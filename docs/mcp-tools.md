@@ -54,7 +54,7 @@ To run from a checkout without installing, use a project-scoped server whose com
 
 ## Tools
 
-The MCP surface is **46 tools** in nine groups. The signatures are below; the prose sections that
+The MCP surface is **47 tools** in nine groups. The signatures are below; the prose sections that
 follow describe response shapes and per-tool behavior. Every symbol/search/read tool additionally
 accepts an optional `"worktree": string` — an absolute path to a linked git worktree, served as a
 branch overlay over the indexed checkout — omitted from the signatures below for brevity.
@@ -70,6 +70,7 @@ branch overlay over the indexed checkout — omitted from the signatures below f
 - `find_callers`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("references" | "unresolved" | "macros" | "common_methods" | "coverage" | "memories")[], "edge_kinds"?: string[] }`
 - `trace_callees`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("references" | "unresolved" | "macros" | "common_methods" | "coverage" | "memories")[], "edge_kinds"?: string[] }`
 - `impact_surface`: `{ "query"?: string, "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("tests" | "docs" | "git" | "papertrail" | "text_fallback" | "memories")[], "full_memories"?: boolean }`
+- `check_library_usage`: `{ "path"?: string, "package"?: string, "deprecated_only"?: boolean, "limit"?: number }`
 - `compare_graph_to_text`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("tests" | "references" | "unresolved" | "macros" | "common_methods")[], "edge_kinds"?: string[] }`
 - `compare_graph_to_scip`: `{}`
 - `ffi_surface`: `{ "limit"?: number }`
@@ -392,6 +393,23 @@ array — `tests`, `docs`, `git`, `papertrail`, `text_fallback`, `memories`, all
 are empty but text fallback finds symbol/path hits, the caveats
 section explicitly says that graph extraction or resolution gaps are likely. Free-text `query`
 requests retain the older flat impact item shape for compatibility.
+
+`check_library_usage` reports how the code uses its EXTERNAL libraries, from the SCIP oracle's
+external symbol info (`index.external_symbols`, parsed into the `external_symbols` table by
+`oracle run` — data the reader used to discard). It joins every `resolved-external` call site to its
+dependency contract by moniker and groups per dependency symbol. Each `entries[]` element carries the
+`moniker`, `package`, `kind`, `display_name`, the dependency's current `signature_text` /
+`signature_language` / `documentation` (**context** — reason about arity / misuse yourself, nothing
+is asserted), the `deprecated` flag (**the one asserted verdict** — a deterministic "deprecated"
+marker in the docs/signature), and the `call_sites` (`path` + line span) with a `call_count`. The
+report also returns `total_external_call_sites`, `distinct_monikers`, `deprecated_call_sites`, and
+`call_sites_without_signature_info` (external calls whose moniker had no contract — coverage
+transparency, not a finding). Filter with `path` (a file or directory prefix), `package` (a single
+dependency), and `deprecated_only`. `status` is `ok`, `no_oracle_run` (run `rag-rat oracle run`
+first), or `no_external_symbols` (the indexer emitted no external symbol info). It does NOT assert
+arity or removed/renamed drift: call-site arg counts are not instrumented and a "removed" verdict
+needs a cross-version baseline (re-index on lockfile change) — both are follow-ups. See
+[`oracle.md`](oracle.md).
 
 Git history tools return historical evidence. `commit_search` searches commit subjects and bodies;
 `git_history_for_path` returns commits touching a current path; `git_history_for_symbol` resolves

@@ -34,6 +34,18 @@ pub(super) enum AdoptIntent {
     ReadOnly,
 }
 
+/// A DB-level, repo-agnostic snapshot of a store, produced by
+/// [`IndexDatabase::global_store_overview`] for the config-less `doctor` path. `schema` is `None`
+/// only when the store file does not exist. Serialized straight into the doctor report.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GlobalStoreOverview {
+    pub database: PathBuf,
+    pub exists: bool,
+    pub size_bytes: Option<u64>,
+    pub schema: Option<schema::SchemaStatus>,
+    pub repos: Vec<schema::RegisteredRepo>,
+}
+
 impl IndexDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_bare(path, BareOpenMode::ConfigLess)
@@ -65,6 +77,12 @@ impl IndexDatabase {
         // (read/MCP/init open) still takes the real lock. Compatible/Newer/Dirty/Missing
         // need no lock — `ensure_compatible_or_migrate` returns or refuses without writing.
         if schema::status(storage.connection())?.state == schema::SchemaState::Older {
+            // #585: refuse a dev/test build's silent forward-migration of the shared global store
+            // BEFORE taking the schema lock — on a box with one global DB the newest-migration
+            // binary otherwise wins the schema race for every process. Installed binaries and
+            // RAG_RAT_ALLOW_MIGRATE proceed; per-repo/temp DBs are never gated.
+            super::migration_gate::MigrationGate::from_env()
+                .ensure_migration_permitted(path, schema::SchemaState::Older)?;
             // A6: the GLOBAL schema lock, not a per-repo write lock — a migration rewrites the
             // shared ladder (every repo's tables), so it serializes across all repos.
             // Reentrant on the holding thread, so a CLI write command that opens under
@@ -137,7 +155,7 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             active_generation,
-            github: github::GitHubContext::default(),
+            papertrail: papertrail::PapertrailContext::default(),
             config: None,
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
@@ -159,7 +177,7 @@ impl IndexDatabase {
             active_generation: 0,
             // Real usage: resolve the GitHub repo context from the local `gh` CLI here, at the
             // boundary. rebuild/open (used by tests and the bare index command) leave it offline.
-            github: github::GitHubContext::from_gh(),
+            papertrail: papertrail::PapertrailContext::from_gh(),
             config: Some(config.clone()),
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
@@ -326,7 +344,7 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             active_generation: 0,
-            github: github::GitHubContext::from_gh(),
+            papertrail: papertrail::PapertrailContext::from_gh(),
             config: Some(config.clone()),
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
@@ -363,8 +381,8 @@ impl IndexDatabase {
 
     /// Set the GitHub repo context explicitly (tests / non-gh callers), so the library never
     /// shells out to `gh`.
-    pub fn set_github_context(&mut self, default_repo: Option<&str>, gh_available: bool) {
-        self.github = github::GitHubContext::new(default_repo, gh_available);
+    pub fn set_papertrail_context(&mut self, default_repo: Option<&str>, gh_available: bool) {
+        self.papertrail = papertrail::PapertrailContext::new(default_repo, gh_available);
     }
 
     pub fn migrate(path: &Path) -> anyhow::Result<schema::SchemaStatus> {
@@ -426,6 +444,45 @@ impl IndexDatabase {
         schema::status(storage.connection())
     }
 
+    /// A DB-LEVEL, repo-agnostic overview of the store at `path` — for `doctor` invoked OUTSIDE any
+    /// rag-rat repo, where the repo-scoped opens (`open`, `open_config`) deliberately refuse to
+    /// guess a repo in a consolidated multi-repo store. Reports on-disk presence/size, the schema
+    /// status, and the registry of real repos the store holds (each with its recorded roots).
+    /// Side-effect-free when the file is ABSENT (returns `exists: false` without opening/creating
+    /// it); the registry is read only when the schema is `Compatible` (a Missing/Newer/Dirty schema
+    /// has no queryable `repos` table). The registry read is READ-ONLY.
+    pub fn global_store_overview(path: &Path) -> anyhow::Result<GlobalStoreOverview> {
+        if !path.is_file() {
+            return Ok(GlobalStoreOverview {
+                database: path.to_path_buf(),
+                exists: false,
+                size_bytes: None,
+                schema: None,
+                repos: Vec::new(),
+            });
+        }
+        let size_bytes = std::fs::metadata(path).ok().map(|meta| meta.len());
+        // READ-ONLY throughout: this diagnostic must work on a read-only mount / backup, so it must
+        // not use the read-WRITE `migration_check` (whose `IndexConnection::open` runs
+        // write-oriented setup pragmas). One read-only connection serves both the schema
+        // status and the registry read. NB: a read-only open never auto-migrates, which is
+        // correct here — the report states the schema STATE, it does not change it.
+        let storage = IndexConnection::open_read_only_blocking(path)?;
+        let schema = schema::status(storage.connection())?;
+        let repos = if schema.state == schema::SchemaState::Compatible {
+            schema::registered_repos(storage.connection())?
+        } else {
+            Vec::new()
+        };
+        Ok(GlobalStoreOverview {
+            database: path.to_path_buf(),
+            exists: true,
+            size_bytes,
+            schema: Some(schema),
+            repos,
+        })
+    }
+
     /// Create-or-migrate the schema for a full [`rebuild`](Self::rebuild). Leaves the repo scope
     /// UNSET (`active_repo_id` empty): `rebuild` registers/adopts the repo and installs the scope
     /// context itself (so the model-manifest heal and every direct-scoped write see the right repo,
@@ -448,7 +505,7 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             active_generation: 0,
-            github: github::GitHubContext::default(),
+            papertrail: papertrail::PapertrailContext::default(),
             config: None,
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
@@ -469,7 +526,13 @@ impl IndexDatabase {
                         "timed out waiting for the schema-migration lock to apply the schema"
                     )
                 })?;
-        if schema::status(conn)?.state != schema::SchemaState::Compatible {
+        let state = schema::status(conn)?.state;
+        if state != schema::SchemaState::Compatible {
+            // #585: a dev/test build must not silently forward-migrate the shared global store —
+            // it would strand every process still on an older binary. Refused here (Older only;
+            // Missing is first-time init) unless RAG_RAT_ALLOW_MIGRATE / an installed binary.
+            super::migration_gate::MigrationGate::from_env()
+                .ensure_migration_permitted(path, state)?;
             schema::apply(conn)?;
         }
         Ok(())
@@ -756,4 +819,71 @@ fn write_repo_generation_view(
         ",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod global_store_overview_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::index::IndexDatabase;
+    use crate::index::schema::{self, register_repo};
+    use crate::repo_identity::{RepoIdentity, RepoIdentityClass};
+    use crate::storage::IndexConnection;
+
+    static N: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db() -> PathBuf {
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("ragrat-gso-{}-{id}", std::process::id()))
+            .join("rag-rat.sqlite")
+    }
+
+    /// An ABSENT store is reported as `exists: false` WITHOUT opening or creating the file —
+    /// `doctor` invoked on a machine that has never indexed anything must not conjure an empty
+    /// global store.
+    #[test]
+    fn overview_reports_an_absent_store_without_creating_it() {
+        let path = temp_db();
+        let overview = IndexDatabase::global_store_overview(&path).unwrap();
+        assert!(!overview.exists);
+        assert!(overview.schema.is_none());
+        assert!(overview.repos.is_empty());
+        assert!(!path.exists(), "reporting an absent store must not create it");
+    }
+
+    /// A store with a registered repo lists it (with its recorded root) and EXCLUDES the
+    /// `__unassigned__` adoption placeholder — the DB-level report the config-less `doctor` shows.
+    #[test]
+    fn overview_lists_registered_repos_excluding_the_placeholder() {
+        let path = temp_db();
+        {
+            let conn = IndexConnection::open(&path).unwrap();
+            schema::apply(conn.connection()).unwrap();
+            register_repo(
+                conn.connection(),
+                &RepoIdentity {
+                    repo_id: "repo-xyz".to_string(),
+                    display_name: "demo".to_string(),
+                    class: RepoIdentityClass::Portable,
+                    shallow_boundary: Vec::new(),
+                },
+                Path::new("/src/demo"),
+                42,
+            )
+            .unwrap();
+        }
+
+        let overview = IndexDatabase::global_store_overview(&path).unwrap();
+        assert!(overview.exists);
+        assert_eq!(overview.schema.unwrap().state, schema::SchemaState::Compatible);
+        assert_eq!(overview.repos.len(), 1, "the '__unassigned__' placeholder is excluded");
+        let repo = &overview.repos[0];
+        assert_eq!(repo.repo_id, "repo-xyz");
+        assert_eq!(repo.display_name, "demo");
+        assert_eq!(repo.roots, vec!["/src/demo".to_string()]);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

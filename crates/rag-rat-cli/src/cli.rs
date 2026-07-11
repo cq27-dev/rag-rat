@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Debug, Parser)]
 #[command(
     name = "rag-rat",
-    version,
+    version = env!("RAG_RAT_VERSION"),
     about = "Local repo-intelligence index, graph, history, and memory — CLI + MCP server.",
     propagate_version = true
 )]
@@ -47,7 +47,7 @@ pub(crate) enum Command {
     Index(IndexArgs),
 
     /// Report schema, storage, discovery, targets, and index health as JSON.
-    Doctor,
+    Doctor(DoctorArgs),
 
     /// Search the index (lexical + semantic).
     Query(QueryArgs),
@@ -322,6 +322,15 @@ pub(crate) struct ClustersArgs {
     /// Omit drive-by repo memories.
     #[arg(long)]
     pub no_memories: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DoctorArgs {
+    /// Reclaim dead space: run a one-off VACUUM to shrink the database file (drops the freelist).
+    /// Takes the global schema lock and rewrites the whole file, so run it while agents/watchers
+    /// are quiet — a live reader can make it fail with a busy error; stop them and retry.
+    #[arg(long)]
+    pub vacuum: bool,
 }
 
 #[derive(Debug, Args)]

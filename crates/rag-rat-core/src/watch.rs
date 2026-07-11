@@ -104,6 +104,46 @@ impl Debounce {
     }
 }
 
+/// Clock for the periodic all-worktrees sweep backstop, pure like [`Debounce`] (clock injected).
+/// It measures time since the last **`All`-scoped** pass COMPLETED — not since any pass (#577
+/// review): an event-scoped pass doesn't perform the sweep's duties (refreshing unlisted
+/// worktrees, retrying overlay embed backlogs), so a steady drip of scoped passes must escalate
+/// the next pass to `All` once the interval elapses rather than keep postponing the backstop.
+#[derive(Debug)]
+struct SweepClock {
+    /// `None` disables the periodic sweep (`periodic_sweep_secs = 0`) — never due.
+    interval: Option<Duration>,
+    last_sweep: Instant,
+    /// Whether the pass currently in flight sweeps every worktree. Starts `true`: the startup
+    /// catch-up (an `All` pass) is dispatched just before the event loop runs.
+    in_flight_sweeps_all: bool,
+}
+
+impl SweepClock {
+    fn new(interval: Option<Duration>, now: Instant) -> Self {
+        Self { interval, last_sweep: now, in_flight_sweeps_all: true }
+    }
+
+    fn on_dispatch(&mut self, scope_is_all: bool) {
+        self.in_flight_sweeps_all = scope_is_all;
+    }
+
+    /// A pass completed; only an `All`-scoped one resets the backstop interval.
+    fn on_pass_done(&mut self, now: Instant) {
+        if self.in_flight_sweeps_all {
+            self.last_sweep = now;
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.interval.is_some_and(|p| now >= self.last_sweep + p)
+    }
+
+    fn due_in(&self, now: Instant) -> Option<Duration> {
+        self.interval.map(|p| (self.last_sweep + p).saturating_duration_since(now))
+    }
+}
+
 /// What the event loop asks the pass worker to run (#506).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PassRequest {
@@ -112,6 +152,9 @@ enum PassRequest {
     StartupCatchup,
     Maintenance {
         run_gc: bool,
+        /// Which linked-worktree overlays this pass refreshes (#577): the checkouts the event
+        /// loop attributed events to since the last dispatch, or `All` for the periodic sweep.
+        overlay_scope: OverlayScope,
     },
 }
 
@@ -146,14 +189,19 @@ impl PassScheduler {
         PassRequest::StartupCatchup
     }
 
-    /// The next maintenance request, or `None` while a pass is already in flight.
-    fn dispatch(&mut self) -> Option<PassRequest> {
+    /// The next maintenance request, or `None` while a pass is already in flight. The gc-cadence
+    /// pass widens `overlay_scope` to `All`: gc's worktree-liveness sweep wants the full picture,
+    /// and 1-in-`GC_EVERY_PASSES` keeps every overlay's missed-event exposure bounded even with
+    /// the periodic sweep disabled (#577).
+    fn dispatch(&mut self, overlay_scope: OverlayScope) -> Option<PassRequest> {
         if self.inflight {
             return None;
         }
         self.inflight = true;
         self.passes += 1;
-        Some(PassRequest::Maintenance { run_gc: self.passes.is_multiple_of(GC_EVERY_PASSES) })
+        let run_gc = self.passes.is_multiple_of(GC_EVERY_PASSES);
+        let overlay_scope = if run_gc { OverlayScope::All } else { overlay_scope };
+        Some(PassRequest::Maintenance { run_gc, overlay_scope })
     }
 
     fn on_done(&mut self) {
@@ -193,9 +241,19 @@ fn spawn_pass_worker(
 
 /// Run one maintenance pass, blocking on the per-DB write lock (watcher-to-watcher serializes).
 pub fn maintenance_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
+    maintenance_pass_scoped(config, run_gc, &OverlayScope::All)
+}
+
+/// [`maintenance_pass`] with an explicit overlay scope — the watcher's event-driven passes name
+/// the checkouts events came from instead of sweeping the whole worktree fleet (#577).
+fn maintenance_pass_scoped(
+    config: &Config,
+    run_gc: bool,
+    overlay_scope: &OverlayScope,
+) -> anyhow::Result<()> {
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
-    run_pass(config, run_gc, false)
+    run_pass(config, run_gc, false, overlay_scope)
 }
 
 /// Run one maintenance pass only if the write lock is free within `SKIP_TIMEOUT`; returns whether
@@ -204,7 +262,7 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
     let lock_repo = locks::write_lock_repo_id(config);
     match locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SKIP_TIMEOUT)? {
         Some(_lock) => {
-            run_pass(config, run_gc, false)?;
+            run_pass(config, run_gc, false, &OverlayScope::All)?;
             Ok(true)
         },
         None => Ok(false),
@@ -214,13 +272,14 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
 fn startup_catchup_pass(config: &Config) -> anyhow::Result<()> {
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
-    run_pass(config, STARTUP_CATCHUP_RUN_GC, true)
+    run_pass(config, STARTUP_CATCHUP_RUN_GC, true, &OverlayScope::All)
 }
 
 fn run_pass(
     config: &Config,
     run_gc: bool,
     retry_base_embedding_backlog: bool,
+    overlay_scope: &OverlayScope,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut timings = PassTimings::new(started);
@@ -257,8 +316,9 @@ fn run_pass(
     // worktree change counts toward running the tail below even when config.root itself didn't
     // change. Reconcile a CHANGED overlay's embeddings INLINE (while scoped to it) so a worktree
     // query isn't BM25-only for branch content — the base reconcile below can't see overlay chunks.
-    let overlays_changed =
-        timings.stage("overlays", || refresh_worktree_overlays(&mut db, config, Some(&budget)));
+    let overlays_changed = timings.stage("overlays", || {
+        refresh_worktree_overlays(&mut db, config, Some(&budget), overlay_scope)
+    });
     let tail_already_forced = pass_tail_forced_by_state(
         content_changed,
         overlays_changed,
@@ -473,7 +533,50 @@ fn base_embedding_backlog_needs_tail(
     budget.next_options().is_some_and(|options| pending_embedding_jobs(&options))
 }
 
-/// Refresh the branch overlay of every live LINKED worktree of `config.root`'s repo (#219), so a
+/// Which linked-worktree overlays a maintenance pass refreshes (#577). The per-worktree refresh
+/// is write-idle on an unchanged worktree but never FREE: each one pays a base↔linked tree diff,
+/// a full working-tree status walk, and an `IgnoreMatcher` compile. Sweeping every live worktree
+/// on every pass made the pass cost scale with the whole worktree fleet instead of with what
+/// changed — on a repo with several active agent worktrees that was ~3 s of overlay sweep per
+/// otherwise-idle pass, all day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayScope {
+    /// Refresh every live linked worktree: startup catch-up, the periodic sweep (the backstop for
+    /// missed events), gc passes, and the CLI/hook `maintenance` command.
+    All,
+    /// Refresh the listed checkout roots (the ones the watcher attributed events to since the
+    /// last dispatch) — plus any worktree whose recorded refresh basis no longer matches, so a
+    /// base or linked commit is never missed just because no file event named the checkout. An
+    /// empty set is a base-only pass: discovery covers the base scope regardless of this value.
+    Linked(BTreeSet<PathBuf>),
+}
+
+impl OverlayScope {
+    /// Whether `worktree_id` (the canonical id `live_worktree_contexts` reports) is listed.
+    /// Scope roots are event/checkout paths; compare via `worktree_id_of` so the event spelling
+    /// and the overlay key can't drift (the same canonicalization every scope consumer uses).
+    fn lists(&self, worktree_id: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Linked(roots) =>
+                roots.iter().any(|root| crate::index::worktree_id_of(root) == worktree_id),
+        }
+    }
+
+    /// Fold another event's contribution into the scope accumulated while the debounce is armed:
+    /// attributable roots union; an unattributable contribution widens the whole pass to `All`.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All, _) | (_, Self::All) => Self::All,
+            (Self::Linked(mut roots), Self::Linked(more)) => {
+                roots.extend(more);
+                Self::Linked(roots)
+            },
+        }
+    }
+}
+
+/// Refresh the branch overlay of live LINKED worktrees of `config.root`'s repo (#219), so a
 /// `worktree`-scoped query stays current without a manual `index --worktree`. Returns whether any
 /// overlay actually changed. `index_worktree_overlay` is delta-only and idle-safe (a static
 /// worktree writes nothing), and the connection is restored to the base scope afterward so the rest
@@ -489,6 +592,15 @@ fn base_embedding_backlog_needs_tail(
 /// table), which the overlay scope reads through its own `files` view. `None` skips overlay
 /// reconcile (the caller has no embedder/options).
 ///
+/// `scope` (#577): which worktrees to refresh. The watcher's event-driven passes name the
+/// checkouts events came from; everything else (`All`) sweeps the fleet. A worktree outside the
+/// scope is still refreshed when its recorded basis — the (base HEAD, linked HEAD) pair its
+/// overlay was last computed against — no longer matches: a BASE commit moves the diff basis for
+/// every worktree at once, and a LINKED commit arrives with no file event for the checkout (hooks,
+/// or edits made while no watcher ran). Working-tree edits in a skipped worktree surface via
+/// events, or at latest via the next `All` sweep (`periodic_sweep_secs`) — the same missed-event
+/// backstop the watcher already relies on.
+///
 /// `pub` so the hook-driven CLI `maintenance` command shares this exact path: the git hooks invoke
 /// `rag-rat maintenance` (not the foreground watcher), so without calling this a commit/checkout/
 /// merge in a linked worktree would index the base `config.root` but leave that worktree's overlay
@@ -497,16 +609,31 @@ pub fn refresh_worktree_overlays(
     db: &mut IndexDatabase,
     config: &Config,
     reconcile: Option<&ReconcileBudget>,
+    scope: &OverlayScope,
 ) -> bool {
     let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
     // The base id is the ENCLOSING worktree root, not `config.root` itself — see
     // `enclosing_worktree_id` (a repo-SUBDIR `config.root` would otherwise mis-classify the main
     // checkout as a linked overlay and re-index it as one) (#219 review).
     let base_id = enclosing_worktree_id(&config.root);
+    // The basis every refresh in this pass records: the base HEAD the overlay delta is computed
+    // from. Read once — a base commit landing mid-pass records the pre-pass sha, which mismatches
+    // on the next pass and re-refreshes (the safe direction).
+    let base_sha = crate::index::head_sha(&config.root);
+    let sweep = matches!(scope, OverlayScope::All);
     let mut changed = false;
     for worktree in worktrees {
         if worktree == base_id {
             continue; // the rooted checkout is the base scope, not an overlay
+        }
+        // The linked HEAD is read BEFORE the refresh, so a commit racing the refresh records the
+        // pre-commit head — mismatching (and re-refreshing) next pass rather than skipping.
+        let linked_head = crate::index::head_sha(Path::new(&worktree));
+        if !scope.lists(&worktree)
+            && db.worktree_overlay_basis(&worktree).ok().flatten()
+                == Some((base_sha.clone(), linked_head.clone()))
+        {
+            continue; // not implicated by events and the diff basis is unchanged (#577)
         }
         // Refresh the overlay with the LINKED worktree's OWN config targets, not the sweeping
         // process's. A branch whose `rag-rat.toml` ADDS a target (e.g. `extra/`) would otherwise be
@@ -519,23 +646,37 @@ pub fn refresh_worktree_overlays(
             Ok(report) => {
                 let this_changed = report.indexed > 0 || report.tombstoned > 0 || report.pruned > 0;
                 changed |= this_changed;
+                match overlay_basis_action(&report) {
+                    // Record the refresh basis so later scoped passes can prove "unchanged" from
+                    // two head reads instead of re-computing the delta (#577). Best-effort: a
+                    // failed write just means the next pass refreshes again.
+                    OverlayBasisAction::Record => {
+                        let _ =
+                            db.record_worktree_overlay_basis(&worktree, &base_sha, &linked_head);
+                    },
+                    OverlayBasisAction::Clear => {
+                        let _ = db.clear_worktree_overlay_basis(&worktree);
+                    },
+                    OverlayBasisAction::Keep => {},
+                }
                 // Embed the overlay's chunks NOW, while the connection is still scoped to this
                 // overlay (index_worktree_overlay left it there) — the trailing base reconcile
-                // won't see them (#219 review). Run when the overlay CHANGED, OR
-                // when it has a BACKLOG of un-embedded chunks: an earlier pass's
-                // inline reconcile may have returned `Partial` (the shared time
-                // budget ran out mid-pass), leaving overlay chunks un-embedded. The
-                // next pass sees the overlay rows as unchanged and would skip the embed forever, so
-                // a worktree-scoped `semantic_search` would stay BM25-only for that
-                // branch content until an unrelated file change.
-                // `pending_embedding_jobs` (active overlay scope) retries that
-                // backlog (#219 review). `budget.next_options()` recomputes `max_seconds`
-                // from the time left in the SHARED budget so overlays + base can't each spend the
-                // full `--max-seconds`; `None` → budget exhausted, skip and let the NEXT pass
-                // retry.
-                let needs_embed = overlay_needs_embed(this_changed, reconcile, |options| {
-                    db.pending_embedding_jobs_with_available_incremental_embedder(options)
-                        .is_ok_and(|pending| pending > 0)
+                // won't see them (#219 review). Run when the overlay CHANGED, OR — on an `All`
+                // sweep only — when it has a BACKLOG of un-embedded chunks: an earlier pass's
+                // inline reconcile may have returned `Partial` (the shared time budget ran out
+                // mid-pass), leaving overlay chunks un-embedded. The next pass sees the overlay
+                // rows as unchanged and would skip the embed forever, so a worktree-scoped
+                // `semantic_search` would stay BM25-only for that branch content until an
+                // unrelated file change; the sweep's `pending_embedding_jobs_with_options` count
+                // (active overlay scope, SQL-only — no embedder acquisition, so an idle pass makes
+                // no embed request) retries it within one `periodic_sweep_secs` (#219 review,
+                // #577). A backlogged reconcile with the embedder unavailable defers inside
+                // `reconcile_with_options_progress` itself (`provision_remote=false`).
+                // `budget.next_options()` recomputes `max_seconds` from the time left in the
+                // SHARED budget so overlays + base can't each spend the full `--max-seconds`;
+                // `None` → budget exhausted, skip and let the NEXT pass retry.
+                let needs_embed = overlay_needs_embed(this_changed, sweep, reconcile, |options| {
+                    db.pending_embedding_jobs_with_options(options).is_ok_and(|pending| pending > 0)
                 });
                 if needs_embed
                     && let Some(budget) = reconcile
@@ -545,7 +686,13 @@ pub fn refresh_worktree_overlays(
                     eprintln!("watch: worktree overlay reconcile failed for {worktree}: {err}");
                 }
             },
-            Err(err) => eprintln!("watch: worktree overlay refresh failed for {worktree}: {err}"),
+            Err(err) => {
+                // A failed refresh may have left the overlay stale while both heads still match
+                // (a dirty edit moves no HEAD) — drop the skip proof so scoped passes keep
+                // refreshing this worktree until a pass completes (#577 review).
+                let _ = db.clear_worktree_overlay_basis(&worktree);
+                eprintln!("watch: worktree overlay refresh failed for {worktree}: {err}");
+            },
         }
     }
     // Restore the base scope for the rest of the pass (index_worktree_overlay leaves the connection
@@ -554,13 +701,45 @@ pub fn refresh_worktree_overlays(
     changed
 }
 
+/// What a refresh outcome does to the worktree's skip-proof basis (#577).
+#[derive(Debug, PartialEq, Eq)]
+enum OverlayBasisAction {
+    /// A COMPLETE refresh of a real linked sibling: the heads captured around it prove the
+    /// overlay current.
+    Record,
+    /// A PARTIAL refresh (the working-tree status read failed midway): dirty/untracked/deleted
+    /// paths may be missing while neither HEAD moved, so a previously recorded basis would keep
+    /// matching and scoped passes would skip the stale overlay until an `All` pass. Drop it so
+    /// they keep refreshing until a complete pass lands.
+    Clear,
+    /// Not a linked sibling — there is no overlay to prove anything about.
+    Keep,
+}
+
+fn overlay_basis_action(report: &crate::index::WorktreeOverlayReport) -> OverlayBasisAction {
+    if report.worktree_id.is_empty() {
+        OverlayBasisAction::Keep
+    } else if report.status_complete {
+        OverlayBasisAction::Record
+    } else {
+        OverlayBasisAction::Clear
+    }
+}
+
 fn overlay_needs_embed(
     this_changed: bool,
+    sweep_backlog_probe: bool,
     reconcile: Option<&ReconcileBudget>,
     pending_embedding_jobs: impl FnOnce(&ReconcileOptions) -> bool,
 ) -> bool {
     if this_changed {
         return true;
+    }
+    // The backlog probe is an O(scope) candidate scan; it belongs to the `All` sweep, not to
+    // every event-scoped pass over an unchanged worktree (#577). A `Partial` drain therefore
+    // heals within one `periodic_sweep_secs` instead of being re-probed per pass.
+    if !sweep_backlog_probe {
+        return false;
     }
     reconcile
         .and_then(ReconcileBudget::next_options)
@@ -663,6 +842,13 @@ fn is_gitignore_path(path: &Path) -> bool {
     path.file_name().is_some_and(|name| name == ".gitignore")
 }
 
+/// A repo-config (`rag-rat.toml`) path. A LINKED checkout's config edit re-targets its branch
+/// overlay without moving either HEAD, so the linked classifier fires on it like a `.gitignore`
+/// edit (#577 review).
+fn is_repo_config_path(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "rag-rat.toml")
+}
+
 /// A relevant event is a rescan/overflow notice, a *content-mutating* `.gitignore` edit (the rules
 /// themselves changed — finding 4), or a *content-mutating* event whose path matches a configured
 /// target and is **not** ignored by the repo's compiled `.gitignore` rules + floor (issue #62).
@@ -746,8 +932,13 @@ impl LinkedWorktreeWatch {
 
     fn touches_event(&self, path: &Path) -> bool {
         // A `.gitignore` edit anywhere in the linked checkout can affect the branch overlay's
-        // ignored/unignored set, including ancestor rules above a subdir-rooted config.
-        if is_gitignore_path(path) && path.starts_with(&self.checkout_root) {
+        // ignored/unignored set, including ancestor rules above a subdir-rooted config. A
+        // `rag-rat.toml` edit likewise changes the branch's TARGET SET without moving either HEAD
+        // (#577 review) — the overlay refresh re-reads the branch config each pass, so firing the
+        // pass is what picks the new targets up.
+        if (is_gitignore_path(path) || is_repo_config_path(path))
+            && path.starts_with(&self.checkout_root)
+        {
             return true;
         }
         if self.ignore.is_ignored(path, false) {
@@ -780,12 +971,21 @@ impl LinkedWorktreeWatches {
         self.states = states;
     }
 
-    fn watch_created_dirs(&mut self, watcher: &mut impl notify::Watcher, event: &Event) -> bool {
-        let mut placed_target_watch = false;
+    /// Place watches for created/moved-in dirs across EVERY state (no short-circuit — placement
+    /// is a side effect each state needs), returning the checkout roots that placed one, so the
+    /// armed pass can scope its overlay refresh to them (#577).
+    fn watch_created_dirs(
+        &mut self,
+        watcher: &mut impl notify::Watcher,
+        event: &Event,
+    ) -> BTreeSet<PathBuf> {
+        let mut placed = BTreeSet::new();
         for state in &mut self.states {
-            placed_target_watch |= state.watch_created_dirs(watcher, event);
+            if state.watch_created_dirs(watcher, event) {
+                placed.insert(state.checkout_root.clone());
+            }
         }
-        placed_target_watch
+        placed
     }
 
     fn recompile_ignore_and_place_watches(&mut self, watcher: &mut impl notify::Watcher) {
@@ -794,17 +994,49 @@ impl LinkedWorktreeWatches {
         }
     }
 
-    fn event_touches(&self, event: &Event, registry: Option<&Path>) -> bool {
+    fn event_touches(&self, event: &Event, registry: Option<&Path>) -> WorktreeEventHint {
         if event.need_rescan() {
-            return !self.states.is_empty() || registry.is_some();
+            // Events were dropped — anything could have changed anywhere.
+            return if !self.states.is_empty() || registry.is_some() {
+                WorktreeEventHint::AllWorktrees
+            } else {
+                WorktreeEventHint::None
+            };
         }
         if !kind_is_mutation(&event.kind) {
-            return false;
+            return WorktreeEventHint::None;
         }
-        event.paths.iter().any(|path| {
-            registry.is_some_and(|reg| path.starts_with(reg))
-                || self.states.iter().any(|state| state.touches_event(path))
-        })
+        let mut roots = BTreeSet::new();
+        for path in &event.paths {
+            if registry.is_some_and(|reg| path.starts_with(reg)) {
+                // A worktree add/remove: the live set itself changed — unattributable.
+                return WorktreeEventHint::AllWorktrees;
+            }
+            for state in self.states.iter().filter(|state| state.touches_event(path)) {
+                roots.insert(state.checkout_root.clone());
+            }
+        }
+        if roots.is_empty() { WorktreeEventHint::None } else { WorktreeEventHint::Roots(roots) }
+    }
+}
+
+/// Overlay implication of one event for the LINKED-worktree layer (#577): which checkouts the
+/// armed pass must refresh — or `AllWorktrees` when the event can't be attributed (a backend
+/// rescan, a worktree-registry change).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeEventHint {
+    /// No linked checkout is touched.
+    None,
+    /// The event touches these linked checkout roots.
+    Roots(BTreeSet<PathBuf>),
+    /// Unattributable — refresh every overlay.
+    AllWorktrees,
+}
+
+impl WorktreeEventHint {
+    /// Whether the linked-worktree layer wants a pass at all.
+    fn fires(&self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -818,7 +1050,7 @@ fn event_touches_worktree(
     event: &Event,
     worktrees: &LinkedWorktreeWatches,
     registry: Option<&Path>,
-) -> bool {
+) -> WorktreeEventHint {
     worktrees.event_touches(event, registry)
 }
 
@@ -1193,6 +1425,11 @@ fn place_initial_watch_state(
     (linked_worktrees, worktree_registry)
 }
 
+/// Whether `event` should arm a maintenance pass — and if so, which linked-worktree overlays it
+/// implicates (#577): `Some(scope)` to fire (an empty `Linked` set is a base-only event — the
+/// pass's discover covers the base scope regardless), `None` to ignore. Every sub-check still
+/// RUNS unconditionally (no short-circuit): watch placement is a side effect both the base and
+/// every linked state need regardless of what else already fired.
 fn event_requests_maintenance(
     watcher: &mut impl notify::Watcher,
     event: &Event,
@@ -1201,14 +1438,30 @@ fn event_requests_maintenance(
     ignore: &mut IgnoreMatcher,
     linked_worktrees: &mut LinkedWorktreeWatches,
     worktree_registry: Option<&Path>,
-) -> bool {
+) -> Option<OverlayScope> {
     let created_dir_watch_placed =
         watch_created_dirs(watcher, event, config, target_dirs, ignore, None);
-    let linked_created_dir_watch_placed = linked_worktrees.watch_created_dirs(watcher, event);
-    created_dir_watch_placed
-        || linked_created_dir_watch_placed
-        || event_is_relevant(config, ignore, event)
-        || event_touches_worktree(event, linked_worktrees, worktree_registry)
+    let linked_created_dir_roots = linked_worktrees.watch_created_dirs(watcher, event);
+    let base_relevant = event_is_relevant(config, ignore, event);
+    let worktree_hint = event_touches_worktree(event, linked_worktrees, worktree_registry);
+    let fires = created_dir_watch_placed
+        || !linked_created_dir_roots.is_empty()
+        || base_relevant
+        || worktree_hint.fires();
+    if !fires {
+        return None;
+    }
+    // A rescan means the backend dropped events — `event_is_relevant` fires for the base and the
+    // overlay side can't attribute anything, so the pass sweeps everything.
+    if event.need_rescan() {
+        return Some(OverlayScope::All);
+    }
+    let scope = match worktree_hint {
+        WorktreeEventHint::AllWorktrees => OverlayScope::All,
+        WorktreeEventHint::Roots(roots) => OverlayScope::Linked(roots),
+        WorktreeEventHint::None => OverlayScope::Linked(BTreeSet::new()),
+    };
+    Some(scope.merge(OverlayScope::Linked(linked_created_dir_roots)))
 }
 
 fn recompile_ignore_and_place_watches(
@@ -1310,7 +1563,8 @@ fn watcher_main(
         move |request| {
             let _ = match request {
                 PassRequest::StartupCatchup => startup_catchup_pass(&config),
-                PassRequest::Maintenance { run_gc } => maintenance_pass(&config, *run_gc),
+                PassRequest::Maintenance { run_gc, overlay_scope } =>
+                    maintenance_pass_scoped(&config, *run_gc, overlay_scope),
             };
         }
     }) else {
@@ -1386,10 +1640,17 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
             Duration::from_millis(self.config.watch.max_latency_ms),
         );
         let mut fleet_debounce = Debounce::new(FLEET_DEBOUNCE, FLEET_MAX_LATENCY);
-        // Periodic backstop (covers event-blind filesystems + missed events). `None` disables it.
+        // Periodic backstop (covers event-blind filesystems + missed events). Counts from the
+        // last ALL-scoped pass, so event-scoped passes can't postpone it (#577 review); `new`
+        // assumes the startup catch-up (an `All` pass) was just dispatched.
         let periodic = (self.config.watch.periodic_sweep_secs > 0)
             .then(|| Duration::from_secs(self.config.watch.periodic_sweep_secs));
-        let mut last_pass = Instant::now(); // the startup catch-up was just dispatched
+        let mut sweep = SweepClock::new(periodic, Instant::now());
+        // The overlay scope accumulated while the debounce is armed (#577): every firing event
+        // merges its contribution, and the union rides the next dispatched pass. Cleared ONLY on
+        // dispatch, like the debounce itself — mid-pass events keep accumulating for the
+        // coalesced follow-up.
+        let mut pending_overlay_scope: Option<OverlayScope> = None;
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 break;
@@ -1402,9 +1663,7 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
             let wait = if self.scheduler.in_flight() {
                 fleet_debounce.due_in(now).unwrap_or(IDLE_WAIT)
             } else {
-                let periodic_wait =
-                    periodic.map(|p| (last_pass + p).saturating_duration_since(now));
-                [debounce.due_in(now), fleet_debounce.due_in(now), periodic_wait]
+                [debounce.due_in(now), fleet_debounce.due_in(now), sweep.due_in(now)]
                     .into_iter()
                     .flatten()
                     .min()
@@ -1428,7 +1687,7 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                     // them. The watch keeps SUBSEQUENT edits firing. Gates each path on real-dir +
                     // target relation + not-ignored, and recompiles the matcher for a moved-in
                     // nested `.gitignore` (#332).
-                    if event_requests_maintenance(
+                    if let Some(scope) = event_requests_maintenance(
                         self.notify_watcher,
                         &event,
                         self.config,
@@ -1438,6 +1697,10 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                         self.worktree_registry,
                     ) {
                         debounce.on_event(now);
+                        pending_overlay_scope = Some(match pending_overlay_scope.take() {
+                            Some(pending) => pending.merge(scope),
+                            None => scope,
+                        });
                         // A `.gitignore` mutation changed the rules — recompile so subsequent
                         // events are classified against current rules, not the matcher
                         // this watcher booted with.
@@ -1468,7 +1731,7 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                 Ok(LoopMsg::Fs(Err(_))) => {},
                 Ok(LoopMsg::PassDone) => {
                     self.scheduler.on_done();
-                    last_pass = Instant::now();
+                    sweep.on_pass_done(Instant::now());
                     // Refresh the live linked-worktree set after every pass. Existing checkout
                     // paths can switch branches and therefore branch-local target sets; rebuilding
                     // the state keeps classification, ignore matchers, and watch placement in one
@@ -1486,14 +1749,33 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             let now = Instant::now();
-            let periodic_due = periodic.is_some_and(|p| now >= last_pass + p);
-            if (debounce.should_fire(now) || periodic_due)
-                && let Some(request) = self.scheduler.dispatch()
-            {
-                let _ = self.pass_tx.send(request);
-                // Reset ONLY on dispatch: while a pass is in flight the armed debounce is the
-                // record that a follow-up is owed, and it fires as soon as `PassDone` lands.
-                debounce.reset();
+            let periodic_due = sweep.due(now);
+            if debounce.should_fire(now) || periodic_due {
+                // The periodic sweep is the missed-event backstop, so it refreshes every overlay;
+                // an event-driven pass carries the roots accumulated above (#577). When both are
+                // due at once, `All` is the superset — and because the sweep clock counts from
+                // the last All COMPLETION, sustained event churn escalates a pass to `All` every
+                // interval instead of postponing the backstop.
+                let overlay_scope = if periodic_due {
+                    OverlayScope::All
+                } else {
+                    pending_overlay_scope
+                        .clone()
+                        .unwrap_or_else(|| OverlayScope::Linked(BTreeSet::new()))
+                };
+                if let Some(request) = self.scheduler.dispatch(overlay_scope) {
+                    // The scheduler may widen the scope (gc-cadence passes force `All`), so read
+                    // the DISPATCHED request's scope, not the one handed in.
+                    if let PassRequest::Maintenance { overlay_scope, .. } = &request {
+                        sweep.on_dispatch(matches!(overlay_scope, OverlayScope::All));
+                    }
+                    let _ = self.pass_tx.send(request);
+                    // Reset ONLY on dispatch: while a pass is in flight the armed debounce (and
+                    // the scope accumulated with it) is the record that a follow-up is owed, and
+                    // it fires as soon as `PassDone` lands.
+                    debounce.reset();
+                    pending_overlay_scope = None;
+                }
             }
             if fleet_debounce.should_fire(now)
                 && let Some(bin) = self.fleet_bin
@@ -1742,14 +2024,114 @@ mod tests {
     }
 
     #[test]
+    fn basis_records_on_complete_clears_on_partial_keeps_on_non_sibling() {
+        // #577 review: a PARTIAL refresh (the gix status read failed midway, so
+        // `status_complete=false` and dirty/untracked paths may be missing) must CLEAR any
+        // recorded basis, not merely skip recording — a dirty edit moves no HEAD, so a prior
+        // basis would keep matching and later scoped passes would skip the stale overlay until
+        // an `All` pass. A non-sibling skip touches nothing.
+        let complete = crate::index::WorktreeOverlayReport {
+            worktree_id: "/wt/a".to_string(),
+            status_complete: true,
+            ..Default::default()
+        };
+        assert_eq!(overlay_basis_action(&complete), OverlayBasisAction::Record);
+        let partial = crate::index::WorktreeOverlayReport {
+            worktree_id: "/wt/a".to_string(),
+            status_complete: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            overlay_basis_action(&partial),
+            OverlayBasisAction::Clear,
+            "a partial status scan drops the stale skip proof"
+        );
+        let not_a_sibling = crate::index::WorktreeOverlayReport::default();
+        assert_eq!(overlay_basis_action(&not_a_sibling), OverlayBasisAction::Keep);
+    }
+
+    #[test]
+    fn overlay_scope_merge_unions_roots_and_all_absorbs() {
+        // #577: hints accumulated while the debounce is armed must union attributable roots, and
+        // an unattributable hint (rescan, registry change) must widen the whole pass to All.
+        let a = OverlayScope::Linked(BTreeSet::from([PathBuf::from("/wt/a")]));
+        let b = OverlayScope::Linked(BTreeSet::from([PathBuf::from("/wt/b")]));
+        assert_eq!(
+            a.clone().merge(b.clone()),
+            OverlayScope::Linked(BTreeSet::from([PathBuf::from("/wt/a"), PathBuf::from("/wt/b")])),
+            "linked roots union"
+        );
+        assert_eq!(a.clone().merge(OverlayScope::All), OverlayScope::All, "All absorbs");
+        assert_eq!(OverlayScope::All.merge(b), OverlayScope::All, "All absorbs from either side");
+        assert_eq!(
+            a.clone().merge(OverlayScope::Linked(BTreeSet::new())),
+            a,
+            "a base-only contribution adds no roots"
+        );
+    }
+
+    #[test]
+    fn scheduler_dispatch_carries_scope_and_a_gc_pass_forces_all() {
+        // #577: the event-accumulated scope rides the PassRequest; the 1-in-GC_EVERY_PASSES gc
+        // pass forces All (gc's worktree-liveness sweep wants the full picture anyway).
+        let mut scheduler = PassScheduler::new();
+        let scoped = OverlayScope::Linked(BTreeSet::from([PathBuf::from("/wt/a")]));
+        for pass in 1..GC_EVERY_PASSES {
+            let request = scheduler.dispatch(scoped.clone()).expect("no pass in flight");
+            assert_eq!(
+                request,
+                PassRequest::Maintenance { run_gc: false, overlay_scope: scoped.clone() },
+                "pass {pass} carries the event scope"
+            );
+            scheduler.on_done();
+        }
+        assert_eq!(
+            scheduler.dispatch(scoped).expect("no pass in flight"),
+            PassRequest::Maintenance { run_gc: true, overlay_scope: OverlayScope::All },
+            "the gc-cadence pass widens to All"
+        );
+    }
+
+    #[test]
     fn changed_overlay_skips_backlog_probe() {
         let budget = ReconcileBudget::new(
             ReconcileOptions::default(),
             Instant::now() - Duration::from_secs(1),
         );
-        let needs_embed = overlay_needs_embed(true, Some(&budget), |_| false);
+        let needs_embed = overlay_needs_embed(true, false, Some(&budget), |_| false);
 
         assert!(needs_embed, "a changed overlay still embeds inline");
+    }
+
+    #[test]
+    fn unchanged_overlay_on_a_scoped_pass_never_probes_the_backlog() {
+        // #577: the per-worktree backlog probe (an O(scope) candidate scan) belongs to the `All`
+        // sweep only. On an event-scoped pass an unchanged worktree must pay NOTHING.
+        let budget = ReconcileBudget::new(
+            ReconcileOptions::default(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        let needs_embed = overlay_needs_embed(false, false, Some(&budget), |_| {
+            panic!("the backlog probe must not run on an event-scoped pass")
+        });
+
+        assert!(!needs_embed, "unchanged + scoped pass: no embed work");
+    }
+
+    #[test]
+    fn unchanged_overlay_on_a_sweep_probes_and_retries_a_backlog() {
+        let budget = ReconcileBudget::new(
+            ReconcileOptions::default(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        assert!(
+            overlay_needs_embed(false, true, Some(&budget), |_| true),
+            "a sweep retries a pending overlay backlog (a Partial drain heals within one sweep)"
+        );
+        assert!(
+            !overlay_needs_embed(false, true, Some(&budget), |_| false),
+            "a sweep with no backlog does no embed work"
+        );
     }
 
     #[test]
@@ -2108,7 +2490,7 @@ mod tests {
         let create =
             Event::new(EventKind::Create(CreateKind::Folder)).add_path(root.join("src/fresh"));
 
-        assert!(
+        assert_eq!(
             event_requests_maintenance(
                 &mut watcher,
                 &create,
@@ -2118,7 +2500,8 @@ mod tests {
                 &mut linked_worktrees,
                 None,
             ),
-            "placing a newly-created target dir must request a maintenance pass",
+            Some(OverlayScope::Linked(BTreeSet::new())),
+            "placing a newly-created BASE target dir must request a base-only maintenance pass",
         );
         assert!(
             watcher.watched.iter().any(|(path, mode)| path == &root.join("src/fresh")
@@ -2164,27 +2547,35 @@ mod tests {
         let mut watcher = RecordingWatcher::default();
         let relevant_file = mutation_event(root.join("src/lib.rs"));
 
-        assert!(event_requests_maintenance(
-            &mut watcher,
-            &relevant_file,
-            &config,
-            &target_dirs,
-            &mut ignore,
-            &mut linked_worktrees,
-            None,
-        ));
+        assert_eq!(
+            event_requests_maintenance(
+                &mut watcher,
+                &relevant_file,
+                &config,
+                &target_dirs,
+                &mut ignore,
+                &mut linked_worktrees,
+                None,
+            ),
+            Some(OverlayScope::Linked(BTreeSet::new())),
+            "a base target edit fires a base-only pass",
+        );
 
         let registry = root.join(".git/worktrees");
         let registry_event = mutation_event(registry.join("feature/HEAD"));
-        assert!(event_requests_maintenance(
-            &mut watcher,
-            &registry_event,
-            &config,
-            &target_dirs,
-            &mut ignore,
-            &mut linked_worktrees,
-            Some(&registry),
-        ));
+        assert_eq!(
+            event_requests_maintenance(
+                &mut watcher,
+                &registry_event,
+                &config,
+                &target_dirs,
+                &mut ignore,
+                &mut linked_worktrees,
+                Some(&registry),
+            ),
+            Some(OverlayScope::All),
+            "a worktree-registry change is unattributable, so the pass sweeps every overlay",
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2390,55 +2781,133 @@ mod tests {
         let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
 
         // A target file in a linked worktree fires (its overlay needs refreshing).
-        assert!(event_touches_worktree(
-            &mutation_event(worktree.join("src/a.rs")),
-            &worktrees,
-            Some(&registry),
-        ));
+        assert!(
+            event_touches_worktree(
+                &mutation_event(worktree.join("src/a.rs")),
+                &worktrees,
+                Some(&registry),
+            )
+            .fires()
+        );
         // A non-target file in the worktree does not.
-        assert!(!event_touches_worktree(
-            &mutation_event(worktree.join("README.md")),
-            &worktrees,
-            Some(&registry),
-        ));
+        assert!(
+            !event_touches_worktree(
+                &mutation_event(worktree.join("README.md")),
+                &worktrees,
+                Some(&registry),
+            )
+            .fires()
+        );
         // A change in the worktree registry (a `git worktree add`/`remove`) fires.
-        assert!(event_touches_worktree(
-            &mutation_event(registry.join("feat/HEAD")),
-            &worktrees,
-            Some(&registry),
-        ));
+        assert!(
+            event_touches_worktree(
+                &mutation_event(registry.join("feat/HEAD")),
+                &worktrees,
+                Some(&registry),
+            )
+            .fires()
+        );
         // A `.gitignore` edit in the linked checkout fires (it changes the overlay's ignored set),
         // mirroring the base classifier (#219 review).
-        assert!(event_touches_worktree(
-            &mutation_event(worktree.join(".gitignore")),
-            &worktrees,
-            Some(&registry),
-        ));
+        assert!(
+            event_touches_worktree(
+                &mutation_event(worktree.join(".gitignore")),
+                &worktrees,
+                Some(&registry),
+            )
+            .fires()
+        );
         // A `.gitignore` OUTSIDE any watched checkout does not.
-        assert!(!event_touches_worktree(
-            &mutation_event(PathBuf::from("/elsewhere/.gitignore")),
-            &worktrees,
-            Some(&registry),
-        ));
+        assert!(
+            !event_touches_worktree(
+                &mutation_event(PathBuf::from("/elsewhere/.gitignore")),
+                &worktrees,
+                Some(&registry),
+            )
+            .fires()
+        );
         // A read event never fires (anti-feedback, same as the base watcher).
         let read = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
             .add_path(worktree.join("src/a.rs"));
-        assert!(!event_touches_worktree(&read, &worktrees, Some(&registry)));
+        assert!(!event_touches_worktree(&read, &worktrees, Some(&registry)).fires());
         // A backend rescan fires when there is linked-worktree or registry state to refresh.
         let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
-        assert!(event_touches_worktree(&rescan, &worktrees, None));
-        assert!(event_touches_worktree(
-            &rescan,
-            &LinkedWorktreeWatches::default(),
-            Some(&registry),
-        ));
-        assert!(!event_touches_worktree(&rescan, &LinkedWorktreeWatches::default(), None,));
+        assert!(event_touches_worktree(&rescan, &worktrees, None).fires());
+        assert!(
+            event_touches_worktree(&rescan, &LinkedWorktreeWatches::default(), Some(&registry),)
+                .fires()
+        );
+        assert!(!event_touches_worktree(&rescan, &LinkedWorktreeWatches::default(), None).fires());
         // No worktrees and no registry → nothing fires.
-        assert!(!event_touches_worktree(
-            &mutation_event(worktree.join("src/a.rs")),
-            &LinkedWorktreeWatches::default(),
-            None,
-        ));
+        assert!(
+            !event_touches_worktree(
+                &mutation_event(worktree.join("src/a.rs")),
+                &LinkedWorktreeWatches::default(),
+                None,
+            )
+            .fires()
+        );
+    }
+
+    #[test]
+    fn event_touches_worktree_attributes_the_touched_checkout_roots() {
+        // #577: the hint names WHICH linked checkouts an event implicates, so the dispatched pass
+        // refreshes those overlays instead of sweeping the fleet; registry changes and rescans are
+        // unattributable and widen to AllWorktrees.
+        let config = whole_root_config(&PathBuf::from("/main"), &[PathBuf::from("src")]);
+        let wt_a = PathBuf::from("/wt/a");
+        let wt_b = PathBuf::from("/wt/b");
+        let registry = PathBuf::from("/main/.git/worktrees");
+        let mut watcher = RecordingWatcher::default();
+        let worktrees =
+            watch_linked_worktrees(&mut watcher, &config, vec![wt_a.clone(), wt_b.clone()]);
+
+        assert_eq!(
+            event_touches_worktree(&mutation_event(wt_a.join("src/a.rs")), &worktrees, None),
+            WorktreeEventHint::Roots(BTreeSet::from([wt_a.clone()])),
+            "a target edit is attributed to its own checkout only"
+        );
+        assert_eq!(
+            event_touches_worktree(&mutation_event(wt_b.join("src/b.rs")), &worktrees, None),
+            WorktreeEventHint::Roots(BTreeSet::from([wt_b.clone()])),
+        );
+        assert_eq!(
+            event_touches_worktree(&mutation_event(wt_a.join("README.md")), &worktrees, None),
+            WorktreeEventHint::None,
+            "a non-target path implicates nothing"
+        );
+        assert_eq!(
+            event_touches_worktree(
+                &mutation_event(registry.join("feat/HEAD")),
+                &worktrees,
+                Some(&registry),
+            ),
+            WorktreeEventHint::AllWorktrees,
+            "a registry change (worktree add/remove) is unattributable"
+        );
+        let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        assert_eq!(
+            event_touches_worktree(&rescan, &worktrees, None),
+            WorktreeEventHint::AllWorktrees,
+            "a rescan means events were dropped — refresh everything"
+        );
+        // A branch-local `rag-rat.toml` edit changes the checkout's TARGET SET without moving
+        // either HEAD (#577 review): like a `.gitignore` edit, it must fire and be attributed to
+        // its checkout so the overlay is refreshed with the new branch config.
+        assert_eq!(
+            event_touches_worktree(&mutation_event(wt_b.join("rag-rat.toml")), &worktrees, None),
+            WorktreeEventHint::Roots(BTreeSet::from([wt_b.clone()])),
+            "a linked checkout's config edit fires for that checkout"
+        );
+        assert_eq!(
+            event_touches_worktree(
+                &mutation_event(PathBuf::from("/elsewhere/rag-rat.toml")),
+                &worktrees,
+                None
+            ),
+            WorktreeEventHint::None,
+            "a config file outside any watched checkout does not fire"
+        );
     }
 
     #[test]
@@ -2463,7 +2932,8 @@ mod tests {
         let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
 
         assert!(
-            event_touches_worktree(&mutation_event(worktree.join("src/lib.rs")), &worktrees, None),
+            event_touches_worktree(&mutation_event(worktree.join("src/lib.rs")), &worktrees, None)
+                .fires(),
             "an unignored linked target file still fires",
         );
         assert!(
@@ -2471,7 +2941,8 @@ mod tests {
                 &mutation_event(worktree.join("ignored_dir/out.rs")),
                 &worktrees,
                 None
-            ),
+            )
+            .fires(),
             "a linked worktree gitignored source-looking path must not fire",
         );
         assert!(
@@ -2479,11 +2950,13 @@ mod tests {
                 &mutation_event(worktree.join("target/debug/build.rs")),
                 &worktrees,
                 None
-            ),
+            )
+            .fires(),
             "a linked worktree floor/gitignored build path must not fire",
         );
         assert!(
-            event_touches_worktree(&mutation_event(worktree.join(".gitignore")), &worktrees, None),
+            event_touches_worktree(&mutation_event(worktree.join(".gitignore")), &worktrees, None)
+                .fires(),
             "a linked worktree .gitignore edit still fires so rules can be recompiled",
         );
 
@@ -2591,9 +3064,10 @@ mod tests {
         let fresh = worktree.join("src/fresh");
         std::fs::create_dir_all(&fresh).unwrap();
         let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(fresh.clone());
-        assert!(
+        assert_eq!(
             worktrees.watch_created_dirs(&mut watcher, &create),
-            "created target dirs should request a maintenance pass",
+            BTreeSet::from([worktree.clone()]),
+            "created target dirs should request a maintenance pass scoped to their checkout",
         );
         assert!(
             watcher.watched.iter().any(|(path, _)| path == &fresh),
@@ -2630,8 +3104,9 @@ mod tests {
         let ancestor = worktree.join("src");
         std::fs::create_dir_all(&ancestor).unwrap();
         let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(ancestor.clone());
-        assert!(
+        assert_eq!(
             worktrees.watch_created_dirs(&mut watcher, &create),
+            BTreeSet::from([worktree.clone()]),
             "created target ancestors should request a maintenance pass after placing watches",
         );
 
@@ -2869,11 +3344,12 @@ mod tests {
         let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(pkg.clone());
 
         assert!(
-            !event_touches_worktree(&create, &worktrees, None),
+            !event_touches_worktree(&create, &worktrees, None).fires(),
             "extensionless directory events are not target-file events",
         );
-        assert!(
+        assert_eq!(
             worktrees.watch_created_dirs(&mut watcher, &create),
+            BTreeSet::from([worktree.clone()]),
             "placing a linked target-dir watch must request a maintenance pass",
         );
         assert!(
@@ -2915,9 +3391,10 @@ mod tests {
             .add_path(first_pkg.clone())
             .add_path(second_pkg.clone());
 
-        assert!(
+        assert_eq!(
             worktrees.watch_created_dirs(&mut watcher, &create),
-            "at least one linked target dir was watched",
+            BTreeSet::from([first.clone(), second.clone()]),
+            "BOTH linked states place their watch and are reported (no short-circuit)",
         );
         assert!(
             watcher.watched.iter().any(|(path, _)| path == &first_pkg),
@@ -3031,7 +3508,8 @@ mod tests {
                 &mutation_event(checkout.join("crate/src/a.rs")),
                 &worktrees,
                 None,
-            ),
+            )
+            .fires(),
             "a subdir-rooted config must fire on a linked edit under <checkout>/<subdir>/<target>"
         );
 
@@ -3291,15 +3769,67 @@ mod tests {
     }
 
     #[test]
+    fn scoped_passes_do_not_postpone_the_periodic_all_sweep() {
+        // #577 review (PR): the periodic backstop measures time since the last ALL-scoped pass
+        // COMPLETED — event-scoped passes don't perform sweep duties (unlisted-worktree refresh,
+        // overlay embed-backlog retries), so a steady drip of scoped passes must escalate the
+        // next pass to `All` once the interval elapses, not keep postponing it.
+        let start = Instant::now();
+        let interval = Duration::from_secs(300);
+        let mut clock = SweepClock::new(Some(interval), start);
+
+        // The startup catch-up (an All pass) is in flight at construction; its completion resets.
+        clock.on_pass_done(start + Duration::from_secs(5));
+        assert!(!clock.due(start + Duration::from_secs(300)), "counts from startup COMPLETION");
+
+        // Scoped passes churn away past the interval — none of them reset the sweep clock.
+        for i in 0..10 {
+            clock.on_dispatch(false);
+            clock.on_pass_done(start + Duration::from_secs(6 + i * 60));
+        }
+        assert!(
+            clock.due(start + Duration::from_secs(5) + interval),
+            "scoped passes do not postpone the sweep"
+        );
+        assert_eq!(
+            clock.due_in(start + Duration::from_secs(6)),
+            Some(Duration::from_secs(299)),
+            "the wait deadline also measures from the last ALL completion"
+        );
+
+        // An ALL pass (periodic or gc-widened) resets the clock at its COMPLETION.
+        clock.on_dispatch(true);
+        let sweep_done = start + Duration::from_secs(700);
+        clock.on_pass_done(sweep_done);
+        assert!(!clock.due(sweep_done + interval - Duration::from_secs(1)));
+        assert!(clock.due(sweep_done + interval));
+    }
+
+    #[test]
+    fn a_disabled_periodic_sweep_is_never_due() {
+        let start = Instant::now();
+        let mut clock = SweepClock::new(None, start);
+        clock.on_pass_done(start + Duration::from_secs(1));
+        clock.on_dispatch(false);
+        clock.on_pass_done(start + Duration::from_secs(2));
+        assert!(!clock.due(start + Duration::from_secs(1_000_000)));
+        assert_eq!(clock.due_in(start), None);
+    }
+
+    #[test]
     fn scheduler_coalesces_fire_requests_while_a_pass_is_in_flight() {
+        let base_only = || OverlayScope::Linked(BTreeSet::new());
         let mut scheduler = PassScheduler::new();
-        assert_eq!(scheduler.dispatch(), Some(PassRequest::Maintenance { run_gc: false }));
+        assert_eq!(
+            scheduler.dispatch(base_only()),
+            Some(PassRequest::Maintenance { run_gc: false, overlay_scope: base_only() })
+        );
         assert!(scheduler.in_flight());
-        assert_eq!(scheduler.dispatch(), None, "a fire while a pass runs must coalesce");
+        assert_eq!(scheduler.dispatch(base_only()), None, "a fire while a pass runs must coalesce");
         scheduler.on_done();
         assert_eq!(
-            scheduler.dispatch(),
-            Some(PassRequest::Maintenance { run_gc: false }),
+            scheduler.dispatch(base_only()),
+            Some(PassRequest::Maintenance { run_gc: false, overlay_scope: base_only() }),
             "the coalesced fire dispatches once the pass completes",
         );
     }
@@ -3311,10 +3841,13 @@ mod tests {
         assert!(scheduler.in_flight(), "the startup catch-up occupies the in-flight slot");
         scheduler.on_done();
         for pass in 1..=GC_EVERY_PASSES {
-            let request = scheduler.dispatch().expect("no pass is in flight");
+            let request = scheduler.dispatch(OverlayScope::All).expect("no pass is in flight");
             assert_eq!(
                 request,
-                PassRequest::Maintenance { run_gc: pass == GC_EVERY_PASSES },
+                PassRequest::Maintenance {
+                    run_gc: pass == GC_EVERY_PASSES,
+                    overlay_scope: OverlayScope::All
+                },
                 "gc runs on pass {GC_EVERY_PASSES}, not on pass {pass}",
             );
             scheduler.on_done();
@@ -3334,7 +3867,9 @@ mod tests {
         })
         .expect("worker thread spawns");
         pass_tx.send(PassRequest::StartupCatchup).unwrap();
-        pass_tx.send(PassRequest::Maintenance { run_gc: true }).unwrap();
+        pass_tx
+            .send(PassRequest::Maintenance { run_gc: true, overlay_scope: OverlayScope::All })
+            .unwrap();
         for _ in 0..2 {
             match done_rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(LoopMsg::PassDone) => {},
@@ -3345,7 +3880,7 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(*ran.lock().unwrap(), vec![
             PassRequest::StartupCatchup,
-            PassRequest::Maintenance { run_gc: true },
+            PassRequest::Maintenance { run_gc: true, overlay_scope: OverlayScope::All },
         ]);
     }
 
@@ -3397,11 +3932,15 @@ mod tests {
         std::thread::scope(|scope| {
             let loop_thread = scope.spawn(move || event_loop.run());
 
-            // A relevant edit dispatches a pass to the worker (played by this test).
+            // A relevant BASE edit dispatches a base-only pass to the worker (played by this
+            // test) — no linked checkout is implicated, so no overlay is swept (#577).
             tx.send(LoopMsg::Fs(Ok(mutation_event(root.join("src/lib.rs"))))).unwrap();
             assert_eq!(
                 pass_rx.recv_timeout(Duration::from_secs(5)),
-                Ok(PassRequest::Maintenance { run_gc: false }),
+                Ok(PassRequest::Maintenance {
+                    run_gc: false,
+                    overlay_scope: OverlayScope::Linked(BTreeSet::new())
+                }),
             );
 
             // While that pass is in flight (no PassDone), a new binary landing must still fire
@@ -3425,7 +3964,10 @@ mod tests {
             tx.send(LoopMsg::PassDone).unwrap();
             assert_eq!(
                 pass_rx.recv_timeout(Duration::from_secs(5)),
-                Ok(PassRequest::Maintenance { run_gc: false }),
+                Ok(PassRequest::Maintenance {
+                    run_gc: false,
+                    overlay_scope: OverlayScope::Linked(BTreeSet::new())
+                }),
             );
 
             stop.store(true, Ordering::Relaxed);

@@ -38,8 +38,11 @@ libc.workspace = true
 # Idle-RSS fix: glibc malloc never returns freed pages to the OS, so a long-lived `rag-rat mcp`
 # server retains its peak RSS (~625 MB observed) after the watcher's heavy index/graph passes.
 # jemalloc + a background purge thread gives dirty/muzzy pages back shortly after they go idle.
-# Gated off msvc (jemalloc has no msvc support); the `#[global_allocator]` cfg matches.
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+# Gated off msvc (jemalloc has no msvc support) and android (the NDK dropped libgcc in r23+, but
+# tikv-jemalloc-sys's link line still references `-lgcc` → an `unable to find -lgcc` link failure;
+# Android isn't the long-lived-server idle-RSS case, so the system allocator is the right fallback).
+# The `#[global_allocator]` cfg in main.rs matches this exactly.
+[target.'cfg(all(not(target_env = "msvc"), not(target_os = "android")))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 tikv-jemalloc-ctl = "0.6"
 

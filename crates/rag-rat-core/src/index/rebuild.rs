@@ -279,6 +279,19 @@ impl IndexDatabase {
             // Full rebuild writes correct `files.generated`, so stamp the flags version current and
             // skip a redundant re-derive on next open (#202).
             db.mark_generated_flags_current()?;
+            // A full rebuild (re)derived every chunk's `embedding_policy` with the current
+            // classifier, so certify the column current for this repo — the reconcile skip-summary
+            // then reads it via GROUP BY instead of re-parsing every file (#530). Gate on
+            // `carried_rows == 0` for the SAME reason as the logical-key version stamp above: a
+            // carried overlay / other-commit leftover rode along WITHOUT a reparse, so its column
+            // still holds the OLD-classifier policy — a repo-wide stamp would wrongly certify it. A
+            // repo with live overlays keeps recomputing (correct) until a carry-free rebuild; the
+            // reconcile self-heal is likewise gated on the active scope covering the whole live
+            // set. NOT stamped on the incremental path, which restamps only changed
+            // files.
+            if carried_rows == 0 {
+                db.mark_embedding_policy_current()?;
+            }
             // The git AUTHORITY writes ride the flip (batch-4 P2): `git_commit`/`git_dirty` meta
             // and the history reload-gate cursors say "this index reflects commit H" — true only
             // once the generation built at H is published. Deferring them here means a tail

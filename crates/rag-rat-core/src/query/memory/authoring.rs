@@ -1,5 +1,5 @@
-//! Translating persisted memories into signed op-log entries, and the one-time full backfill of a
-//! store's pre-existing memories into the log (#524).
+//! Translating persisted memories into signed op-log entries, and the per-node/edge reconcile that
+//! keeps the log a COMPLETE signed mirror of `repo_memories` / `repo_node_edges` (#524, #541).
 //!
 //! This bridges `repo_memories` / `repo_node_edges` (owned by this module) and the op-log MINTING
 //! primitives ([`crate::oplog`]) — a ONE-WAY dependency, so `oplog` never depends back on the
@@ -9,13 +9,54 @@
 //! (before the first live entry) and the `author_*` seams below INSIDE their own transaction, so
 //! the op-append and the table write commit — or roll back — together (strict-atomic). Authoring is
 //! a NO-OP under an unstable scope ([`stable_owner_stream`]), leaving scope-less callers untouched.
+//!
+//! [`backfill_memory_oplog`] is a per-node/edge RECONCILE (#541), not a per-chain gate: it authors
+//! every table row MISSING from the materialized shadow projection, so a row that entered the
+//! tables outside the wired path (a pre-#532 binary, a raw writer, a consolidation import) is
+//! signed on the next mutation and no later lifecycle op on it is ever inert. Genesis is just the
+//! empty-chain case where every row is missing.
 
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 use super::hydrate::tags_for_memory;
-use super::{EdgeRelation, NodeEdge, RepoMemory, all_edges_from, memory_repo_scope};
+
+/// Scoped durability bump for an AUTHORED write (#560). The index connection runs
+/// `synchronous = NORMAL` — the right policy for the high-frequency, fully reconstructable
+/// derived-index writes, where skipping the per-commit WAL fsync is a throughput win and the only
+/// cost is that the last committed transaction can roll back on power loss (a re-index recovers
+/// it).
+///
+/// Authored memory / op-log mutations are the OPPOSITE class: irreplaceable, low-frequency, and
+/// they return success to the caller. They must not acknowledge under a mode that can silently lose
+/// the last commit, so they raise `synchronous = FULL` (fsync the WAL on commit) for the duration
+/// of their transaction and restore `NORMAL` on drop. The guard is held ACROSS the authored
+/// `BEGIN .. COMMIT` and dropped after, so the commit fsyncs; restore runs on every path (including
+/// error/panic), so a shared connection is never stranded at FULL — and a stray failure could only
+/// leave it on the *safer*, slower setting, never a less durable one.
+pub(super) struct AuthoredDurability<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> AuthoredDurability<'a> {
+    /// Raise `synchronous = FULL`. MUST be called OUTSIDE a transaction (SQLite only applies a
+    /// `synchronous` change to subsequent transactions), i.e. immediately before the authored
+    /// `BEGIN`/`unchecked_transaction`.
+    pub(super) fn begin(conn: &'a Connection) -> anyhow::Result<Self> {
+        conn.execute_batch("PRAGMA synchronous = FULL;")?;
+        Ok(Self { conn })
+    }
+}
+
+impl Drop for AuthoredDurability<'_> {
+    fn drop(&mut self) {
+        // Best-effort restore of the connection default (see the struct doc for why swallowing is
+        // safe). Runs after the authored txn has committed/rolled back, so no transaction is open.
+        let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL;");
+    }
+}
+use super::{EdgeRelation, NodeEdge, RepoMemory, memory_repo_scope};
 use crate::oplog::{
-    EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, StreamId, author_genesis_in_tx,
+    EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, StreamId, author_batch_in_tx,
     author_in_tx, chain_tail, local_device, owner_stream,
 };
 
@@ -34,8 +75,7 @@ struct MemoryRow {
 }
 
 /// Build the op model's content register from a memory's projectable columns — shared by the
-/// backfill ([`memory_to_ops`]) and the live create/update authors, so all three agree
-/// byte-for-byte.
+/// reconcile ([`node_ops`]) and the live create/update authors, so all three agree byte-for-byte.
 fn node_content(
     kind: &str,
     title: &str,
@@ -56,16 +96,20 @@ fn node_content(
     }
 }
 
-/// Translate one memory into its BACKFILL op sequence: a `NodeCreate` for content, a `NodeStatus`
-/// ONLY when the status is not the fold's `active` create-time default, and an `EdgeAdd` per
-/// outgoing typed node-edge (in `edge_key` order, so the authored chain is reproducible).
-/// Code-anchor BINDINGS are excluded — per-device derived resolution state, never part of the
-/// shared node graph.
-fn memory_to_ops(
-    row: &MemoryRow,
-    owner_repo_id: &str,
-    edges: &[NodeEdge],
-) -> anyhow::Result<Vec<MemoryOp>> {
+/// A memory's NODE ops: a `NodeCreate` for content, then a `NodeStatus`.
+///
+/// `elide_active_status = true` (GENESIS on an empty chain, no stale registers) emits the status op
+/// ONLY when non-active — the fold's create-time default handles `active`, so genesis stays
+/// byte-identical to the pre-#541 backfill. `false` (INCREMENTAL heal on a non-empty chain) ALWAYS
+/// emits `NodeStatus`, so a healed node's status wins its register at the new, higher Lamport even
+/// if an inert `NodeStatus` from an old binary left a stale value in it (the fold's status register
+/// is independent of existence — a `NodeCreate` never touches it — so authoring only the create
+/// would let that stale register surface; see decision 6 of #541).
+///
+/// An unrecognized status token FAILS — a signed op cannot be corrected, and coercing to `active`
+/// would permanently mint the wrong status into the immutable history. Code-anchor BINDINGS are
+/// excluded — per-device derived resolution state, never part of the shared node graph.
+fn node_ops(row: &MemoryRow, elide_active_status: bool) -> anyhow::Result<Vec<MemoryOp>> {
     let node_id = NodeId::from(row.memory_id.as_str());
     let mut ops = vec![MemoryOp::NodeCreate {
         node_id: node_id.clone(),
@@ -79,96 +123,144 @@ fn memory_to_ops(
             row.payload_json.as_deref(),
         ),
     }];
-    // `active` is the fold's create-time default, so it needs no op. A status token this binary
-    // does NOT recognize (a newer binary's future status) must NOT be silently dropped — that would
-    // permanently mint this row as `active` in the SIGNED history, and a signed op cannot be
-    // corrected later. FAIL the backfill instead, so a binary that understands the token authors
-    // it.
-    if row.status != NodeStatus::default().as_db_str() {
+    let is_active = row.status == NodeStatus::default().as_db_str();
+    if !(elide_active_status && is_active) {
         let status = NodeStatus::from_db_str(&row.status).ok_or_else(|| {
             anyhow::anyhow!(
-                "cannot backfill memory `{}`: unknown status token `{}` (a newer binary must \
-                 author this history)",
+                "cannot author memory `{}`: unknown status token `{}` (a newer binary must author \
+                 this history)",
                 row.memory_id,
                 row.status
             )
         })?;
-        ops.push(MemoryOp::NodeStatus { node_id: node_id.clone(), status });
-    }
-    // An `EdgeAdd` ONLY — deliberately NO `Rebind`. `EdgeAdd` carries the edge's presence and the
-    // DURABLE spec (incl. the `target_repo_id` `all_edges_from` re-resolved to current). The
-    // `Rebind` op's resolved dimension (`target_node_id`, `anchor_status`) is PER-DEVICE
-    // derived state: `anchor_status` (current/gone/unresolved — is the target present in THIS
-    // db) differs by device and is recomputed on every read by `reresolve_on_read`. Signing it
-    // into the immutable shared history would bake one device's view into the log — excluded
-    // for the same reason code-anchor BINDINGS are. The projection's `resolved` column stays
-    // NULL for a backfilled edge; the reader recomputes it locally, exactly as the live edge
-    // table does.
-    let mut edges = edges.to_vec();
-    edges.sort_by(|a, b| a.edge_key.cmp(&b.edge_key));
-    for edge in &edges {
-        ops.push(MemoryOp::EdgeAdd {
-            edge: EdgeSpec {
-                source_node_id: NodeId::from(edge.source_node_id.as_str()),
-                relation: EdgeRelation::from_db_str(&edge.relation)?,
-                target_repo_id: edge.target_repo_id.clone(),
-                target_kind: edge.target_kind.clone(),
-                target_anchor: edge.target_anchor.clone(),
-                owner_repo_id: owner_repo_id.to_string(),
-            },
-        });
+        ops.push(MemoryOp::NodeStatus { node_id, status });
     }
     Ok(ops)
 }
 
-/// Author every one of the active repo's pre-existing memories into its owner stream — the one-time
-/// full backfill that makes the op-log the complete signed history from genesis. Idempotent and
-/// scope-gated:
-/// - a NO-OP on an unscoped database (no active repo → no owner stream to root the log on);
-/// - a NO-OP once the owner chain is non-empty: because [`crate::oplog::author_batch`] is atomic, a
-///   non-empty chain is a COMPLETED backfill (no partial state to resume). The next increment's
-///   "backfill before the first live author" ordering keeps this gate correct once live ops share
-///   the chain.
-///
-/// Memories are ordered deterministically `(created_at_ms, memory_id)` — a reproducible Lamport
-/// assignment. Each contributes NodeCreate, then a NodeStatus when non-active, then its EdgeAdds.
-/// ALL statuses are backfilled (obsolete/rejected included): the log is the whole history.
-pub(crate) fn backfill_memory_oplog(conn: &Connection, now_ms: i64) -> anyhow::Result<()> {
-    let Some(repo_id) = memory_repo_scope(conn)? else {
-        return Ok(());
-    };
-    // Only a STABLE repo id may root an IMMUTABLE owner stream. Two ids get re-pointed later, which
-    // would strand a stream signed under the old id: the legacy `__unassigned__` placeholder (an
-    // unadopted DB, re-pointed on adoption) and a machine-local `local:` shallow-clone id (upgraded
-    // to a portable id when the clone is deepened). No-op until a stable id is active — as if
-    // unscoped.
+/// One `EdgeAdd` — presence + the durable, RE-RESOLVED spec only. `edge.target_repo_id` is already
+/// current: `unauthored_edges`'s `reresolve_on_read` repaired the add-time snapshot before the
+/// reconcile signs it (a signed op cannot be corrected later). Deliberately NO `Rebind`: the
+/// `Rebind` op's resolved dimension (`target_node_id`, `anchor_status`) is PER-DEVICE derived state
+/// recomputed on every read by `reresolve_on_read`, so signing it would bake one device's view into
+/// the immutable shared history — excluded for the same reason code-anchor BINDINGS are.
+fn edge_add_op(edge: &NodeEdge, owner_repo_id: &str) -> anyhow::Result<MemoryOp> {
+    Ok(MemoryOp::EdgeAdd {
+        edge: EdgeSpec {
+            source_node_id: NodeId::from(edge.source_node_id.as_str()),
+            relation: EdgeRelation::from_db_str(&edge.relation)?,
+            target_repo_id: edge.target_repo_id.clone(),
+            target_kind: edge.target_kind.clone(),
+            target_anchor: edge.target_anchor.clone(),
+            owner_repo_id: owner_repo_id.to_string(),
+        },
+    })
+}
+
+/// The ordered reconcile batch. Missing edges are grouped by `source_node_id`; for each missing
+/// memory in `(created_at_ms, id)` order it emits [`node_ops`] then that memory's missing edges (in
+/// the `edge_key` order [`unauthored_edges`] returned), then a final pass for edges whose source is
+/// an already-authored node. On an EMPTY projection with `elide_active_status = true` this is
+/// byte-identical to today's genesis sequence: every source memory is missing (`FK ON DELETE
+/// CASCADE` on `source_node_id` rules out an orphan edge), so the final pass is empty and each
+/// memory's edges follow its `NodeCreate`/`NodeStatus` in `edge_key` order.
+fn build_reconcile_ops(
+    missing_nodes: &[MemoryRow],
+    missing_edges: &[NodeEdge],
+    owner_repo_id: &str,
+    elide_active_status: bool,
+) -> anyhow::Result<Vec<MemoryOp>> {
+    use std::collections::BTreeMap;
+    let mut by_source: BTreeMap<&str, Vec<&NodeEdge>> = BTreeMap::new();
+    for edge in missing_edges {
+        by_source.entry(edge.source_node_id.as_str()).or_default().push(edge);
+    }
+    let mut ops = Vec::new();
+    for row in missing_nodes {
+        ops.extend(node_ops(row, elide_active_status)?);
+        if let Some(group) = by_source.remove(row.memory_id.as_str()) {
+            for edge in group {
+                ops.push(edge_add_op(edge, owner_repo_id)?);
+            }
+        }
+    }
+    // Lone ghost edges whose source node was already authored (absent on a genesis projection).
+    for (_source, group) in by_source {
+        for edge in group {
+            ops.push(edge_add_op(edge, owner_repo_id)?);
+        }
+    }
+    Ok(ops)
+}
+
+/// Reconcile the owner stream against the repo's tables: author every `repo_memories` /
+/// `repo_node_edges` row MISSING from the shadow projection. Genesis (empty chain) authors the full
+/// history; a populated chain authors only the ghosts. Idempotent and scope-gated (LEGACY /
+/// `local:` ids never root an immutable stream). Scope-EXPLICIT — `repo_id` is passed, and the
+/// readers + re-resolution are scope-independent, so the consolidation importer's unscoped
+/// connection can call it. Concurrency: two racing callers serialize on the IMMEDIATE lock; the
+/// loser re-reads under the lock and authors only what the winner left missing.
+fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::Result<()> {
+    // Only a STABLE id may root an IMMUTABLE owner stream. Two ids get re-pointed later, which
+    // would strand a stream signed under the old id: the legacy `__unassigned__` placeholder
+    // (an unadopted DB, re-pointed on adoption) and a machine-local `local:` shallow-clone id
+    // (upgraded to a portable id when the clone is deepened). No-op until a stable id is active
+    // — as if unscoped.
     if repo_id == crate::index::schema::LEGACY_REPO_ID
         || repo_id.starts_with(crate::repo_identity::LOCAL_ONLY_ID_PREFIX)
     {
         return Ok(());
     }
-    let stream = owner_stream(&repo_id)?;
-    let device = local_device(conn, now_ms)?;
-    // Cheap fast-path: skip opening the write txn when a chain already exists. NOT the correctness
-    // gate — `author_genesis_in_tx` re-checks emptiness inside the txn below.
-    if chain_tail(conn, stream, device.fingerprint())?.is_some() {
+    let stream = owner_stream(repo_id)?;
+    // Cheap autocommit probe: return WITHOUT a write lock when nothing is missing (steady state).
+    if read_unauthored_memory_rows(conn, repo_id, stream)?.is_empty()
+        && crate::query::memory::edges::unauthored_edges(conn, repo_id, stream)?.is_empty()
+    {
         return Ok(());
     }
-    // ATOMIC snapshot: open the write txn FIRST — the `IMMEDIATE` lock blocks concurrent memory
-    // writers — THEN read the memory/edge snapshot and author it, so a memory created between the
-    // read and the batch cannot be silently omitted from the complete history (after which the
-    // idempotency gate would hide it forever). The empty-chain gate is re-checked inside this txn.
+    let device = local_device(conn, now_ms)?;
+    // Authored, irreplaceable data → durable (#560). FULL for this txn only, restored on drop; set
+    // OUTSIDE the txn (SQLite applies a `synchronous` change to SUBSEQUENT transactions only).
+    let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let mut ops = Vec::new();
-    for row in read_memory_rows(&tx, &repo_id)? {
-        // `all_edges_from`, not `edges_from`: a backfilled obsolete/rejected memory still carries
-        // its persisted edges into the complete-history log (the live reader hides them).
-        let edges = all_edges_from(&tx, &row.memory_id)?;
-        ops.extend(memory_to_ops(&row, &repo_id, &edges)?);
-    }
-    author_genesis_in_tx(&tx, stream, &device, &ops, now_ms)?;
+    // Authoritative re-read UNDER the write lock (TOCTOU): a concurrent author may have healed or
+    // added rows between the probe and the lock, so re-read the missing set and re-derive `genesis`
+    // here. `genesis` decides the status-elision: an empty LOCAL chain ⇒ no stale registers ⇒ elide
+    // `active` (byte-identical to the pre-#541 genesis). This equivalence holds ONLY under the
+    // single-local-writer owner stream (see the module header); phase D (foreign devices can
+    // populate the stream) must revisit whether local-chain-empty still implies register-clean.
+    let genesis = chain_tail(&tx, stream, device.fingerprint())?.is_none();
+    let missing_nodes = read_unauthored_memory_rows(&tx, repo_id, stream)?;
+    let missing_edges = crate::query::memory::edges::unauthored_edges(&tx, repo_id, stream)?;
+    let ops = build_reconcile_ops(&missing_nodes, &missing_edges, repo_id, genesis)?;
+    author_batch_in_tx(&tx, stream, &device, &ops, now_ms)?;
     tx.commit()?;
     Ok(())
+}
+
+/// Reconcile the ACTIVE repo's owner stream (scope read from the connection) — the idempotent call
+/// every live memory/edge mutation makes before authoring (#532), now self-healing per node/edge (a
+/// ghost row is authored on the next mutation, so no later lifecycle op on it is inert). A no-op on
+/// an unscoped DB.
+pub(crate) fn backfill_memory_oplog(conn: &Connection, now_ms: i64) -> anyhow::Result<()> {
+    let Some(repo_id) = memory_repo_scope(conn)? else {
+        return Ok(());
+    };
+    sync_owner_stream(conn, &repo_id, now_ms)
+}
+
+/// Reconcile a SPECIFIC repo's owner stream independent of connection scope — the seam
+/// consolidation uses to author freshly-imported (remapped) rows into the TARGET's owner stream
+/// under the TARGET's identity (#541). The source's pre-remap signed entries are intentionally NOT
+/// carried (they are signed under the source device over pre-remap ids). Wired into consolidation
+/// by [`crate::index::consolidate::run`] (#541 Task 5), immediately after the import commits and
+/// before the legacy file is renamed away.
+pub(crate) fn reconcile_owner_stream_for_repo(
+    conn: &Connection,
+    repo_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    sync_owner_stream(conn, repo_id, now_ms)
 }
 
 /// The active repo's owner stream, but ONLY when the scope is a STABLE identity to root an
@@ -305,14 +397,27 @@ fn content_of(memory: &RepoMemory) -> NodeContent {
     )
 }
 
-/// The active repo's memories in deterministic `(created_at_ms, memory_id)` order, tags attached.
-fn read_memory_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<MemoryRow>> {
+/// The repo's memories with NO projected node on `stream` — the rows the signed log is MISSING —
+/// in deterministic `(created_at_ms, id)` order, tags attached. On an EMPTY projection this is
+/// every memory (genesis); on a populated one, the ghosts a raw writer or an old binary left
+/// behind (#541). Reuses the memory subsystem's own tag reader (the op encoder sorts + dedupes
+/// anyway).
+fn read_unauthored_memory_rows(
+    conn: &Connection,
+    repo_id: &str,
+    stream: StreamId,
+) -> anyhow::Result<Vec<MemoryRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, kind, title, body, confidence, status, source, payload_json
-         FROM repo_memories WHERE repo_id = ?1 ORDER BY created_at_ms, id",
+        "SELECT m.id, m.kind, m.title, m.body, m.confidence, m.status, m.source, m.payload_json
+         FROM repo_memories m
+         WHERE m.repo_id = ?1
+           AND NOT EXISTS (
+                 SELECT 1 FROM oplog_projected_nodes p
+                 WHERE p.stream_id = ?2 AND p.node_id = m.id)
+         ORDER BY m.created_at_ms, m.id",
     )?;
     let mut rows = stmt
-        .query_map(params![repo_id], |row| {
+        .query_map(params![repo_id, stream.to_bytes().as_slice()], |row| {
             Ok(MemoryRow {
                 memory_id: row.get(0)?,
                 kind: row.get(1)?,
@@ -327,7 +432,6 @@ fn read_memory_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<Memo
         })?
         .collect::<Result<Vec<_>, _>>()?;
     for row in &mut rows {
-        // Reuse the memory subsystem's own tag reader (the op encoder sorts + dedupes anyway).
         row.tags = tags_for_memory(conn, &row.memory_id)?;
     }
     Ok(rows)
@@ -374,6 +478,42 @@ mod tests {
         .unwrap();
     }
 
+    /// Read the materialized shadow projection for `stream` — the completeness mirror the reconcile
+    /// heals into.
+    fn projected_state(conn: &Connection, stream: StreamId) -> crate::oplog::ProjectedState {
+        crate::oplog::load_projection(conn, stream).unwrap()
+    }
+
+    /// Insert a node-edge by RAW SQL, bypassing the wired `add_edge` author — a "ghost edge" that
+    /// exists in `repo_node_edges` but was never signed into the op-log.
+    fn insert_raw_node_edge(conn: &Connection, source: &str, relation: &str, target: &str) {
+        let key = crate::query::memory::edge_key(source, relation, "node", target);
+        conn.execute(
+            "INSERT INTO repo_node_edges(edge_key, repo_id, source_node_id, relation, \
+             target_repo_id,
+                 target_kind, target_anchor, target_node_id, anchor_status, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?2, 'node', ?5, ?5, 'current', 100)",
+            params![key, REPO, source, relation, target],
+        )
+        .unwrap();
+    }
+
+    /// Author a BARE `NodeStatus` for a node with NO `NodeCreate` — simulates the INERT op a
+    /// pre-fix (#532) binary authored when it `mark_obsolete`'d a still-ghost memory. Leaves a
+    /// stale status register with no projected node.
+    fn author_inert_status_op(conn: &Connection, node_id: &str, status: NodeStatus) {
+        let device = crate::oplog::local_device(conn, 0).unwrap();
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        crate::oplog::author_op(
+            conn,
+            stream,
+            &device,
+            &MemoryOp::NodeStatus { node_id: NodeId::from(node_id), status },
+            100,
+        )
+        .unwrap();
+    }
+
     fn entry_count(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM oplog_entries", [], |r| r.get(0)).unwrap()
     }
@@ -382,19 +522,68 @@ mod tests {
         conn.query_row("SELECT COUNT(*) FROM oplog_projected_nodes", [], |r| r.get(0)).unwrap()
     }
 
+    /// #560 durability split: an authored write commits under `synchronous = FULL`, and the guard
+    /// restores the connection's `NORMAL` default on drop so derived-index writes are unaffected.
+    /// Uses a file-backed index connection (WAL + NORMAL, like every real open) because an
+    /// in-memory database ignores the `synchronous` setting and would not report the change.
     #[test]
-    fn memory_to_ops_translates_content_status_and_edges() {
-        let row = MemoryRow {
+    fn authored_durability_raises_full_then_restores_normal() {
+        let dir = std::env::temp_dir().join(format!("ragrat-authdur-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = crate::storage::IndexConnection::open(&dir.join("index.db")).unwrap();
+        let conn = storage.connection();
+        let synchronous = |c: &Connection| -> i64 {
+            c.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap()
+        };
+
+        assert_eq!(synchronous(conn), 1, "an index connection defaults to synchronous=NORMAL (=1)");
+        {
+            let _durability = AuthoredDurability::begin(conn).unwrap();
+            assert_eq!(
+                synchronous(conn),
+                2,
+                "an authored write must raise synchronous=FULL (=2) for its commit"
+            );
+        }
+        assert_eq!(
+            synchronous(conn),
+            1,
+            "the authored-durability guard must restore synchronous=NORMAL (=1) on drop"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `MemoryRow` with the given status, no payload, one tag — the fixture the ported op-split
+    /// tests translate.
+    fn op_row(status: &str) -> MemoryRow {
+        MemoryRow {
             memory_id: "mem_a".to_string(),
             kind: "Invariant".to_string(),
             title: "t".to_string(),
             body: "b".to_string(),
             confidence: "high".to_string(),
-            status: "obsolete".to_string(),
+            status: status.to_string(),
             source: "agent".to_string(),
             payload_json: None,
             tags: vec!["x".to_string()],
-        };
+        }
+    }
+
+    #[test]
+    fn node_ops_and_edge_add_op_translate_content_status_and_an_edge() {
+        // GENESIS (elide=true) on a non-active memory: NodeCreate then a NodeStatus (obsolete is
+        // not the active default). `edge_add_op` yields one EdgeAdd and DELIBERATELY no
+        // Rebind — the per-device resolved dimension (target_node_id / anchor_status) is
+        // recomputed on read, never signed into the log.
+        let ops = node_ops(&op_row("obsolete"), true).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(
+            matches!(&ops[0], MemoryOp::NodeCreate { node_id, .. } if node_id.as_str() == "mem_a")
+        );
+        assert!(
+            matches!(&ops[1], MemoryOp::NodeStatus { status, .. } if status.as_db_str() == "obsolete")
+        );
         let edge = NodeEdge {
             edge_key: "k1".to_string(),
             source_node_id: "mem_a".to_string(),
@@ -405,58 +594,142 @@ mod tests {
             target_node_id: Some("mem_b".to_string()),
             anchor_status: "current".to_string(),
         };
-        let ops = memory_to_ops(&row, REPO, std::slice::from_ref(&edge)).unwrap();
-        // NodeCreate, then a NodeStatus (obsolete is not the active default), then the EdgeAdd.
-        assert_eq!(ops.len(), 3);
+        let edge_op = edge_add_op(&edge, REPO).unwrap();
+        assert!(matches!(&edge_op, MemoryOp::EdgeAdd { .. }));
+        let all_ops: Vec<MemoryOp> = ops.into_iter().chain(std::iter::once(edge_op)).collect();
         assert!(
-            matches!(&ops[0], MemoryOp::NodeCreate { node_id, .. } if node_id.as_str() == "mem_a")
-        );
-        assert!(
-            matches!(&ops[1], MemoryOp::NodeStatus { status, .. } if status.as_db_str() == "obsolete")
-        );
-        // An EdgeAdd, and DELIBERATELY no Rebind — the per-device resolved dimension
-        // (target_node_id / anchor_status) is recomputed on read, never signed into the log.
-        assert!(matches!(&ops[2], MemoryOp::EdgeAdd { .. }));
-        assert!(
-            !ops.iter().any(|op| matches!(op, MemoryOp::Rebind { .. })),
-            "the backfill omits the per-device resolved dimension"
+            !all_ops.iter().any(|op| matches!(op, MemoryOp::Rebind { .. })),
+            "the reconcile omits the per-device resolved dimension"
         );
     }
 
     #[test]
-    fn an_active_memory_emits_no_status_op() {
-        let row = MemoryRow {
-            memory_id: "mem_a".to_string(),
-            kind: "Invariant".to_string(),
-            title: "t".to_string(),
-            body: "b".to_string(),
-            confidence: "high".to_string(),
-            status: "active".to_string(),
-            source: "agent".to_string(),
-            payload_json: None,
-            tags: Vec::new(),
-        };
-        let ops = memory_to_ops(&row, REPO, &[]).unwrap();
-        assert_eq!(ops.len(), 1, "an active, edgeless memory is just its NodeCreate");
+    fn genesis_node_ops_for_an_active_memory_emit_no_status_op() {
+        // elide=true (genesis, no stale registers): an active, edgeless memory is just its
+        // NodeCreate — the fold's create-time default handles `active`.
+        let ops = node_ops(&op_row("active"), true).unwrap();
+        assert_eq!(ops.len(), 1, "an active memory on genesis is just its NodeCreate");
+        assert!(matches!(&ops[0], MemoryOp::NodeCreate { .. }));
     }
 
     #[test]
-    fn memory_to_ops_fails_on_an_unknown_status() {
-        // A status token this binary can't map must FAIL the backfill, not silently default the
-        // signed history to `active`.
-        let row = MemoryRow {
-            memory_id: "mem_a".to_string(),
-            kind: "Invariant".to_string(),
-            title: "t".to_string(),
-            body: "b".to_string(),
-            confidence: "high".to_string(),
-            status: "future_status_from_a_newer_binary".to_string(),
-            source: "agent".to_string(),
-            payload_json: None,
-            tags: Vec::new(),
-        };
-        let err = memory_to_ops(&row, REPO, &[]).unwrap_err();
-        assert!(err.to_string().contains("unknown status"), "an unknown status fails the backfill");
+    fn incremental_node_ops_for_an_active_memory_do_emit_an_explicit_status() {
+        // elide=false (incremental heal on a non-empty chain): ALWAYS emit NodeStatus, even
+        // `active`, so a healed node's status wins its register at the new Lamport and overrides
+        // any stale register a prior inert op left behind (decision 6 of #541).
+        let ops = node_ops(&op_row("active"), false).unwrap();
+        assert_eq!(ops.len(), 2, "an active memory on a heal emits an explicit NodeStatus");
+        assert!(matches!(&ops[0], MemoryOp::NodeCreate { .. }));
+        assert!(
+            matches!(&ops[1], MemoryOp::NodeStatus { status, .. } if status.as_db_str() == "active"),
+            "the incremental branch emits NodeStatus{{active}} to win the register"
+        );
+    }
+
+    #[test]
+    fn node_ops_fails_on_an_unknown_status() {
+        // A status token this binary can't map must FAIL, not silently default the signed history
+        // to `active`. Holds in either branch — an unknown token is never the active
+        // default.
+        let err = node_ops(&op_row("future_status_from_a_newer_binary"), true).unwrap_err();
+        assert!(err.to_string().contains("unknown status"), "an unknown status fails authoring");
+    }
+
+    /// #541: the reconcile's memory reader anti-joins `repo_memories` against
+    /// `oplog_projected_nodes` — only a row with no projected node (never signed) comes back.
+    #[test]
+    fn read_unauthored_memory_rows_returns_only_rows_absent_from_the_projection() {
+        let conn = scoped_conn();
+        insert_memory(&conn, "mem_live", "active", 100);
+        insert_memory(&conn, "mem_ghost", "active", 200);
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        conn.execute(
+            "INSERT INTO oplog_projected_nodes(stream_id, node_id, content_json, status)
+             VALUES (?1, 'mem_live', '{}', 'active')",
+            params![stream.to_bytes().as_slice()],
+        )
+        .unwrap();
+        let missing = read_unauthored_memory_rows(&conn, REPO, stream).unwrap();
+        assert_eq!(missing.iter().map(|r| r.memory_id.as_str()).collect::<Vec<_>>(), ["mem_ghost"]);
+    }
+
+    // --- the per-node/edge self-healing reconcile (#541) ---
+
+    #[test]
+    fn a_ghost_memory_is_authored_on_the_next_reconcile() {
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap(); // roots the chain via genesis
+        insert_memory(&conn, "mem_ghost", "obsolete", 500); // raw, un-authored ghost
+        backfill_memory_oplog(&conn, 9_000).unwrap();
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        let g = projected_state(&conn, stream)
+            .nodes
+            .get(&NodeId::from("mem_ghost"))
+            .cloned()
+            .expect("ghost is now authored");
+        assert_eq!(g.status, NodeStatus::Obsolete, "create-time status carried");
+    }
+
+    #[test]
+    fn heal_overrides_a_stale_status_register_left_by_an_inert_op() {
+        // The decision-6 divergence: an inert NodeStatus{obsolete} exists, the row is now active,
+        // the heal must author an explicit NodeStatus{active} so the projection matches the table.
+        let conn = scoped_conn();
+        let id = create_concept(&conn, "seed").unwrap().memory.memory_id;
+        // Author an inert NodeStatus for a NOT-yet-created ghost by hand (simulate the old binary):
+        let ghost = "mem_ghost";
+        author_inert_status_op(&conn, ghost, NodeStatus::Obsolete);
+        insert_memory(&conn, ghost, "active", 500); // the table says active
+        backfill_memory_oplog(&conn, 9_000).unwrap();
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        let node = projected_state(&conn, stream)
+            .nodes
+            .get(&NodeId::from(ghost))
+            .cloned()
+            .expect("ghost healed");
+        assert_eq!(
+            node.status,
+            NodeStatus::Active,
+            "explicit NodeStatus{{active}} overrode the stale register"
+        );
+        let _ = id;
+    }
+
+    #[test]
+    fn a_ghost_edge_on_a_live_node_is_authored_on_the_next_reconcile() {
+        let conn = scoped_conn();
+        let a = create_concept(&conn, "a").unwrap().memory.memory_id;
+        let b = create_concept(&conn, "b").unwrap().memory.memory_id;
+        insert_raw_node_edge(&conn, &a, "relates_to", &b); // writes repo_node_edges directly
+        backfill_memory_oplog(&conn, 9_000).unwrap();
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        assert_eq!(projected_state(&conn, stream).edges.len(), 1, "ghost edge now signed");
+    }
+
+    #[test]
+    fn reconcile_is_idempotent_and_a_clean_repo_authors_nothing() {
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap();
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        let fp = crate::oplog::local_device(&conn, 0).unwrap().fingerprint();
+        let before = crate::oplog::chain_tail(&conn, stream, fp).unwrap();
+        backfill_memory_oplog(&conn, 9_000).unwrap();
+        assert_eq!(
+            crate::oplog::chain_tail(&conn, stream, fp).unwrap(),
+            before,
+            "no ghost → no new op"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_status_ghost_fails_the_mutation_path_loudly() {
+        // Blast-radius pin: a ghost carrying a status token THIS binary cannot decode makes the
+        // whole reconcile (hence the mutation that triggered it) fail, rather than silently minting
+        // `active`.
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap();
+        insert_memory(&conn, "mem_future", "some_future_status", 500);
+        assert!(backfill_memory_oplog(&conn, 9_000).is_err());
     }
 
     #[test]
@@ -708,6 +981,58 @@ mod tests {
         assert_eq!(projected_edge_count(&conn), 1, "add_edge authored an EdgeAdd");
         assert!(crate::query::memory::remove_edge(&conn, &edge.edge_key).unwrap());
         assert_eq!(projected_edge_count(&conn), 0, "remove_edge authored an EdgeRemove tombstone");
+    }
+
+    // --- live mutation seam self-heals a ghost end to end (#541 Task 4) ---
+
+    #[test]
+    fn mark_obsolete_on_a_ghost_authors_a_create_not_an_inert_status() {
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap(); // roots the chain
+        insert_memory(&conn, "mem_ghost", "active", 500); // raw, un-authored ghost
+        // mark_obsolete reconciles first (heals NodeCreate + NodeStatus{active}), THEN authors the
+        // obsolete NodeStatus — so it is NOT inert and the node projects obsolete.
+        crate::query::memory::mark_obsolete(&conn, "mem_ghost").unwrap();
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        let node = projected_state(&conn, stream)
+            .nodes
+            .get(&NodeId::from("mem_ghost"))
+            .cloned()
+            .expect("ghost healed then obsoleted");
+        assert_eq!(node.status, NodeStatus::Obsolete);
+    }
+
+    #[test]
+    fn remove_edge_on_a_ghost_edge_heals_then_tombstones_not_an_inert_remove() {
+        // The EdgeRemove path: `remove_edge` calls backfill (edges.rs) BEFORE its delete txn, so a
+        // raw ghost edge is first healed (EdgeAdd authored), then the delete authors EdgeRemove —
+        // the signed history is add→remove (complete), and the projection ends with the
+        // edge ABSENT (not an inert tombstone with no matching add).
+        //
+        // `remove_edge` authors its `EdgeRemove` unconditionally once the raw row is deleted
+        // (edges.rs gates it on `n > 0`, NOT on whether an `EdgeAdd` was ever signed) — so
+        // `edges.is_empty()` alone is satisfied whether or not the heal ran (a
+        // never-authored edge and a healed-then-removed edge both project empty). The
+        // `entry_count` delta is what actually distinguishes them: it is +2 (heal's
+        // `EdgeAdd` + `remove_edge`'s own `EdgeRemove`) only when the reconcile fired; a
+        // disabled reconcile would author just the bare `EdgeRemove` (+1).
+        let conn = scoped_conn();
+        let a = create_concept(&conn, "a").unwrap().memory.memory_id;
+        let b = create_concept(&conn, "b").unwrap().memory.memory_id;
+        insert_raw_node_edge(&conn, &a, "relates_to", &b);
+        let key = crate::query::memory::edge_key(&a, "relates_to", "node", &b);
+        let before = entry_count(&conn);
+        crate::query::memory::remove_edge(&conn, &key).unwrap();
+        assert_eq!(
+            entry_count(&conn),
+            before + 2,
+            "the heal's EdgeAdd + remove_edge's own EdgeRemove — not a bare, inert tombstone"
+        );
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        assert!(
+            projected_state(&conn, stream).edges.is_empty(),
+            "healed then tombstoned → edge absent"
+        );
     }
 
     #[test]

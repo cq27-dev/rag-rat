@@ -20,7 +20,7 @@ fn papertrail_for_commit_prefers_commit_sourced_github_refs() {
         .query_row("SELECT hash FROM git_commits LIMIT 1", [], |row| row.get::<_, String>(0))
         .unwrap();
     let mock = MockGitHubClient;
-    github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+    sync_from_refs_blocking(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
         .unwrap();
 
     let papertrail = db.papertrail_for_commit(&commit[..7], 10).unwrap();
@@ -50,7 +50,7 @@ fn papertrail_for_symbol_dedupes_duplicate_file_refs() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let mock = MockGitHubClient;
-    github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+    sync_from_refs_blocking(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
         .unwrap();
     let papertrail = db
         .papertrail_for_symbol("tracked_symbol", Some(Language::Rust), 10)
@@ -79,21 +79,22 @@ fn github_sync_keeps_partial_cache_and_skips_synced_refs_after_404() {
     let mock = PartiallyFailingGitHubClient;
 
     let report =
-        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+        sync_from_refs_blocking(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
             .unwrap();
     assert_eq!(report.discovered_refs, 2);
-    assert_eq!(report.synced_items, 5);
+    // The mock change request stores 2 rows (issue shadow + pull) plus its 4 comments.
+    assert_eq!(report.synced_items, 6);
     assert_eq!(report.failed_refs, 1);
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].number, 404);
     assert_eq!(report.errors[0].status, "not_found");
 
-    let issue_hits = db.github_issue_search("sqlite", 10).unwrap();
+    let issue_hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(issue_hits.len(), 1);
     assert_eq!(issue_hits[0].number, 42);
 
     let second =
-        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+        sync_from_refs_blocking(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
             .unwrap();
     assert_eq!(second.synced_items, 0);
     assert_eq!(second.skipped_refs, 2);
@@ -610,17 +611,22 @@ fn both_repos_keep_a_shared_prs_comments_across_syncs() {
             [repo_id],
         )
         .unwrap();
-        crate::index::github::store_comment(&conn, &crate::index::github::GitHubComment {
-            id: 7,
-            owner: "o".into(),
-            repo: "r".into(),
-            number: 1,
-            html_url: "http://c".into(),
-            body: body.into(),
-            author: None,
-            created_at: None,
-            updated_at: None,
-        })
+        crate::index::papertrail::store_comment(
+            &conn,
+            &crate::index::papertrail::PapertrailComment {
+                project: "o/r".into(),
+                item_kind: crate::index::papertrail::ItemKind::Issue,
+                item_key: "1".into(),
+                comment_id: "7".into(),
+                url: Some("http://c".into()),
+                body: body.into(),
+                author: None,
+                created_at: None,
+                updated_at: None,
+                review_state: None,
+                anchor_path: None,
+            },
+        )
         .unwrap();
     };
 
@@ -639,4 +645,134 @@ fn both_repos_keep_a_shared_prs_comments_across_syncs() {
     };
     assert_eq!(body_for("repo-a"), "from-a-v2", "A's re-sync refreshed A's own copy");
     assert_eq!(body_for("repo-b"), "from-b", "B's copy survived A's re-sync — no oscillation");
+}
+
+/// A client whose comment fetch fails ONCE with a non-404 error (rate limit) and then recovers —
+/// the shape that leaves a partial cache behind: the item row stored, the comments missing.
+struct RecoveringCommentsClient {
+    failed_once: std::cell::Cell<bool>,
+}
+
+impl papertrail::PapertrailClient for RecoveringCommentsClient {
+    async fn item(
+        &self,
+        project: &str,
+        kind: papertrail::ItemKind,
+        key: &str,
+    ) -> anyhow::Result<papertrail::PapertrailItem> {
+        MockGitHubClient.item(project, kind, key).await
+    }
+
+    async fn item_comments(
+        &self,
+        project: &str,
+        kind: papertrail::ItemKind,
+        key: &str,
+    ) -> anyhow::Result<Vec<papertrail::PapertrailComment>> {
+        if !self.failed_once.replace(true) {
+            anyhow::bail!("gh: HTTP 429 rate limited");
+        }
+        MockGitHubClient.item_comments(project, kind, key).await
+    }
+
+    async fn items_page(
+        &self,
+        project: &str,
+        cursor: &papertrail::PageCursor,
+    ) -> anyhow::Result<papertrail::ItemsPage> {
+        MockGitHubClient.items_page(project, cursor).await
+    }
+
+    async fn comments_page(
+        &self,
+        project: &str,
+        cursor: &papertrail::PageCursor,
+    ) -> anyhow::Result<papertrail::CommentsPage> {
+        MockGitHubClient.comments_page(project, cursor).await
+    }
+
+    async fn freshness_probe(
+        &self,
+        project: &str,
+        cursor: &papertrail::PageCursor,
+    ) -> anyhow::Result<Option<String>> {
+        MockGitHubClient.freshness_probe(project, cursor).await
+    }
+}
+
+#[test]
+fn github_sync_retries_a_failed_ref_instead_of_trusting_its_partial_cache() {
+    let (root, config) =
+        markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let client = RecoveringCommentsClient { failed_once: std::cell::Cell::new(false) };
+
+    // First pass: the item row lands, the comment fetch fails — the ref is FAILED but the
+    // partial cache is real.
+    let first = sync_from_refs_blocking(
+        db.storage.connection(),
+        &root,
+        Some(&client),
+        false,
+        &test_gh_ctx(),
+    )
+    .unwrap();
+    assert_eq!(first.failed_refs, 1);
+    assert_eq!(first.errors[0].status, "failed");
+    assert_eq!(first.status.issues, 1, "the item row is cached despite the failed ref");
+    assert_eq!(first.status.comments, 0);
+
+    // Second pass: a failed ref MUST retry — the cached issue row must not masquerade as a
+    // completed sync (that would leave the comments missing forever).
+    let second = sync_from_refs_blocking(
+        db.storage.connection(),
+        &root,
+        Some(&client),
+        false,
+        &test_gh_ctx(),
+    )
+    .unwrap();
+    assert_eq!(second.skipped_refs, 0, "a failed ref must retry, not trust its partial cache");
+    assert_eq!(second.failed_refs, 0);
+    assert_eq!(second.synced_items, 6);
+    assert_eq!(second.status.comments, 2);
+
+    // Third pass: now genuinely synced — skipped.
+    let third = sync_from_refs_blocking(
+        db.storage.connection(),
+        &root,
+        Some(&client),
+        false,
+        &test_gh_ctx(),
+    )
+    .unwrap();
+    assert_eq!(third.skipped_refs, 1);
+    assert_eq!(third.synced_items, 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn papertrail_client_batch_surface_round_trips_through_the_trait() {
+    use crate::index::papertrail::PapertrailClient;
+
+    let cursor = papertrail::PageCursor::default();
+    let items = papertrail::block_on(MockGitHubClient.items_page("o/r", &cursor)).unwrap();
+    assert_eq!(items.items.len(), 1);
+    assert_eq!(items.items[0].item_kind, papertrail::ItemKind::ChangeRequest);
+
+    let comments = papertrail::block_on(MockGitHubClient.comments_page("o/r", &cursor)).unwrap();
+    assert_eq!(comments.comments.len(), 4);
+    assert_eq!(comments.comments.iter().filter(|c| c.review_state.is_some()).count(), 1);
+    assert_eq!(comments.comments.iter().filter(|c| c.anchor_path.is_some()).count(), 1);
+
+    let moved = papertrail::block_on(MockGitHubClient.freshness_probe("o/r", &cursor)).unwrap();
+    assert_eq!(moved.as_deref(), Some("2026-01-02T00:00:00Z"));
+    let quiet_cursor = papertrail::PageCursor {
+        updated_since: Some("2026-01-02T00:00:00Z".into()),
+        page_token: None,
+    };
+    let quiet =
+        papertrail::block_on(MockGitHubClient.freshness_probe("o/r", &quiet_cursor)).unwrap();
+    assert_eq!(quiet, None, "a probe at the cursor position reports no movement");
 }

@@ -3,11 +3,12 @@
 //! re-encode), `maintenance` (the git-hook pass, coalesced), `doctor` (health snapshot), and the
 //! `run_watch` / `run_maintenance_pass` helpers they drive.
 use std::fs;
+use std::path::Path;
 use std::time::Instant;
 
 use rag_rat_core::{Config, IndexDatabase, OutputFormat};
 
-use crate::cli::{IndexArgs, MaintenanceArgs, ReconcileArgs};
+use crate::cli::{DoctorArgs, IndexArgs, MaintenanceArgs, ReconcileArgs};
 use crate::commands::output_format;
 use crate::render::{
     print_output, print_reconcile_plan, render_index_progress, render_reconcile_progress,
@@ -132,7 +133,11 @@ pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result
     // `reconcile --plan --reencode-vectors` from mutating the index during a dry run. Do not
     // reorder.
     if args.plan {
-        let plan = db.reconcile_plan()?;
+        // Same cap the actual reconcile below resolves (`args` override else config), so `--plan`
+        // classifies against exactly what the run it previews will use.
+        let plan = db.reconcile_plan_with_cap(
+            args.max_embedding_chars.unwrap_or(config.llm.embedding.runtime.max_embedding_chars),
+        )?;
         // `--plan` prints a human summary by default; the global `--json` switches to the
         // structured plan.
         if output_format() == OutputFormat::Json {
@@ -210,7 +215,10 @@ pub(crate) fn run_watch(config: Config) -> anyhow::Result<()> {
     }
 }
 
-pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
+pub(crate) fn doctor(config: &Config, args: &DoctorArgs) -> anyhow::Result<()> {
+    if args.vacuum {
+        return vacuum(config);
+    }
     let schema = IndexDatabase::migration_check(&config.database)?;
     let (index, discovery, storage, clone_fingerprints, file_health) =
         if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
@@ -233,6 +241,7 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
             (None, None, None, None, None)
         };
     print_output(&serde_json::json!({
+        "scope": "repo",
         "config_root": config.root,
         "database": config.database,
         "schema": schema,
@@ -253,6 +262,51 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
             "source_read_only": true,
             "index_writes": "sqlite_auto_heal"
         }
+    }))
+}
+
+/// `doctor` for the config-less case: report the machine-global store — its schema, on-disk size,
+/// and the registry of repos it holds — rather than a specific repo. Reached from `run_doctor` when
+/// no `rag-rat.toml` is found at or above the cwd. The repo-scoped opens can't run against a
+/// consolidated multi-repo store, so this is a deliberately distinct DB-level report.
+pub(crate) fn doctor_global_store(database: &Path) -> anyhow::Result<()> {
+    let overview = IndexDatabase::global_store_overview(database)?;
+    print_output(&serde_json::json!({
+        "scope": "global-store",
+        "note": "No rag-rat.toml found at or above the cwd — reporting the machine-global store. \
+                 cd into an indexed repo (or run `rag-rat init` here) for a repo-scoped report.",
+        "database": overview.database,
+        "exists": overview.exists,
+        "size_bytes": overview.size_bytes,
+        "schema": overview.schema,
+        "repos": overview.repos,
+        "mcp": {
+            "transport": "stdio",
+            "tools": rag_rat_mcp::tools::TOOL_NAMES,
+            "source_read_only": true,
+            "index_writes": "sqlite_auto_heal"
+        }
+    }))
+}
+
+/// `doctor --vacuum`: reclaim dead space by rewriting the database (#574). Explicit operator action
+/// — VACUUM takes the global schema lock and rewrites the whole file, so it's never automatic.
+fn vacuum(config: &Config) -> anyhow::Result<()> {
+    let db = IndexDatabase::open_config(config)?;
+    let report = db.reclaim_freelist()?;
+    let reclaimed_bytes = report.main_bytes_before.saturating_sub(report.main_bytes_after);
+    // VACUUM cleared the freelist, but a live reader can pin the WAL so the post-VACUUM checkpoint
+    // can't truncate — the file then stays large on disk. Say so, actionably, rather than report a
+    // silent "success".
+    let note = (!report.wal_truncated).then_some(
+        "dead space was cleared but the compacted image is staged in the WAL — a live reader \
+         pinned it, so the file has not shrunk on disk; stop agents/watchers/MCP servers and \
+         re-run `rag-rat doctor --vacuum`",
+    );
+    print_output(&serde_json::json!({
+        "vacuum": report,
+        "reclaimed_bytes": reclaimed_bytes,
+        "note": note,
     }))
 }
 
@@ -428,7 +482,12 @@ fn run_maintenance_pass(
     // CHANGED overlay's embeddings are reconciled INLINE (while scoped to it) so worktree queries
     // aren't BM25-only for branch content. It restores the base scope afterward so the base
     // reconcile/gc/memory-validate below run unscoped.
-    rag_rat_core::watch::refresh_worktree_overlays(&mut db, config, budget.as_ref());
+    rag_rat_core::watch::refresh_worktree_overlays(
+        &mut db,
+        config,
+        budget.as_ref(),
+        &rag_rat_core::watch::OverlayScope::All,
+    );
     // The base reconcile gets whatever budget the overlays left; `None` → exhausted (or no cap left
     // at all), so skip it rather than start a fresh full-budget reconcile.
     let reconcile_report = match budget
@@ -502,6 +561,17 @@ fn run_maintenance_pass(
         total_chunks = artifacts.total_chunks,
         "maintenance pass complete (remaining backlog is unscoped/cross-worktree, #360)"
     );
+    // #573: give the git-hook write path a WAL-checkpoint owner. On a hooks/MCP-only machine (no
+    // long-lived foreground watcher) nothing else truncates the shared global `-wal`, so it grows
+    // unbounded. Size-gated by the same threshold the watcher's quiet-pass checkpoint uses
+    // (`WAL_CHECKPOINT_MIN_BYTES`); best-effort — a busy/failed checkpoint just rides the next pass
+    // and never fails maintenance. Runs under the write lock this pass already holds.
+    let wal_checkpoint = db
+        .checkpoint_wal_if_oversized(rag_rat_core::index::WAL_CHECKPOINT_MIN_BYTES)
+        .inspect_err(|err| {
+            tracing::debug!(target: "rag_rat_core::maintenance", error = %err, "wal checkpoint failed");
+        })
+        .ok();
     Ok(serde_json::json!({
         "trigger": trigger,
         "status": "complete",
@@ -510,6 +580,7 @@ fn run_maintenance_pass(
         "branch_checkout": args.branch_checkout,
         "max_seconds": max_seconds,
         "elapsed_seconds": started.elapsed().as_secs_f64(),
+        "wal_checkpoint": wal_checkpoint,
         "reconcile": reconcile_report,
         // #312: rows the legacy-f32 → int8 re-encode converted this pass, or null when it was
         // skipped (max_seconds == 0, or already done/the gate was set so the call returned 0 — note
@@ -546,6 +617,55 @@ mod tests {
     use rag_rat_core::{Config, IndexDatabase};
 
     static N: AtomicU64 = AtomicU64::new(0);
+
+    /// #574: `doctor --vacuum` opens the store, reclaims dead space under the schema lock, and
+    /// leaves the freelist empty. (Reclamation-under-load correctness is unit-tested in
+    /// `db_file_health`; this pins the CLI wiring — dispatch → open_config → VACUUM → report.)
+    #[test]
+    fn doctor_vacuum_runs_and_leaves_no_freelist() {
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-vacuum-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/a.md"), "# Title\nalpha token\n").unwrap();
+        let config = Config {
+            repo_id_override: None,
+            database_key_pinned: true,
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "markdown".to_string(),
+                language: Language::Markdown,
+                directories: vec![PathBuf::from("docs")],
+                include: vec!["**/*.md".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Docs,
+            }],
+            llm: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+            search: Default::default(),
+            memory: Default::default(),
+            log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+
+        super::doctor(&config, &crate::cli::DoctorArgs { vacuum: true }).unwrap();
+
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert_eq!(
+            db.database_file_health().unwrap().freelist_pages,
+            0,
+            "a vacuum leaves no reclaimable freelist"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn maintenance_command_refreshes_a_linked_worktree_overlay() {
@@ -704,6 +824,76 @@ mod tests {
              unscoped={unscoped}"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #573: the hook write path (`run_maintenance_pass`) checkpoints the shared global `-wal`, so a
+    /// hooks/MCP-only machine (no long-lived foreground watcher) has a truncation owner. On a fresh
+    /// fixture the sidecar is under the threshold, so the checkpoint is size-gated to
+    /// attempted:false — asserting the field's presence pins that the pass CALLS the
+    /// checkpoint.
+    #[test]
+    fn maintenance_pass_owns_the_wal_checkpoint() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-maint-wal-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "t"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "base"]);
+        let config = Config {
+            repo_id_override: None,
+            database_key_pinned: true,
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            llm: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+            search: Default::default(),
+            memory: Default::default(),
+            log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+
+        let args = super::MaintenanceArgs {
+            trigger: Some("post-commit".to_string()),
+            max_seconds: Some(0),
+            branch_checkout: None,
+            old_head: None,
+            new_head: None,
+        };
+        let report = super::run_maintenance_pass(&config, &args, "post-commit").unwrap();
+
+        let checkpoint = &report["wal_checkpoint"];
+        assert!(
+            checkpoint.is_object(),
+            "the maintenance pass reports a wal checkpoint — the hook-path owner (#573): {report}"
+        );
+        assert_eq!(
+            checkpoint["attempted"],
+            serde_json::json!(false),
+            "a fresh fixture's -wal is under the threshold, so the checkpoint is size-gated off"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

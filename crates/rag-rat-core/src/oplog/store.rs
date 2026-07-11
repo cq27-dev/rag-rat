@@ -208,14 +208,36 @@ pub(crate) fn author_op(
     Ok(entry_hash)
 }
 
-/// Author `ops` as the GENESIS batch of `stream` WITHIN a caller-provided txn — gate on an empty
-/// chain, then chain every entry from genesis with a SINGLE projection re-fold at the end, but
-/// NEITHER open NOR commit. The empty-chain gate lives INSIDE the txn (the caller's), so two
-/// concurrent first-authoring callers converge: the winner authors genesis→N, and the loser —
-/// serialized behind the winner's write — sees a non-empty chain and no-ops. Returns whether it
-/// authored (`false` = a chain already existed). The backfill opens its OWN `IMMEDIATE` txn, reads
-/// the memory snapshot UNDER that write lock, and calls this so the snapshot read + gate + write
-/// are one atomic unit (no memory created between the read and the batch is lost from the history).
+/// Author `ops` as a continuation batch on `stream` WITHIN the caller's txn: chain each entry from
+/// the current tail (genesis when the chain is empty), with a SINGLE projection re-fold at the end.
+/// NO empty-chain gate — the caller has already decided these ops belong. Neither opens nor commits
+/// the txn. Empty `ops` authors no entry (the loop is zero iterations) but STILL re-folds + stamps
+/// the projection — an idempotent sweep, not a no-op. That preserves the pre-refactor empty-genesis
+/// behavior, where the 0-iteration loop still ran `reproject_after_write` +
+/// `stamp_projector_version`.
+pub(crate) fn author_batch_in_tx(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    device: &LocalDevice,
+    ops: &[MemoryOp],
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    assert_projector_not_newer(tx)?;
+    for op in ops {
+        // The tail read sees prior in-txn inserts, so each op chains off the one before it.
+        author_one(tx, stream, device, op, now_ms)?;
+    }
+    reproject_after_write(tx, stream)?;
+    stamp_projector_version(tx)?;
+    Ok(())
+}
+
+/// The GENESIS batch — [`author_batch_in_tx`] GATED on an empty chain so two concurrent
+/// first-authoring callers converge: the winner authors genesis→N, and the loser — serialized
+/// behind the winner's write — sees a non-empty chain and no-ops. Returns whether it authored
+/// (`false` = a chain already existed). The backfill opens its OWN `IMMEDIATE` txn, reads the
+/// memory snapshot UNDER that write lock, and calls this so the snapshot read + gate + write are
+/// one atomic unit (no memory created between the read and the batch is lost from the history).
 pub(crate) fn author_genesis_in_tx(
     tx: &Transaction<'_>,
     stream: StreamId,
@@ -227,12 +249,7 @@ pub(crate) fn author_genesis_in_tx(
     if chain_tail(tx, stream, device.fingerprint())?.is_some() {
         return Ok(false);
     }
-    for op in ops {
-        // The tail read sees prior in-txn inserts, so each op chains off the one before it.
-        author_one(tx, stream, device, op, now_ms)?;
-    }
-    reproject_after_write(tx, stream)?;
-    stamp_projector_version(tx)?;
+    author_batch_in_tx(tx, stream, device, ops, now_ms)?;
     Ok(true)
 }
 
@@ -1008,6 +1025,26 @@ mod tests {
             author_batch(&conn, stream_a(), &device, &[create("mem_b", "b")], 2_000).unwrap();
         assert!(!authored, "a genesis batch no-ops on a non-empty chain");
         assert_eq!(entry_count(&conn), 1, "the non-empty chain is left untouched");
+    }
+
+    #[test]
+    fn author_batch_in_tx_chains_a_continuation_and_refolds_once() {
+        let conn = db();
+        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        let stream = stream_a();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        // NON-empty chain seeded, then a continuation batch on the SAME chain (must not gate).
+        author_batch_in_tx(&tx, stream, &device, &[create("mem_a", "first")], 10).unwrap();
+        author_batch_in_tx(&tx, stream, &device, &[create("mem_b", "second")], 20).unwrap();
+        let before = entry_count(&tx);
+        // An empty batch authors NO entry but still re-folds + stamps (idempotent sweep, not a
+        // no-op).
+        author_batch_in_tx(&tx, stream, &device, &[], 30).unwrap();
+        assert_eq!(entry_count(&tx), before, "an empty batch adds no oplog entry");
+        tx.commit().unwrap();
+        let state = load_projection(&conn, stream).unwrap();
+        assert!(state.nodes.contains_key(&NodeId::from("mem_a")));
+        assert!(state.nodes.contains_key(&NodeId::from("mem_b")));
     }
 
     #[test]

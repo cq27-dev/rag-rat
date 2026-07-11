@@ -147,86 +147,90 @@ impl IndexDatabase {
         Ok(Some(summary))
     }
 
-    pub fn github_sync_from_refs(&self, offline: bool) -> anyhow::Result<GitHubSyncReport> {
-        self.github_sync_from_refs_with_progress(offline, |_| {})
+    pub fn papertrail_sync_from_refs(&self, offline: bool) -> anyhow::Result<PapertrailSyncReport> {
+        self.papertrail_sync_from_refs_with_progress(offline, |_| {})
     }
 
-    pub fn github_sync_from_refs_with_progress(
+    pub fn papertrail_sync_from_refs_with_progress(
         &self,
         offline: bool,
-        progress: impl FnMut(github::GitHubSyncProgress),
-    ) -> anyhow::Result<GitHubSyncReport> {
+        progress: impl FnMut(papertrail::PapertrailSyncProgress),
+    ) -> anyhow::Result<PapertrailSyncReport> {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("index has no source_root metadata; rebuild required");
         };
         if offline {
-            github::sync_from_refs::<github::GhCliGitHubClient>(
+            papertrail::block_on(papertrail::sync_from_refs::<papertrail::GitHubClient>(
                 self.storage.connection(),
                 root,
                 None,
                 true,
-                &self.github,
-            )
+                &self.papertrail,
+            ))
         } else {
-            let client = github::GhCliGitHubClient;
-            github::sync_from_refs_with_progress(
+            let client = papertrail::GitHubClient;
+            papertrail::block_on(papertrail::sync_from_refs_with_progress(
                 self.storage.connection(),
                 root,
                 Some(&client),
                 false,
-                &self.github,
+                &self.papertrail,
                 progress,
-            )
+            ))
         }
     }
 
-    pub fn github_sync_issue(
+    pub fn papertrail_sync_issue(
         &self,
         issue_ref: &str,
         offline: bool,
-    ) -> anyhow::Result<GitHubSyncReport> {
+    ) -> anyhow::Result<PapertrailSyncReport> {
         if offline {
-            github::sync_issue::<github::GhCliGitHubClient>(
+            papertrail::block_on(papertrail::sync_issue::<papertrail::GitHubClient>(
                 self.storage.connection(),
                 issue_ref,
                 None,
                 true,
-                &self.github,
-            )
+                &self.papertrail,
+            ))
         } else {
-            let client = github::GhCliGitHubClient;
-            github::sync_issue(
+            let client = papertrail::GitHubClient;
+            papertrail::block_on(papertrail::sync_issue(
                 self.storage.connection(),
                 issue_ref,
                 Some(&client),
                 false,
-                &self.github,
-            )
+                &self.papertrail,
+            ))
         }
     }
 
-    pub fn github_issue_search(
+    pub fn papertrail_issue_search(
         &self,
         query: &str,
         limit: u32,
-    ) -> anyhow::Result<Vec<GitHubEvidence>> {
-        github::issue_search(self.storage.connection(), query, limit)
+    ) -> anyhow::Result<Vec<PapertrailEvidence>> {
+        papertrail::issue_search(self.storage.connection(), query, limit)
     }
 
-    pub fn rationale_search(&self, query: &str, limit: u32) -> anyhow::Result<Vec<GitHubEvidence>> {
-        github::rationale_search(self.storage.connection(), query, limit, &self.github)
+    pub fn rationale_search(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<PapertrailEvidence>> {
+        papertrail::rationale_search(self.storage.connection(), query, limit, &self.papertrail)
     }
 
-    pub fn github_refs_for_path(
+    pub fn papertrail_refs_for_path(
         &self,
         path: &str,
         limit: u32,
-    ) -> anyhow::Result<Vec<github::GitHubRef>> {
-        github::refs_for_path(self.storage.connection(), path, limit)
+    ) -> anyhow::Result<Vec<papertrail::PapertrailRef>> {
+        papertrail::refs_for_path(self.storage.connection(), path, limit)
     }
 
-    pub fn github_sync_status(&self) -> anyhow::Result<GitHubStatus> {
-        self.github_status()
+    pub fn papertrail_sync_status(&self) -> anyhow::Result<PapertrailStatus> {
+        self.papertrail_status()
     }
 
     pub fn papertrail_for_chunk(
@@ -237,11 +241,11 @@ impl IndexDatabase {
         let Some(chunk) = self.read_chunk(chunk_id)? else {
             return Ok(None);
         };
-        Ok(Some(github::papertrail_for_chunk(
+        Ok(Some(papertrail::papertrail_for_chunk(
             self.storage.connection(),
             &chunk,
             limit,
-            &self.github,
+            &self.papertrail,
         )?))
     }
 
@@ -254,11 +258,11 @@ impl IndexDatabase {
         let Some(symbol) = self.symbols(symbol, language, limit)?.into_iter().next() else {
             return Ok(None);
         };
-        Ok(Some(github::papertrail_for_symbol(
+        Ok(Some(papertrail::papertrail_for_symbol(
             self.storage.connection(),
             &symbol,
             limit,
-            &self.github,
+            &self.papertrail,
         )?))
     }
 
@@ -267,7 +271,12 @@ impl IndexDatabase {
         symbol: &crate::query::symbol::SymbolHit,
         limit: u32,
     ) -> anyhow::Result<Papertrail> {
-        github::papertrail_for_symbol(self.storage.connection(), symbol, limit, &self.github)
+        papertrail::papertrail_for_symbol(
+            self.storage.connection(),
+            symbol,
+            limit,
+            &self.papertrail,
+        )
     }
 
     pub fn papertrail_for_commit(
@@ -275,6 +284,11 @@ impl IndexDatabase {
         commit_hash: &str,
         limit: u32,
     ) -> anyhow::Result<Papertrail> {
-        github::papertrail_for_commit(self.storage.connection(), commit_hash, limit, &self.github)
+        papertrail::papertrail_for_commit(
+            self.storage.connection(),
+            commit_hash,
+            limit,
+            &self.papertrail,
+        )
     }
 }

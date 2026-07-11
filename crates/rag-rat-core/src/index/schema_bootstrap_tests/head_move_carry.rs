@@ -58,6 +58,61 @@ fn chunk_ids_of_file(db: &IndexDatabase, file_id: i64) -> Vec<i64> {
     stmt.query_map([file_id], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
 }
 
+/// #561: the incremental write phase skips overwriting a scope key whose current row already has a
+/// NEWER disk mtime than the version it prepared (a concurrent lockless heal). The interleaving
+/// isn't unit-testable, but `scope_row_modified_at_ms` — the value the guard compares against the
+/// prepared mtime — is: it returns the row's `modified_at_ms` for the exact scope key, `None` for
+/// any other.
+#[test]
+fn scope_row_modified_at_ms_reads_the_scoped_disk_mtime() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn a() -> i32 { 1 }\n").unwrap();
+    fs::write(root.join(".gitignore"), ".rag-rat/\n").unwrap();
+    init_git_repo(&root);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "seed"]);
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // The committed row's own scope + disk mtime.
+    let (commit_sha, worktree_id, modified_at_ms): (String, String, i64) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT commit_sha, worktree_id, modified_at_ms FROM files WHERE path = 'src/lib.rs'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let path = std::path::Path::new("src/lib.rs");
+
+    // The guard reads this exact scope's mtime — the value it compares against the prepared mtime.
+    assert_eq!(
+        db.scope_row_modified_at_ms(path, &commit_sha, &worktree_id).unwrap(),
+        Some(modified_at_ms)
+    );
+    // Scope-keyed: a different commit scope or a different path is a different row → None.
+    assert_eq!(
+        db.scope_row_modified_at_ms(path, "deadbeefdeadbeef", &worktree_id).unwrap(),
+        None,
+        "a different commit_sha is a different scope key"
+    );
+    assert_eq!(
+        db.scope_row_modified_at_ms(
+            std::path::Path::new("src/other.rs"),
+            &commit_sha,
+            &worktree_id
+        )
+        .unwrap(),
+        None,
+        "a different path is a different scope key"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn a_head_move_carries_unchanged_rows_and_rederives_only_the_diff() {
     let (root, config) = head_move_repo("carry");

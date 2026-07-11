@@ -11,7 +11,7 @@ resolver = "3"
 # and the internal path deps below pin the same literal, so the three crates always publish in
 # lockstep. Bump this one line (and the two internal-dep `version`s under workspace.dependencies)
 # to release.
-version = "0.15.0"
+version = "0.16.0"
 authors = ["Kristaps Karlsons"]
 edition = "2024"
 # Bundled SQLite (rusqlite `bundled` -> libsqlite3-sys 0.38.1) compiles a build script that uses the
@@ -28,14 +28,20 @@ categories = ["command-line-utilities", "development-tools"]
 # Internal crates — declared once here so the version requirement is set in lockstep with
 # [workspace.package].version above. Members reference these via `{ workspace = true }` and add
 # their own feature toggles at the use site.
-rag-rat-core = { version = "0.15.0", path = "crates/rag-rat-core", default-features = false }
-rag-rat-mcp = { version = "0.15.0", path = "crates/rag-rat-mcp", default-features = false }
+rag-rat-core = { version = "0.16.0", path = "crates/rag-rat-core", default-features = false }
+rag-rat-mcp = { version = "0.16.0", path = "crates/rag-rat-mcp", default-features = false }
 anyhow = "1.0"
 # ed25519 device-identity signing for the op-log's signed entry envelope (§C4 layer-1). Default
 # features (incl. `zeroize`, which zeroizes a `SigningKey`'s seed on drop) are kept; the `rand_core`
 # CSPRNG-keygen feature stays OFF — device keys derive deterministically from a seed via
 # `SigningKey::from_bytes`. Verification uses `verify_strict` (rejects malleable / small-order sigs).
 ed25519-dalek = "2"
+# X25519 device ENCRYPTION keypair beside the ed25519 signing key (sync phase C, §5). Shares
+# curve25519-dalek 4 with ed25519-dalek 2 (no second curve impl in the tree). `static_secrets`
+# enables the persistable `StaticSecret`, reconstructed from the stored 32-byte secret exactly as the
+# ed25519 key is rebuilt from its seed; the default `zeroize` scrubs it on drop. C1 only mints,
+# persists, and validates the key (rejecting small-order / identity public keys); ECDH + HKDF is C4.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 # OS CSPRNG for the op-log device key: fills a 32-byte ed25519 seed at first use, which then flows
 # through the existing deterministic `SigningKey::from_bytes`. The lowest-level entropy source (no

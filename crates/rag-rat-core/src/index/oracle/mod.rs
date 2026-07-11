@@ -21,6 +21,7 @@
 mod auto_run;
 mod corpus;
 mod join;
+mod library_usage;
 mod lsp;
 mod manifest;
 mod report;
@@ -39,6 +40,10 @@ pub use corpus::{
     HealthViolation, check_corpus_health, corpora_for_tier, corpus_by_id, load_corpora,
 };
 pub(crate) use join::package_of;
+pub use library_usage::{
+    LibraryUsageCallSite, LibraryUsageEntry, LibraryUsageOptions, LibraryUsageReport,
+    LibraryUsageStatus, check_library_usage,
+};
 pub use manifest::{ToolAvailability, ToolManifest};
 pub use report::{
     CorpusHealth, CorpusProfile, OracleResolutionReport, REPORT_SCHEMA_VERSION, ResolutionBefore,
@@ -585,6 +590,18 @@ pub fn prune_oracle_runs_outside_scope(
     store::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)
 }
 
+/// Prune `external_symbols` rows for dead `(commit_sha, worktree_id)` checkouts (#114) — the gc
+/// companion for the checkout-keyed dependency-contract table (nothing cascades it, keyed by
+/// `(commit, worktree)`, like `oracle_runs`). See [`store::prune_external_symbols_outside_scope`].
+/// Returns rows deleted.
+pub fn prune_external_symbols_outside_scope(
+    conn: &Connection,
+    live_commits: &[String],
+    live_worktrees: &[String],
+) -> anyhow::Result<u64> {
+    store::prune_external_symbols_outside_scope(conn, live_commits, live_worktrees)
+}
+
 /// Sweep `edge_oracle` verdicts whose content key matches no live edge ANYWHERE — the gc
 /// replacement for the `edges_data` FK cascade dropped in #248 (correctness no longer depends on
 /// it; it is anti-growth hygiene). GLOBAL, not checkout-scoped, so a sweep never deletes a sibling
@@ -806,6 +823,10 @@ pub struct OracleReport {
     /// (fields/variants map up to the enclosing symbol); only the deterministic best (shortest)
     /// moniker is written, so this counts rows, not defs.
     pub monikers_written: u64,
+    /// `external_symbols` rows written this pass — distinct external dependency monikers whose
+    /// `SymbolInformation` the `.scip` carried in `index.external_symbols` (#114). The dependency
+    /// contract `check_library_usage` reads.
+    pub external_symbols_written: u64,
     pub status: String,
 }
 

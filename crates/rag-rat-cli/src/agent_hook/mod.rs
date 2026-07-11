@@ -735,18 +735,12 @@ pub fn format_digest(o: &Orientation, live: bool, enabled: bool) -> String {
     out
 }
 
-/// Walk up from the hook's cwd to the nearest rag-rat.toml. `None` ⇒ not a rag-rat repo ⇒
-/// silent no-op (what makes `--global` install safe).
+/// Walk up from the hook's cwd to the nearest rag-rat.toml and load it. `None` ⇒ not a rag-rat repo
+/// ⇒ silent no-op (what makes `--global` install safe). Shares the upward-walk primitive with
+/// `Config::load`'s discovery seam ([`rag_rat_core::config::nearest_config_at_or_above`]).
 fn find_config(start: &Path) -> Option<Config> {
-    let mut dir = Some(start);
-    while let Some(current) = dir {
-        let candidate = current.join("rag-rat.toml");
-        if candidate.is_file() {
-            return Config::load(&candidate).ok();
-        }
-        dir = current.parent();
-    }
-    None
+    rag_rat_core::config::nearest_config_at_or_above(start)
+        .and_then(|path| Config::load(&path).ok())
 }
 
 /// Outer Option: did the listener answer at all (None ⇒ fall back). Inner Option: did it

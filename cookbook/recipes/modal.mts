@@ -22,8 +22,13 @@
  *   - GPU: ollama/infinity default to CPU (GPU is opt-in and, for ollama, must attach before its
  *     discovery watchdog times out or the box dies exit 137). vLLM's image is CUDA-only, so when the
  *     backend `requiresGpu` and the caller passed none we default one in ({@link MODAL_DEFAULT_GPU}).
- *   - timeout=1800s (30 min) is the provider-side max-lifetime backstop: if rag-rat dies or
- *     SIGKILLs us before teardown runs, Modal self-destructs the box. (RunPod has no equivalent.)
+ *   - Two provider-side backstops guard against a leaked box when rag-rat dies or SIGKILLs us
+ *     before teardown runs. idleTimeoutMs self-destructs the box once it goes idle (Modal counts
+ *     only a running exec, an stdin write, or an open tunnel TCP connection as activity — NOT the
+ *     serve process); timeout=1800s (30 min) is the unconditional max-lifetime cap. The idle window
+ *     is `provisionTimeoutMs + SERVING_IDLE_GRACE_MS`, NOT a bare few minutes: the idle clock runs
+ *     from creation and a vLLM/infinity cold start opens no tunnel until it serves, so a short
+ *     window would kill a legit slow boot. (RunPod has neither backstop.)
  *
  * The harness ({@link runRecipe}) owns the terminate-on-error wrapper and the provision-timeout
  * clamp, so this recipe is just: create the box, report it via `ctx.onBox`, (pull,) verify, return.
@@ -52,6 +57,39 @@ import { assertCapabilitySupported, selectBackendSpec } from "./backends.mjs";
 
 /** Provider-side max-lifetime backstop in ms — a leaked box self-destructs after this. */
 const BOX_MAX_LIFETIME_MS = 1_800_000; // 30 minutes
+/**
+ * Serving-phase margin (ms) added ON TOP OF the provisioning budget to form the box's `idleTimeoutMs`
+ * (see {@link idleWindowMs}). Modal terminates a box after `idleTimeoutMs` of NO activity — where
+ * "active" means a running `sb.exec`, an `sb.stdin` write, or an OPEN TCP CONNECTION OVER A TUNNEL;
+ * the main serve process does NOT count. Once serving, rag-rat's keep-alive HTTP pool holds a tunnel
+ * connection open, so a live job keeps the box active; when the owning rag-rat process dies (crash,
+ * killed terminal) its connections drop and the box eventually goes idle and self-destructs instead
+ * of billing to BOX_MAX_LIFETIME_MS.
+ *
+ * Why the window is provision-budget + margin, not a bare few minutes: the idle clock runs from
+ * CREATION, and a vLLM/infinity cold start (image pull + model load) opens no tunnel until the
+ * recipe's verify step, so a short window would self-destruct a legit slow boot before it ever
+ * serves. The provision budget already bounds that boot-idle gap (the recipe aborts + tears down if
+ * boot overruns it), so a window ≥ it can never fire mid-boot.
+ *
+ * RECLAIM TIME, stated honestly: Modal restarts the idle countdown on EVERY activity, so a box
+ * orphaned mid-serve is reclaimed after the FULL window elapses from its last request — i.e.
+ * `provisionTimeoutMs + this margin`, NOT just this margin. That is minutes-to-low-tens-of-minutes
+ * (well under the 30-min max-lifetime cap), the price of a single static value: SDK 0.8.1 has no
+ * post-create setter to tighten the idle timeout once the box is past boot and serving.
+ */
+const SERVING_IDLE_GRACE_MS = 180_000; // 3 minutes past the provisioning budget
+
+/**
+ * The box's idle window: the provisioning budget (rounded UP to a whole second) plus the
+ * serving-phase margin. Rounding keeps it an integer number of seconds — Modal encodes idle timeout
+ * as a uint32 seconds field, so a fractional `provision_timeout_s` (the contract allows one) must
+ * not produce a sub-second `idleTimeoutMs`. Rounding UP preserves the "≥ provisionTimeoutMs" boot
+ * guarantee above.
+ */
+function idleWindowMs(provisionTimeoutMs: number): number {
+  return Math.ceil(provisionTimeoutMs / 1000) * 1000 + SERVING_IDLE_GRACE_MS;
+}
 /** Default provisioning budget (boot + pull + first serving response) when input omits it. */
 const DEFAULT_PROVISION_TIMEOUT_S = 600;
 /** Modal app the sandboxes are grouped under (created on first use). */
@@ -121,6 +159,7 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
         encryptedPorts: [port],
         readinessProbe: Probe.withTcp(port, { intervalMs: 1000 }),
         timeoutMs: BOX_MAX_LIFETIME_MS,
+        idleTimeoutMs: idleWindowMs(provisionTimeoutMs),
         ...(gpu !== null ? { gpu } : {}),
       });
       return createRef.promise;

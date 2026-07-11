@@ -160,6 +160,8 @@ impl IndexDatabase {
         // dead-GENERATION sweep already ran above, unconditionally.
         self.delete_staged_files_cascade(StagedSweep::DeadContext)?;
         conn.execute_batch("DELETE FROM temp.staged_file_ids;")?;
+        // A removed worktree's overlay refresh basis (#577) follows its overlay rows out.
+        self.prune_worktree_overlay_basis_outside(live_worktrees)?;
         // Since #248 `edge_oracle` is content-keyed with NO `edges_data` FK (it survives reindex,
         // the moniker model), so the file/edge prune above no longer cascades verdicts
         // away. Dangling verdicts are harmless for correctness — every read joins live
@@ -179,6 +181,10 @@ impl IndexDatabase {
         // `multiple_real_repos` guard, so the prune runs unconditionally again (exactly as it did
         // on a single-repo DB before scoping).
         oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
+        // #114: `external_symbols` is checkout-keyed like `oracle_runs` (nothing cascades it), so a
+        // dead checkout's dependency contracts need the SAME per-repo, dead-scope prune — otherwise
+        // signature/doc payloads for retired branches/worktrees accumulate without bound.
+        oracle::prune_external_symbols_outside_scope(conn, live_commits, live_worktrees)?;
         // #357: `embedding_cache` is content-keyed too (survives reindex, like the oracle above),
         // so it needs the SAME global sweep — drop vectors no live chunk references in ANY
         // context (a sibling worktree / branch may still use one, so this must not be

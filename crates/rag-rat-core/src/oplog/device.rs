@@ -18,6 +18,7 @@
 use anyhow::Context;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use super::op::DeviceFingerprint;
@@ -100,6 +101,137 @@ impl DevicePublic {
         let signature = Signature::from_bytes(sig);
         self.0.verify_strict(msg, &signature).context("ed25519 signature verification failed")
     }
+}
+
+/// A device's X25519 ENCRYPTION secret — minted BESIDE the ed25519 signing key (sync phase C, §5),
+/// and, like it, rebuilt deterministically from persisted bytes. C1 only holds, persists, and
+/// validates it; no ECDH happens until C4. Its seed is INDEPENDENT of the ed25519 seed — the
+/// signing and encryption identities never share entropy. Intentionally not `Debug` / `Clone`.
+pub(super) struct DeviceX25519Secret(StaticSecret);
+
+impl DeviceX25519Secret {
+    /// Rebuild the X25519 secret from its persisted 32-byte scalar. `StaticSecret::from` and
+    /// `to_bytes` are inverses — x25519-dalek 2 stores the scalar VERBATIM (clamping happens at DH
+    /// / public derivation, not construction) — so the round-trip through
+    /// [`secret_bytes`](Self::secret_bytes) re-derives the SAME key. Deterministic (the backfill
+    /// tests rely on it).
+    pub(super) fn from_seed(seed: &[u8; 32]) -> Self {
+        // Scrub the stack copy; `StaticSecret` zeroizes its own copy on drop (dalek `zeroize`).
+        let seed = Zeroizing::new(*seed);
+        Self(StaticSecret::from(*seed))
+    }
+
+    /// Mint a FRESH X25519 secret from OS entropy — the production keygen path, routed through
+    /// [`from_seed`](Self::from_seed) so seeding stays the one construction point. Fails only if
+    /// the OS CSPRNG is unavailable.
+    pub(super) fn generate() -> anyhow::Result<Self> {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        getrandom::fill(seed.as_mut_slice())
+            .map_err(|e| anyhow::anyhow!("OS CSPRNG failed to seed an X25519 device key: {e}"))?;
+        Ok(Self::from_seed(&seed))
+    }
+
+    /// The 32-byte secret scalar, scrubbed. The persistence layer stores this so a reopened store
+    /// re-derives the same key — the only durable copy (plaintext-at-rest, D4).
+    pub(super) fn secret_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.0.to_bytes())
+    }
+
+    /// The matching public encryption key.
+    pub(super) fn public(&self) -> DeviceX25519Public {
+        DeviceX25519Public(X25519PublicKey::from(&self.0).to_bytes())
+    }
+}
+
+/// A device's X25519 ENCRYPTION public key — a Montgomery-u coordinate. Every 32-byte string
+/// decodes to *some* u-coordinate, so unlike an ed25519 key there is no curve-point rejection;
+/// [`from_bytes`](Self::from_bytes) is where the identity + small-order points are refused instead
+/// (the C1 half of §5 — the all-zero-shared-secret check is C4).
+///
+/// The type does NOT itself guarantee "blocklist-validated": [`DeviceX25519Secret::public`]
+/// constructs one directly (a key derived from a real secret is never small-order). The guarantee
+/// only matters for PEER keys — C4's `DeviceAdd` handling MUST route an incoming public key through
+/// [`from_bytes`](Self::from_bytes) to hit the blocklist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DeviceX25519Public([u8; 32]);
+
+impl DeviceX25519Public {
+    /// Parse a 32-byte X25519 public key, rejecting the identity and the known small-order points
+    /// (a key that would force an all-zero shared secret). X25519 ignores bit 255 of the
+    /// u-coordinate, so the comparison masks it — a `| 0x80` variant of a blocklisted point is
+    /// the same point and must not slip past.
+    pub(super) fn from_bytes(bytes: &[u8; 32]) -> anyhow::Result<Self> {
+        if is_small_order(bytes) {
+            anyhow::bail!("X25519 public key is a small-order / identity point");
+        }
+        Ok(Self(*bytes))
+    }
+
+    /// The 32-byte public key.
+    pub(super) fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// `p + delta` (`p = 2^255 - 19`) in little-endian 32-byte form, with bit 255 cleared. `delta ∈
+/// {0,1,2}` builds `p-1`, `p`, `p+1` (their byte-0 is `0xec`/`0xed`/`0xee`; the rest is the `0xff…`
+/// run ending `0x7f`). A `const fn` so the `0xff` run can't be mis-transcribed by hand.
+const fn p_offset(byte0: u8) -> [u8; 32] {
+    let mut v = [0xffu8; 32];
+    v[0] = byte0;
+    v[31] = 0x7f;
+    v
+}
+
+/// The `u = 1` low-order X25519 point in little-endian 32-byte form.
+const fn low_order_one() -> [u8; 32] {
+    let mut v = [0u8; 32];
+    v[0] = 1;
+    v
+}
+
+/// The canonical X25519 small-order point blocklist (RFC 7748 §6.1 / the libsodium
+/// `crypto_scalarmult_curve25519` blacklist). Every entry is a low-order point: DH with ANY scalar
+/// yields the all-zero shared secret, so accepting one as a peer's public key would silently
+/// produce a predictable key. A public key equal (mod the ignored high bit) to any of these is
+/// refused at `DeviceAdd`. Each is annotated by its u-coordinate, not its torsion order — order
+/// labels vary between references, whereas the verified property is the all-zero DH output.
+const X25519_SMALL_ORDER_POINTS: [[u8; 32]; 7] = [
+    // u = 0.
+    [0u8; 32],
+    // u = 1.
+    low_order_one(),
+    // u = 325606250916557431795983626356110631294008115727848805560023387167927233504.
+    [
+        0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4,
+        0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49,
+        0xb8, 0x00,
+    ],
+    // u = 39382357235489614581723060781553021112529911719440698176882885853963445705823.
+    [
+        0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
+        0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
+        0x11, 0x57,
+    ],
+    // u = p - 1  (p = 2^255 - 19).
+    p_offset(0xec),
+    // u = p      (≡ u = 0 mod p).
+    p_offset(0xed),
+    // u = p + 1  (≡ u = 1 mod p).
+    p_offset(0xee),
+];
+
+/// Whether `bytes` encodes a small-order / identity X25519 point. Masks bit 255 (which X25519
+/// clears) before comparing, so a high-bit-set variant of a blocklisted point is still caught. A
+/// plain (non-constant-time) compare is fine: the input is a public key, not secret material.
+fn is_small_order(bytes: &[u8; 32]) -> bool {
+    let mut candidate = *bytes;
+    candidate[31] &= 0x7f;
+    X25519_SMALL_ORDER_POINTS.iter().any(|bad| {
+        let mut bad = *bad;
+        bad[31] &= 0x7f;
+        candidate == bad
+    })
 }
 
 #[cfg(test)]
@@ -207,5 +339,62 @@ mod tests {
         assert!(refused > 0, "from_bytes must reject non-curve encodings");
         let real = DeviceSecret::from_seed(&seed_a()).public().to_bytes();
         assert!(DevicePublic::from_bytes(&real).is_ok(), "a genuine pubkey must parse");
+    }
+
+    #[test]
+    fn x25519_from_seed_is_deterministic() {
+        // The same seed yields the same X25519 key; a different seed differs — the property the
+        // reopen/backfill path relies on.
+        let a1 = DeviceX25519Secret::from_seed(&seed_a());
+        let a2 = DeviceX25519Secret::from_seed(&seed_a());
+        assert_eq!(a1.public().to_bytes(), a2.public().to_bytes());
+        let b = DeviceX25519Secret::from_seed(&seed_b());
+        assert_ne!(
+            a1.public().to_bytes(),
+            b.public().to_bytes(),
+            "a different seed is a different key"
+        );
+        // The secret round-trips through its persisted bytes (the reopen path).
+        let reloaded = DeviceX25519Secret::from_seed(&a1.secret_bytes());
+        assert_eq!(
+            a1.public().to_bytes(),
+            reloaded.public().to_bytes(),
+            "secret_bytes reconstructs the key"
+        );
+    }
+
+    #[test]
+    fn x25519_generate_is_nondeterministic() {
+        // Two independent generations must not collide — the CSPRNG, not a fixed seed, is the
+        // source.
+        let a = DeviceX25519Secret::generate().expect("OS CSPRNG available");
+        let b = DeviceX25519Secret::generate().expect("OS CSPRNG available");
+        assert_ne!(a.public().to_bytes(), b.public().to_bytes(), "generate must not repeat a key");
+    }
+
+    #[test]
+    fn x25519_from_bytes_rejects_small_order_and_identity_points() {
+        // Every canonical small-order encoding (identity + order 2/4/8 + p-1/p/p+1) must be
+        // refused, INCLUDING the high-bit-set variant X25519 treats as the same point —
+        // else a peer could add a device whose encryption key forces an all-zero shared
+        // secret.
+        for bad in X25519_SMALL_ORDER_POINTS {
+            assert!(
+                DeviceX25519Public::from_bytes(&bad).is_err(),
+                "small-order point accepted: {bad:02x?}",
+            );
+            let mut high_bit = bad;
+            high_bit[31] |= 0x80;
+            assert!(
+                DeviceX25519Public::from_bytes(&high_bit).is_err(),
+                "high-bit variant of a small-order point accepted: {high_bit:02x?}",
+            );
+        }
+        // A genuine device public key parses.
+        let real = DeviceX25519Secret::from_seed(&seed_a()).public().to_bytes();
+        assert!(
+            DeviceX25519Public::from_bytes(&real).is_ok(),
+            "a genuine X25519 pubkey must parse"
+        );
     }
 }

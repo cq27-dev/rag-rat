@@ -11,15 +11,15 @@ pub(crate) use registry::multiple_real_repos;
 pub(crate) use registry::{
     CONNECTION_CONTEXT_GENERATION_KEY, CONNECTION_CONTEXT_REPO_KEY, LIVE_FILES_GENERATION_META_KEY,
     active_generation, active_repo_id, connection_context_value, earliest_recorded_root,
-    live_files_generation, periphery_repo_scope, periphery_repo_scope_clause,
+    live_files_generation, periphery_repo_scope, periphery_repo_scope_clause, registered_repos,
     repo_has_recorded_root, repo_id_is_registered, resolve_config_repo_id, scope_context_repo_id,
     sole_repo_id,
 };
-pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
+pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 55;
+pub const LATEST_SCHEMA_VERSION: u32 = 58;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -45,7 +45,7 @@ pub const LATEST_SCHEMA_VERSION: u32 = 55;
 // it is intentionally a durable schema-invariant declaration.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const ORACLE_PERSISTED_TABLES: &[&str] =
-    &["edge_oracle", "logical_symbol_monikers", "oracle_runs"];
+    &["edge_oracle", "logical_symbol_monikers", "oracle_runs", "external_symbols"];
 
 /// The parent tables a reindex REWRITES (full rebuild and/or per-file `remove_file_in_scope`), so
 /// an `ON DELETE CASCADE`/`RESTRICT` FK from an oracle-derived table to one of these wipes the
@@ -382,6 +382,34 @@ const MIGRATION_055_DESCRIPTION: &str =
      instead of stamping, and only a SECOND consecutive gone observation persists the downgrade — \
      so a single torn observation (a validate racing a rebuild window, or a sweep from a narrower \
      checkout) cannot flip a healthy anchor to gone and hand doctor destructive advice";
+const MIGRATION_056_ID: &str = "056_git_change_couplings";
+const MIGRATION_056_CHECKSUM: &str = "sha256:rag-rat-git-change-couplings-v56";
+const MIGRATION_056_DESCRIPTION: &str =
+    "Add git_change_couplings (#566), the windowed file-pair change-coupling table derived from \
+     git_file_changes: one STRICT symmetric row per unordered pair (path_a < path_b) holding raw \
+     co-change + endpoint counts over a bounded recency window of eligible commits, keyed \
+     (repo_id, path_a, path_b) with a secondary (repo_id, path_b) index. A DerivedIndex table \
+     (repo_id-scoped, no FK to the volatile history rows): wholesale-recomputed lazily on the \
+     impact_surface read path against a repo_meta 'git_coupling_stamp', never patched \
+     incrementally. Fresh + empty on create; the first git-inclusive impact read fills it";
+const MIGRATION_057_ID: &str = "057_external_symbols";
+const MIGRATION_057_CHECKSUM: &str = "sha256:rag-rat-external-symbols-v57";
+const MIGRATION_057_DESCRIPTION: &str =
+    "Add external_symbols (#114), the per-moniker dependency contract oracle run parses out of \
+     the .scip index.external_symbols (kind, display_name, signature_documentation text, \
+     documentation, a derived deprecated flag) — data from_index previously discarded. \
+     Oracle-persisted, content/moniker-keyed with NO reindex-cascading FK, checkout-scoped \
+     (repo_id, tool, commit_sha, worktree_id) from birth; moniker is the RAW SCIP symbol string \
+     so it exact-joins edge_oracle.scip_symbol. Backs the check_library_usage tool that surfaces \
+     the current signature/docs at external call sites and flags deprecated usage";
+const MIGRATION_058_ID: &str = "058_oplog_device_x25519";
+const MIGRATION_058_CHECKSUM: &str = "sha256:rag-rat-oplog-device-x25519-v58";
+const MIGRATION_058_DESCRIPTION: &str =
+    "Add x25519_secret + x25519_public (nullable BLOB) to oplog_device_identity (sync phase C, \
+     §5): the device's X25519 ENCRYPTION keypair beside its ed25519 signing key. Additive on the \
+     STRICT table; an existing ed25519-only row is backfilled at the next local_device open via a \
+     CAS UPDATE that mirrors the ed25519 mint-if-absent race, so concurrent opens converge on one \
+     encryption identity. C1 only mints/persists/validates the key; ECDH + HKDF is C4";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -516,6 +544,10 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     // clear it, or the remedy would leave the DB refusing every open forever (#498). A crash
     // before this point keeps the marker, so a genuinely torn apply still reads as Dirty.
     conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
+    // #585: record which binary brought the schema current, so a stranded fleet is diagnosable.
+    // Best-effort: the schema is already applied, and provenance is diagnostic — a stamp failure
+    // must not fail the migration (the reader tolerates an absent record).
+    let _ = record_migration_provenance(conn);
     Ok(())
 }
 
@@ -854,6 +886,24 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_055_DESCRIPTION,
         apply: apply_binding_downgrade_marker,
     },
+    Migration {
+        id: MIGRATION_056_ID,
+        checksum: MIGRATION_056_CHECKSUM,
+        description: MIGRATION_056_DESCRIPTION,
+        apply: apply_git_change_couplings,
+    },
+    Migration {
+        id: MIGRATION_057_ID,
+        checksum: MIGRATION_057_CHECKSUM,
+        description: MIGRATION_057_DESCRIPTION,
+        apply: apply_external_symbols,
+    },
+    Migration {
+        id: MIGRATION_058_ID,
+        checksum: MIGRATION_058_CHECKSUM,
+        description: MIGRATION_058_DESCRIPTION,
+        apply: apply_oplog_device_x25519,
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -885,6 +935,10 @@ pub fn migrate_forward(conn: &Connection) -> anyhow::Result<()> {
             record_migration(conn, step.id, step.checksum, step.description)?;
         }
     }
+    // #585: this path only runs when a forward migration actually happened (early-returned above
+    // otherwise) — stamp who did it (the shared-store stranding path). Best-effort: the migration
+    // has committed; a diagnostic stamp failure must not fail it (the reader tolerates absence).
+    let _ = record_migration_provenance(conn);
     Ok(())
 }
 
@@ -956,13 +1010,17 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
             current_version: known_version(&migrations),
             latest_version: LATEST_SCHEMA_VERSION,
             migrations,
-            // #484: on a shared global DB one upgraded agent migrates the schema and every
-            // process still on an older binary lands here — the refusal must carry the remedy,
-            // because it surfaces as the error text of every CLI/MCP open.
+            // #484/#585: on a shared global DB one upgraded agent migrates the schema and every
+            // process still on an older binary lands here — the refusal must carry the remedy AND
+            // name this binary's schema ceiling + WHO migrated the store (from provenance), because
+            // it surfaces as the error text of every CLI/MCP open and is how a fleet outage is
+            // diagnosed.
             message: format!(
-                "index schema was created by a newer rag-rat; refusing to open — upgrade rag-rat \
-                 or restart sessions/servers still running an older binary{}",
-                hot_upgrade_caveat()
+                "index schema was created by a newer rag-rat; refusing to open — this rag-rat \
+                 supports up to schema v{LATEST_SCHEMA_VERSION}, so upgrade rag-rat or restart \
+                 sessions/servers still running an older binary{}{}",
+                hot_upgrade_caveat(),
+                migration_provenance_note(conn),
             ),
         });
     }

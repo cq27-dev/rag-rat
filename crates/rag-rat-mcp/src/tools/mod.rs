@@ -10,6 +10,7 @@ pub use catalog::*;
 pub(crate) use defaults::*;
 pub(crate) use handlers::*;
 use rag_rat_core::config::MemorySurface;
+use rag_rat_core::index::oracle::LibraryUsageOptions;
 use rag_rat_core::language::Language;
 use rag_rat_core::query::clusters::RepoClustersOptions;
 use rag_rat_core::query::graph::{GraphResolutionMode, GraphTraversalOptions};
@@ -68,6 +69,15 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
 
 fn is_read_only_tool(name: &str) -> bool {
     !is_write_tool(name)
+}
+
+/// Whether `name` is an advertised tool. [`TOOL_NAMES`] is the single source of truth `list_tools`
+/// advertises and is kept routable by the dispatcher
+/// (`mcp_stdio_every_advertised_tool_is_routable`), so this is the same "is this a real tool" test
+/// the active `call_tool_for_config` applies — used by the dormant server to reject an
+/// unknown/misspelled name instead of masking it as `no_index`.
+pub(crate) fn is_known_tool(name: &str) -> bool {
+    TOOL_NAMES.contains(&name)
 }
 
 /// Read tools that compare indexed graph/symbol data against LIVE on-disk source text, read through

@@ -693,6 +693,58 @@ pub(crate) fn apply_scip_moniker_anchors(conn: &Connection) -> rusqlite::Result<
     Ok(())
 }
 
+/// V056 (#114): `external_symbols` — the per-moniker `SymbolInformation` (`kind`, `display_name`,
+/// `signature_documentation.text`, `documentation`, a derived `deprecated` flag) that `oracle run`
+/// parses out of `index.external_symbols` and previously DISCARDED. This is the dependency-side
+/// contract that `check_library_usage` joins to external call sites to surface signature/docs as
+/// inline context and to assert deprecated-but-compiling usage.
+///
+/// JOIN CONTRACT (load-bearing): `moniker` is the RAW SCIP symbol string, stored byte-for-byte as
+/// it appears in `SymbolInformation.symbol` — the SAME form `edge_oracle.scip_symbol` stores (an
+/// occurrence's `symbol`, unstabilized; see `oracle::join::classify_edge`). The read join is an
+/// exact string match on `moniker = edge_oracle.scip_symbol`; applying `stabilize_moniker_version`
+/// to one side and not the other would silently break it. External monikers carry the dependency's
+/// real version, so a cross-version re-index naturally produces distinct rows (the drift the spike
+/// targets).
+///
+/// INVARIANT (oracle-persisted, #248): NO foreign key — the table is content/moniker-keyed and its
+/// reads JOIN live `edge_oracle`, so a dangling row never resolves rather than being CASCADE-wiped
+/// on reindex. Listed in [`super::ORACLE_PERSISTED_TABLES`]. Born post-A5, so `repo_id` is a birth
+/// column and leads the PK.
+///
+/// CHECKOUT-SCOPED like its run sibling `oracle_runs` (NOT like `logical_symbol_monikers`): the
+/// contract set is the product of ONE oracle run in ONE checkout, so the PK carries `(commit_sha,
+/// worktree_id)`. Two linked worktrees of the same repo — at different dependency versions — keep
+/// DISJOINT contract sets, so the later run's authoritative per-`(tool, checkout)` clear cannot
+/// erase a sibling checkout's contracts (the same multi-worktree isolation `edge_oracle` /
+/// `oracle_runs` already enforce). `tool_version` rides along as write provenance; the moniker's
+/// version component still distinguishes dependency versions within a checkout.
+pub(crate) fn apply_external_symbols(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS external_symbols(
+            repo_id            TEXT NOT NULL,
+            tool               TEXT NOT NULL,
+            tool_version       TEXT NOT NULL,
+            commit_sha         TEXT NOT NULL,
+            worktree_id        TEXT NOT NULL,
+            moniker            TEXT NOT NULL,
+            kind               TEXT NOT NULL,
+            display_name       TEXT NOT NULL,
+            signature_text     TEXT NOT NULL,
+            signature_language TEXT NOT NULL,
+            documentation      TEXT NOT NULL,
+            deprecated         INTEGER NOT NULL,
+            computed_at_ms     INTEGER NOT NULL,
+            PRIMARY KEY(repo_id, tool, commit_sha, worktree_id, moniker)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_external_symbols_deprecated
+            ON external_symbols(repo_id, tool, commit_sha, worktree_id, deprecated);
+        ",
+    )
+}
+
 /// The integer indexes on `edges_data` (#79) — the successors of the old TEXT indexes on `edges`.
 /// Called from baseline (fresh DBs) AND after the V020 conversion (upgrading DBs, where the
 /// same-named legacy indexes blocked `IF NOT EXISTS` until `DROP TABLE edges` removed them).
@@ -1190,6 +1242,9 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_053_ID => Some(53),
             MIGRATION_054_ID => Some(54),
             MIGRATION_055_ID => Some(55),
+            MIGRATION_056_ID => Some(56),
+            MIGRATION_057_ID => Some(57),
+            MIGRATION_058_ID => Some(58),
             _ => None,
         })
         .max()
@@ -1254,6 +1309,9 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_053_ID
             | MIGRATION_054_ID
             | MIGRATION_055_ID
+            | MIGRATION_056_ID
+            | MIGRATION_057_ID
+            | MIGRATION_058_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1315,6 +1373,9 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_053_ID => migration.checksum != MIGRATION_053_CHECKSUM,
         MIGRATION_054_ID => migration.checksum != MIGRATION_054_CHECKSUM,
         MIGRATION_055_ID => migration.checksum != MIGRATION_055_CHECKSUM,
+        MIGRATION_056_ID => migration.checksum != MIGRATION_056_CHECKSUM,
+        MIGRATION_057_ID => migration.checksum != MIGRATION_057_CHECKSUM,
+        MIGRATION_058_ID => migration.checksum != MIGRATION_058_CHECKSUM,
         _ => false,
     }
 }
@@ -1331,6 +1392,65 @@ pub(crate) fn record_migration(
         params![id, now_ms(), checksum, description],
     )?;
     Ok(())
+}
+
+/// GLOBAL `index_meta` keys recording WHO last brought this store's schema current (#585). About
+/// the DB file, not a repo — so they live in `index_meta`, not `repo_meta`. Overwritten each time a
+/// migration/create runs, so a stranded fleet is diagnosable in one query instead of forensics.
+pub(crate) const MIGRATION_PROVENANCE_KEYS: &[&str] = &[
+    "last_migration_binary_version",
+    "last_migration_binary_exe",
+    "last_migration_to_version",
+    "last_migration_at_ms",
+];
+
+/// Stamp the migration-provenance keys after the schema is brought current. The binary version is
+/// [`crate::binary_version`] (the CLI's git-stamped `RAG_RAT_VERSION`, else `CARGO_PKG_VERSION`),
+/// so a dev build that migrates a shared store leaves a `+g<hash>` fingerprint that names it.
+///
+/// ONE atomic multi-row upsert: statement-level atomicity means a mid-write failure (e.g. a
+/// concurrent writer's `SQLITE_BUSY`) leaves NO partial provenance — all four keys land or none do,
+/// so the reader never sees a half-written record. Call sites treat a failure here as best-effort
+/// (the migration already committed; provenance is diagnostic), so a stamp failure never fails the
+/// migration — it just leaves the record absent until the next one, which the reader handles.
+pub(crate) fn record_migration_provenance(conn: &Connection) -> rusqlite::Result<()> {
+    let exe =
+        std::env::current_exe().ok().map(|path| path.display().to_string()).unwrap_or_default();
+    conn.execute(
+        "INSERT INTO index_meta(key, value) VALUES (?1, ?2), (?3, ?4), (?5, ?6), (?7, ?8) ON \
+         CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![
+            MIGRATION_PROVENANCE_KEYS[0],
+            crate::binary_version(),
+            MIGRATION_PROVENANCE_KEYS[1],
+            exe,
+            MIGRATION_PROVENANCE_KEYS[2],
+            LATEST_SCHEMA_VERSION.to_string(),
+            MIGRATION_PROVENANCE_KEYS[3],
+            now_ms().to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// A human note naming who last migrated this store, appended to the `Newer` refusal (#585). Empty
+/// when no provenance is recorded (an older DB, or one never migrated by a provenance-aware
+/// binary). Defensive: any read error yields "" — `status` must never fail on a weird DB.
+pub(crate) fn migration_provenance_note(conn: &Connection) -> String {
+    let read = |key: &str| -> Option<String> {
+        conn.query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+        .filter(|value| !value.is_empty())
+    };
+    match (read("last_migration_binary_version"), read("last_migration_binary_exe")) {
+        (Some(version), Some(exe)) => {
+            format!("; the index was last migrated by rag-rat {version} at {exe}")
+        },
+        (Some(version), None) => format!("; the index was last migrated by rag-rat {version}"),
+        _ => String::new(),
+    }
 }
 
 pub(crate) fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
@@ -2471,7 +2591,7 @@ fn github_object_exists(conn: &Connection, kind: &str, name: &str) -> rusqlite::
 }
 
 /// Rebuild `github_issues` dropping the inline `UNIQUE(owner, repo, number)` and adding a NAMED
-/// unique index `(repo_id, owner, repo, number)` (the V044 sentinel + the `store_issue` `ON
+/// unique index `(repo_id, owner, repo, number)` (the V044 sentinel + the `store_item` `ON
 /// CONFLICT` target). The full V041 column set (through `repo_id`) is reproduced verbatim; `id`
 /// values are copied so a mid-flight papertrail resync's `github_fts.item_id` stays stable. Runs
 /// inside the caller's transaction (opens none of its own).
@@ -2511,8 +2631,8 @@ fn rebuild_github_issues_with_repo_scoped_key(conn: &Connection) -> rusqlite::Re
 }
 
 /// Rebuild `github_pull_requests` dropping the inline `UNIQUE(owner, repo, number)` and adding a
-/// NAMED unique index `(repo_id, owner, repo, number)` (the `store_pull` `ON CONFLICT` target). See
-/// [`rebuild_github_issues_with_repo_scoped_key`] for the shared rationale.
+/// NAMED unique index `(repo_id, owner, repo, number)` (the `store_item` change-request `ON
+/// CONFLICT` target). See [`rebuild_github_issues_with_repo_scoped_key`] for the shared rationale.
 fn rebuild_github_pull_requests_with_repo_scoped_key(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -2793,7 +2913,7 @@ pub(crate) fn apply_memory_model_failures_table(conn: &Connection) -> rusqlite::
 /// duplicated child rows still cannot FIND them through the scoped FTS readers
 /// (`rationale_search` / papertrail filter `repo_id = active`) until some later github sync
 /// happens to run the sync-tail rebuild — the migration would fix the base tables while the
-/// mirror kept serving the last-syncer state. The derivation mirrors `github::rebuild_fts`'s
+/// mirror kept serving the last-syncer state. The derivation mirrors `papertrail::rebuild_fts`'s
 /// column mapping exactly (per-kind title slots; reviews' `COALESCE(html_url,'')`); the
 /// `classification` column is a Rust-derived label (`classify_text`), so it is CARRIED from the
 /// old mirror by `(item_kind, item_id)` — identical per item across per-repo duplicates — with
@@ -3686,6 +3806,20 @@ pub(crate) fn apply_oplog_device_identity(conn: &Connection) -> rusqlite::Result
     Ok(())
 }
 
+/// V058 (sync phase C, §5): give the single device identity an X25519 ENCRYPTION keypair beside its
+/// ed25519 signing key. Two nullable `BLOB` columns — `x25519_secret` (the 32-byte scalar, the sole
+/// durable copy, D4) and `x25519_public` — added to the STRICT `oplog_device_identity` table
+/// (`BLOB` is a valid STRICT type). Nullable + additive: an existing row keeps its ed25519 identity
+/// and is backfilled at the next `local_device` open via a CAS UPDATE (mirroring the ed25519
+/// mint-if-absent race), so a concurrent open cannot split into two encryption identities.
+/// Idempotent via `add_column_if_missing`; on a fresh DB this runs right after V054 creates the
+/// table, so both columns are present before the first `local_device` call.
+pub(crate) fn apply_oplog_device_x25519(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "oplog_device_identity", "x25519_secret", "BLOB")?;
+    add_column_if_missing(conn, "oplog_device_identity", "x25519_public", "BLOB")?;
+    Ok(())
+}
+
 /// V055 (#492): the anchor-status downgrade hysteresis marker. INVARIANT: NULL means "no gone
 /// observation is pending" — every persisted non-deferred stamp clears it, so a non-null marker
 /// only ever bridges two CONSECUTIVE gone observations of the same binding. Nullable and
@@ -3694,6 +3828,53 @@ pub(crate) fn apply_oplog_device_identity(conn: &Connection) -> rusqlite::Result
 pub(crate) fn apply_binding_downgrade_marker(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "repo_memory_bindings", "downgrade_pending_at_ms", "INTEGER")?;
     Ok(())
+}
+
+/// V056 (#566): the windowed file-pair change-coupling table, derived from `git_file_changes` over
+/// a bounded recency window of eligible commits. INVARIANTS:
+///  * PURE GIT-HISTORY table: the stored rows are a function of `(git-history window, params)` ONLY
+///    — no `files`-view dependence (generation / generated flag / worktree scope). This makes the
+///    freshness stamp complete by construction; the generated / existence filter is a READ-time
+///    concern (a generated or absent-at-HEAD partner is stored but not surfaced).
+///  * `path_a < path_b` (BINARY) — exactly ONE symmetric row per unordered pair; the two
+///    directional confidences (`P(B|A)` / `P(A|B)`) are derived at READ time from the endpoint
+///    counts.
+///  * DerivedIndex posture: rows are wholesale `DELETE` + `INSERT`ed per recompute inside one
+///    transaction, stamped via `repo_meta` `'git_coupling_stamp'` (=
+///    `history_freshness_key:params`). Rows are never patched incrementally; a stale/absent stamp
+///    means "recompute or treat as absent", never "trust the rows". No FK to `git_file_changes` /
+///    `git_commits`: the row aggregates over commits and must survive a history full-replace
+///    between recompute passes (the stamp, not row integrity, is the freshness authority).
+///  * WRITE-time storage floors (both pure git-history): `co_change_count >= MIN_COUPLING_SUPPORT`
+///    AND `lift = co * N / (a_count * b_count) >= MIN_COUPLING_LIFT`. The lift floor bounds the
+///    table without a per-file cap — a hub file scores `lift ~= 1` with everything and is dropped
+///    here.
+///  * Direct `repo_id` scope (V040): every reader joins AND filters on `repo_id` — a fork sharing
+///    commit hashes must never surface a sibling repo's couplings. The PK covers `(repo_id,
+///    path_a)` lookups; the secondary index covers `(repo_id, path_b)`, so one `OR` query serves
+///    both directions of the symmetric row.
+///
+/// Additive + idempotent (`CREATE ... IF NOT EXISTS`); a fresh DB creates it empty and the first
+/// git-inclusive `impact_surface` read fills it.
+pub(crate) fn apply_git_change_couplings(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS git_change_couplings(
+            repo_id TEXT NOT NULL,
+            path_a TEXT NOT NULL,
+            path_b TEXT NOT NULL,
+            co_change_count INTEGER NOT NULL,
+            path_a_change_count INTEGER NOT NULL,
+            path_b_change_count INTEGER NOT NULL,
+            window_commit_count INTEGER NOT NULL,
+            last_co_change_at_s INTEGER NOT NULL,
+            computed_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(repo_id, path_a, path_b)
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_git_change_couplings_b
+            ON git_change_couplings(repo_id, path_b);
+        ",
+    )
 }
 
 pub(crate) fn apply_symbols_is_test(conn: &Connection) -> rusqlite::Result<()> {

@@ -21,7 +21,11 @@ const TOOL_WORKERS_ENV: &str = "RAG_RAT_MCP_TOOL_WORKERS";
 
 #[derive(Clone)]
 pub struct RagRatService {
-    config: Config,
+    /// `None` ⇒ DORMANT: the server was launched outside any rag-rat repo (no `rag-rat.toml` at or
+    /// above cwd). It still speaks MCP so a globally-registered server stays alive, but every tool
+    /// call returns the dormant notice ([`dormant_tool_result`]) instead of touching an index.
+    /// `Some` ⇒ the active server bound to a resolved repo config.
+    config: Option<Config>,
     /// Output format for tool results. Defaults to TOON (denser for the LLM that reads them); set
     /// to JSON when the server was launched as `rag-rat mcp --json` — MCP has no per-call flag, so
     /// the choice is made once at launch (the CLI `--json` flag flows in via `run_stdio`).
@@ -34,7 +38,24 @@ pub struct RagRatService {
 }
 
 impl RagRatService {
+    /// The ACTIVE server bound to a resolved repo config. Published constructor — its
+    /// `new(Config, …)` signature is preserved for source compatibility; the config-less DORMANT
+    /// server is built via [`RagRatService::new_dormant`] instead of widening this to `Option`.
     pub fn new(config: Config, output_format: rag_rat_core::OutputFormat) -> Self {
+        Self::with_optional_config(Some(config), output_format)
+    }
+
+    /// The DORMANT server (launched outside any rag-rat repo): no config, so every tool call
+    /// returns [`RagRatService::dormant_tool_result`]. Separate from [`RagRatService::new`] so
+    /// that constructor's published signature stays source-compatible (#603).
+    pub(crate) fn new_dormant(output_format: rag_rat_core::OutputFormat) -> Self {
+        Self::with_optional_config(None, output_format)
+    }
+
+    fn with_optional_config(
+        config: Option<Config>,
+        output_format: rag_rat_core::OutputFormat,
+    ) -> Self {
         Self {
             config,
             output_format,
@@ -51,7 +72,22 @@ impl RagRatService {
     }
 
     fn call(&self, name: &str, value: Value) -> Result<CallToolResult, ErrorData> {
-        let value = crate::tools::call_tool_for_config(&self.config, name, value)
+        // Dormant (launched outside a repo): return the notice. We deliberately do NOT re-discover
+        // and serve a config that appears mid-session — a server without the active lifecycle
+        // (watcher, git-hook freshness) could return results NOT validated against current source,
+        // breaking rag-rat's core guarantee. Dormancy is binary: dormant, or fully active from
+        // launch. The notice tells the user to restart the MCP server after `init` + `index`
+        // (#603).
+        let Some(config) = &self.config else {
+            // A dormant server still rejects an UNKNOWN tool name exactly like an active one, so a
+            // typo or stale tool surfaces as an error instead of being masked as `no_index`. Only a
+            // KNOWN (advertised) tool earns the dormant notice.
+            if !crate::tools::is_known_tool(name) {
+                return Err(ErrorData::internal_error(format!("unknown tool `{name}`"), None));
+            }
+            return Ok(self.dormant_tool_result());
+        };
+        let value = crate::tools::call_tool_for_config(config, name, value)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
         // MCP tool results are text content read by an LLM, so render TOON by default — it is
         // materially denser than JSON on the uniform-row payloads that dominate these tools, and
@@ -96,10 +132,13 @@ impl RagRatService {
     /// (or concatenate all text blocks), and a prose block would break them. The nudge is
     /// agent-directed prose, meaningful only in the default TOON (LLM-facing) mode.
     fn stale_memory_nudge(&self) -> Option<String> {
+        // No nudge in dormant mode (no index to read) or in `--json` mode (prose breaks JSON
+        // clients).
+        let config = self.config.as_ref()?;
         if self.output_format == rag_rat_core::OutputFormat::Json {
             return None;
         }
-        let n = rag_rat_core::memory_attention_count(&self.config.database);
+        let n = rag_rat_core::memory_attention_count(&config.database);
         (n > 0).then(|| {
             let noun = if n == 1 { "memory" } else { "memories" };
             format!(
@@ -108,6 +147,23 @@ impl RagRatService {
                  source-anchored memory stays trustworthy for the next agent."
             )
         })
+    }
+
+    /// The result every tool call returns while the server is DORMANT (launched outside any rag-rat
+    /// repo, and cwd STILL has no config). Rendered through the SAME output-format path as every
+    /// tool result, so `--json` mode yields a directly-parseable JSON block (the JSON contract
+    /// holds in dormant mode too) while the default TOON mode stays LLM-friendly. NON-error:
+    /// the agent reads it as a normal response explaining how to enable an index.
+    fn dormant_tool_result(&self) -> CallToolResult {
+        let payload = serde_json::json!({
+            "status": "no_index",
+            "message": "This rag-rat MCP server was started outside an indexed rag-rat repository, \
+                        so it has no index to serve here.",
+            "remedy": "Run `rag-rat init` then `rag-rat index` in the repository root, then restart \
+                       (reconnect) the rag-rat MCP server so it activates against the new index.",
+        });
+        let text = rag_rat_core::render(&payload, self.output_format);
+        CallToolResult::success(vec![Content::text(text)])
     }
 }
 
@@ -319,6 +375,10 @@ fn tool_timeout_error(
     ))
 }
 
+/// Serve the stdio MCP server for a RESOLVED repo config — the ACTIVE server: keeps the index fresh
+/// (watcher), serves the grep-hook listener, and (Unix) arms the SIGUSR1 hot-upgrade. Published
+/// entry point; its `run_stdio(Config, …)` signature is preserved for source compatibility. The
+/// config-less DORMANT server is [`run_stdio_dormant`].
 pub async fn run_stdio(
     config: Config,
     output_format: rag_rat_core::OutputFormat,
@@ -336,6 +396,18 @@ pub async fn run_stdio(
         service.waiting().await?;
         Ok(())
     }
+}
+
+/// The DORMANT server (launched outside any rag-rat repo, so no config resolved): no watcher, no
+/// hook listener, no hot-upgrade — nothing to keep fresh. It just serves the MCP protocol until the
+/// client disconnects; `tools/list` still advertises the full catalog, but every `tools/call`
+/// returns [`RagRatService::dormant_tool_result`]. Split from [`run_stdio`] so that published
+/// `run_stdio(Config)` signature stays source-compatible, while a globally-registered `rag-rat mcp`
+/// can still stay alive in a non-rag-rat project instead of dying (#603).
+pub async fn run_stdio_dormant(output_format: rag_rat_core::OutputFormat) -> anyhow::Result<()> {
+    let running = RagRatService::new_dormant(output_format).serve(rmcp::transport::stdio()).await?;
+    running.waiting().await?;
+    Ok(())
 }
 
 /// Aborts a spawned task when dropped. Used to tear down the hook listener on normal EOF

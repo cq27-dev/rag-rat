@@ -1,33 +1,33 @@
 use super::*;
 use crate::index::{repo_meta, schema, scoped_table_row_count, set_repo_meta};
 
-pub(crate) fn sync_from_refs<C: GitHubClient>(
+pub(crate) async fn sync_from_refs<C: PapertrailClient>(
     conn: &Connection,
     root: &Path,
     client: Option<&C>,
     offline: bool,
-    ctx: &GitHubContext,
-) -> anyhow::Result<GitHubSyncReport> {
-    sync_from_refs_with_progress(conn, root, client, offline, ctx, |_| {})
+    ctx: &PapertrailContext,
+) -> anyhow::Result<PapertrailSyncReport> {
+    sync_from_refs_with_progress(conn, root, client, offline, ctx, |_| {}).await
 }
-pub(crate) fn sync_from_refs_with_progress<C: GitHubClient>(
+pub(crate) async fn sync_from_refs_with_progress<C: PapertrailClient>(
     conn: &Connection,
     root: &Path,
     client: Option<&C>,
     offline: bool,
-    ctx: &GitHubContext,
-    mut progress: impl FnMut(GitHubSyncProgress),
-) -> anyhow::Result<GitHubSyncReport> {
+    ctx: &PapertrailContext,
+    mut progress: impl FnMut(PapertrailSyncProgress),
+) -> anyhow::Result<PapertrailSyncReport> {
     let refs = discover_and_store_refs(conn, root, ctx)?;
     let sync = if offline {
         SyncRefsReport::default()
     } else {
         let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
-        sync_refs(conn, client, refs.iter(), &mut progress)?
+        sync_refs(conn, client, refs.iter(), &mut progress).await?
     };
     let repo_id = schema::active_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, "github_last_sync_ms", &now_ms().to_string())?;
-    Ok(GitHubSyncReport {
+    Ok(PapertrailSyncReport {
         offline,
         discovered_refs: refs.len(),
         skipped_refs: sync.skipped_refs,
@@ -37,16 +37,16 @@ pub(crate) fn sync_from_refs_with_progress<C: GitHubClient>(
         status: status(conn, ctx)?,
     })
 }
-pub(crate) fn sync_issue<C: GitHubClient>(
+pub(crate) async fn sync_issue<C: PapertrailClient>(
     conn: &Connection,
     issue_ref: &str,
     client: Option<&C>,
     offline: bool,
-    ctx: &GitHubContext,
-) -> anyhow::Result<GitHubSyncReport> {
+    ctx: &PapertrailContext,
+) -> anyhow::Result<PapertrailSyncReport> {
     let parsed = parse_issue_ref(issue_ref, ctx.default_repo())
         .ok_or_else(|| anyhow::anyhow!("invalid GitHub issue reference `{issue_ref}`"))?;
-    store_ref(conn, &GitHubRef {
+    store_ref(conn, &PapertrailRef {
         owner: parsed.owner,
         repo: parsed.repo,
         number: parsed.number,
@@ -61,11 +61,12 @@ pub(crate) fn sync_issue<C: GitHubClient>(
         SyncRefsReport::default()
     } else {
         let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
-        sync_refs(conn, client, refs.iter().filter(|r| r.number == parsed.number), &mut |_| {})?
+        sync_refs(conn, client, refs.iter().filter(|r| r.number == parsed.number), &mut |_| {})
+            .await?
     };
     let repo_id = schema::active_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, "github_last_sync_ms", &now_ms().to_string())?;
-    Ok(GitHubSyncReport {
+    Ok(PapertrailSyncReport {
         offline,
         discovered_refs: refs.len(),
         skipped_refs: sync.skipped_refs,
@@ -75,11 +76,14 @@ pub(crate) fn sync_issue<C: GitHubClient>(
         status: status(conn, ctx)?,
     })
 }
-pub(crate) fn status(conn: &Connection, ctx: &GitHubContext) -> anyhow::Result<GitHubStatus> {
+pub(crate) fn status(
+    conn: &Connection,
+    ctx: &PapertrailContext,
+) -> anyhow::Result<PapertrailStatus> {
     // The github_* tables are direct-scoped (V041); report only the ACTIVE repo's counts, not the
     // union across a consolidated DB.
     let repo_id = schema::active_repo_id(conn)?;
-    Ok(GitHubStatus {
+    Ok(PapertrailStatus {
         refs: scoped_table_row_count(conn, "github_refs", &repo_id)?,
         issues: scoped_table_row_count(conn, "github_issues", &repo_id)?,
         comments: scoped_table_row_count(conn, "github_comments", &repo_id)?,
@@ -99,15 +103,15 @@ pub(crate) fn issue_search(
     conn: &Connection,
     query: &str,
     limit: u32,
-) -> anyhow::Result<Vec<GitHubEvidence>> {
+) -> anyhow::Result<Vec<PapertrailEvidence>> {
     search_fts(conn, query, Some("issue"), limit)
 }
 pub(crate) fn rationale_search(
     conn: &Connection,
     query: &str,
     limit: u32,
-    ctx: &GitHubContext,
-) -> anyhow::Result<Vec<GitHubEvidence>> {
+    ctx: &PapertrailContext,
+) -> anyhow::Result<Vec<PapertrailEvidence>> {
     let mut evidence = Vec::new();
     for reference in parse_refs(query, ctx.default_repo()) {
         evidence.extend(evidence_for_issue(
@@ -127,7 +131,7 @@ pub(crate) fn refs_for_path(
     conn: &Connection,
     path: &str,
     limit: u32,
-) -> anyhow::Result<Vec<GitHubRef>> {
+) -> anyhow::Result<Vec<PapertrailRef>> {
     let repo_id = schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
@@ -145,7 +149,7 @@ pub(crate) fn papertrail_for_chunk(
     conn: &Connection,
     chunk: &crate::query::ReadChunk,
     limit: u32,
-    ctx: &GitHubContext,
+    ctx: &PapertrailContext,
 ) -> anyhow::Result<Papertrail> {
     let mut evidence = evidence_for_path(conn, &chunk.path, limit)?;
     if evidence.is_empty() {
@@ -167,7 +171,7 @@ pub(crate) fn papertrail_for_symbol(
     conn: &Connection,
     symbol: &crate::query::symbol::SymbolHit,
     limit: u32,
-    ctx: &GitHubContext,
+    ctx: &PapertrailContext,
 ) -> anyhow::Result<Papertrail> {
     let mut evidence = evidence_for_path(conn, &symbol.path, limit)?;
     evidence.extend(rationale_search(conn, &symbol.qualified_name, limit, ctx)?);
@@ -190,7 +194,7 @@ pub(crate) fn papertrail_for_commit(
     conn: &Connection,
     commit_hash: &str,
     limit: u32,
-    ctx: &GitHubContext,
+    ctx: &PapertrailContext,
 ) -> anyhow::Result<Papertrail> {
     let mut evidence = evidence_for_commit_refs(conn, commit_hash, limit)?;
     let mut fallback_evidence = Vec::new();
@@ -222,7 +226,7 @@ pub(crate) fn papertrail_for_commit(
         fallback_github_evidence: fallback_evidence,
     })
 }
-pub(crate) fn mark_fallback_evidence(evidence: &mut [GitHubEvidence]) {
+pub(crate) fn mark_fallback_evidence(evidence: &mut [PapertrailEvidence]) {
     for item in evidence {
         item.evidence_kind = match item.evidence_kind {
             "literal_github_ref" => "fallback_literal_github_ref",

@@ -47,6 +47,13 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
     "github_review_comments",
     "github_ref_sync",
     "github_fts",
+    // V056 (#566) derived change-coupling table: standalone, direct `repo_id`, no FK children, so
+    // a LocalOnly→Portable adoption re-points its rows here (moving them together with the
+    // `git_coupling_stamp` repo_meta so the derived table stays consistent + fresh), and the
+    // late-merge path DELETEs the retiring id's rows. Without this the stamp would move but the
+    // rows strand — `ensure_coupling_fresh` would then see a matching stamp and serve an empty
+    // section.
+    "git_change_couplings",
 ];
 
 /// The periphery tables that gain a `repo_id` column in the phase-A5 periphery-scoping migration
@@ -71,6 +78,9 @@ const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
     "oracle_runs",
     "edge_oracle",
     "logical_symbol_monikers",
+    // V056 (#114): the per-moniker external dependency contract, repo_id-scoped from birth like
+    // its oracle-periphery siblings; a LocalOnly→Portable adoption must re-point its rows too.
+    "external_symbols",
     "reconcile_attempts",
     "dream_findings",
     "repo_memories",
@@ -550,6 +560,9 @@ const LATE_MERGE_DERIVED_PERIPHERY_TABLES: &[&str] = &[
     "oracle_runs",
     "edge_oracle",
     "logical_symbol_monikers",
+    // V056 (#114): DERIVED (re-produced by a fresh oracle run under the target id), so it is
+    // DROPPED under the retiring id, not moved — same posture as edge_oracle.
+    "external_symbols",
     "reconcile_attempts",
     "dream_findings",
 ];
@@ -1023,6 +1036,45 @@ pub(crate) fn multiple_real_repos(conn: &Connection) -> rusqlite::Result<bool> {
         |row| row.get(0),
     )?;
     Ok(count > 1)
+}
+
+/// One REAL (non-placeholder) repo in this database's registry, with its recorded source roots —
+/// the read-only shape `doctor`'s machine-global-store report lists. `roots` can be empty (identity
+/// registered but no root recorded yet).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegisteredRepo {
+    pub repo_id: String,
+    pub display_name: String,
+    pub roots: Vec<String>,
+    pub registered_at_ms: i64,
+}
+
+/// List every REAL (non-placeholder) repo in the registry with its recorded roots, ordered by
+/// display name then id — read-only, for `doctor`'s global-store overview. Excludes the
+/// [`LEGACY_REPO_ID`] adoption placeholder.
+pub(crate) fn registered_repos(conn: &Connection) -> rusqlite::Result<Vec<RegisteredRepo>> {
+    let mut repos = conn
+        .prepare(
+            "SELECT repo_id, display_name, registered_at_ms FROM repos WHERE repo_id != ?1 ORDER \
+             BY display_name, repo_id",
+        )?
+        .query_map([LEGACY_REPO_ID], |row| {
+            Ok(RegisteredRepo {
+                repo_id: row.get(0)?,
+                display_name: row.get(1)?,
+                registered_at_ms: row.get(2)?,
+                roots: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut roots_stmt =
+        conn.prepare("SELECT root FROM repo_roots WHERE repo_id = ?1 ORDER BY root")?;
+    for repo in &mut repos {
+        repo.roots = roots_stmt
+            .query_map([&repo.repo_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+    }
+    Ok(repos)
 }
 
 /// Resolve the `repo_id` a config maps to on a connection WITHOUT registering anything — the

@@ -16,6 +16,23 @@ impl IndexDatabase {
         crate::query::graph::traverse(self.storage.connection(), symbol, true, limit)
     }
 
+    /// `check_library_usage` (#114): join the active checkout's `resolved-external` call sites to
+    /// the `external_symbols` dependency contracts, surface each dependency's current
+    /// signature/docs as context, and assert deprecated-but-compiling usage. Read-only;
+    /// requires an `oracle run` to have populated the side tables (else a `NoOracleRun` /
+    /// `NoExternalSymbols` status).
+    pub fn check_library_usage(
+        &self,
+        opts: &crate::index::oracle::LibraryUsageOptions,
+    ) -> anyhow::Result<crate::index::oracle::LibraryUsageReport> {
+        crate::index::oracle::check_library_usage(
+            self.storage.connection(),
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+            opts,
+        )
+    }
+
     pub fn find_callers_with_options(
         &self,
         symbol: &str,
@@ -740,6 +757,14 @@ impl IndexDatabase {
         if options.include_tests || options.include_docs || options.include_text_fallback {
             self.ensure_fts_fresh()?;
         }
+        // Change coupling is a DerivedIndex table (windowed file-pair co-change): lazily self-heal
+        // it on read, exactly where `ensure_fts_fresh` heals the text sections — but only
+        // when the git evidence lane is requested (the same `include_git` gate the coupling
+        // section rides). Kept OFF the index pass's terminal transaction; the read path is
+        // its recompute trigger.
+        if options.include_git {
+            self.ensure_coupling_fresh()?;
+        }
         // Surface the `Compiler` tier on impact's direct graph neighbors too (same read-side JOIN
         // as trace_callees/find_callers). The enrichment is now injected INTO the builder so it
         // runs over the OVERFETCHED candidate set before the re-rank + limit truncation (#82
@@ -792,11 +817,27 @@ impl IndexDatabase {
             .chain(report.tests_touching_symbol_path.iter())
             .chain(report.docs_mentioning_symbol_path.iter())
             .chain(report.text_fallback_hits.iter())
+            // A co-changed file that's dirty-since-index must count toward `stale_files` too, else
+            // the caller trusts a surface whose coupling lane has moved under it (#566 finding 2).
+            .chain(report.files_co_changed_with_symbol_path.iter())
         {
             result_paths.push(item.path.clone());
         }
         report.completeness_and_caveats.stale_files =
             u64::try_from(self.stale_source_paths(&result_paths)?.len()).unwrap_or(u64::MAX);
         Ok(report)
+    }
+
+    /// Lazy self-heal for the windowed change-coupling table (V056) — the DerivedIndex twin of
+    /// `ensure_fts_fresh`: recompute from `git_file_changes` when the `git_coupling_stamp` lags the
+    /// git-history freshness key (cursor snapshot) + params version, else a cheap stamp-only no-op.
+    /// The stored table is pure git-history, so a files-view change never triggers this.
+    /// Write-bearing (same posture as `ensure_fts_fresh` / `store_blame`), so it stays OFF the
+    /// index pass's terminal transaction.
+    pub(crate) fn ensure_coupling_fresh(&self) -> anyhow::Result<()> {
+        crate::index::change_coupling::ensure_coupling_fresh(
+            self.storage.connection(),
+            crate::index::now_ms(),
+        )
     }
 }

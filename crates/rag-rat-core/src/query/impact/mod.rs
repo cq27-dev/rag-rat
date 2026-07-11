@@ -99,6 +99,7 @@ pub struct ImpactSurfaceReport {
     pub docs_mentioning_symbol_path: Vec<ImpactItem>,
     pub text_fallback_hits: Vec<ImpactItem>,
     pub recent_commits_touching_symbol_path: Vec<ImpactItem>,
+    pub files_co_changed_with_symbol_path: Vec<ImpactItem>,
     pub github_rationale_issues_prs: Vec<ImpactItem>,
     pub repo_memories: RepoMemoryEvidenceView,
     pub completeness_and_caveats: ImpactCompleteness,
@@ -242,6 +243,11 @@ pub fn impact_surface_report_for_symbol(
     } else {
         Vec::new()
     };
+    // Change coupling is git-derived evidence, so it rides the existing `include_git` gate (no new
+    // `ImpactInclude` variant). The DerivedIndex table is kept fresh by `ensure_coupling_fresh` on
+    // the IndexDatabase seam before this pure reader runs.
+    let files_co_changed_with_symbol_path =
+        if options.include_git { coupling_items(conn, &symbol.path, limit)? } else { Vec::new() };
     let github_rationale_issues_prs = if options.include_papertrail {
         let mut items = github_ref_items(conn, std::slice::from_ref(&symbol.path), limit)?;
         items.extend(github_rationale_items(conn, &symbol.qualified_name, limit)?);
@@ -298,6 +304,7 @@ pub fn impact_surface_report_for_symbol(
         ("docs_mentioning_symbol_path", docs_mentioning_symbol_path.len()),
         ("text_fallback_hits", text_fallback_hits.len()),
         ("recent_commits_touching_symbol_path", recent_commits_touching_symbol_path.len()),
+        ("files_co_changed_with_symbol_path", files_co_changed_with_symbol_path.len()),
         ("github_rationale_issues_prs", github_rationale_issues_prs.len()),
     ]
     .into_iter()
@@ -360,6 +367,7 @@ pub fn impact_surface_report_for_symbol(
         docs_mentioning_symbol_path,
         text_fallback_hits,
         recent_commits_touching_symbol_path,
+        files_co_changed_with_symbol_path,
         github_rationale_issues_prs,
         repo_memories,
     })

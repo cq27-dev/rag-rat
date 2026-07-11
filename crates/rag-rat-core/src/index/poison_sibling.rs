@@ -98,7 +98,7 @@ const POISON_COMMIT: &str = "zzpoison00000000000000000000000000000000";
 const POISON_GH_NUMBER: i64 = 9_900_077;
 
 /// Base for the EXPLICIT GitHub item ids on the five body-bearing poison rows (+1 issue, +2
-/// comment, +3 pull, +4 review, +5 review comment). `github::rebuild_fts` derives
+/// comment, +3 pull, +4 review, +5 review comment). `papertrail::rebuild_fts` derives
 /// `github_fts.item_id` from each base row's `id`, so the harness pins the ids rather than letting
 /// AUTOINCREMENT choose — the seeded mirror rows and a post-resync re-derived mirror then agree on
 /// every tripwire-pinned column (see `github_fts_tripwires_survive_a_papertrail_resync`).
@@ -343,7 +343,7 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
     // gained a `repo_id` column, so a sibling row is now valid (these caches carry NO FK to
     // `repos`) and any unscoped papertrail read/count/delete trips a tripwire. The five
     // body-bearing rows carry EXPLICIT item ids (`POISON_GH_ITEM_ID` + kind offset) because a
-    // papertrail resync (`github::rebuild_fts`) re-derives the whole mirror from these rows —
+    // papertrail resync (`papertrail::rebuild_fts`) re-derives the whole mirror from these rows —
     // pinned ids keep the re-derived mirror identical to the seeded one. ---
     let gh_owner = format!("{POISON_PREFIX}owner");
     let gh_repo = format!("{POISON_PREFIX}repo");
@@ -431,14 +431,14 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
          VALUES (?1, ?2, ?3, 'ok', 0, ?4)",
         params![gh_owner, gh_repo, POISON_GH_NUMBER, POISON_REPO_ID],
     )?;
-    // github_fts mirror rows, seeded EXACTLY as `github::rebuild_fts` derives them from the five
-    // base rows above (one row per item kind; same item_id / url / title / body slot mapping —
-    // reviews derive url = COALESCE(html_url, '') = '' and review comments derive title =
-    // COALESCE(path, '') = '' from the unseeded nullable columns). A resync DELETEs the whole
-    // mirror and re-derives it, so seeding anything else would strand the intact check on a
-    // vanished row set; `github_fts_tripwires_survive_a_papertrail_resync` pins this equivalence.
-    // `classification` is recomputed by `insert_fts` (`classify_text`) at re-derivation and is
-    // deliberately NOT pinned by the tripwires.
+    // github_fts mirror rows, seeded EXACTLY as `papertrail::rebuild_fts` derives them from the
+    // five base rows above (one row per item kind; same item_id / url / title / body slot
+    // mapping — reviews derive url = COALESCE(html_url, '') = '' and review comments derive
+    // title = COALESCE(path, '') = '' from the unseeded nullable columns). A resync DELETEs the
+    // whole mirror and re-derives it, so seeding anything else would strand the intact check on
+    // a vanished row set; `github_fts_tripwires_survive_a_papertrail_resync` pins this
+    // equivalence. `classification` is recomputed by `insert_fts` (`classify_text`) at
+    // re-derivation and is deliberately NOT pinned by the tripwires.
     let insert_poison_fts = |kind: &str, item_id: i64, url: &str, title: &str, body: String| {
         conn.execute(
             "INSERT INTO github_fts(owner, repo, number, item_kind, item_id, url, title, body, \
@@ -1176,7 +1176,7 @@ mod tests {
         // Intact on the seeded mirror…
         assert_sibling_intact(conn);
         // …and byte-equivalently intact on the re-derived mirror.
-        crate::index::github::rebuild_fts(conn).unwrap();
+        crate::index::papertrail::rebuild_fts(conn).unwrap();
         assert_sibling_intact(conn);
     }
 

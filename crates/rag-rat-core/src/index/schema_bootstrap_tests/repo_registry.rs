@@ -2712,7 +2712,7 @@ fn v044_a_syncing_repo_is_isolated_from_stranded_placeholder_github_rows() {
     ))
     .unwrap();
     // Mirror state before any reclaim: derived from the stranded base rows.
-    crate::index::github::rebuild_fts(&conn).unwrap();
+    crate::index::papertrail::rebuild_fts(&conn).unwrap();
 
     // Pin the connection's active repo to repo-a (what `set_context` installs on a real open).
     conn.execute_batch(
@@ -2723,7 +2723,7 @@ fn v044_a_syncing_repo_is_isolated_from_stranded_placeholder_github_rows() {
 
     // repo-a's sync touches o/r#7: re-discovers the ref (same natural key as the stranded row),
     // refetches the issue with fresh content, and marks the sync cursor.
-    let reference = crate::index::github::GitHubRef {
+    let reference = crate::index::papertrail::PapertrailRef {
         owner: "o".to_string(),
         repo: "r".to_string(),
         number: 7,
@@ -2733,24 +2733,24 @@ fn v044_a_syncing_repo_is_isolated_from_stranded_placeholder_github_rows() {
         source_commit: None,
         source_text: "o/r#7".to_string(),
     };
-    crate::index::github::store_ref(&conn, &reference).unwrap();
-    crate::index::github::store_issue(&conn, &crate::index::github::GitHubIssue {
-        owner: "o".to_string(),
-        repo: "r".to_string(),
-        number: 7,
-        html_url: "http://fresh".to_string(),
+    crate::index::papertrail::store_ref(&conn, &reference).unwrap();
+    crate::index::papertrail::store_item(&conn, &crate::index::papertrail::PapertrailItem {
+        project: "o/r".to_string(),
+        item_kind: crate::index::papertrail::ItemKind::Issue,
+        item_key: "7".to_string(),
+        url: "http://fresh".to_string(),
         state: "closed".to_string(),
         title: "fresh title".to_string(),
         body: "fresh body".to_string(),
         author: None,
         created_at: None,
         updated_at: None,
-        is_pull_request: false,
+        merged_at: None,
     })
     .unwrap();
-    crate::index::github::mark_ref_sync(&conn, &reference, "synced", None).unwrap();
+    crate::index::papertrail::mark_ref_sync(&conn, &reference, "synced", None).unwrap();
     // The sync tail: the whole-table mirror rebuild follows the reclaimed base rows.
-    crate::index::github::rebuild_fts(&conn).unwrap();
+    crate::index::papertrail::rebuild_fts(&conn).unwrap();
 
     // repo-a's sync wrote its OWN issue row with fresh content, under its own repo_id…
     let a_title: String = conn
@@ -3175,6 +3175,15 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
         [LEGACY_REPO_ID],
     )
     .unwrap();
+    // A V056 derived change-coupling row — repo_id-scoped, no FK; adoption must re-point it too so
+    // it stays consistent with the (separately relocated) git_coupling_stamp repo_meta.
+    conn.execute(
+        "INSERT INTO git_change_couplings(repo_id, path_a, path_b, co_change_count, \
+         path_a_change_count, path_b_change_count, window_commit_count, last_co_change_at_s, \
+         computed_at_ms) VALUES (?1, 'a.rs', 'b.rs', 2, 2, 2, 4, 100, 0)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
 
     // Roll the ledger back to the pre-A-phase tip and forward-migrate the WHOLE A-phase ladder.
     truncate_schema_to(&conn, 37);
@@ -3209,6 +3218,7 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
         ("clone_graph_generations", "generation = 1"),
         ("memory_reality", "memory_id = 'm1'"),
         ("memory_model_failures", "memory_id = 'm1'"),
+        ("git_change_couplings", "path_a = 'a.rs'"),
     ] {
         assert_eq!(
             placeholder_count(&format!(
@@ -3257,4 +3267,63 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
         "repo-real",
         "adoption re-points the V047 memory_model_failures sibling"
     );
+    assert_eq!(
+        real_repo("SELECT repo_id FROM git_change_couplings WHERE path_a = 'a.rs'"),
+        "repo-real",
+        "adoption re-points the V056 git_change_couplings derived table"
+    );
+}
+
+/// Codex #566 finding B: `git_change_couplings` is in `DIRECT_SCOPED_ADOPTION_TABLES`, so a
+/// LocalOnly→Portable adoption re-points its rows TOGETHER with the `git_coupling_stamp` repo_meta
+/// — keeping the derived table stamp-consistent. Without the registration the stamp would move but
+/// the rows would strand, and `ensure_coupling_fresh` would then see a matching stamp and serve an
+/// EMPTY section instead of the adopted rows.
+#[test]
+fn adoption_repoints_change_couplings_consistently_with_its_stamp() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    // A derived coupling row + a CONSISTENT freshness stamp (head h1 + params 1), both under the
+    // placeholder — the shape a legacy single-repo index carries pre-adoption.
+    conn.execute(
+        "INSERT INTO git_change_couplings(repo_id, path_a, path_b, co_change_count, \
+         path_a_change_count, path_b_change_count, window_commit_count, last_co_change_at_s, \
+         computed_at_ms) VALUES (?1, 'a.rs', 'b.rs', 2, 2, 2, 4, 100, 50)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
+    // A stamp CONSISTENT with the seeded state: no git-history cursors set ⇒ empty history key,
+    // plus the current params version. The stamp is pure git-history (`history_key:params`, no
+    // files axis), so the post-adoption `ensure_coupling_fresh` sees a matching stamp and does
+    // NOT recompute.
+    let consistent_stamp = format!(":{}", crate::index::change_coupling::COUPLING_PARAMS_VERSION);
+    crate::index::set_repo_meta(&conn, LEGACY_REPO_ID, "git_coupling_stamp", &consistent_stamp)
+        .unwrap();
+
+    register_repo(&conn, &identity("repo-real", "r"), Path::new("/src/r"), 1).unwrap();
+
+    // Rows re-pointed onto the real id, none stranded under the placeholder.
+    let count_for = |repo: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM git_change_couplings WHERE repo_id = ?1",
+            [repo],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(count_for("repo-real"), 1, "coupling row re-pointed onto the real id");
+    assert_eq!(count_for(LEGACY_REPO_ID), 0, "no coupling row stranded under the placeholder");
+
+    // Stamp + rows consistent (the stamp relocated to the real id too), so ensure_coupling_fresh is
+    // a NO-OP — it must NOT recompute the freshly-adopted rows away to an empty section.
+    crate::index::change_coupling::ensure_coupling_fresh(&conn, 999).unwrap();
+    let computed_at: i64 = conn
+        .query_row(
+            "SELECT computed_at_ms FROM git_change_couplings WHERE repo_id = 'repo-real'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(computed_at, 50, "matching stamp => no recompute; the adopted rows survive intact");
 }

@@ -517,6 +517,7 @@ fn move_target_with_edit(h: &Harness, old_file: i64, new_kind: &str) -> i64 {
 
 mod edge_view;
 mod join_tests;
+mod library_usage;
 mod memory_bindings;
 mod monikers;
 mod persisted_enums;

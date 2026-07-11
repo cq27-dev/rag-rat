@@ -64,6 +64,9 @@ pub(crate) fn create_memory(
     // chain exists), then do the table writes + the op-append in ONE transaction so they commit —
     // or roll back — together (strict-atomic). Writes via `conn` participate in the open txn.
     authoring::backfill_memory_oplog(conn, now)?;
+    // Authored write: commit durably so a `memory_create` that returned success survives power loss
+    // (#560). FULL for this transaction only; the connection restores NORMAL on drop.
+    let _durability = authoring::AuthoredDurability::begin(conn)?;
     let tx = conn.unchecked_transaction()?;
     conn.execute(
         "
@@ -122,6 +125,8 @@ pub(crate) fn update_memory(
     // READ and the UPDATE are ONE atomic unit — a racing writer cannot flip the status between the
     // read and the write and desync the table from the op-log projection.
     authoring::backfill_memory_oplog(conn, now)?;
+    // Authored write (content / status / obsolete): commit durably (#560), NORMAL restored on drop.
+    let _durability = authoring::AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let current = memory_by_id(conn, &update.memory_id)?
         .ok_or_else(|| anyhow::anyhow!("memory `{}` not found", update.memory_id))?;
@@ -603,6 +608,10 @@ pub(crate) fn rebind_memory(
     }
     // Resolve inside the transaction so the stamped source_text_hash is consistent with the
     // bindings written in the same atomic unit.
+    // Authored write (#560): a rebind is an explicit, non-reconstructable choice of a new anchor,
+    // so it commits durably even though it does not yet mint a signed op (it will ride the FULL
+    // path for free once it does). NORMAL restored on drop.
+    let _durability = authoring::AuthoredDurability::begin(conn)?;
     let tx = conn.unchecked_transaction()?;
     // Rebind MUST name an anchor — moving a memory to "no binding" is meaningless (delete/recreate
     // it unanchored instead). Only `create_memory` accepts the unanchored (`None`) case (#463).
@@ -1024,6 +1033,10 @@ pub(crate) fn validate_memories(
     let rows = stmt.query_map([], |row| {
         Ok((binding_row(row)?, row.get::<_, Option<i64>>("downgrade_pending_at_ms")?))
     })?;
+    // DERIVED write (#560): this pass re-anchors bindings against current source and runs
+    // automatically after every index — its output is fully reconstructable, so it stays on the
+    // connection's `synchronous = NORMAL` default (no authored-durability bump). Only the authored
+    // mutations (create / update / rebind / edge add+remove / op-log genesis) raise FULL.
     let tx = conn.unchecked_transaction()?;
     let mut report = RepoMemoryValidationReport {
         checked: 0,

@@ -119,6 +119,239 @@ fn mcp_stdio_smoke_lists_and_calls_core_tools() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// A `rag-rat mcp` launched OUTSIDE any rag-rat repo (no `rag-rat.toml` at or above cwd) must NOT
+/// exit — a globally-registered MCP server is spawned in EVERY project, so dying in a non-rag-rat
+/// one would take repo intelligence down for the whole session (#603). It serves a DORMANT server:
+/// `initialize` + `tools/list` (full catalog) succeed, every `tools/call` returns the informative
+/// dormant notice as a NON-error result, and the process stays alive across calls.
+#[test]
+fn mcp_stdio_serves_dormant_without_a_config() {
+    let root = unique_temp_root();
+    // A bare directory — deliberately NO rag-rat.toml here or (temp roots have none) above it.
+    fs::create_dir_all(&root).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_rag-rat");
+    let mut child = Command::new(binary)
+        .arg("mcp") // NO --config: discovery from this cwd finds nothing → dormant.
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "rag-rat-test", "version": "0.1"}
+            }
+        }),
+    );
+    let initialize = recv(&mut reader);
+    assert_eq!(initialize["id"], 1, "a dormant server must still answer initialize");
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+    );
+    send(&mut stdin, json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = recv(&mut reader);
+    let tool_names = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        tool_names.contains(&"semantic_search"),
+        "a dormant server still advertises the full tool catalog",
+    );
+
+    // A tool call returns the dormant notice as a NON-error result (the agent reads it as a normal
+    // response), not an MCP error and not a dead pipe.
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "semantic_search", "arguments": {"query": "anything"}}
+        }),
+    );
+    let response = recv(&mut reader);
+    assert_ne!(
+        response["result"]["isError"],
+        json!(true),
+        "the dormant tool result must not be an error",
+    );
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("no_index"),
+        "the dormant tool result must carry the no-index notice, got: {text}",
+    );
+
+    // An UNKNOWN tool name is still rejected as an error — dormancy must not mask a typo/stale tool
+    // as `no_index` (a client can't otherwise tell an invalid call from genuine dormancy).
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "definitely_not_a_tool", "arguments": {}}
+        }),
+    );
+    let unknown = recv(&mut reader);
+    assert!(
+        unknown["error"]["message"].as_str().unwrap_or_default().contains("unknown tool"),
+        "a dormant server must reject an unknown tool, got: {unknown}",
+    );
+
+    // The server is still alive after those calls — a further request is answered.
+    send(&mut stdin, json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list"}));
+    assert_eq!(recv(&mut reader)["id"], 5, "the dormant server stays alive across calls");
+
+    stop(child);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The dormant tool result honors `--json` mode: its text block must be directly parseable as JSON
+/// (the JSON-output contract holds even with no repo), not the default TOON prose. A JSON-parsing
+/// MCP client would otherwise fail ONLY in dormant mode.
+#[test]
+fn mcp_stdio_dormant_result_is_valid_json_in_json_mode() {
+    let root = unique_temp_root();
+    fs::create_dir_all(&root).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_rag-rat");
+    let mut child = Command::new(binary)
+        .arg("mcp")
+        .arg("--json")
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "rag-rat-test", "version": "0.1"}}
+        }),
+    );
+    assert_eq!(recv(&mut reader)["id"], 1);
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+    );
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "semantic_search", "arguments": {"query": "anything"}}
+        }),
+    );
+    let text = recv(&mut reader)["result"]["content"][0]["text"].as_str().unwrap().to_string();
+    let parsed: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("dormant --json result must be valid JSON ({err}): {text}"));
+    assert_eq!(parsed["status"], "no_index", "dormant JSON payload carries the no-index status");
+
+    stop(child);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Self-healing (#603): a server that started DORMANT activates its tools as soon as the directory
+/// becomes a rag-rat repo mid-session — a `rag-rat init` + index run reachable through the dormant
+/// notice actually works, with NO MCP restart. The server re-discovers the config on each call.
+/// Dormancy is BINARY and decided at launch: a server that started dormant does NOT half-activate
+/// when the directory becomes a rag-rat repo mid-session — it keeps returning the notice (which
+/// tells the user to restart) rather than serving through a config it discovered per-call. A
+/// per-call-discovered server would lack the active lifecycle (watcher / git-hook freshness) and
+/// could return results not validated against current source, breaking rag-rat's core guarantee
+/// (#603). Activation requires a restart; the smoke test covers the launched-with-config path.
+#[test]
+fn mcp_stdio_dormant_server_stays_dormant_until_restart() {
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn healed_symbol_marker() {}\n").unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_rag-rat");
+    let mut child = Command::new(binary)
+        .arg("mcp")
+        .current_dir(&root) // NO --config, NO rag-rat.toml yet → starts dormant.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "rag-rat-test", "version": "0.1"}}
+        }),
+    );
+    assert_eq!(recv(&mut reader)["id"], 1);
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+    );
+
+    // Before init: a tool call is dormant.
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "semantic_search", "arguments": {"query": "healed", "limit": 3}}}),
+    );
+    let before = recv(&mut reader)["result"]["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(before.contains("no_index"), "must be dormant before the repo is indexed: {before}");
+
+    // Turn the dir into an indexed rag-rat repo mid-session — but do NOT restart the server.
+    fs::write(
+        root.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
+    )
+    .unwrap();
+    let config = Config::load(root.join("rag-rat.toml")).unwrap();
+    rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
+
+    // Without a restart the SAME server stays dormant — it does not half-activate against the new
+    // config; the notice (restart to activate) still stands.
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+               "params": {"name": "semantic_search", "arguments": {"query": "healed", "limit": 3}}}),
+    );
+    let after = recv(&mut reader)["result"]["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(
+        after.contains("no_index"),
+        "a launched-dormant server must stay dormant until restart, got: {after}",
+    );
+
+    stop(child);
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Regression guard: every tool advertised by `tools/list` (built from `TOOL_NAMES`) must be
 /// ROUTABLE by `tools/call`. The two are built from different sources — `list_tools` from
 /// `TOOL_NAMES`, the call router from the `#[tool]`-annotated methods — so a tool added to one but

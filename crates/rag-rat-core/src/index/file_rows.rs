@@ -202,6 +202,43 @@ impl IndexDatabase {
         Ok(restamped)
     }
 
+    /// The `modified_at_ms` (source-file mtime) of the CURRENT file row at `(active repo, path,
+    /// commit_sha, worktree_id, active generation)`, or `None` when no such row exists — the #561
+    /// concurrent-writer guard. The incremental write phase compares this against the mtime it
+    /// prepared: a row whose disk mtime is NEWER means a lockless heal indexed a fresher version
+    /// during the OFF-lock prepare window, so the caller skips its (now-stale) overwrite. Using
+    /// disk mtime (not the indexing clock `indexed_at_ms`) is what makes this
+    /// false-positive-free: the row's OWN prior stamp is always older-or-equal (edits only
+    /// advance mtime), so a legitimate re-index never trips the guard — only a genuinely newer
+    /// index does. A tombstone's `modified_at_ms = 0` never exceeds a real prepared mtime, so
+    /// it never blocks a resurrection. Point lookup on the V043 UNIQUE `(repo_id, path,
+    /// commit_sha, worktree_id, generation)`; direct `main.files` probe (not the scope view),
+    /// so it carries `repo_id` + `generation` explicitly like the other file-row probes here.
+    pub(super) fn scope_row_modified_at_ms(
+        &self,
+        path: &Path,
+        commit_sha: &str,
+        worktree_id: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        self.storage
+            .connection()
+            .query_row(
+                "SELECT modified_at_ms FROM main.files
+                 WHERE repo_id = ?1 AND path = ?2 AND commit_sha = ?3 AND worktree_id = ?4
+                   AND generation = ?5",
+                params![
+                    self.active_repo_id,
+                    path_string(path),
+                    commit_sha,
+                    worktree_id,
+                    self.active_generation
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub(super) fn file_row(&self, path: &Path) -> anyhow::Result<FileRow> {
         self.storage
             .connection()
@@ -259,6 +296,21 @@ impl IndexDatabase {
     /// re-derive.
     pub(super) fn mark_generated_flags_current(&self) -> anyhow::Result<()> {
         self.set_meta(GENERATED_FLAGS_VERSION_KEY, GENERATED_FLAGS_VERSION)
+    }
+
+    /// Stamp the embedding-policy freshness for THIS repo (`repo_meta`, not the DB-global
+    /// `index_meta`), certifying that every `chunks.embedding_policy` reflects the current
+    /// classifier ([`EMBEDDING_POLICY_VERSION`](crate::index::ai::EMBEDDING_POLICY_VERSION)) at
+    /// the default cap. The reconcile skip-summary then reads the column via `GROUP BY` instead
+    /// of re-parsing every file (#530). Called ONLY where every chunk was (re)derived by
+    /// current code — a full rebuild and the reconcile self-heal — NEVER an incremental pass,
+    /// which restamps only changed files and so cannot certify unchanged chunks.
+    pub(super) fn mark_embedding_policy_current(&self) -> anyhow::Result<()> {
+        self.set_repo_meta(ai::EMBEDDING_POLICY_VERSION_KEY, ai::EMBEDDING_POLICY_VERSION)?;
+        self.set_repo_meta(
+            ai::EMBEDDING_POLICY_CAP_KEY,
+            &ai::DEFAULT_MAX_EMBEDDING_CHARS.to_string(),
+        )
     }
 
     fn rederive_generated_flags(&self) -> anyhow::Result<()> {

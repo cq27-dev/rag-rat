@@ -1075,3 +1075,402 @@ fn git_history_reload_is_skipped_when_head_is_unchanged() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn skip_summary_shared_parse_matches_per_chunk_text() {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use crate::index::ai::{
+        self, LowSignalCheck, embedding_policy_for_chunk, embedding_policy_skip_summary,
+    };
+    use crate::index::text_compression::{ChunkTextDecoder, ChunkTextRow};
+
+    // The FromSpan (shared-parse) summary must equal the per-chunk FromText computation on a real
+    // index — exercising reconstruction + sha-verify + one-parse-per-file span classification, and
+    // the markdown-fallback gate. Nested symbols (`impl` methods) create OVERLAPPING chunks.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Plumbing-only file (a use-block ≥ MIN_EMBEDDING_CHARS so it reaches the low-signal gate
+    // rather than SkipTooSmall) → low-signal; real-code file → embeds; markdown → fallback
+    // path.
+    fs::write(
+        root.join("src/plumbing.rs"),
+        "use std::collections::HashMap;\nuse std::collections::BTreeMap;\nuse \
+         std::path::PathBuf;\nuse std::sync::Arc;\npub use crate::foo::Bar;\nuse \
+         a::b::c::d::e::f;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/code.rs"),
+        // Blank lines between symbols become unchunked whitespace gaps → exercises `\n`-padded
+        // reconstruction on the shared-parse path (still hash-matches, so FromSpan applies).
+        "pub fn compute(x: i64, y: i64) -> i64 {\n    let sum = x * 2 + y - 1;\n    let scaled = \
+         sum.wrapping_mul(3);\n    scaled - x + y\n}\n\npub struct Foo {\n    n: i64,\n}\n\nimpl \
+         Foo {\n    pub fn bar(&self) -> i64 {\n        self.n + compute(4, 5)\n    }\n}\n",
+    )
+    .unwrap();
+    // A file under `fixtures/` → every chunk is SkipTestFixture (a cheap gate before low-signal),
+    // so the shared-parse path must not reconstruct/parse it.
+    fs::create_dir_all(root.join("src/fixtures")).unwrap();
+    fs::write(
+        root.join("src/fixtures/data.rs"),
+        "pub fn fixture_helper_that_is_long_enough_to_clear_the_min_embedding_chars() -> i64 {\n    \
+         7\n}\n",
+    )
+    .unwrap();
+    // A CRLF file: chunk text is LF-normalized while byte offsets count `\r\n`, so reconstruction
+    // will NOT hash-match `files.sha256` and must fall back to per-chunk FromText (without the
+    // sha-verify guard this would silently corrupt, failing the equality below).
+    fs::write(
+        root.join("src/crlf.rs"),
+        "use std::io::Read;\r\nuse std::io::Write;\r\nuse std::path::Path;\r\npub use \
+         crate::x::Y;\r\nuse a::b::c::d::e;\r\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/readme.md"), "# Title\n\nsome prose that is not code.\n").unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    // Reference: the previous per-chunk FromText classification.
+    let reference: BTreeMap<String, u64> = {
+        let dicts = crate::query::chunk_text_dicts(conn).unwrap();
+        let mut decoder = ChunkTextDecoder::new(&dicts);
+        let mut out = BTreeMap::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT files.path, files.language, files.kind, chunks.chunk_kind,
+                        chunks.symbol_path, chunk_text.blob, chunk_text.raw_len,
+                        chunk_text.dict_version
+                 FROM chunks JOIN files ON files.id = chunks.file_id
+                 JOIN chunk_text ON chunk_text.chunk_id = chunks.id",
+            )
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            let path: String = row.get(0).unwrap();
+            let language: String = row.get(1).unwrap();
+            let file_kind: String = row.get(2).unwrap();
+            let chunk_kind: String = row.get(3).unwrap();
+            let symbol_path: Option<String> = row.get(4).unwrap();
+            let text = ChunkTextRow {
+                blob: row.get(5).unwrap(),
+                raw_len: row.get(6).unwrap(),
+                dict_version: row.get(7).unwrap(),
+            }
+            .resolve(&mut decoder)
+            .unwrap();
+            let decision = embedding_policy_for_chunk(
+                Path::new(&path),
+                &language,
+                &file_kind,
+                &chunk_kind,
+                symbol_path.as_deref(),
+                &text,
+                ai::DEFAULT_MAX_EMBEDDING_CHARS,
+                LowSignalCheck::FromText,
+            );
+            if !decision.eligible {
+                *out.entry(decision.policy).or_default() += 1;
+            }
+        }
+        out
+    };
+
+    // #530: a fresh rebuild stamps the policy version, so the summary takes the FAST path (GROUP BY
+    // the certified column). Both paths must agree with the per-chunk FromText reference here.
+    let fast = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(fast, reference, "fast-path (certified column) must equal the FromText reference");
+
+    // Clear the stamp → the slow recompute (#572's subject: FromSpan reconstruction + sha-verify)
+    // runs and must also equal the reference.
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+        .unwrap();
+    let span = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(span, reference, "slow recompute must equal the per-chunk FromText reference");
+    assert!(
+        span.get("SkipLowSignal").copied().unwrap_or(0) >= 1,
+        "the all-import file must contribute a low-signal skip (exercises the shared-parse span \
+         classification): {span:?}"
+    );
+    assert!(
+        span.get("SkipTestFixture").copied().unwrap_or(0) >= 1,
+        "the fixtures/ file must be a test-fixture skip (exercises the parse-free cheap gate): \
+         {span:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn skip_summary_fast_path_reads_certified_column_and_falls_back_when_stale() {
+    use crate::index::ai::{self, embedding_policy_skip_summary};
+
+    // #530: after a full rebuild the policy version is stamped, so the summary reads its counts
+    // from the certified `chunks.embedding_policy` column (GROUP BY, no parse). Prove (a) the
+    // fast path really READS the column — poisoning one chunk moves the count — and (b) a stale
+    // stamp falls back to the recompute, which classifies from source and so IGNORES the
+    // poisoned column.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/code.rs"),
+        "pub fn compute(x: i64, y: i64) -> i64 {\n    let sum = x * 2 + y - 1;\n    \
+         sum.wrapping_mul(3)\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/plumbing.rs"),
+        "use std::collections::HashMap;\nuse std::collections::BTreeMap;\nuse \
+         std::path::PathBuf;\nuse std::sync::Arc;\npub use crate::foo::Bar;\n",
+    )
+    .unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    // Fresh rebuild certified the column: fast path.
+    let fast = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    let embed_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks WHERE embedding_policy = 'Embed'", [], |r| r.get(0))
+        .unwrap();
+    assert!(embed_before >= 1, "fixture must have an eligible (Embed) chunk to poison");
+
+    // Poison one Embed chunk in the base table; the fast path must reflect the (wrong) column
+    // value.
+    conn.execute(
+        "UPDATE main.chunks SET embedding_policy = 'SkipGenerated'
+         WHERE id = (SELECT MIN(id) FROM main.chunks WHERE embedding_policy = 'Embed')",
+        [],
+    )
+    .unwrap();
+    let poisoned = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(
+        poisoned.get("SkipGenerated").copied().unwrap_or(0),
+        fast.get("SkipGenerated").copied().unwrap_or(0) + 1,
+        "fast path must read the poisoned column: {poisoned:?} vs fresh {fast:?}"
+    );
+
+    // Clear the stamp → recompute from source ignores the poisoned column and returns ground truth.
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+        .unwrap();
+    let recomputed = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(
+        recomputed, fast,
+        "stale stamp must recompute from source, ignoring the poisoned column: {recomputed:?} vs \
+         {fast:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reconcile_self_heals_stale_policy_column_and_restamps() {
+    use crate::index::ai::{self, embedding_policy_skip_summary};
+
+    // #530: after a rag-rat upgrade bumps the classifier version, an incrementally-maintained index
+    // never full-rebuilds, so its column stays uncertified and every summary pays the O(files)
+    // parse. The reconcile self-heal fixes that: it recomputes from source, writes the column
+    // back, and restamps the version — so the FIRST reconcile after the bump pays once and
+    // every later reconcile/plan takes the fast path.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/code.rs"),
+        "pub fn compute(x: i64, y: i64) -> i64 {\n    let sum = x * 2 + y - 1;\n    \
+         sum.wrapping_mul(3)\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/plumbing.rs"),
+        "use std::collections::HashMap;\nuse std::collections::BTreeMap;\nuse \
+         std::path::PathBuf;\nuse std::sync::Arc;\npub use crate::foo::Bar;\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+
+    // Ground truth from the freshly certified column.
+    let truth = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+
+    // Simulate a version bump that left the column stale: poison one chunk AND stale the stamp.
+    conn.execute(
+        "UPDATE main.chunks SET embedding_policy = 'SkipGenerated'
+         WHERE id = (SELECT MIN(id) FROM main.chunks WHERE embedding_policy = 'Embed')",
+        [],
+    )
+    .unwrap();
+    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+        .unwrap();
+
+    // A reconcile (no model → NotReady, but it still runs the summary + self-heal) must repair the
+    // column and restamp the version current.
+    let _ = db.reconcile(None, Some(8)).unwrap();
+    assert_eq!(
+        crate::index::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY)
+            .unwrap()
+            .as_deref(),
+        Some(ai::EMBEDDING_POLICY_VERSION),
+        "reconcile must restamp the policy version current"
+    );
+    let healed = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(healed, truth, "self-heal must restore the column to ground truth: {healed:?}");
+
+    // Prove it is the FAST path now: re-poisoning moves the count (a recompute would ignore it).
+    conn.execute(
+        "UPDATE main.chunks SET embedding_policy = 'SkipGenerated'
+         WHERE id = (SELECT MIN(id) FROM main.chunks WHERE embedding_policy = 'Embed')",
+        [],
+    )
+    .unwrap();
+    let after = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(
+        after.get("SkipGenerated").copied().unwrap_or(0),
+        truth.get("SkipGenerated").copied().unwrap_or(0) + 1,
+        "after self-heal the summary reads the certified column (fast path): {after:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn self_heal_does_not_certify_a_repo_with_another_live_scope() {
+    use crate::index::ai::{self};
+
+    // #530 (Codex): the self-heal reparses only the ACTIVE scope, so it must NOT write the
+    // repo-wide version stamp when another live scope exists (a second linked-worktree overlay
+    // / other-commit leftover) — that scope would go un-healed while the stamp certified it.
+    // Simulate the other scope with a live `main.files` row outside the active (base) scope and
+    // assert the reconcile self-heal leaves the stamp stale (so every scope keeps recomputing).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/code.rs"), "pub fn compute(x: i64) -> i64 {\n    x * 2 + 1\n}\n")
+        .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    let generation = crate::index::schema::active_generation(conn).unwrap();
+
+    // Stale the stamp (simulate a version bump) so the self-heal would otherwise fire and restamp.
+    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+        .unwrap();
+    // A live row OUTSIDE the active base scope (git-less fixture ⇒ active commit_sha/worktree_id
+    // are both ''): commit_sha != '' AND worktree_id != '' is what
+    // `carry_forward_live_overlays` treats as a foreign scope.
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+                                repo_id, generation, commit_sha, worktree_id)
+         VALUES ('other/f.rs', 'rust', 'source', 'deadbeef', 0, 0, ?1, ?2, 'othercommit', \
+         'otherwt')",
+        rusqlite::params![repo_id, generation],
+    )
+    .unwrap();
+
+    let _ = db.reconcile(None, Some(8)).unwrap();
+    assert_eq!(
+        crate::index::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY)
+            .unwrap()
+            .as_deref(),
+        Some("stale"),
+        "self-heal must NOT certify a repo whose active scope is not its whole live set"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reconcile_heals_an_op_log_ghost_in_an_idle_repo() {
+    // #583 (follow-up to #541). The per-node op-log reconcile heals a "ghost" — a row present in
+    // `repo_memories` but absent from the signed projection, left by a raw writer / a pre-#532
+    // binary — on the next MEMORY mutation. A repo that gets NO subsequent memory mutation would
+    // carry the ghost indefinitely, so an index reconcile pass runs the same idempotent reconcile.
+    // Both `rag-rat reconcile` and the watcher's incremental pass route through
+    // `reconcile_with_options_progress`, so exercising it here covers every idle-repo trigger.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn seed() {}\n").unwrap();
+    // A COMMITTED git repo yields a stable repo_id — the op-log reconcile only roots an immutable
+    // owner stream on a stable id, so a `local:` (uncommitted) id would make it a no-op and the
+    // ghost would never heal, silently voiding the test.
+    run_git(&root, &["init"]);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &[
+        "-c",
+        "user.name=Rag Rat Test",
+        "-c",
+        "user.email=rag-rat@example.invalid",
+        "commit",
+        "-m",
+        "initial",
+    ]);
+    let root = root.canonicalize().unwrap();
+
+    let mut config = source_config(root.clone(), Language::Rust);
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
+
+    // Root the owner chain with a real authored memory — the realistic idle-repo precondition is a
+    // repo that ALREADY has signed history when a ghost slips in (exercises the INCREMENTAL heal,
+    // not genesis). Unanchored `Concept` per #465.
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Concept".to_string(),
+        title: "seed concept".to_string(),
+        body: "roots the owner chain".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test-agent".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        payload_json: None,
+        bind: crate::query::memory::RepoMemoryBindTarget::default(),
+    })
+    .unwrap();
+
+    // A ghost written by RAW SQL — never authored into the signed log.
+    let conn = db.storage.connection();
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    conn.execute(
+        "INSERT INTO repo_memories(
+             id, kind, title, body, confidence, status, created_by, created_at_ms, updated_at_ms,
+             source, input_hash, memory_version, repo_id)
+         VALUES ('mem_ghost_583', 'Concept', 'ghost', 'raw-written ghost', 'high', 'active',
+             'raw', 1000, 1000, 'agent', 'h583', 'v1', ?1)",
+        [&repo_id],
+    )
+    .unwrap();
+
+    let ghost_in_projection = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM oplog_projected_nodes WHERE node_id = 'mem_ghost_583'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(ghost_in_projection(conn), 0, "the raw ghost is absent from the signed projection");
+
+    // The idle-repo backstop: a reconcile pass heals the ghost though no memory mutation ran.
+    db.reconcile_with_options_progress(crate::index::ai::ReconcileOptions::default(), |_| {})
+        .unwrap();
+
+    assert_eq!(
+        ghost_in_projection(db.storage.connection()),
+        1,
+        "the reconcile pass authored the idle-repo ghost into the signed log"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

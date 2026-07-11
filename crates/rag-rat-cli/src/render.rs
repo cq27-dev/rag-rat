@@ -192,23 +192,23 @@ pub(crate) fn render_reconcile_progress(progress: rag_rat_core::index::ai::Recon
 pub(crate) fn progress_percent(current: u64, total: u64) -> u64 {
     current.saturating_mul(100).checked_div(total).unwrap_or(100).min(100)
 }
-pub(crate) fn render_github_sync_progress(
-    progress: rag_rat_core::index::github::GitHubSyncProgress,
+pub(crate) fn render_papertrail_sync_progress(
+    progress: rag_rat_core::index::papertrail::PapertrailSyncProgress,
 ) {
     match progress.action {
-        GitHubSyncAction::Syncing => eprintln!(
+        PapertrailSyncAction::Syncing => eprintln!(
             "github sync: {}/{} fetching {}/{}#{}",
             progress.current, progress.total, progress.owner, progress.repo, progress.number
         ),
-        GitHubSyncAction::Skipped => eprintln!(
+        PapertrailSyncAction::Skipped => eprintln!(
             "github sync: {}/{} skip cached {}/{}#{}",
             progress.current, progress.total, progress.owner, progress.repo, progress.number
         ),
-        GitHubSyncAction::Synced => eprintln!(
+        PapertrailSyncAction::Synced => eprintln!(
             "github sync: {}/{} synced {}/{}#{}",
             progress.current, progress.total, progress.owner, progress.repo, progress.number
         ),
-        GitHubSyncAction::Failed => eprintln!(
+        PapertrailSyncAction::Failed => eprintln!(
             "github sync: {}/{} failed {}/{}#{}: {}",
             progress.current,
             progress.total,
@@ -217,7 +217,7 @@ pub(crate) fn render_github_sync_progress(
             progress.number,
             progress.message.unwrap_or_else(|| "unknown error".to_string())
         ),
-        GitHubSyncAction::RebuildingFts => {
+        PapertrailSyncAction::RebuildingFts => {
             eprintln!("github sync: rebuilding GitHub FTS cache")
         },
     }

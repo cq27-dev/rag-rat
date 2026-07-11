@@ -33,8 +33,21 @@ impl IndexDatabase {
         ai::reconcile(self.storage.connection(), limit, batch_size)
     }
 
+    /// Plan the embedding reconcile at the DEFAULT char cap. The CLI uses the cap-aware
+    /// [`reconcile_plan_with_cap`](Self::reconcile_plan_with_cap) so `--plan` classifies against
+    /// the same cap the run will; this default-cap form stays for callers without a configured
+    /// cap.
     pub fn reconcile_plan(&self) -> anyhow::Result<ReconcilePlan> {
-        ai::reconcile_plan(self.storage.connection())
+        self.reconcile_plan_with_cap(ai::DEFAULT_MAX_EMBEDDING_CHARS)
+    }
+
+    /// `max_embedding_chars` is the caller's configured/overridden cap, so the plan classifies
+    /// against the SAME cap the reconcile it previews will use.
+    pub fn reconcile_plan_with_cap(
+        &self,
+        max_embedding_chars: usize,
+    ) -> anyhow::Result<ReconcilePlan> {
+        ai::reconcile_plan(self.storage.connection(), max_embedding_chars)
     }
 
     pub fn reconcile_with_progress(
@@ -52,7 +65,30 @@ impl IndexDatabase {
         options: ai::ReconcileOptions,
         progress: impl FnMut(ai::ReconcileProgress),
     ) -> anyhow::Result<ReconcileReport> {
-        ai::reconcile_with_options_progress(self.storage.connection(), options, progress)
+        let report =
+            ai::reconcile_with_options_progress(self.storage.connection(), options, progress)?;
+        self.heal_memory_oplog_ghosts()?;
+        Ok(report)
+    }
+
+    /// Idle-repo op-log ghost backstop (#583, follow-up to #541). The per-node op-log reconcile
+    /// (#541) heals a "ghost" memory/edge — a row present in `repo_memories`/`repo_node_edges` but
+    /// absent from the signed projection, left by a pre-#532 binary or a raw writer such as the
+    /// `dream` passes — on the next MEMORY mutation. A repo with no subsequent memory mutation
+    /// would carry the ghost indefinitely, so a reconcile pass runs the same idempotent
+    /// reconcile: both `rag-rat reconcile` and the watcher's incremental pass route through
+    /// [`Self::reconcile_with_options_progress`], so this one seam covers every idle-repo trigger.
+    ///
+    /// Cheap and safe on the hot path: [`backfill_memory_oplog`] probes with two indexed anti-joins
+    /// that return empty in steady state and take NO write lock when nothing is missing, and it is
+    /// a no-op under an absent/unstable scope. Runs after the embedding reconcile has
+    /// committed, so its authored write (a durable `IMMEDIATE` txn only when a ghost exists)
+    /// never nests inside it.
+    pub(crate) fn heal_memory_oplog_ghosts(&self) -> anyhow::Result<()> {
+        crate::query::memory::backfill_memory_oplog(
+            self.storage.connection(),
+            crate::index::now_ms(),
+        )
     }
 
     pub fn current_embedding_count(&self, model_id: &str) -> anyhow::Result<u64> {
@@ -64,6 +100,17 @@ impl IndexDatabase {
     /// even on a later pass where the overlay rows themselves did not change (#219 review).
     pub fn pending_embedding_jobs(&self) -> anyhow::Result<u64> {
         ai::pending_embedding_jobs(self.storage.connection())
+    }
+
+    /// [`Self::pending_embedding_jobs`] with the caller's candidate sizing — SQL-only, no embedder
+    /// acquisition (no probe request), so the watcher's `All`-sweep overlay backlog check is free
+    /// of network work on an idle pass (#577). Whether the backlog can actually drain is decided
+    /// inside the reconcile itself.
+    pub(crate) fn pending_embedding_jobs_with_options(
+        &self,
+        options: &ai::ReconcileOptions,
+    ) -> anyhow::Result<u64> {
+        ai::pending_embedding_jobs_with_options(self.storage.connection(), options)
     }
 
     pub(crate) fn pending_embedding_jobs_with_available_incremental_embedder(

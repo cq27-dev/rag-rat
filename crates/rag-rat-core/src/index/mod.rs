@@ -3,9 +3,9 @@ pub mod anchors;
 pub mod chunker;
 pub mod edges;
 pub mod git_history;
-pub mod github;
 pub mod ignore_rules;
 pub mod oracle;
+pub mod papertrail;
 pub mod parser;
 pub mod schema;
 pub mod symbols;
@@ -14,6 +14,7 @@ pub mod walker;
 pub mod consolidate;
 
 mod adoption_hints;
+pub(crate) mod change_coupling;
 pub(crate) mod chunk_text_store;
 pub(crate) mod clones;
 mod discovery;
@@ -27,6 +28,7 @@ mod incremental;
 mod lifecycle;
 mod mem_diag;
 mod meta;
+mod migration_gate;
 mod packages;
 mod parser_failures;
 mod prep;
@@ -53,7 +55,7 @@ pub(crate) use git_context::*;
 // fallback. Gate the re-export so the non-test build doesn't warn it unused.
 #[cfg(test)]
 pub(crate) use lifecycle::install_scope_view;
-pub use lifecycle::{install_worktree_scope_view, resolve_scope_repo_id};
+pub use lifecycle::{GlobalStoreOverview, install_worktree_scope_view, resolve_scope_repo_id};
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
 pub(crate) use meta::{delete_repo_meta, repo_meta, set_repo_meta};
 pub use parser_failures::ParserFailure;
@@ -66,7 +68,9 @@ pub use query_api::{
     OracleShaSnapshots, RoiFactors, SearchRequest, TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES,
     WalCheckpointReport,
 };
+pub use schema::RegisteredRepo;
 pub(crate) use util::*;
+pub use worktree_overlay::WorktreeOverlayReport;
 
 #[cfg(test)]
 mod anchor_tests;
@@ -100,7 +104,9 @@ use crate::index::git_history::{
     ChunkBlameSummary, CommitSearchHit, GitHistoryIndexStatus, PathHistoryItem, QueryCommitHit,
     SymbolHistoryItem,
 };
-use crate::index::github::{GitHubEvidence, GitHubStatus, GitHubSyncReport, Papertrail};
+use crate::index::papertrail::{
+    Papertrail, PapertrailEvidence, PapertrailStatus, PapertrailSyncReport,
+};
 use crate::index::symbols::Symbol;
 use crate::language::Language;
 use crate::query::graph_meta::{self, GraphMetaMode};
@@ -127,7 +133,7 @@ pub struct IndexDatabase {
     /// Injected GitHub repo context. Resolved from `gh` only in `open_config` (real usage);
     /// `rebuild`/`open` leave it offline, and tests set it explicitly — so the library never
     /// shells out to `gh` during tests (#60).
-    github: github::GitHubContext,
+    papertrail: papertrail::PapertrailContext,
     /// The config this index was opened against — present only on the config-bearing opens
     /// (`open_config` / `try_open_config_read_only`), `None` for `rebuild`/`open`/tests. Lets a
     /// read tool classify a working-tree change set against the indexed targets — the lazy
@@ -223,7 +229,7 @@ pub struct IndexStatus {
     pub parser_failures: u64,
     pub parser_failure_paths: Vec<ParserFailure>,
     pub git_history: GitHistoryIndexStatus,
-    pub github: GitHubStatus,
+    pub github: PapertrailStatus,
     pub llm: LlmStatus,
     pub anchor_health: AnchorHealth,
 }

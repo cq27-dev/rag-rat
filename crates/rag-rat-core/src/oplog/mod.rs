@@ -32,6 +32,7 @@
 //! seam, roster/epochs, and transport) — this mirrors the `content_hash` freeze: pin the semantic
 //! primitive first, in isolation-testable form.
 
+mod account;
 mod cbor;
 mod device;
 mod entry;
@@ -47,10 +48,21 @@ mod stream;
 // direction of the dependency (`oplog` never depends back on `query::memory`).
 pub(crate) use identity::local_device;
 pub(crate) use op::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
-// `author_op` / `author_batch` are the standalone (own-txn) wrappers — still only test-used,
-// so their re-export stays `allow(unused_imports)`. The live write path uses the in-txn
-// primitives.
+// The reconcile's tests read the materialized shadow projection as a `ProjectedState` via
+// `load_projection` (below) — test-only today (the live path folds in-txn), so `allow`'d.
+#[allow(unused_imports)]
+pub(crate) use project::ProjectedState;
+// `author_batch_in_tx` is the gate-free batch-author primitive (#541) the reconcile authors
+// its ghost batch through (`query::memory::authoring::sync_owner_stream`).
+pub(crate) use store::author_batch_in_tx;
+// `load_projection` materializes a `ProjectedState` from the shadow tables — the
+// reconcile-test read seam above; only test-used for now, so `allow`'d.
+#[allow(unused_imports)]
+pub(crate) use store::load_projection;
+// `author_batch` / `author_op` are the standalone (own-txn) wrappers — `author_batch` is only
+// test-used and `author_op` is only reached from a test helper, so their re-export stays
+// `allow(unused_imports)`. The live write path uses the in-txn primitives.
 #[allow(unused_imports)]
 pub(crate) use store::{author_batch, author_op};
-pub(crate) use store::{author_genesis_in_tx, author_in_tx, chain_tail};
+pub(crate) use store::{author_in_tx, chain_tail};
 pub(crate) use stream::{StreamId, owner_stream};

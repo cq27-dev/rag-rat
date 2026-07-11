@@ -21,16 +21,20 @@ impl IndexDatabase {
         git_history::is_history_current(self.storage.connection(), root)
     }
 
-    pub(super) fn apply_prepared_git_history(
+    /// Apply an ALREADY-JOINED prepared git history to the live checkout. The incremental pass
+    /// joins the prepare thread OFF the SQLite write lock (#560) and calls this inside its
+    /// terminal transaction; `git_history::apply_prepared` revalidates the append plan against
+    /// the current cursors here, under the lock, so a history rewrite between prepare and apply
+    /// is still caught.
+    pub(super) fn apply_joined_git_history(
         &self,
         root: &Path,
-        handle: JoinHandle<anyhow::Result<git_history::PreparedGitHistory>>,
+        prepared: git_history::PreparedGitHistory,
     ) -> anyhow::Result<GitHistoryIndexStatus> {
-        let prepared = join_git_history_prepare(handle)?;
         git_history::apply_prepared(self.storage.connection(), root, prepared)
     }
 
-    /// [`Self::apply_prepared_git_history`] minus the reload-gate cursor write — the
+    /// [`Self::apply_joined_git_history`] minus the reload-gate cursor write — the
     /// generation-staged rebuild's rows-inert/cursors-last seam (A6, batch-4 P2): the bulky
     /// `git_commits`/`git_file_changes` rows land in Phase 2 (keyed, inert data — no reader
     /// treats row presence alone as authority), while the returned cursors are recorded inside
@@ -66,7 +70,7 @@ impl IndexDatabase {
         git_history::status(self.storage.connection(), root)
     }
 
-    pub(super) fn github_status(&self) -> anyhow::Result<GitHubStatus> {
-        github::status(self.storage.connection(), &self.github)
+    pub(super) fn papertrail_status(&self) -> anyhow::Result<PapertrailStatus> {
+        papertrail::status(self.storage.connection(), &self.papertrail)
     }
 }

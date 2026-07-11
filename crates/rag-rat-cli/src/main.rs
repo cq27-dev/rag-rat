@@ -3,6 +3,10 @@ mod commands;
 mod fs_atomic;
 mod hooks_support;
 mod render;
+// The version-string formatter is shared with `build.rs` via `include!`; the crate only needs it
+// under test (the runtime reads the baked `RAG_RAT_VERSION`), so compiling it here is test-only.
+#[cfg(test)]
+mod version_describe;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,12 +15,12 @@ pub(crate) use commands::*;
 pub(crate) use fs_atomic::*;
 pub(crate) use hooks_support::*;
 use rag_rat_core::index::IndexProgress;
-use rag_rat_core::index::github::GitHubSyncAction;
+use rag_rat_core::index::papertrail::PapertrailSyncAction;
 use rag_rat_core::search::lexical::SearchHit;
 use rag_rat_core::{Config, IndexDatabase};
 pub(crate) use render::*;
 
-use crate::cli::{Cli, Command as Cmd};
+use crate::cli::{Cli, Command as Cmd, DoctorArgs};
 
 mod agent_hook;
 mod claude_settings;
@@ -25,7 +29,10 @@ mod init;
 // Idle-RSS fix: glibc malloc never hands freed pages back to the OS, so a long-lived `rag-rat mcp`
 // server keeps its peak RSS (~625 MB observed) after the watcher's heavy index/graph passes.
 // jemalloc with a background purge thread returns idle dirty/muzzy pages to the OS instead.
-#[cfg(not(target_env = "msvc"))]
+// Excluded on msvc (no jemalloc support) and android: the NDK dropped libgcc in r23+, but
+// tikv-jemalloc-sys's link line still references `-lgcc`, so the binary fails to link there.
+// Android isn't the long-lived-server case anyway — the system allocator is the right fallback.
+#[cfg(all(not(target_env = "msvc"), not(target_os = "android")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -33,7 +40,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// decayed pages are only reclaimed on later alloc calls, which a quiet server rarely makes) and
 /// tighten the decay window from the 10s default so an idle server releases memory within ~1s.
 /// Best-effort — a server that holds slightly more RAM is better than one that won't boot.
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(target_os = "android")))]
 fn configure_jemalloc() {
     use tikv_jemalloc_ctl::{background_thread, raw};
     // Purge decayed pages on a background thread; a quiet server makes few alloc calls, which is
@@ -54,7 +61,10 @@ fn configure_jemalloc() {
 }
 
 fn main() -> anyhow::Result<()> {
-    #[cfg(not(target_env = "msvc"))]
+    // Record this binary's git-stamped version (#585) so migration provenance and the stranded-
+    // binary refusal name a dev build (`0.16.0+g<hash>`) distinctly from a release (`0.16.0`).
+    rag_rat_core::set_binary_version(env!("RAG_RAT_VERSION"));
+    #[cfg(all(not(target_env = "msvc"), not(target_os = "android")))]
     configure_jemalloc();
     let cli = Cli::parse();
 
@@ -67,11 +77,15 @@ fn main() -> anyhow::Result<()> {
         rag_rat_core::OutputFormat::Toon
     });
 
-    // These commands must work without a config file present — `init` creates one, and the
-    // Claude Code hook entrypoint reads its event from stdin. Everything else needs a config.
+    // These commands must tolerate the ABSENCE of a config: `init` creates one; `agent-hook`
+    // reads its event from stdin; `mcp` serves a dormant server so a globally-registered MCP stays
+    // alive outside a rag-rat repo (#603); `doctor` reports the machine-global store. Everything
+    // else needs a resolved config and fails with a friendly hint when there isn't one.
     match &cli.command {
         Cmd::Init(args) => return init::run(args, cli.config.as_deref().unwrap_or("rag-rat.toml")),
         Cmd::AgentHook => return agent_hook::run(),
+        Cmd::Mcp => return run_mcp(cli.config.as_deref(), cli.json),
+        Cmd::Doctor(args) => return run_doctor(args, cli.config.as_deref()),
         _ => {},
     }
 
@@ -86,47 +100,18 @@ fn main() -> anyhow::Result<()> {
     let _log = rag_rat_core::logging::init_logging(&config, log_role(&cli.command));
 
     match cli.command {
-        Cmd::Init(_) | Cmd::AgentHook => unreachable!("handled before the config load above"),
+        Cmd::Init(_) | Cmd::AgentHook | Cmd::Mcp | Cmd::Doctor(_) =>
+            unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
-        Cmd::Doctor => doctor(&config)?,
         Cmd::Query(args) => query(&config, &args)?,
         Cmd::Brief(args) => brief(&config, &args)?,
         Cmd::Clusters(args) => clusters(&config, &args)?,
         Cmd::ImportantSymbols(args) => important_symbols(&config, &args)?,
         Cmd::Clones(args) => clones(&config, &args)?,
         Cmd::ClonesFor(args) => clones_for(&config, &args)?,
-        Cmd::Mcp => {
-            // Refresh the crates.io version cache out of band (a detached thread on this long-lived
-            // server) when stale + opted-in, so `index_status` and the next SessionStart digest
-            // read a fresh result without ever blocking startup or a request. Fail-open
-            // (#version-check).
-            spawn_detached_version_refresh(&config);
-            // Keep SCIP-grade ranking self-maintaining: a heavily-throttled detached thread runs
-            // the oracle when the active checkout's index is stale AND quiet (opt-in
-            // via `[oracle] auto_run`, default OFF). Mirrors the version-refresh thread
-            // — fail-open, dies with the process. No-op unless enabled.
-            spawn_detached_oracle_auto_run(&config);
-            // The MCP server is an stdio JSON-RPC loop (one client, mostly serial) plus a SIGUSR1
-            // task; the file watcher runs on its own OS thread and CPU-heavy indexing is rayon, not
-            // tokio. The default runtime's ~num_cpus workers are therefore idle overhead, so cap it
-            // small (issue #63, facet 3). Stay multi_thread (not current_thread) so a blocking tool
-            // handler can't stall the serve loop or the upgrade-signal task.
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()?
-                .block_on(rag_rat_mcp::server::run_stdio(
-                    config,
-                    if cli.json {
-                        rag_rat_core::OutputFormat::Json
-                    } else {
-                        rag_rat_core::OutputFormat::Toon
-                    },
-                ))?;
-        },
         Cmd::Memory(args) => memory(&config, &args)?,
         Cmd::Dream(args) => dream(&config, &args)?,
-        Cmd::Github(args) => github(&config, &args)?,
+        Cmd::Github(args) => papertrail(&config, &args)?,
         Cmd::Hooks(args) => hooks(&config, &args)?,
         Cmd::Maintenance(args) => maintenance(&config, &args)?,
         Cmd::Models(args) => models(&config, &args)?,
@@ -347,26 +332,120 @@ fn now_epoch_ms() -> i64 {
 
 /// Load the config, mapping a missing file to a friendly hint instead of a raw IO error.
 /// `init`/`--help`/`--version` never reach here, so this only guards commands that genuinely
-/// need a configured repo.
-///
-/// `explicit` is the user's `--config` value, taken literally; `None` resolves through
-/// [`rag_rat_core::config::discover_config_path`] — the discovery side of the governing seam, so
-/// a linked worktree with no branch-local `rag-rat.toml` (the state `init`'s refusal leaves)
-/// finds the MAIN worktree's config instead of dying at the existence check, and the hint in a
-/// truly config-less repo names the path where the config BELONGS (main's, in a linked checkout).
+/// need a configured repo. `mcp`/`doctor` deliberately do NOT — they degrade gracefully via
+/// [`discover_config_optional`] instead (dormant server / global-store report).
 pub(crate) fn load_config_or_hint(explicit: Option<&str>) -> anyhow::Result<Config> {
-    let path = match explicit {
-        Some(path) => std::path::PathBuf::from(path),
-        None => rag_rat_core::config::discover_config_path(Path::new(".")),
-    };
-    if !path.exists() {
-        anyhow::bail!(
+    match discover_config_optional(explicit)? {
+        Some(config) => Ok(config),
+        None => anyhow::bail!(
             "No rag-rat config found at `{}`.\nRun `rag-rat init` to create one, or pass --config \
              <path>.",
-            path.display()
+            rag_rat_core::config::discover_config_path(Path::new(".")).display()
+        ),
+    }
+}
+
+/// Resolve a config WITHOUT the fail-fast hint, distinguishing "absent" from "broken":
+///  * explicit `--config` given → taken literally; a MISSING file is a loud error (a user override
+///    that can't be honored), an invalid file propagates its parse error.
+///  * no `--config` → discover from cwd via [`rag_rat_core::config::discover_config_path`] (the
+///    governing seam: local file, else linked-worktree main, else the ancestor walk). Absent ⇒
+///    `Ok(None)` so the caller can degrade gracefully (dormant `mcp`, global-store `doctor`);
+///    present-but-invalid ⇒ the parse error — a real repo with a broken config must NOT silently
+///    degrade to dormancy.
+fn discover_config_optional(explicit: Option<&str>) -> anyhow::Result<Option<Config>> {
+    match explicit {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            if !path.exists() {
+                anyhow::bail!(
+                    "No rag-rat config found at `{}`.\nRun `rag-rat init` to create one, or pass \
+                     --config <path>.",
+                    path.display()
+                );
+            }
+            Ok(Some(Config::load(path)?))
+        },
+        None => {
+            let path = rag_rat_core::config::discover_config_path(Path::new("."));
+            // Only a GENUINELY ABSENT path is "no config" (graceful). A path that EXISTS but is not
+            // a readable config file (e.g. a directory named `rag-rat.toml`) is
+            // present-but-invalid: let `Config::load` surface the error rather than
+            // silently going dormant.
+            if !path.exists() {
+                return Ok(None);
+            }
+            Ok(Some(Config::load(path)?))
+        },
+    }
+}
+
+/// Serve the stdio MCP server, tolerating the ABSENCE of a config. A globally-registered
+/// `rag-rat mcp` is spawned in EVERY project, so outside a rag-rat repo it must serve a DORMANT
+/// server (stays alive; every tool call returns a "no index here" notice) instead of exiting and
+/// taking repo intelligence down for the whole session (#603). A config that is PRESENT but invalid
+/// — or an explicit `--config` path that is missing — is still a loud error.
+fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> {
+    let output_format =
+        if json { rag_rat_core::OutputFormat::Json } else { rag_rat_core::OutputFormat::Toon };
+    let config = discover_config_optional(explicit)?;
+    // Repo-specific setup only when a config actually resolved. `_log` holds the tracing guard for
+    // the server's lifetime; a dormant server writes no log (there is no repo to anchor it to).
+    let _log = config.as_ref().map(|config| {
+        apply_embedding_runtime_env(&config.llm.embedding.runtime);
+        rag_rat_core::logging::init_logging(config, rag_rat_core::logging::Role::Mcp)
+    });
+    if let Some(config) = &config {
+        // Detached, fail-open, dies with the process — no-ops unless opted in. Never spawned for a
+        // dormant server (no repo to refresh or rank).
+        spawn_detached_version_refresh(config);
+        spawn_detached_oracle_auto_run(config);
+    }
+    // Small worker pool: the stdio JSON-RPC loop is mostly serial and CPU-heavy indexing is rayon,
+    // not tokio; stay multi_thread so a blocking tool handler can't stall the serve/upgrade tasks
+    // (issue #63, facet 3).
+    let runtime =
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    // A resolved config → the active server; none → the dormant one. Kept as two calls so the
+    // published `run_stdio(Config, …)` entry point stays source-compatible (#603).
+    match config {
+        Some(config) => runtime.block_on(rag_rat_mcp::server::run_stdio(config, output_format))?,
+        None => runtime.block_on(rag_rat_mcp::server::run_stdio_dormant(output_format))?,
+    }
+    Ok(())
+}
+
+/// Run `doctor`, tolerating the ABSENCE of a config: with no `rag-rat.toml` at or above the cwd,
+/// report the machine-global store (`$XDG_DATA_HOME/rag-rat/rag-rat.sqlite`) instead of erroring —
+/// "no local config" is not "no data". `--vacuum` rewrites a specific repo's index, so it still
+/// requires a config. Only when this platform resolves no data dir at all does the config-less
+/// report fall back to the friendly "run rag-rat init" hint.
+fn run_doctor(args: &DoctorArgs, explicit: Option<&str>) -> anyhow::Result<()> {
+    if let Some(config) = discover_config_optional(explicit)? {
+        let _log = rag_rat_core::logging::init_logging(
+            &config,
+            rag_rat_core::logging::Role::Cli("doctor".to_string()),
+        );
+        return doctor(&config, args);
+    }
+    // No rag-rat.toml at or above the cwd. `--vacuum` needs a repo (it rewrites that repo's index),
+    // so it can't run against the config-less global-store report.
+    if args.vacuum {
+        anyhow::bail!(
+            "`rag-rat doctor --vacuum` needs a rag-rat repo (it rewrites that repo's index).\nRun \
+             it from the repo checkout, or pass --config <path>."
         );
     }
-    Ok(Config::load(path)?)
+    // A plain config-less `doctor` reports the machine-global store instead of erroring.
+    match rag_rat_core::data_dir::global_database_path() {
+        Some(database) => doctor_global_store(&database),
+        None => anyhow::bail!(
+            "No rag-rat config found at `{}`, and this platform has no data directory for a \
+             machine-global store.\nRun `rag-rat init` to create a config, or pass --config \
+             <path>.",
+            rag_rat_core::config::discover_config_path(Path::new(".")).display()
+        ),
+    }
 }
 
 /// Map the invoked subcommand to a debug-log [`Role`](rag_rat_core::logging::Role) (drives the log
@@ -381,7 +460,7 @@ fn log_role(cmd: &Cmd) -> rag_rat_core::logging::Role {
         Cmd::Maintenance(_) => Role::Cli("maintenance".to_string()),
         Cmd::Reconcile(_) => Role::Cli("reconcile".to_string()),
         Cmd::Index(_) => Role::Cli("index".to_string()),
-        Cmd::Doctor => Role::Cli("doctor".to_string()),
+        Cmd::Doctor(_) => Role::Cli("doctor".to_string()),
         Cmd::Gc => Role::Cli("gc".to_string()),
         _ => Role::Cli("cmd".to_string()),
     }

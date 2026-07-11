@@ -24,13 +24,27 @@
 //!
 //! Tokens (repo ids, kind/relation tokens, node ids) are machine identifiers and are encoded
 //! VERBATIM — no NFC/trim (the same "structural canonicity only" rule as [`super::op`]).
+//!
+//! **Two derivations coexist (sync phase C).** [`owner_stream`] / [`derive`] produce the original
+//! `rag-rat/stream/1` id — LOCAL-only, what the live phase-B authoring path mints. [`derive_v2`]
+//! produces the owner-bound `rag-rat/stream/2` id (§14), which commits the owning `AccountId`
+//! inside the hash so a synced `/3` content entry transitively names its owner. C1 adds `/2`
+//! ALONGSIDE `/1` (byte-unchanged); nothing switches the live path until C3 adoption.
 
 use minicbor::Encoder;
 use sha2::{Digest, Sha256};
 
+use super::account::AccountId;
+
 /// Domain tag + version for the stream-identity derivation. Bump only when the canonical rule
 /// itself changes — never when a kind/relation token is added.
 const STREAM_DOMAIN: &str = "rag-rat/stream/1";
+
+/// Domain tag for the OWNER-BOUND stream identity (sync phase C, §14). `/2` commits the owning
+/// `AccountId` inside the hashed identity, so a `/3` content entry that names the stream
+/// transitively names its owner — two accounts claiming one stream is cryptographically impossible.
+/// `/1` stays local-only (never on the wire); `/2` is what sync mints.
+const STREAM_V2_DOMAIN: &str = "rag-rat/stream/2";
 
 /// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::op`.
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
@@ -113,9 +127,33 @@ pub(crate) fn derive(spec: &StreamSpec) -> anyhow::Result<StreamId> {
     Ok(StreamId(out))
 }
 
-/// The canonical CBOR tuple the identity hashes — `[domain, repo_set, kind_allow_list | null,
+/// The canonical CBOR tuple the `/1` identity hashes — `[domain, repo_set, kind_allow_list | null,
 /// relation_policy | null, override_pairs]`, definite lengths + minimal headers throughout.
 fn canonical_spec_bytes(spec: &StreamSpec) -> anyhow::Result<Vec<u8>> {
+    let policy = canonical_policy(spec)?;
+    let mut buf = Vec::with_capacity(96);
+    {
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(5).expect(INFALLIBLE);
+        enc.str(STREAM_DOMAIN).expect(INFALLIBLE);
+        encode_policy(&mut enc, &policy);
+    }
+    Ok(buf)
+}
+
+/// The validated + canonicalized policy fields shared by the `/1` and `/2` derivations. Extracting
+/// them keeps the two identities byte-identical in everything but the domain tag + owner prefix.
+struct CanonicalPolicy {
+    repo_set: Vec<String>,
+    kind_allow_list: Option<Vec<String>>,
+    relation_policy: Option<Vec<String>>,
+    overrides: Vec<NodeOverride>,
+}
+
+/// Validate + canonicalize a stream's policy (sort + dedup; reject an empty/blank `repo_set` or a
+/// node with conflicting overrides) — the identity-defining rules, independent of the domain
+/// version.
+fn canonical_policy(spec: &StreamSpec) -> anyhow::Result<CanonicalPolicy> {
     let repo_set = sorted_deduped(&spec.repo_set);
     if repo_set.is_empty() {
         anyhow::bail!("a stream must carry at least one repo");
@@ -123,24 +161,67 @@ fn canonical_spec_bytes(spec: &StreamSpec) -> anyhow::Result<Vec<u8>> {
     if repo_set.iter().any(|repo| repo.is_empty()) {
         anyhow::bail!("a stream repo id must be non-empty");
     }
-    let kind_allow_list = spec.kind_allow_list.as_deref().map(sorted_deduped);
-    let relation_policy = spec.relation_policy.as_deref().map(sorted_deduped);
-    let overrides = canonical_overrides(&spec.node_overrides)?;
+    Ok(CanonicalPolicy {
+        repo_set,
+        kind_allow_list: spec.kind_allow_list.as_deref().map(sorted_deduped),
+        relation_policy: spec.relation_policy.as_deref().map(sorted_deduped),
+        overrides: canonical_overrides(&spec.node_overrides)?,
+    })
+}
 
-    let mut buf = Vec::with_capacity(96);
+/// Append the four policy fields (`repo_set, kind_allow_list|null, relation_policy|null,
+/// override_pairs`) to `enc` in the frozen order. The BYTES are identical whether they follow the
+/// `/1` header or the `/2` header+owner — the shared tail of both identities.
+fn encode_policy(enc: &mut Encoder<&mut Vec<u8>>, policy: &CanonicalPolicy) {
+    encode_str_array(enc, &policy.repo_set);
+    encode_optional_str_array(enc, policy.kind_allow_list.as_deref());
+    encode_optional_str_array(enc, policy.relation_policy.as_deref());
+    enc.array(policy.overrides.len() as u64).expect(INFALLIBLE);
+    for entry in &policy.overrides {
+        enc.array(2).expect(INFALLIBLE);
+        enc.str(&entry.node_id).expect(INFALLIBLE);
+        enc.str(entry.action.as_wire_str()).expect(INFALLIBLE);
+    }
+}
+
+/// The owner-bound stream policy (`/2`, §14): the `/1` visibility policy plus the owning account.
+/// The owner is committed INSIDE the hashed identity, so ownership is self-certifying and
+/// immutable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamSpecV2 {
+    /// The account that owns this stream — all its authorization lives in this account's logs.
+    pub(crate) owner_account_id: AccountId,
+    /// The visibility policy (repos, kind/relation filters, per-node overrides), same shape as
+    /// `/1`.
+    pub(crate) policy: StreamSpec,
+}
+
+/// Derive the owner-bound `stream_id` (`/2`, §14): `sha256(cbor(["rag-rat/stream/2",
+/// owner_account_id (b32), repo_set, kind_allow_list|null, relation_policy|null, override_set]))`.
+/// C1 ships this ALONGSIDE [`owner_stream`] / [`derive`] (`/1`), which the live phase-B authoring
+/// path keeps using until C3 adoption — nothing switches the live path here.
+///
+/// Consumed by `StreamOwn` validation in the fold (Phase 4); the allow drops when that lands.
+#[allow(dead_code)]
+pub(crate) fn derive_v2(spec: &StreamSpecV2) -> anyhow::Result<StreamId> {
+    let bytes = canonical_spec_v2_bytes(spec)?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(&bytes));
+    Ok(StreamId(out))
+}
+
+/// The canonical CBOR tuple the `/2` identity hashes — `[domain, owner_account_id (b32), repo_set,
+/// kind_allow_list | null, relation_policy | null, override_pairs]`. The owner sits between the
+/// domain and the shared policy tail.
+fn canonical_spec_v2_bytes(spec: &StreamSpecV2) -> anyhow::Result<Vec<u8>> {
+    let policy = canonical_policy(&spec.policy)?;
+    let mut buf = Vec::with_capacity(128);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(5).expect(INFALLIBLE);
-        enc.str(STREAM_DOMAIN).expect(INFALLIBLE);
-        encode_str_array(&mut enc, &repo_set);
-        encode_optional_str_array(&mut enc, kind_allow_list.as_deref());
-        encode_optional_str_array(&mut enc, relation_policy.as_deref());
-        enc.array(overrides.len() as u64).expect(INFALLIBLE);
-        for entry in &overrides {
-            enc.array(2).expect(INFALLIBLE);
-            enc.str(&entry.node_id).expect(INFALLIBLE);
-            enc.str(entry.action.as_wire_str()).expect(INFALLIBLE);
-        }
+        enc.array(6).expect(INFALLIBLE);
+        enc.str(STREAM_V2_DOMAIN).expect(INFALLIBLE);
+        enc.bytes(&spec.owner_account_id.to_bytes()).expect(INFALLIBLE);
+        encode_policy(&mut enc, &policy);
     }
     Ok(buf)
 }
@@ -331,5 +412,77 @@ mod tests {
             ],
         };
         assert!(derive(&spec).is_err(), "one node cannot be both included and excluded");
+    }
+
+    fn owner() -> AccountId {
+        AccountId::from_bytes([0x11; 32])
+    }
+
+    fn spec_v2() -> StreamSpecV2 {
+        StreamSpecV2 { owner_account_id: owner(), policy: filtered_spec() }
+    }
+
+    #[test]
+    fn stream_v2_pins_the_owner_bound_identity() {
+        // The `/2` derivation is a frozen primitive (StreamOwn validation + `/3` bodies build on
+        // it); a canonical-rule change must break this and force a deliberate
+        // `rag-rat/stream/2` bump.
+        let id = derive_v2(&spec_v2()).unwrap();
+        assert_eq!(
+            hex(&id.to_bytes()),
+            "d998110a767b415646b18c09745d6586b2ae6afdeb3144fe5f0907d2761557e3",
+            "stream/2 golden",
+        );
+    }
+
+    #[test]
+    fn stream_v2_canonical_bytes_have_the_expected_structure() {
+        // The owner b32 sits between the domain and the shared policy tail.
+        let bytes = canonical_spec_v2_bytes(&StreamSpecV2 {
+            owner_account_id: AccountId::from_bytes([0x11; 32]),
+            policy: StreamSpec {
+                repo_set: vec!["repo-a".to_string()],
+                kind_allow_list: None,
+                relation_policy: None,
+                node_overrides: Vec::new(),
+            },
+        })
+        .unwrap();
+        assert_eq!(bytes[0], 0x86, "6-element array header");
+        assert_eq!(bytes[1], 0x70, "text header, len 16");
+        assert_eq!(&bytes[2..18], b"rag-rat/stream/2");
+        assert_eq!(&bytes[18..20], &[0x58, 0x20], "owner_account_id bstr header, len 32");
+        assert_eq!(&bytes[20..52], &[0x11; 32], "owner_account_id bytes");
+        assert_eq!(bytes[52], 0x81, "repo_set: 1-element array");
+        assert_eq!(bytes[53], 0x66, "text header, len 6");
+        assert_eq!(&bytes[54..60], b"repo-a");
+        assert_eq!(bytes[60], 0xf6, "unfiltered kind_allow_list is CBOR null");
+        assert_eq!(bytes[61], 0xf6, "all-relations policy is CBOR null");
+        assert_eq!(bytes[62], 0x80, "empty override set");
+        assert_eq!(bytes.len(), 63);
+        cbor::require_canonical_cbor(&bytes).expect("stream/2 tuple is canonical CBOR");
+    }
+
+    #[test]
+    fn two_owners_cannot_derive_the_same_stream_id() {
+        // Same policy, different owner ⇒ different stream — ownership is committed inside the id,
+        // so two accounts claiming one stream is impossible.
+        let a = derive_v2(&StreamSpecV2 {
+            owner_account_id: AccountId::from_bytes([0x11; 32]),
+            policy: filtered_spec(),
+        })
+        .unwrap();
+        let b = derive_v2(&StreamSpecV2 {
+            owner_account_id: AccountId::from_bytes([0x22; 32]),
+            policy: filtered_spec(),
+        })
+        .unwrap();
+        assert_ne!(a, b, "a different owner must derive a different stream_id");
+    }
+
+    #[test]
+    fn stream_v2_is_distinct_from_the_legacy_v1_identity() {
+        // The same visibility policy under `/2` (owner-bound) must not collide with its `/1` id.
+        assert_ne!(derive(&filtered_spec()).unwrap(), derive_v2(&spec_v2()).unwrap());
     }
 }

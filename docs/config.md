@@ -435,6 +435,82 @@ reference it cites must resolve in the indexed papertrail); a failing summary is
 dropped (no row is stored, so the surface falls back to the title). The pass **never** writes a
 `repo_memories` column.
 
+### Scheduling the passes (nightly systemd timer / cron)
+
+The verify and compaction passes are a periodic memory-maintenance chore — run them on a schedule so
+verdicts and summaries stay fresh as memories churn. Two things shape a good schedule:
+
+- **Run both passes in one invocation** — `rag-rat dream --verify --compact`. A single run provisions
+  the ephemeral GPU box *once* and runs both passes against it; two separate jobs pay two cold starts
+  (image pull + model load) for the same work. The zero-work guard means an idle run never boots a
+  box, so scheduling generously costs nothing when there is nothing to do.
+- **`--max-memories` caps *each* model pass over its churn-skip queue — it is per pass, not a shared
+  total.** An up-to-date memory is skipped: `--compact` keys that on the body + prompt version, while
+  `--verify` *also* re-enqueues when a memory's bound files or cited identifiers change (evidence
+  drift), so a nightly run after ordinary code churn still does verify work even if no memory was
+  edited. Because the cap is per pass, `--verify --compact --max-memories 200` can drive up to 200
+  verifications **and** 200 summaries (~400 model calls) on a full backlog — likely more than one
+  box's 30-minute max-lifetime finishes in one run, so a large initial backlog drains over several
+  nights (churn-skip resumes where it left off). Size the cap for the per-pass cost you want.
+
+A headless scheduler runs with a **bare environment**, which is where this usually goes wrong. The
+run must be able to (a) find the `rag-rat` binary *and* `node`/`npx` (the cookbook recipe shells out
+to `npx`), (b) reach the **provider credentials that provision the box** — for Modal, `MODAL_TOKEN_ID`
+/ `MODAL_TOKEN_SECRET` in the environment or `~/.modal.toml` (so set `HOME`); these are distinct from
+`[llm.dream.remote] auth_env`, which is only the *served endpoint's* bearer token (connect mode, or
+the provisioned box's tunnel), not the provisioning credential — and (c) start in the repo whose
+`rag-rat.toml` sets `[llm.dream] enabled = true` (the dream config is repo-local; the index store is
+machine-global).
+
+A systemd **user** timer, nightly at 04:30:
+
+```ini
+# ~/.config/systemd/user/rag-rat-dream.service
+[Unit]
+Description=rag-rat dream memory maintenance (verify + compact)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/your/repo
+Environment=HOME=%h
+Environment=PATH=%h/.cargo/bin:/path/to/node/bin:/usr/bin:/bin
+ExecStart=%h/.cargo/bin/rag-rat dream --verify --compact --max-memories 200
+TimeoutStartSec=60min
+```
+
+```ini
+# ~/.config/systemd/user/rag-rat-dream.timer
+[Unit]
+Description=Nightly rag-rat dream memory maintenance
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+# Catch up on the next boot if the machine was off/asleep at 04:30.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now rag-rat-dream.timer
+systemctl --user list-timers rag-rat-dream.timer   # confirm the next run
+loginctl enable-linger "$USER"                      # REQUIRED to fire the timer while logged out
+```
+
+`loginctl enable-linger` is easy to forget and load-bearing: without it the user systemd instance is
+torn down when your last session ends, and an overnight timer never fires. The **plain-cron
+equivalent** is the same command wrapped so `PATH`/`HOME`/cwd are set (cron's environment is even
+barer than systemd's).
+
+Either way the run is unattended, so teardown reliability matters. On **Modal**, the cookbook box
+carries its own idle + max-lifetime backstops, so a crashed run or a flaked teardown still
+self-terminates the box rather than billing a GPU indefinitely. On **RunPod** there is **no
+provider-side backstop** — an on-demand pod stops only when the recipe's teardown runs — so a headless
+RunPod schedule depends entirely on clean teardown; prefer the Modal cookbook for unattended runs, or
+add your own external watchdog.
+
 ### Reviewing findings (`rag-rat dream <id> --accept|--dismiss|--reset`)
 
 The worklist `rag-rat dream` prints carries a stable `id` per finding. Dream only *proposes*; a

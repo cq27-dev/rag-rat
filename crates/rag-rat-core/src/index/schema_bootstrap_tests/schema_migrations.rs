@@ -391,7 +391,7 @@ fn migrate_preserves_github_papertrail_cache() {
     let (root, config) =
         markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    github::sync_from_refs(
+    sync_from_refs_blocking(
         db.storage.connection(),
         &root,
         Some(&MockGitHubClient),
@@ -401,11 +401,11 @@ fn migrate_preserves_github_papertrail_cache() {
     .unwrap();
     assert_eq!(row_count(&db, "github_refs"), 1);
     assert_eq!(row_count(&db, "github_issues"), 1);
-    assert_eq!(row_count(&db, "github_comments"), 1);
+    assert_eq!(row_count(&db, "github_comments"), 2);
     assert_eq!(row_count(&db, "github_pull_requests"), 1);
     assert_eq!(row_count(&db, "github_reviews"), 1);
     assert_eq!(row_count(&db, "github_review_comments"), 1);
-    assert_eq!(row_count(&db, "github_fts"), 5);
+    assert_eq!(row_count(&db, "github_fts"), 6);
     db.storage
         .connection()
         .execute("DELETE FROM schema_version WHERE id = ?1", ["010_symbol_facts"])
@@ -417,12 +417,12 @@ fn migrate_preserves_github_papertrail_cache() {
     let db = IndexDatabase::open(&config.database).unwrap();
     assert_eq!(row_count(&db, "github_refs"), 1);
     assert_eq!(row_count(&db, "github_issues"), 1);
-    assert_eq!(row_count(&db, "github_comments"), 1);
+    assert_eq!(row_count(&db, "github_comments"), 2);
     assert_eq!(row_count(&db, "github_pull_requests"), 1);
     assert_eq!(row_count(&db, "github_reviews"), 1);
     assert_eq!(row_count(&db, "github_review_comments"), 1);
-    assert_eq!(row_count(&db, "github_fts"), 5);
-    let hits = db.github_issue_search("sqlite", 10).unwrap();
+    assert_eq!(row_count(&db, "github_fts"), 6);
+    let hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].number, 42);
 
@@ -439,7 +439,7 @@ fn full_rebuild_preserves_github_papertrail_cache() {
     let (root, config) =
         markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    github::sync_from_refs(
+    sync_from_refs_blocking(
         db.storage.connection(),
         &root,
         Some(&MockGitHubClient),
@@ -448,20 +448,20 @@ fn full_rebuild_preserves_github_papertrail_cache() {
     )
     .unwrap();
     assert_eq!(row_count(&db, "github_issues"), 1);
-    assert_eq!(row_count(&db, "github_fts"), 5);
+    assert_eq!(row_count(&db, "github_fts"), 6);
     drop(db);
 
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     assert_eq!(row_count(&db, "github_refs"), 1);
     assert_eq!(row_count(&db, "github_issues"), 1);
-    assert_eq!(row_count(&db, "github_comments"), 1);
+    assert_eq!(row_count(&db, "github_comments"), 2);
     assert_eq!(row_count(&db, "github_pull_requests"), 1);
     assert_eq!(row_count(&db, "github_reviews"), 1);
     assert_eq!(row_count(&db, "github_review_comments"), 1);
     assert_eq!(row_count(&db, "github_ref_sync"), 1);
-    assert_eq!(row_count(&db, "github_fts"), 5);
-    let hits = db.github_issue_search("sqlite", 10).unwrap();
+    assert_eq!(row_count(&db, "github_fts"), 6);
+    let hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].number, 42);
 
@@ -665,6 +665,10 @@ fn compatible_open_refuses_dirty_and_newer_schema() {
     // the schema and every older-binary process hits this, so a bare refusal reads as breakage.
     assert!(err.contains("upgrade rag-rat"), "{err}");
     assert!(err.contains("restart"), "{err}");
+    // #585: it also names this binary's schema ceiling. (This fixture never recorded provenance —
+    // no index_meta — so the "who migrated" clause is correctly absent; the defensive note yields
+    // "".)
+    assert!(err.contains(&format!("schema v{}", schema::LATEST_SCHEMA_VERSION)), "{err}");
     // The fleet hot-upgrade re-execs armed MCP servers only on Linux; elsewhere the message must
     // say running servers stay stale until their sessions restart.
     if cfg!(target_os = "linux") {
@@ -1488,17 +1492,31 @@ fn migration_054_adds_the_single_row_device_identity_table() {
     }
 
     // `CHECK (id = 0)` + the primary key make it a strict single-row table: id 0 inserts once; a
-    // non-zero id is refused by the CHECK; a second id-0 insert is refused by the PK.
-    conn.execute("INSERT INTO oplog_device_identity VALUES (0, x'00', x'11', x'22', 0)", [])
-        .expect("the sole id=0 identity row inserts");
+    // non-zero id is refused by the CHECK; a second id-0 insert is refused by the PK. (Columns are
+    // named because V058 added the nullable x25519 columns — a positional 5-value insert no longer
+    // matches the 7-column table.)
+    conn.execute(
+        "INSERT INTO oplog_device_identity(id, seed, public_key, fingerprint, created_at_ms)
+         VALUES (0, x'00', x'11', x'22', 0)",
+        [],
+    )
+    .expect("the sole id=0 identity row inserts");
     assert!(
-        conn.execute("INSERT INTO oplog_device_identity VALUES (1, x'00', x'11', x'22', 0)", [])
-            .is_err(),
+        conn.execute(
+            "INSERT INTO oplog_device_identity(id, seed, public_key, fingerprint, created_at_ms)
+             VALUES (1, x'00', x'11', x'22', 0)",
+            [],
+        )
+        .is_err(),
         "CHECK (id = 0) rejects a second, non-zero identity"
     );
     assert!(
-        conn.execute("INSERT INTO oplog_device_identity VALUES (0, x'99', x'88', x'77', 1)", [])
-            .is_err(),
+        conn.execute(
+            "INSERT INTO oplog_device_identity(id, seed, public_key, fingerprint, created_at_ms)
+             VALUES (0, x'99', x'88', x'77', 1)",
+            [],
+        )
+        .is_err(),
         "the id=0 primary key rejects a second identity"
     );
 
@@ -1522,10 +1540,13 @@ fn migration_054_adds_the_single_row_device_identity_table() {
 fn migration_055_adds_the_binding_downgrade_marker_column() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V055 is the schema tip — this test carries the absolute pin (the older tests dropped to
-    // the symbolic `current_version == LATEST` check).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 55, "V055 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 55, "schema at LATEST after apply");
+    // The absolute tip pin lives with the newest migration's test (`migration_057_*` now); this
+    // drops to the symbolic `current_version == LATEST` freshness check.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
     assert!(
         conn_table_columns(&conn, "repo_memory_bindings")
             .contains(&"downgrade_pending_at_ms".to_string()),
@@ -1547,6 +1568,251 @@ fn migration_055_adds_the_binding_downgrade_marker_column() {
         schema::LATEST_SCHEMA_VERSION,
         "forward migrate reaches the tip"
     );
+}
+
+#[test]
+fn migration_056_adds_the_git_change_couplings_table() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // The absolute tip pin lives with the newest migration's test (`migration_057_*` now); this
+    // drops to the symbolic `current_version == LATEST` freshness check.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
+    assert!(
+        conn_table_exists(&conn, "git_change_couplings"),
+        "V056 creates the git_change_couplings table"
+    );
+
+    // STRICT + composite (repo_id, path_a, path_b) PK: a duplicate pair is rejected.
+    conn.execute(
+        "INSERT INTO git_change_couplings(repo_id, path_a, path_b, co_change_count, \
+         path_a_change_count, path_b_change_count, window_commit_count, last_co_change_at_s, \
+         computed_at_ms) VALUES ('r', 'a.rs', 'b.rs', 2, 3, 4, 10, 100, 1)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO git_change_couplings(repo_id, path_a, path_b, co_change_count, \
+             path_a_change_count, path_b_change_count, window_commit_count, last_co_change_at_s, \
+             computed_at_ms) VALUES ('r', 'a.rs', 'b.rs', 9, 9, 9, 9, 9, 9)",
+            [],
+        )
+        .is_err(),
+        "the composite PK rejects a duplicate (repo_id, path_a, path_b)"
+    );
+
+    // Deferred-absence in ISOLATION: drop + re-run the applier alone; it recreates, replay is a
+    // no-op.
+    conn.execute_batch("DROP TABLE git_change_couplings;").unwrap();
+    assert!(!conn_table_exists(&conn, "git_change_couplings"), "dropped before the isolated apply");
+    schema::apply_git_change_couplings(&conn).unwrap();
+    schema::apply_git_change_couplings(&conn).expect("replay is a no-op");
+    assert!(
+        conn_table_exists(&conn, "git_change_couplings"),
+        "the isolated applier recreates the table"
+    );
+
+    // A forward migrate over a ledger truncated below V056 replays the step and reaches the tip.
+    truncate_schema_to(&conn, 55);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip"
+    );
+}
+
+#[test]
+fn migration_057_adds_the_external_symbols_table() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // The absolute tip pin moved to `migration_058_*` (V058 is the tip now); this drops to the
+    // symbolic `current_version == LATEST` check, per the ladder convention.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
+
+    // The external-symbol contract table exists with its full column set.
+    for column in [
+        "repo_id",
+        "tool",
+        "tool_version",
+        "commit_sha",
+        "worktree_id",
+        "moniker",
+        "kind",
+        "display_name",
+        "signature_text",
+        "signature_language",
+        "documentation",
+        "deprecated",
+        "computed_at_ms",
+    ] {
+        assert!(
+            conn_table_columns(&conn, "external_symbols").contains(&column.to_string()),
+            "V057 gives external_symbols its {column} column"
+        );
+    }
+
+    // PK `(repo_id, tool, commit_sha, worktree_id, moniker)`: a second row with the same key is
+    // rejected even when the payload differs; the SAME moniker under a DIFFERENT checkout inserts
+    // (the multi-worktree isolation), as does a distinct moniker.
+    let insert = "INSERT INTO external_symbols(repo_id, tool, tool_version, commit_sha, \
+                  worktree_id, moniker, kind, display_name, signature_text, signature_language, \
+                  documentation, deprecated, computed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
+                  ?8, ?9, ?10, ?11, ?12, ?13)";
+    conn.execute(insert, rusqlite::params![
+        "r",
+        "rust-analyzer",
+        "1.0",
+        "sha1",
+        "",
+        "crate a 1.0 mod/get().",
+        "Function",
+        "get",
+        "fn get()",
+        "rust",
+        "docs",
+        0,
+        123_i64
+    ])
+    .expect("first external-symbol row inserts");
+    assert!(
+        conn.execute(insert, rusqlite::params![
+            "r",
+            "rust-analyzer",
+            "2.0",
+            "sha1",
+            "",
+            "crate a 1.0 mod/get().",
+            "Method",
+            "get",
+            "fn get(x)",
+            "rust",
+            "other",
+            1,
+            456_i64
+        ])
+        .is_err(),
+        "the (repo_id, tool, commit_sha, worktree_id, moniker) primary key rejects a duplicate"
+    );
+    conn.execute(insert, rusqlite::params![
+        "r",
+        "rust-analyzer",
+        "1.0",
+        "sha2",
+        "",
+        "crate a 1.0 mod/get().",
+        "Function",
+        "get",
+        "fn get()",
+        "rust",
+        "docs",
+        0,
+        123_i64
+    ])
+    .expect("the same moniker under a different checkout (commit_sha) inserts — worktree-isolated");
+    conn.execute(insert, rusqlite::params![
+        "r",
+        "rust-analyzer",
+        "1.0",
+        "sha1",
+        "",
+        "crate a 1.0 mod/other().",
+        "Function",
+        "other",
+        "fn other()",
+        "rust",
+        "docs",
+        0,
+        123_i64
+    ])
+    .expect("a distinct moniker inserts");
+
+    // Deferred-absence in ISOLATION: drop the table and re-run the applier alone (never against the
+    // full ladder's end state). It recreates the table, and a replay is a no-op (CREATE … IF NOT
+    // EXISTS).
+    conn.execute_batch("DROP TABLE external_symbols;").unwrap();
+    assert!(!conn_table_exists(&conn, "external_symbols"), "dropped before the isolated apply");
+    schema::apply_external_symbols(&conn).unwrap();
+    schema::apply_external_symbols(&conn).expect("replay is a no-op");
+    assert!(
+        conn_table_columns(&conn, "external_symbols").contains(&"moniker".to_string()),
+        "the isolated applier recreates the table"
+    );
+
+    // A forward migrate over a ledger truncated below V057 replays the step and lands the table.
+    conn.execute_batch("DROP TABLE external_symbols;").unwrap();
+    truncate_schema_to(&conn, 56);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip"
+    );
+    assert!(
+        conn_table_exists(&conn, "external_symbols"),
+        "the forward migrate re-creates external_symbols"
+    );
+}
+
+#[test]
+fn migration_058_adds_the_oplog_device_x25519_columns() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V058 is the schema tip — this test carries the absolute pin (the older tests dropped to
+    // the symbolic `current_version == LATEST` check).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 58, "V058 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 58, "schema at LATEST after apply");
+
+    // The identity table gains the X25519 encryption columns (sync phase C, §5).
+    for column in ["x25519_secret", "x25519_public"] {
+        assert!(
+            conn_table_columns(&conn, "oplog_device_identity").contains(&column.to_string()),
+            "V058 gives oplog_device_identity its {column} column"
+        );
+    }
+
+    // Deferred-absence in ISOLATION: build the table from the V054 DDL ALONE (never the full
+    // ladder's end state) — the x25519 columns are absent — then the V058 applier adds them, and a
+    // replay is an idempotent no-op (add_column_if_missing).
+    let isolated = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_oplog_device_identity(&isolated).unwrap();
+    for column in ["x25519_secret", "x25519_public"] {
+        assert!(
+            !conn_table_columns(&isolated, "oplog_device_identity").contains(&column.to_string()),
+            "the V054 table alone lacks the {column} column"
+        );
+    }
+    schema::apply_oplog_device_x25519(&isolated).unwrap();
+    schema::apply_oplog_device_x25519(&isolated).expect("replay is a no-op");
+    for column in ["x25519_secret", "x25519_public"] {
+        assert!(
+            conn_table_columns(&isolated, "oplog_device_identity").contains(&column.to_string()),
+            "the isolated V058 applier adds the {column} column"
+        );
+    }
+
+    // A forward migrate over a ledger truncated below V058 replays the step and keeps the columns.
+    truncate_schema_to(&conn, 57);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip"
+    );
+    for column in ["x25519_secret", "x25519_public"] {
+        assert!(
+            conn_table_columns(&conn, "oplog_device_identity").contains(&column.to_string()),
+            "the forward migrate keeps the {column} column"
+        );
+    }
 }
 
 #[test]
@@ -1647,4 +1913,95 @@ fn migration_046_deferred_absence_and_reconverges_from_torn_state() {
         [],
     )
     .expect("a new content_hash is a distinct summary row");
+}
+
+/// #585: bringing the schema current records WHO did it into the global `index_meta`, so a stranded
+/// fleet is diagnosable in one query instead of forensics. Covers the `schema::apply` (create /
+/// funnel-2) path.
+#[test]
+fn applying_the_schema_records_migration_provenance() {
+    use rusqlite::OptionalExtension;
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    let read = |key: &str| -> Option<String> {
+        conn.query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
+            .optional()
+            .unwrap()
+    };
+
+    assert_eq!(
+        read("last_migration_to_version").as_deref(),
+        Some(schema::LATEST_SCHEMA_VERSION.to_string().as_str()),
+        "provenance records the schema version migrated TO"
+    );
+    assert_eq!(
+        read("last_migration_binary_version").as_deref(),
+        Some(crate::binary_version()),
+        "provenance records this binary's version string"
+    );
+    assert!(read("last_migration_binary_exe").is_some(), "provenance records the binary path");
+    assert!(
+        read("last_migration_at_ms").and_then(|value| value.parse::<i64>().ok()).unwrap_or(0) > 0,
+        "provenance records a timestamp"
+    );
+}
+
+/// #585: the `Newer`-schema refusal (what every stranded process prints) names this binary's schema
+/// ceiling AND who last migrated the store, so the fleet outage is diagnosable from the error text.
+#[test]
+fn newer_schema_refusal_names_the_migrating_binary_and_ceiling() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap(); // stamps provenance for THIS binary
+    // Fabricate a Newer schema: an applied migration this binary doesn't know.
+    conn.execute(
+        "INSERT INTO schema_version(id, applied_at_ms, checksum, description) VALUES \
+         ('999_from_the_future', 0, 'sha256:future', 'a migration this binary lacks')",
+        [],
+    )
+    .unwrap();
+
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(status.state, schema::SchemaState::Newer);
+    assert!(
+        status.message.contains(crate::binary_version()),
+        "refusal should name the migrating binary version; got: {}",
+        status.message
+    );
+    assert!(
+        status.message.contains(&schema::LATEST_SCHEMA_VERSION.to_string()),
+        "refusal should name this binary's schema ceiling; got: {}",
+        status.message
+    );
+}
+
+/// #585: a forward migration of an existing store (the `migrate_forward` funnel) also stamps
+/// provenance — the stranding path, not just create.
+#[test]
+fn forward_migration_records_migration_provenance() {
+    use rusqlite::OptionalExtension;
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // Roll back one migration and clear provenance, then forward-migrate.
+    conn.execute(
+        "DELETE FROM schema_version WHERE id = (SELECT id FROM schema_version ORDER BY id DESC \
+         LIMIT 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM index_meta WHERE key LIKE 'last_migration_%'", []).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
+
+    schema::migrate_forward(&conn).unwrap();
+
+    let to: Option<String> = conn
+        .query_row(
+            "SELECT value FROM index_meta WHERE key = 'last_migration_to_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(to.as_deref(), Some(schema::LATEST_SCHEMA_VERSION.to_string().as_str()));
 }
