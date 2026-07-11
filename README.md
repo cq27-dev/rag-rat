@@ -103,21 +103,12 @@ See [Quickstart](#quickstart) for what the skills do and the one-time `rag-rat i
 
 ## Quickstart
 
-From the repository you want to index:
+The fastest path is the **[plugin](#connect-it-to-your-agent-mcp)** (Claude Code / Codex): install it,
+then **ask your agent to set the repo up** — its `init-rag-rat` skill scans the repo, picks an
+embedding backend, writes `rag-rat.toml`, and indexes. You just say "set up rag-rat in this repo."
 
-```bash
-cd /path/to/your/repo
-rag-rat init
-```
-
-`init` scans the repo, prompts for languages and path bindings, writes `rag-rat.toml`, indexes,
-offers to install the local embedding model, and can install git hooks; on completion it prints the
-one command to connect your agent. Preview without writing anything with `rag-rat init --dry-run`;
-`--yes` runs the non-interactive defaults.
-
-**Install the agent skills.** `init` wires up the index and MCP server; a pair of skills teaches your
-agent to actually reach for them. Install into whatever agents you have (Claude Code, Codex, Cursor,
-and 70+ others, detected automatically):
+**Install the agent skills** so any agent reaches for the index (and can run that setup) — Claude
+Code, Codex, Cursor, and 70+ others, detected automatically:
 
 ```bash
 npx @rag-rat/skills
@@ -128,6 +119,22 @@ memories), **`dream-review`** (triage the memory-maintenance worklist), **`init-
 not-yet-indexed repo conversationally — scan, choose an embedding backend, index, restart), and
 **`configure-rag-rat-dream`** (enable the optional AI memory-maintenance model passes). See
 [`skills/README.md`](skills/README.md) for `update` / `list` / `remove` and per-agent flags.
+
+<details>
+<summary>Set it up by hand (CLI)</summary>
+
+From the repository you want to index:
+
+```bash
+cd /path/to/your/repo
+rag-rat init
+```
+
+`init` scans the repo, prompts for languages and path bindings, writes `rag-rat.toml`, indexes, offers
+to install the local embedding model, and can install git hooks; on completion it prints the one
+command to connect your agent. Preview without writing anything with `rag-rat init --dry-run`; `--yes`
+runs the non-interactive defaults.
+</details>
 
 Manual setup and every config knob live in [`docs/config.md`](docs/config.md). For a large repo where
 the default local embedder is too slow, see [Embedding backends](#embedding-backends).
@@ -149,10 +156,22 @@ codex plugin marketplace add cq27-dev/rag-rat
 codex plugin add rag-rat@rag-rat
 ```
 
-Then initialize each repo you want indexed with `npx -y @rag-rat/bin init` — the plugin caches its
-binary privately, so `rag-rat` isn't on your `PATH`; run the CLI through npx (or `npm i -g
-@rag-rat/bin`). See [Quickstart](#quickstart). The server stays dormant until a repo has a
-`rag-rat.toml`.
+Then **just ask your agent to set the repo up** — the plugin ships the `init-rag-rat` skill, so it
+scans the repo, picks an embedding backend, writes `rag-rat.toml`, runs the first index, and tells you
+to reconnect — conversationally. For example:
+
+> Set up rag-rat in this repo.
+
+The server stays dormant until a repo has a `rag-rat.toml`; after the agent writes one, reconnect
+(restart) the MCP server so it activates against the new index.
+
+<details>
+<summary>Prefer to set it up by hand?</summary>
+
+Initialize each repo yourself with `npx -y @rag-rat/bin init` — the plugin caches its binary
+privately, so `rag-rat` isn't on your `PATH`; run the CLI through npx (or `npm i -g @rag-rat/bin`).
+See the [Quickstart](#quickstart) CLI recipe.
+</details>
 
 Claude Code asks once per tool before it first runs a rag-rat MCP tool (its standard MCP consent — a
 plugin can't pre-approve its own tools). To allow them all up front, choose "Yes, don't ask again" on
