@@ -1375,6 +1375,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_055_ID => migration.checksum != MIGRATION_055_CHECKSUM,
         MIGRATION_056_ID => migration.checksum != MIGRATION_056_CHECKSUM,
         MIGRATION_057_ID => migration.checksum != MIGRATION_057_CHECKSUM,
+        MIGRATION_058_ID => migration.checksum != MIGRATION_058_CHECKSUM,
         _ => false,
     }
 }
