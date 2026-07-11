@@ -1,43 +1,33 @@
 # Local reproduction of Glama's hosted MCP build for cq27-dev/rag-rat.
 #
-# Glama builds from its own Build Spec (base image + node + mcp-proxy, clone repo, then `buildSteps`,
-# then `cmdArguments`), NOT from this file. This Dockerfile bundles the same steps into one runnable
-# image so the Glama build can be reproduced and tested locally. The Build Spec's `buildSteps` must
-# install a Rust toolchain and `cargo install` rag-rat (Glama's base has none), and `cmdArguments`
-# must be `mcp-proxy -- rag-rat --config /workspace/rag-rat.toml mcp` — mcp-proxy spawns rag-rat as a
-# stdio MCP server and exposes it at :8080/mcp (+/sse) with the /ping health check Glama polls.
+# Glama builds from its own Build Spec (base image + node + mcp-proxy, then buildSteps, then
+# cmdArguments), NOT from this file. This Dockerfile bundles the same steps into one runnable image so
+# the Glama build can be reproduced + tested locally. buildSteps install the PREBUILT rag-rat CLI from
+# npm (@rag-rat/bin — no Rust toolchain, no compile), and cmdArguments must be
+# `mcp-proxy -- rag-rat --config /workspace/rag-rat.toml mcp` — mcp-proxy spawns rag-rat as a stdio
+# MCP server at :8080/mcp (+/sse) with the /ping health check Glama polls.
 #
-# The server roots itself in a tiny sample repo with embeddings off, so introspection
-# (initialize + tools/list, served from a static catalog) boots instantly — no model download,
-# no outbound network.
+# @rag-rat/bin is installed at BUILD time (its postinstall fetches the platform prebuilt), so the
+# server roots itself in a tiny sample repo with embeddings off and boots instantly — no model
+# download, no cargo compile, no outbound network at runtime.
 FROM debian:trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     GLAMA_VERSION="1.0.0" \
     PYTHONUNBUFFERED=1 \
-    RAG_RAT_NO_WATCH=1 \
-    RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH="/usr/local/cargo/bin:/app/node_modules/.bin:$PATH"
+    RAG_RAT_NO_WATCH=1
 
-# node + mcp-proxy (Glama's harness); build-essential/pkg-config for rusqlite's bundled SQLite (cc);
-# rustup toolchain pinned to satisfy rag-rat's 1.95+ MSRV.
+# node + mcp-proxy (Glama's harness) + git (rag-rat roots itself in a git worktree). No Rust
+# toolchain / build-essential: rag-rat is the prebuilt @rag-rat/bin npm package. `npm i -g @rag-rat/bin`
+# runs its postinstall, which downloads the platform binary (glibc >=2.38 — trixie has it; FastEmbed's
+# ONNX Runtime is statically linked, so no libonnxruntime.so at runtime) and puts `rag-rat` on PATH.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git build-essential pkg-config \
+        ca-certificates curl git \
     && curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g mcp-proxy@6.4.3 \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-         | sh -s -- -y --default-toolchain 1.96.0 --profile minimal \
+    && npm install -g mcp-proxy@6.4.3 @rag-rat/bin@latest \
+    && rag-rat --version \
     && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-WORKDIR /app
-# Track main HEAD, matching the Glama Build Spec's `pinnedCommit: null`.
-RUN git clone --depth 1 https://github.com/cq27-dev/rag-rat .
-
-# Hash-only build (no FastEmbed) -> small and offline; identical MCP tool surface for introspection.
-RUN cargo install --locked --path crates/rag-rat-cli --bin rag-rat \
-        --no-default-features --root /usr/local
 
 # Minimal sample repo the server roots itself in. Absolute paths so it's CWD-independent;
 # model="none" (BM25-only) downloads nothing; watcher + crates.io version check disabled.
