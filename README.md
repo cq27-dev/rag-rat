@@ -49,102 +49,10 @@ sequenceDiagram
   repo — so an agent reuses instead of re-implementing. Read-only, and a silent no-op when the index
   isn't ready, so it never blocks a write.
 
-## Install
-
-> **Using Claude Code or Codex?** The [plugin](#connect-it-to-your-agent-mcp) is the one-step path —
-> it installs the MCP server, the agent skills, the hooks, **and** a version-matched `rag-rat` binary,
-> so you can skip this section. The manual install below is for the CLI, other agents, or building
-> from source.
-
-The quickest way is a prebuilt binary — no Rust toolchain — for Apple Silicon macOS, glibc ≥2.38
-Linux (x86-64 and arm64), Windows x64, and Android/Termux (arm64):
-
-```bash
-npm install -g @rag-rat/bin        # puts `rag-rat` on your PATH
-# or run it once, without installing:
-npx @rag-rat/bin --help
-```
-
-`@rag-rat/bin` fetches the prebuilt binary for your platform from the matching GitHub release. It is
-the full build — FastEmbed's ONNX Runtime is statically linked, so nothing else is needed at runtime.
-
-**Build from source** if you'd rather compile it yourself (or assemble it from parts):
-
-```bash
-cargo install rag-rat              # from crates.io (FastEmbed included by default)
-```
-
-From a checkout:
-
-```bash
-cargo install --path crates/rag-rat-cli --bin rag-rat
-```
-
-The default build links FastEmbed's ONNX Runtime, whose prebuilt needs **glibc ≥2.38** and doesn't
-exist for **Intel macOS** or **musl/Alpine Linux**. On any of those — an older glibc (e.g. Ubuntu
-22.04), Intel Mac, or musl — build the pure-Rust embedder instead (real embeddings, no ONNX):
-
-```bash
-cargo install rag-rat --no-default-features --features model2vec
-```
-
-`--no-default-features` alone gives a smaller hash-only build with no real embeddings. SQLite is
-bundled (compiled in via `rusqlite`), so there is no system-library prerequisite — see
-[Platform support](#platform-support) for the per-OS C-toolchain note. On Android/Termux, `cargo
-install rag-rat` also builds from source (needs the `rust` package).
-
-**Then add the agent skills** so your agent actually reaches for the index:
-
-```bash
-npx @rag-rat/skills
-```
-
-See [Quickstart](#quickstart) for what the skills do and the one-time `rag-rat init` setup.
-
 ## Quickstart
 
-The fastest path is the **[plugin](#connect-it-to-your-agent-mcp)** (Claude Code / Codex): install it,
-then **ask your agent to set the repo up** — its `init-rag-rat` skill scans the repo, picks an
-embedding backend, writes `rag-rat.toml`, and indexes. You just say "set up rag-rat in this repo."
-
-**Install the agent skills** so any agent reaches for the index (and can run that setup) — Claude
-Code, Codex, Cursor, and 70+ others, detected automatically:
-
-```bash
-npx @rag-rat/skills
-```
-
-That installs **`using-rag-rat`** (reach for the MCP tools before grep; record durable findings as
-memories), **`dream-review`** (triage the memory-maintenance worklist), **`init-rag-rat`** (set up a
-not-yet-indexed repo conversationally — scan, choose an embedding backend, index, restart), and
-**`configure-rag-rat-dream`** (enable the optional AI memory-maintenance model passes). See
-[`skills/README.md`](skills/README.md) for `update` / `list` / `remove` and per-agent flags.
-
-<details>
-<summary>Set it up by hand (CLI)</summary>
-
-From the repository you want to index:
-
-```bash
-cd /path/to/your/repo
-rag-rat init
-```
-
-`init` scans the repo, prompts for languages and path bindings, writes `rag-rat.toml`, indexes, offers
-to install the local embedding model, and can install git hooks; on completion it prints the one
-command to connect your agent. Preview without writing anything with `rag-rat init --dry-run`; `--yes`
-runs the non-interactive defaults.
-</details>
-
-Manual setup and every config knob live in [`docs/config.md`](docs/config.md). For a large repo where
-the default local embedder is too slow, see [Embedding backends](#embedding-backends).
-
-## Connect it to your agent (MCP)
-
-**Claude Code and Codex: install the plugin — the one-step path.** It registers the MCP server, adds
-the agent skills, wires the hooks (grep-augmentation, write-time clone check, a session-start repo
-digest), and installs a version-matched `rag-rat` binary on first run — so a plugin user skips the
-`npm install` / `cargo install` above entirely:
+For Claude Code and Codex, install the plugin. It registers the MCP server, adds the skills and
+hooks, and installs a version-matched `rag-rat` binary on first run:
 
 ```bash
 # Claude Code
@@ -156,42 +64,90 @@ codex plugin marketplace add cq27-dev/rag-rat
 codex plugin add rag-rat@rag-rat
 ```
 
-Then **just ask your agent to set the repo up** — the plugin ships the `init-rag-rat` skill, so it
-scans the repo, picks an embedding backend, writes `rag-rat.toml`, indexes, installs the git hooks, and tells you
-to reconnect — conversationally. For example:
+Then open the repository and ask:
 
 > Set up rag-rat in this repo.
 
-The server stays dormant until a repo has a `rag-rat.toml`; after the agent writes one, reconnect
-(restart) the MCP server so it activates against the new index.
+The `init-rag-rat` skill scans the repo, explains the material choices, previews `rag-rat.toml`, and
+writes and indexes only after confirmation. The MCP server starts dormant in an unconfigured repo;
+when setup finishes, reconnect it so it restarts fully active against the new index.
+
+Now try the loop rag-rat is built for:
+
+- "Run `impact_surface` on the function I'm about to edit."
+- "Where is config reload handled, and why is it designed that way?"
+- "Does this helper duplicate anything already in the codebase?"
+- "Record the invariant we just discovered on this symbol."
 
 <details>
-<summary>Prefer to set it up by hand?</summary>
+<summary><strong>Manual installation and other agents</strong></summary>
 
-Initialize each repo yourself with `npx -y @rag-rat/bin init` — the plugin caches its binary
-privately, so `rag-rat` isn't on your `PATH`; run the CLI through npx (or `npm i -g @rag-rat/bin`).
-See the [Quickstart](#quickstart) CLI recipe.
-</details>
+Use this path for the standalone CLI, agents without plugin support, or building from source.
 
-Claude Code asks once per tool before it first runs a rag-rat MCP tool (its standard MCP consent — a
-plugin can't pre-approve its own tools). To allow them all up front, choose "Yes, don't ask again" on
-the prompt, or add to your user settings (`~/.claude/settings.json`):
+### Install the CLI
 
-```json
-{ "permissions": { "allow": ["mcp__rag-rat__*"] } }
-```
-
-**Any other MCP agent, or wiring it by hand.** The MCP server is STDIO — the client launches
-`rag-rat` as a child process. Register it with one command, run from the repo directory so the server
-resolves that repo's `rag-rat.toml` and each repo gets its own index:
+The prebuilt package needs no Rust toolchain and supports Apple Silicon macOS, glibc ≥2.38 Linux
+(x86-64 and arm64), Windows x64, and Android/Termux arm64:
 
 ```bash
-claude mcp add --scope project rag-rat -- rag-rat mcp     # Claude Code
-codex  mcp add rag-rat -- rag-rat mcp                     # Codex
+npm install -g @rag-rat/bin
+# or run it without installing:
+npx @rag-rat/bin --help
 ```
 
-`rag-rat init` prints this command on completion — it does not register the server for you. Or add a
-project `.mcp.json` / equivalent:
+`@rag-rat/bin` fetches the full binary from the matching GitHub release. FastEmbed's ONNX Runtime is
+statically linked.
+
+To build from source instead:
+
+```bash
+cargo install rag-rat
+# or from a checkout:
+cargo install --path crates/rag-rat-cli --bin rag-rat
+```
+
+The default source build needs glibc ≥2.38 and is unavailable for Intel macOS and musl/Alpine. On
+those platforms, including Ubuntu 22.04, use the pure-Rust embedder:
+
+```bash
+cargo install rag-rat --no-default-features --features model2vec
+```
+
+`--no-default-features` alone produces a smaller hash-only build without real embeddings. SQLite is
+bundled; see [Platform support](#platform-support) for toolchain details.
+
+### Initialize the repository
+
+```bash
+cd /path/to/your/repo
+rag-rat init
+```
+
+`init` scans the repo, guides language and embedding choices, writes `rag-rat.toml`, and builds the
+initial index. Use `rag-rat init --dry-run` to preview without writing, or `--yes` for
+non-interactive defaults. Configuration reference: [`docs/config.md`](docs/config.md).
+
+### Add skills and connect MCP
+
+Install the skills for Claude Code, Codex, Cursor, and 70+ other detected agents:
+
+```bash
+npx @rag-rat/skills
+```
+
+That installs `using-rag-rat`, `dream-review`, `init-rag-rat`, and
+`configure-rag-rat-dream`. See [`skills/README.md`](skills/README.md) for per-agent flags and
+`update`, `list`, and `remove`.
+
+The MCP server uses STDIO: the client launches `rag-rat mcp` from the repository so it discovers the
+correct `rag-rat.toml` and repository scope in the consolidated machine-global store.
+
+```bash
+claude mcp add --scope project rag-rat -- rag-rat mcp
+codex  mcp add rag-rat -- rag-rat mcp
+```
+
+Or add the equivalent project configuration:
 
 ```json
 {
@@ -201,14 +157,26 @@ project `.mcp.json` / equivalent:
 }
 ```
 
-> **Don't pin a single global server to one repo's config.** A user-scoped server with a hardcoded
-> `--config /some/repo/rag-rat.toml` serves *that* repo's index and memories everywhere — so browsing
-> a different codebase loads the wrong context. Register the server per project and let it resolve
-> `rag-rat.toml` from the repo it runs in. (`--config <path>` still exists for the rare case you need
-> to point at a specific profile.)
+`rag-rat init` prints the registration command but does not register the server itself. Pass
+`rag-rat mcp --json` if the client must parse JSON; tool text defaults to [TOON](#output). Full tool
+schemas: [`docs/mcp-tools.md`](docs/mcp-tools.md).
 
-Pass `rag-rat mcp --json` if your client must parse tool text as JSON (results are
-[TOON](#output) by default). Full tool schemas: [`docs/mcp-tools.md`](docs/mcp-tools.md).
+<details>
+<summary>Claude Code tool permissions</summary>
+
+Claude Code asks once before each rag-rat MCP tool first runs. Choose "Yes, don't ask again," or
+allow the tool namespace in `~/.claude/settings.json`:
+
+```json
+{ "permissions": { "allow": ["mcp__rag-rat__*"] } }
+```
+</details>
+
+> **Do not pin a global server to one repository's config.** A user-scoped server with
+> `--config /some/repo/rag-rat.toml` serves that repository everywhere. Register MCP per project and
+> let the process discover the config from its working directory.
+
+</details>
 
 ## Try it
 
@@ -475,7 +443,7 @@ rag-rat builds and tests on Linux, macOS, and Windows. Linux is covered on every
 push to main; macOS and Windows are exercised on release, so `cargo install rag-rat` builds and
 links on all three. Android (aarch64, bionic) is also a release target — a prebuilt binary is
 attached to each release and published to `@rag-rat/bin`, so `npx @rag-rat/bin` works on Termux; see
-[Install](#install).
+[Quickstart](#quickstart).
 SQLite is bundled (compiled from source via `rusqlite`), so there's no system-library prerequisite,
 but each platform needs a C toolchain: Linux ships one; on macOS install the Xcode Command Line
 Tools (`xcode-select --install`); on Windows install the Visual Studio Build Tools with the C++
