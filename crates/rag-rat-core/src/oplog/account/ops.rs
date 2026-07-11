@@ -29,7 +29,9 @@ use crate::oplog::stream::StreamId;
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// The frozen `entry_type` tag set (header part 7). A tag is a wire constant — a renumber is a wire
-/// bump. Values 10.. are reserved (`PublicStreamConfig`, `ModerationOp` — C3/E).
+/// bump. Deferred control ops land ADDITIVELY at 10+ (`StandoffResolve` §12, `PublicStreamConfig`,
+/// `ModerationOp` — C3/E). NOTE: §10 lists `StandoffResolve` before `AccountReRoot`, but
+/// `AccountReRoot` is frozen at 9 here, so `StandoffResolve` takes a 10+ slot, never 9.
 pub(super) mod entry_type {
     pub(in crate::oplog::account) const ACCOUNT_GENESIS: u32 = 0;
     pub(in crate::oplog::account) const DEVICE_ADD: u32 = 1;
@@ -361,7 +363,16 @@ pub(super) fn decode(entry_type: u32, bytes: &[u8]) -> Result<DecodedAccountOp, 
         entry_type::STREAM_GRANT => decode_stream_grant(bytes)?,
         entry_type::STREAM_REVOKE => decode_stream_revoke(bytes)?,
         entry_type::ACCOUNT_REROOT => decode_account_reroot(bytes)?,
-        other => return Ok(DecodedAccountOp::Unknown { entry_type: other, bytes: bytes.to_vec() }),
+        other => {
+            // A forward-version op is RETAINED opaque (we can't re-encode it), but it must STILL be
+            // exactly one canonical CBOR item — otherwise a future binary that learns this
+            // entry_type would run the `encode(decode) == bytes` check below and REJECT an entry an
+            // older peer accepted + chained, splitting consensus on a signed log. The envelope
+            // validates the payload only as an opaque bstr (it never recurses into it), so this is
+            // the ONLY place the payload interior is checked. (Mirrors `super::super::op::decode`.)
+            cbor::require_canonical_cbor(bytes)?;
+            return Ok(DecodedAccountOp::Unknown { entry_type: other, bytes: bytes.to_vec() });
+        },
     };
     // Canonicity guarantee for a KNOWN op: the decoded value must re-encode to the exact wire (this
     // rejects non-minimal ints, unsorted cut arrays, trailing bytes, etc. in one check).
@@ -801,6 +812,33 @@ mod tests {
         let bytes = vec![0x81, 0x00];
         let decoded = decode(999, &bytes).unwrap();
         assert_eq!(decoded, DecodedAccountOp::Unknown { entry_type: 999, bytes });
+    }
+
+    #[test]
+    fn unknown_entry_type_with_a_non_canonical_payload_is_rejected() {
+        // A forward op is retained opaque, but its payload must STILL be canonical — else a future
+        // binary that learns the type would reject (via encode(decode)==bytes) an entry an older
+        // peer accepted + chained, splitting consensus on a signed log.
+        let non_minimal_uint = vec![0x81, 0x18, 0x05]; // [uint 5] with a non-minimal 1-byte header
+        assert!(decode(999, &non_minimal_uint).is_err(), "non-canonical unknown payload rejected");
+        let trailing = vec![0x81, 0x00, 0xff]; // a valid item + a trailing byte
+        assert!(decode(999, &trailing).is_err(), "trailing bytes after an unknown op rejected");
+    }
+
+    #[test]
+    fn entry_type_tag_set_is_frozen() {
+        // The tags live in the envelope header (part 7), so the op goldens don't pin them — pin
+        // them here. A renumber is a wire bump.
+        assert_eq!(entry_type::ACCOUNT_GENESIS, 0);
+        assert_eq!(entry_type::DEVICE_ADD, 1);
+        assert_eq!(entry_type::DEVICE_REMOVE, 2);
+        assert_eq!(entry_type::OWNER_PROMOTE, 3);
+        assert_eq!(entry_type::OWNER_DEMOTE, 4);
+        assert_eq!(entry_type::CUT_EXTEND, 5);
+        assert_eq!(entry_type::STREAM_OWN, 6);
+        assert_eq!(entry_type::STREAM_GRANT, 7);
+        assert_eq!(entry_type::STREAM_REVOKE, 8);
+        assert_eq!(entry_type::ACCOUNT_REROOT, 9);
     }
 
     #[test]
