@@ -24,8 +24,10 @@
 //! handful of truly C2–C5-deferred seams get precise per-item allows.
 #![allow(dead_code)]
 
+mod cut;
 mod envelope;
 mod id;
 mod limits;
+mod ops;
 
 pub(crate) use id::AccountId;
