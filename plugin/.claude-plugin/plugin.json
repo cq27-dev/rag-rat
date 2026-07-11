@@ -10,8 +10,8 @@
   "keywords": ["mcp", "code-intelligence", "semantic-search", "code-graph", "repo-memory"],
   "mcpServers": {
     "rag-rat": {
-      "command": "npx",
-      "args": ["-y", "@rag-rat/bin@latest", "mcp"]
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/launch.js", "mcp"]
     }
   }
 }
