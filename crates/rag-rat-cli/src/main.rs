@@ -29,7 +29,10 @@ mod init;
 // Idle-RSS fix: glibc malloc never hands freed pages back to the OS, so a long-lived `rag-rat mcp`
 // server keeps its peak RSS (~625 MB observed) after the watcher's heavy index/graph passes.
 // jemalloc with a background purge thread returns idle dirty/muzzy pages to the OS instead.
-#[cfg(not(target_env = "msvc"))]
+// Excluded on msvc (no jemalloc support) and android: the NDK dropped libgcc in r23+, but
+// tikv-jemalloc-sys's link line still references `-lgcc`, so the binary fails to link there.
+// Android isn't the long-lived-server case anyway — the system allocator is the right fallback.
+#[cfg(all(not(target_env = "msvc"), not(target_os = "android")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -37,7 +40,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// decayed pages are only reclaimed on later alloc calls, which a quiet server rarely makes) and
 /// tighten the decay window from the 10s default so an idle server releases memory within ~1s.
 /// Best-effort — a server that holds slightly more RAM is better than one that won't boot.
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(target_os = "android")))]
 fn configure_jemalloc() {
     use tikv_jemalloc_ctl::{background_thread, raw};
     // Purge decayed pages on a background thread; a quiet server makes few alloc calls, which is
@@ -61,7 +64,7 @@ fn main() -> anyhow::Result<()> {
     // Record this binary's git-stamped version (#585) so migration provenance and the stranded-
     // binary refusal name a dev build (`0.16.0+g<hash>`) distinctly from a release (`0.16.0`).
     rag_rat_core::set_binary_version(env!("RAG_RAT_VERSION"));
-    #[cfg(not(target_env = "msvc"))]
+    #[cfg(all(not(target_env = "msvc"), not(target_os = "android")))]
     configure_jemalloc();
     let cli = Cli::parse();
 
