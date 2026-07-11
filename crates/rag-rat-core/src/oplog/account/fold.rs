@@ -506,7 +506,6 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         };
     };
     let genesis_owner_id = genesis.hash();
-    let genesis_founder = genesis.subject_device();
 
     // A hash → index map backs the [`CandidateView`] the ancestry walk / cut binding read through.
     let by_hash: HashMap<[u8; 32], usize> =
@@ -530,303 +529,280 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     // re-blesses its condemned cone even when authored at a DEEPER incarnation depth than the
     // register's creator. Recovery is thus a pure function of the final registers — never sticky
     // per-depth condemnation.
-    let base_outcomes = outcomes;
-    let mut final_registers: HashMap<RegisterKey, Cut> = HashMap::new();
-    for pass in 0..2 {
-        let mut outcomes = base_outcomes.clone();
-        // Seed the genesis founder as an owner (and enrolled) from the start — genesis's own effect
-        // re-inserts it idempotently, but seeding lets the I2 last-owner guard see an owner even at
-        // depth 0, so a founder self-removal can't strand the account with zero owners.
-        let mut state = FoldState {
-            live: HashSet::from([genesis_owner_id]),
-            owners: HashMap::from([(genesis_founder, genesis_owner_id)]),
-            roster: HashSet::from([genesis_founder]),
-            ..Default::default()
-        };
-        // The revocation registers accumulated so far (extend-only, joined by `⊔`; pass 1 seeds
-        // them with the final set so every depth condemns against final watermarks), every
-        // entry a register condemns / parks, and the cut ops decided in the register pass
-        // (a binding failure / I2).
-        let mut registers: HashMap<RegisterKey, Cut> = final_registers.clone();
-        let mut condemned: HashMap<[u8; 32], CondemnedReason> = HashMap::new();
-        let mut parked: HashMap<[u8; 32], ParkReason> = HashMap::new();
-        let mut cut_verdicts: HashMap<[u8; 32], Outcome> = HashMap::new();
-        let mut classification = AccountClassification::Live;
+    let mut state = FoldState { live: HashSet::from([genesis_owner_id]), ..Default::default() };
+    // The revocation registers accumulated so far (extend-only, joined by `⊔`), every entry a
+    // register condemns (grows monotonically — a lower-depth decision is final, no oscillation) /
+    // parks (rebuilt fresh each depth), and the cut ops decided in the register pass (a binding
+    // failure / I2). Per-depth monotone, matching §11.1 — a CutExtend re-blesses its cone via the
+    // same-depth `⊔` join, not a global recompute (a global seed could preserve a register whose
+    // creator the fold later condemns).
+    let mut registers: HashMap<RegisterKey, Cut> = HashMap::new();
+    let mut condemned: HashMap<[u8; 32], CondemnedReason> = HashMap::new();
+    let mut parked: HashMap<[u8; 32], ParkReason> = HashMap::new();
+    let mut cut_verdicts: HashMap<[u8; 32], Outcome> = HashMap::new();
+    let mut classification = AccountClassification::Live;
 
-        'depths: for (&depth, idxs) in &strata {
-            let view = CandidateView { candidates: &candidates, by_hash: &by_hash };
+    'depths: for (depth, idxs) in strata {
+        let view = CandidateView { candidates: &candidates, by_hash: &by_hash };
 
-            // (a) REGISTER PASS. A cut op installs a register iff its author is AUTHORIZED
-            // (authority_status == Live: its cited incarnation resolves to a mint for the SIGNER
-            // and is live — the transitive-liveness gate that defeats laundering AND
-            // owner impersonation), it passes cut-target binding (§11.3), and — for
-            // OwnerDemote — its target `owner_id` names its subject device.
-            let mut admitted: Vec<AdmittedCut<'_>> = Vec::new();
-            for &i in idxs {
-                let c = &candidates[i];
-                if condemned.contains_key(&c.hash()) {
-                    continue;
-                }
-                let Some((key, cut, coord)) = control_register(c) else {
-                    continue;
-                };
-                if !matches!(authority_status(c, &incarnations, &state), AuthorityStatus::Live) {
-                    continue; // unauthorized → the effect pass classifies it (wrong-device / stale / park)
-                }
-                // An OwnerDemote's `owner_id` must resolve to a mint minted for the demoted device
-                // — a wrong-device binding would leave the target's real
-                // incarnation unbounded.
-                if let AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } = &c.op {
-                    match incarnations.candidate(owner_id) {
-                        None => {
-                            cut_verdicts
-                                .insert(c.hash(), Outcome::Parked(ParkReason::UnknownOwnerRef));
-                            continue;
-                        },
-                        Some(target) if target.subject_device() != *device_fingerprint => {
-                            cut_verdicts
-                                .insert(c.hash(), Outcome::Rejected(RejectReason::WrongDevice));
-                            continue;
-                        },
-                        Some(_) => {},
-                    }
-                }
-                match candidate::validate_cut_target(&cut, &coord, &view) {
-                    // A held watermark naming a DIFFERENT coordinate is a structural reject
-                    // (§11.3).
-                    candidate::CutBinding::Mismatch => {
-                        cut_verdicts
-                            .insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
+        // (a) REGISTER PASS. A cut op installs a register iff its author is AUTHORIZED
+        // (authority_status == Live: its cited incarnation resolves to a mint for the SIGNER
+        // and is live — the transitive-liveness gate that defeats laundering AND
+        // owner impersonation), it passes cut-target binding (§11.3), and — for
+        // OwnerDemote — its target `owner_id` names its subject device.
+        let mut admitted: Vec<AdmittedCut<'_>> = Vec::new();
+        for &i in &idxs {
+            let c = &candidates[i];
+            if condemned.contains_key(&c.hash()) {
+                continue;
+            }
+            let Some((key, cut, coord)) = control_register(c) else {
+                continue;
+            };
+            if !matches!(authority_status(c, &incarnations, &state), AuthorityStatus::Live) {
+                continue; // unauthorized → the effect pass classifies it (wrong-device / stale / park)
+            }
+            // An OwnerDemote's `owner_id` must resolve to a mint minted for the demoted device
+            // — a wrong-device binding would leave the target's real
+            // incarnation unbounded.
+            if let AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } = &c.op {
+                match incarnations.candidate(owner_id) {
+                    None => {
+                        cut_verdicts.insert(c.hash(), Outcome::Parked(ParkReason::UnknownOwnerRef));
                         continue;
                     },
-                    // Held-and-correct, OR not-yet-held: install the register either way. Its
-                    // `[seq]` condemns beyond entries from seq alone (I11) even
-                    // before the watermark syncs; the under-cut branch decision
-                    // parks until it does (a withheld watermark never flips a
-                    // verdict). A revoking owner is trusted not to misstate the watermark seq
-                    // (§10).
-                    candidate::CutBinding::Ok | candidate::CutBinding::TargetNotHeld => {},
-                }
-                admitted.push(AdmittedCut { op: c, key, cut });
-            }
-            // Deterministic order (by entry hash) so cut selection + the `⊔` join + the I2
-            // reservation are arrival-independent (I9) when two same-depth cuts contend
-            // for one register key.
-            admitted.sort_by_key(|a| a.op.hash());
-
-            // A same-depth mutual owner-condemnation cycle is genuine owner-key compromise (§12):
-            // halt at the last cycle-free stratum. Detected BEFORE I2 so a two-owner
-            // mutual removal folds contested rather than being resolved by reserving
-            // one owner.
-            if has_condemn_cycle(&admitted, &view) {
-                classification = AccountClassification::Contested { state_before_depth: depth };
-                break 'depths;
-            }
-
-            // I2 last-owner protection across ALL same-depth admitted cuts: simulate the removals
-            // in the deterministic order and reject any cut that would empty the owner set,
-            // reserving a surviving owner. A cut counts only if it CLOSES a device's currently-open
-            // incarnation (a DeviceRemove of any owner, or an OwnerDemote naming the open
-            // `owner_id`) — a stale demote does not. The seeded founder makes this hold at depth 0.
-            let mut surviving = state.owners.clone();
-            admitted.retain(|a| {
-                let closes = match &a.op.op {
-                    AccountOp::DeviceRemove { device_fingerprint, .. } =>
-                        surviving.contains_key(device_fingerprint).then_some(*device_fingerprint),
-                    AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } =>
-                        (surviving.get(device_fingerprint) == Some(owner_id))
-                            .then_some(*device_fingerprint),
-                    _ => None,
-                };
-                if let Some(dev) = closes {
-                    if surviving.len() == 1 {
-                        cut_verdicts
-                            .insert(a.op.hash(), Outcome::Rejected(RejectReason::LastOwner));
-                        return false;
-                    }
-                    surviving.remove(&dev);
-                }
-                true
-            });
-
-            // Join each admitted creator register (§11.3 `⊔`). Two incomparable cuts for ONE key
-            // (equal-seq different-hash, or divergent branches — only two owner cut ops can produce
-            // this) are a same-depth mutual condemnation ⇒ contested, never a chosen hash.
-            for a in &admitted {
-                match join_register(&mut registers, a.key.clone(), a.cut.clone(), &view) {
-                    RegisterJoin::Applied => {},
-                    RegisterJoin::Contested => {
-                        classification =
-                            AccountClassification::Contested { state_before_depth: depth };
-                        break 'depths;
+                    Some(target) if target.subject_device() != *device_fingerprint => {
+                        cut_verdicts.insert(c.hash(), Outcome::Rejected(RejectReason::WrongDevice));
+                        continue;
                     },
-                    // The branch relation can't be decided yet — keep the held register and park
-                    // the newcomer (it re-joins on the next refold once its
-                    // watermark syncs).
-                    RegisterJoin::Parked => {
-                        cut_verdicts
-                            .insert(a.op.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
-                    },
+                    Some(_) => {},
                 }
             }
-
-            // Raise registers with this depth's live `CutExtend`s (§11.4 recovery). An extend is
-            // EXTEND-ONLY: it may only raise a register a prior DeviceRemove/OwnerDemote created,
-            // never conjure a fresh one (else a live owner could condemn a chain with a
-            // bare extend). An extend for a not-yet-established register parks until
-            // the creator syncs.
-            let mut extends: Vec<(&Candidate, RegisterKey, Cut)> = Vec::new();
-            for &i in idxs {
-                let c = &candidates[i];
-                if condemned.contains_key(&c.hash()) {
-                    continue;
-                }
-                let Some((key, cut, coord)) = cut_extend_register(c) else {
-                    continue;
-                };
-                if !matches!(authority_status(c, &incarnations, &state), AuthorityStatus::Live) {
-                    continue;
-                }
-                if candidate::validate_cut_target(&cut, &coord, &view)
-                    == candidate::CutBinding::Mismatch
-                {
+            match candidate::validate_cut_target(&cut, &coord, &view) {
+                // A held watermark naming a DIFFERENT coordinate is a structural reject
+                // (§11.3).
+                candidate::CutBinding::Mismatch => {
                     cut_verdicts
                         .insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
                     continue;
-                }
-                if !registers.contains_key(&key) {
-                    cut_verdicts.insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
-                    continue;
-                }
-                extends.push((c, key, cut));
+                },
+                // Held-and-correct, OR not-yet-held: install the register either way. Its
+                // `[seq]` condemns beyond entries from seq alone (I11) even
+                // before the watermark syncs; the under-cut branch decision
+                // parks until it does (a withheld watermark never flips a
+                // verdict). A revoking owner is trusted not to misstate the watermark seq
+                // (§10).
+                candidate::CutBinding::Ok | candidate::CutBinding::TargetNotHeld => {},
             }
-            extends.sort_by_key(|(c, _, _)| c.hash());
-            for (c, key, cut) in extends {
-                match join_register(&mut registers, key, cut, &view) {
-                    RegisterJoin::Applied => {},
-                    RegisterJoin::Contested => {
-                        classification =
-                            AccountClassification::Contested { state_before_depth: depth };
-                        break 'depths;
-                    },
-                    RegisterJoin::Parked => {
-                        cut_verdicts
-                            .insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
-                    },
-                }
-            }
+            admitted.push(AdmittedCut { op: c, key, cut });
+        }
+        // Deterministic order (by entry hash) so cut selection + the `⊔` join + the I2
+        // reservation are arrival-independent (I9) when two same-depth cuts contend
+        // for one register key.
+        admitted.sort_by_key(|a| a.op.hash());
 
-            // Re-derive condemnation + parking against the current registers. Condemnation grows
-            // monotonically (a lower-depth decision is never revised); parking is rebuilt fresh (a
-            // withheld watermark parks the under-cut prefix — I11). Pruning a condemned MINT from
-            // `live` kills its dependents transitively (they cite an owner_id no longer live →
-            // stale).
-            parked.clear();
-            for c in &candidates {
-                if condemned.contains_key(&c.hash()) {
-                    continue;
-                }
-                match register_verdict(c, &registers, &view) {
-                    RegisterVerdict::Condemned(reason) => {
-                        condemned.insert(c.hash(), reason);
-                        if c.is_mint() {
-                            state.live.remove(&c.hash());
-                        }
-                    },
-                    RegisterVerdict::Parked(reason) => {
-                        parked.insert(c.hash(), reason);
-                    },
-                    RegisterVerdict::Clear => {},
-                }
-            }
+        // A same-depth mutual owner-condemnation cycle is genuine owner-key compromise (§12):
+        // halt at the last cycle-free stratum. Detected BEFORE I2 so a two-owner
+        // mutual removal folds contested rather than being resolved by reserving
+        // one owner.
+        if has_condemn_cycle(&admitted, &view) {
+            classification = AccountClassification::Contested { state_before_depth: depth };
+            break 'depths;
+        }
 
-            // (b) EFFECT PASS over the stratum in (chain, seq, hash) order — a TOTAL order, so an
-            // equivocation (same device + seq, different content) sorts identically under every
-            // arrival permutation (I9).
-            let mut ordered = idxs.clone();
-            ordered.sort_by_key(|&i| {
-                let h = candidates[i].header();
-                (h.device_fingerprint.to_bytes(), h.seq, candidates[i].hash())
-            });
-            for i in ordered {
-                let c = &candidates[i];
-                if let Some(reason) = condemned.get(&c.hash()) {
-                    outcomes.insert(c.hash(), Outcome::Condemned(*reason));
-                    continue;
+        // I2 last-owner protection across ALL same-depth admitted cuts: simulate the removals
+        // in deterministic order over the prior-depth owner set and reject any cut that would
+        // empty it, reserving a surviving owner. A cut counts only if it CLOSES a device's
+        // currently-open incarnation (a DeviceRemove of any owner, or an OwnerDemote naming the
+        // open `owner_id`) — a stale demote does not. (A self-cut is separately self-defeating:
+        // its own op sits beyond any watermark it can name on its chain, so it self-condemns.)
+        let mut surviving = state.owners.clone();
+        admitted.retain(|a| {
+            let closes = match &a.op.op {
+                AccountOp::DeviceRemove { device_fingerprint, .. } =>
+                    surviving.contains_key(device_fingerprint).then_some(*device_fingerprint),
+                AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } =>
+                    (surviving.get(device_fingerprint) == Some(owner_id))
+                        .then_some(*device_fingerprint),
+                _ => None,
+            };
+            if let Some(dev) = closes {
+                if surviving.len() == 1 {
+                    cut_verdicts.insert(a.op.hash(), Outcome::Rejected(RejectReason::LastOwner));
+                    return false;
                 }
-                if let Some(reason) = parked.get(&c.hash()) {
-                    outcomes.insert(c.hash(), Outcome::Parked(*reason));
-                    continue;
-                }
-                if let Some(verdict) = cut_verdicts.get(&c.hash()) {
-                    outcomes.insert(c.hash(), *verdict);
-                    continue;
-                }
-                let outcome = classify_effect(c, &incarnations, &state);
-                if let Outcome::Effective { .. } = outcome {
-                    apply_effect(c, &mut state);
-                }
-                outcomes.insert(c.hash(), outcome);
+                surviving.remove(&dev);
+            }
+            true
+        });
+
+        // Join each admitted creator register (§11.3 `⊔`). Two incomparable cuts for ONE key
+        // (equal-seq different-hash, or divergent branches — only two owner cut ops can produce
+        // this) are a same-depth mutual condemnation ⇒ contested, never a chosen hash.
+        for a in &admitted {
+            match join_register(&mut registers, a.key.clone(), a.cut.clone(), &view) {
+                RegisterJoin::Applied => {},
+                RegisterJoin::Contested => {
+                    classification = AccountClassification::Contested { state_before_depth: depth };
+                    break 'depths;
+                },
+                // The branch relation can't be decided yet — keep the held register and park
+                // the newcomer (it re-joins on the next refold once its
+                // watermark syncs).
+                RegisterJoin::Parked => {
+                    cut_verdicts.insert(a.op.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
+                },
             }
         }
 
-        // Overlay the FINAL register verdicts: a candidate effective at a shallow depth but
-        // condemned / parked by a later register reflects that here (the strictest verdict
-        // wins over an earlier one).
+        // Raise registers with this depth's live `CutExtend`s (§11.4 recovery). An extend is
+        // EXTEND-ONLY: it may only raise a register a prior DeviceRemove/OwnerDemote created,
+        // never conjure a fresh one (else a live owner could condemn a chain with a
+        // bare extend). An extend for a not-yet-established register parks until
+        // the creator syncs.
+        let mut extends: Vec<(&Candidate, RegisterKey, Cut)> = Vec::new();
+        for &i in &idxs {
+            let c = &candidates[i];
+            if condemned.contains_key(&c.hash()) {
+                continue;
+            }
+            let Some((key, cut, coord)) = cut_extend_register(c) else {
+                continue;
+            };
+            if !matches!(authority_status(c, &incarnations, &state), AuthorityStatus::Live) {
+                continue;
+            }
+            if candidate::validate_cut_target(&cut, &coord, &view)
+                == candidate::CutBinding::Mismatch
+            {
+                cut_verdicts.insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
+                continue;
+            }
+            if !registers.contains_key(&key) {
+                cut_verdicts.insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
+                continue;
+            }
+            extends.push((c, key, cut));
+        }
+        extends.sort_by_key(|(c, _, _)| c.hash());
+        for (c, key, cut) in extends {
+            match join_register(&mut registers, key, cut, &view) {
+                RegisterJoin::Applied => {},
+                RegisterJoin::Contested => {
+                    classification = AccountClassification::Contested { state_before_depth: depth };
+                    break 'depths;
+                },
+                RegisterJoin::Parked => {
+                    cut_verdicts.insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
+                },
+            }
+        }
+
+        // Re-derive condemnation + parking against the current registers. Condemnation grows
+        // monotonically (a lower-depth decision is never revised); parking is rebuilt fresh (a
+        // withheld watermark parks the under-cut prefix — I11). Pruning a condemned MINT from
+        // `live` kills its dependents transitively (they cite an owner_id no longer live →
+        // stale).
+        parked.clear();
         for c in &candidates {
+            if condemned.contains_key(&c.hash()) {
+                continue;
+            }
+            match register_verdict(c, &registers, &view) {
+                RegisterVerdict::Condemned(reason) => {
+                    condemned.insert(c.hash(), reason);
+                    if c.is_mint() {
+                        state.live.remove(&c.hash());
+                    }
+                },
+                RegisterVerdict::Parked(reason) => {
+                    parked.insert(c.hash(), reason);
+                },
+                RegisterVerdict::Clear => {},
+            }
+        }
+
+        // (b) EFFECT PASS over the stratum in (chain, seq, hash) order — a TOTAL order, so an
+        // equivocation (same device + seq, different content) sorts identically under every
+        // arrival permutation (I9).
+        let mut ordered = idxs;
+        ordered.sort_by_key(|&i| {
+            let h = candidates[i].header();
+            (h.device_fingerprint.to_bytes(), h.seq, candidates[i].hash())
+        });
+        for i in ordered {
+            let c = &candidates[i];
             if let Some(reason) = condemned.get(&c.hash()) {
                 outcomes.insert(c.hash(), Outcome::Condemned(*reason));
-            } else if let Some(reason) = parked.get(&c.hash()) {
+                continue;
+            }
+            if let Some(reason) = parked.get(&c.hash()) {
                 outcomes.insert(c.hash(), Outcome::Parked(*reason));
+                continue;
             }
-        }
-
-        // In a `contested` account authority mutation halts (§12), with ONE exception:
-        // `AccountReRoot` by an owner live in state_before(d). It is advisory (transfers no
-        // authority — a subscriber re-decides trust against the self-certifying successor
-        // genesis), so it needs no residue registers. Multiple re-roots ⇒ the deterministic
-        // successor is the smallest by byte order (order-free). Every other undecided
-        // candidate parks as a contested subject — fail-closed and observable, reclassified
-        // if the account recovers.
-        let mut contested_successor: Option<AccountId> = None;
-        if matches!(classification, AccountClassification::Contested { .. }) {
-            // Admit re-roots in a deterministic (successor_id, hash) order so `auth_epoch` is
-            // order-free.
-            let mut reroots: Vec<(&Candidate, AccountId)> = candidates
-                .iter()
-                .filter_map(|c| match &c.op {
-                    // A recovery re-root must be signed by a pre-contest owner: the FULL authority
-                    // check (the cited mint names the signer AND is live in state_before(d)), not
-                    // just liveness — else a member citing another device's incarnation could pick
-                    // the successor.
-                    AccountOp::AccountReRoot { successor_account_id, .. }
-                        if !condemned.contains_key(&c.hash())
-                            && matches!(
-                                authority_status(c, &incarnations, &state),
-                                AuthorityStatus::Live
-                            ) =>
-                        Some((c, *successor_account_id)),
-                    _ => None,
-                })
-                .collect();
-            reroots.sort_by_key(|(c, successor)| (successor.to_bytes(), c.hash()));
-            for (c, successor) in &reroots {
-                outcomes.insert(c.hash(), effective(&state));
-                state.next_auth_epoch += 1;
-                contested_successor.get_or_insert(*successor);
+            if let Some(verdict) = cut_verdicts.get(&c.hash()) {
+                outcomes.insert(c.hash(), *verdict);
+                continue;
             }
-            for c in &candidates {
-                outcomes.entry(c.hash()).or_insert(Outcome::Parked(ParkReason::ContestedSubject));
+            let outcome = classify_effect(c, &incarnations, &state);
+            if let Outcome::Effective { .. } = outcome {
+                apply_effect(c, &mut state);
             }
-        }
-
-        // Pass 0 keeps only the accumulated registers, to seed pass 1; pass 1 is authoritative.
-        final_registers = registers;
-        if pass == 1 {
-            return AccountAuthHistory { outcomes, classification, contested_successor };
+            outcomes.insert(c.hash(), outcome);
         }
     }
-    unreachable!("the two-pass loop always returns on pass 1")
+
+    // Overlay the FINAL register verdicts: a candidate effective at a shallow depth but
+    // condemned / parked by a later register reflects that here (the strictest verdict
+    // wins over an earlier one).
+    for c in &candidates {
+        if let Some(reason) = condemned.get(&c.hash()) {
+            outcomes.insert(c.hash(), Outcome::Condemned(*reason));
+        } else if let Some(reason) = parked.get(&c.hash()) {
+            outcomes.insert(c.hash(), Outcome::Parked(*reason));
+        }
+    }
+
+    // In a `contested` account authority mutation halts (§12), with ONE exception:
+    // `AccountReRoot` by an owner live in state_before(d). It is advisory (transfers no
+    // authority — a subscriber re-decides trust against the self-certifying successor
+    // genesis), so it needs no residue registers. Multiple re-roots ⇒ the deterministic
+    // successor is the smallest by byte order (order-free). Every other undecided
+    // candidate parks as a contested subject — fail-closed and observable, reclassified
+    // if the account recovers.
+    let mut contested_successor: Option<AccountId> = None;
+    if matches!(classification, AccountClassification::Contested { .. }) {
+        // Admit re-roots in a deterministic (successor_id, hash) order so `auth_epoch` is
+        // order-free.
+        let mut reroots: Vec<(&Candidate, AccountId)> = candidates
+            .iter()
+            .filter_map(|c| match &c.op {
+                // A recovery re-root must be signed by a pre-contest owner: the FULL authority
+                // check (the cited mint names the signer AND is live in state_before(d)), not
+                // just liveness — else a member citing another device's incarnation could pick
+                // the successor.
+                AccountOp::AccountReRoot { successor_account_id, .. }
+                    if !condemned.contains_key(&c.hash())
+                        && matches!(
+                            authority_status(c, &incarnations, &state),
+                            AuthorityStatus::Live
+                        ) =>
+                    Some((c, *successor_account_id)),
+                _ => None,
+            })
+            .collect();
+        reroots.sort_by_key(|(c, successor)| (successor.to_bytes(), c.hash()));
+        for (c, successor) in &reroots {
+            outcomes.insert(c.hash(), effective(&state));
+            state.next_auth_epoch += 1;
+            contested_successor.get_or_insert(*successor);
+        }
+        for c in &candidates {
+            outcomes.entry(c.hash()).or_insert(Outcome::Parked(ParkReason::ContestedSubject));
+        }
+    }
+
+    AccountAuthHistory { outcomes, classification, contested_successor }
 }
 
 /// The genesis candidate: an `AccountGenesis` whose payload hashes to the shared `account_id` (§4).
@@ -1700,11 +1676,15 @@ mod tests {
     }
 
     #[test]
-    fn cut_extend_reblesses_across_incarnation_depths_p7() {
-        // The cross-depth recovery case: F (depth 0) removes B pinned to seq 0, condemning b1/b2. A
-        // DEEPER owner A (a depth-1 incarnation) extends B's device cut to seq 2. Because the fold
-        // classifies against the FINAL accumulated registers, the cone re-blesses even though the
-        // extend is authored at a deeper depth than the removal — recovery is not sticky per-depth.
+    fn a_cross_depth_cut_extend_does_not_re_bless_within_a_fold() {
+        // §11.1 is per-depth monotone: condemnation grows depth by depth and a lower-depth decision
+        // is final. A CutExtend re-blesses its cone ONLY when joined at the CREATOR's depth (the
+        // same-depth `⊔`, covered by `cut_extend_reblesses_a_condemned_cone_p7`). Here F removes B
+        // at depth 0 (condemning b1/b2) and a DEEPER owner A (depth 1) extends the cut — because
+        // A's extend lands a stratum later than the depth-0 condemnation, the cone stays
+        // condemned in this fold. (A global recompute would fix this but could preserve a
+        // register whose creator the fold later condemns — a laundering hole — so we stay
+        // faithful to the per-depth model.)
         let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let (d, e, g) = (Dev::new(5), Dev::new(6), Dev::new(7));
         let mut f = Fixture::genesis(&fdr);
@@ -1713,16 +1693,17 @@ mod tests {
         let b0 = f.author(&b, Some(add_b), &device_add(&d, DeviceRole::Member));
         let b1 = f.author(&b, Some(add_b), &device_add(&e, DeviceRole::Member));
         let b2 = f.author(&b, Some(add_b), &device_add(&g, DeviceRole::Member));
-        // Creator at depth 0.
-        let remove_b =
-            f.author(&fdr, Some(f.genesis_hash), &device_remove(&b, Cut::At { seq: 0, hash: b0 }));
-        // Extend authored by A (depth-1 incarnation) — DEEPER than the depth-0 removal.
+        f.author(&fdr, Some(f.genesis_hash), &device_remove(&b, Cut::At { seq: 0, hash: b0 }));
         let extend = f.author(&a, Some(add_a), &cut_extend_ctrl(f.account_id, &b, None, 2, b2));
 
         let h = f.fold();
-        assert!(h.is_effective(&remove_b) && h.is_effective(&extend));
-        assert!(h.is_effective(&b1), "b1 re-blessed by the deeper-depth extend");
-        assert!(h.is_effective(&b2), "b2 re-blessed by the deeper-depth extend");
+        assert!(h.is_effective(&b0), "the within-cut prefix is effective");
+        assert!(h.is_effective(&extend), "the extend itself is a valid owner op");
+        assert_eq!(
+            h.outcome(&b1),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+            "a deeper-depth extend does not re-bless a shallower depth's condemnation",
+        );
     }
 
     #[test]
@@ -1745,9 +1726,10 @@ mod tests {
     }
 
     #[test]
-    fn a_founder_cannot_strand_the_account_by_removing_itself_i2() {
-        // The founder is the only owner at depth 0. Removing itself would leave zero owners — the
-        // seeded founder makes the I2 guard fire even at depth 0, so the self-removal is rejected.
+    fn a_device_removing_its_own_chain_is_self_defeating() {
+        // A self-cut cannot strand the account: the removal op sits at a higher seq than any
+        // watermark it can name on its own chain, so the register it installs condemns the removal
+        // itself. The founder therefore stays an owner — no zero-owner state, no I2 needed.
         let fdr = Dev::new(1);
         let mut f = Fixture::genesis(&fdr);
         let remove_self = f.author(
@@ -1757,12 +1739,8 @@ mod tests {
         );
 
         let h = f.fold();
-        assert!(h.is_effective(&f.genesis_hash), "genesis stands");
-        assert_eq!(
-            h.outcome(&remove_self),
-            Some(Outcome::Rejected(RejectReason::LastOwner)),
-            "the founder cannot remove the last owner (I2)",
-        );
+        assert!(h.is_effective(&f.genesis_hash), "genesis stands — the founder remains an owner");
+        assert!(!h.is_effective(&remove_self), "a device cannot remove its own chain");
     }
 
     #[test]
