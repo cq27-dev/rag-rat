@@ -256,7 +256,13 @@ function npxCachedBin() {
   // .bin_real/<bin> — the platform binary @rag-rat/bin downloaded. Reuse whichever hash has a
   // VERSION-matched binary; a stale hash (an older @rag-rat/bin cached under a prior `@latest`
   // install, e.g. from before a rename) is skipped rather than invoked with the wrong subcommands.
-  const npmCache = process.env.npm_config_cache || path.join(os.homedir(), ".npm");
+  const npmCache =
+    process.env.npm_config_cache ||
+    (process.platform === "win32"
+      // npm's Windows default is %LocalAppData%\npm-cache, NOT ~/.npm — a hook subprocess that
+      // doesn't inherit npm_config_cache would otherwise miss the binary the MCP server's npx staged.
+      ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "npm-cache")
+      : path.join(os.homedir(), ".npm"));
   let hashes;
   try {
     hashes = fs.readdirSync(path.join(npmCache, "_npx"));
