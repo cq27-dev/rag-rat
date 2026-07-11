@@ -358,7 +358,11 @@ fn discover_config_optional(explicit: Option<&str>) -> anyhow::Result<Option<Con
         },
         None => {
             let path = rag_rat_core::config::discover_config_path(Path::new("."));
-            if !path.is_file() {
+            // Only a GENUINELY ABSENT path is "no config" (graceful). A path that EXISTS but is not
+            // a readable config file (e.g. a directory named `rag-rat.toml`) is
+            // present-but-invalid: let `Config::load` surface the error rather than
+            // silently going dormant.
+            if !path.exists() {
                 return Ok(None);
             }
             Ok(Some(Config::load(path)?))
@@ -390,11 +394,14 @@ fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> {
     // Small worker pool: the stdio JSON-RPC loop is mostly serial and CPU-heavy indexing is rayon,
     // not tokio; stay multi_thread so a blocking tool handler can't stall the serve/upgrade tasks
     // (issue #63, facet 3).
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?
-        .block_on(rag_rat_mcp::server::run_stdio(config, output_format))?;
+    let runtime =
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    // A resolved config → the active server; none → the dormant one. Kept as two calls so the
+    // published `run_stdio(Config, …)` entry point stays source-compatible (#603).
+    match config {
+        Some(config) => runtime.block_on(rag_rat_mcp::server::run_stdio(config, output_format))?,
+        None => runtime.block_on(rag_rat_mcp::server::run_stdio_dormant(output_format))?,
+    }
     Ok(())
 }
 

@@ -456,9 +456,14 @@ impl IndexDatabase {
             });
         }
         let size_bytes = std::fs::metadata(path).ok().map(|meta| meta.len());
-        let schema = Self::migration_check(path)?;
+        // READ-ONLY throughout: this diagnostic must work on a read-only mount / backup, so it must
+        // not use the read-WRITE `migration_check` (whose `IndexConnection::open` runs
+        // write-oriented setup pragmas). One read-only connection serves both the schema
+        // status and the registry read. NB: a read-only open never auto-migrates, which is
+        // correct here — the report states the schema STATE, it does not change it.
+        let storage = IndexConnection::open_read_only_blocking(path)?;
+        let schema = schema::status(storage.connection())?;
         let repos = if schema.state == schema::SchemaState::Compatible {
-            let storage = IndexConnection::open_read_only_blocking(path)?;
             schema::registered_repos(storage.connection())?
         } else {
             Vec::new()

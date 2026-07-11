@@ -71,6 +71,15 @@ fn is_read_only_tool(name: &str) -> bool {
     !is_write_tool(name)
 }
 
+/// Whether `name` is an advertised tool. [`TOOL_NAMES`] is the single source of truth `list_tools`
+/// advertises and is kept routable by the dispatcher
+/// (`mcp_stdio_every_advertised_tool_is_routable`), so this is the same "is this a real tool" test
+/// the active `call_tool_for_config` applies — used by the dormant server to reject an
+/// unknown/misspelled name instead of masking it as `no_index`.
+pub(crate) fn is_known_tool(name: &str) -> bool {
+    TOOL_NAMES.contains(&name)
+}
+
 /// Read tools that compare indexed graph/symbol data against LIVE on-disk source text, read through
 /// the stored `source_root` (the MAIN checkout). Under a linked-worktree overlay scope these tools'
 /// GRAPH side would come from the branch overlay while their TEXT side still read the main

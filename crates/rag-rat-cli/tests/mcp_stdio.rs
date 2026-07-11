@@ -200,9 +200,26 @@ fn mcp_stdio_serves_dormant_without_a_config() {
         "the dormant tool result must carry the no-index notice, got: {text}",
     );
 
-    // The server is still alive after a tool call — a second request is answered.
-    send(&mut stdin, json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}));
-    assert_eq!(recv(&mut reader)["id"], 4, "the dormant server stays alive across calls");
+    // An UNKNOWN tool name is still rejected as an error — dormancy must not mask a typo/stale tool
+    // as `no_index` (a client can't otherwise tell an invalid call from genuine dormancy).
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "definitely_not_a_tool", "arguments": {}}
+        }),
+    );
+    let unknown = recv(&mut reader);
+    assert!(
+        unknown["error"]["message"].as_str().unwrap_or_default().contains("unknown tool"),
+        "a dormant server must reject an unknown tool, got: {unknown}",
+    );
+
+    // The server is still alive after those calls — a further request is answered.
+    send(&mut stdin, json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list"}));
+    assert_eq!(recv(&mut reader)["id"], 5, "the dormant server stays alive across calls");
 
     stop(child);
     fs::remove_dir_all(root).unwrap();

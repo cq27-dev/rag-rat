@@ -1221,11 +1221,14 @@ fn anchor_root_to_main_worktree(root: &Path) -> PathBuf {
 ///    AND emits the divergence warning — routing discovery straight to main when a branch file
 ///    exists would silently skip that warning, so the file's presence keeps the load going through
 ///    the seam (governance is identical either way).
-///  * no local file, linked worktree → the MAIN worktree's `rag-rat.toml` (whether or not it exists
-///    yet — a missing-config hint should name the path where the config BELONGS).
-///  * no local file, main/non-git → the nearest `rag-rat.toml` in an ANCESTOR directory, so a
-///    launch from a SUBDIRECTORY of a rag-rat repo still finds the repo's config; failing that, the
-///    local path (the hint names it).
+///  * linked worktree, no local file at `dir` → the nearest `rag-rat.toml` in an ANCESTOR up to the
+///    linked worktree root (a subdirectory launch still finds a branch-local config → seam +
+///    warning); failing that, the MAIN worktree's `rag-rat.toml` (whether or not it exists yet — a
+///    missing-config hint should name where the config BELONGS).
+///  * main/non-git, no local file → the nearest `rag-rat.toml` in an ANCESTOR directory (bounded at
+///    the enclosing git root so a nested checkout never adopts a parent repo's config), so a launch
+///    from a SUBDIRECTORY of a rag-rat repo still finds the repo's config; failing that, the local
+///    path (the hint names it).
 ///
 /// An EXPLICIT `--config` path never routes through this — a user override is taken literally.
 pub fn discover_config_path(dir: &Path) -> PathBuf {
@@ -1234,12 +1237,16 @@ pub fn discover_config_path(dir: &Path) -> PathBuf {
         return local;
     }
     match linked_worktree_main_root(dir) {
-        // Linked worktree: the MAIN checkout's config governs UNCONDITIONALLY — return its path
-        // even when the file is missing. This is the governing seam; the ancestor walk
-        // below must never preempt it (a subdir of the MAIN worktree is deliberately NOT
-        // classified as linked, so it falls into the `None` arm and the walk finds main's
-        // config there).
-        Some(main_top) => main_top.join("rag-rat.toml"),
+        // Linked worktree: a BRANCH-LOCAL rag-rat.toml (at the worktree root, or an ancestor of
+        // `dir` within it) must still be found from a SUBDIRECTORY launch — it routes the load
+        // through the governing seam, which governs from main AND emits the divergence warning
+        // (jumping straight to main would skip that warning, or wrongly go dormant when main has no
+        // config). `nearest_config_at_or_above` is bounded at the enclosing git root (the linked
+        // worktree root), so it cannot escape into main or a parent. No branch-local config
+        // ANYWHERE in the linked worktree ⇒ main's config path (even if missing) — the
+        // governing-seam invariant.
+        Some(main_top) =>
+            nearest_config_at_or_above(dir).unwrap_or_else(|| main_top.join("rag-rat.toml")),
         None => nearest_config_at_or_above(dir).unwrap_or(local),
     }
 }
@@ -1248,8 +1255,12 @@ pub fn discover_config_path(dir: &Path) -> PathBuf {
 /// returning that file's path. `None` ⇒ no rag-rat repo at or above `dir`. The single upward-walk
 /// primitive: `discover_config_path`'s non-worktree arm uses it so a subdirectory launch inside a
 /// repo finds the repo's config, and the Claude-hook cwd→config resolver
-/// (`claude_hook::find_config`) loads the returned path. Unbounded (to the filesystem root),
-/// matching a repo that has no other marker than its `rag-rat.toml`.
+/// (`claude_hook::find_config`) loads the returned path.
+///
+/// The climb STOPS at the enclosing git repository root: a nested checkout or submodule that has no
+/// `rag-rat.toml` of its own must NOT bind to an indexed PARENT repo's config — that would target
+/// the wrong repository for searches and, worse, for memory writes. When `dir` is not inside a git
+/// repo there is no such boundary, so the walk runs to the filesystem root.
 pub fn nearest_config_at_or_above(dir: &Path) -> Option<PathBuf> {
     // Resolve to an ABSOLUTE path first. A relative `dir` such as `.` has `parent() == Some("")`
     // then `None`, so the ancestor walk would only ever inspect `.` and never climb the real
@@ -1257,11 +1268,24 @@ pub fn nearest_config_at_or_above(dir: &Path) -> Option<PathBuf> {
     // `..`/symlinks so the climb follows the true directory chain. If it fails (a non-existent
     // `dir`), fall back to walking `dir` as given rather than aborting discovery.
     let absolute = dir.canonicalize().ok();
-    let mut current = absolute.as_deref().or(Some(dir));
+    let start = absolute.as_deref().unwrap_or(dir);
+    // The enclosing git repo's workdir root — the ceiling the climb must not cross (canonicalized
+    // so it compares equal to the canonicalized `cur`). `None` for a non-git `dir` ⇒ no
+    // ceiling.
+    let boundary = crate::index::discover_repo(start)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .and_then(|workdir| workdir.canonicalize().ok());
+    let mut current = Some(start);
     while let Some(cur) = current {
         let candidate = cur.join("rag-rat.toml");
         if candidate.is_file() {
             return Some(candidate);
+        }
+        // At the git repo root: its `rag-rat.toml` was just checked; never climb into a parent
+        // repo.
+        if boundary.as_deref() == Some(cur) {
+            break;
         }
         current = cur.parent();
     }
@@ -2395,6 +2419,83 @@ mod tests {
         let bare = tmp.join("bare").join("deep");
         std::fs::create_dir_all(&bare).unwrap();
         assert_eq!(discover_config_path(&bare), bare.join("rag-rat.toml"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The ancestor walk STOPS at the enclosing git repo root: a nested checkout / submodule with
+    /// no `rag-rat.toml` of its own must NOT bind to an indexed PARENT repo's config — that
+    /// would point searches and (worse) memory writes at the wrong repository (#611 review,
+    /// P2).
+    #[test]
+    fn discover_config_path_does_not_cross_a_nested_repo_boundary() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-nested-{}-{id}", std::process::id()));
+        let parent = tmp.join("parent");
+        let nested = parent.join("vendor").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        // Parent IS a rag-rat repo (git + rag-rat.toml at its root).
+        git(&parent, &["init", "-q"]);
+        std::fs::write(parent.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
+        // `nested` is its OWN git repo (submodule-like), with no rag-rat.toml.
+        git(&nested, &["init", "-q"]);
+
+        // Launched from the nested repo, discovery stays WITHIN it (no toml) → its local path,
+        // never the parent's config.
+        let got = discover_config_path(&nested);
+        assert_eq!(got, nested.join("rag-rat.toml"), "must not adopt the parent repo's config");
+        assert_ne!(
+            got.canonicalize().ok(),
+            parent.join("rag-rat.toml").canonicalize().ok(),
+            "the parent repo's rag-rat.toml must not leak across the nested boundary",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A SUBDIRECTORY launch inside a LINKED worktree finds a BRANCH-LOCAL `rag-rat.toml` at the
+    /// worktree root (routing the load through the governing seam + divergence warning) instead of
+    /// jumping straight to main; with no branch-local config anywhere in the worktree it still
+    /// resolves to MAIN's path (the governing-seam invariant). #611 review, P2 (linked arm).
+    #[test]
+    fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdir() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-wtsub-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+        let main_c = main.canonicalize().unwrap();
+        let sub = linked.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // No branch-local config anywhere in the worktree: a subdir launch resolves to MAIN's path.
+        assert_eq!(discover_config_path(&sub), main_c.join("rag-rat.toml"), "invariant: → main");
+
+        // A branch-local config at the LINKED worktree root: the subdir launch now finds IT (never
+        // climbing past the worktree root into main).
+        std::fs::write(linked.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
+        assert_eq!(
+            discover_config_path(&sub).canonicalize().unwrap(),
+            linked.join("rag-rat.toml").canonicalize().unwrap(),
+            "a subdir launch must find the branch-local config, not jump to main",
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

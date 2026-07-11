@@ -38,7 +38,24 @@ pub struct RagRatService {
 }
 
 impl RagRatService {
-    pub fn new(config: Option<Config>, output_format: rag_rat_core::OutputFormat) -> Self {
+    /// The ACTIVE server bound to a resolved repo config. Published constructor — its
+    /// `new(Config, …)` signature is preserved for source compatibility; the config-less DORMANT
+    /// server is built via [`RagRatService::new_dormant`] instead of widening this to `Option`.
+    pub fn new(config: Config, output_format: rag_rat_core::OutputFormat) -> Self {
+        Self::with_optional_config(Some(config), output_format)
+    }
+
+    /// The DORMANT server (launched outside any rag-rat repo): no config, so every tool call
+    /// returns [`RagRatService::dormant_tool_result`]. Separate from [`RagRatService::new`] so
+    /// that constructor's published signature stays source-compatible (#603).
+    pub(crate) fn new_dormant(output_format: rag_rat_core::OutputFormat) -> Self {
+        Self::with_optional_config(None, output_format)
+    }
+
+    fn with_optional_config(
+        config: Option<Config>,
+        output_format: rag_rat_core::OutputFormat,
+    ) -> Self {
         Self {
             config,
             output_format,
@@ -62,6 +79,12 @@ impl RagRatService {
         // launch. The notice tells the user to restart the MCP server after `init` + `index`
         // (#603).
         let Some(config) = &self.config else {
+            // A dormant server still rejects an UNKNOWN tool name exactly like an active one, so a
+            // typo or stale tool surfaces as an error instead of being masked as `no_index`. Only a
+            // KNOWN (advertised) tool earns the dormant notice.
+            if !crate::tools::is_known_tool(name) {
+                return Err(ErrorData::internal_error(format!("unknown tool `{name}`"), None));
+            }
             return Ok(self.dormant_tool_result());
         };
         let value = crate::tools::call_tool_for_config(config, name, value)
@@ -352,24 +375,11 @@ fn tool_timeout_error(
     ))
 }
 
-/// `Some(config)` ⇒ the ACTIVE server bound to a resolved repo. `None` ⇒ a DORMANT server: the
-/// launch directory (and every parent) had no `rag-rat.toml`, so there is no repo to serve. A
-/// dormant server still speaks MCP — it just returns the dormant notice from every tool call —
-/// because a globally-registered `rag-rat mcp` is spawned in EVERY project, and dying in a
-/// non-rag-rat one takes repo intelligence down for that whole session (#603).
+/// Serve the stdio MCP server for a RESOLVED repo config — the ACTIVE server: keeps the index fresh
+/// (watcher), serves the grep-hook listener, and (Unix) arms the SIGUSR1 hot-upgrade. Published
+/// entry point; its `run_stdio(Config, …)` signature is preserved for source compatibility. The
+/// config-less DORMANT server is [`run_stdio_dormant`].
 pub async fn run_stdio(
-    config: Option<Config>,
-    output_format: rag_rat_core::OutputFormat,
-) -> anyhow::Result<()> {
-    match config {
-        Some(config) => run_stdio_active(config, output_format).await,
-        None => run_stdio_dormant(output_format).await,
-    }
-}
-
-/// The active server: keeps the index fresh (watcher), serves the grep-hook listener, and (Unix)
-/// arms the SIGUSR1 hot-upgrade.
-async fn run_stdio_active(
     config: Config,
     output_format: rag_rat_core::OutputFormat,
 ) -> anyhow::Result<()> {
@@ -382,17 +392,20 @@ async fn run_stdio_active(
         // Keep the index fresh while a session is connected; dropping the watcher on shutdown
         // runs a final timeout-skip pass. (Hot-upgrade is Unix-only.)
         let _watcher = rag_rat_core::watch::Watcher::spawn(config.clone());
-        let service = RagRatService::new(Some(config), output_format).serve(stdio()).await?;
+        let service = RagRatService::new(config, output_format).serve(stdio()).await?;
         service.waiting().await?;
         Ok(())
     }
 }
 
-/// The dormant server (no config resolved): no watcher, no hook listener, no hot-upgrade — nothing
-/// to keep fresh. It just serves the MCP protocol until the client disconnects; `tools/list` still
-/// advertises the full catalog, but every `tools/call` returns [`dormant_tool_result`].
-async fn run_stdio_dormant(output_format: rag_rat_core::OutputFormat) -> anyhow::Result<()> {
-    let running = RagRatService::new(None, output_format).serve(rmcp::transport::stdio()).await?;
+/// The DORMANT server (launched outside any rag-rat repo, so no config resolved): no watcher, no
+/// hook listener, no hot-upgrade — nothing to keep fresh. It just serves the MCP protocol until the
+/// client disconnects; `tools/list` still advertises the full catalog, but every `tools/call`
+/// returns [`RagRatService::dormant_tool_result`]. Split from [`run_stdio`] so that published
+/// `run_stdio(Config)` signature stays source-compatible, while a globally-registered `rag-rat mcp`
+/// can still stay alive in a non-rag-rat project instead of dying (#603).
+pub async fn run_stdio_dormant(output_format: rag_rat_core::OutputFormat) -> anyhow::Result<()> {
+    let running = RagRatService::new_dormant(output_format).serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
 }
@@ -425,7 +438,7 @@ async fn run_stdio_unix(
     use crate::upgrade::{self, GatedStdin, Upgrade, UpgradeGate};
 
     let gate = UpgradeGate::new();
-    let service = RagRatService::new(Some(config.clone()), output_format);
+    let service = RagRatService::new(config.clone(), output_format);
     let inflight = service.inflight();
 
     let transport = (GatedStdin::new(tokio::io::stdin(), Arc::clone(&gate)), tokio::io::stdout());
@@ -546,7 +559,7 @@ mod tests {
 
     fn service_over_temp_repo() -> (PathBuf, RagRatService) {
         let (root, config) = config_over_temp_repo();
-        (root, RagRatService::new(Some(config), OutputFormat::Toon))
+        (root, RagRatService::new(config, OutputFormat::Toon))
     }
 
     fn ok_result() -> CallToolResult {
@@ -769,7 +782,7 @@ mod tests {
     fn stale_memory_nudge_rides_toon_but_not_json() {
         let (root, config) = config_over_temp_repo();
         // A memory bound to an unindexed/absent path resolves `gone` → drift the nudge reports.
-        let toon = RagRatService::new(Some(config.clone()), OutputFormat::Toon);
+        let toon = RagRatService::new(config.clone(), OutputFormat::Toon);
         toon.call(
             "memory_create",
             json!({
@@ -791,7 +804,7 @@ mod tests {
         assert_eq!(toon_result.content.len(), 2, "TOON result carries the nudge block");
 
         // JSON mode: suppressed (single parseable block).
-        let json_svc = RagRatService::new(Some(config), OutputFormat::Json);
+        let json_svc = RagRatService::new(config, OutputFormat::Json);
         let json_result = json_svc.call("index_status", json!({})).unwrap();
         assert_eq!(json_result.content.len(), 1, "JSON result omits the prose nudge");
 
