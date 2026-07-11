@@ -30,9 +30,18 @@ pub(crate) fn describe_version(
     }
 }
 
+/// Whether GitHub Actions' tag signal proves HEAD is exactly the `v<pkg>` release tag. A cargo-dist
+/// release build checks out shallowly with no tags fetched, so `git describe --exact-match` finds
+/// nothing even AT the release commit; the `GITHUB_REF_TYPE` / `GITHUB_REF_NAME` pair is the
+/// reliable exact-tag proof there. `ref_type` / `ref_name` are the raw env values (`None` when
+/// unset — e.g. a local build, which falls back to `git describe`).
+pub(crate) fn ci_release_tag(ref_type: Option<&str>, ref_name: Option<&str>, pkg: &str) -> bool {
+    ref_type == Some("tag") && ref_name == Some(format!("v{pkg}").as_str())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::describe_version;
+    use super::{ci_release_tag, describe_version};
 
     #[test]
     fn pristine_release_tag_reads_plain() {
@@ -63,5 +72,28 @@ mod tests {
             describe_version("0.16.0", true, Some("abc1234"), true),
             "0.16.0+gabc1234.dirty"
         );
+    }
+
+    #[test]
+    fn ci_tag_ref_matching_pkg_is_a_release() {
+        // The release build: GitHub Actions building the `v0.16.0` tag. Proves exact-tag even
+        // though a shallow checkout gives `git describe` no tag to find.
+        assert!(ci_release_tag(Some("tag"), Some("v0.16.0"), "0.16.0"));
+    }
+
+    #[test]
+    fn ci_branch_ref_is_not_a_release() {
+        assert!(!ci_release_tag(Some("branch"), Some("main"), "0.16.0"));
+    }
+
+    #[test]
+    fn ci_tag_ref_for_a_different_version_is_not_this_release() {
+        assert!(!ci_release_tag(Some("tag"), Some("v0.15.0"), "0.16.0"));
+    }
+
+    #[test]
+    fn no_ci_env_is_not_a_release() {
+        // A local build (env unset) — falls back to `git describe`, never the CI signal.
+        assert!(!ci_release_tag(None, None, "0.16.0"));
     }
 }

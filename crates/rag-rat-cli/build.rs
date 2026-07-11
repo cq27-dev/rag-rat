@@ -1,5 +1,6 @@
 //! Stamps `RAG_RAT_VERSION` at build time: a plain `CARGO_PKG_VERSION` for a pristine release
-//! (built at a `v*` tag with a clean tree, or from a cargo-packaged crates.io source), else
+//! (built at a `v*` tag — proven by `git describe` or the CI tag signal — with a clean tree, or
+//! from a cargo-packaged crates.io source), else
 //! `<version>+g<short_hash>` (`.dirty` for uncommitted changes) for a git dev build, or
 //! `<version>+src` for a source tree with neither git nor cargo package metadata. So any build that
 //! isn't a vetted release names itself in `--version` and the migration-provenance record (#585),
@@ -14,7 +15,7 @@ include!("src/version_describe.rs");
 fn main() {
     let pkg = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let version = match git_state(&manifest_dir) {
+    let version = match git_state(&manifest_dir, &pkg) {
         Some(state) =>
             describe_version(&pkg, state.exact_tag, Some(&state.short_hash), state.dirty),
         // No git: a cargo-packaged (crates.io) build is a real release → plain version; a raw
@@ -44,7 +45,7 @@ struct GitState {
 /// The git state for `dir`, or `None` when git is unavailable / this isn't the rag-rat repo. The
 /// toplevel-sentinel guard (`rag-rat.toml` at the repo root) means a copy of these sources vendored
 /// inside a FOREIGN git repo can't stamp that repo's hash — it degrades to the plain version.
-fn git_state(dir: &str) -> Option<GitState> {
+fn git_state(dir: &str, pkg: &str) -> Option<GitState> {
     let toplevel = git_output(dir, &["rev-parse", "--show-toplevel"])?;
     if !Path::new(toplevel.trim()).join("rag-rat.toml").exists() {
         return None;
@@ -53,15 +54,32 @@ fn git_state(dir: &str) -> Option<GitState> {
     if short_hash.is_empty() {
         return None;
     }
-    let exact_tag = Command::new("git")
+    // Exact-tag proof, either way: `git describe` in a normal full clone, OR GitHub Actions' tag
+    // signal — the release build (cargo-dist) checks out shallowly with NO tags, so `git describe`
+    // finds nothing even at the release commit. Without the CI fallback every release binary would
+    // stamp `+g<hash>` and #585 would gate it as a dev build.
+    let exact_tag = git_describes_exact_tag(dir)
+        || ci_release_tag(
+            std::env::var("GITHUB_REF_TYPE").ok().as_deref(),
+            std::env::var("GITHUB_REF_NAME").ok().as_deref(),
+            pkg,
+        );
+    // Only TRACKED changes count as dirty. cargo-dist drops build artifacts
+    // (`plan-dist-manifest.json`, …) into the release working tree; those are untracked and
+    // must not stamp a real release `.dirty`.
+    let dirty = git_output(dir, &["status", "--porcelain", "--untracked-files=no"])
+        .is_some_and(|out| !out.trim().is_empty());
+    Some(GitState { exact_tag, short_hash, dirty })
+}
+
+/// True when `git describe` resolves HEAD to an exact `v*` tag — the normal full-clone path.
+fn git_describes_exact_tag(dir: &str) -> bool {
+    Command::new("git")
         .current_dir(dir)
         .args(["describe", "--tags", "--match", "v*", "--exact-match", "HEAD"])
         .output()
         .map(|out| out.status.success())
-        .unwrap_or(false);
-    let dirty =
-        git_output(dir, &["status", "--porcelain"]).is_some_and(|out| !out.trim().is_empty());
-    Some(GitState { exact_tag, short_hash, dirty })
+        .unwrap_or(false)
 }
 
 /// stdout of a successful `git` invocation in `dir`, else `None`.
