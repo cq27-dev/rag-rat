@@ -32,6 +32,7 @@
 //! seam, roster/epochs, and transport) — this mirrors the `content_hash` freeze: pin the semantic
 //! primitive first, in isolation-testable form.
 
+mod account;
 mod cbor;
 mod device;
 mod entry;

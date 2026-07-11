@@ -34,7 +34,6 @@ use anyhow::Context;
 use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
-use sha2::{Digest, Sha256};
 
 use super::cbor;
 use super::device::{DevicePublic, DeviceSecret};
@@ -110,7 +109,7 @@ pub(super) fn sign_entry(
         device_fingerprint,
         op_bytes: &op_bytes,
     });
-    let entry_hash = sha256(&body_bytes);
+    let entry_hash = cbor::sha256(&body_bytes);
     let signature = secret.sign(&body_bytes);
     let signed_bytes = encode_signed(&body_bytes, &signature);
     SignedEntry {
@@ -148,7 +147,7 @@ pub(super) fn sign_entry_from_op_bytes(
         device_fingerprint,
         op_bytes: &op_bytes,
     });
-    let entry_hash = sha256(&body_bytes);
+    let entry_hash = cbor::sha256(&body_bytes);
     let signature = secret.sign(&body_bytes);
     let signed_bytes = encode_signed(&body_bytes, &signature);
     SignedEntry {
@@ -269,9 +268,9 @@ fn decode_signed_cbor(bytes: &[u8]) -> Result<SignedEntry, CborError> {
     cbor::require_canonical_cbor(bytes)?;
     let mut d = Decoder::new(bytes);
     cbor::expect_array(&mut d, 3)?;
-    expect_domain(&mut d, SIGNED_DOMAIN)?;
+    cbor::expect_domain(&mut d, SIGNED_DOMAIN)?;
     let body_bytes = d.bytes()?.to_vec();
-    let signature = fixed_bytes::<64>(d.bytes()?, "signature")?;
+    let signature = cbor::fixed_bytes::<64>(d.bytes()?, "signature")?;
     let entry = decode_body(&body_bytes)?;
     Ok(SignedEntry { entry, signature, body_bytes, signed_bytes: bytes.to_vec() })
 }
@@ -282,26 +281,15 @@ fn decode_body(body_bytes: &[u8]) -> Result<VerifiedEntry, CborError> {
     cbor::require_canonical_cbor(body_bytes)?;
     let mut d = Decoder::new(body_bytes);
     cbor::expect_array(&mut d, 6)?;
-    expect_domain(&mut d, ENTRY_DOMAIN)?;
-    let stream_id = StreamId::from_bytes(fixed_bytes::<32>(d.bytes()?, "stream_id")?);
+    cbor::expect_domain(&mut d, ENTRY_DOMAIN)?;
+    let stream_id = StreamId::from_bytes(cbor::fixed_bytes::<32>(d.bytes()?, "stream_id")?);
     let prev_hash = decode_prev_hash(&mut d)?;
     let lamport = d.u64()?;
     let device_fingerprint =
-        DeviceFingerprint::from_bytes(fixed_bytes::<32>(d.bytes()?, "device fingerprint")?);
+        DeviceFingerprint::from_bytes(cbor::fixed_bytes::<32>(d.bytes()?, "device fingerprint")?);
     let op_bytes = d.bytes()?.to_vec();
-    let entry_hash = sha256(body_bytes);
+    let entry_hash = cbor::sha256(body_bytes);
     Ok(VerifiedEntry { stream_id, prev_hash, lamport, device_fingerprint, op_bytes, entry_hash })
-}
-
-/// Read the leading domain string and assert it matches `want` — a wrong/absent tag is a foreign or
-/// version-bumped object an old binary must reject, never misread.
-fn expect_domain(d: &mut Decoder<'_>, want: &str) -> Result<(), CborError> {
-    let got = d.str()?;
-    if got == want {
-        Ok(())
-    } else {
-        Err(CborError::message(format!("unknown domain tag `{got}` (expected `{want}`)")))
-    }
 }
 
 /// Decode the `prev_hash` slot: CBOR null → genesis (`None`), else a 32-byte bstr link.
@@ -310,22 +298,8 @@ fn decode_prev_hash(d: &mut Decoder<'_>) -> Result<Option<[u8; 32]>, CborError> 
         d.null()?;
         Ok(None)
     } else {
-        Ok(Some(fixed_bytes::<32>(d.bytes()?, "prev_hash")?))
+        Ok(Some(cbor::fixed_bytes::<32>(d.bytes()?, "prev_hash")?))
     }
-}
-
-/// Convert an opaque byte slice to a fixed `[u8; N]`, erroring with the field name on a length
-/// mismatch (a wrong-length hash / fingerprint / signature is a structural error).
-fn fixed_bytes<const N: usize>(bytes: &[u8], field: &str) -> Result<[u8; N], CborError> {
-    <[u8; N]>::try_from(bytes)
-        .map_err(|_| CborError::message(format!("{field} must be {N} bytes, got {}", bytes.len())))
-}
-
-/// `sha256` into a fixed 32-byte array — the entry-hash / content-address primitive.
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::digest(bytes));
-    out
 }
 
 #[cfg(test)]
@@ -423,7 +397,7 @@ mod tests {
     #[test]
     fn entry_hash_is_sha256_of_the_body() {
         let signed = sign_entry(&secret(), stream(), None, 1, &MemoryOp::Snapshot);
-        assert_eq!(signed.entry.entry_hash, sha256(&signed.body_bytes));
+        assert_eq!(signed.entry.entry_hash, cbor::sha256(&signed.body_bytes));
     }
 
     #[test]

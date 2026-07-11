@@ -20,6 +20,7 @@
 //! the encoding-level floor beneath that.
 
 use minicbor::decode::{Decoder, Error as CborError};
+use sha2::{Digest, Sha256};
 
 /// Validate that `bytes` is EXACTLY one canonical CBOR item (RFC 8949 §4.2 core-deterministic) with
 /// no trailing bytes: MINIMAL-length argument headers, DEFINITE lengths only, sorted + unique map
@@ -174,4 +175,32 @@ pub(super) fn expect_array(d: &mut Decoder<'_>, want: u64) -> Result<(), CborErr
 /// array (canonical CBOR is definite-length only).
 pub(super) fn expect_definite_len(d: &mut Decoder<'_>) -> Result<u64, CborError> {
     d.array()?.ok_or_else(|| CborError::message("expected a definite-length array"))
+}
+
+/// `sha256` into a fixed 32-byte array — the entry-hash / content-address primitive shared by the
+/// op-log entry envelope ([`super::entry`]) and the account layer ([`super::account`]).
+pub(super) fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(bytes));
+    out
+}
+
+/// Convert an opaque byte slice to a fixed `[u8; N]`, erroring with the field name on a length
+/// mismatch (a wrong-length hash / fingerprint / signature is a structural error). Shared by every
+/// signed-wire decoder in `oplog`.
+pub(super) fn fixed_bytes<const N: usize>(bytes: &[u8], field: &str) -> Result<[u8; N], CborError> {
+    <[u8; N]>::try_from(bytes)
+        .map_err(|_| CborError::message(format!("{field} must be {N} bytes, got {}", bytes.len())))
+}
+
+/// Read a leading domain string and assert it matches `want` — a wrong/absent tag is a foreign or
+/// version-bumped object an old binary must reject, never misread. Shared by every domain-tagged
+/// decoder in `oplog`.
+pub(super) fn expect_domain(d: &mut Decoder<'_>, want: &str) -> Result<(), CborError> {
+    let got = d.str()?;
+    if got == want {
+        Ok(())
+    } else {
+        Err(CborError::message(format!("unknown domain tag `{got}` (expected `{want}`)")))
+    }
 }
