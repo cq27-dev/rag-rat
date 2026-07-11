@@ -277,8 +277,11 @@ async function fetchText(url) {
   return body;
 }
 async function acquireLock(lockPath) {
-  // Atomic create-if-absent; spin with backoff up to ~60s, then break a stale lock.
-  const start = Date.now();
+  // Atomic create-if-absent. When the lock is held, only break it if the LOCK FILE itself is stale
+  // (a crashed holder), judged by its age — NOT by how long *we* have waited. A slow-but-live
+  // download must not have its lock yanked: that would start a second download and race the final
+  // rename (on Windows the rename onto an existing file can fail outright).
+  const STALE_MS = 15 * 60_000; // no real download approaches this; an older lock ⇒ the holder died
   for (;;) {
     try {
       const fd = fs.openSync(lockPath, "wx");
@@ -286,8 +289,14 @@ async function acquireLock(lockPath) {
       return () => fs.rmSync(lockPath, { force: true });
     } catch (e) {
       if (e.code !== "EEXIST") throw e;
-      if (Date.now() - start > 60_000) {
-        fs.rmSync(lockPath, { force: true }); // assume a crashed holder
+      let age;
+      try {
+        age = Date.now() - fs.statSync(lockPath).mtimeMs;
+      } catch {
+        continue; // holder released between the EEXIST and the stat — retry the create now
+      }
+      if (age > STALE_MS) {
+        fs.rmSync(lockPath, { force: true }); // crashed holder — reclaim
         continue;
       }
       await new Promise((r) => setTimeout(r, 200));

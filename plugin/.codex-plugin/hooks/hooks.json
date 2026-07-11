@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CODEX_PLUGIN_ROOT}/scripts/launch.js\" --no-install agent-hook",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install agent-hook",
             "timeout": 5
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CODEX_PLUGIN_ROOT}/scripts/launch.js\" --no-install agent-hook",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install agent-hook",
             "timeout": 10
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CODEX_PLUGIN_ROOT}/scripts/launch.js\" --no-install agent-hook",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install agent-hook",
             "timeout": 10
           }
         ]
