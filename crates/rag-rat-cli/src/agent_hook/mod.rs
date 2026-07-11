@@ -401,13 +401,14 @@ fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
     let context = ask_listener(&config, &input.session_id, &input.cwd, &search)
         .unwrap_or_else(|| fallback_compose(&config, &input.cwd, &search));
     if let Some(context) = context {
-        // PreToolUse contract: allow + additionalContext; plain stdout is debug-only.
+        // PreToolUse contract: additionalContext only — no `permissionDecision` (Codex rejects the
+        // "allow" value, and we only inject context, never gate the tool). Plain stdout is
+        // debug-only.
         println!(
             "{}",
             serde_json::json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
                     "additionalContext": context,
                 }
             })
@@ -449,13 +450,13 @@ fn clone_check(input: &HookInput) -> anyhow::Result<()> {
     }
     let matches = db.clones_of_texts(&inputs, HOOK_NEAR_THRESHOLD)?;
     if let Some(context) = format_clone_warning(&matches) {
-        // PreToolUse contract: allow + additionalContext (a warning, not a block).
+        // PreToolUse contract: additionalContext only — a warning, not a block (no
+        // permissionDecision).
         println!(
             "{}",
             serde_json::json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
                     "additionalContext": context,
                 }
             })
