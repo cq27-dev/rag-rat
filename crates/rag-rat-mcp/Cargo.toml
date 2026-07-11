@@ -22,7 +22,7 @@ tokio = { workspace = true, features = ["sync", "io-util", "time"] }
 tracing.workspace = true
 
 # `net` / `signal` are consumed only by the unix-gated hot-upgrade (`upgrade.rs`) and hook listener
-# (`claude_hook.rs::listener`) — dead on non-unix targets, so gate them there (#54).
+# (`agent_hook.rs::listener`) — dead on non-unix targets, so gate them there (#54).
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 tokio = { workspace = true, features = ["net", "time", "signal"] }

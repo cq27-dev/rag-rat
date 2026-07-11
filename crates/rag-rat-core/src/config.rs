@@ -1255,7 +1255,7 @@ pub fn discover_config_path(dir: &Path) -> PathBuf {
 /// returning that file's path. `None` ⇒ no rag-rat repo at or above `dir`. The single upward-walk
 /// primitive: `discover_config_path`'s non-worktree arm uses it so a subdirectory launch inside a
 /// repo finds the repo's config, and the Claude-hook cwd→config resolver
-/// (`claude_hook::find_config`) loads the returned path.
+/// (`agent_hook::find_config`) loads the returned path.
 ///
 /// The climb STOPS at the enclosing git repository root: a nested checkout or submodule that has no
 /// `rag-rat.toml` of its own must NOT bind to an indexed PARENT repo's config — that would target

@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 pub const HOOK_COMMAND: &str = "rag-rat agent-hook";
+// Older installs wrote `rag-rat claude-hook` (before the harness-neutral rename). We recognize it
+// as ours so a reinstall upgrades it in place — otherwise the stale entry is a dead subcommand and
+// a fresh install adds a duplicate alongside it.
+const LEGACY_HOOK_COMMANDS: &[&str] = &["rag-rat claude-hook"];
 // `Grep`/`Bash` drive the grep-augmentation; `Write`/`Edit`/`MultiEdit` drive the write-time clone
 // check (#287). All five fire the one `rag-rat agent-hook` command, which dispatches on tool name.
 const MATCHERS: &[&str] = &["Grep", "Bash", "Write", "Edit", "MultiEdit"];
@@ -37,11 +41,28 @@ fn our_session_start_entry() -> Value {
     })
 }
 
-/// True if this hook-array entry contains our command in any of its hooks.
+/// True if this hook-array entry contains our command (current or a superseded legacy spelling) in
+/// any of its hooks.
 fn is_ours(entry: &Value) -> bool {
-    entry["hooks"]
-        .as_array()
-        .is_some_and(|hooks| hooks.iter().any(|h| h["command"] == HOOK_COMMAND))
+    entry["hooks"].as_array().is_some_and(|hooks| {
+        hooks.iter().any(|h| {
+            h["command"] == HOOK_COMMAND || LEGACY_HOOK_COMMANDS.iter().any(|c| h["command"] == *c)
+        })
+    })
+}
+
+/// Rewrite any legacy command in this entry's hooks to the current one, in place. Returns true if
+/// it changed anything — so a reinstall upgrades a pre-rename entry rather than duplicating it.
+fn upgrade_legacy_commands(entry: &mut Value) -> bool {
+    let Some(hooks) = entry["hooks"].as_array_mut() else { return false };
+    let mut changed = false;
+    for h in hooks {
+        if LEGACY_HOOK_COMMANDS.iter().any(|c| h["command"] == *c) {
+            h["command"] = json!(HOOK_COMMAND);
+            changed = true;
+        }
+    }
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -109,10 +130,13 @@ pub fn merge_hook_entries(settings: &mut Value) -> bool {
     let Some(entries) = pretooluse_array_mut(settings, true) else { return false };
     let mut changed = false;
     for matcher in MATCHERS {
-        let present = entries.iter().any(|e| e["matcher"] == *matcher && is_ours(e));
-        if !present {
-            entries.push(our_pretooluse_entry(matcher));
-            changed = true;
+        match entries.iter().position(|e| e["matcher"] == *matcher && is_ours(e)) {
+            // Recognized entry (possibly a legacy `claude-hook` one): upgrade its command in place.
+            Some(pos) => changed |= upgrade_legacy_commands(&mut entries[pos]),
+            None => {
+                entries.push(our_pretooluse_entry(matcher));
+                changed = true;
+            },
         }
     }
     // SessionStart: single is-ours entry; replace if matcher/timeout drifted.
@@ -130,10 +154,12 @@ fn merge_session_start(settings: &mut Value) -> bool {
     match ours_pos {
         Some(pos) => {
             let entry = &entries[pos];
-            // Check whether matcher and timeout already match.
+            // Check whether matcher, timeout, and command already match (command drift catches a
+            // legacy `claude-hook` entry, which is recognized as ours but must be upgraded).
             let matcher_ok = entry["matcher"] == SESSION_START_MATCHER;
             let timeout_ok = entry["hooks"][0]["timeout"] == SESSION_START_TIMEOUT;
-            if matcher_ok && timeout_ok {
+            let command_ok = entry["hooks"][0]["command"] == HOOK_COMMAND;
+            if matcher_ok && timeout_ok && command_ok {
                 false // already correct, no-op
             } else {
                 entries[pos] = our_session_start_entry();
@@ -265,6 +291,65 @@ mod tests {
             "foreign Edit entry preserved"
         );
         assert_eq!(settings["permissions"]["allow"][0], "Bash(ls:*)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy `rag-rat claude-hook` → `rag-rat agent-hook` migration
+    // -----------------------------------------------------------------------
+
+    /// A settings.json as an old (`rag-rat claude-hook`) install would have left it.
+    fn legacy_settings() -> Value {
+        let legacy = LEGACY_HOOK_COMMANDS[0];
+        let pre: Vec<Value> = MATCHERS
+            .iter()
+            .map(|m| {
+                json!({"matcher": m, "hooks": [{"type": "command", "command": legacy, "timeout": 10}]})
+            })
+            .collect();
+        json!({
+            "hooks": {
+                "PreToolUse": pre,
+                "SessionStart": [{
+                    "matcher": SESSION_START_MATCHER,
+                    "hooks": [{"type": "command", "command": legacy, "timeout": SESSION_START_TIMEOUT}]
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn install_upgrades_legacy_claude_hook_in_place() {
+        let mut settings = legacy_settings();
+        assert!(merge_hook_entries(&mut settings), "legacy install is upgraded");
+        assert!(!merge_hook_entries(&mut settings), "second install is a no-op");
+
+        // No duplicates: exactly one entry per matcher, all upgraded to the current command.
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), MATCHERS.len(), "no duplicate entries added");
+        for e in pre {
+            assert_eq!(e["hooks"][0]["command"], HOOK_COMMAND, "command upgraded");
+        }
+        let ss = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(ss.len(), 1, "SessionStart not duplicated");
+        assert_eq!(ss[0]["hooks"][0]["command"], HOOK_COMMAND, "SessionStart command upgraded");
+
+        // No legacy command survives anywhere.
+        let dump = serde_json::to_string(&settings).unwrap();
+        assert!(!dump.contains("rag-rat claude-hook"), "no legacy command remains");
+    }
+
+    #[test]
+    fn uninstall_removes_legacy_claude_hook() {
+        let mut settings = legacy_settings();
+        assert!(remove_hook_entries(&mut settings), "legacy entries removed");
+        assert!(settings.get("hooks").is_none(), "empty containers pruned");
+    }
+
+    #[test]
+    fn status_reports_legacy_claude_hook_as_present() {
+        let status = hook_status(&legacy_settings());
+        assert!(status.pretooluse, "legacy PreToolUse recognized");
+        assert!(status.session_start, "legacy SessionStart recognized");
     }
 
     #[test]
