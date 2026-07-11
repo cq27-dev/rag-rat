@@ -89,6 +89,15 @@ pub(super) fn sign_account_entry(
     header: &AccountEntryHeader,
     payload: &[u8],
 ) -> SignedAccountEntry {
+    // Fail fast at the authoring site if the header names a different device than the signing key —
+    // `verify_account_signed` would reject it later, but a local bug should surface here, not on
+    // the wire. (Aligns this layer's posture with `super::super::entry::sign_entry`, which
+    // derives the fingerprint internally.)
+    debug_assert_eq!(
+        header.device_fingerprint,
+        secret.public().fingerprint(),
+        "header.device_fingerprint must be the signing key's fingerprint",
+    );
     let header_bytes = encode_header(header);
     let body_bytes = encode_body(&header_bytes, payload);
     let entry_hash = cbor::sha256(&body_bytes);
@@ -412,39 +421,41 @@ mod tests {
         let wrong = DeviceSecret::from_seed(&[9u8; 32]).public();
         assert!(verify_account_signed(&signed.signed_bytes, &wrong).is_err(), "wrong key");
 
-        // A header claiming device B's fingerprint but signed by A must fail under both keys.
+        // A header claiming device B's fingerprint but signed by A must fail under both keys. Build
+        // the wire MANUALLY — `sign_account_entry`'s debug_assert deliberately refuses to author a
+        // header/key mismatch, so this exercises verify's fingerprint bind at the wire level.
+        let secret_a = secret();
         let secret_b = DeviceSecret::from_seed(&[9u8; 32]);
         let mut forged = genesis_header();
         forged.device_fingerprint = secret_b.public().fingerprint();
-        let signed_forged = sign_account_entry(&secret(), &forged, &payload());
+        let header_bytes = encode_header(&forged);
+        let body_bytes = encode_body(&header_bytes, &payload());
+        let signature = secret_a.sign(&body_bytes);
+        let forged_wire = encode_signed(&body_bytes, &signature);
         assert!(
-            verify_account_signed(&signed_forged.signed_bytes, &secret().public()).is_err(),
+            verify_account_signed(&forged_wire, &secret_a.public()).is_err(),
             "A's key vs a header claiming B",
         );
         assert!(
-            verify_account_signed(&signed_forged.signed_bytes, &secret_b.public()).is_err(),
+            verify_account_signed(&forged_wire, &secret_b.public()).is_err(),
             "B's key vs a body A signed",
         );
     }
 
     #[test]
-    fn tampering_the_header_or_payload_is_rejected() {
+    fn tampering_any_byte_is_rejected() {
+        // Every byte of the wire is load-bearing: flipping one in the outer frame / domain / body
+        // bstr header breaks the structural decode, and flipping one in the body or signature
+        // breaks the signature. So verification must fail no matter which byte is flipped.
         let signed = sign_account_entry(&secret(), &genesis_header(), &payload());
-        // The body starts after the outer [0x83, 0x77, 23-byte domain, 0x58, len] = 27-byte header.
-        let body_start = 2 + 23 + 2;
-        for offset in [3usize, 60, 108] {
+        for index in 0..signed.signed_bytes.len() {
             let mut wire = signed.signed_bytes.clone();
-            wire[body_start + offset] ^= 0x01;
+            wire[index] ^= 0x01;
             assert!(
                 verify_account_signed(&wire, &secret().public()).is_err(),
-                "flipping a body byte at offset {offset} must fail verification",
+                "flipping byte {index} must fail decode or verification",
             );
         }
-        // Flipping the trailing signature byte fails too.
-        let mut wire = signed.signed_bytes.clone();
-        let last = wire.len() - 1;
-        wire[last] ^= 0x01;
-        assert!(verify_account_signed(&wire, &secret().public()).is_err(), "signature tamper");
     }
 
     #[test]

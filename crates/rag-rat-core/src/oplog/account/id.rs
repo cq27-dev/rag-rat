@@ -7,9 +7,9 @@
 //! principal.
 
 use minicbor::Encoder;
-use sha2::{Digest, Sha256};
 
 use super::limits::ACCOUNT_ID_DOMAIN;
+use crate::oplog::cbor;
 
 /// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::super`.
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
@@ -44,13 +44,13 @@ pub(super) fn account_id_from_genesis_payload(genesis_payload_bytes: &[u8]) -> A
         enc.str(ACCOUNT_ID_DOMAIN).expect(INFALLIBLE);
         enc.bytes(genesis_payload_bytes).expect(INFALLIBLE);
     }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::digest(&buf));
-    AccountId(out)
+    AccountId(cbor::sha256(&buf))
 }
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use super::*;
     use crate::oplog::cbor;
 

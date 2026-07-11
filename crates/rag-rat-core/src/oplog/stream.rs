@@ -24,6 +24,12 @@
 //!
 //! Tokens (repo ids, kind/relation tokens, node ids) are machine identifiers and are encoded
 //! VERBATIM — no NFC/trim (the same "structural canonicity only" rule as [`super::op`]).
+//!
+//! **Two derivations coexist (sync phase C).** [`owner_stream`] / [`derive`] produce the original
+//! `rag-rat/stream/1` id — LOCAL-only, what the live phase-B authoring path mints. [`derive_v2`]
+//! produces the owner-bound `rag-rat/stream/2` id (§14), which commits the owning `AccountId`
+//! inside the hash so a synced `/3` content entry transitively names its owner. C1 adds `/2`
+//! ALONGSIDE `/1` (byte-unchanged); nothing switches the live path until C3 adoption.
 
 use minicbor::Encoder;
 use sha2::{Digest, Sha256};
