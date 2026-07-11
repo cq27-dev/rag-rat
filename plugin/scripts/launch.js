@@ -148,6 +148,14 @@ if (isExecutable(managedBin)) return run(managedBin);
 const seeded = path.join(pluginRoot, "bin", bin);
 if (isExecutable(seeded)) return run(seeded);
 
+// ---- 2b) npx-installed binary --------------------------------------------------------------------
+// The MCP server command is `npx @rag-rat/bin@latest mcp`, which downloads the platform binary into
+// npm's _npx cache. Reuse it so a hook resolves a real binary without its own download — this is the
+// shared cache that keeps the `--no-install` hook path fast (and non-empty) now that the MCP runs
+// through npx rather than this launcher.
+const npxBin = npxCachedBin();
+if (npxBin) return run(npxBin);
+
 // ---- 3) PATH rag-rat, only if it matches the declared version ------------------------------------
 const onPath = which(bin);
 if (onPath) {
@@ -223,6 +231,22 @@ function which(name) {
       const full = path.join(dir, name.endsWith(".exe") ? name : name + e);
       if (isExecutable(full)) return full;
     }
+  }
+  return null;
+}
+function npxCachedBin() {
+  // npm stages `npx @rag-rat/bin@latest` under <npm cache>/_npx/<hash>/…/@rag-rat/bin/node_modules/
+  // .bin_real/<bin> — the platform binary @rag-rat/bin downloaded. Reuse whichever hash has it.
+  const npmCache = process.env.npm_config_cache || path.join(os.homedir(), ".npm");
+  let hashes;
+  try {
+    hashes = fs.readdirSync(path.join(npmCache, "_npx"));
+  } catch {
+    return null; // no _npx cache yet
+  }
+  for (const h of hashes) {
+    const p = path.join(npmCache, "_npx", h, "node_modules", "@rag-rat", "bin", "node_modules", ".bin_real", bin);
+    if (isExecutable(p)) return p;
   }
   return null;
 }
