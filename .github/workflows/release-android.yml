@@ -2,15 +2,14 @@
 #
 # cargo-dist does not support android as a platform (`dist plan --target aarch64-linux-android` skips
 # every installer), so the release workflow it generates neither builds the android binary nor teaches
-# @rag-rat/bin about it. This workflow fills both gaps:
+# @rag-rat/bin about it. This workflow builds the android binary and attaches it to the release:
 #
 #   build-android : cross-compile rag-rat for aarch64-linux-android (bionic) with the NDK + cargo-ndk,
 #                   and attach rag-rat-aarch64-linux-android.tar.gz to the GitHub release.
-#   publish-npm   : download cargo-dist's own npm package (attached to the release), inject android
-#                   support (dist-android/patch-npm-package.mjs), prove it resolves
-#                   (test-npm-package.cjs), then publish @rag-rat/bin. cargo-dist's own npm publish is
-#                   disabled (publish-jobs = [] in dist-workspace.toml) so there is no version
-#                   collision — this is the sole publisher.
+#
+# The npm publish that injects this android archive into @rag-rat/bin lives in release-npm.yml (the
+# sole npm publisher — cargo-dist's own npm publish is disabled, publish-jobs = [] in
+# dist-workspace.toml). release-npm.yml waits for this workflow's android asset before publishing.
 #
 # Triggered on the SAME tag push as cargo-dist's release.yml (`on: push: tags`), NOT `release:
 # published`. Flow: release-plz pushes the vX.Y.Z tag with a PAT (RELEASE_PLZ_TOKEN), which fires
@@ -40,9 +39,10 @@ env:
 
 jobs:
   build-android:
-    # Skip prereleases, matching cargo-dist's own npm publisher default — a prerelease must not become
-    # the npm `latest` dist-tag. A semver prerelease tag carries a `-` (v1.2.3-rc.1); a normal release
-    # tag (v1.2.3) does not. publish-npm needs this job, so it skips too.
+    # Skip prereleases: a prerelease's android archive must not feed the npm `latest` installer. A
+    # semver prerelease tag carries a `-` (v1.2.3-rc.1); a normal release tag (v1.2.3) does not.
+    # release-npm.yml skips prereleases the same way, so the android asset and the npm publish stay
+    # consistent.
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
@@ -99,73 +99,3 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null # fail loudly if still absent
           gh release upload "$TAG" "${STAGE}.tar.gz" "${STAGE}.tar.gz.sha256" \
             --repo "$GITHUB_REPOSITORY" --clobber
-
-  publish-npm:
-    if: ${{ !contains(github.ref_name, '-') }}
-    runs-on: ubuntu-latest
-    needs: build-android # the android asset must exist before the installer that points at it ships
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          registry-url: "https://registry.npmjs.org"
-      - name: Fetch cargo-dist's npm package + wait for its desktop assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          # Use cargo-dist's OWN generated npm package (attached to the release as
-          # rag-rat-npm-package.tar.gz) rather than regenerating it here — the published package is then
-          # byte-identical to cargo-dist's for every desktop platform, and this job needs no dist
-          # install. Wait for the tarball to appear (both workflows race on the tag push), download it.
-          for i in $(seq 1 180); do
-            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null \
-              | grep -qxF "rag-rat-npm-package.tar.gz" && break
-            echo "waiting for npm package artifact ($i/180)…"
-            sleep 15
-          done
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "rag-rat-npm-package.tar.gz" -D . --clobber
-          mkdir -p pkg && tar xzf rag-rat-npm-package.tar.gz -C pkg --strip-components 1
-          # The package lists exactly the desktop archives the installer will point users at. gh release
-          # create exposes the release before those finish uploading, so wait until each is present —
-          # otherwise a desktop `npm i @rag-rat/bin` could 404.
-          mapfile -t EXPECTED < <(node -e '
-            const p = require("./pkg/package.json");
-            for (const k of Object.keys(p.supportedPlatforms)) console.log(p.supportedPlatforms[k].artifactName);
-          ' | sort -u)
-          echo "expecting desktop assets: ${EXPECTED[*]}"
-          for i in $(seq 1 180); do
-            present="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' || true)"
-            missing=""
-            for a in "${EXPECTED[@]}"; do
-              printf '%s\n' "$present" | grep -qxF "$a" || missing="$missing $a"
-            done
-            if [ -z "$missing" ]; then echo "all desktop assets present"; break; fi
-            echo "waiting for desktop assets ($i/180):$missing"
-            sleep 15
-          done
-          present="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
-          for a in "${EXPECTED[@]}"; do
-            printf '%s\n' "$present" | grep -qxF "$a" || { echo "desktop asset never appeared: $a"; exit 1; }
-          done
-      - name: Inject android support
-        run: node dist-android/patch-npm-package.mjs pkg
-      - name: Verify the patched installer resolves android + desktop
-        working-directory: pkg
-        run: |
-          # We only need detect-libc present so binary.js can be require()d by the resolution test.
-          # `npm install` (not `npm ci`) so it works whether or not the package ships a lockfile — we
-          # don't need a reproducible install here. --ignore-scripts is load-bearing: this package's own
-          # `postinstall` (install.js) DOWNLOADS the platform binary from the release, which we neither
-          # need nor want here (getPackage resolves a URL, it doesn't download).
-          npm install --omit=dev --ignore-scripts
-          node "$GITHUB_WORKSPACE/dist-android/test-npm-package.cjs" .
-      - name: Publish @rag-rat/bin
-        working-directory: pkg
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public

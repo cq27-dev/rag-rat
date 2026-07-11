@@ -18,14 +18,14 @@ installers = ["shell", "powershell", "npm"]
 # Publish the npm installer as `@rag-rat/bin` (alongside @rag-rat/skills, @rag-rat/setup).
 npm-scope = "@rag-rat"
 npm-package = "bin"
-# npm publish is handled by .github/workflows/release-android.yml, NOT cargo-dist. That workflow
-# regenerates this same package, injects aarch64-linux-android support (which cargo-dist can't build
-# or describe — `dist plan --target aarch64-linux-android` skips every installer), and publishes the
-# result as the SOLE publisher of `@rag-rat/bin`. Leaving cargo-dist's own npm publisher on would
-# republish the android-less package under the same version (a collision). `npm` stays in `installers`
-# above so cargo-dist still ATTACHES the package (rag-rat-npm-package.tar.gz) to the release for that
-# workflow to download + patch; the `NPM_TOKEN` repo secret (publish rights to the @rag-rat org) is
-# read there.
+# npm publish is handled by .github/workflows/release-npm.yml, NOT cargo-dist. That workflow downloads
+# this generated package, injects aarch64-linux-android support (which cargo-dist can't build or
+# describe — `dist plan --target aarch64-linux-android` skips every installer), and publishes the
+# result as the SOLE publisher of `@rag-rat/bin` (release-android.yml builds + attaches the android
+# archive that release-npm.yml waits for). Leaving cargo-dist's own npm publisher on would republish
+# the android-less package under the same version (a collision). `npm` stays in `installers` above so
+# cargo-dist still ATTACHES the package (rag-rat-npm-package.tar.gz) to the release for release-npm.yml
+# to download + patch; the `NPM_TOKEN` repo secret (publish rights to the @rag-rat org) is read there.
 publish-jobs = []
 # Target platforms to build apps for (Rust target-triple syntax).
 # NOTE: x86_64-apple-darwin (Intel Mac) is intentionally absent — `ort` ships no prebuilt ONNX

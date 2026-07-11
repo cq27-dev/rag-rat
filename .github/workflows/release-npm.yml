@@ -1,0 +1,132 @@
+# The SOLE npm publisher for a release — @rag-rat/bin plus the auxiliary packages.
+#
+# Rides the SAME tag push as cargo-dist's release.yml and release-android.yml. release-plz pushes the
+# vX.Y.Z tag with a PAT (RELEASE_PLZ_TOKEN), which fires tag-push workflows; a `release: published`
+# trigger would NOT fire for a GITHUB_TOKEN-created release. cargo-dist's own npm publish is disabled
+# (publish-jobs = [] in dist-workspace.toml) so this is the only publisher — no version collision.
+#
+#   @rag-rat/bin      — cargo-dist's generated installer package with aarch64-linux-android injected.
+#                       release.yml builds the desktop archives; release-android.yml builds + attaches
+#                       the android archive; this job waits for ALL of them on the release, patches
+#                       android in, proves it resolves, and publishes. (Previously lived in
+#                       release-android.yml; moved here so npm publishing is not buried in the android
+#                       workflow.)
+#   @rag-rat/skills   — the agent-skills installer (a thin wrapper; the skills are fetched from GitHub).
+#   @rag-rat/cookbook — the ephemeral-provisioning recipes.
+#
+# @rag-rat/skills and @rag-rat/cookbook are versioned INDEPENDENTLY of the crate, so each publishes
+# only when its package.json version is not already on npm — a re-run, or a release that didn't bump
+# them, is a no-op. (`npm publish` also rejects a duplicate version, so the guard is belt-and-braces.)
+name: release-npm
+
+on:
+  push:
+    tags:
+      - "**[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: read # read the release assets (publishing goes to npm via NPM_TOKEN)
+
+jobs:
+  publish:
+    # Skip prereleases — a `-` tag (v1.2.3-rc.1) must not become the npm `latest` dist-tag. Matches
+    # release-android.yml's build-android skip, so a prerelease attaches no android asset either.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      # ── @rag-rat/bin: cargo-dist's package + injected android, published as the unified installer ──
+      - name: Fetch cargo-dist's npm package + wait for all platform assets (desktop + android)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Use cargo-dist's OWN generated npm package (attached to the release as
+          # rag-rat-npm-package.tar.gz) rather than regenerating it — the published package is then
+          # byte-identical to cargo-dist's for every desktop platform. All release workflows race on the
+          # tag push, so wait for the tarball to appear, then download it.
+          for i in $(seq 1 180); do
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null \
+              | grep -qxF "rag-rat-npm-package.tar.gz" && break
+            echo "waiting for npm package artifact ($i/180)…"
+            sleep 15
+          done
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "rag-rat-npm-package.tar.gz" -D . --clobber
+          mkdir -p pkg && tar xzf rag-rat-npm-package.tar.gz -C pkg --strip-components 1
+          # The package lists the desktop archives the installer points users at; gh release create
+          # exposes the release before those finish uploading, so wait until each is present (else a
+          # desktop `npm i @rag-rat/bin` could 404). ALSO wait for the android archive that
+          # release-android.yml attaches — this cross-workflow wait is what replaces the old in-workflow
+          # `needs: build-android`.
+          mapfile -t EXPECTED < <(node -e '
+            const p = require("./pkg/package.json");
+            for (const k of Object.keys(p.supportedPlatforms)) console.log(p.supportedPlatforms[k].artifactName);
+          ' | sort -u)
+          EXPECTED+=("rag-rat-aarch64-linux-android.tar.gz")
+          echo "expecting assets: ${EXPECTED[*]}"
+          for i in $(seq 1 180); do
+            present="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' || true)"
+            missing=""
+            for a in "${EXPECTED[@]}"; do
+              printf '%s\n' "$present" | grep -qxF "$a" || missing="$missing $a"
+            done
+            if [ -z "$missing" ]; then echo "all platform assets present"; break; fi
+            echo "waiting for platform assets ($i/180):$missing"
+            sleep 15
+          done
+          present="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for a in "${EXPECTED[@]}"; do
+            printf '%s\n' "$present" | grep -qxF "$a" || { echo "asset never appeared: $a"; exit 1; }
+          done
+      - name: Inject android support
+        run: node dist-android/patch-npm-package.mjs pkg
+      - name: Verify the patched installer resolves android + desktop
+        working-directory: pkg
+        run: |
+          # detect-libc must be present so binary.js can be require()d by the resolution test.
+          # --ignore-scripts is load-bearing: this package's own postinstall DOWNLOADS the platform
+          # binary from the release, which we neither need nor want here (getPackage resolves a URL).
+          npm install --omit=dev --ignore-scripts
+          node "$GITHUB_WORKSPACE/dist-android/test-npm-package.cjs" .
+      - name: Publish @rag-rat/bin
+        working-directory: pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+      # ── @rag-rat/skills + @rag-rat/cookbook: publish only when their version is new ───────────────
+      - name: Publish @rag-rat/skills (only if this version is new)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./skills/package.json').name")"
+          ver="$(node -p "require('./skills/package.json').version")"
+          if npm view "$name@$ver" version >/dev/null 2>&1; then
+            echo "$name@$ver already on npm — skipping"
+          else
+            echo "publishing $name@$ver"
+            (cd skills && npm publish --access public)
+          fi
+      - name: Publish @rag-rat/cookbook (only if this version is new)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./cookbook/package.json').name")"
+          ver="$(node -p "require('./cookbook/package.json').version")"
+          if npm view "$name@$ver" version >/dev/null 2>&1; then
+            echo "$name@$ver already on npm — skipping"
+          else
+            echo "publishing $name@$ver"
+            # `npm ci` restores devDeps (typescript/tsx) so the prepack `tsc` can build dist/.
+            (cd cookbook && npm ci && npm publish --access public)
+          fi
