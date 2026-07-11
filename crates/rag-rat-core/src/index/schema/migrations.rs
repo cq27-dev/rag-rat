@@ -1245,6 +1245,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_056_ID => Some(56),
             MIGRATION_057_ID => Some(57),
             MIGRATION_058_ID => Some(58),
+            MIGRATION_059_ID => Some(59),
             _ => None,
         })
         .max()
@@ -1312,6 +1313,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_056_ID
             | MIGRATION_057_ID
             | MIGRATION_058_ID
+            | MIGRATION_059_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1376,6 +1378,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_056_ID => migration.checksum != MIGRATION_056_CHECKSUM,
         MIGRATION_057_ID => migration.checksum != MIGRATION_057_CHECKSUM,
         MIGRATION_058_ID => migration.checksum != MIGRATION_058_CHECKSUM,
+        MIGRATION_059_ID => migration.checksum != MIGRATION_059_CHECKSUM,
         _ => false,
     }
 }
@@ -3818,6 +3821,55 @@ pub(crate) fn apply_oplog_device_x25519(conn: &Connection) -> rusqlite::Result<(
     add_column_if_missing(conn, "oplog_device_identity", "x25519_secret", "BLOB")?;
     add_column_if_missing(conn, "oplog_device_identity", "x25519_public", "BLOB")?;
     Ok(())
+}
+
+/// V059 (sync phase C, §16.1): the account-log CANDIDATE DAG. `account_entries` stores EVERY
+/// structurally-valid, signature-valid account entry — all branches of an equivocating chain are
+/// first-class, so the candidate table has NO seq-uniqueness; grow-only (I8). The `accepted` flag
+/// is DERIVED, rewritten by every `refold_account` (the fold + branch selection §16.2), and the
+/// partial unique index `account_accepted_slot` pins accepted-set uniqueness per `(account, log,
+/// device, seq)` slot (I10a). `account_entry_status` holds the projected §16.3 taxonomy per entry;
+/// `account_pre_verify` durably holds an entry whose signing device can't yet be resolved
+/// (`sha256(pk) == fingerprint` not found among genesis + stored candidates), retried when a later
+/// DeviceAdd/AccountGenesis for the claimed account arrives (Codex-8). Idempotent — every statement
+/// is `CREATE ... IF NOT EXISTS`, so a torn replay reconverges without a wrapping txn.
+pub(crate) fn apply_account_candidate_dag(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_entries(
+             entry_hash         BLOB    PRIMARY KEY,
+             account_id         BLOB    NOT NULL,
+             log_id             INTEGER NOT NULL,
+             device_fingerprint BLOB    NOT NULL,
+             seq                INTEGER NOT NULL,
+             prev_hash          BLOB,
+             parent_ref         BLOB,
+             authority_ref      BLOB,
+             entry_type         INTEGER NOT NULL,
+             accepted           INTEGER NOT NULL DEFAULT 0,
+             signed_bytes       BLOB    NOT NULL,
+             received_at_ms     INTEGER NOT NULL
+         ) STRICT;
+
+         CREATE INDEX IF NOT EXISTS account_entries_chain
+             ON account_entries(account_id, log_id, device_fingerprint, seq);
+
+         CREATE UNIQUE INDEX IF NOT EXISTS account_accepted_slot
+             ON account_entries(account_id, log_id, device_fingerprint, seq) WHERE accepted = 1;
+
+         CREATE TABLE IF NOT EXISTS account_entry_status(
+             entry_hash BLOB PRIMARY KEY,
+             status     TEXT NOT NULL,
+             detail     TEXT
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS account_pre_verify(
+             entry_hash          BLOB    PRIMARY KEY,
+             claimed_account_id  BLOB    NOT NULL,
+             claimed_fingerprint BLOB    NOT NULL,
+             raw_bytes           BLOB    NOT NULL,
+             received_at_ms      INTEGER NOT NULL
+         ) STRICT;",
+    )
 }
 
 /// V055 (#492): the anchor-status downgrade hysteresis marker. INVARIANT: NULL means "no gone

@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 58;
+pub const LATEST_SCHEMA_VERSION: u32 = 59;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -410,6 +410,15 @@ const MIGRATION_058_DESCRIPTION: &str =
      STRICT table; an existing ed25519-only row is backfilled at the next local_device open via a \
      CAS UPDATE that mirrors the ed25519 mint-if-absent race, so concurrent opens converge on one \
      encryption identity. C1 only mints/persists/validates the key; ECDH + HKDF is C4";
+const MIGRATION_059_ID: &str = "059_account_candidate_dag";
+const MIGRATION_059_CHECKSUM: &str = "sha256:rag-rat-account-candidate-dag-v59";
+const MIGRATION_059_DESCRIPTION: &str =
+    "The account-log CANDIDATE DAG (sync phase C, §16.1): account_entries (all branches, \
+     grow-only, no seq-uniqueness — equivocation heads are first-class; the derived `accepted` \
+     flag + the account_accepted_slot partial unique index pin accepted-set uniqueness per slot, \
+     I10a), account_entry_status (the projected §16.3 taxonomy), and account_pre_verify (entries \
+     whose signing device isn't yet resolvable, retried on a later DeviceAdd/AccountGenesis \
+     arrival). All CREATE ... IF NOT EXISTS + STRICT tables";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -903,6 +912,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_058_CHECKSUM,
         description: MIGRATION_058_DESCRIPTION,
         apply: apply_oplog_device_x25519,
+    },
+    Migration {
+        id: MIGRATION_059_ID,
+        checksum: MIGRATION_059_CHECKSUM,
+        description: MIGRATION_059_DESCRIPTION,
+        apply: apply_account_candidate_dag,
     },
 ];
 

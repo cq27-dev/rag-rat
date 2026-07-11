@@ -1766,10 +1766,12 @@ fn migration_057_adds_the_external_symbols_table() {
 fn migration_058_adds_the_oplog_device_x25519_columns() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V058 is the schema tip — this test carries the absolute pin (the older tests dropped to
-    // the symbolic `current_version == LATEST` check).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 58, "V058 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 58, "schema at LATEST after apply");
+    // V058 is no longer the tip (the absolute pin moved to the V059 test) — symbolic tip check.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
 
     // The identity table gains the X25519 encryption columns (sync phase C, §5).
     for column in ["x25519_secret", "x25519_public"] {
@@ -1813,6 +1815,49 @@ fn migration_058_adds_the_oplog_device_x25519_columns() {
             "the forward migrate keeps the {column} column"
         );
     }
+}
+
+#[test]
+fn migration_059_creates_the_account_candidate_dag() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V059 is the schema tip — this test carries the absolute pin.
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 59, "V059 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 59, "schema at LATEST after apply");
+
+    // The candidate-DAG tables + indexes exist (sync phase C, §16.1).
+    for table in ["account_entries", "account_entry_status", "account_pre_verify"] {
+        assert!(conn_table_exists(&conn, table), "V059 creates {table}");
+    }
+    assert!(conn_index_exists(&conn, "account_entries_chain"), "V059 creates the chain index");
+    assert!(
+        conn_index_exists(&conn, "account_accepted_slot"),
+        "V059 creates the accepted-slot partial unique index (I10a)"
+    );
+
+    // Deferred-absence in ISOLATION: a bare DB lacks the tables until the V059 applier runs, and a
+    // replay is an idempotent no-op (every statement is CREATE ... IF NOT EXISTS).
+    let isolated = rusqlite::Connection::open_in_memory().unwrap();
+    assert!(!conn_table_exists(&isolated, "account_entries"), "bare DB lacks account_entries");
+    schema::apply_account_candidate_dag(&isolated).unwrap();
+    schema::apply_account_candidate_dag(&isolated).expect("replay is a no-op");
+    for table in ["account_entries", "account_entry_status", "account_pre_verify"] {
+        assert!(conn_table_exists(&isolated, table), "the isolated V059 applier creates {table}");
+    }
+    assert!(conn_index_exists(&isolated, "account_accepted_slot"), "and the partial unique index");
+
+    // A forward migrate over a ledger truncated below V059 replays the step and keeps the tables.
+    truncate_schema_to(&conn, 58);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip"
+    );
+    assert!(
+        conn_table_exists(&conn, "account_entries"),
+        "the forward migrate keeps account_entries"
+    );
 }
 
 #[test]
