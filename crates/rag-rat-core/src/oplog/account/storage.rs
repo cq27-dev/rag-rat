@@ -91,9 +91,20 @@ pub(crate) fn account_ingest(
     let mut pubkeys = stored_device_pubkeys(&tx, account_id)?;
     add_self_pubkey(&mut pubkeys, &signed.header, &signed.payload);
     let Some(pubkey_bytes) = pubkeys.get(&device_fp).copied() else {
-        insert_pre_verify(&tx, &signed.entry_hash, account_id, device_fp, signed_bytes, now_ms)?;
+        let parked = insert_pre_verify(
+            &tx,
+            &signed.entry_hash,
+            account_id,
+            device_fp,
+            signed_bytes,
+            now_ms,
+        )?;
         tx.commit()?;
-        return Ok(IngestOutcome::PreVerify);
+        return Ok(if parked {
+            IngestOutcome::PreVerify
+        } else {
+            IngestOutcome::Rejected("pre-verify queue capacity reached".into())
+        });
     };
 
     // Verify the signature under the resolved key (also re-binds fingerprint == sha256(pk)). A
@@ -440,7 +451,7 @@ fn insert_pre_verify(
     fingerprint: DeviceFingerprint,
     signed_bytes: &[u8],
     now_ms: i64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<bool> {
     let signed_hash = cbor::sha256(signed_bytes);
     conn.execute(
         "INSERT OR IGNORE INTO account_pre_verify(
@@ -457,7 +468,11 @@ fn insert_pre_verify(
         ],
     )?;
     enforce_pre_verify_budget(conn, account_id)?;
-    Ok(())
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM account_pre_verify WHERE signed_hash = ?1)",
+        params![signed_hash.as_slice()],
+        |row| row.get(0),
+    )
 }
 
 /// Keep the unauthenticated queue within deterministic oldest-first account and global budgets.
@@ -950,6 +965,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(account_a_remaining, 0, "global eviction removes the globally oldest rows");
+
+        let evicted_raw = [0xfe, 0xed];
+        assert!(
+            !insert_pre_verify(
+                &conn,
+                &cbor::sha256(&evicted_raw),
+                AccountId::from_bytes([0xcc; 32]),
+                Dev::new(4).fp,
+                &evicted_raw,
+                -1,
+            )
+            .unwrap(),
+            "the insert result must report when global eviction removes the new row",
+        );
     }
 
     #[test]
