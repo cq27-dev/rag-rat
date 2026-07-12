@@ -26,6 +26,12 @@ type BranchKey = (u8, DeviceFingerprint, Option<EntryHash>);
 type BranchChild = (u64, EntryHash);
 type BranchChildren = HashMap<BranchKey, Vec<BranchChild>>;
 
+struct AccountProjection {
+    history: fold::AccountAuthHistory,
+    accepted: HashSet<EntryHash>,
+    forked: HashSet<EntryHash>,
+}
+
 /// The result of ingesting one signed account entry (§16.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IngestOutcome {
@@ -117,59 +123,27 @@ fn refold_in_tx(
     account_id: AccountId,
 ) -> anyhow::Result<HashMap<[u8; 32], String>> {
     let rows = load_candidates(tx, account_id)?;
-    let mut removed = HashSet::new();
-    let (history, effective, accepted_set) = loop {
-        let entries: Vec<VerifiedAccountEntry> = rows
-            .iter()
-            .filter(|row| !removed.contains(&row.entry_hash))
-            .map(|row| row.verified.clone())
-            .collect();
-        let history = fold::fold_account(&entries);
-        let effective: HashSet<EntryHash> = rows
-            .iter()
-            .filter(|row| {
-                !removed.contains(&row.entry_hash)
-                    && history
-                        .outcome(&row.entry_hash)
-                        .is_some_and(|outcome| outcome.is_effective())
-            })
-            .map(|row| row.entry_hash)
-            .collect();
-        let selected = select_coherent_branches(&rows, &effective);
-        let accepted = authority_closed_selection(&rows, selected);
-        let rejected: Vec<EntryHash> = effective.difference(&accepted).copied().collect();
-        if rejected.is_empty() {
-            break (history, effective, accepted);
-        }
-        // Monotone elimination is both the termination argument and the security boundary: once
-        // an effective candidate loses its author branch or its cited authority branch, neither it
-        // nor any effect it produced may participate in a later fold round.
-        removed.extend(rejected);
-    };
+    let projection = derive_account_projection(&rows);
 
-    // Rewrite: clear every accepted flag for the account, then re-set the winners — atomically,
-    // so the partial unique index never sees two accepted rows at one slot mid-transaction.
+    // Rewrite atomically so the partial unique index never observes two accepted rows at a slot.
     tx.execute("UPDATE account_entries SET accepted = 0 WHERE account_id = ?1", params![
         account_id.to_bytes().as_slice()
     ])?;
 
     let mut statuses: HashMap<[u8; 32], String> = HashMap::new();
     for row in rows {
-        let accepted = accepted_set.contains(&row.entry_hash);
+        let accepted = projection.accepted.contains(&row.entry_hash);
         let (status, detail): (String, Option<String>) = if accepted {
             ("accepted".to_string(), None)
-        } else if removed.contains(&row.entry_hash) || effective.contains(&row.entry_hash) {
-            // Effective but outside the authority-closed accepted DAG: an equivocation loser, a
-            // descendant of one, or an entry whose cited mint lost branch selection.
+        } else if projection.forked.contains(&row.entry_hash) {
             ("forked".to_string(), None)
         } else {
-            match history.outcome(&row.entry_hash) {
+            match projection.history.outcome(&row.entry_hash) {
                 Some(outcome) => {
                     let (s, d) = outcome.taxonomy();
                     (s.to_string(), d.map(str::to_string))
                 },
-                // A candidate eliminated in an earlier round is covered by `removed`; every
-                // remaining candidate is classified by the final fold.
+                // Every non-forked candidate participates in the final fold.
                 None => ("retained_unfolded".to_string(), None),
             }
         };
@@ -187,6 +161,39 @@ fn refold_in_tx(
         statuses.insert(row.entry_hash, status);
     }
     Ok(statuses)
+}
+
+/// Derive an author-chain-coherent, authority-closed projection without touching storage.
+fn derive_account_projection(rows: &[CandidateRow]) -> AccountProjection {
+    let mut forked = HashSet::new();
+    loop {
+        let entries: Vec<VerifiedAccountEntry> = rows
+            .iter()
+            .filter(|row| !forked.contains(&row.entry_hash))
+            .map(|row| row.verified.clone())
+            .collect();
+        let history = fold::fold_account(&entries);
+        let effective: HashSet<EntryHash> = rows
+            .iter()
+            .filter(|row| {
+                !forked.contains(&row.entry_hash)
+                    && history
+                        .outcome(&row.entry_hash)
+                        .is_some_and(|outcome| outcome.is_effective())
+            })
+            .map(|row| row.entry_hash)
+            .collect();
+        let selected = select_coherent_branches(rows, &effective);
+        let accepted = close_selection_over_authority(rows, selected);
+        let newly_forked: Vec<EntryHash> = effective.difference(&accepted).copied().collect();
+        if newly_forked.is_empty() {
+            return AccountProjection { history, accepted, forked };
+        }
+        // Monotone elimination is both the termination argument and the security boundary: once
+        // an effective candidate loses its author branch or its cited authority branch, neither it
+        // nor any effect it produced may participate in a later fold round.
+        forked.extend(newly_forked);
+    }
 }
 
 /// Select one contiguous effective hash-chain per `(log_id, device)` (§16.2).
@@ -233,7 +240,7 @@ fn select_coherent_branches(
 /// Remove selected entries whose cited incarnation is not itself selected. Iterate because an
 /// invalid mint can authorize another mint, so authority loss must propagate through the whole
 /// incarnation DAG rather than only one edge.
-fn authority_closed_selection(
+fn close_selection_over_authority(
     rows: &[CandidateRow],
     mut selected: HashSet<EntryHash>,
 ) -> HashSet<EntryHash> {
