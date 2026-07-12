@@ -411,7 +411,7 @@ const MIGRATION_058_DESCRIPTION: &str =
      CAS UPDATE that mirrors the ed25519 mint-if-absent race, so concurrent opens converge on one \
      encryption identity. C1 only mints/persists/validates the key; ECDH + HKDF is C4";
 const MIGRATION_059_ID: &str = "059_account_candidate_dag";
-const MIGRATION_059_CHECKSUM: &str = "sha256:rag-rat-account-candidate-dag-v59";
+const MIGRATION_059_CHECKSUM: &str = "sha256:rag-rat-account-candidate-dag-v59-signed-envelope-key";
 const MIGRATION_059_DESCRIPTION: &str =
     "The account-log CANDIDATE DAG (sync phase C, §16.1): account_entries (all branches, \
      grow-only, no seq-uniqueness — equivocation heads are first-class; the derived `accepted` \

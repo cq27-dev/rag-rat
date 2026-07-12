@@ -3863,7 +3863,8 @@ pub(crate) fn apply_account_candidate_dag(conn: &Connection) -> rusqlite::Result
          ) STRICT;
 
          CREATE TABLE IF NOT EXISTS account_pre_verify(
-             entry_hash          BLOB    PRIMARY KEY,
+             signed_hash         BLOB    PRIMARY KEY,
+             entry_hash          BLOB    NOT NULL,
              claimed_account_id  BLOB    NOT NULL,
              claimed_fingerprint BLOB    NOT NULL,
              raw_bytes           BLOB    NOT NULL,

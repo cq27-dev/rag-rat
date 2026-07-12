@@ -1838,6 +1838,9 @@ fn migration_059_creates_the_account_candidate_dag() {
         conn_index_exists(&conn, "account_pre_verify_account"),
         "V059 creates the pre-verify claimed_account_id index"
     );
+    let pre_verify_columns = conn_table_columns(&conn, "account_pre_verify");
+    assert!(pre_verify_columns.contains(&"signed_hash".to_string()));
+    assert!(pre_verify_columns.contains(&"entry_hash".to_string()));
 
     // Deferred-absence in ISOLATION: a bare DB lacks the tables until the V059 applier runs, and a
     // replay is an idempotent no-op (every statement is CREATE ... IF NOT EXISTS).

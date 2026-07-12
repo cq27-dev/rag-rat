@@ -28,7 +28,7 @@ use crate::oplog::op::DeviceFingerprint;
 /// The account CONTROL log the fold operates on (§11) — its registers are control-log scoped
 /// (`log: 0`). A known op on the secrets (1) or content (2) log is not a control op and is retained
 /// unfolded here (its own C2/C4 fold owns it), never minting control authority.
-const CONTROL_LOG: u8 = 0;
+pub(super) const CONTROL_LOG: u8 = 0;
 /// The account-op version this fold understands. A known `entry_type` at a different version may
 /// reuse the tag with new semantics, so it is retained-unfolded rather than folded as today's op.
 pub(super) const SUPPORTED_OP_VERSION: u32 = 1;
