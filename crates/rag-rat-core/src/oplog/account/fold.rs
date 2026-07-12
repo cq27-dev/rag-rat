@@ -2539,4 +2539,64 @@ mod tests {
             "an op under a rejected incarnation is stale_authority",
         );
     }
+
+    #[test]
+    fn every_fold_outcome_has_a_stable_storage_taxonomy() {
+        // §16.3 is persisted API, not display text. Pin every closed-enum token so adding or
+        // renaming a fold reason cannot silently drift existing database rows or query behavior.
+        let cases = [
+            (Outcome::Effective { auth_epoch: 7 }, ("effective", None)),
+            (Outcome::RetainedUnfolded, ("retained_unfolded", None)),
+            (Outcome::Condemned(CondemnedReason::BeyondCut), ("condemned", Some("beyond_cut"))),
+            (Outcome::Condemned(CondemnedReason::OffBranch), ("condemned", Some("off_branch"))),
+            (
+                Outcome::Condemned(CondemnedReason::ClosedIncarnation),
+                ("condemned", Some("closed_incarnation")),
+            ),
+            (Outcome::Parked(ParkReason::UnknownOwnerRef), ("parked", Some("unknown_owner_ref"))),
+            (Outcome::Parked(ParkReason::UnknownCutTarget), ("parked", Some("unknown_cut_target"))),
+            (
+                Outcome::Parked(ParkReason::IncompleteCutAncestry),
+                ("parked", Some("incomplete_cut_ancestry")),
+            ),
+            (Outcome::Parked(ParkReason::ContestedSubject), ("parked", Some("contested_subject"))),
+            (
+                Outcome::Parked(ParkReason::DeferredStreamAuthorization),
+                ("parked", Some("deferred_stream_authorization")),
+            ),
+            (
+                Outcome::Rejected(RejectReason::StaleAuthority),
+                ("rejected", Some("stale_authority")),
+            ),
+            (
+                Outcome::Rejected(RejectReason::GenesisSelfHash),
+                ("rejected", Some("genesis_self_hash")),
+            ),
+            (
+                Outcome::Rejected(RejectReason::DuplicateGenesis),
+                ("rejected", Some("duplicate_genesis")),
+            ),
+            (Outcome::Rejected(RejectReason::DuplicateAdd), ("rejected", Some("duplicate_add"))),
+            (
+                Outcome::Rejected(RejectReason::TombstoneReAdd),
+                ("rejected", Some("tombstone_re_add")),
+            ),
+            (Outcome::Rejected(RejectReason::BadPromote), ("rejected", Some("bad_promote"))),
+            (Outcome::Rejected(RejectReason::LastOwner), ("rejected", Some("last_owner"))),
+            (
+                Outcome::Rejected(RejectReason::CutTargetMismatch),
+                ("rejected", Some("cut_target_mismatch")),
+            ),
+            (Outcome::Rejected(RejectReason::WrongDevice), ("rejected", Some("wrong_device"))),
+            (Outcome::Rejected(RejectReason::Malformed), ("rejected", Some("malformed"))),
+            (
+                Outcome::Rejected(RejectReason::NonGenesisOrigin),
+                ("rejected", Some("non_genesis_origin")),
+            ),
+            (Outcome::Rejected(RejectReason::Ineffective), ("rejected", Some("ineffective"))),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(outcome.taxonomy(), expected, "taxonomy drift for {outcome:?}");
+        }
+    }
 }

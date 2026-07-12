@@ -586,6 +586,46 @@ mod tests {
     }
 
     #[test]
+    fn malformed_envelopes_and_wrong_genesis_self_hashes_never_touch_storage() {
+        let conn = db();
+        assert!(matches!(account_ingest(&conn, &[0xff], NOW).unwrap(), IngestOutcome::Rejected(_)));
+
+        let founder = Dev::new(1);
+        let genesis_op = AccountOp::AccountGenesis {
+            ed25519_pubkey: founder.ed,
+            x25519_pubkey: founder.x,
+            nonce16: [0u8; 16],
+            created_at_ms: NOW as u64,
+            label: None,
+        };
+        let payload = encode(&genesis_op).unwrap();
+        let wrong_account = AccountId::from_bytes([0x55; 32]);
+        assert_ne!(wrong_account, account_id_from_genesis_payload(&payload));
+        let header = AccountEntryHeader {
+            account_id: wrong_account,
+            log_id: 0,
+            device_fingerprint: founder.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: ops::entry_type::ACCOUNT_GENESIS,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 0,
+            key_id: None,
+            authority_ref: None,
+        };
+        let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
+        assert_eq!(
+            account_ingest(&conn, &signed.signed_bytes, NOW).unwrap(),
+            IngestOutcome::Rejected("genesis payload does not hash to its account_id".into()),
+        );
+        let stored: i64 =
+            conn.query_row("SELECT COUNT(*) FROM account_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(stored, 0, "structural rejects never create candidate rows");
+    }
+
+    #[test]
     fn a_forged_re_signed_genesis_is_rejected_not_stored() {
         // A non-owner re-signs the victim's genesis payload under its own key: the fold binds the
         // founder key, so ingest verifies but the fold classifies the forgery non-effective. (The
@@ -894,5 +934,124 @@ mod tests {
             "a malformed op payload is rejected: {out:?}"
         );
         assert_eq!(status(&conn, &signed.entry_hash), None, "and is never stored");
+    }
+
+    #[test]
+    fn sealed_and_future_version_payloads_remain_opaque_through_ingest() {
+        // C1 does not understand sealed ciphertext or future op versions. Both must remain valid
+        // ancestry/watermark targets instead of being decoded with today's plaintext schema.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+
+        let opaque = [0xff, 0x00, 0xff]; // deliberately not a current DeviceAdd payload
+        let sealed_header = AccountEntryHeader {
+            account_id: acct,
+            log_id: 0,
+            device_fingerprint: founder.fp,
+            seq: 1,
+            prev_hash: Some(gh),
+            parent_ref: None,
+            entry_type: ops::entry_type::DEVICE_ADD,
+            op_version: 1,
+            crypto_suite: 1,
+            auth_len: 1,
+            key_id: Some([0x44; 32]),
+            authority_ref: Some(gh),
+        };
+        let sealed = sign_account_entry(&founder.secret, &sealed_header, &opaque).unwrap();
+        assert_eq!(
+            account_ingest(&conn, &sealed.signed_bytes, NOW).unwrap(),
+            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+        );
+
+        let future_header = AccountEntryHeader {
+            seq: 2,
+            prev_hash: Some(sealed.entry_hash),
+            op_version: 2,
+            crypto_suite: 0,
+            key_id: None,
+            ..sealed_header
+        };
+        let future = sign_account_entry(&founder.secret, &future_header, &opaque).unwrap();
+        assert_eq!(
+            account_ingest(&conn, &future.signed_bytes, NOW).unwrap(),
+            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+        );
+        assert_eq!(status(&conn, &sealed.entry_hash).as_deref(), Some("retained_unfolded"));
+        assert_eq!(status(&conn, &future.entry_hash).as_deref(), Some("retained_unfolded"));
+    }
+
+    #[test]
+    fn malformed_pre_verify_payload_is_discarded_when_its_signer_resolves() {
+        // A malformed entry can arrive before its signer is known, so the first ingest cannot
+        // authenticate or inspect its plaintext. Once DeviceAdd resolves the signer, promotion
+        // must apply the same structural gate as direct ingest and delete—not persist—the entry.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        let b = Dev::new(2);
+        let malformed_header = AccountEntryHeader {
+            account_id: acct,
+            log_id: 0,
+            device_fingerprint: b.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: ops::entry_type::DEVICE_ADD,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: Some(gh),
+        };
+        let malformed =
+            sign_account_entry(&b.secret, &malformed_header, &[0xff, 0xff, 0xff]).unwrap();
+        assert_eq!(
+            account_ingest(&conn, &malformed.signed_bytes, NOW).unwrap(),
+            IngestOutcome::PreVerify,
+        );
+
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+        let (add_b_bytes, _) =
+            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        account_ingest(&conn, &add_b_bytes, NOW).unwrap();
+
+        assert_eq!(
+            status(&conn, &malformed.entry_hash),
+            None,
+            "malformed bytes never enter the DAG"
+        );
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM account_pre_verify", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pending, 0, "the now-refuted queued entry is deleted");
+    }
+
+    #[test]
+    fn refold_is_idempotent_and_preserves_the_selected_branch() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+        let b = Dev::new(2);
+        let (add_bytes, add_hash) =
+            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        account_ingest(&conn, &add_bytes, NOW).unwrap();
+
+        refold_account(&conn, acct).unwrap();
+        refold_account(&conn, acct).unwrap();
+
+        assert_eq!(status(&conn, &gh).as_deref(), Some("accepted"));
+        assert_eq!(status(&conn, &add_hash).as_deref(), Some("accepted"));
+        let accepted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE account_id = ?1 AND accepted = 1",
+                params![acct.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accepted, 2, "repeated clear-and-set refolds keep the same accepted chain");
     }
 }
