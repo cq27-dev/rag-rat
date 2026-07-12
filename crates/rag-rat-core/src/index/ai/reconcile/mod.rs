@@ -9,14 +9,19 @@
 //!   `activate_model_with_version`, `recover_cached_fastembed_model*`, …).
 //! - [`status`] — status/plan reads (`status`, `pending_embedding_jobs`, `reconcile_plan`,
 //!   `embedding_reconcile_plan`, `last_reconcile_status`).
-//! - [`embed_loop`] — the reconcile/embed loop and its write helpers.
+//! - [`embed_loop`] — the reconcile/embed orchestration loop.
+//! - [`batch_write`] — embed-batch grouping, remote-scoped writes, and retry policy.
+//! - [`policy_scan`] — embedding-policy skip summaries and column self-heal.
 
+mod batch_write;
 mod embed_loop;
 mod manifest;
 mod model_lifecycle;
+mod policy_scan;
 mod status;
 
 pub(crate) use embed_loop::*;
 pub(crate) use manifest::*;
 pub(crate) use model_lifecycle::*;
+pub(crate) use policy_scan::embedding_policy_skip_summary;
 pub(crate) use status::*;
