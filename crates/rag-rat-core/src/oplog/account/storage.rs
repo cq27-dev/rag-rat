@@ -26,10 +26,25 @@ type BranchKey = (u8, DeviceFingerprint, Option<EntryHash>);
 type BranchChild = (u64, EntryHash);
 type BranchChildren = HashMap<BranchKey, Vec<BranchChild>>;
 
+// Operational admission limits, not wire-validity limits. At the §18a envelope maximum these cap
+// unauthenticated parked bytes at 4 MiB/account and 16 MiB globally. Candidate history is larger
+// because it is signature-authenticated, but still finite so full refold work cannot grow without
+// bound before the incremental projector exists.
+const PRE_VERIFY_PER_ACCOUNT_MAX: usize = 64;
+const PRE_VERIFY_GLOBAL_MAX: usize = 256;
+const CANDIDATES_PER_ACCOUNT_MAX: usize = 4_096;
+
 struct AccountProjection {
     history: fold::AccountAuthHistory,
     accepted: HashSet<EntryHash>,
     forked: HashSet<EntryHash>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateInsert {
+    Inserted,
+    AlreadyPresent,
+    AtCapacity,
 }
 
 /// The result of ingesting one signed account entry (§16.2).
@@ -94,7 +109,9 @@ pub(crate) fn account_ingest(
         return Ok(IngestOutcome::Rejected(err));
     }
 
-    insert_candidate(&tx, &verified, signed_bytes, now_ms)?;
+    if insert_candidate(&tx, &verified, signed_bytes, now_ms)? == CandidateInsert::AtCapacity {
+        return Ok(IngestOutcome::Rejected("account candidate limit reached".into()));
+    }
     // A DeviceAdd/genesis may resolve devices that were parked — retry their pre-verify rows.
     if is_genesis(&verified.header) || is_device_add(&verified) {
         promote_pre_verify(&tx, account_id, now_ms)?;
@@ -316,11 +333,27 @@ fn insert_candidate(
     verified: &VerifiedAccountEntry,
     signed_bytes: &[u8],
     now_ms: i64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<CandidateInsert> {
     let h = &verified.header;
+    let already_present = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM account_entries WHERE entry_hash = ?1)",
+        params![verified.entry_hash.as_slice()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if already_present {
+        return Ok(CandidateInsert::AlreadyPresent);
+    }
+    let candidate_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM account_entries WHERE account_id = ?1",
+        params![h.account_id.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if candidate_count >= CANDIDATES_PER_ACCOUNT_MAX as i64 {
+        return Ok(CandidateInsert::AtCapacity);
+    }
     // INSERT OR IGNORE on the entry_hash PK: idempotent, and the candidate table has NO
     // seq-uniqueness — an equivocation head at an already-occupied slot is a first-class candidate.
-    tx.execute(
+    let inserted = tx.execute(
         "INSERT OR IGNORE INTO account_entries(
              entry_hash, account_id, log_id, device_fingerprint, seq, prev_hash, parent_ref,
              authority_ref, entry_type, accepted, signed_bytes, received_at_ms)
@@ -339,7 +372,7 @@ fn insert_candidate(
             now_ms,
         ],
     )?;
-    Ok(())
+    Ok(if inserted == 1 { CandidateInsert::Inserted } else { CandidateInsert::AlreadyPresent })
 }
 
 /// The `(fingerprint → ed25519_pubkey)` map from every stored genesis / DeviceAdd for the account —
@@ -423,6 +456,42 @@ fn insert_pre_verify(
             now_ms,
         ],
     )?;
+    enforce_pre_verify_budget(conn, account_id)?;
+    Ok(())
+}
+
+/// Keep the unauthenticated queue within deterministic oldest-first account and global budgets.
+/// Ties use `signed_hash`, so replicas with the same rows and timestamps retain the same set.
+fn enforce_pre_verify_budget(conn: &Connection, account_id: AccountId) -> rusqlite::Result<()> {
+    evict_oldest_pre_verify(conn, Some(account_id), PRE_VERIFY_PER_ACCOUNT_MAX)?;
+    evict_oldest_pre_verify(conn, None, PRE_VERIFY_GLOBAL_MAX)
+}
+
+fn evict_oldest_pre_verify(
+    conn: &Connection,
+    account_id: Option<AccountId>,
+    limit: usize,
+) -> rusqlite::Result<()> {
+    let account_bytes = account_id.map(AccountId::to_bytes);
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM account_pre_verify
+         WHERE (?1 IS NULL OR claimed_account_id = ?1)",
+        params![account_bytes.as_ref().map(<[u8; 32]>::as_slice)],
+        |row| row.get(0),
+    )?;
+    if count <= limit as i64 {
+        return Ok(());
+    }
+    let excess = count - limit as i64;
+    conn.execute(
+        "DELETE FROM account_pre_verify WHERE signed_hash IN (
+             SELECT signed_hash FROM account_pre_verify
+             WHERE (?1 IS NULL OR claimed_account_id = ?1)
+             ORDER BY received_at_ms, signed_hash
+             LIMIT ?2
+         )",
+        params![account_bytes.as_ref().map(<[u8; 32]>::as_slice), excess,],
+    )?;
     Ok(())
 }
 
@@ -468,11 +537,13 @@ fn promote_pre_verify(
                         && validate_authenticated_entry(v).is_ok()
                 });
             if let Some(verified) = promoted {
-                insert_candidate(tx, &verified, &raw_bytes, now_ms)?;
+                let inserted = insert_candidate(tx, &verified, &raw_bytes, now_ms)?;
                 // A promoted genesis/DeviceAdd certifies a device key — feed it back so the next
                 // round can resolve entries that were waiting on it.
-                add_self_pubkey(&mut pubkeys, &verified.header, &verified.payload);
-                promoted_any = true;
+                if inserted != CandidateInsert::AtCapacity {
+                    add_self_pubkey(&mut pubkeys, &verified.header, &verified.payload);
+                    promoted_any = true;
+                }
             }
             // Resolved (promoted) or refuted (verify failed): clear it from the queue either way.
             tx.execute("DELETE FROM account_pre_verify WHERE signed_hash = ?1", params![
@@ -816,6 +887,104 @@ mod tests {
         let pending: i64 =
             conn.query_row("SELECT COUNT(*) FROM account_pre_verify", [], |r| r.get(0)).unwrap();
         assert_eq!(pending, 0, "the pre-verify queue is drained");
+    }
+
+    #[test]
+    fn pre_verify_budget_evicts_oldest_per_account_and_globally() {
+        let conn = db();
+        let account_a = AccountId::from_bytes([0xa1; 32]);
+        for ordinal in 0..PRE_VERIFY_PER_ACCOUNT_MAX + 2 {
+            let raw = ordinal.to_be_bytes();
+            insert_pre_verify(
+                &conn,
+                &cbor::sha256(&raw),
+                account_a,
+                Dev::new(2).fp,
+                &raw,
+                ordinal as i64,
+            )
+            .unwrap();
+        }
+        let account_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_pre_verify WHERE claimed_account_id = ?1",
+                params![account_a.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(account_count, PRE_VERIFY_PER_ACCOUNT_MAX as i64);
+        let oldest_remaining: i64 = conn
+            .query_row(
+                "SELECT MIN(received_at_ms) FROM account_pre_verify
+                 WHERE claimed_account_id = ?1",
+                params![account_a.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(oldest_remaining, 2, "the oldest account rows are evicted first");
+
+        for account_byte in 0xb0..0xb4 {
+            let account = AccountId::from_bytes([account_byte; 32]);
+            for ordinal in 0..PRE_VERIFY_PER_ACCOUNT_MAX {
+                let raw = [account_byte, ordinal as u8];
+                insert_pre_verify(
+                    &conn,
+                    &cbor::sha256(&raw),
+                    account,
+                    Dev::new(3).fp,
+                    &raw,
+                    1_000 + i64::try_from(ordinal).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        let global_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM account_pre_verify", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(global_count, PRE_VERIFY_GLOBAL_MAX as i64);
+        let account_a_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_pre_verify WHERE claimed_account_id = ?1",
+                params![account_a.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(account_a_remaining, 0, "global eviction removes the globally oldest rows");
+    }
+
+    #[test]
+    fn candidate_ceiling_rejects_new_history_before_refold_work_grows_unbounded() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account_id, genesis_bytes, _) = genesis(&founder);
+        let verified =
+            envelope::verify_account_signed(&genesis_bytes, &founder.secret.public()).unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        for ordinal in 0..CANDIDATES_PER_ACCOUNT_MAX {
+            let entry_hash = cbor::sha256(&ordinal.to_be_bytes());
+            tx.execute(
+                "INSERT INTO account_entries(
+                     entry_hash, account_id, log_id, device_fingerprint, seq, entry_type,
+                     accepted, signed_bytes, received_at_ms)
+                 VALUES (?1, ?2, 0, ?3, ?4, 99, 0, X'00', ?4)",
+                params![
+                    entry_hash.as_slice(),
+                    account_id.to_bytes().as_slice(),
+                    founder.fp.to_bytes().as_slice(),
+                    i64::try_from(ordinal).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            insert_candidate(&tx, &verified, &genesis_bytes, NOW).unwrap(),
+            CandidateInsert::AtCapacity,
+        );
+        tx.commit().unwrap();
+        assert_eq!(
+            account_ingest(&conn, &genesis_bytes, NOW).unwrap(),
+            IngestOutcome::Rejected("account candidate limit reached".into()),
+        );
     }
 
     #[test]
