@@ -117,29 +117,88 @@ fn refold_in_tx(
     account_id: AccountId,
 ) -> anyhow::Result<HashMap<[u8; 32], String>> {
     let rows = load_candidates(tx, account_id)?;
-    let entries: Vec<VerifiedAccountEntry> = rows.iter().map(|r| r.verified.clone()).collect();
-    let history = fold::fold_account(&entries);
+    let mut removed = HashSet::new();
+    let (history, effective, accepted_set) = loop {
+        let entries: Vec<VerifiedAccountEntry> = rows
+            .iter()
+            .filter(|row| !removed.contains(&row.entry_hash))
+            .map(|row| row.verified.clone())
+            .collect();
+        let history = fold::fold_account(&entries);
+        let effective: HashSet<EntryHash> = rows
+            .iter()
+            .filter(|row| {
+                !removed.contains(&row.entry_hash)
+                    && history
+                        .outcome(&row.entry_hash)
+                        .is_some_and(|outcome| outcome.is_effective())
+            })
+            .map(|row| row.entry_hash)
+            .collect();
+        let selected = select_coherent_branches(&rows, &effective);
+        let accepted = authority_closed_selection(&rows, selected);
+        let rejected: Vec<EntryHash> = effective.difference(&accepted).copied().collect();
+        if rejected.is_empty() {
+            break (history, effective, accepted);
+        }
+        // Monotone elimination is both the termination argument and the security boundary: once
+        // an effective candidate loses its author branch or its cited authority branch, neither it
+        // nor any effect it produced may participate in a later fold round.
+        removed.extend(rejected);
+    };
 
-    // Branch selection (§16.2): project the fold's effective entries onto a single accepted
-    // hash-chain per (log, device). From the smallest-entry_hash root (an effective entry with no
-    // prev_hash) walk forward, taking the smallest-entry_hash child (an effective entry whose
-    // prev_hash cites the current head) at each step. The min-hash tiebreak resolves an unforced
-    // equivocation the registers did not; crucially, an effective entry that chains from a LOSING
-    // head is off-branch and is NOT accepted — accepting it would leave the accepted history with
-    // an entry whose parent is `forked`, i.e. no longer a single chain under equivocation (the
-    // account_accepted_slot partial unique index keeps one accepted row per slot (I10a), but chain
-    // coherence needs the whole walk). Register-named branches were already promoted inside the
-    // fold (off-branch → condemned).
-    let effective: HashSet<[u8; 32]> = rows
-        .iter()
-        .filter(|r| history.outcome(&r.entry_hash).is_some_and(|o| o.is_effective()))
-        .map(|r| r.entry_hash)
-        .collect();
+    // Rewrite: clear every accepted flag for the account, then re-set the winners — atomically,
+    // so the partial unique index never sees two accepted rows at one slot mid-transaction.
+    tx.execute("UPDATE account_entries SET accepted = 0 WHERE account_id = ?1", params![
+        account_id.to_bytes().as_slice()
+    ])?;
+
+    let mut statuses: HashMap<[u8; 32], String> = HashMap::new();
+    for row in rows {
+        let accepted = accepted_set.contains(&row.entry_hash);
+        let (status, detail): (String, Option<String>) = if accepted {
+            ("accepted".to_string(), None)
+        } else if removed.contains(&row.entry_hash) || effective.contains(&row.entry_hash) {
+            // Effective but outside the authority-closed accepted DAG: an equivocation loser, a
+            // descendant of one, or an entry whose cited mint lost branch selection.
+            ("forked".to_string(), None)
+        } else {
+            match history.outcome(&row.entry_hash) {
+                Some(outcome) => {
+                    let (s, d) = outcome.taxonomy();
+                    (s.to_string(), d.map(str::to_string))
+                },
+                // A candidate eliminated in an earlier round is covered by `removed`; every
+                // remaining candidate is classified by the final fold.
+                None => ("retained_unfolded".to_string(), None),
+            }
+        };
+        if accepted {
+            tx.execute("UPDATE account_entries SET accepted = 1 WHERE entry_hash = ?1", params![
+                row.entry_hash.as_slice()
+            ])?;
+        }
+        tx.execute(
+            "INSERT INTO account_entry_status(entry_hash, status, detail) VALUES (?1, ?2, ?3)
+             ON CONFLICT(entry_hash) DO UPDATE SET status = excluded.status, detail = \
+             excluded.detail",
+            params![row.entry_hash.as_slice(), status, detail],
+        )?;
+        statuses.insert(row.entry_hash, status);
+    }
+    Ok(statuses)
+}
+
+/// Select one contiguous effective hash-chain per `(log_id, device)` (§16.2).
+fn select_coherent_branches(
+    rows: &[CandidateRow],
+    effective: &HashSet<EntryHash>,
+) -> HashSet<EntryHash> {
     // Effective entries indexed by the (log, device, prev_hash) parent slot they chain from; a
     // chain root keys on `None`.
     let mut children = BranchChildren::new();
     let mut groups: HashSet<(u8, DeviceFingerprint)> = HashSet::new();
-    for row in &rows {
+    for row in rows {
         if effective.contains(&row.entry_hash) {
             children
                 .entry((row.log_id, row.device_fingerprint, row.verified.header.prev_hash))
@@ -148,7 +207,7 @@ fn refold_in_tx(
             groups.insert((row.log_id, row.device_fingerprint));
         }
     }
-    let mut accepted_set: HashSet<[u8; 32]> = HashSet::new();
+    let mut accepted_set = HashSet::new();
     for (log_id, device) in groups {
         let mut parent: Option<[u8; 32]> = None;
         // Bounded by the candidate count; only the exact next sequence slot may extend a branch.
@@ -168,45 +227,35 @@ fn refold_in_tx(
             parent = Some(winner);
         }
     }
+    accepted_set
+}
 
-    // Rewrite: clear every accepted flag for the account, then re-set the winners — atomically,
-    // so the partial unique index never sees two accepted rows at one slot mid-transaction.
-    tx.execute("UPDATE account_entries SET accepted = 0 WHERE account_id = ?1", params![
-        account_id.to_bytes().as_slice()
-    ])?;
-
-    let mut statuses: HashMap<[u8; 32], String> = HashMap::new();
-    for row in &rows {
-        let accepted = accepted_set.contains(&row.entry_hash);
-        let (status, detail): (String, Option<String>) = if accepted {
-            ("accepted".to_string(), None)
-        } else if effective.contains(&row.entry_hash) {
-            // Effective but off the accepted chain — an equivocation loser or a descendant of one.
-            ("forked".to_string(), None)
-        } else {
-            match history.outcome(&row.entry_hash) {
-                Some(outcome) => {
-                    let (s, d) = outcome.taxonomy();
-                    (s.to_string(), d.map(str::to_string))
-                },
-                // Not in the fold's outcome map (unreachable — every candidate is classified).
-                None => ("retained_unfolded".to_string(), None),
-            }
-        };
-        if accepted {
-            tx.execute("UPDATE account_entries SET accepted = 1 WHERE entry_hash = ?1", params![
-                row.entry_hash.as_slice()
-            ])?;
+/// Remove selected entries whose cited incarnation is not itself selected. Iterate because an
+/// invalid mint can authorize another mint, so authority loss must propagate through the whole
+/// incarnation DAG rather than only one edge.
+fn authority_closed_selection(
+    rows: &[CandidateRow],
+    mut selected: HashSet<EntryHash>,
+) -> HashSet<EntryHash> {
+    loop {
+        let invalid: Vec<EntryHash> = rows
+            .iter()
+            .filter(|row| selected.contains(&row.entry_hash))
+            .filter(|row| {
+                row.verified
+                    .header
+                    .authority_ref
+                    .is_some_and(|authority| !selected.contains(&authority))
+            })
+            .map(|row| row.entry_hash)
+            .collect();
+        if invalid.is_empty() {
+            return selected;
         }
-        tx.execute(
-            "INSERT INTO account_entry_status(entry_hash, status, detail) VALUES (?1, ?2, ?3)
-             ON CONFLICT(entry_hash) DO UPDATE SET status = excluded.status, detail = \
-             excluded.detail",
-            params![row.entry_hash.as_slice(), status, detail],
-        )?;
-        statuses.insert(row.entry_hash, status);
+        for hash in invalid {
+            selected.remove(&hash);
+        }
     }
-    Ok(statuses)
 }
 
 /// A stored candidate row, with its verified entry reconstituted from the trusted stored bytes (the
@@ -609,6 +658,16 @@ mod tests {
         }
     }
 
+    fn owner_demote(dev: &Dev, owner_id: EntryHash) -> AccountOp {
+        AccountOp::OwnerDemote {
+            device_fingerprint: dev.fp,
+            owner_id,
+            control_cut: super::super::cut::Cut::Empty,
+            secrets_cut: super::super::cut::Cut::Empty,
+            reason: "demoted".to_string(),
+        }
+    }
+
     fn status(conn: &Connection, hash: &[u8; 32]) -> Option<String> {
         entry_status(conn, hash).unwrap().map(|(s, _)| s)
     }
@@ -884,6 +943,103 @@ mod tests {
             )
             .unwrap();
         assert_eq!(accepted_at_slot, 1, "one accepted head per slot (I10a)");
+    }
+
+    #[test]
+    fn losing_mint_authority_is_pruned_transitively_in_every_arrival_order() {
+        // The founder equivocates between minting B and W. Whichever mint loses by hash must not
+        // authorize an independent B chain: B mints C, then C mints D. Content-addressed key
+        // discovery deliberately knows all three keys, so signature verification alone cannot
+        // hide an authority-closure bug. The winning device also authors a child to prove pruning
+        // is scoped to the losing incarnation rather than all newly minted devices.
+        for rotation in 0..4 {
+            let conn = db();
+            let founder = Dev::new(1);
+            let (acct, gbytes, gh) = genesis(&founder);
+            account_ingest(&conn, &gbytes, NOW).unwrap();
+
+            let (b, w, c, d, survivor_child) =
+                (Dev::new(2), Dev::new(3), Dev::new(4), Dev::new(5), Dev::new(6));
+            let (add_b_bytes, add_b) =
+                op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+            let (add_w_bytes, add_w) =
+                op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&w, DeviceRole::Owner));
+
+            let (loser, loser_add_bytes, loser_add, winner, winner_add_bytes, winner_add) =
+                if add_b < add_w {
+                    (&w, &add_w_bytes, add_w, &b, &add_b_bytes, add_b)
+                } else {
+                    (&b, &add_b_bytes, add_b, &w, &add_w_bytes, add_w)
+                };
+            let (add_c_bytes, add_c) =
+                op(acct, loser, 0, None, Some(loser_add), &device_add(&c, DeviceRole::Owner));
+            let (add_d_bytes, add_d) =
+                op(acct, &c, 0, None, Some(add_c), &device_add(&d, DeviceRole::Member));
+            let (winner_child_bytes, winner_child) = op(
+                acct,
+                winner,
+                0,
+                None,
+                Some(winner_add),
+                &device_add(&survivor_child, DeviceRole::Member),
+            );
+
+            let mut arrivals = [loser_add_bytes, winner_add_bytes, &add_c_bytes, &add_d_bytes];
+            arrivals.rotate_left(rotation);
+            for bytes in arrivals {
+                account_ingest(&conn, bytes, NOW).unwrap();
+            }
+            account_ingest(&conn, &winner_child_bytes, NOW).unwrap();
+
+            assert_eq!(status(&conn, &winner_add).as_deref(), Some("accepted"));
+            assert_eq!(status(&conn, &winner_child).as_deref(), Some("accepted"));
+            assert_eq!(status(&conn, &loser_add).as_deref(), Some("forked"));
+            assert_eq!(status(&conn, &add_c).as_deref(), Some("forked"));
+            assert_eq!(status(&conn, &add_d).as_deref(), Some("forked"));
+        }
+    }
+
+    #[test]
+    fn final_fold_does_not_keep_control_effects_from_a_losing_mint() {
+        // The losing founder branch mints owner B. A demotion of B sits on the WINNING founder
+        // branch, so the first all-candidate fold can resolve B's owner_id and treat the demotion
+        // as effective. After branch elimination, the final fold must run without the
+        // losing mint: the demotion can no longer resolve its target and must park without leaving
+        // a control register or an accepted status behind. A post-hoc accepted-set filter would
+        // fail this assertion.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+        let b = Dev::new(2);
+        let (add_b_bytes, add_b) =
+            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        // Find a deterministic rival whose hash is smaller, making the owner mint the losing
+        // branch without depending on an assumed ordering of test keys.
+        let (winner_bytes, winner_hash) = (3u8..=u8::MAX)
+            .find_map(|seed| {
+                let rival = Dev::new(seed);
+                let candidate = op(
+                    acct,
+                    &founder,
+                    1,
+                    Some(gh),
+                    Some(gh),
+                    &device_add(&rival, DeviceRole::Member),
+                );
+                (candidate.1 < add_b).then_some(candidate)
+            })
+            .expect("the deterministic fixture set contains a lower-hash rival");
+        let (demote_bytes, demote) =
+            op(acct, &founder, 2, Some(winner_hash), Some(gh), &owner_demote(&b, add_b));
+
+        account_ingest(&conn, &add_b_bytes, NOW).unwrap();
+        account_ingest(&conn, &winner_bytes, NOW).unwrap();
+        account_ingest(&conn, &demote_bytes, NOW).unwrap();
+
+        assert_eq!(status(&conn, &add_b).as_deref(), Some("forked"));
+        assert_eq!(status(&conn, &winner_hash).as_deref(), Some("accepted"));
+        assert_eq!(status(&conn, &demote).as_deref(), Some("parked"));
     }
 
     #[test]
