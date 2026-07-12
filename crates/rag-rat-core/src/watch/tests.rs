@@ -2,14 +2,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::thread::JoinHandle;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
-use notify::event::{
-    AccessKind, AccessMode, CreateKind, DataChange, EventKind, Flag, ModifyKind, RemoveKind,
-    RenameMode,
-};
+use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, Flag, ModifyKind};
 use notify::{Event, RecursiveMode, Watcher as _, recommended_watcher};
 
 use super::*;

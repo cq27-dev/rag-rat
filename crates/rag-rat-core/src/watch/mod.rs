@@ -29,15 +29,14 @@ pub use overlay::{OverlayScope, ReconcileBudget, refresh_worktree_overlays};
 pub use pass::{CLONE_GRAPH_QUIET_MS, maintenance_pass, maintenance_pass_or_skip};
 #[cfg(test)]
 pub(crate) use pass::{
-    Debounce, GC_EVERY_PASSES, LoopMsg, PASS_RECONCILE_MAX_SECONDS, PassRequest, PassScheduler,
-    SKIP_TIMEOUT, STARTUP_CATCHUP_RUN_GC, SweepClock, base_embedding_backlog_needs_tail,
-    maybe_checkpoint_wal, pass_tail_forced_by_state, should_run_pass_tail, spawn_pass_worker,
-    startup_catchup_pass,
+    Debounce, GC_EVERY_PASSES, LoopMsg, PassRequest, PassScheduler, STARTUP_CATCHUP_RUN_GC,
+    SweepClock, base_embedding_backlog_needs_tail, maybe_checkpoint_wal, should_run_pass_tail,
+    spawn_pass_worker, startup_catchup_pass,
 };
 #[cfg(test)]
 pub(crate) use placement::{
-    CreatedDirPlacement, LinkedWorktreeWatch, LinkedWorktreeWatches, WorktreeEventHint,
-    created_dir_placement, event_is_relevant, event_requests_maintenance, event_touches_worktree,
+    CreatedDirPlacement, LinkedWorktreeWatches, WorktreeEventHint, created_dir_placement,
+    event_is_relevant, event_requests_maintenance, event_touches_worktree,
     gitignore_rule_watch_dirs, gitignore_watch_dirs, is_gitignore_path, kind_is_mutation,
     missing_config_root_bootstrap_dirs, place_initial_watch_state,
     recompile_ignore_and_place_watches, sync_linked_worktrees_after_pass, watch_created_dirs,
