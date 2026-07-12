@@ -8,10 +8,10 @@ use super::{
     Config, ConfigError, DEFAULT_QUERY_ENDPOINT, EmbeddingRuntimeConfig, LlmConfig, LogConfig,
     LogFormat, LogLevel, MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface,
     OracleConfig, RawConfig, RawMemory, RawOracle, RawSearch, RawTarget, RawVersionCheck, RawWatch,
-    RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig, TargetKind,
-    VersionCheckConfig, WatchConfig, anchor_root_to_main_worktree, discover_config_path,
-    endpoint_authority_has_userinfo, linked_worktree_main_root, resolve_relative_cookbook_path,
-    resolve_targets,
+    RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget, SearchConfig,
+    TargetKind, VersionCheckConfig, WatchConfig, anchor_root_to_main_worktree,
+    discover_config_path, endpoint_authority_has_userinfo, linked_worktree_main_root,
+    resolve_relative_cookbook_path, resolve_targets,
 };
 use crate::language::Language;
 
@@ -2376,4 +2376,133 @@ fn log_dir_defaults_to_db_sibling_and_custom_is_config_relative() {
     std::fs::write(dir.path().join("rag-rat.toml"), "[log]\nenabled=true\n").unwrap();
     let cfg = Config::load(dir.path().join("rag-rat.toml")).unwrap();
     assert_eq!(cfg.log.dir, cfg.database.parent().unwrap().join("logs"));
+}
+
+#[test]
+fn for_linked_worktree_overlay_falls_back_when_branch_config_is_missing_or_invalid() {
+    let git = |dir: &Path, args: &[&str]| {
+        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+    };
+    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+    let tmp =
+        std::env::temp_dir().join(format!("ragrat-overlay-fallback-{}-{id}", std::process::id()));
+    let main = tmp.join("main");
+    std::fs::create_dir_all(main.join("src")).unwrap();
+    std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::write(
+        main.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+    )
+    .unwrap();
+    git(&main, &["init", "-q"]);
+    git(&main, &["config", "user.email", "t@example.com"]);
+    git(&main, &["config", "user.name", "t"]);
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "seed"]);
+
+    let linked = tmp.join("wt");
+    git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    let base = Config::load(main.join("rag-rat.toml")).unwrap();
+
+    let missing = base.for_linked_worktree_overlay(&linked);
+    assert_eq!(missing.targets, base.targets, "missing branch config keeps base targets");
+
+    std::fs::write(linked.join("rag-rat.toml"), "not valid toml [[[\n").unwrap();
+    let invalid = base.for_linked_worktree_overlay(&linked);
+    assert_eq!(invalid.targets, base.targets, "invalid branch config keeps base targets");
+
+    std::fs::write(
+        linked.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\", \"extra\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(linked.join("extra")).unwrap();
+    std::fs::write(linked.join("extra/more.rs"), "pub fn b() {}\n").unwrap();
+    let branch = base.for_linked_worktree_overlay(&linked);
+    let dirs = branch.target_directories();
+    assert!(dirs.contains(&PathBuf::from("extra")), "valid branch config swaps targets: {dirs:?}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn config_load_propagates_main_parse_error_from_linked_worktree() {
+    let git = |dir: &Path, args: &[&str]| {
+        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+    };
+    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("ragrat-main-broken-{}-{id}", std::process::id()));
+    let main = tmp.join("main");
+    std::fs::create_dir_all(main.join("src")).unwrap();
+    std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::write(main.join("rag-rat.toml"), "[index]\nroot = \".\"\n[local_ai]\n").unwrap();
+    git(&main, &["init", "-q"]);
+    git(&main, &["config", "user.email", "t@example.com"]);
+    git(&main, &["config", "user.name", "t"]);
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "seed"]);
+
+    let linked = tmp.join("wt");
+    git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    std::fs::write(
+        linked.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+    )
+    .unwrap();
+
+    let err = Config::load(linked.join("rag-rat.toml")).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::LocalAiTableRenamed),
+        "linked checkout must inherit main's fatal parse error, got {err:?}",
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn target_directories_deduplicates_across_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::create_dir_all(dir.path().join("extra")).unwrap();
+    let cfg = Config {
+        repo_id_override: None,
+        database_key_pinned: true,
+        root: dir.path().to_path_buf(),
+        database: dir.path().join(".rag-rat/index.sqlite"),
+        targets: vec![
+            ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src"), PathBuf::from("extra")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            },
+            ResolvedTarget {
+                name: "docs".to_string(),
+                language: Language::Markdown,
+                directories: vec![PathBuf::from("extra"), PathBuf::from("docs")],
+                include: vec!["**/*.md".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Docs,
+            },
+        ],
+        llm: LlmConfig::default(),
+        watch: WatchConfig::default(),
+        version_check: Default::default(),
+        oracle: Default::default(),
+        search: Default::default(),
+        memory: Default::default(),
+        log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
+    };
+    std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+
+    let dirs = cfg.target_directories();
+    assert_eq!(
+        dirs,
+        vec![PathBuf::from("src"), PathBuf::from("extra"), PathBuf::from("docs")],
+        "shared dirs appear once in stable order"
+    );
 }

@@ -2787,3 +2787,162 @@ fn a_moved_in_dir_with_a_nested_gitignore_prunes_against_it() {
     assert!(!ignored_seen, "a moved-in nested-.gitignore-ignored subdir must not be watched");
     assert!(kept_seen, "the kept sibling under the moved-in dir must be watched (#332)");
 }
+
+#[test]
+fn watcher_spawn_is_disabled_when_watch_is_off_or_env_opt_out_is_set() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    config.watch.enabled = false;
+    assert!(Watcher::spawn(config).is_none(), "disabled watch config must not spawn a thread");
+
+    let mut enabled = whole_root_config(root, &[PathBuf::from("src")]);
+    enabled.watch.enabled = true;
+    // SAFETY: this test is the only one touching RAG_RAT_NO_WATCH in this process.
+    unsafe {
+        std::env::set_var("RAG_RAT_NO_WATCH", "1");
+    }
+    assert!(Watcher::spawn(enabled).is_none(), "RAG_RAT_NO_WATCH must suppress the watcher");
+    unsafe {
+        std::env::remove_var("RAG_RAT_NO_WATCH");
+    }
+}
+
+#[test]
+fn event_loop_ignores_fs_errors_and_exits_on_disconnect() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    config.watch.debounce_ms = 50;
+    config.watch.max_latency_ms = 200;
+    config.watch.periodic_sweep_secs = 0;
+    let target_dirs = config.target_directories();
+    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+    let mut linked_worktrees = LinkedWorktreeWatches::default();
+    let mut notify_watcher =
+        <RecordingWatcher as notify::Watcher>::new(|_| {}, notify::Config::default()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (pass_tx, pass_rx) = std::sync::mpsc::channel::<PassRequest>();
+    let pass_tx_for_loop = pass_tx.clone();
+    let mut scheduler = PassScheduler::new();
+    let stop = AtomicBool::new(false);
+    let mut fleet_trigger = |_: &Path| {};
+
+    let event_loop = EventLoop {
+        config: &config,
+        target_dirs: &target_dirs,
+        fleet_bin: None,
+        notify_watcher: &mut notify_watcher,
+        ignore: &mut ignore,
+        linked_worktrees: &mut linked_worktrees,
+        worktree_registry: None,
+        rx,
+        pass_tx: &pass_tx_for_loop,
+        scheduler: &mut scheduler,
+        stop: &stop,
+        fleet_trigger: &mut fleet_trigger,
+    };
+
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(move || event_loop.run());
+        tx.send(LoopMsg::Fs(Err(notify::Error::generic("disk full")))).unwrap();
+        tx.send(LoopMsg::Wake).unwrap();
+        drop(tx);
+        drop(pass_tx);
+        let _ = pass_rx;
+        let final_refresh_owed = handle.join().unwrap();
+        assert!(!final_refresh_owed, "ignored errors and disconnect should not arm a refresh");
+    });
+}
+
+#[test]
+fn periodic_sweep_dispatches_all_overlay_scope() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    config.watch.debounce_ms = 60_000;
+    config.watch.max_latency_ms = 60_000;
+    config.watch.periodic_sweep_secs = 1;
+    let target_dirs = config.target_directories();
+    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+    let mut linked_worktrees = LinkedWorktreeWatches::default();
+    let mut notify_watcher =
+        <RecordingWatcher as notify::Watcher>::new(|_| {}, notify::Config::default()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (pass_tx, pass_rx) = std::sync::mpsc::channel();
+    let pass_tx_for_loop = pass_tx.clone();
+    let mut scheduler = PassScheduler::new();
+    let stop = AtomicBool::new(false);
+    let mut fleet_trigger = |_: &Path| {};
+
+    let event_loop = EventLoop {
+        config: &config,
+        target_dirs: &target_dirs,
+        fleet_bin: None,
+        notify_watcher: &mut notify_watcher,
+        ignore: &mut ignore,
+        linked_worktrees: &mut linked_worktrees,
+        worktree_registry: None,
+        rx,
+        pass_tx: &pass_tx_for_loop,
+        scheduler: &mut scheduler,
+        stop: &stop,
+        fleet_trigger: &mut fleet_trigger,
+    };
+
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(move || event_loop.run());
+        let request = pass_rx.recv_timeout(Duration::from_secs(5)).expect("periodic sweep pass");
+        assert_eq!(
+            request,
+            PassRequest::Maintenance { run_gc: false, overlay_scope: OverlayScope::All },
+            "the periodic backstop must refresh every overlay"
+        );
+        stop.store(true, Ordering::Relaxed);
+        tx.send(LoopMsg::Wake).unwrap();
+        drop(tx);
+        drop(pass_tx);
+        let _ = handle.join();
+    });
+}
+
+#[test]
+fn shutdown_discover_skips_when_write_lock_is_held() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let config = whole_root_config(root, &[PathBuf::from("src")]);
+    let lock_repo = crate::locks::write_lock_repo_id(&config);
+    let holder_config = config.clone();
+    let holder_repo = lock_repo.clone();
+    let release = Arc::new(AtomicBool::new(false));
+    let release_for_holder = Arc::clone(&release);
+    let holder = std::thread::spawn(move || {
+        let _held =
+            crate::locks::WriteLock::acquire_blocking(&holder_config.database, &holder_repo)
+                .unwrap();
+        while !release_for_holder.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    });
+    std::thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    assert!(
+        !shutdown_discover(&config).unwrap(),
+        "shutdown discover must skip when another thread holds the write lock"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "shutdown discover should time out waiting for the lock, not block until it is released"
+    );
+    release.store(true, Ordering::Relaxed);
+    holder.join().unwrap();
+}

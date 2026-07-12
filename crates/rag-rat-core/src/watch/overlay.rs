@@ -271,3 +271,53 @@ impl ReconcileBudget {
         Some(options)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::index::ai::ReconcileOptions;
+
+    #[test]
+    fn overlay_scope_lists_all_and_linked_roots() {
+        let linked = OverlayScope::Linked(BTreeSet::from([PathBuf::from("/tmp/wt-a")]));
+        let id = crate::index::worktree_id_of(Path::new("/tmp/wt-a"));
+        assert!(OverlayScope::All.lists(&id));
+        assert!(linked.lists(&id));
+        assert!(!linked.lists("some-other-worktree"));
+    }
+
+    #[test]
+    fn overlay_scope_merge_unions_or_widens_to_all() {
+        let a = OverlayScope::Linked(BTreeSet::from([PathBuf::from("/wt/a")]));
+        let b = OverlayScope::Linked(BTreeSet::from([PathBuf::from("/wt/b")]));
+        let merged = a.clone().merge(b);
+        assert_eq!(
+            merged,
+            OverlayScope::Linked(BTreeSet::from([PathBuf::from("/wt/a"), PathBuf::from("/wt/b")]))
+        );
+        assert_eq!(a.merge(OverlayScope::All), OverlayScope::All);
+    }
+
+    #[test]
+    fn enclosing_worktree_id_falls_back_outside_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("crate");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            enclosing_worktree_id(&root),
+            crate::index::worktree_id_of(&root),
+            "non-git roots use their own worktree id"
+        );
+    }
+
+    #[test]
+    fn reconcile_budget_returns_none_when_exhausted() {
+        let options = ReconcileOptions { max_seconds: Some(5), ..ReconcileOptions::default() };
+        let spent = ReconcileBudget::new(options, Instant::now() - Duration::from_secs(10));
+        assert!(spent.next_options().is_none());
+    }
+}

@@ -175,3 +175,6 @@ fn tool_timeout_error(
         None,
     ))
 }
+
+#[cfg(test)]
+mod tests;
