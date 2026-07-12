@@ -1255,6 +1255,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_058_ID => Some(58),
             MIGRATION_059_ID => Some(59),
             MIGRATION_060_ID => Some(60),
+            MIGRATION_061_ID => Some(61),
             _ => None,
         })
         .max()
@@ -1324,6 +1325,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_058_ID
             | MIGRATION_059_ID
             | MIGRATION_060_ID
+            | MIGRATION_061_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1390,6 +1392,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_058_ID => migration.checksum != MIGRATION_058_CHECKSUM,
         MIGRATION_059_ID => migration.checksum != MIGRATION_059_CHECKSUM,
         MIGRATION_060_ID => migration.checksum != MIGRATION_060_CHECKSUM,
+        MIGRATION_061_ID => migration.checksum != MIGRATION_061_CHECKSUM,
         _ => false,
     }
 }
@@ -3090,6 +3093,7 @@ pub(crate) fn create_papertrail_tables(conn: &Connection) -> rusqlite::Result<()
             tracker TEXT NOT NULL,
             project TEXT NOT NULL,
             item_key TEXT NOT NULL,
+            item_kind TEXT,
             ref_kind TEXT NOT NULL DEFAULT 'unknown',
             source_kind TEXT NOT NULL,
             source_path TEXT,
@@ -3100,9 +3104,10 @@ pub(crate) fn create_papertrail_tables(conn: &Connection) -> rusqlite::Result<()
         ) STRICT;
         CREATE INDEX IF NOT EXISTS idx_papertrail_refs_path ON papertrail_refs(source_path);
         CREATE INDEX IF NOT EXISTS idx_papertrail_refs_item
-            ON papertrail_refs(repo_id, tracker, project, item_key);
+            ON papertrail_refs(repo_id, tracker, project, item_kind, item_key);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_refs_unique
-            ON papertrail_refs(repo_id, tracker, project, item_key, source_kind,
+            ON papertrail_refs(repo_id, tracker, project, COALESCE(item_kind, ''), item_key, \
+         source_kind,
                                COALESCE(source_path, ''), COALESCE(source_commit, ''), \
          source_text);
 
@@ -3236,6 +3241,22 @@ pub(crate) fn apply_papertrail_provider_neutral_schema(conn: &Connection) -> rus
         return result;
     }
     conn.execute_batch("COMMIT;")
+}
+
+pub(crate) fn apply_papertrail_ref_item_kind(conn: &Connection) -> rusqlite::Result<()> {
+    if !column_exists(conn, "papertrail_refs", "item_kind")? {
+        conn.execute_batch("ALTER TABLE papertrail_refs ADD COLUMN item_kind TEXT;")?;
+    }
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_papertrail_refs_item;
+         DROP INDEX IF EXISTS idx_papertrail_refs_unique;
+         CREATE INDEX idx_papertrail_refs_item
+             ON papertrail_refs(repo_id, tracker, project, item_kind, item_key);
+         CREATE UNIQUE INDEX idx_papertrail_refs_unique
+             ON papertrail_refs(repo_id, tracker, project, COALESCE(item_kind, ''), item_key,
+                                source_kind, COALESCE(source_path, ''),
+                                COALESCE(source_commit, ''), source_text);",
+    )
 }
 
 /// The V060 base-table backfill (step 2 of [`apply_papertrail_provider_neutral_schema`]): runs

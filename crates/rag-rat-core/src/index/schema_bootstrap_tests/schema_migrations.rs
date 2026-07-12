@@ -8,6 +8,8 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
     fs::create_dir_all(&docs).unwrap();
 
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

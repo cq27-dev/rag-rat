@@ -28,6 +28,8 @@ fn mutation_event(path: PathBuf) -> Event {
 /// `&Config` for the target-relation gate, #332).
 fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> Config {
     Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.to_path_buf(),
@@ -910,6 +912,8 @@ fn created_dir_placement_classifies_target_ancestors_and_subtrees() {
 #[test]
 fn event_touches_worktree_matches_checkout_targets_and_registry() {
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: PathBuf::from("/main"),
@@ -1620,6 +1624,8 @@ fn event_touches_worktree_rebases_subdir_rooted_config() {
     // `config.root` is the `crate` SUBDIR of the repo.
     let config_root = repo.join("crate").canonicalize().unwrap();
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: config_root,
@@ -1666,6 +1672,8 @@ fn event_is_relevant_skips_gitignored_paths_consistently_with_walker() {
     std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
 
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -1730,6 +1738,8 @@ fn gitignore_edit_is_relevant_and_recompile_reflects_new_rules() {
     std::fs::write(root.join(".gitignore"), "").unwrap();
 
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -1805,6 +1815,8 @@ fn worktree_root_gitignore_edit_recompiles_for_subdir_config_root() {
     let sub = wt.join("crates"); // config.root is the subdirectory.
     let target_dirs = vec![PathBuf::from(".")];
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: sub.clone(),
@@ -2159,6 +2171,8 @@ fn worktree_watch_targets_excludes_the_main_checkout_for_a_subdir_config_root() 
 
     let sub = main.join("crate").canonicalize().unwrap(); // config.root is the subdir.
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: sub.clone(),
@@ -2500,6 +2514,8 @@ fn a_bare_directory_create_is_not_relevant_so_placement_must_be_unconditional() 
     std::fs::create_dir_all(root.join("src")).unwrap();
     let root = root.canonicalize().unwrap();
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

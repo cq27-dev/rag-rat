@@ -465,6 +465,8 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n")
             .unwrap();
         let config = Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -516,6 +518,8 @@ mod tests {
         // A target carrying the SAME default filters the simple `[target_bindings]` form renders
         // (`include = ["**/*.rs"]`, no exclude), so the bindings-match check accepts it.
         let config_with = |include: Vec<String>, exclude: Vec<String>| Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: PathBuf::from("/x"),

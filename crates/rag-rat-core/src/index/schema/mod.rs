@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 60;
+pub const LATEST_SCHEMA_VERSION: u32 = 61;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -431,6 +431,11 @@ const MIGRATION_060_DESCRIPTION: &str =
      github_* tables then DROPS them (hard rename, no aliases); renames the memory binding kind \
      github -> tracker (tracker/project/item_key columns backfilled, github_* columns dropped) \
      and the github_last_sync_ms repo_meta key to papertrail_last_sync_ms";
+const MIGRATION_061_ID: &str = "061_papertrail_ref_item_kind";
+const MIGRATION_061_CHECKSUM: &str = "sha256:rag-rat-papertrail-ref-item-kind-v61";
+const MIGRATION_061_DESCRIPTION: &str = "Preserve the nullable item_kind on papertrail_refs so \
+                                         providers with separate issue/change-request namespaces \
+                                         cannot collapse #N and !N annotations";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -936,6 +941,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_060_CHECKSUM,
         description: MIGRATION_060_DESCRIPTION,
         apply: apply_papertrail_provider_neutral_schema,
+    },
+    Migration {
+        id: MIGRATION_061_ID,
+        checksum: MIGRATION_061_CHECKSUM,
+        description: MIGRATION_061_DESCRIPTION,
+        apply: apply_papertrail_ref_item_kind,
     },
 ];
 

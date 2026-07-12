@@ -1038,6 +1038,8 @@ fn mixed_config() -> (PathBuf, Config) {
     fs::write(root.join("docs/search.md"), "# Title\nalpha token\n").unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn alpha_symbol() {}\n").unwrap();
     (root.clone(), Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -1077,6 +1079,8 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
     fs::create_dir_all(root.join("docs")).unwrap();
     fs::write(root.join("docs/search.md"), text).unwrap();
     (root.clone(), Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -1103,6 +1107,8 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
 
 fn rust_config(root: PathBuf) -> Config {
     Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

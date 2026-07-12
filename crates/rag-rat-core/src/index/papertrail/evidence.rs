@@ -13,6 +13,7 @@ pub(crate) fn evidence_for_path(
             reference.tracker,
             &reference.project,
             &reference.item_key,
+            reference.item_kind,
             limit,
         )?);
     }
@@ -53,6 +54,7 @@ pub(crate) fn evidence_for_item(
     tracker: Tracker,
     project: &str,
     item_key: &str,
+    item_kind: Option<ItemKind>,
     limit: u32,
 ) -> anyhow::Result<Vec<PapertrailEvidence>> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
@@ -62,11 +64,19 @@ pub(crate) fn evidence_for_item(
          classification, 0.0
         FROM papertrail_fts
         WHERE tracker = ?1 AND project = ?2 AND item_key = ?3 AND repo_id = ?5
+          AND (?6 IS NULL OR item_kind = ?6)
         LIMIT ?4
         ",
     )?;
     let rows = stmt.query_map(
-        params![tracker.as_db_str(), project, item_key, i64::from(limit), repo_id],
+        params![
+            tracker.as_db_str(),
+            project,
+            item_key,
+            i64::from(limit),
+            repo_id,
+            item_kind.map(ItemKind::as_db_str)
+        ],
         evidence_row,
     )?;
     let mut evidence = collect_rows(rows)?;
@@ -84,7 +94,7 @@ pub(crate) fn evidence_for_commit_refs(
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
-        SELECT tracker, project, item_key
+        SELECT tracker, project, item_key, item_kind
         FROM papertrail_refs
         WHERE source_kind = 'commit'
           AND source_commit LIKE ?1
@@ -95,16 +105,22 @@ pub(crate) fn evidence_for_commit_refs(
     )?;
     let commit_like = format!("{commit_hash}%");
     let refs = stmt.query_map(params![commit_like, i64::from(limit), repo_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
     })?;
     let mut evidence = Vec::new();
     for reference in refs {
-        let (tracker, project, item_key) = reference?;
+        let (tracker, project, item_key, item_kind) = reference?;
         evidence.extend(evidence_for_item(
             conn,
             Tracker::from_db_str(&tracker)?,
             &project,
             &item_key,
+            item_kind.as_deref().map(ItemKind::from_db_str).transpose()?,
             limit,
         )?);
     }
@@ -200,18 +216,29 @@ pub(crate) fn ref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PapertrailRef
         })?,
         project: row.get(1)?,
         item_key: row.get(2)?,
-        ref_kind: row.get(3)?,
-        source_kind: row.get(4)?,
-        source_path: row.get(5)?,
-        source_commit: row.get(6)?,
-        source_text: row.get(7)?,
+        item_kind: row
+            .get::<_, Option<String>>(3)?
+            .map(|kind| ItemKind::from_db_str(&kind))
+            .transpose()
+            .map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    err.into(),
+                )
+            })?,
+        ref_kind: row.get(4)?,
+        source_kind: row.get(5)?,
+        source_path: row.get(6)?,
+        source_commit: row.get(7)?,
+        source_text: row.get(8)?,
     })
 }
 pub(crate) fn refs(conn: &Connection) -> anyhow::Result<Vec<PapertrailRef>> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
-        "SELECT tracker, project, item_key, ref_kind, source_kind, source_path, source_commit, \
-         source_text FROM papertrail_refs WHERE repo_id = ?1",
+        "SELECT tracker, project, item_key, item_kind, ref_kind, source_kind, source_path, \
+         source_commit, source_text FROM papertrail_refs WHERE repo_id = ?1",
     )?;
     let rows = stmt.query_map([repo_id], ref_row)?;
     collect_rows(rows)

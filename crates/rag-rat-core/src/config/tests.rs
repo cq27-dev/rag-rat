@@ -8,8 +8,8 @@ use super::{
     self as config, Config, ConfigError, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat,
     LogLevel, MemoryConfig, MemorySurface, OracleConfig, RawConfig, RawMemory, RawOracle,
     RawSearch, RawTarget, RawVersionCheck, RawWatch, RemoteBackend, RemoteDreamConfig,
-    RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, TargetKind, VersionCheckConfig,
-    WatchConfig,
+    RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, TargetKind, TrackerAuth,
+    VersionCheckConfig, WatchConfig,
 };
 use crate::language::Language;
 
@@ -64,6 +64,171 @@ fn config_load_resolves_main_and_linked_worktrees_to_one_database() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn tracker_and_papertrail_config_parse_with_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("rag-rat.toml"),
+        "[[tracker]]\nprovider = \"github\"\nproject = \"owner/repo\"\n",
+    )
+    .unwrap();
+    let cfg = Config::load(dir.path().join("rag-rat.toml")).unwrap();
+    assert_eq!(cfg.trackers.len(), 1);
+    assert_eq!(cfg.trackers[0].provider, super::Tracker::Github);
+    assert_eq!(cfg.trackers[0].project.as_deref(), Some("owner/repo"));
+    assert_eq!(cfg.trackers[0].remote, "origin");
+}
+
+#[test]
+fn jira_tracker_requires_an_explicit_project() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("rag-rat.toml"), "[[tracker]]\nprovider = \"jira\"\n").unwrap();
+    assert!(matches!(
+        Config::load(dir.path().join("rag-rat.toml")),
+        Err(ConfigError::JiraTrackerRequiresProject)
+    ));
+}
+
+#[test]
+fn tracker_auth_requires_exactly_one_source() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("rag-rat.toml"),
+        "[[tracker]]\nprovider = \"gitlab\"\nauth = { env = \"TOKEN\", token_command = \"glab \
+         auth token\" }\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        Config::load(dir.path().join("rag-rat.toml")),
+        Err(ConfigError::TrackerAuthExactlyOne)
+    ));
+}
+
+#[test]
+fn tracker_auth_accepts_each_supported_source() {
+    for (auth, expected) in [
+        ("env = \"TOKEN\"", TrackerAuth::Env("TOKEN".to_string())),
+        (
+            "token_command = \"gh auth token\"",
+            TrackerAuth::TokenCommand("gh auth token".to_string()),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rag-rat.toml"),
+            format!(
+                "[[tracker]]\nprovider = \"github\"\nproject = \"org/repo\"\nauth = {{ {auth} }}\n"
+            ),
+        )
+        .unwrap();
+        let config = Config::load(dir.path().join("rag-rat.toml")).unwrap();
+        assert_eq!(config.trackers[0].auth.as_ref(), Some(&expected));
+    }
+}
+
+#[test]
+fn tracker_provider_is_required_and_closed() {
+    for (body, expected) in [
+        ("[[tracker]]\nproject = \"org/repo\"\n", "requires a `provider`"),
+        ("[[tracker]]\nprovider = \"forgejo\"\n", "must be one of"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rag-rat.toml"), body).unwrap();
+        let error = Config::load(dir.path().join("rag-rat.toml")).unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn tracker_projects_are_validated_by_provider() {
+    for (provider, project) in [
+        ("github", "org/team/repo"),
+        ("bitbucket", "workspace/repo/extra"),
+        ("gitlab", "repo"),
+        ("jira", "Proj"),
+        ("jira", "A"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rag-rat.toml"),
+            format!("[[tracker]]\nprovider = \"{provider}\"\nproject = \"{project}\"\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load(dir.path().join("rag-rat.toml")),
+            Err(ConfigError::InvalidTrackerProject { .. })
+        ));
+    }
+
+    for (provider, project) in
+        [("github", "org/repo"), ("bitbucket", "workspace/repo"), ("gitlab", "group/sub/repo")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rag-rat.toml"),
+            format!("[[tracker]]\nprovider = \"{provider}\"\nproject = \"{project}\"\n"),
+        )
+        .unwrap();
+        Config::load(dir.path().join("rag-rat.toml")).unwrap();
+    }
+}
+
+#[test]
+fn tracker_base_url_requires_a_nonempty_authority() {
+    for base_url in [
+        "https://",
+        "https:///gitlab",
+        "ftp://gitlab.example.com",
+        "gitlab.example.com",
+        "https://:8443",
+        "https://gitlab example.com",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rag-rat.toml"),
+            format!("[[tracker]]\nprovider = \"gitlab\"\nbase_url = \"{base_url}\"\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load(dir.path().join("rag-rat.toml")),
+            Err(ConfigError::TrackerBaseUrlNotHttp(_))
+        ));
+    }
+}
+
+#[test]
+fn tracker_base_url_rejects_credentials_and_normalizes_trailing_slashes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("rag-rat.toml"),
+        "[[tracker]]\nprovider = \"gitlab\"\nbase_url = \"https://user:token@gitlab.example.com\"\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        Config::load(dir.path().join("rag-rat.toml")),
+        Err(ConfigError::TrackerBaseUrlHasCredentials)
+    ));
+
+    std::fs::write(
+        dir.path().join("rag-rat.toml"),
+        "[[tracker]]\nprovider = \"gitlab\"\nbase_url = \"http://gitlab.example.com:8080/\"\n",
+    )
+    .unwrap();
+    let config = Config::load(dir.path().join("rag-rat.toml")).unwrap();
+    assert_eq!(config.trackers[0].base_url.as_deref(), Some("http://gitlab.example.com:8080"));
+}
+
+#[test]
+fn papertrail_scheduling_table_is_rejected_until_it_is_consumed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("rag-rat.toml"), "[papertrail]\nprobe_interval_secs = 60\n")
+        .unwrap();
+    assert!(matches!(
+        Config::load(dir.path().join("rag-rat.toml")),
+        Err(ConfigError::PapertrailSchedulingNotSupported)
+    ));
 }
 
 #[test]
@@ -2471,11 +2636,51 @@ fn config_load_propagates_main_parse_error_from_linked_worktree() {
 }
 
 #[test]
+fn config_load_rejects_reserved_papertrail_table_from_governing_main() {
+    let git = |dir: &Path, args: &[&str]| {
+        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+    };
+    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+    let tmp =
+        std::env::temp_dir().join(format!("ragrat-main-papertrail-{}-{id}", std::process::id()));
+    let main = tmp.join("main");
+    std::fs::create_dir_all(main.join("src")).unwrap();
+    std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::write(
+        main.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\n[papertrail]\nprobe_interval_secs = 60\n",
+    )
+    .unwrap();
+    git(&main, &["init", "-q"]);
+    git(&main, &["config", "user.email", "t@example.com"]);
+    git(&main, &["config", "user.name", "t"]);
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "seed"]);
+
+    let linked = tmp.join("wt");
+    git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    std::fs::write(
+        linked.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        Config::load(linked.join("rag-rat.toml")),
+        Err(ConfigError::PapertrailSchedulingNotSupported)
+    ));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn target_directories_deduplicates_across_targets() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::create_dir_all(dir.path().join("extra")).unwrap();
     let cfg = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: dir.path().to_path_buf(),

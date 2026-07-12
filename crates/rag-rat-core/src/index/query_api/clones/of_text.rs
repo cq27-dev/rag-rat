@@ -665,6 +665,8 @@ mod tests {
         )
         .unwrap();
         let config = crate::Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -780,6 +782,8 @@ mod tests {
         .unwrap();
         let db_path = root.join(".rag-rat/index.sqlite");
         let config = crate::Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -849,6 +853,8 @@ mod tests {
         )
         .unwrap();
         let config = crate::Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -949,6 +955,8 @@ mod tests {
             kind: crate::config::TargetKind::Source,
         };
         let config = crate::Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),

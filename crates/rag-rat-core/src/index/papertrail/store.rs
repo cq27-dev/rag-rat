@@ -26,17 +26,18 @@ pub(crate) fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow:
     conn.execute(
         "
         INSERT INTO papertrail_refs(
-            tracker, project, item_key, ref_kind, source_kind, source_path, source_commit, \
-         source_text, discovered_at_ms, repo_id
+            tracker, project, item_key, item_kind, ref_kind, source_kind, source_path, \
+         source_commit, source_text, discovered_at_ms, repo_id
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-        ON CONFLICT(repo_id, tracker, project, item_key, source_kind, COALESCE(source_path, ''), \
-         COALESCE(source_commit, ''), source_text) DO NOTHING
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(repo_id, tracker, project, COALESCE(item_kind, ''), item_key, source_kind, \
+         COALESCE(source_path, ''), COALESCE(source_commit, ''), source_text) DO NOTHING
         ",
         params![
             reference.tracker.as_db_str(),
             reference.project,
             reference.item_key,
+            reference.item_kind.map(ItemKind::as_db_str),
             reference.ref_kind,
             reference.source_kind,
             reference.source_path,

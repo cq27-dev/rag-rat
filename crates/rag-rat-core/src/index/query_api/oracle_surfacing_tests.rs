@@ -29,6 +29,8 @@ fn temp_root() -> PathBuf {
 
 fn rust_config(root: PathBuf) -> Config {
     Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -1147,6 +1149,8 @@ fn deleted_and_generated_paths_counted_in_skipped() {
     fs::write(root.join("gen/out.rs"), "pub fn generated_fn() {}\n").unwrap();
     // A config with a Generated target for `gen/` so `out.rs` indexes generated.
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

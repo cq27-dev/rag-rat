@@ -263,6 +263,8 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn health_probe() -> i32 { 1 }\n").unwrap();
         crate::Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),

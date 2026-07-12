@@ -1,6 +1,207 @@
 use super::*;
 
 #[test]
+fn configless_discovery_keeps_self_contained_github_refs_from_files_and_commits() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("docs")).unwrap();
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "user.name", "Rag Rat"]);
+    run_git(&root, &["config", "user.email", "rag@example.com"]);
+    fs::write(root.join("docs/search.md"), "File rationale cq27-dev/rag-rat#7\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "Commit rationale cq27-dev/rag-rat#8"]);
+
+    let config = markdown_config_for_root(root.clone());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let ctx = papertrail::PapertrailContext::default();
+    let report = sync_from_refs_blocking::<MockGitHubClient>(
+        db.storage.connection(),
+        &root,
+        None,
+        true,
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(report.discovered_refs, 2);
+
+    let refs = papertrail::refs(db.storage.connection()).unwrap();
+    for (source_kind, key) in [("file", "7"), ("commit", "8")] {
+        assert!(refs.iter().any(|reference| {
+            reference.tracker == papertrail::Tracker::Github
+                && reference.project == "cq27-dev/rag-rat"
+                && reference.item_key == key
+                && reference.source_kind == source_kind
+        }));
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() {
+    let (root, config) = markdown_config("GitLab group/repo#42\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let ctx = test_gh_ctx();
+
+    let invalid = papertrail::block_on(papertrail::sync_issue::<MockGitHubClient>(
+        db.storage.connection(),
+        "not-a-ref",
+        None,
+        false,
+        &ctx,
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(invalid.contains("invalid tracker item reference"), "{invalid}");
+
+    let missing_client = papertrail::block_on(papertrail::sync_issue::<MockGitHubClient>(
+        db.storage.connection(),
+        "cq27-dev/rag-rat#42",
+        None,
+        false,
+        &ctx,
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(missing_client.contains("requires a client"), "{missing_client}");
+
+    papertrail::store_ref(db.storage.connection(), &papertrail::PapertrailRef {
+        tracker: papertrail::Tracker::Gitlab,
+        project: "group/repo".to_string(),
+        item_kind: Some(papertrail::ItemKind::Issue),
+        item_key: "42".to_string(),
+        ref_kind: "reference".to_string(),
+        source_kind: "manual".to_string(),
+        source_path: None,
+        source_commit: None,
+        source_text: "group/repo#42".to_string(),
+    })
+    .unwrap();
+
+    let live = papertrail::block_on(papertrail::sync_issue(
+        db.storage.connection(),
+        "cq27-dev/rag-rat#42",
+        Some(&MockGitHubClient),
+        false,
+        &ctx,
+    ))
+    .unwrap();
+    assert_eq!(live.synced_items, 5);
+    assert_eq!(live.failed_refs, 0);
+
+    let offline = papertrail::block_on(papertrail::sync_issue::<MockGitHubClient>(
+        db.storage.connection(),
+        "cq27-dev/rag-rat#43",
+        None,
+        true,
+        &ctx,
+    ))
+    .unwrap();
+    assert!(offline.offline);
+    assert_eq!(offline.synced_items, 0);
+
+    let gitlab_cached: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM papertrail_items WHERE tracker = 'gitlab' AND project = \
+             'group/repo'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(gitlab_cached, 0, "manual GitHub sync must not dispatch the same-key GitLab ref");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rationale_lookup_keeps_self_contained_github_refs_without_a_binding() {
+    let (root, config) = markdown_config("# Decision\nalpha\n");
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    let reference = papertrail::PapertrailRef {
+        tracker: papertrail::Tracker::Github,
+        project: "cq27-dev/rag-rat".to_string(),
+        item_kind: None,
+        item_key: "42".to_string(),
+        ref_kind: "reference".to_string(),
+        source_kind: "manual".to_string(),
+        source_path: None,
+        source_commit: None,
+        source_text: "cq27-dev/rag-rat#42".to_string(),
+    };
+    papertrail::store_ref(db.storage.connection(), &reference).unwrap();
+    papertrail::block_on(papertrail::sync_refs(
+        db.storage.connection(),
+        &MockGitHubClient,
+        std::iter::once(&reference),
+        &mut |_| {},
+    ))
+    .unwrap();
+    db.set_papertrail_context(None, false);
+
+    let evidence = db.rationale_search("cq27-dev/rag-rat#42", 10).unwrap();
+    assert!(
+        evidence.iter().any(|item| item.project == "cq27-dev/rag-rat" && item.item_key == "42")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn production_discovery_persists_refs_for_every_configured_tracker() {
+    let (root, config) = markdown_config(
+        "# Links\nGitLab group/sub/repo#7 and group/sub/repo!7 plus Jira PROJ-42 annotate this \
+         file.\n",
+    );
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let ctx = papertrail::PapertrailContext {
+        trackers: vec![
+            papertrail::ResolvedTracker {
+                provider: papertrail::Tracker::Gitlab,
+                project: "group/sub/repo".to_string(),
+                base_url: None,
+                auth: None,
+                tags: Vec::new(),
+            },
+            papertrail::ResolvedTracker {
+                provider: papertrail::Tracker::Jira,
+                project: "PROJ".to_string(),
+                base_url: Some("https://example.atlassian.net".to_string()),
+                auth: None,
+                tags: Vec::new(),
+            },
+        ],
+        github_cli_available: false,
+    };
+
+    sync_from_refs_blocking(db.storage.connection(), &root, Some(&MockGitHubClient), true, &ctx)
+        .unwrap();
+
+    let refs = db.papertrail_refs_for_path("docs/search.md", 10).unwrap();
+    assert!(refs.iter().any(|reference| {
+        reference.tracker == papertrail::Tracker::Gitlab
+            && reference.project == "group/sub/repo"
+            && reference.item_key == "7"
+            && reference.item_kind == Some(papertrail::ItemKind::Issue)
+    }));
+    assert!(refs.iter().any(|reference| {
+        reference.tracker == papertrail::Tracker::Gitlab
+            && reference.project == "group/sub/repo"
+            && reference.item_key == "7"
+            && reference.item_kind == Some(papertrail::ItemKind::ChangeRequest)
+    }));
+    assert!(refs.iter().any(|reference| {
+        reference.tracker == papertrail::Tracker::Jira
+            && reference.project == "PROJ"
+            && reference.item_key == "PROJ-42"
+    }));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn papertrail_for_commit_prefers_commit_sourced_tracker_refs() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
@@ -299,6 +500,8 @@ fn parser_failures_report_paths() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("broken.rs"), "pub fn broken(").unwrap();
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -338,10 +541,11 @@ fn parser_failures_report_paths() {
 fn v060_creates_the_papertrail_tables_on_fresh_apply() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V060 is the schema tip — this test carries the absolute pin (the older tests dropped to
-    // the symbolic `current_version == LATEST` check).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 60, "V060 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 60, "schema at LATEST after apply");
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "fresh apply reaches the current schema tip",
+    );
     for table in [
         "papertrail_items",
         "papertrail_comments",
@@ -374,10 +578,10 @@ fn v060_creates_the_papertrail_tables_on_fresh_apply() {
     schema::apply(&conn).unwrap();
     assert!(conn_table_exists(&conn, "papertrail_items"), "survives re-apply");
 
-    // A V059 ledger advances through the new papertrail step and records V060 as the tip.
+    // A V059 ledger advances through both papertrail steps and reaches the current tip.
     truncate_schema_to(&conn, 59);
     schema::migrate_forward(&conn).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 60);
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 }
 
 /// The load-bearing multi-repo invariant carried over from V044/V045: two repos can each cache
@@ -971,6 +1175,7 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
     assert_eq!(projects, 3, "tracker/project derive from the legacy owner/repo columns");
 
     let migrated_ref = |item_key: &str| papertrail::PapertrailRef {
+        item_kind: None,
         tracker: papertrail::Tracker::Github,
         project: "o/r".to_string(),
         item_key: item_key.to_string(),

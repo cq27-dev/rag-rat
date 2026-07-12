@@ -632,6 +632,8 @@ mod tests {
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("docs/a.md"), "# Title\nalpha token\n").unwrap();
         let config = Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -691,6 +693,8 @@ mod tests {
         git(&main, &["add", "-A"]);
         git(&main, &["commit", "-qm", "base"]);
         let config = Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: main.clone(),
@@ -772,6 +776,8 @@ mod tests {
         git(&main, &["add", "-A"]);
         git(&main, &["commit", "-qm", "base"]);
         let config = Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: main.clone(),
@@ -851,6 +857,8 @@ mod tests {
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-qm", "base"]);
         let config = Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -921,6 +929,8 @@ mod tests {
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-qm", "base"]);
         let config = Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -995,6 +1005,8 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         let config = Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -1070,6 +1082,8 @@ mod tests {
         )
         .unwrap();
         let config = Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),

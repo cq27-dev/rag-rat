@@ -53,6 +53,8 @@ pub fn temp_db_path() -> PathBuf {
 /// A Config indexing `subdir` of the corpus into a fresh temp DB.
 pub fn bench_config(subdir: &str) -> Config {
     Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: corpus_dir(),

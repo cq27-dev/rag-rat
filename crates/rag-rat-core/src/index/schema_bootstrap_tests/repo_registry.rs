@@ -2726,6 +2726,7 @@ fn a_syncing_repo_is_isolated_from_stranded_placeholder_papertrail_rows() {
     // and refetches the item with fresh content. The incremental FTS writer refreshes only
     // repo-a's own mirror row.
     let reference = crate::index::papertrail::PapertrailRef {
+        item_kind: None,
         tracker: crate::index::papertrail::Tracker::Github,
         project: "o/r".to_string(),
         item_key: "7".to_string(),

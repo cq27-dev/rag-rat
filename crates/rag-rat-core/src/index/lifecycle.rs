@@ -175,9 +175,10 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             active_generation: 0,
-            // Real usage: resolve the GitHub repo context from the local `gh` CLI here, at the
-            // boundary. rebuild/open (used by tests and the bare index command) leave it offline.
-            papertrail: papertrail::PapertrailContext::from_gh(),
+            // Real usage: resolve the tracker context (config bindings, or auto-detect from the
+            // git remote) here, at the boundary. rebuild/open (used by tests and the bare index
+            // command) leave it offline.
+            papertrail: papertrail::PapertrailContext::resolve(config),
             config: Some(config.clone()),
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
@@ -344,7 +345,7 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             active_generation: 0,
-            papertrail: papertrail::PapertrailContext::from_gh(),
+            papertrail: papertrail::PapertrailContext::resolve(config),
             config: Some(config.clone()),
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
@@ -381,8 +382,12 @@ impl IndexDatabase {
 
     /// Set the GitHub repo context explicitly (tests / non-gh callers), so the library never
     /// shells out to `gh`.
-    pub fn set_papertrail_context(&mut self, default_repo: Option<&str>, gh_available: bool) {
-        self.papertrail = papertrail::PapertrailContext::new(default_repo, gh_available);
+    pub fn set_papertrail_context(
+        &mut self,
+        default_repo: Option<&str>,
+        github_cli_available: bool,
+    ) {
+        self.papertrail = papertrail::PapertrailContext::new(default_repo, github_cli_available);
     }
 
     pub fn migrate(path: &Path) -> anyhow::Result<schema::SchemaStatus> {

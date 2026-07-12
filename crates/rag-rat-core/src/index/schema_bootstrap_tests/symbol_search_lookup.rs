@@ -521,6 +521,8 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
     )
     .unwrap();
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -1298,6 +1300,8 @@ where
     )
     .unwrap();
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

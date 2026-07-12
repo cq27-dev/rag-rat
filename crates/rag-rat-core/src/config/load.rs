@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use super::{
-    self as config, Config, ConfigError, LlmConfig, LogConfig, MemoryConfig, RawConfig, RawTarget,
-    ResolvedTarget, TargetKind,
+    self as config, Config, ConfigError, LlmConfig, LogConfig, MemoryConfig, PapertrailConfig,
+    RawConfig, RawTarget, ResolvedTarget, TargetKind, TrackerConfig,
 };
 use crate::language::Language;
 
@@ -101,15 +101,7 @@ impl Config {
         // The `[local_ai]` / `[dream]` rejections are part of local validity — see the
         // `RawConfig` presence-capture fields.
         let local_parse: Result<RawConfig, ConfigError> =
-            toml::from_str::<RawConfig>(&text).map_err(ConfigError::from).and_then(|raw| {
-                if raw.local_ai.is_some() {
-                    Err(ConfigError::LocalAiTableRenamed)
-                } else if raw.dream.is_some() {
-                    Err(ConfigError::DreamTableMoved)
-                } else {
-                    Ok(raw)
-                }
-            });
+            toml::from_str::<RawConfig>(&text).map_err(ConfigError::from).and_then(validate_raw);
         let local_config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         // The topology subject must be a discoverable directory: a RELATIVE config path like
         // `rag-rat.toml` has the EMPTY path as its parent (`Path::parent` yields `Some("")`, not
@@ -272,6 +264,9 @@ impl Config {
         let oracle = raw.oracle.into();
         let search = raw.search.into();
         let memory = MemoryConfig::try_from(raw.memory)?;
+        let trackers =
+            raw.tracker.into_iter().map(TrackerConfig::try_from).collect::<Result<Vec<_>, _>>()?;
+        let papertrail = PapertrailConfig::default();
         let mut log = LogConfig::try_from(raw.log)?;
         // Finalize `dir`: empty (unset) → sibling of the db (`<db_parent>/logs`); a set value is
         // resolved relative to the GOVERNING config dir (absolute honored).
@@ -293,6 +288,8 @@ impl Config {
             oracle,
             search,
             memory,
+            trackers,
+            papertrail,
             log,
             repo_id_override,
             database_key_pinned,
@@ -316,14 +313,24 @@ fn governing_main_config(main_top: &Path) -> Result<Option<(RawConfig, PathBuf)>
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    let raw: RawConfig = toml::from_str(&text)?;
+    let raw = validate_raw(toml::from_str(&text)?)?;
+    Ok(Some((raw, main_top)))
+}
+
+/// Presence-captured retired/reserved tables are invalid regardless of which checkout's config
+/// wins the governing seam. Keep this validation single-sourced so loading the same config from
+/// main and from a linked worktree cannot disagree.
+fn validate_raw(raw: RawConfig) -> Result<RawConfig, ConfigError> {
     if raw.local_ai.is_some() {
         return Err(ConfigError::LocalAiTableRenamed);
     }
     if raw.dream.is_some() {
         return Err(ConfigError::DreamTableMoved);
     }
-    Ok(Some((raw, main_top)))
+    if raw.papertrail.is_some() {
+        return Err(ConfigError::PapertrailSchedulingNotSupported);
+    }
+    Ok(raw)
 }
 
 pub(crate) fn resolve_targets(

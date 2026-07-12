@@ -137,6 +137,31 @@ pub enum ConfigError {
     UnknownLogFormat(String),
     #[error("[memory] `surface` must be `full` or `summary` (got `{0}`)")]
     UnknownMemorySurface(String),
+    #[error(
+        "each [[tracker]] binding requires a `provider` (`github`, `gitlab`, `bitbucket`, or \
+         `jira`)"
+    )]
+    TrackerProviderMissing,
+    #[error(
+        "[[tracker]] `provider` must be one of `github`, `gitlab`, `bitbucket`, or `jira` (got \
+         `{0}`)"
+    )]
+    UnknownTrackerProvider(String),
+    #[error("[[tracker]] `provider = \"jira\"` requires an explicit `project`")]
+    JiraTrackerRequiresProject,
+    #[error("[[tracker]] `project = \"{project}\"` is not valid for provider `{provider}`")]
+    InvalidTrackerProject { provider: &'static str, project: String },
+    #[error("[[tracker]] `auth` requires exactly one of `env` or `token_command`")]
+    TrackerAuthExactlyOne,
+    #[error("[[tracker]] `base_url` must be an http(s) URL (got `{0}`)")]
+    TrackerBaseUrlNotHttp(String),
+    #[error("[[tracker]] `base_url` must not embed credentials in the URL")]
+    TrackerBaseUrlHasCredentials,
+    #[error(
+        "[papertrail] scheduling settings are not supported until the provider mirror scheduler \
+         is active"
+    )]
+    PapertrailSchedulingNotSupported,
 }
 
 pub use discovery::{
@@ -153,9 +178,9 @@ pub(crate) use raw::{RawMemory, RawOracle, RawSearch, RawVersionCheck, RawWatch}
 pub use types::{
     Config, DEFAULT_QUERY_ENDPOINT, DreamLlmConfig, EmbeddingBackend, EmbeddingConfig,
     EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,
-    MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, RemoteBackend,
-    RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, TargetKind,
-    VersionCheckConfig, WatchConfig,
+    MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, PapertrailConfig,
+    RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget, SearchConfig,
+    TargetKind, Tracker, TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig,
 };
 
 #[cfg(test)]

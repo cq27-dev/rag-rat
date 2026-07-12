@@ -22,6 +22,8 @@ pub struct Config {
     pub oracle: OracleConfig,
     pub search: SearchConfig,
     pub memory: MemoryConfig,
+    pub trackers: Vec<TrackerConfig>,
+    pub papertrail: PapertrailConfig,
     /// Optional `[index] repo_id` override for the consolidated global store — pins the repo's
     /// identity instead of deriving it from the root-commit hash. `None` = derive. Consumed by
     /// `crate::repo_identity::resolve_repo_identity`. An EXPLICIT `database` path never depends on
@@ -46,6 +48,87 @@ pub struct Config {
     /// `index --allow-empty` flag sets this `true`; every other caller (watcher, git-hook
     /// `maintenance`, MCP, init) leaves it `false`. Not read from TOML — set per invocation.
     pub allow_empty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackerConfig {
+    pub provider: Tracker,
+    pub project: Option<String>,
+    pub remote: String,
+    pub base_url: Option<String>,
+    pub auth: Option<TrackerAuth>,
+    pub tags: Vec<String>,
+}
+
+/// One provider identity shared by configuration, runtime bindings, and every persisted
+/// `papertrail_*` key. Database parsing is exact and closed; config parsing is deliberately
+/// case-insensitive at the user-input boundary.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum Tracker {
+    Github,
+    Gitlab,
+    Bitbucket,
+    Jira,
+}
+
+impl Tracker {
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown tracker token `{value}`"))
+    }
+    pub(crate) fn parse_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "github" => Some(Self::Github),
+            "gitlab" => Some(Self::Gitlab),
+            "bitbucket" => Some(Self::Bitbucket),
+            "jira" => Some(Self::Jira),
+            _ => None,
+        }
+    }
+    pub fn is_code_host(self) -> bool {
+        !matches!(self, Self::Jira)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackerAuth {
+    Env(String),
+    TokenCommand(String),
+}
+
+/// Reserved scheduler defaults. User overrides remain rejected until the provider mirror
+/// scheduler consumes them; retaining the typed defaults keeps the runtime contract explicit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PapertrailConfig {
+    pub probe_interval_secs: u64,
+    pub sync_min_interval_secs: u64,
+    pub full_sync_interval_secs: u64,
+    pub rate_limit_reserve: f64,
+}
+
+impl Default for PapertrailConfig {
+    fn default() -> Self {
+        Self {
+            probe_interval_secs: 900,
+            sync_min_interval_secs: 900,
+            full_sync_interval_secs: 86_400,
+            rate_limit_reserve: 0.35,
+        }
+    }
 }
 
 /// Search-ranking knobs (`[search]`). Default OFF so the shipped fuse is byte-identical to today;

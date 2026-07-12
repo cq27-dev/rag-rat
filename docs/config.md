@@ -556,3 +556,59 @@ surface = "summary"   # default; or "full" — return whole bodies everywhere
 the body), and the grep-augmentation hook context. A memory with no summary for its current body
 falls back to title-only. `memory show` / `memory_show` **always** return the full body, regardless
 of this setting — it is the expand path.
+
+## Issue trackers (`[[tracker]]`) and papertrail sync (`[papertrail]`)
+
+`[[tracker]]` binds the repo to the issue tracker(s) whose items annotate its papertrail. It is
+list-valued: one repo can bind a code host **and** Jira at the same time.
+
+```toml
+[[tracker]]
+provider = "github"            # github | gitlab | bitbucket | jira
+# project = "owner/repo"       # default: derived from the git remote; jira: the project KEY
+# remote = "origin"            # which git remote to derive `project` from
+# base_url = "https://gitlab.example.com"   # self-hosted / enterprise instance
+# auth = { env = "GITLAB_TOKEN" }           # or { token_command = "glab auth token" }
+# tags = ["bug", "perf"]       # tracked tags/labels; empty or missing = track ALL
+```
+
+**Zero-config default.** With no `[[tracker]]` at all, the binding is auto-detected from the git
+`origin` remote URL (ssh and https forms alike): a `github.com` remote binds GitHub, a `gitlab.*`
+host (gitlab.com or self-hosted — the base URL is taken from the host) binds GitLab, and
+`bitbucket.org` binds Bitbucket. Most repos never need a `[[tracker]]` section. Writing one
+**replaces** auto-detection entirely.
+
+Per-key notes:
+
+- `provider` — required, one of `github` / `gitlab` / `bitbucket` / `jira`.
+- `project` — optional for the code hosts (derived from the git remote named by `remote`,
+  default `origin`); GitLab keeps full subgroup paths (`group/sub/repo`). **Required for Jira**
+  (the project key, e.g. `PROJ`): Jira is not a code host, so it is never auto-detected and has
+  no remote to derive from.
+- `base_url` — self-hosted / enterprise instances (`https://gitlab.example.com`). Must be an
+  http(s) URL without inline credentials. Self-hosted GitHub Enterprise and Bitbucket instances
+  are configured this way — only the three cloud hosts auto-detect.
+- `auth` — exactly one of `env` (the NAME of an env var holding the token — never the token
+  itself) or `token_command` (a command printing the token to stdout). Omitted = anonymous /
+  provider-native fallback.
+- `tags` — the tracked subset, OR-matched case-insensitively against the provider's label-like
+  facets (labels on GitHub/GitLab; labels + components on Jira; kind + component on Bitbucket
+  issues). Empty or missing tracks everything; item kinds with no tag facet (e.g. Bitbucket pull
+  requests) are always tracked. The normalized list is fingerprinted into the sync cursor, so
+  widening the list restarts the backfill and narrowing prunes.
+
+Ref grammar per provider (what the annotation layer recognizes in commits, files, and branch
+names): GitHub `#N` / `GH-N` / `owner/repo#N` / issue+PR URLs; GitLab `#N` (issues), `!N` (merge
+requests), `namespace/path#N` / `!N` with subgroups, and `/-/issues/N` / `/-/merge_requests/N`
+URLs; Bitbucket `#N` (issues) and `/issues/N` / `/pull-requests/N` URLs; Jira bare keys
+(`PROJ-123`) for the bound project. A bare `#N` resolves against the first code-host binding
+only. A self-hosted binding's URL grammar matches its own host, not the cloud host.
+
+On the `#588` schema stack, all bindings participate in production reference discovery and
+annotation lookup, but the live network client remains GitHub-only. GitLab, Bitbucket, and Jira
+refs are persisted without being sent through the GitHub client. Parallel per-binding mirror sync
+lands with the shared provider transport from `#589`; until then these settings describe the
+stable configuration/cursor contract, not an already-active non-GitHub network mirror.
+
+The `[papertrail]` cadence and rate-governance keys land with the provider mirror scheduler; they
+are intentionally not accepted before that production path can consume them.

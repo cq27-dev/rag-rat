@@ -23,7 +23,17 @@ pub(crate) async fn sync_from_refs_with_progress<C: PapertrailClient>(
         SyncRefsReport::default()
     } else {
         let client = client.ok_or_else(|| anyhow::anyhow!("papertrail sync requires a client"))?;
-        sync_refs(conn, client, refs.iter(), &mut progress).await?
+        // The stacked schema lets production discovery persist every provider's refs. Live
+        // transport is still GitHub-only until #589 lands, so never send another provider's
+        // identity through GitHubClient. Multi-provider mirror dispatch is the remaining #590
+        // sync slice, intentionally outside this config/grammar PR.
+        sync_refs(
+            conn,
+            client,
+            refs.iter().filter(|reference| reference.tracker == Tracker::Github),
+            &mut progress,
+        )
+        .await?
     };
     let repo_id = schema::active_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, "papertrail_last_sync_ms", &now_ms().to_string())?;
@@ -46,6 +56,7 @@ pub(crate) async fn sync_issue<C: PapertrailClient>(
 ) -> anyhow::Result<PapertrailSyncReport> {
     let parsed = parse_issue_ref(issue_ref, ctx.default_repo())
         .ok_or_else(|| anyhow::anyhow!("invalid tracker item reference `{issue_ref}`"))?;
+    let project = parsed.project.clone();
     let item_key = parsed.number.to_string();
     store_ref(conn, &parsed.into_ref("manual", None, None, issue_ref.to_string()))?;
     let refs = refs(conn)?;
@@ -53,7 +64,17 @@ pub(crate) async fn sync_issue<C: PapertrailClient>(
         SyncRefsReport::default()
     } else {
         let client = client.ok_or_else(|| anyhow::anyhow!("papertrail sync requires a client"))?;
-        sync_refs(conn, client, refs.iter().filter(|r| r.item_key == item_key), &mut |_| {}).await?
+        sync_refs(
+            conn,
+            client,
+            refs.iter().filter(|reference| {
+                reference.tracker == Tracker::Github
+                    && reference.project == project
+                    && reference.item_key == item_key
+            }),
+            &mut |_| {},
+        )
+        .await?
     };
     let repo_id = schema::active_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, "papertrail_last_sync_ms", &now_ms().to_string())?;
@@ -89,7 +110,7 @@ pub(crate) fn status(
         comments: scoped_table_row_count(conn, "papertrail_comments", &repo_id)?,
         last_sync_ms: repo_meta(conn, &repo_id, "papertrail_last_sync_ms")?
             .and_then(|value| value.parse().ok()),
-        capability: if ctx.gh_available {
+        capability: if ctx.github_cli_available {
             "gh_cli_available".to_string()
         } else {
             "gh_cli_missing".to_string()
@@ -111,14 +132,27 @@ pub(crate) fn rationale_search(
     ctx: &PapertrailContext,
 ) -> anyhow::Result<Vec<PapertrailEvidence>> {
     let mut evidence = Vec::new();
-    for parsed in parse_refs(query, ctx.default_repo()) {
+    for parsed in parse_tracker_refs(query, &ctx.trackers) {
         evidence.extend(evidence_for_item(
             conn,
-            Tracker::Github,
+            parsed.provider,
             &parsed.project,
-            &parsed.number.to_string(),
+            &parsed.item_key,
+            parsed.item_kind,
             limit,
         )?);
+    }
+    if ctx.trackers.is_empty() {
+        for parsed in parse_refs(query, None) {
+            evidence.extend(evidence_for_item(
+                conn,
+                Tracker::Github,
+                &parsed.project,
+                &parsed.number.to_string(),
+                None,
+                limit,
+            )?);
+        }
     }
     evidence.extend(search_fts(conn, query, None, limit)?);
     dedupe_evidence(&mut evidence);
@@ -133,8 +167,8 @@ pub(crate) fn refs_for_path(
     let repo_id = schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
-        SELECT tracker, project, item_key, ref_kind, source_kind, source_path, source_commit, \
-         source_text
+        SELECT tracker, project, item_key, item_kind, ref_kind, source_kind, source_path, \
+         source_commit, source_text
         FROM papertrail_refs
         WHERE source_path = ?1 AND repo_id = ?3
         ORDER BY id DESC

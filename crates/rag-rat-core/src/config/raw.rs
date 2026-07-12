@@ -7,7 +7,8 @@ use super::{
     ConfigError, DEFAULT_QUERY_ENDPOINT, DreamLlmConfig, EmbeddingBackend, EmbeddingConfig,
     EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,
     MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, RemoteBackend,
-    RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig, VersionCheckConfig, WatchConfig,
+    RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig, Tracker, TrackerAuth, TrackerConfig,
+    VersionCheckConfig, WatchConfig,
 };
 use crate::embedding_models::Backend;
 
@@ -43,10 +44,116 @@ pub(crate) struct RawConfig {
     pub(crate) search: RawSearch,
     #[serde(default)]
     pub(crate) memory: RawMemory,
+    #[serde(default, rename = "tracker")]
+    pub(crate) tracker: Vec<RawTracker>,
+    /// Reserved for the provider mirror scheduler. Capture the table so config cannot silently
+    /// accept cadence/rate knobs before any production path consumes them.
+    #[serde(default)]
+    pub(crate) papertrail: Option<toml::Value>,
     #[serde(default)]
     pub(crate) target_bindings: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "target")]
     pub(crate) target: Vec<RawTarget>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+pub(crate) struct RawTracker {
+    provider: Option<String>,
+    project: Option<String>,
+    remote: Option<String>,
+    base_url: Option<String>,
+    auth: Option<RawTrackerAuth>,
+    tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+struct RawTrackerAuth {
+    env: Option<String>,
+    token_command: Option<String>,
+}
+
+impl TryFrom<RawTracker> for TrackerConfig {
+    type Error = ConfigError;
+    fn try_from(raw: RawTracker) -> Result<Self, Self::Error> {
+        let trimmed = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let provider = match trimmed(raw.provider) {
+            None => return Err(ConfigError::TrackerProviderMissing),
+            Some(p) => Tracker::parse_config(&p).ok_or(ConfigError::UnknownTrackerProvider(p))?,
+        };
+        let project = trimmed(raw.project);
+        if provider == Tracker::Jira && project.is_none() {
+            return Err(ConfigError::JiraTrackerRequiresProject);
+        }
+        if let Some(project) = project.as_deref()
+            && !valid_tracker_project(provider, project)
+        {
+            return Err(ConfigError::InvalidTrackerProject {
+                provider: provider.as_db_str(),
+                project: project.to_string(),
+            });
+        }
+        let base_url = match trimmed(raw.base_url) {
+            None => None,
+            Some(url) => {
+                let Some((scheme, rest)) = url.split_once("://") else {
+                    return Err(ConfigError::TrackerBaseUrlNotHttp(url));
+                };
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                if !matches!(scheme, "http" | "https")
+                    || authority.is_empty()
+                    || authority.starts_with(':')
+                    || authority.chars().any(char::is_whitespace)
+                {
+                    return Err(ConfigError::TrackerBaseUrlNotHttp(url));
+                }
+                if endpoint_authority_has_userinfo(&url) {
+                    return Err(ConfigError::TrackerBaseUrlHasCredentials);
+                }
+                Some(url.trim_end_matches('/').to_string())
+            },
+        };
+        let auth = raw.auth.map(TrackerAuth::try_from).transpose()?;
+        let tags = raw
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        Ok(Self {
+            provider,
+            project,
+            remote: trimmed(raw.remote).unwrap_or_else(|| "origin".to_string()),
+            base_url,
+            auth,
+            tags,
+        })
+    }
+}
+
+fn valid_tracker_project(provider: Tracker, project: &str) -> bool {
+    let parts = project.split('/').collect::<Vec<_>>();
+    match provider {
+        Tracker::Github | Tracker::Bitbucket =>
+            parts.len() == 2 && parts.iter().all(|part| !part.is_empty()),
+        Tracker::Gitlab => parts.len() >= 2 && parts.iter().all(|part| !part.is_empty()),
+        Tracker::Jira =>
+            project.chars().count() >= 2
+                && project.chars().next().is_some_and(|first| first.is_ascii_uppercase())
+                && project.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()),
+    }
+}
+
+impl TryFrom<RawTrackerAuth> for TrackerAuth {
+    type Error = ConfigError;
+    fn try_from(raw: RawTrackerAuth) -> Result<Self, Self::Error> {
+        let trimmed = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        match (trimmed(raw.env), trimmed(raw.token_command)) {
+            (Some(v), None) => Ok(Self::Env(v)),
+            (None, Some(v)) => Ok(Self::TokenCommand(v)),
+            _ => Err(ConfigError::TrackerAuthExactlyOne),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq)]

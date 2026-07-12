@@ -74,6 +74,8 @@ fn git_history_targets() -> Vec<ResolvedTarget> {
 
 fn rag_rat_config(root: &Path) -> Config {
     Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.to_path_buf(),
@@ -199,6 +201,8 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
 
 fn markdown_config_for_root(root: PathBuf) -> Config {
     Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -349,6 +353,8 @@ pub(crate) fn poison_test_config(tag: &str) -> (PathBuf, Config) {
 
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -717,6 +723,8 @@ fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-m", "init"]);
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -848,6 +856,8 @@ fn write_four_renamed_clones(root: &Path) -> IndexDatabase {
 /// fixture) before rebuilding.
 fn four_clone_config(root: &Path) -> Config {
     Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.to_path_buf(),

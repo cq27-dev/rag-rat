@@ -307,6 +307,8 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
         fs::write(root.join("src/pkg/inner/deep").join(name), "pub fn f() {}\n").unwrap();
     }
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -539,6 +541,8 @@ fn dir_tree_truncates_at_max_nodes() {
         fs::write(dir.join("lib.rs"), "pub fn f() {}\n").unwrap();
     }
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -688,6 +692,8 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
         fs::write(root.join("top/mid/y").join(name), "pub fn fy() {}\n").unwrap();
     }
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

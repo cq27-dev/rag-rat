@@ -726,6 +726,8 @@ fn policy_skip_summary_recomputes_exactly_for_a_non_default_char_cap() {
         "// generated data line with sufficient length to matter for the cap xxxxx\n".repeat(80);
     fs::write(root.join("gen/bindings.rs"), &big).unwrap();
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -973,6 +975,8 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
     run_git(&root, &["commit", "-m", "Refresh beta docs"]);
 
     let config = Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

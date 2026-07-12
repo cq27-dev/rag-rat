@@ -3,6 +3,7 @@ mod evidence;
 mod parse;
 mod store;
 mod sync;
+mod trackers;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
@@ -11,40 +12,68 @@ use std::sync::OnceLock;
 pub(crate) use api::*;
 pub(crate) use evidence::*;
 pub(crate) use parse::*;
+pub use parse::{TrackerParsedRef, parse_tracker_refs};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub(crate) use store::*;
 pub(crate) use sync::*;
+pub(crate) use trackers::resolve_trackers;
+pub use trackers::{ResolvedTracker, detect_tracker_from_remote_url, normalized_tags};
 
+pub use crate::config::Tracker;
 use crate::index::now_ms;
 
-/// Resolved GitHub repo context, injected into the sync/query paths instead of being resolved
-/// from the local `gh` CLI inside the library. `gh` is network-bound, non-deterministic under
-/// parallelism, and unauthenticated in CI — so it is resolved ONLY at the real-usage boundary
-/// (`IndexDatabase::open_config`) and never in tests, which pass an explicit context (#60).
+/// Resolved tracker context, injected into the sync/query paths instead of being resolved inside
+/// the library. Resolution runs ONLY at the real-usage boundary (`IndexDatabase::open_config`)
+/// and never in tests, which pass an explicit context (#60): it reads local git state (the
+/// remote URL) plus a `gh --version` capability probe — the old `gh repo view` network shell-out
+/// is gone.
 #[derive(Debug, Clone, Default)]
 pub struct PapertrailContext {
-    /// `owner/repo` used to qualify bare `#N` refs. `None` leaves bare refs unresolved.
-    pub default_repo: Option<String>,
-    /// Whether the `gh` CLI is available (reported as a capability in status).
-    pub gh_available: bool,
+    /// Resolved tracker bindings, in config order (or the single auto-detected code host).
+    /// Production discovery and rationale lookup consume every binding. On the #588 stack the
+    /// network client remains GitHub-only; #589 supplies transport for parallel provider sync.
+    pub trackers: Vec<ResolvedTracker>,
+    /// Whether the `gh` CLI is available (reported as a capability in status; the current
+    /// GitHub client still shells out to it until the native transport lands).
+    pub github_cli_available: bool,
 }
 
 impl PapertrailContext {
-    /// Resolve from the local `gh` CLI. Call ONLY at the real-usage boundary (open_config),
-    /// never inside the library internals or tests.
-    pub(crate) fn from_gh() -> Self {
-        Self { default_repo: default_repo(), gh_available: gh_available() }
+    /// Resolve from the repo config: `[[tracker]]` bindings when present, otherwise a binding
+    /// auto-detected from the git `origin` remote. Call ONLY at the real-usage boundary
+    /// (open_config), never inside the library internals or tests.
+    pub(crate) fn resolve(config: &crate::config::Config) -> Self {
+        Self {
+            trackers: resolve_trackers(&config.trackers, &config.root),
+            github_cli_available: github_cli_available(),
+        }
     }
 
-    /// An explicit context that never touches `gh` — for tests and non-gh callers.
-    pub(crate) fn new(default_repo: Option<&str>, gh_available: bool) -> Self {
-        Self { default_repo: default_repo.map(str::to_string), gh_available }
+    /// An explicit GitHub-repo context that never touches git or `gh` — for tests and non-gh
+    /// callers.
+    pub(crate) fn new(default_repo: Option<&str>, github_cli_available: bool) -> Self {
+        let trackers = default_repo
+            .map(|project| ResolvedTracker {
+                provider: Tracker::Github,
+                project: project.to_string(),
+                base_url: None,
+                auth: None,
+                tags: Vec::new(),
+            })
+            .into_iter()
+            .collect();
+        Self { trackers, github_cli_available }
     }
 
+    /// `owner/repo` qualifying a manually requested legacy GitHub reference. Production
+    /// discovery and rationale parsing use all bindings through [`parse_tracker_refs`].
     fn default_repo(&self) -> Option<&str> {
-        self.default_repo.as_deref()
+        self.trackers
+            .iter()
+            .find(|tracker| tracker.provider == Tracker::Github)
+            .map(|tracker| tracker.project.as_str())
     }
 }
 
@@ -101,6 +130,7 @@ pub struct PapertrailRef {
     pub tracker: Tracker,
     pub project: String,
     pub item_key: String,
+    pub item_kind: Option<ItemKind>,
     pub ref_kind: String,
     pub source_kind: String,
     pub source_path: Option<String>,
@@ -142,41 +172,6 @@ pub struct CurrentSourceEvidence {
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
     pub symbol: Option<String>,
-}
-
-/// The tracker provider a papertrail row belongs to — the persisted `tracker` column of every
-/// `papertrail_*` table. A CLOSED token set: readers reject unknown tokens instead of guessing, so
-/// a new provider lands by adding a variant here (with its exact-token test), never by writing a
-/// free-form string. Only GitHub exists today; GitLab / Bitbucket / Jira arrive with their
-/// provider clients.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    strum::EnumString,
-    strum::IntoStaticStr,
-)]
-#[strum(serialize_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
-pub enum Tracker {
-    Github,
-}
-
-impl Tracker {
-    /// The exact persisted token (`papertrail_*.tracker`).
-    pub fn as_db_str(self) -> &'static str {
-        self.into()
-    }
-
-    /// Parse a persisted token, rejecting anything outside the closed set — a papertrail row with
-    /// an unknown tracker is a bug (or a newer binary's data), never something to coerce.
-    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
-        value.parse().map_err(|_| anyhow::anyhow!("unknown tracker token `{value}`"))
-    }
 }
 
 /// Provider-neutral item kind. GitHub's shared issue/PR numbering is the exception, not the
@@ -511,6 +506,7 @@ impl ParsedRef {
             tracker: Tracker::Github,
             project: self.project,
             item_key: self.number.to_string(),
+            item_kind: None,
             ref_kind: self.kind,
             source_kind: source_kind.to_string(),
             source_path,
@@ -529,9 +525,16 @@ mod token_tests {
     // row read back with a drifted token is a bug to surface, not to coerce.
     #[test]
     fn tracker_tokens_are_exact_and_closed() {
-        assert_eq!(Tracker::Github.as_db_str(), "github");
-        assert_eq!(Tracker::from_db_str("github").unwrap(), Tracker::Github);
-        for rejected in ["GitHub", "GITHUB", " github", "github ", "gitlab", ""] {
+        for (tracker, token) in [
+            (Tracker::Github, "github"),
+            (Tracker::Gitlab, "gitlab"),
+            (Tracker::Bitbucket, "bitbucket"),
+            (Tracker::Jira, "jira"),
+        ] {
+            assert_eq!(tracker.as_db_str(), token);
+            assert_eq!(Tracker::from_db_str(token).unwrap(), tracker);
+        }
+        for rejected in ["GitHub", "GITHUB", " github", "github ", "sourcehut", ""] {
             assert!(Tracker::from_db_str(rejected).is_err(), "must reject `{rejected}`");
         }
     }

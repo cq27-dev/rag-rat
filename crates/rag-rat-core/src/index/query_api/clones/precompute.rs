@@ -1062,6 +1062,8 @@ pub(super) mod tests {
         )
         .unwrap();
         crate::Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),

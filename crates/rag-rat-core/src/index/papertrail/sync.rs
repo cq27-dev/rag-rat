@@ -5,17 +5,21 @@ pub(crate) fn discover_and_store_refs(
     root: &Path,
     ctx: &PapertrailContext,
 ) -> anyhow::Result<Vec<PapertrailRef>> {
-    let default_repo = ctx.default_repo().map(str::to_string);
     let mut refs = Vec::new();
-    discover_commit_refs(conn, default_repo.as_deref(), &mut refs)?;
-    discover_file_refs(conn, root, default_repo.as_deref(), &mut refs)?;
+    discover_commit_refs(conn, &ctx.trackers, &mut refs)?;
+    discover_file_refs(conn, root, &ctx.trackers, &mut refs)?;
     let branch = crate::index::git_context::discover_repo(root)
         .ok()
         .and_then(|repo| repo.head_name().ok().flatten())
         .map(|name| name.shorten().to_string())
         .unwrap_or_default();
-    for parsed in parse_refs(&branch, default_repo.as_deref()) {
+    for parsed in parse_tracker_refs(&branch, &ctx.trackers) {
         refs.push(parsed.into_ref("branch", None, None, branch.clone()));
+    }
+    if ctx.trackers.is_empty() {
+        for parsed in parse_refs(&branch, None) {
+            refs.push(parsed.into_ref("branch", None, None, branch.clone()));
+        }
     }
     let mut unique = BTreeSet::new();
     refs.retain(|r| {
@@ -23,6 +27,7 @@ pub(crate) fn discover_and_store_refs(
             r.tracker.as_db_str(),
             r.project.clone(),
             r.item_key.clone(),
+            r.item_kind.map(ItemKind::as_db_str),
             r.source_kind.clone(),
             r.source_path.clone(),
             r.source_commit.clone(),
@@ -42,7 +47,12 @@ pub(crate) async fn sync_refs<'a, C: PapertrailClient>(
 ) -> anyhow::Result<SyncRefsReport> {
     let refs = refs.collect::<Vec<_>>();
     let identity = |reference: &PapertrailRef| {
-        (reference.tracker.as_db_str(), reference.project.clone(), reference.item_key.clone())
+        (
+            reference.tracker.as_db_str(),
+            reference.project.clone(),
+            reference.item_kind.map(ItemKind::as_db_str),
+            reference.item_key.clone(),
+        )
     };
     let total = refs.iter().map(|reference| identity(reference)).collect::<BTreeSet<_>>().len();
     let mut report = SyncRefsReport::default();
@@ -163,7 +173,7 @@ pub(crate) fn is_not_found_error(message: &str) -> bool {
 }
 pub(crate) fn discover_commit_refs(
     conn: &Connection,
-    default_repo: Option<&str>,
+    trackers: &[ResolvedTracker],
     out: &mut Vec<PapertrailRef>,
 ) -> anyhow::Result<()> {
     // `git_commits` is direct-scoped (V040), so discovery only mines the ACTIVE repo's commit
@@ -178,8 +188,13 @@ pub(crate) fn discover_commit_refs(
     for row in rows {
         let (hash, subject, body) = row?;
         for text in [subject, body] {
-            for parsed in parse_refs(&text, default_repo) {
+            for parsed in parse_tracker_refs(&text, trackers) {
                 out.push(parsed.into_ref("commit", None, Some(hash.clone()), text.clone()));
+            }
+            if trackers.is_empty() {
+                for parsed in parse_refs(&text, None) {
+                    out.push(parsed.into_ref("commit", None, Some(hash.clone()), text.clone()));
+                }
             }
         }
     }
@@ -188,7 +203,7 @@ pub(crate) fn discover_commit_refs(
 pub(crate) fn discover_file_refs(
     conn: &Connection,
     root: &Path,
-    default_repo: Option<&str>,
+    trackers: &[ResolvedTracker],
     out: &mut Vec<PapertrailRef>,
 ) -> anyhow::Result<()> {
     let mut stmt = conn.prepare("SELECT path FROM files ORDER BY path")?;
@@ -199,13 +214,23 @@ pub(crate) fn discover_file_refs(
             continue;
         };
         for line in text.lines() {
-            for parsed in parse_refs(line, default_repo) {
+            for parsed in parse_tracker_refs(line, trackers) {
                 out.push(parsed.into_ref(
                     "file",
                     Some(path.clone()),
                     None,
                     line.trim().to_string(),
                 ));
+            }
+            if trackers.is_empty() {
+                for parsed in parse_refs(line, None) {
+                    out.push(parsed.into_ref(
+                        "file",
+                        Some(path.clone()),
+                        None,
+                        line.trim().to_string(),
+                    ));
+                }
             }
         }
     }
