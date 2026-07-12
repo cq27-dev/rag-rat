@@ -41,7 +41,7 @@ pub(crate) fn account_ingest(
     signed_bytes: &[u8],
     now_ms: i64,
 ) -> anyhow::Result<IngestOutcome> {
-    // Structure + §18a size + canonicity (never stored on failure).
+    // Structure + §18a size + canonicity (never stored on failure). No DB touch yet.
     let signed = match envelope::decode_account_signed(signed_bytes) {
         Ok(signed) => signed,
         Err(err) => return Ok(IngestOutcome::Rejected(err.to_string())),
@@ -49,17 +49,25 @@ pub(crate) fn account_ingest(
     let account_id = signed.header.account_id;
     let device_fp = signed.header.device_fingerprint;
 
+    // One IMMEDIATE transaction spans resolution → park-or-store → promote → refold. The write
+    // lock is what makes the park decision race-free: a concurrent ingest on another connection
+    // cannot commit a resolving DeviceAdd between our device-set read and our pre-verify insert,
+    // so an entry is never parked after its only promotion trigger has already passed.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+
     // Resolve the signer's ed25519 pubkey content-addressedly: from stored genesis/DeviceAdd
     // candidates for this account, plus THIS entry if it self-certifies (a genesis / a DeviceAdd of
-    // its own signer). Unresolvable ⇒ pre-verify queue.
-    let mut pubkeys = stored_device_pubkeys(conn, account_id)?;
+    // its own signer). Unresolvable ⇒ pre-verify queue (durably, under the same lock).
+    let mut pubkeys = stored_device_pubkeys(&tx, account_id)?;
     add_self_pubkey(&mut pubkeys, &signed.header, &signed.payload);
     let Some(pubkey_bytes) = pubkeys.get(&device_fp).copied() else {
-        insert_pre_verify(conn, &signed.entry_hash, account_id, device_fp, signed_bytes, now_ms)?;
+        insert_pre_verify(&tx, &signed.entry_hash, account_id, device_fp, signed_bytes, now_ms)?;
+        tx.commit()?;
         return Ok(IngestOutcome::PreVerify);
     };
 
-    // Verify the signature under the resolved key (also re-binds fingerprint == sha256(pk)).
+    // Verify the signature under the resolved key (also re-binds fingerprint == sha256(pk)). A
+    // failure here has written nothing, so dropping the txn rolls back cleanly.
     let Ok(pubkey) = DevicePublic::from_bytes(&pubkey_bytes) else {
         return Ok(IngestOutcome::Rejected("resolved device key is not a valid point".into()));
     };
@@ -77,7 +85,6 @@ pub(crate) fn account_ingest(
         ));
     }
 
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     insert_candidate(&tx, &verified, signed_bytes, now_ms)?;
     // A DeviceAdd/genesis may resolve devices that were parked — retry their pre-verify rows.
     if is_genesis(&verified.header) || is_device_add(&verified) {
@@ -111,15 +118,17 @@ fn refold_in_tx(
     let history = fold::fold_account(&entries);
 
     // Branch selection: an entry is a candidate for `accepted` iff the fold makes it effective;
-    // when two effective entries collide on one (device, seq) slot (an unforced fork the
+    // when two effective entries collide on one (log, device, seq) slot (an unforced fork the
     // registers did not resolve), the lexicographically-smaller entry_hash wins the slot and
-    // the loser is `forked` (I10a). Register-named branches were already promoted inside the
-    // fold (off-branch → condemned).
-    let mut slot_winner: HashMap<(DeviceFingerprint, u64), [u8; 32]> = HashMap::new();
+    // the loser is `forked` (I10a). The slot key mirrors the account_accepted_slot unique index
+    // exactly — including log_id, so a future effective non-control-log entry can never be
+    // mistaken for a control-log rival at the same (device, seq). Register-named branches were
+    // already promoted inside the fold (off-branch → condemned).
+    let mut slot_winner: HashMap<(u8, DeviceFingerprint, u64), [u8; 32]> = HashMap::new();
     for row in &rows {
         if history.outcome(&row.entry_hash).is_some_and(|o| o.is_effective()) {
             slot_winner
-                .entry((row.device_fingerprint, row.seq))
+                .entry((row.log_id, row.device_fingerprint, row.seq))
                 .and_modify(|best| {
                     if row.entry_hash < *best {
                         *best = row.entry_hash;
@@ -139,7 +148,8 @@ fn refold_in_tx(
     for row in &rows {
         let effective = history.outcome(&row.entry_hash).is_some_and(|o| o.is_effective());
         let accepted = effective
-            && slot_winner.get(&(row.device_fingerprint, row.seq)) == Some(&row.entry_hash);
+            && slot_winner.get(&(row.log_id, row.device_fingerprint, row.seq))
+                == Some(&row.entry_hash);
         let (status, detail): (String, Option<String>) = if accepted {
             ("accepted".to_string(), None)
         } else if effective {
@@ -176,6 +186,7 @@ fn refold_in_tx(
 /// only rather than re-verify — which would need the device set we are loading).
 struct CandidateRow {
     entry_hash: [u8; 32],
+    log_id: u8,
     device_fingerprint: DeviceFingerprint,
     seq: u64,
     verified: VerifiedAccountEntry,
@@ -203,6 +214,7 @@ fn load_candidates(conn: &Connection, account_id: AccountId) -> anyhow::Result<V
             .map_err(|err| anyhow::anyhow!("stored candidate re-decode failed: {err}"))?;
         out.push(CandidateRow {
             entry_hash: fixed(&hash)?,
+            log_id: signed.header.log_id,
             device_fingerprint: DeviceFingerprint::from_bytes(fixed(&fp)?),
             seq: seq as u64,
             verified: VerifiedAccountEntry {
@@ -327,36 +339,57 @@ fn promote_pre_verify(
     account_id: AccountId,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let pubkeys = stored_device_pubkeys(tx, account_id)?;
-    let pending: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = {
-        let mut stmt = tx.prepare(
-            "SELECT entry_hash, claimed_fingerprint, raw_bytes
-             FROM account_pre_verify WHERE claimed_account_id = ?1",
-        )?;
-        stmt.query_map(params![account_id.to_bytes().as_slice()], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for (entry_hash, fp_bytes, raw_bytes) in pending {
-        let fp = DeviceFingerprint::from_bytes(fixed(&fp_bytes)?);
-        let Some(pk_bytes) = pubkeys.get(&fp).copied() else {
-            continue; // still unresolvable
+    // Fixpoint: a promoted genesis/DeviceAdd enlarges the resolvable device set, which can in turn
+    // resolve a DEEPER parked entry (a device chain — founder→B→C — delivered before its
+    // authorizers). Feed each promoted key back and re-scan until a full pass promotes nothing.
+    // Snapshotting the device set once would strand depth≥2 chains forever, so two peers that
+    // received the same entries in different orders would converge on different accepted sets.
+    let mut pubkeys = stored_device_pubkeys(tx, account_id)?;
+    loop {
+        let pending: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT entry_hash, claimed_fingerprint, raw_bytes
+                 FROM account_pre_verify WHERE claimed_account_id = ?1",
+            )?;
+            stmt.query_map(params![account_id.to_bytes().as_slice()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let promoted = DevicePublic::from_bytes(&pk_bytes)
-            .ok()
-            .and_then(|pk| envelope::verify_account_signed(&raw_bytes, &pk).ok())
-            .filter(|v| {
-                !is_genesis(&v.header)
-                    || account_id_from_genesis_payload(&v.payload) == v.header.account_id
-            });
-        if let Some(verified) = promoted {
-            insert_candidate(tx, &verified, &raw_bytes, now_ms)?;
+        let mut promoted_any = false;
+        for (entry_hash, fp_bytes, raw_bytes) in pending {
+            let fp = DeviceFingerprint::from_bytes(fixed(&fp_bytes)?);
+            let Some(pk_bytes) = pubkeys.get(&fp).copied() else {
+                continue; // still unresolvable — may resolve in a later round
+            };
+            let promoted = DevicePublic::from_bytes(&pk_bytes)
+                .ok()
+                .and_then(|pk| envelope::verify_account_signed(&raw_bytes, &pk).ok())
+                .filter(|v| {
+                    !is_genesis(&v.header)
+                        || account_id_from_genesis_payload(&v.payload) == v.header.account_id
+                });
+            if let Some(verified) = promoted {
+                insert_candidate(tx, &verified, &raw_bytes, now_ms)?;
+                // A promoted genesis/DeviceAdd certifies a device key — feed it back so the next
+                // round can resolve entries that were waiting on it.
+                add_self_pubkey(&mut pubkeys, &verified.header, &verified.payload);
+                promoted_any = true;
+            }
+            // Resolved (promoted) or refuted (verify failed): clear it from the queue either way.
+            tx.execute("DELETE FROM account_pre_verify WHERE entry_hash = ?1", params![
+                entry_hash.as_slice()
+            ])?;
         }
-        // Resolved (promoted) or refuted (verify failed): clear it from the queue either way.
-        tx.execute("DELETE FROM account_pre_verify WHERE entry_hash = ?1", params![
-            entry_hash.as_slice()
-        ])?;
+        // A round advances the queue only by promoting (each promotion deletes ≥1 pending row and
+        // adds ≥1 key), so this terminates; a round that promotes nothing new is the fixpoint.
+        if !promoted_any {
+            break;
+        }
     }
     Ok(())
 }
@@ -599,6 +632,47 @@ mod tests {
         let pending: i64 =
             conn.query_row("SELECT COUNT(*) FROM account_pre_verify", [], |r| r.get(0)).unwrap();
         assert_eq!(pending, 0, "the pre-verify queue is drained");
+    }
+
+    #[test]
+    fn a_depth_two_pre_verify_chain_promotes_to_a_fixpoint_when_the_root_arrives() {
+        // A device chain delivered before its authorizers: founder→B (DeviceAdd signed by the
+        // founder) →C (DeviceAdd signed by B). Deliver in REVERSE so both the C-add and the B-add
+        // park. The genesis arrival resolves the founder and promotes the B-add; the newly added B
+        // key must then resolve the parked C-add in the SAME drain (the fixpoint). A one-shot
+        // device-set snapshot would strand the C-add forever — a peer that received the three
+        // entries in forward order would accept it, so the two peers would diverge.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        let b = Dev::new(2);
+        let (add_b_bytes, add_b) =
+            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        // C added by owner B on B's own log (seq 0), authorized by the entry that made B an owner.
+        let c = Dev::new(3);
+        let (add_c_bytes, add_c) =
+            op(acct, &b, 0, None, Some(add_b), &device_add(&c, DeviceRole::Member));
+
+        // Reverse delivery: the C-add parks (B unknown), then the B-add parks (founder unknown).
+        assert_eq!(account_ingest(&conn, &add_c_bytes, NOW).unwrap(), IngestOutcome::PreVerify);
+        assert_eq!(account_ingest(&conn, &add_b_bytes, NOW).unwrap(), IngestOutcome::PreVerify);
+
+        // The genesis resolves the founder → promotes add_b → the fed-back B key promotes add_c.
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+        assert_eq!(status(&conn, &gh).as_deref(), Some("accepted"), "genesis accepted");
+        assert_eq!(
+            status(&conn, &add_b).as_deref(),
+            Some("accepted"),
+            "the B-add promoted (depth 1)"
+        );
+        assert_eq!(
+            status(&conn, &add_c).as_deref(),
+            Some("accepted"),
+            "the C-add promoted transitively (depth 2 — the fixpoint drain)",
+        );
+        let pending: i64 =
+            conn.query_row("SELECT COUNT(*) FROM account_pre_verify", [], |r| r.get(0)).unwrap();
+        assert_eq!(pending, 0, "the pre-verify queue is fully drained");
     }
 
     #[test]
