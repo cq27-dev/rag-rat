@@ -413,15 +413,15 @@ pub(super) mod guards {
     /// Whether every tracker reference in the summary RESOLVES in the indexed papertrail — the only
     /// ref check (no shape lint). A ref that resolves is KEPT (a consumer can expand it via the
     /// papertrail tools); an unresolvable one FAILS the guard. Refs are matched by SET-MEMBERSHIP
-    /// against `github_issues` / `github_pull_requests` (repo-scoped). When the papertrail is EMPTY
-    /// (github sync never ran), the guard is SKIPPED rather than failing everything — otherwise a
-    /// repo with no synced issues could never keep a legitimately-referenced number.
+    /// against `papertrail_items` (repo-scoped; either item kind counts). When the papertrail is
+    /// EMPTY (sync never ran), the guard is SKIPPED rather than failing everything — otherwise a
+    /// repo with no synced items could never keep a legitimately-referenced number.
     fn tracker_refs_resolve(conn: &Connection, summary: &str) -> rusqlite::Result<bool> {
         let refs = extract_tracker_numbers(summary);
         if refs.is_empty() {
             return Ok(true);
         }
-        let scope = schema::periphery_repo_scope(conn, "github_issues")?;
+        let scope = schema::periphery_repo_scope(conn, "papertrail_items")?;
         if papertrail_is_empty(conn, &scope)? {
             return Ok(true);
         }
@@ -448,46 +448,32 @@ pub(super) mod guards {
         numbers
     }
 
-    /// Whether the active repo's papertrail is empty (github sync never ran) — the skip signal.
-    /// Both tables are repo-scoped (V041), so a sibling repo's issues never make THIS repo's
-    /// papertrail read non-empty.
+    /// Whether the active repo's papertrail is empty (sync never ran) — the skip signal. The
+    /// table is repo-scoped, so a sibling repo's items never make THIS repo's papertrail read
+    /// non-empty.
     fn papertrail_is_empty(conn: &Connection, scope: &Option<String>) -> rusqlite::Result<bool> {
-        let issue_clause = schema::periphery_repo_scope_clause(scope, "github_issues");
-        let pr_clause = schema::periphery_repo_scope_clause(scope, "github_pull_requests");
+        let item_clause = schema::periphery_repo_scope_clause(scope, "papertrail_items");
         let count: i64 = conn.query_row(
-            &format!(
-                "SELECT (SELECT COUNT(*) FROM github_issues WHERE 1=1{issue_clause}) + (SELECT \
-                 COUNT(*) FROM github_pull_requests WHERE 1=1{pr_clause})"
-            ),
+            &format!("SELECT COUNT(*) FROM papertrail_items WHERE 1=1{item_clause}"),
             [],
             |r| r.get(0),
         )?;
         Ok(count == 0)
     }
 
-    /// Whether `number` exists as an issue OR a pull request in the active repo's papertrail.
+    /// Whether `number` exists as ANY item (issue or change request) in the active repo's
+    /// papertrail. `item_key` is TEXT (provider keys are not uniformly numeric), so the extracted
+    /// number matches by its canonical decimal rendering.
     fn ref_exists(
         conn: &Connection,
         number: i64,
         scope: &Option<String>,
     ) -> rusqlite::Result<bool> {
-        let issue_clause = schema::periphery_repo_scope_clause(scope, "github_issues");
-        let in_issues = conn
-            .query_row(
-                &format!("SELECT 1 FROM github_issues WHERE number = ?1{issue_clause} LIMIT 1"),
-                [number],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if in_issues {
-            return Ok(true);
-        }
-        let pr_clause = schema::periphery_repo_scope_clause(scope, "github_pull_requests");
+        let item_clause = schema::periphery_repo_scope_clause(scope, "papertrail_items");
         Ok(conn
             .query_row(
-                &format!("SELECT 1 FROM github_pull_requests WHERE number = ?1{pr_clause} LIMIT 1"),
-                [number],
+                &format!("SELECT 1 FROM papertrail_items WHERE item_key = ?1{item_clause} LIMIT 1"),
+                [number.to_string()],
                 |_| Ok(()),
             )
             .optional()?
@@ -593,9 +579,10 @@ mod tests {
 
     fn seed_issue(c: &Connection, number: i64, repo_id: &str) {
         c.execute(
-            "INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, \
-             synced_at_ms, repo_id) VALUES ('o','r',?1,'http://x','open','t','b',0,?2)",
-            rusqlite::params![number, repo_id],
+            "INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, \
+             title, body, synced_at_ms, repo_id)
+             VALUES ('github','o/r','issue',?1,'http://x','open','t','b',0,?2)",
+            rusqlite::params![number.to_string(), repo_id],
         )
         .unwrap();
     }
@@ -627,7 +614,7 @@ mod tests {
     fn tracker_ref_guard_skips_when_the_papertrail_is_empty() {
         let c = mem_db();
         set_repo(&c, "r");
-        // No github rows at all (sync never ran) → the ref guard is SKIPPED, so even an
+        // No papertrail items at all (sync never ran) → the ref guard is SKIPPED, so even an
         // otherwise-unresolvable #999 does not fail acceptance.
         assert!(
             guards::accepts(&c, "It fixes the leak from #999. The scope is per-repo. Done now.")

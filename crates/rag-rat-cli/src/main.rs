@@ -110,7 +110,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::ClonesFor(args) => clones_for(&config, &args)?,
         Cmd::Memory(args) => memory(&config, &args)?,
         Cmd::Dream(args) => dream(&config, &args)?,
-        Cmd::Github(args) => papertrail(&config, &args)?,
+        Cmd::Papertrail(args) => papertrail(&config, &args)?,
         Cmd::Hooks(args) => hooks(&config, &args)?,
         Cmd::Maintenance(args) => maintenance(&config, &args)?,
         Cmd::Models(args) => models(&config, &args)?,

@@ -105,7 +105,7 @@ pub(crate) fn print_query_explain(hits: &[SearchHit]) {
             println!("  symbol: {:.3}", components.symbol);
             println!("  graph: {:.3}", components.graph);
             println!("  git: {:.3}", components.git);
-            println!("  github: {:.3}", components.github);
+            println!("  papertrail: {:.3}", components.papertrail);
             if let Some(note) = &components.vector_note {
                 println!("  vector_note: {note}");
             }
@@ -197,29 +197,25 @@ pub(crate) fn render_papertrail_sync_progress(
 ) {
     match progress.action {
         PapertrailSyncAction::Syncing => eprintln!(
-            "github sync: {}/{} fetching {}/{}#{}",
-            progress.current, progress.total, progress.owner, progress.repo, progress.number
+            "papertrail sync: {}/{} fetching {}#{}",
+            progress.current, progress.total, progress.project, progress.item_key
         ),
         PapertrailSyncAction::Skipped => eprintln!(
-            "github sync: {}/{} skip cached {}/{}#{}",
-            progress.current, progress.total, progress.owner, progress.repo, progress.number
+            "papertrail sync: {}/{} skip cached {}#{}",
+            progress.current, progress.total, progress.project, progress.item_key
         ),
         PapertrailSyncAction::Synced => eprintln!(
-            "github sync: {}/{} synced {}/{}#{}",
-            progress.current, progress.total, progress.owner, progress.repo, progress.number
+            "papertrail sync: {}/{} synced {}#{}",
+            progress.current, progress.total, progress.project, progress.item_key
         ),
         PapertrailSyncAction::Failed => eprintln!(
-            "github sync: {}/{} failed {}/{}#{}: {}",
+            "papertrail sync: {}/{} failed {}#{}: {}",
             progress.current,
             progress.total,
-            progress.owner,
-            progress.repo,
-            progress.number,
+            progress.project,
+            progress.item_key,
             progress.message.unwrap_or_else(|| "unknown error".to_string())
         ),
-        PapertrailSyncAction::RebuildingFts => {
-            eprintln!("github sync: rebuilding GitHub FTS cache")
-        },
     }
 }
 /// Print a serializable result in the process-wide output format (TOON by default, JSON under

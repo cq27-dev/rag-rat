@@ -757,7 +757,7 @@ mod tests {
             recent_touch_count: 0,
             additions: 10,
             deletions: 0,
-            github_ref_count: 0,
+            papertrail_ref_count: 0,
             symbol_kinds: BTreeMap::new(),
             memories: RepoBriefMemoryCounts::default(),
         }

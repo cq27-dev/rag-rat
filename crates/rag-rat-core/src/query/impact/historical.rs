@@ -22,11 +22,11 @@ pub(crate) fn historical_evidence(
     if surface.len() >= limit {
         return Ok(());
     }
-    github_refs_for_paths(conn, paths, surface, limit.saturating_sub(surface.len()))?;
+    papertrail_refs_for_paths(conn, paths, surface, limit.saturating_sub(surface.len()))?;
     if surface.len() >= limit {
         return Ok(());
     }
-    github_rationale_for_query(conn, query, surface, limit.saturating_sub(surface.len()))?;
+    papertrail_rationale_for_query(conn, query, surface, limit.saturating_sub(surface.len()))?;
     Ok(())
 }
 
@@ -104,24 +104,24 @@ pub(crate) fn git_commits_for_paths(
     Ok(())
 }
 
-pub(crate) fn github_refs_for_paths(
+pub(crate) fn papertrail_refs_for_paths(
     conn: &Connection,
     paths: &[String],
     surface: &mut ImpactSurface,
     budget: usize,
 ) -> anyhow::Result<()> {
-    // Budget per PATH (one `(path, "github_papertrail")` item per path), not per ref row — same
+    // Budget per PATH (one `(path, "papertrail")` item per path), not per ref row — same
     // item-vs-row reasoning as `git_commits_for_paths` (#150 review).
     if budget == 0 {
         return Ok(());
     }
-    // `github_refs` is direct-scoped (V041): only surface the ACTIVE repo's refs for this path.
+    // `papertrail_refs` is direct-scoped: only surface the ACTIVE repo's refs for this path.
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut added = 0usize;
     let mut stmt = conn.prepare(
         "
-        SELECT owner, repo, number, ref_kind, source_kind, source_text
-        FROM github_refs
+        SELECT tracker, project, item_key, ref_kind, source_kind, source_text
+        FROM papertrail_refs
         WHERE source_path = ?1 AND repo_id = ?3
         ORDER BY id DESC
         LIMIT ?2
@@ -139,7 +139,7 @@ pub(crate) fn github_refs_for_paths(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
@@ -147,12 +147,12 @@ pub(crate) fn github_refs_for_paths(
             },
         )?;
         for row in rows {
-            let (owner, repo, number, ref_kind, source_kind, source_text) = row?;
+            let (tracker, project, item_key, ref_kind, source_kind, source_text) = row?;
             surface.push(
                 ImpactCategory::HistoricalPapertrail,
                 file.clone(),
-                "github_papertrail",
-                format!("{owner}/{repo}#{number} {ref_kind}/{source_kind}: {source_text}"),
+                "papertrail",
+                format!("{tracker}:{project}#{item_key} {ref_kind}/{source_kind}: {source_text}"),
             );
         }
         if surface.len() > before {
@@ -162,7 +162,7 @@ pub(crate) fn github_refs_for_paths(
     Ok(())
 }
 
-pub(crate) fn github_rationale_for_query(
+pub(crate) fn papertrail_rationale_for_query(
     conn: &Connection,
     query: &str,
     surface: &mut ImpactSurface,
@@ -172,14 +172,14 @@ pub(crate) fn github_rationale_for_query(
     if fts_query.is_empty() {
         return Ok(());
     }
-    // `github_fts` is one index over every repo's papertrail; the `repo_id` filter is MANDATORY
-    // (V041) so a MATCH here never surfaces a sibling repo's issue in a consolidated DB.
+    // `papertrail_fts` is one index over every repo's papertrail; the `repo_id` filter is
+    // MANDATORY so a MATCH here never surfaces a sibling repo's issue in a consolidated DB.
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT url, title, classification
-        FROM github_fts
-        WHERE github_fts MATCH ?1 AND repo_id = ?3
+        FROM papertrail_fts
+        WHERE papertrail_fts MATCH ?1 AND repo_id = ?3
         ORDER BY rank
         LIMIT ?2
         ",
@@ -193,12 +193,12 @@ pub(crate) fn github_rationale_for_query(
         surface.push(
             ImpactCategory::HistoricalPapertrail,
             FileSymbol {
-                path: "(github papertrail)".to_string(),
-                language: "github".to_string(),
+                path: "(papertrail)".to_string(),
+                language: "papertrail".to_string(),
                 kind: "papertrail".to_string(),
                 symbol: None,
             },
-            "github_papertrail",
+            "papertrail",
             format!("{classification}: {title} ({url})"),
         );
     }

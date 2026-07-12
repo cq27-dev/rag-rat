@@ -1718,7 +1718,7 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
 }
 
 #[test]
-fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
+fn papertrail_sync_caches_rationale_without_query_time_crawling() {
     let (root, config) =
         markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
     let mut db = IndexDatabase::rebuild(&config).unwrap();
@@ -1744,17 +1744,16 @@ fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
             .unwrap();
     assert!(!report.offline);
     assert_eq!(report.discovered_refs, 1);
-    assert_eq!(report.synced_items, 6);
-    assert_eq!(report.status.issues, 1);
-    assert_eq!(report.status.comments, 2);
-    assert_eq!(report.status.pulls, 1);
-    assert_eq!(report.status.reviews, 1);
-    assert_eq!(report.status.review_comments, 1);
+    // One item (the mock change request — no issue-shadow duplication) + 4 unified comments.
+    assert_eq!(report.synced_items, 5);
+    assert_eq!(report.status.issues, 0);
+    assert_eq!(report.status.change_requests, 1);
+    assert_eq!(report.status.comments, 4);
 
     let issue_hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(issue_hits.len(), 1);
     assert_eq!(issue_hits[0].classification, "decision");
-    assert_eq!(issue_hits[0].evidence_kind, "historical_github");
+    assert_eq!(issue_hits[0].evidence_kind, "historical_tracker");
 
     let refs = db.papertrail_refs_for_path("docs/search.md", 10).unwrap();
     assert_eq!(refs.len(), 1);
@@ -1763,26 +1762,24 @@ fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
     let rationale = db.rationale_search("risk", 10).unwrap();
     assert!(rationale.iter().any(|item| item.classification == "risk"));
     let issue_ref_rationale = db.rationale_search("Fixes #42", 10).unwrap();
-    assert_eq!(issue_ref_rationale.first().map(|item| item.number), Some(42));
+    assert_eq!(issue_ref_rationale.first().map(|item| item.item_key.as_str()), Some("42"));
     assert_eq!(
         issue_ref_rationale.first().map(|item| item.evidence_kind),
-        Some("literal_github_ref")
+        Some("literal_tracker_ref")
     );
     assert_eq!(issue_ref_rationale.first().map(|item| item.score), Some(1.0));
     assert!(
-        issue_ref_rationale.iter().any(|item| item.number == 42),
-        "issue ref rationale should use structured GitHub refs: {issue_ref_rationale:?}"
+        issue_ref_rationale.iter().any(|item| item.item_key == "42"),
+        "issue ref rationale should use structured tracker refs: {issue_ref_rationale:?}"
     );
 
     let chunk_id = first_chunk_id(&db);
     let papertrail = db.papertrail_for_chunk(chunk_id, 10).unwrap().unwrap();
     assert!(papertrail.current_source.is_some());
-    assert!(!papertrail.github_evidence.is_empty());
-    assert!(
-        papertrail.github_evidence.iter().all(|item| {
-            matches!(item.evidence_kind, "historical_github" | "literal_github_ref")
-        })
-    );
+    assert!(!papertrail.evidence.is_empty());
+    assert!(papertrail.evidence.iter().all(|item| {
+        matches!(item.evidence_kind, "historical_tracker" | "literal_tracker_ref")
+    }));
 
     let _ = fs::remove_dir_all(root);
 }

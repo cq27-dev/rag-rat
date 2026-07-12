@@ -113,7 +113,7 @@ fn mcp_stdio_smoke_lists_and_calls_core_tools() {
     );
     let papertrail = response_text_json(recv(&mut reader));
     assert!(papertrail["current_source"].is_object());
-    assert!(papertrail["github_evidence"].is_array());
+    assert!(papertrail["evidence"].is_array());
 
     stop(child);
     fs::remove_dir_all(root).unwrap();

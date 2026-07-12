@@ -16,7 +16,7 @@ pub(crate) fn validate_binding(
         "scip_moniker" => validate_moniker_binding(conn, binding),
         "path" => validate_path_binding(conn, binding, fs_root),
         "dir" => validate_dir_binding(conn, binding, fs_root),
-        "commit" | "github" => Ok("unverified".to_string()),
+        "commit" | "tracker" => Ok("unverified".to_string()),
         _ => Ok("unverified".to_string()),
     }
 }

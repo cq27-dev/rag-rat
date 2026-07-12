@@ -1,42 +1,42 @@
 use super::*;
 
-// KEY SCOPING (V044 + V045, phase A7): every github cache key folds `repo_id`. The `(owner,
-// repo, number)`-style natural keys are `(repo_id, owner, repo, number)` (V044:
-// `github_issues` / `github_pull_requests` UNIQUE, `github_ref_sync` PK, `idx_github_refs_unique`
-// leading column), and the id-keyed CHILD caches (`github_comments` / `github_reviews` /
-// `github_review_comments`) are `(repo_id, id)` unique (V045). So on a consolidated DB two repos
-// referencing the SAME external item each own a full copy — parent AND children — and a conflict
-// only ever fires WITHIN one repo (this repo re-syncing its own item). The natural-key writers'
-// `ON CONFLICT` targets name the widened keys and refresh content in place; the id-keyed writers
-// keep `INSERT OR REPLACE`, which resolves through the widened unique index — a same-repo re-sync
-// replaces in place, a sibling repo's sync inserts its own row, and neither can restamp the
-// other's copy (the pre-V045 last-syncer-owns oscillation: repo A's scoped papertrail lost a
-// shared PR's comments the moment repo B synced). The `github_fts` mirror follows automatically
-// because every sync path ends in the whole-table [`rebuild_fts`], which re-derives each mirror
-// row's `repo_id` from its base row.
+// KEY SCOPING: every papertrail cache key folds `repo_id` (the V044/V045 discipline, carried into
+// the provider-neutral tables). Items key `(repo_id, tracker, project, item_kind, item_key)` —
+// `item_kind` is part of the identity because namespaced providers (GitLab) can hold an issue and
+// a change request under the same key. Comments key `(repo_id, tracker, project, comment_id)`.
+// Refs scope uniqueness through `idx_papertrail_refs_unique` with a leading `repo_id`. So on a
+// consolidated DB two repos referencing the SAME external item each own a full copy — item AND
+// comments — and a conflict only ever fires WITHIN one repo (this repo re-syncing its own rows):
+// the writers' `ON CONFLICT` upserts refresh content in place and can never restamp a sibling
+// repo's copy.
+//
+// FTS MIRROR (incremental): `papertrail_fts` is maintained INCREMENTALLY — each writer deletes and
+// reinserts ONLY its own mirror row(s), keyed the same way as its base row (`doc_kind = 'item'`
+// rows by the item identity, `doc_kind = 'comment'` rows by the comment identity). The
+// whole-table [`rebuild_fts`] survives ONLY for the full re-walk / recovery paths (and the schema
+// migration backfill); routine syncs never pay the whole-mirror cost, which matters once the
+// mirror is a whole-project cache instead of a small referenced-only one.
 
 pub(crate) fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result<()> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
-    // The widened `idx_github_refs_unique` (V044) leads with `repo_id`, so a conflict is always
-    // THIS repo re-discovering its OWN ref — keep the first-sighting row untouched (`DO
-    // NOTHING` preserves the original `discovered_at_ms`/`ref_kind`, the pre-V044 same-repo
-    // semantics). A sibling repo referencing the same `(owner, repo, number)` gets its own
-    // distinct row rather than conflicting, so the old cross-owner reclaim guard is no longer
-    // reachable.
+    // `idx_papertrail_refs_unique` leads with `repo_id`, so a conflict is always THIS repo
+    // re-discovering its OWN ref — keep the first-sighting row untouched (`DO NOTHING` preserves
+    // the original `discovered_at_ms`/`ref_kind`). A sibling repo referencing the same item gets
+    // its own distinct row rather than conflicting.
     conn.execute(
         "
-        INSERT INTO github_refs(
-            owner, repo, number, ref_kind, source_kind, source_path, source_commit, source_text, \
-         discovered_at_ms, repo_id
+        INSERT INTO papertrail_refs(
+            tracker, project, item_key, ref_kind, source_kind, source_path, source_commit, \
+         source_text, discovered_at_ms, repo_id
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-        ON CONFLICT(repo_id, owner, repo, number, source_kind, COALESCE(source_path, ''), \
+        ON CONFLICT(repo_id, tracker, project, item_key, source_kind, COALESCE(source_path, ''), \
          COALESCE(source_commit, ''), source_text) DO NOTHING
         ",
         params![
-            reference.owner,
-            reference.repo,
-            reference.number,
+            reference.tracker.as_db_str(),
+            reference.project,
+            reference.item_key,
             reference.ref_kind,
             reference.source_kind,
             reference.source_path,
@@ -48,69 +48,33 @@ pub(crate) fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow:
     )?;
     Ok(())
 }
-/// Split a normalized item identity back onto the github_* cache key columns. The tables keep
-/// the provider-shaped `(owner, repo, number)` key until the schema normalization; this glue is
-/// the only place that reverse mapping lives.
-fn github_key(project: &str, item_key: &str) -> anyhow::Result<(String, String, i64)> {
-    let (owner, repo) = split_repo(project)
-        .ok_or_else(|| anyhow::anyhow!("malformed papertrail project `{project}`"))?;
-    let number = item_key
-        .parse::<i64>()
-        .map_err(|_| anyhow::anyhow!("non-numeric github item key `{item_key}`"))?;
-    Ok((owner.to_string(), repo.to_string(), number))
-}
-/// Store one normalized item into the github_* cache. Returns the number of rows written: every
-/// item keeps an issue-shadow row (GitHub's shared numbering — a change request IS an issue on
-/// the issues endpoints, and refs resolve through one table regardless of kind), and a change
-/// request additionally refreshes its `github_pull_requests` row.
-pub(crate) fn store_item(conn: &Connection, item: &PapertrailItem) -> anyhow::Result<usize> {
+
+/// Store one normalized item into the papertrail cache: exactly ONE `papertrail_items` row per
+/// item — `item_kind` is part of the identity, so a change request is NOT shadowed by an issue row
+/// (the github_* schema's shared-numbering shadow is gone). The item's own `papertrail_fts` mirror
+/// row is refreshed INCREMENTALLY: delete + reinsert of this item's `doc_kind = 'item'` row only.
+pub(crate) fn store_item(
+    conn: &Connection,
+    tracker: Tracker,
+    item: &PapertrailItem,
+) -> anyhow::Result<()> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
-    let (owner, repo, number) = github_key(&item.project, &item.item_key)?;
     conn.execute(
         "
-        INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, author, \
-         created_at, updated_at, is_pull_request, synced_at_ms, repo_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-        ON CONFLICT(repo_id, owner, repo, number) DO UPDATE SET
-            html_url = excluded.html_url, state = excluded.state, title = excluded.title,
-            body = excluded.body, author = excluded.author, created_at = excluded.created_at,
-            updated_at = excluded.updated_at, is_pull_request = excluded.is_pull_request,
-            synced_at_ms = excluded.synced_at_ms
-        ",
-        params![
-            owner,
-            repo,
-            number,
-            item.url,
-            item.state,
-            item.title,
-            item.body,
-            item.author,
-            item.created_at,
-            item.updated_at,
-            item.item_kind == ItemKind::ChangeRequest,
-            now_ms(),
-            repo_id,
-        ],
-    )?;
-    if item.item_kind != ItemKind::ChangeRequest {
-        return Ok(1);
-    }
-    conn.execute(
-        "
-        INSERT INTO github_pull_requests(owner, repo, number, html_url, state, title, body, \
-         author, created_at, updated_at, merged_at, synced_at_ms, repo_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-        ON CONFLICT(repo_id, owner, repo, number) DO UPDATE SET
-            html_url = excluded.html_url, state = excluded.state, title = excluded.title,
+        INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, title, \
+         body, author, created_at, updated_at, merged_at, synced_at_ms, repo_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        ON CONFLICT(repo_id, tracker, project, item_kind, item_key) DO UPDATE SET
+            url = excluded.url, state = excluded.state, title = excluded.title,
             body = excluded.body, author = excluded.author, created_at = excluded.created_at,
             updated_at = excluded.updated_at, merged_at = excluded.merged_at,
             synced_at_ms = excluded.synced_at_ms
         ",
         params![
-            owner,
-            repo,
-            number,
+            tracker.as_db_str(),
+            item.project,
+            item.item_kind.as_db_str(),
+            item.item_key,
             item.url,
             item.state,
             item.title,
@@ -123,173 +87,161 @@ pub(crate) fn store_item(conn: &Connection, item: &PapertrailItem) -> anyhow::Re
             repo_id,
         ],
     )?;
-    Ok(2)
+    conn.execute(
+        "DELETE FROM papertrail_fts
+         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4
+           AND item_key = ?5 AND doc_kind = 'item'",
+        params![
+            repo_id,
+            tracker.as_db_str(),
+            item.project,
+            item.item_kind.as_db_str(),
+            item.item_key
+        ],
+    )?;
+    insert_fts(conn, FtsRow {
+        tracker: tracker.as_db_str(),
+        project: &item.project,
+        item_kind: item.item_kind.as_db_str(),
+        item_key: &item.item_key,
+        doc_kind: "item",
+        comment_id: "",
+        url: &item.url,
+        title: &item.title,
+        body: &item.body,
+        repo_id: &repo_id,
+    })?;
+    Ok(())
 }
-/// Store one normalized comment into the github_* cache, routed by its markers: a file-anchored
-/// comment lands in `github_review_comments`, a review event in `github_reviews`, and a plain
-/// thread comment in `github_comments`.
-pub(crate) fn store_comment(conn: &Connection, comment: &PapertrailComment) -> anyhow::Result<()> {
+
+/// Store one normalized comment into the unified `papertrail_comments` cache. The old github_*
+/// three-way routing (comments / reviews / review comments) collapses into one row shape: a
+/// review event carries `review_state`, a file-anchored comment carries `anchor_path`, a plain
+/// thread comment carries neither. The comment's own `papertrail_fts` mirror row is refreshed
+/// INCREMENTALLY, keyed by its `(repo_id, tracker, project, comment_id)` identity.
+pub(crate) fn store_comment(
+    conn: &Connection,
+    tracker: Tracker,
+    comment: &PapertrailComment,
+) -> anyhow::Result<()> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
-    let (owner, repo, number) = github_key(&comment.project, &comment.item_key)?;
-    let id = comment
-        .comment_id
-        .parse::<i64>()
-        .map_err(|_| anyhow::anyhow!("non-numeric github comment id `{}`", comment.comment_id))?;
-    if comment.anchor_path.is_some() {
-        conn.execute(
-            "
-            INSERT OR REPLACE INTO github_review_comments(id, owner, repo, number, path, html_url, \
-             body, author, created_at, updated_at, synced_at_ms, repo_id)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-            ",
-            params![
-                id,
-                owner,
-                repo,
-                number,
-                comment.anchor_path,
-                comment.url.as_deref().unwrap_or_default(),
-                comment.body,
-                comment.author,
-                comment.created_at,
-                comment.updated_at,
-                now_ms(),
-                repo_id,
-            ],
-        )?;
-        return Ok(());
-    }
-    if let Some(review_state) = &comment.review_state {
-        conn.execute(
-            "
-            INSERT OR REPLACE INTO github_reviews(id, owner, repo, number, html_url, state, body, \
-             author, submitted_at, synced_at_ms, repo_id)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            ",
-            params![
-                id,
-                owner,
-                repo,
-                number,
-                comment.url,
-                review_state,
-                comment.body,
-                comment.author,
-                comment.created_at,
-                now_ms(),
-                repo_id,
-            ],
-        )?;
-        return Ok(());
-    }
     conn.execute(
         "
-        INSERT OR REPLACE INTO github_comments(id, owner, repo, number, html_url, body, author, \
-         created_at, updated_at, synced_at_ms, repo_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        INSERT INTO papertrail_comments(tracker, project, item_kind, item_key, comment_id, url, \
+         body, author, created_at, updated_at, review_state, anchor_path, synced_at_ms, repo_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        ON CONFLICT(repo_id, tracker, project, comment_id) DO UPDATE SET
+            item_kind = excluded.item_kind, item_key = excluded.item_key, url = excluded.url,
+            body = excluded.body, author = excluded.author, created_at = excluded.created_at,
+            updated_at = excluded.updated_at, review_state = excluded.review_state,
+            anchor_path = excluded.anchor_path, synced_at_ms = excluded.synced_at_ms
         ",
         params![
-            id,
-            owner,
-            repo,
-            number,
-            comment.url.as_deref().unwrap_or_default(),
+            tracker.as_db_str(),
+            comment.project,
+            comment.item_kind.as_db_str(),
+            comment.item_key,
+            comment.comment_id,
+            comment.url,
             comment.body,
             comment.author,
             comment.created_at,
             comment.updated_at,
+            comment.review_state,
+            comment.anchor_path,
             now_ms(),
             repo_id,
         ],
     )?;
-    Ok(())
-}
-pub(crate) fn rebuild_fts(conn: &Connection) -> anyhow::Result<()> {
-    // github_fts is a standalone (own-content) FTS5 table, so a DELETE + re-insert is the correct
-    // rebuild — unlike the external-content chunk_fts / commit_fts, which must rebuild via
-    // INSERT(t) VALUES('rebuild'). This is a WHOLE-TABLE rebuild (every repo's rows in a
-    // consolidated DB): the DELETE clears all rows and each per-kind SELECT re-reads the entire
-    // base table, so github_fts is repopulated complete for EVERY repo, each row stamped its
-    // base row's `repo_id` (V041). The papertrail cache is small, so the whole-table cost is
-    // acceptable — a per-repo incremental rebuild is not worth the bookkeeping. Each query
-    // selects the eight `FtsRow` columns in order (id, owner, repo, number, url, title, body,
-    // repo_id); kinds without a title (comment, review) select an empty string for that slot,
-    // and review comments surface the file path as the title.
-    conn.execute("DELETE FROM github_fts", [])?;
-    insert_fts_rows(
-        conn,
-        "issue",
-        "SELECT id, owner, repo, number, html_url, title, body, repo_id FROM github_issues",
+    conn.execute(
+        "DELETE FROM papertrail_fts
+         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND comment_id = ?4
+           AND doc_kind = 'comment'",
+        params![repo_id, tracker.as_db_str(), comment.project, comment.comment_id],
     )?;
-    insert_fts_rows(
-        conn,
-        "comment",
-        "SELECT id, owner, repo, number, html_url, '', body, repo_id FROM github_comments",
-    )?;
-    insert_fts_rows(
-        conn,
-        "pull",
-        "SELECT id, owner, repo, number, html_url, title, body, repo_id FROM github_pull_requests",
-    )?;
-    insert_fts_rows(
-        conn,
-        "review",
-        "SELECT id, owner, repo, number, COALESCE(html_url, ''), '', body, repo_id FROM \
-         github_reviews",
-    )?;
-    insert_fts_rows(
-        conn,
-        "review_comment",
-        "SELECT id, owner, repo, number, html_url, COALESCE(path, ''), body, repo_id FROM \
-         github_review_comments",
-    )?;
-    Ok(())
-}
-/// Bulk-load one GitHub item kind into `github_fts`. `sql` must select exactly the eight `FtsRow`
-/// columns in order — `id, owner, repo, number, url, title, body, repo_id` — using an empty-string
-/// literal in the title slot for kinds that carry no title. Adding a new item kind is a one-line
-/// call here, not another copy of the load loop.
-fn insert_fts_rows(conn: &Connection, kind: &str, sql: &str) -> anyhow::Result<()> {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-        ))
+    insert_fts(conn, FtsRow {
+        tracker: tracker.as_db_str(),
+        project: &comment.project,
+        item_kind: comment.item_kind.as_db_str(),
+        item_key: &comment.item_key,
+        doc_kind: "comment",
+        comment_id: &comment.comment_id,
+        url: comment.url.as_deref().unwrap_or_default(),
+        // A file-anchored comment surfaces its path in the title slot (the affordance the old
+        // review-comment loader had); other comments carry no title.
+        title: comment.anchor_path.as_deref().unwrap_or_default(),
+        body: &comment.body,
+        repo_id: &repo_id,
     })?;
-    for row in rows {
-        let (id, owner, repo, number, url, title, body, repo_id) = row?;
+    Ok(())
+}
+
+/// WHOLE-TABLE rebuild of the `papertrail_fts` mirror from the base tables — the full re-walk /
+/// recovery path ONLY (and the V060 migration backfill). Routine syncs maintain the mirror
+/// incrementally in [`store_item`] / [`store_comment`]; calling this per sync would re-pay the
+/// whole-mirror cost the incremental writers exist to avoid. `papertrail_fts` is a standalone
+/// (own-content) FTS5 table, so DELETE + re-insert is the correct rebuild — unlike the
+/// external-content chunk_fts / commit_fts, which must rebuild via INSERT(t) VALUES('rebuild').
+/// Every repo's rows are re-derived (each stamped its base row's `repo_id`), and `classification`
+/// is recomputed by [`insert_fts`].
+pub(crate) fn rebuild_fts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM papertrail_fts", [])?;
+    {
+        let mut stmt = conn.prepare(
+            "SELECT tracker, project, item_kind, item_key, url, title, body, repo_id
+             FROM papertrail_items",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            insert_fts(conn, FtsRow {
+                tracker: &row.get::<_, String>(0)?,
+                project: &row.get::<_, String>(1)?,
+                item_kind: &row.get::<_, String>(2)?,
+                item_key: &row.get::<_, String>(3)?,
+                doc_kind: "item",
+                comment_id: "",
+                url: &row.get::<_, String>(4)?,
+                title: &row.get::<_, String>(5)?,
+                body: &row.get::<_, String>(6)?,
+                repo_id: &row.get::<_, String>(7)?,
+            })?;
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT tracker, project, item_kind, item_key, comment_id, COALESCE(url, ''),
+                COALESCE(anchor_path, ''), body, repo_id
+         FROM papertrail_comments",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
         insert_fts(conn, FtsRow {
-            owner: &owner,
-            repo: &repo,
-            number,
-            kind,
-            item_id: &id.to_string(),
-            url: &url,
-            title: &title,
-            body: &body,
-            repo_id: &repo_id,
+            tracker: &row.get::<_, String>(0)?,
+            project: &row.get::<_, String>(1)?,
+            item_kind: &row.get::<_, String>(2)?,
+            item_key: &row.get::<_, String>(3)?,
+            doc_kind: "comment",
+            comment_id: &row.get::<_, String>(4)?,
+            url: &row.get::<_, String>(5)?,
+            title: &row.get::<_, String>(6)?,
+            body: &row.get::<_, String>(7)?,
+            repo_id: &row.get::<_, String>(8)?,
         })?;
     }
     Ok(())
 }
-pub(crate) fn insert_fts(conn: &Connection, row: FtsRow<'_>) -> anyhow::Result<()> {
+
+pub(crate) fn insert_fts(conn: &Connection, row: FtsRow<'_>) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO github_fts(owner, repo, number, item_kind, item_id, url, title, body, \
-         classification, repo_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO papertrail_fts(tracker, project, item_kind, item_key, doc_kind, comment_id, \
+         url, title, body, classification, repo_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
-            row.owner,
-            row.repo,
-            row.number,
-            row.kind,
-            row.item_id,
+            row.tracker,
+            row.project,
+            row.item_kind,
+            row.item_key,
+            row.doc_kind,
+            row.comment_id,
             row.url,
             row.title,
             row.body,
@@ -301,7 +253,7 @@ pub(crate) fn insert_fts(conn: &Connection, row: FtsRow<'_>) -> anyhow::Result<(
 }
 
 #[cfg(test)]
-mod fts_rebuild_tests {
+mod fts_mirror_tests {
     use rusqlite::Connection;
 
     use super::*;
@@ -339,128 +291,177 @@ mod fts_rebuild_tests {
         }
     }
 
-    // rebuild_fts collapses five near-identical per-kind loaders into insert_fts_rows. This pins
-    // the behaviour they shared: every comment routing target lands in github_fts under its own
-    // item_kind, the body is tokenized/searchable, and the title slot is populated the way each
-    // old loader did — the title text for issues/pulls, the file path for review comments, empty
-    // for the rest. A change request keeps its issue-shadow row (shared GitHub numbering), so it
-    // surfaces under BOTH the issue and pull kinds.
+    fn fts_rows(conn: &Connection) -> Vec<(String, String, String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT doc_kind, item_kind, title, body FROM papertrail_fts
+                 ORDER BY doc_kind, item_kind, comment_id, body",
+            )
+            .unwrap();
+        let mapped = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap();
+        mapped.map(Result::unwrap).collect()
+    }
+
+    // Every stored row lands in papertrail_fts exactly once: items under doc_kind='item' with the
+    // item title, comments under doc_kind='comment' with the anchor path (when file-anchored) in
+    // the title slot. A change request is ONE row — the github issue-shadow duplication is gone.
     #[test]
-    fn rebuild_fts_indexes_every_item_kind_with_the_right_title() {
+    fn writers_mirror_every_row_with_the_right_title_slot() {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn).unwrap();
 
-        store_item(&conn, &item(ItemKind::Issue, "1", "issuetitle", "issuebody")).unwrap();
-        store_comment(&conn, &comment("1", "10", "commentbody")).unwrap();
-        let stored =
-            store_item(&conn, &item(ItemKind::ChangeRequest, "2", "pulltitle", "pullbody"))
-                .unwrap();
-        assert_eq!(stored, 2, "a change request writes its issue-shadow row AND the pull row");
-        // url None exercises the review loader's COALESCE(html_url, '').
-        store_comment(&conn, &PapertrailComment {
+        store_item(&conn, Tracker::Github, &item(ItemKind::Issue, "1", "issuetitle", "issuebody"))
+            .unwrap();
+        store_comment(&conn, Tracker::Github, &comment("1", "10", "commentbody")).unwrap();
+        store_item(
+            &conn,
+            Tracker::Github,
+            &item(ItemKind::ChangeRequest, "2", "crtitle", "crbody"),
+        )
+        .unwrap();
+        // url None exercises the COALESCE('') slots.
+        store_comment(&conn, Tracker::Github, &PapertrailComment {
             url: None,
             review_state: Some("approved".into()),
+            item_kind: ItemKind::ChangeRequest,
             ..comment("2", "20", "reviewbody")
         })
         .unwrap();
-        store_comment(&conn, &PapertrailComment {
+        store_comment(&conn, Tracker::Github, &PapertrailComment {
             anchor_path: Some("src/lib.rs".into()),
+            item_kind: ItemKind::ChangeRequest,
             ..comment("2", "30", "reviewcommentbody")
         })
         .unwrap();
 
-        rebuild_fts(&conn).unwrap();
-
-        // One row per stored table row, each keyed by its item_kind, with the expected title.
-        let rows: Vec<(String, String)> = {
-            let mut stmt = conn
-                .prepare("SELECT item_kind, title FROM github_fts ORDER BY item_kind, title")
-                .unwrap();
-            let mapped = stmt
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .unwrap();
-            mapped.map(Result::unwrap).collect()
-        };
-        assert_eq!(
-            rows,
-            vec![
-                ("comment".to_string(), String::new()),
-                ("issue".to_string(), "issuetitle".to_string()),
-                ("issue".to_string(), "pulltitle".to_string()),
-                ("pull".to_string(), "pulltitle".to_string()),
-                ("review".to_string(), String::new()),
-                ("review_comment".to_string(), "src/lib.rs".to_string()),
-            ],
-            "every kind is indexed once with the title slot the old per-kind loaders produced"
-        );
+        assert_eq!(fts_rows(&conn), vec![
+            ("comment".into(), "change_request".into(), String::new(), "reviewbody".into()),
+            (
+                "comment".into(),
+                "change_request".into(),
+                "src/lib.rs".into(),
+                "reviewcommentbody".into()
+            ),
+            ("comment".into(), "issue".into(), String::new(), "commentbody".into()),
+            ("item".into(), "change_request".into(), "crtitle".into(), "crbody".into()),
+            ("item".into(), "issue".into(), "issuetitle".into(), "issuebody".into()),
+        ]);
 
         // The body column is tokenized and queryable via MATCH.
         let hits: i64 = conn
             .query_row(
-                "SELECT count(*) FROM github_fts WHERE github_fts MATCH 'reviewcommentbody'",
+                "SELECT count(*) FROM papertrail_fts WHERE papertrail_fts MATCH \
+                 'reviewcommentbody'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(hits, 1, "review-comment body is tokenized and searchable after rebuild");
+        assert_eq!(hits, 1, "comment body is tokenized and searchable");
+
+        // And the whole-table rebuild reconverges onto the SAME derived set — the writers and the
+        // full re-walk path must never drift apart.
+        let incremental = fts_rows(&conn);
+        rebuild_fts(&conn).unwrap();
+        assert_eq!(fts_rows(&conn), incremental, "rebuild reconverges onto the incremental set");
     }
-}
 
-#[cfg(test)]
-mod store_glue_tests {
-    use rusqlite::Connection;
-
-    use super::*;
-    use crate::index::schema;
-
-    // The reverse (owner, repo, number) mapping is the ONLY place normalized identities meet the
-    // github_* key columns until the schema normalization — a non-GitHub-shaped identity must be
-    // rejected loudly, never coerced into a wrong key.
+    // Pins the INCREMENTAL path: the writers must touch ONLY their own mirror rows. The test
+    // poisons the mirror with a foreign row no base table backs — a whole-table rebuild (DELETE
+    // all + re-derive) would ERASE it, so this test FAILS if a writer is ever routed through
+    // rebuild_fts. It also pins that a re-store replaces the item's own row (no duplicate) while a
+    // sibling item's mirror row is left byte-identical.
     #[test]
-    fn store_glue_rejects_non_github_shaped_identities() {
+    fn store_item_touches_only_its_own_mirror_rows() {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn).unwrap();
 
-        let item = PapertrailItem {
-            project: "no-slash".into(),
-            item_kind: ItemKind::Issue,
-            item_key: "7".into(),
-            url: String::new(),
-            state: "open".into(),
-            title: String::new(),
-            body: String::new(),
-            author: None,
-            created_at: None,
-            updated_at: None,
-            merged_at: None,
+        store_item(&conn, Tracker::Github, &item(ItemKind::Issue, "1", "one", "first body"))
+            .unwrap();
+        store_item(&conn, Tracker::Github, &item(ItemKind::Issue, "2", "two", "second body"))
+            .unwrap();
+        // The poison row: present ONLY in the mirror. Any whole-table rebuild would delete it
+        // (no base row re-derives it); the incremental writer must leave it alone.
+        conn.execute(
+            "INSERT INTO papertrail_fts(tracker, project, item_kind, item_key, doc_kind, \
+             comment_id, url, title, body, classification, repo_id)
+             VALUES ('github', 'o/r', 'issue', '999', 'item', '', 'u', 'poison title', 'poison \
+             body', 'other', 'poison-repo')",
+            [],
+        )
+        .unwrap();
+
+        store_item(&conn, Tracker::Github, &item(ItemKind::Issue, "1", "one", "updated body"))
+            .unwrap();
+
+        let poison: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM papertrail_fts WHERE item_key = '999' AND title = 'poison \
+                 title' AND body = 'poison body' AND repo_id = 'poison-repo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            poison, 1,
+            "the incremental writer must not touch foreign mirror rows — a whole-table rebuild \
+             would have erased the poison row"
+        );
+        let sibling: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM papertrail_fts WHERE item_key = '2' AND body = 'second body'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sibling, 1, "a sibling item's mirror row is untouched");
+        let own: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT body FROM papertrail_fts WHERE item_key = '1' AND doc_kind = 'item'",
+                )
+                .unwrap();
+            let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+            rows.map(Result::unwrap).collect()
         };
-        let err = store_item(&conn, &item).unwrap_err().to_string();
-        assert!(err.contains("malformed papertrail project"), "{err}");
+        assert_eq!(own, vec!["updated body".to_string()], "re-store replaced its own row exactly");
+    }
 
-        let err = store_item(&conn, &PapertrailItem {
-            project: "o/r".into(),
-            item_key: "PROJ-7".into(),
-            ..item.clone()
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("non-numeric github item key"), "{err}");
+    // Same pin for the comment writer: only its own (repo, tracker, project, comment_id) mirror
+    // row is replaced.
+    #[test]
+    fn store_comment_touches_only_its_own_mirror_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
 
-        let err = store_comment(&conn, &PapertrailComment {
-            project: "o/r".into(),
-            item_kind: ItemKind::Issue,
-            item_key: "7".into(),
-            comment_id: "abc".into(),
-            url: None,
-            body: String::new(),
-            author: None,
-            created_at: None,
-            updated_at: None,
-            review_state: None,
-            anchor_path: None,
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("non-numeric github comment id"), "{err}");
+        store_comment(&conn, Tracker::Github, &comment("1", "10", "keep me")).unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_fts(tracker, project, item_kind, item_key, doc_kind, \
+             comment_id, url, title, body, classification, repo_id)
+             VALUES ('github', 'o/r', 'issue', '1', 'comment', '888', 'u', '', 'poison comment', \
+             'other', 'poison-repo')",
+            [],
+        )
+        .unwrap();
+
+        store_comment(&conn, Tracker::Github, &comment("1", "10", "replaced body")).unwrap();
+
+        let poison: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM papertrail_fts WHERE comment_id = '888' AND body = 'poison \
+                 comment'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(poison, 1, "foreign comment mirror rows are untouched");
+        let own: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT body FROM papertrail_fts WHERE comment_id = '10'").unwrap();
+            let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(own, vec!["replaced body".to_string()], "re-store replaced its own row");
     }
 }

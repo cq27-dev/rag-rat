@@ -90,7 +90,7 @@ branch overlay over the indexed checkout — omitted from the signatures below f
 
 - `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include"?: ("memories")[] }`
 
-**Git & GitHub history**
+**Git & tracker history**
 
 - `commit_search`: `{ "query": string, "limit"?: number }`
 - `git_history_for_path`: `{ "path": string, "limit"?: number }`
@@ -100,15 +100,15 @@ branch overlay over the indexed checkout — omitted from the signatures below f
 - `papertrail_for_chunk`: `{ "chunk_id": number, "limit"?: number }`
 - `papertrail_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "lang"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
 - `papertrail_for_commit`: `{ "commit_hash": string, "limit"?: number, "include"?: ("fallback")[] }`
-- `github_issue_search`: `{ "query": string, "limit"?: number }`
-- `github_refs_for_path`: `{ "path": string, "limit"?: number }`
+- `papertrail_issue_search`: `{ "query": string, "limit"?: number }`
+- `papertrail_refs_for_path`: `{ "path": string, "limit"?: number }`
 - `rationale_search`: `{ "query": string, "limit"?: number, "include"?: ("fallback")[] }`
 
 **Index health**
 
 - `llm_status`: `{}`
 - `heal_index`: `{ "limit"?: number }`
-- `github_sync_status`: `{}`
+- `papertrail_sync_status`: `{}`
 - `index_status`: `{}`
 
 **Repo memories**
@@ -226,9 +226,9 @@ from an outdated FTS table.
 - `graph_limit`: maximum caller/callee/import/type evidence entries to attach. Default is `3` for
   search and `20` for `read_chunk`.
 - `include`: array of `generated` (index generated files), `git` (git-history ranking boosts),
-  `papertrail` (cached GitHub papertrail boosts), `fallback`. `git` and `papertrail` are on by
+  `papertrail` (cached tracker papertrail boosts), `fallback`. `git` and `papertrail` are on by
   default — omit `include` to keep them; pass an explicit list to override.
-- `explain`: include score components (`bm25`, `vector`, `symbol`, `graph`, `git`, `github`).
+- `explain`: include score components (`bm25`, `vector`, `symbol`, `graph`, `git`, `papertrail`).
   Default is `false`.
 
 Every hit also carries `retrieval_mode` (`lexical`, `vector`, or `hybrid`) — always present, so a
@@ -382,7 +382,7 @@ where tree-sitter and the compiler actively disagree. See [`oracle.md`](oracle.m
 5. `docs_mentioning_symbol_path`
 6. `text_fallback_hits`
 7. `recent_commits_touching_symbol_path`
-8. `github_rationale_issues_prs`
+8. `papertrail_rationale_items`
 9. `completeness_and_caveats`
 
 Use the same disambiguation controls as graph tools. `resolution: "exact"` means direct graph
@@ -421,17 +421,19 @@ and caches it by `source_text_hash`.
 commit count, and file-change count. Non-git roots report unavailable history without failing source
 or docs indexing.
 
-GitHub papertrail tools read the local cache only. `rag-rat github sync --from-refs` discovers refs
-and fetches through `gh api --paginate`; `rag-rat github sync --issue owner/repo#123` fetches one
-issue/PR thread; `--offline` updates discovered refs and reports cache status without network use.
+Papertrail tools read the local cache only. `rag-rat papertrail sync --from-refs` discovers refs
+and fetches through `gh api --paginate`; `rag-rat papertrail sync --issue owner/repo#123` fetches
+one item thread; `--offline` updates discovered refs and reports cache status without network use.
 
-Papertrail outputs keep `current_source` separate from `github_evidence`. GitHub snippets are labeled
-as historical GitHub evidence and classified as `decision`, `rejected_alternative`, `constraint`,
-`risk`, `obsolete`, or `context`.
+Papertrail outputs keep `current_source` separate from `evidence`. Cached snippets are labeled as
+historical tracker evidence (`historical_tracker` / `literal_tracker_ref`) and classified as
+`decision`, `rejected_alternative`, `constraint`, `risk`, `obsolete`, or `context`. Each evidence
+row names its `tracker` (`github`), `project` (`owner/repo`), `item_kind` (`issue` |
+`change_request`), `item_key`, and `doc_kind` (`item` | `comment`).
 
-`index_status.github` reports cached refs, issues, comments, pulls, reviews, review comments,
-last sync time, and whether the `gh` CLI capability is available.
-`github_sync_status` returns that GitHub cache section directly. `heal_index` repairs or removes
+`index_status.papertrail` reports cached refs, issues, change requests, comments, last sync time,
+and whether the `gh` CLI capability is available.
+`papertrail_sync_status` returns that cache section directly. `heal_index` repairs or removes
 already-indexed files whose current source no longer matches the stored SQLite index, then refreshes
 SQLite FTS. It does not discover brand-new files; run `rag-rat index` for discovery.
 
@@ -446,7 +448,7 @@ command needed to make local AI current. `reconcile` writes model-id, dimension,
 embedding-input-hash-bound chunk embeddings in configurable batches for eligible current chunks
 only.
 `semantic_search` combines BM25 candidates, vector similarity, symbol/name/path boosts,
-graph-neighborhood boosts, and optional git/GitHub papertrail boosts. Embeddings are used only when
+graph-neighborhood boosts, and optional git/tracker papertrail boosts. Embeddings are used only when
 the active model is installed, the embedding dimension matches active model metadata, the artifact
 status is `Current`, the artifact text hash matches the current chunk text hash, and the stored
 embedding input hash matches the current bounded embedding input; stale embeddings are treated as
@@ -527,8 +529,8 @@ lands, so leave those alone.
 
 **`BindTarget`** (the `bind` on `memory_create` / `memory_rebind`) names **exactly one** anchor form:
 a logical symbol (`id`), a concrete `chunk_id`, a graph `edge_id`, a `path` (optionally with
-`start_line` + `end_line`), a `commit_hash`, a GitHub ref (`github_owner` + `github_repo` +
-`github_number`), a call-path (`edge_path`: an ordered list of edge ids, from which the server derives
+`start_line` + `end_line`), a `commit_hash`, a tracker-item ref (`tracker` + `project` +
+`item_key`), a call-path (`edge_path`: an ordered list of edge ids, from which the server derives
 the authoritative `edge_sequence_hash`), or a directory (`dir`, relative to the repo root; `""` anchors
 to the root). On **`memory_create`** only, omit `bind` entirely to create an **unanchored** node — a
 `Concept` or standalone `Task` that lives only as a graph node. **`memory_rebind`** requires a real

@@ -52,10 +52,8 @@ impl PapertrailContext {
 pub struct PapertrailStatus {
     pub refs: u64,
     pub issues: u64,
+    pub change_requests: u64,
     pub comments: u64,
-    pub pulls: u64,
-    pub reviews: u64,
-    pub review_comments: u64,
     pub last_sync_ms: Option<i64>,
     pub capability: String,
 }
@@ -73,9 +71,9 @@ pub struct PapertrailSyncReport {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PapertrailSyncError {
-    pub owner: String,
-    pub repo: String,
-    pub number: i64,
+    pub tracker: Tracker,
+    pub project: String,
+    pub item_key: String,
     pub status: String,
     pub error: String,
 }
@@ -84,9 +82,8 @@ pub struct PapertrailSyncError {
 pub struct PapertrailSyncProgress {
     pub current: usize,
     pub total: usize,
-    pub owner: String,
-    pub repo: String,
-    pub number: i64,
+    pub project: String,
+    pub item_key: String,
     pub action: PapertrailSyncAction,
     pub message: Option<String>,
 }
@@ -97,14 +94,13 @@ pub enum PapertrailSyncAction {
     Skipped,
     Synced,
     Failed,
-    RebuildingFts,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PapertrailRef {
-    pub owner: String,
-    pub repo: String,
-    pub number: i64,
+    pub tracker: Tracker,
+    pub project: String,
+    pub item_key: String,
     pub ref_kind: String,
     pub source_kind: String,
     pub source_path: Option<String>,
@@ -114,11 +110,15 @@ pub struct PapertrailRef {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PapertrailEvidence {
-    pub owner: String,
-    pub repo: String,
-    pub number: i64,
+    pub tracker: String,
+    pub project: String,
+    /// Kind of the ITEM this row belongs to: `issue` | `change_request`.
     pub item_kind: String,
-    pub item_id: String,
+    pub item_key: String,
+    /// Which mirror row matched: the item's own text (`item`) or one of its comments (`comment`).
+    pub doc_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_id: Option<String>,
     pub url: String,
     pub title: String,
     pub snippet: String,
@@ -130,9 +130,9 @@ pub struct PapertrailEvidence {
 #[derive(Debug, Clone, Serialize)]
 pub struct Papertrail {
     pub current_source: Option<CurrentSourceEvidence>,
-    pub github_evidence: Vec<PapertrailEvidence>,
+    pub evidence: Vec<PapertrailEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub fallback_github_evidence: Vec<PapertrailEvidence>,
+    pub fallback_evidence: Vec<PapertrailEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,10 +144,56 @@ pub struct CurrentSourceEvidence {
     pub symbol: Option<String>,
 }
 
+/// The tracker provider a papertrail row belongs to — the persisted `tracker` column of every
+/// `papertrail_*` table. A CLOSED token set: readers reject unknown tokens instead of guessing, so
+/// a new provider lands by adding a variant here (with its exact-token test), never by writing a
+/// free-form string. Only GitHub exists today; GitLab / Bitbucket / Jira arrive with their
+/// provider clients.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum Tracker {
+    Github,
+}
+
+impl Tracker {
+    /// The exact persisted token (`papertrail_*.tracker`).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set — a papertrail row with
+    /// an unknown tracker is a bug (or a newer binary's data), never something to coerce.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown tracker token `{value}`"))
+    }
+}
+
 /// Provider-neutral item kind. GitHub's shared issue/PR numbering is the exception, not the
 /// rule — GitLab issues and merge requests live in separate iid namespaces and Jira has no
 /// change requests at all — so the kind is part of an item's identity, never inferred.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ItemKind {
     Issue,
@@ -155,11 +201,14 @@ pub enum ItemKind {
 }
 
 impl ItemKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Issue => "issue",
-            Self::ChangeRequest => "change_request",
-        }
+    /// The exact persisted token (`papertrail_items.item_kind` and friends).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown item kind token `{value}`"))
     }
 }
 
@@ -421,25 +470,81 @@ pub(crate) struct SyncRefsReport {
 }
 
 pub(crate) struct FtsRow<'a> {
-    owner: &'a str,
-    repo: &'a str,
-    number: i64,
-    kind: &'a str,
-    item_id: &'a str,
+    tracker: &'a str,
+    project: &'a str,
+    item_kind: &'a str,
+    item_key: &'a str,
+    /// `item` for the item's own title/body row, `comment` for a comment row.
+    doc_kind: &'a str,
+    /// The provider comment id for a `comment` row; empty string on `item` rows.
+    comment_id: &'a str,
     url: &'a str,
     title: &'a str,
     body: &'a str,
-    /// The active repo that owns this papertrail row (V041). Stamped into `github_fts.repo_id`
-    /// (UNINDEXED) so a MATCH in a consolidated DB filters to one repo.
+    /// The active repo that owns this papertrail row (V041). Stamped into
+    /// `papertrail_fts.repo_id` (UNINDEXED) so a MATCH in a consolidated DB filters to one repo.
     repo_id: &'a str,
 }
 
+/// A tracker reference parsed out of source/commit/branch text. The grammar is GitHub's today
+/// (`#N`, `owner/repo#N`, `GH-N`, issue/PR URLs), so the parsed key is numeric; `project` is the
+/// `owner/repo` path.
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedRef {
-    owner: String,
-    repo: String,
+    project: String,
     number: i64,
     kind: String,
+}
+
+impl ParsedRef {
+    /// Lift a parsed GitHub-grammar ref into a storable [`PapertrailRef`] with its discovery
+    /// provenance. The grammar is GitHub-only today, so the tracker is fixed here.
+    pub(crate) fn into_ref(
+        self,
+        source_kind: &str,
+        source_path: Option<String>,
+        source_commit: Option<String>,
+        source_text: String,
+    ) -> PapertrailRef {
+        PapertrailRef {
+            tracker: Tracker::Github,
+            project: self.project,
+            item_key: self.number.to_string(),
+            ref_kind: self.kind,
+            source_kind: source_kind.to_string(),
+            source_path,
+            source_commit,
+            source_text,
+        }
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    // The persisted token sets are CLOSED and exact: `from_db_str` must round-trip every
+    // `as_db_str` output and reject everything else (no trimming, no case folding) — a papertrail
+    // row read back with a drifted token is a bug to surface, not to coerce.
+    #[test]
+    fn tracker_tokens_are_exact_and_closed() {
+        assert_eq!(Tracker::Github.as_db_str(), "github");
+        assert_eq!(Tracker::from_db_str("github").unwrap(), Tracker::Github);
+        for rejected in ["GitHub", "GITHUB", " github", "github ", "gitlab", ""] {
+            assert!(Tracker::from_db_str(rejected).is_err(), "must reject `{rejected}`");
+        }
+    }
+
+    #[test]
+    fn item_kind_tokens_are_exact_and_closed() {
+        assert_eq!(ItemKind::Issue.as_db_str(), "issue");
+        assert_eq!(ItemKind::ChangeRequest.as_db_str(), "change_request");
+        assert_eq!(ItemKind::from_db_str("issue").unwrap(), ItemKind::Issue);
+        assert_eq!(ItemKind::from_db_str("change_request").unwrap(), ItemKind::ChangeRequest);
+        for rejected in ["Issue", "pull", "change-request", " issue", ""] {
+            assert!(ItemKind::from_db_str(rejected).is_err(), "must reject `{rejected}`");
+        }
+    }
 }
 
 #[cfg(test)]

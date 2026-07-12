@@ -250,23 +250,28 @@ pub(crate) fn coupling_items(
         .collect())
 }
 
-pub(crate) fn github_ref_items(
+pub(crate) fn papertrail_ref_items(
     conn: &Connection,
     paths: &[String],
     limit: u32,
 ) -> anyhow::Result<Vec<ImpactItem>> {
     let mut surface = ImpactSurface::default();
-    github_refs_for_paths(conn, paths, &mut surface, usize::try_from(limit).unwrap_or(usize::MAX))?;
+    papertrail_refs_for_paths(
+        conn,
+        paths,
+        &mut surface,
+        usize::try_from(limit).unwrap_or(usize::MAX),
+    )?;
     Ok(surface.into_items(usize::try_from(limit).unwrap_or(usize::MAX)))
 }
 
-pub(crate) fn github_rationale_items(
+pub(crate) fn papertrail_rationale_items_for_query(
     conn: &Connection,
     query: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<ImpactItem>> {
     let mut surface = ImpactSurface::default();
-    github_rationale_for_query(
+    papertrail_rationale_for_query(
         conn,
         query,
         &mut surface,

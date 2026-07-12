@@ -1,16 +1,17 @@
-//! Git-hook and GitHub-sync commands, split out of the `commands` god-module:
-//! `hooks` (install/uninstall/status of the managed git hooks) and `github` (issue / refs sync).
+//! Git-hook and papertrail-sync commands, split out of the `commands` god-module:
+//! `hooks` (install/uninstall/status of the managed git hooks) and `papertrail` (item / refs
+//! sync).
 use std::fs;
 
 use rag_rat_core::Config;
 
-use crate::cli::{GithubArgs, GithubCommand, HookAction, HooksArgs};
+use crate::cli::{HookAction, HooksArgs, PapertrailArgs, PapertrailCommand};
 use crate::render::{print_output, render_papertrail_sync_progress};
 use crate::{MANAGED_HOOKS, git_paths, install_hook, is_rag_rat_hook, open_index};
 
-pub(crate) fn papertrail(config: &Config, args: &GithubArgs) -> anyhow::Result<()> {
+pub(crate) fn papertrail(config: &Config, args: &PapertrailArgs) -> anyhow::Result<()> {
     match &args.command {
-        GithubCommand::Sync { from_refs, issue, offline } => {
+        PapertrailCommand::Sync { from_refs, issue, offline } => {
             let db = open_index(config)?;
             let report = if let Some(issue) = issue {
                 db.papertrail_sync_issue(issue, *offline)?
@@ -20,7 +21,7 @@ pub(crate) fn papertrail(config: &Config, args: &GithubArgs) -> anyhow::Result<(
                     render_papertrail_sync_progress,
                 )?
             } else {
-                anyhow::bail!("github sync needs --from-refs or --issue <owner/repo#number>");
+                anyhow::bail!("papertrail sync needs --from-refs or --issue <owner/repo#number>");
             };
             print_output(&report)
         },

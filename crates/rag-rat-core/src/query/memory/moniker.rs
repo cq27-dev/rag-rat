@@ -328,7 +328,7 @@ pub(crate) fn insert_auto_moniker_binding(
         "
         INSERT OR IGNORE INTO repo_memory_bindings(
             memory_id, binding_kind, binding_id, path, start_line, end_line, logical_symbol_id,
-            symbol_id, chunk_id, edge_id, commit_hash, github_owner, github_repo, github_number,
+            symbol_id, chunk_id, edge_id, commit_hash, tracker, project, item_key,
             symbol_kind, signature_hash, moniker_tool, moniker_tool_version, anchor_status,
             created_at_ms
         )

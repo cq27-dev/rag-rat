@@ -710,35 +710,33 @@ fn orientation_pins_the_fork_repo_over_a_shared_root_sibling() {
 const B_LEXICAL_TOKEN: &str = "zebrafishunique";
 const B_COMMIT_TOKEN: &str = "narwhalcommitunique";
 const B_ISSUE_TOKEN: &str = "unicornissueunique";
-/// Repo A's unique GitHub token (seeded under the real repo id) — the positive control on the same
-/// papertrail surface.
+/// Repo A's unique tracker token (seeded under the real repo id) — the positive control on the
+/// same papertrail surface.
 const A_ISSUE_TOKEN: &str = "phoenixissueunique";
 
-/// Seed a GitHub ref + issue + FTS row for `repo_id`, all carrying `token`.
-fn seed_github_issue(
+/// Seed a papertrail ref + item + FTS row for `repo_id`, all carrying `token`.
+fn seed_papertrail_item(
     conn: &rusqlite::Connection,
     repo_id: &str,
-    owner: &str,
-    repo: &str,
-    number: i64,
+    project: &str,
+    item_key: &str,
     token: &str,
     source_path: &str,
 ) {
     conn.execute(
-        "INSERT INTO github_refs(owner, repo, number, ref_kind, source_kind, source_path, \
-         source_commit, source_text, discovered_at_ms, repo_id)
-         VALUES (?1, ?2, ?3, 'closing', 'file', ?4, NULL, ?5, 0, ?6)",
-        rusqlite::params![owner, repo, number, source_path, format!("{token} ref"), repo_id],
+        "INSERT INTO papertrail_refs(tracker, project, item_key, ref_kind, source_kind, \
+         source_path, source_commit, source_text, discovered_at_ms, repo_id)
+         VALUES ('github', ?1, ?2, 'closing', 'file', ?3, NULL, ?4, 0, ?5)",
+        rusqlite::params![project, item_key, source_path, format!("{token} ref"), repo_id],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, \
-         is_pull_request, synced_at_ms, repo_id)
-         VALUES (?1, ?2, ?3, 'http://x', 'open', ?4, ?5, 0, 0, ?6)",
+        "INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, title, \
+         body, synced_at_ms, repo_id)
+         VALUES ('github', ?1, 'issue', ?2, 'http://x', 'open', ?3, ?4, 0, ?5)",
         rusqlite::params![
-            owner,
-            repo,
-            number,
+            project,
+            item_key,
             format!("{token} title"),
             format!("{token} body"),
             repo_id
@@ -746,14 +744,12 @@ fn seed_github_issue(
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO github_fts(owner, repo, number, item_kind, item_id, url, title, body, \
-         classification, repo_id)
-         VALUES (?1, ?2, ?3, 'issue', ?4, 'http://x', ?5, ?6, 'other', ?7)",
+        "INSERT INTO papertrail_fts(tracker, project, item_kind, item_key, doc_kind, comment_id, \
+         url, title, body, classification, repo_id)
+         VALUES ('github', ?1, 'issue', ?2, 'item', '', 'http://x', ?3, ?4, 'other', ?5)",
         rusqlite::params![
-            owner,
-            repo,
-            number,
-            number.to_string(),
+            project,
+            item_key,
             format!("{token} title"),
             format!("{token} body"),
             repo_id
@@ -763,7 +759,7 @@ fn seed_github_issue(
 }
 
 /// Seed repo B's search-surface rows (a chunk in chunk_fts, a commit in commit_fts, a
-/// git_file_changes row, a github ref/issue/fts) under REPO_B, plus repo A's own github issue under
+/// git_file_changes row, a papertrail ref/item/fts) under REPO_B, plus repo A's own issue under
 /// the real id (the positive control). Requires a `two_repo_fixture` (repo A indexed, repo B's file
 /// rows already seeded).
 fn seed_search_leak_data(fx: &TwoRepoFixture) {
@@ -814,8 +810,8 @@ fn seed_search_leak_data(fx: &TwoRepoFixture) {
     crate::index::schema::rebuild_commit_fts(conn).unwrap();
 
     // Repo B's papertrail (must never leak) + repo A's own papertrail (the positive control).
-    seed_github_issue(conn, REPO_B, "octob", "rb", 77, B_ISSUE_TOKEN, "src/b_only.rs");
-    seed_github_issue(conn, &fx.repo_a_id, "octoa", "ra", 11, A_ISSUE_TOKEN, "src/a_only.rs");
+    seed_papertrail_item(conn, REPO_B, "octob/rb", "77", B_ISSUE_TOKEN, "src/b_only.rs");
+    seed_papertrail_item(conn, &fx.repo_a_id, "octoa/ra", "11", A_ISSUE_TOKEN, "src/a_only.rs");
 }
 
 /// Lexical + hybrid candidate selection is repo-scoped: repo B's uniquely-tokened chunk is
@@ -873,25 +869,26 @@ fn git_history_queries_never_surface_the_other_repo() {
     let _ = fs::remove_dir_all(fx.root_a);
 }
 
-/// Papertrail queries are repo-scoped: repo B's issue (github_fts MATCH) and its path-anchored ref
-/// are unreachable from repo A, while repo A's own issue on the SAME surface is found.
+/// Papertrail queries are repo-scoped: repo B's issue (papertrail_fts MATCH) and its
+/// path-anchored ref are unreachable from repo A, while repo A's own issue on the SAME surface is
+/// found.
 #[test]
 fn papertrail_queries_never_surface_the_other_repo() {
     let fx = two_repo_fixture();
     seed_search_leak_data(&fx);
     let conn = fx.db.storage.connection();
 
-    // github_issue_search → search_fts, which filters github_fts.repo_id.
+    // papertrail_issue_search → search_fts, which filters papertrail_fts.repo_id.
     let leaked = fx.db.papertrail_issue_search(B_ISSUE_TOKEN, 10).unwrap();
-    assert!(leaked.is_empty(), "repo B issue leaked into repo A github search: {leaked:?}");
+    assert!(leaked.is_empty(), "repo B issue leaked into repo A papertrail search: {leaked:?}");
     let own = fx.db.papertrail_issue_search(A_ISSUE_TOKEN, 10).unwrap();
     assert!(!own.is_empty(), "repo A must still see its own issue");
 
-    // refs_for_path filters github_refs.repo_id.
+    // refs_for_path filters papertrail_refs.repo_id.
     let leaked_refs = crate::index::papertrail::refs_for_path(conn, "src/b_only.rs", 10).unwrap();
-    assert!(leaked_refs.is_empty(), "repo B github ref leaked: {leaked_refs:?}");
+    assert!(leaked_refs.is_empty(), "repo B papertrail ref leaked: {leaked_refs:?}");
     let own_refs = crate::index::papertrail::refs_for_path(conn, "src/a_only.rs", 10).unwrap();
-    assert!(!own_refs.is_empty(), "repo A must still see its own github ref");
+    assert!(!own_refs.is_empty(), "repo A must still see its own papertrail ref");
 
     let _ = fs::remove_dir_all(fx.root_a);
 }

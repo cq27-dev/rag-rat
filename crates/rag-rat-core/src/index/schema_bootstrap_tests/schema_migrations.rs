@@ -86,9 +86,9 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
     let member_columns = table_columns(&db, "logical_symbol_members");
     assert!(member_columns.contains(&"symbol_id".to_string()));
     assert!(member_columns.contains(&"signature_hash".to_string()));
-    let github_ref_sync_columns = table_columns(&db, "github_ref_sync");
-    assert!(github_ref_sync_columns.contains(&"status".to_string()));
-    assert!(github_ref_sync_columns.contains(&"last_error".to_string()));
+    let sync_cursor_columns = table_columns(&db, "papertrail_sync_cursor");
+    assert!(sync_cursor_columns.contains(&"high_mark_at".to_string()));
+    assert!(sync_cursor_columns.contains(&"backfill_done".to_string()));
     let symbol_fact_columns = table_columns(&db, "symbol_facts");
     assert!(symbol_fact_columns.contains(&"fact_kind".to_string()));
     assert!(symbol_fact_columns.contains(&"fact_value".to_string()));
@@ -382,10 +382,54 @@ fn migrate_adds_edge_name_columns_before_indexing_them() {
 }
 
 #[test]
-fn migrate_preserves_github_papertrail_cache() {
+fn migrate_preserves_the_papertrail_cache() {
     // Whole-table `row_count` cache-total checks are single-repo by nature: they assert the
-    // papertrail cache survived a schema migration. The poison sibling's V041-scoped github rows
-    // would inflate the unscoped totals (production github reads ARE scoped — the multi_repo_scope
+    // papertrail cache survived a schema migration. The poison sibling's scoped papertrail rows
+    // would inflate the unscoped totals (production papertrail reads ARE scoped — the
+    // multi_repo_scope leak matrix proves it), so opt this cache-total test out of the harness.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
+    let (root, config) =
+        markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    sync_from_refs_blocking(
+        db.storage.connection(),
+        &root,
+        Some(&MockGitHubClient),
+        false,
+        &test_gh_ctx(),
+    )
+    .unwrap();
+    // The mock change request stores ONE item + 4 unified comments; the mirror holds one row per
+    // base row (no issue-shadow duplication).
+    assert_eq!(row_count(&db, "papertrail_refs"), 1);
+    assert_eq!(row_count(&db, "papertrail_items"), 1);
+    assert_eq!(row_count(&db, "papertrail_comments"), 4);
+    assert_eq!(row_count(&db, "papertrail_fts"), 5);
+    db.storage
+        .connection()
+        .execute("DELETE FROM schema_version WHERE id = ?1", ["010_symbol_facts"])
+        .unwrap();
+    drop(db);
+
+    let migrated = IndexDatabase::migrate(&config.database).unwrap();
+    assert_eq!(migrated.state, schema::SchemaState::Compatible);
+    let db = IndexDatabase::open(&config.database).unwrap();
+    assert_eq!(row_count(&db, "papertrail_refs"), 1);
+    assert_eq!(row_count(&db, "papertrail_items"), 1);
+    assert_eq!(row_count(&db, "papertrail_comments"), 4);
+    assert_eq!(row_count(&db, "papertrail_fts"), 5);
+    let hits = db.papertrail_issue_search("sqlite", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].item_key, "42");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn full_rebuild_preserves_the_papertrail_cache() {
+    // Whole-table `row_count` cache-total checks are single-repo by nature: they assert the
+    // papertrail cache survived a full rebuild. The poison sibling's scoped papertrail rows would
+    // inflate the unscoped totals (production papertrail reads ARE scoped — the multi_repo_scope
     // leak matrix proves it), so opt this cache-total test out of the harness.
     let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let (root, config) =
@@ -399,71 +443,19 @@ fn migrate_preserves_github_papertrail_cache() {
         &test_gh_ctx(),
     )
     .unwrap();
-    assert_eq!(row_count(&db, "github_refs"), 1);
-    assert_eq!(row_count(&db, "github_issues"), 1);
-    assert_eq!(row_count(&db, "github_comments"), 2);
-    assert_eq!(row_count(&db, "github_pull_requests"), 1);
-    assert_eq!(row_count(&db, "github_reviews"), 1);
-    assert_eq!(row_count(&db, "github_review_comments"), 1);
-    assert_eq!(row_count(&db, "github_fts"), 6);
-    db.storage
-        .connection()
-        .execute("DELETE FROM schema_version WHERE id = ?1", ["010_symbol_facts"])
-        .unwrap();
-    drop(db);
-
-    let migrated = IndexDatabase::migrate(&config.database).unwrap();
-    assert_eq!(migrated.state, schema::SchemaState::Compatible);
-    let db = IndexDatabase::open(&config.database).unwrap();
-    assert_eq!(row_count(&db, "github_refs"), 1);
-    assert_eq!(row_count(&db, "github_issues"), 1);
-    assert_eq!(row_count(&db, "github_comments"), 2);
-    assert_eq!(row_count(&db, "github_pull_requests"), 1);
-    assert_eq!(row_count(&db, "github_reviews"), 1);
-    assert_eq!(row_count(&db, "github_review_comments"), 1);
-    assert_eq!(row_count(&db, "github_fts"), 6);
-    let hits = db.papertrail_issue_search("sqlite", 10).unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].number, 42);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn full_rebuild_preserves_github_papertrail_cache() {
-    // Whole-table `row_count` cache-total checks are single-repo by nature: they assert the
-    // papertrail cache survived a full rebuild. The poison sibling's V041-scoped github rows would
-    // inflate the unscoped totals (production github reads ARE scoped — the multi_repo_scope leak
-    // matrix proves it), so opt this cache-total test out of the harness.
-    let _poison = crate::index::poison_sibling::disable_poison_sibling();
-    let (root, config) =
-        markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
-    let db = IndexDatabase::rebuild(&config).unwrap();
-    sync_from_refs_blocking(
-        db.storage.connection(),
-        &root,
-        Some(&MockGitHubClient),
-        false,
-        &test_gh_ctx(),
-    )
-    .unwrap();
-    assert_eq!(row_count(&db, "github_issues"), 1);
-    assert_eq!(row_count(&db, "github_fts"), 6);
+    assert_eq!(row_count(&db, "papertrail_items"), 1);
+    assert_eq!(row_count(&db, "papertrail_fts"), 5);
     drop(db);
 
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    assert_eq!(row_count(&db, "github_refs"), 1);
-    assert_eq!(row_count(&db, "github_issues"), 1);
-    assert_eq!(row_count(&db, "github_comments"), 2);
-    assert_eq!(row_count(&db, "github_pull_requests"), 1);
-    assert_eq!(row_count(&db, "github_reviews"), 1);
-    assert_eq!(row_count(&db, "github_review_comments"), 1);
-    assert_eq!(row_count(&db, "github_ref_sync"), 1);
-    assert_eq!(row_count(&db, "github_fts"), 6);
+    assert_eq!(row_count(&db, "papertrail_refs"), 1);
+    assert_eq!(row_count(&db, "papertrail_items"), 1);
+    assert_eq!(row_count(&db, "papertrail_comments"), 4);
+    assert_eq!(row_count(&db, "papertrail_fts"), 5);
     let hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].number, 42);
+    assert_eq!(hits[0].item_key, "42");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1766,7 +1758,7 @@ fn migration_057_adds_the_external_symbols_table() {
 fn migration_058_adds_the_oplog_device_x25519_columns() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V058 is no longer the tip (the absolute pin moved to the V059 test) — symbolic tip check.
+    // V058 is no longer the tip — symbolic tip check.
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -1821,9 +1813,12 @@ fn migration_058_adds_the_oplog_device_x25519_columns() {
 fn migration_059_creates_the_account_candidate_dag() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V059 is the schema tip — this test carries the absolute pin.
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 59, "V059 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 59, "schema at LATEST after apply");
+    // V059 is no longer the tip (the absolute pin moved to the V060 papertrail test).
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
 
     // The candidate-DAG tables + indexes exist (sync phase C, §16.1).
     for table in ["account_entries", "account_entry_status", "account_pre_verify"] {

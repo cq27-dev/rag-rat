@@ -145,12 +145,12 @@ fn list_tools_exposes_complete_typed_schemas() {
         "papertrail_for_chunk",
         "papertrail_for_symbol",
         "papertrail_for_commit",
-        "github_issue_search",
-        "github_refs_for_path",
+        "papertrail_issue_search",
+        "papertrail_refs_for_path",
         "rationale_search",
         "llm_status",
         "heal_index",
-        "github_sync_status",
+        "papertrail_sync_status",
         "memory_create",
         "memory_update",
         "memory_search",
@@ -384,10 +384,10 @@ fn mcp_tool_calls_preserve_compatibility_shapes() {
     )
     .unwrap();
     assert!(papertrail["current_source"].is_object());
-    assert!(papertrail["github_evidence"].is_array());
+    assert!(papertrail["evidence"].is_array());
 
-    let github_status = call_tool(&config.database, "github_sync_status", json!({})).unwrap();
-    assert!(github_status["capability"].is_string());
+    let sync_status = call_tool(&config.database, "papertrail_sync_status", json!({})).unwrap();
+    assert!(sync_status["capability"].is_string());
 
     let llm = call_tool(&config.database, "llm_status", json!({})).unwrap();
     assert_eq!(llm["embedding"]["state"], "MissingModel");

@@ -49,13 +49,13 @@ you're actually asking (full schemas: `docs/mcp-tools.md`):
 | Check if code duplicates what's already here | `find_clones`; the clone class of one symbol → `clones_for_symbol` |
 | Understand **why** code exists (rationale) | `papertrail_for_symbol` / `papertrail_for_chunk`, `rationale_search` |
 | Trace **when/why** something changed | `git_history_for_symbol` / `git_history_for_path`, `commit_search`, `commits_touching_query`, `git_blame_chunk` |
-| Pull a GitHub issue/PR or refs for a path | `github_issue_search`, `github_refs_for_path`, `papertrail_for_commit` |
+| Pull a tracker issue/PR or refs for a path | `papertrail_issue_search`, `papertrail_refs_for_path`, `papertrail_for_commit` |
 | Read docs / doc-comments for a symbol | `docs_for_symbol` |
 | Map the FFI / binding surface | `ffi_surface` |
 | Audit whether the graph is trustworthy here | `compare_graph_to_scip` (vs compiler), `compare_graph_to_text` (vs regex) |
 | Recall prior notes and their links | `memory_search`, `memory_for_symbol` / `memory_for_path` / `memory_for_call_path`, `memory_edges` |
 | Triage the memory-maintenance worklist | `dream` → `dream_review` (see the **dream-review** skill) |
-| Check index / embedding / GitHub-cache health | `index_status`, `llm_status`, `github_sync_status`; repair drift with `heal_index` |
+| Check index / embedding / papertrail-cache health | `index_status`, `llm_status`, `papertrail_sync_status`; repair drift with `heal_index` |
 
 Reaching for the right tool is cheap and eager: prefer the specific one (`papertrail_for_symbol` for
 *why*, `find_clones` before writing a helper) over defaulting to `semantic_search` for everything.

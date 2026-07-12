@@ -166,9 +166,9 @@ pub(crate) fn binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemor
         chunk_id: row.get("chunk_id")?,
         edge_id: row.get("edge_id")?,
         commit_hash: row.get("commit_hash")?,
-        github_owner: row.get("github_owner")?,
-        github_repo: row.get("github_repo")?,
-        github_number: row.get("github_number")?,
+        tracker: row.get("tracker")?,
+        project: row.get("project")?,
+        item_key: row.get("item_key")?,
         symbol_kind: row.get("symbol_kind")?,
         signature_hash: row.get("signature_hash")?,
         moniker_tool: row.get("moniker_tool")?,
@@ -185,8 +185,8 @@ pub(crate) fn attach_memory_children(
     let mut stmt = conn.prepare(
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line, logical_symbol_id,
-               symbol_id, chunk_id, edge_id, commit_hash, github_owner, github_repo,
-               github_number, symbol_kind, signature_hash, moniker_tool, moniker_tool_version,
+               symbol_id, chunk_id, edge_id, commit_hash, tracker, project,
+               item_key, symbol_kind, signature_hash, moniker_tool, moniker_tool_version,
                relocation_reason, anchor_status, created_at_ms
         FROM repo_memory_bindings
         WHERE memory_id = ?1

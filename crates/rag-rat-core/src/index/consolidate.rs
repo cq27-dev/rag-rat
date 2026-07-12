@@ -13,7 +13,7 @@
 //! - Portable bindings only: the memory bindings' LOCAL rowid columns (`logical_symbol_id` /
 //!   `symbol_id` / `chunk_id` / `edge_id`) are NULLed on import — those rowids mean nothing in a
 //!   fresh index — and the normal validate loop re-resolves them from the portable anchor (path /
-//!   commit / github / moniker fields, which ARE copied verbatim) after the next index pass.
+//!   commit / tracker / moniker fields, which ARE copied verbatim) after the next index pass.
 //! - `live_files_generation` is NOT carried (absent ⇒ 0 is load-bearing: a fresh index of the
 //!   consolidated repo stages above 0 and flips normally — A6 handoff rule #1).
 //! - Idempotent AND crash-honest: a no-edit retry writes nothing (content-gated upserts / `INSERT
@@ -80,7 +80,7 @@ use crate::{data_dir, locks};
 ///  (b) DB-LOCAL STATE — never copied; each entry states why:
 ///      * freshness/progress cursors that would make a fresh 0-row index falsely report itself
 ///        current: `content_revision`, `git_commit`, `git_dirty`, `git_history_indexed_head` /
-///        `_root` / `_shallow` / `_complete`, `github_last_sync_ms`, `graph_index_version`,
+///        `_root` / `_shallow` / `_complete`, `papertrail_last_sync_ms`, `graph_index_version`,
 ///        `indexed_at_ms`, `vector_int8_reencode_done` / `_cursor`,
 ///        `last_embedding_reconcile_started_at_ms` / `_finished_at_ms`;
 ///      * pointers/state owned by THIS database file's lifecycle: `live_files_generation` (absent ⇒
@@ -823,10 +823,22 @@ fn copy_bindings(
     let moniker_tool = source_column_or_null(source, "moniker_tool")?;
     let moniker_tool_version = source_column_or_null(source, "moniker_tool_version")?;
     let relocation_reason = source_column_or_null(source, "relocation_reason")?;
+    // The tracker columns exist per source VINTAGE: a post-V060 source carries
+    // tracker/project/item_key, a pre-V060 source carries github_owner/github_repo/github_number
+    // — probe both shapes and convert legacy `github` bindings to the `tracker` kind below (the
+    // V060 mapping, applied at the import seam because a foreign source file is read as-is,
+    // never migrated).
+    let tracker_col = source_column_or_null(source, "tracker")?;
+    let project_col = source_column_or_null(source, "project")?;
+    let item_key_col = source_column_or_null(source, "item_key")?;
+    let github_owner = source_column_or_null(source, "github_owner")?;
+    let github_repo = source_column_or_null(source, "github_repo")?;
+    let github_number = source_column_or_null(source, "github_number")?;
     let mut stmt = source.prepare(&format!(
         "SELECT memory_id, binding_kind, binding_id, path, start_line, end_line, commit_hash, \
-         github_owner, github_repo, github_number, anchor_status, created_at_ms, {symbol_kind}, \
-         {signature_hash}, {moniker_tool}, {moniker_tool_version}, {relocation_reason}
+         {tracker_col}, {project_col}, {item_key_col}, {github_owner}, {github_repo}, \
+         {github_number}, anchor_status, created_at_ms, {symbol_kind}, {signature_hash}, \
+         {moniker_tool}, {moniker_tool_version}, {relocation_reason}
          FROM repo_memory_bindings",
     ))?;
     let mut rows = stmt.query([])?;
@@ -837,32 +849,51 @@ fn copy_bindings(
         let Some(memory_id) = id_map.get(&row.get::<_, String>(0)?) else {
             continue;
         };
+        let mut binding_kind = row.get::<_, String>(1)?;
+        let mut binding_id = row.get::<_, String>(2)?;
+        let mut tracker = row.get::<_, Option<String>>(7)?;
+        let mut project = row.get::<_, Option<String>>(8)?;
+        let mut item_key = row.get::<_, Option<String>>(9)?;
+        // Legacy `github` bindings convert to the `tracker` kind — exactly the V060 backfill
+        // mapping, so an imported binding is indistinguishable from a migrated one.
+        if binding_kind == "github"
+            && let (Some(owner), Some(gh_repo), Some(number)) = (
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<i64>>(12)?,
+            )
+        {
+            binding_kind = "tracker".to_string();
+            binding_id = format!("github:{owner}/{gh_repo}#{number}");
+            tracker = Some("github".to_string());
+            project = Some(format!("{owner}/{gh_repo}"));
+            item_key = Some(number.to_string());
+        }
         let changed = tx.execute(
             "INSERT OR IGNORE INTO repo_memory_bindings(memory_id, binding_kind, binding_id, \
              path, start_line, end_line, logical_symbol_id, symbol_id, chunk_id, edge_id, \
-             commit_hash, github_owner, github_repo, github_number, anchor_status, created_at_ms, \
-             symbol_kind, signature_hash, moniker_tool, moniker_tool_version, relocation_reason, \
-             repo_id)
+             commit_hash, tracker, project, item_key, anchor_status, created_at_ms, symbol_kind, \
+             signature_hash, moniker_tool, moniker_tool_version, relocation_reason, repo_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, ?8, ?9, ?10, ?11, ?12, \
              ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 memory_id,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+                binding_kind,
+                binding_id,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<i64>>(5)?,
                 row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<i64>>(9)?,
-                row.get::<_, String>(10)?,
-                row.get::<_, i64>(11)?,
-                row.get::<_, Option<String>>(12)?,
-                row.get::<_, Option<String>>(13)?,
-                row.get::<_, Option<String>>(14)?,
+                tracker,
+                project,
+                item_key,
+                row.get::<_, String>(13)?,
+                row.get::<_, i64>(14)?,
                 row.get::<_, Option<String>>(15)?,
                 row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
+                row.get::<_, Option<String>>(19)?,
                 repo_id,
             ],
         )?;
@@ -1251,10 +1282,11 @@ mod tests {
         conn.execute(
             "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
              start_line, end_line, logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, \
-             github_owner, github_repo, github_number, anchor_status, created_at_ms, symbol_kind, \
+             tracker, project, item_key, anchor_status, created_at_ms, symbol_kind, \
              signature_hash, moniker_tool, moniker_tool_version, relocation_reason, repo_id)
-             VALUES ('m1', 'path', 'b1', 'src/x.rs', 10, 20, 111, 222, 333, 444, 'abc', 'o', 'r', \
-             7, 'current', 0, 'function', 'sighash', 'scip-rust', '0.4', 'moved', 'legacy-repo')",
+             VALUES ('m1', 'path', 'b1', 'src/x.rs', 10, 20, 111, 222, 333, 444, 'abc', 'github', \
+             'o/r', '7', 'current', 0, 'function', 'sighash', 'scip-rust', '0.4', 'moved', \
+             'legacy-repo')",
             [],
         )
         .unwrap();
@@ -1389,17 +1421,16 @@ mod tests {
         );
         assert_eq!(nulled, 1, "local rowids nulled for re-resolution");
         // Its portable fields survive.
-        let (path, commit, num): (Option<String>, Option<String>, Option<i64>) = target
+        let (path, commit, key): (Option<String>, Option<String>, Option<String>) = target
             .query_row(
-                "SELECT path, commit_hash, github_number FROM repo_memory_bindings WHERE \
-                 memory_id='m1'",
+                "SELECT path, commit_hash, item_key FROM repo_memory_bindings WHERE memory_id='m1'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!(path.as_deref(), Some("src/x.rs"), "portable path survives");
         assert_eq!(commit.as_deref(), Some("abc"));
-        assert_eq!(num, Some(7));
+        assert_eq!(key.as_deref(), Some("7"));
 
         // Call-path logical ids are NULLed too; the edge is copied verbatim.
         let (start, end): (Option<i64>, Option<i64>) = target

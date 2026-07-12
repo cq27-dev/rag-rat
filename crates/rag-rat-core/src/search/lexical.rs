@@ -12,7 +12,7 @@ const VECTOR_WEIGHT: f64 = 0.35;
 const SYMBOL_WEIGHT: f64 = 0.10;
 const GRAPH_WEIGHT: f64 = 0.05;
 const GIT_WEIGHT: f64 = 0.03;
-const GITHUB_WEIGHT: f64 = 0.02;
+const PAPERTRAIL_WEIGHT: f64 = 0.02;
 
 // --- Graded-git rerank (#109, behind `SearchOptions::graded_history`) ----------------------------
 // All of these are A/B-SWEPT on the commit-replay eval (`rag-rat eval --replay --rerank`); they are
@@ -79,7 +79,7 @@ pub struct ScoreComponents {
     pub symbol: f64,
     pub graph: f64,
     pub git: f64,
-    pub github: f64,
+    pub papertrail: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_note: Option<String>,
 }
@@ -209,8 +209,8 @@ fn search_with_query_embedding(
     // REPO SCOPING (A4): every candidate row flows through the `files` scope VIEW (both the bm25
     // and the vector pass JOIN `files`), which filters `repo_id` FIRST — so in a consolidated
     // DB a sibling repo's chunks are dropped by the INNER JOIN before ranking. `active_repo_id`
-    // is resolved ONCE here and threaded into the git/github boost queries (which read the
-    // direct-scoped `git_file_changes` / `github_refs` by path, bypassing the view).
+    // is resolved ONCE here and threaded into the git/papertrail boost queries (which read the
+    // direct-scoped `git_file_changes` / `papertrail_refs` by path, bypassing the view).
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     // RECALL BOUND: `chunk_fts` / `chunk_embeddings` MATCH globally, then the repo (+ commit +
     // worktree) filter is applied by the scope-view JOIN. Because SQLite applies `LIMIT` AFTER the
@@ -276,7 +276,7 @@ fn search_with_query_embedding(
             } else {
                 GIT_WEIGHT * boosts.git
             };
-            hit.components.github = GITHUB_WEIGHT * boosts.github;
+            hit.components.papertrail = PAPERTRAIL_WEIGHT * boosts.papertrail;
             let chunk_id = hit.hit.chunk_id;
             let mut finished = hit.finish(explain, vector_available);
             // Multiplicative demotion AFTER the weighted sum (near-free precision lever): generated
@@ -318,7 +318,7 @@ impl RankedHit {
                 + self.components.symbol
                 + self.components.graph
                 + self.components.git
-                + self.components.github,
+                + self.components.papertrail,
         );
         // Always state how this hit was retrieved (#41): a hit enters `ranked` via the BM25 and/or
         // the vector candidate pass, so its mode follows which of those components scored.
@@ -566,7 +566,7 @@ struct BoostComponents {
     symbol: f64,
     graph: f64,
     git: f64,
-    github: f64,
+    papertrail: f64,
 }
 
 fn boosts(
@@ -581,7 +581,7 @@ fn boosts(
         symbol: symbol_path_boost(hit, terms),
         graph: graph_boost(conn, hit, terms, repo_id)?,
         git: historical.git,
-        github: historical.github,
+        papertrail: historical.papertrail,
     })
 }
 
@@ -743,7 +743,7 @@ fn relation_weight(edge_kind: &str) -> f64 {
 #[derive(Debug, Clone, Default)]
 struct HistoricalBoost {
     git: f64,
-    github: f64,
+    papertrail: f64,
 }
 
 fn historical_boost(
@@ -752,7 +752,7 @@ fn historical_boost(
     options: SearchOptions,
     repo_id: &str,
 ) -> anyhow::Result<HistoricalBoost> {
-    // `git_file_changes` / `github_refs` are direct-scoped (V040/V041) and queried by PATH here
+    // `git_file_changes` / `papertrail_refs` are direct-scoped and queried by PATH here
     // (bypassing the scope view), so the `repo_id` predicate keeps a sibling repo's history from
     // boosting a same-named path in a consolidated DB.
     let git = if options.include_git {
@@ -764,9 +764,9 @@ fn historical_boost(
     } else {
         0
     };
-    let github = if options.include_papertrail {
+    let papertrail = if options.include_papertrail {
         conn.query_row(
-            "SELECT COUNT(*) FROM github_refs WHERE source_path = ?1 AND repo_id = ?2 LIMIT 1",
+            "SELECT COUNT(*) FROM papertrail_refs WHERE source_path = ?1 AND repo_id = ?2 LIMIT 1",
             params![path, repo_id],
             |row| row.get::<_, i64>(0),
         )?
@@ -775,7 +775,7 @@ fn historical_boost(
     };
     Ok(HistoricalBoost {
         git: if git > 0 { 1.0 } else { 0.0 },
-        github: if github > 0 { 1.0 } else { 0.0 },
+        papertrail: if papertrail > 0 { 1.0 } else { 0.0 },
     })
 }
 
@@ -1517,7 +1517,7 @@ mod tests {
             assert_eq!(ca.bm25, cb.bm25);
             assert_eq!(ca.symbol, cb.symbol);
             assert_eq!(ca.graph, cb.graph);
-            assert_eq!(ca.github, cb.github);
+            assert_eq!(ca.papertrail, cb.papertrail);
         }
     }
 

@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 59;
+pub const LATEST_SCHEMA_VERSION: u32 = 60;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -419,6 +419,18 @@ const MIGRATION_059_DESCRIPTION: &str =
      I10a), account_entry_status (the projected §16.3 taxonomy), and account_pre_verify (entries \
      whose signing device isn't yet resolvable, retried on a later DeviceAdd/AccountGenesis \
      arrival). All CREATE ... IF NOT EXISTS + STRICT tables";
+const MIGRATION_060_ID: &str = "060_papertrail_provider_neutral_schema";
+const MIGRATION_060_CHECKSUM: &str = "sha256:rag-rat-papertrail-provider-neutral-schema-v60";
+const MIGRATION_060_DESCRIPTION: &str =
+    "Normalize the GitHub papertrail cache into the provider-neutral papertrail_* tables (#588): \
+     papertrail_items (tracker + item_kind in the natural key, issue-shadow deduped), unified \
+     papertrail_comments (reviews fold in behind review_state / anchor_path), papertrail_refs \
+     (annotation layer only), papertrail_sync_cursor (one row per repo/tracker/project — the \
+     per-ref github_ref_sync state machine is deleted), papertrail_item_tags, and the \
+     incrementally-maintained papertrail_fts mirror; backfills mechanically from the seven \
+     github_* tables then DROPS them (hard rename, no aliases); renames the memory binding kind \
+     github -> tracker (tracker/project/item_key columns backfilled, github_* columns dropped) \
+     and the github_last_sync_ms repo_meta key to papertrail_last_sync_ms";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -918,6 +930,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_059_CHECKSUM,
         description: MIGRATION_059_DESCRIPTION,
         apply: apply_account_candidate_dag,
+    },
+    Migration {
+        id: MIGRATION_060_ID,
+        checksum: MIGRATION_060_CHECKSUM,
+        description: MIGRATION_060_DESCRIPTION,
+        apply: apply_papertrail_provider_neutral_schema,
     },
 ];
 

@@ -118,11 +118,11 @@ pub struct RepoMemoryBinding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_owner: Option<String>,
+    pub tracker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_repo: Option<String>,
+    pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_number: Option<i64>,
+    pub item_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,9 +207,9 @@ pub struct RepoMemoryBindTarget {
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
     pub commit_hash: Option<String>,
-    pub github_owner: Option<String>,
-    pub github_repo: Option<String>,
-    pub github_number: Option<i64>,
+    pub tracker: Option<String>,
+    pub project: Option<String>,
+    pub item_key: Option<String>,
     #[serde(
         rename = "start_id",
         default,
@@ -237,7 +237,7 @@ impl RepoMemoryBindTarget {
     /// True iff NO field is set — a truly empty target, i.e. an UNANCHORED node (#463). Derived
     /// structurally (`== default`) so it is drift-proof: any field added to this struct is covered
     /// automatically. A PARTIALLY populated target (some field set, but not a complete binding —
-    /// e.g. github owner+repo without a number, or a span without a path) is NOT empty; it is a
+    /// e.g. a tracker+project without an item_key, or a span without a path) is NOT empty; it is a
     /// malformed anchor that `resolve_binding` rejects rather than silently treating as unanchored.
     pub(crate) fn is_empty(&self) -> bool {
         self == &Self::default()
@@ -494,9 +494,9 @@ pub(crate) struct ResolvedBinding {
     chunk_id: Option<i64>,
     edge_id: Option<i64>,
     commit_hash: Option<String>,
-    github_owner: Option<String>,
-    github_repo: Option<String>,
-    github_number: Option<i64>,
+    tracker: Option<String>,
+    project: Option<String>,
+    item_key: Option<String>,
     symbol_kind: Option<String>,
     signature_hash: Option<String>,
     call_path: Option<ResolvedCallPath>,
@@ -576,9 +576,9 @@ mod tests {
             chunk_id: None,
             edge_id: None,
             commit_hash: None,
-            github_owner: None,
-            github_repo: None,
-            github_number: None,
+            tracker: None,
+            project: None,
+            item_key: None,
             symbol_kind: None,
             signature_hash: None,
             moniker_tool: None,

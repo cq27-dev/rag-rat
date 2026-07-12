@@ -406,9 +406,9 @@ fn dir_bind_target(dir: Option<String>) -> crate::query::memory::RepoMemoryBindT
         start_line: None,
         end_line: None,
         commit_hash: None,
-        github_owner: None,
-        github_repo: None,
-        github_number: None,
+        tracker: None,
+        project: None,
+        item_key: None,
         start_logical_symbol_id: None,
         end_logical_symbol_id: None,
         edge_sequence_hash: None,
@@ -902,12 +902,12 @@ mod dispatch;
 mod embedding_policy_fast_path;
 mod generation_rebuild;
 mod git_history_reload;
-mod github_papertrail;
 mod graph_edges;
 mod head_move_carry;
 mod migration_gate_wiring;
 mod multi_repo_scope;
 mod orientation_healing;
+mod papertrail_tests;
 mod reconcile_embeddings;
 mod repo_memory;
 mod repo_registry;

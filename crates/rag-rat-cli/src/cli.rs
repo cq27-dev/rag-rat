@@ -77,8 +77,8 @@ pub(crate) enum Command {
     /// findings written to `dream_findings`. Surfaces findings ABOUT memories; never mutates them.
     Dream(DreamArgs),
 
-    /// GitHub papertrail sync.
-    Github(GithubArgs),
+    /// Tracker papertrail sync.
+    Papertrail(PapertrailArgs),
 
     /// Install / uninstall / inspect git hooks and Claude Code hooks.
     Hooks(HooksArgs),
@@ -599,19 +599,19 @@ pub(crate) enum MemoryCommand {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct GithubArgs {
+pub(crate) struct PapertrailArgs {
     #[command(subcommand)]
-    pub command: GithubCommand,
+    pub command: PapertrailCommand,
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum GithubCommand {
-    /// Sync issues/PRs into the papertrail.
+pub(crate) enum PapertrailCommand {
+    /// Sync tracker items (issues / change requests) into the papertrail.
     Sync {
         /// Sync only refs already mentioned in indexed source/commits.
         #[arg(long)]
         from_refs: bool,
-        /// Sync a single issue/PR (owner/repo#number).
+        /// Sync a single item (owner/repo#number).
         #[arg(long)]
         issue: Option<String>,
         /// Do not hit the network; use cached evidence only.

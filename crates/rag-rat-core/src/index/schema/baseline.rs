@@ -343,103 +343,6 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS github_refs(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            number INTEGER NOT NULL,
-            ref_kind TEXT NOT NULL DEFAULT 'unknown',
-            source_kind TEXT NOT NULL,
-            source_path TEXT,
-            source_commit TEXT,
-            source_text TEXT NOT NULL,
-            discovered_at_ms INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS github_issues(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            number INTEGER NOT NULL,
-            html_url TEXT NOT NULL,
-            state TEXT NOT NULL,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL,
-            author TEXT,
-            created_at TEXT,
-            updated_at TEXT,
-            is_pull_request INTEGER NOT NULL DEFAULT 0,
-            synced_at_ms INTEGER NOT NULL,
-            UNIQUE(owner, repo, number)
-        );
-
-        CREATE TABLE IF NOT EXISTS github_comments(
-            id INTEGER PRIMARY KEY,
-            owner TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            number INTEGER NOT NULL,
-            html_url TEXT NOT NULL,
-            body TEXT NOT NULL,
-            author TEXT,
-            created_at TEXT,
-            updated_at TEXT,
-            synced_at_ms INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS github_pull_requests(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            number INTEGER NOT NULL,
-            html_url TEXT NOT NULL,
-            state TEXT NOT NULL,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL,
-            author TEXT,
-            created_at TEXT,
-            updated_at TEXT,
-            merged_at TEXT,
-            synced_at_ms INTEGER NOT NULL,
-            UNIQUE(owner, repo, number)
-        );
-
-        CREATE TABLE IF NOT EXISTS github_reviews(
-            id INTEGER PRIMARY KEY,
-            owner TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            number INTEGER NOT NULL,
-            html_url TEXT,
-            state TEXT NOT NULL,
-            body TEXT NOT NULL,
-            author TEXT,
-            submitted_at TEXT,
-            synced_at_ms INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS github_review_comments(
-            id INTEGER PRIMARY KEY,
-            owner TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            number INTEGER NOT NULL,
-            path TEXT,
-            html_url TEXT NOT NULL,
-            body TEXT NOT NULL,
-            author TEXT,
-            created_at TEXT,
-            updated_at TEXT,
-            synced_at_ms INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS github_ref_sync(
-            owner TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            number INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            synced_at_ms INTEGER NOT NULL,
-            last_error TEXT,
-            PRIMARY KEY(owner, repo, number)
-        );
-
         CREATE TABLE IF NOT EXISTS repo_memories(
             id TEXT PRIMARY KEY,
             kind TEXT NOT NULL,
@@ -468,9 +371,9 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             chunk_id INTEGER,
             edge_id INTEGER,
             commit_hash TEXT,
-            github_owner TEXT,
-            github_repo TEXT,
-            github_number INTEGER,
+            tracker TEXT,
+            project TEXT,
+            item_key TEXT,
             anchor_status TEXT NOT NULL,
             created_at_ms INTEGER NOT NULL,
             PRIMARY KEY(memory_id, binding_kind, binding_id),
@@ -518,19 +421,6 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             tokenize='porter'
         );
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS github_fts USING fts5(
-            owner,
-            repo,
-            number UNINDEXED,
-            item_kind UNINDEXED,
-            item_id UNINDEXED,
-            url UNINDEXED,
-            title,
-            body,
-            classification,
-            tokenize='porter'
-        );
-
         CREATE VIRTUAL TABLE IF NOT EXISTS repo_memory_fts USING fts5(
             memory_id UNINDEXED,
             title,
@@ -555,12 +445,6 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             ON logical_symbol_members(symbol_id);
         CREATE INDEX IF NOT EXISTS idx_git_file_changes_path ON git_file_changes(path);
         CREATE INDEX IF NOT EXISTS idx_git_file_changes_commit ON git_file_changes(commit_hash);
-        CREATE INDEX IF NOT EXISTS idx_github_refs_path ON github_refs(source_path);
-        CREATE INDEX IF NOT EXISTS idx_github_refs_issue ON github_refs(owner, repo, number);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_github_refs_unique
-            ON github_refs(owner, repo, number, source_kind, COALESCE(source_path, ''), \
-         COALESCE(source_commit, ''), source_text);
-        CREATE INDEX IF NOT EXISTS idx_github_review_comments_path ON github_review_comments(path);
         CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_logical_symbol
             ON repo_memory_bindings(logical_symbol_id);
         CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_symbol
@@ -591,7 +475,11 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     apply_edge_source_target_spans(conn)?;
     apply_embedding_policy_and_input_hash(conn)?;
     apply_logical_symbol_groups(conn)?;
-    apply_github_ref_sync(conn)?;
+    // The provider-neutral papertrail tables (V060). The baseline produces the CURRENT schema
+    // directly — no legacy github_* tables are created — so a routine `migrate_forward` (which
+    // re-runs the baseline) can never resurrect the dropped legacy cache. The V009/V041/V044/V045
+    // github migrations in the ladder each no-op when the legacy tables are absent.
+    create_papertrail_tables(conn)?;
     apply_symbol_facts(conn)?;
     apply_repo_memories(conn)?;
     apply_repo_memory_call_paths(conn)?;

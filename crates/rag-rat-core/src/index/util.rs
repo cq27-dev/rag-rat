@@ -60,7 +60,7 @@ pub(crate) fn scoped_chunk_row_count(
 /// (the active repo), so a status/freshness read reports THIS repo's totals rather than the union
 /// across every repo in a consolidated DB. `table` is always an internal string literal, never user
 /// input, and MUST carry a `repo_id` column (the V040/V041 direct-scoped tables — git_commits,
-/// git_file_changes, the github_* papertrail tables).
+/// git_file_changes, the papertrail_* tables).
 pub(crate) fn scoped_table_row_count(
     conn: &rusqlite::Connection,
     table: &str,

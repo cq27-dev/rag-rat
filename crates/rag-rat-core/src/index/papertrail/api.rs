@@ -22,11 +22,11 @@ pub(crate) async fn sync_from_refs_with_progress<C: PapertrailClient>(
     let sync = if offline {
         SyncRefsReport::default()
     } else {
-        let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
+        let client = client.ok_or_else(|| anyhow::anyhow!("papertrail sync requires a client"))?;
         sync_refs(conn, client, refs.iter(), &mut progress).await?
     };
     let repo_id = schema::active_repo_id(conn)?;
-    set_repo_meta(conn, &repo_id, "github_last_sync_ms", &now_ms().to_string())?;
+    set_repo_meta(conn, &repo_id, "papertrail_last_sync_ms", &now_ms().to_string())?;
     Ok(PapertrailSyncReport {
         offline,
         discovered_refs: refs.len(),
@@ -45,27 +45,18 @@ pub(crate) async fn sync_issue<C: PapertrailClient>(
     ctx: &PapertrailContext,
 ) -> anyhow::Result<PapertrailSyncReport> {
     let parsed = parse_issue_ref(issue_ref, ctx.default_repo())
-        .ok_or_else(|| anyhow::anyhow!("invalid GitHub issue reference `{issue_ref}`"))?;
-    store_ref(conn, &PapertrailRef {
-        owner: parsed.owner,
-        repo: parsed.repo,
-        number: parsed.number,
-        ref_kind: "unknown".to_string(),
-        source_kind: "manual".to_string(),
-        source_path: None,
-        source_commit: None,
-        source_text: issue_ref.to_string(),
-    })?;
+        .ok_or_else(|| anyhow::anyhow!("invalid tracker item reference `{issue_ref}`"))?;
+    let item_key = parsed.number.to_string();
+    store_ref(conn, &parsed.into_ref("manual", None, None, issue_ref.to_string()))?;
     let refs = refs(conn)?;
     let sync = if offline {
         SyncRefsReport::default()
     } else {
-        let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
-        sync_refs(conn, client, refs.iter().filter(|r| r.number == parsed.number), &mut |_| {})
-            .await?
+        let client = client.ok_or_else(|| anyhow::anyhow!("papertrail sync requires a client"))?;
+        sync_refs(conn, client, refs.iter().filter(|r| r.item_key == item_key), &mut |_| {}).await?
     };
     let repo_id = schema::active_repo_id(conn)?;
-    set_repo_meta(conn, &repo_id, "github_last_sync_ms", &now_ms().to_string())?;
+    set_repo_meta(conn, &repo_id, "papertrail_last_sync_ms", &now_ms().to_string())?;
     Ok(PapertrailSyncReport {
         offline,
         discovered_refs: refs.len(),
@@ -80,17 +71,23 @@ pub(crate) fn status(
     conn: &Connection,
     ctx: &PapertrailContext,
 ) -> anyhow::Result<PapertrailStatus> {
-    // The github_* tables are direct-scoped (V041); report only the ACTIVE repo's counts, not the
+    // The papertrail_* tables are direct-scoped; report only the ACTIVE repo's counts, not the
     // union across a consolidated DB.
     let repo_id = schema::active_repo_id(conn)?;
+    let items_by_kind = |kind: ItemKind| -> anyhow::Result<u64> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM papertrail_items WHERE item_kind = ?1 AND repo_id = ?2",
+            params![kind.as_db_str(), repo_id],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or_default())
+    };
     Ok(PapertrailStatus {
-        refs: scoped_table_row_count(conn, "github_refs", &repo_id)?,
-        issues: scoped_table_row_count(conn, "github_issues", &repo_id)?,
-        comments: scoped_table_row_count(conn, "github_comments", &repo_id)?,
-        pulls: scoped_table_row_count(conn, "github_pull_requests", &repo_id)?,
-        reviews: scoped_table_row_count(conn, "github_reviews", &repo_id)?,
-        review_comments: scoped_table_row_count(conn, "github_review_comments", &repo_id)?,
-        last_sync_ms: repo_meta(conn, &repo_id, "github_last_sync_ms")?
+        refs: scoped_table_row_count(conn, "papertrail_refs", &repo_id)?,
+        issues: items_by_kind(ItemKind::Issue)?,
+        change_requests: items_by_kind(ItemKind::ChangeRequest)?,
+        comments: scoped_table_row_count(conn, "papertrail_comments", &repo_id)?,
+        last_sync_ms: repo_meta(conn, &repo_id, "papertrail_last_sync_ms")?
             .and_then(|value| value.parse().ok()),
         capability: if ctx.gh_available {
             "gh_cli_available".to_string()
@@ -104,7 +101,8 @@ pub(crate) fn issue_search(
     query: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<PapertrailEvidence>> {
-    search_fts(conn, query, Some("issue"), limit)
+    // Item rows only (issues AND change requests — their titles/bodies), not comment rows.
+    search_fts(conn, query, Some("item"), limit)
 }
 pub(crate) fn rationale_search(
     conn: &Connection,
@@ -113,12 +111,12 @@ pub(crate) fn rationale_search(
     ctx: &PapertrailContext,
 ) -> anyhow::Result<Vec<PapertrailEvidence>> {
     let mut evidence = Vec::new();
-    for reference in parse_refs(query, ctx.default_repo()) {
-        evidence.extend(evidence_for_issue(
+    for parsed in parse_refs(query, ctx.default_repo()) {
+        evidence.extend(evidence_for_item(
             conn,
-            &reference.owner,
-            &reference.repo,
-            reference.number,
+            Tracker::Github,
+            &parsed.project,
+            &parsed.number.to_string(),
             limit,
         )?);
     }
@@ -135,8 +133,9 @@ pub(crate) fn refs_for_path(
     let repo_id = schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
-        SELECT owner, repo, number, ref_kind, source_kind, source_path, source_commit, source_text
-        FROM github_refs
+        SELECT tracker, project, item_key, ref_kind, source_kind, source_path, source_commit, \
+         source_text
+        FROM papertrail_refs
         WHERE source_path = ?1 AND repo_id = ?3
         ORDER BY id DESC
         LIMIT ?2
@@ -163,8 +162,8 @@ pub(crate) fn papertrail_for_chunk(
             end_line: Some(chunk.end_line),
             symbol: chunk.symbol_path.clone(),
         }),
-        github_evidence: evidence,
-        fallback_github_evidence: Vec::new(),
+        evidence,
+        fallback_evidence: Vec::new(),
     })
 }
 pub(crate) fn papertrail_for_symbol(
@@ -186,8 +185,8 @@ pub(crate) fn papertrail_for_symbol(
             end_line,
             symbol: Some(symbol.qualified_name.clone()),
         }),
-        github_evidence: evidence,
-        fallback_github_evidence: Vec::new(),
+        evidence,
+        fallback_evidence: Vec::new(),
     })
 }
 pub(crate) fn papertrail_for_commit(
@@ -220,18 +219,14 @@ pub(crate) fn papertrail_for_commit(
     dedupe_evidence(&mut fallback_evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     fallback_evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    Ok(Papertrail {
-        current_source: None,
-        github_evidence: evidence,
-        fallback_github_evidence: fallback_evidence,
-    })
+    Ok(Papertrail { current_source: None, evidence, fallback_evidence })
 }
 pub(crate) fn mark_fallback_evidence(evidence: &mut [PapertrailEvidence]) {
     for item in evidence {
         item.evidence_kind = match item.evidence_kind {
-            "literal_github_ref" => "fallback_literal_github_ref",
-            "historical_github" => "fallback_historical_github",
-            _ => "fallback_github_evidence",
+            "literal_tracker_ref" => "fallback_literal_tracker_ref",
+            "historical_tracker" => "fallback_historical_tracker",
+            _ => "fallback_tracker_evidence",
         };
         item.score = item.score.min(0.25);
     }

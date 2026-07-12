@@ -21,9 +21,10 @@ pub(crate) const LIVE_FILES_GENERATION_META_KEY: &str = "live_files_generation";
 
 /// The direct-scoped tables whose [`LEGACY_REPO_ID`] placeholder rows [`register_repo`] re-points
 /// at the real id when it adopts a legacy DB. V040 (phase A3) added the core tables; V041 (phase
-/// A4) added the seven GitHub papertrail tables plus the derived `github_fts` mirror (own-content
-/// FTS5, so its `repo_id UNINDEXED` value updates in place — re-pointing here keeps papertrail
-/// scoped to the real id without waiting for the next sync's `rebuild_fts`). `git_file_changes` is
+/// A4) added the github papertrail tables, which V060 normalized into the provider-neutral
+/// papertrail_* set listed here (the migration copies `repo_id` verbatim, so placeholder rows
+/// stay placeholder and adoption re-points them exactly as before — `papertrail_fts` is
+/// own-content FTS5, so its `repo_id UNINDEXED` value updates in place). `git_file_changes` is
 /// intentionally ABSENT: its `(repo_id, commit_hash)` FK to `git_commits(repo_id, hash)` is `ON
 /// UPDATE CASCADE`, so rewriting `git_commits.repo_id` re-points its rows automatically — an
 /// explicit UPDATE would instead trip the FK (the child would reference the real id before the
@@ -38,15 +39,14 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
     "docs",
     "parser_failures",
     "git_commits",
-    // V041 (phase A4) GitHub papertrail tables + the derived FTS mirror.
-    "github_refs",
-    "github_issues",
-    "github_comments",
-    "github_pull_requests",
-    "github_reviews",
-    "github_review_comments",
-    "github_ref_sync",
-    "github_fts",
+    // The provider-neutral papertrail tables (V060, successors of the seven V041 github_* tables)
+    // + the derived FTS mirror.
+    "papertrail_refs",
+    "papertrail_items",
+    "papertrail_comments",
+    "papertrail_sync_cursor",
+    "papertrail_item_tags",
+    "papertrail_fts",
     // V056 (#566) derived change-coupling table: standalone, direct `repo_id`, no FK children, so
     // a LocalOnly→Portable adoption re-points its rows here (moving them together with the
     // `git_coupling_stamp` repo_meta so the derived table stays consistent + fresh), and the
@@ -407,17 +407,18 @@ fn register_repo_inner(
             SHALLOW_BOUNDARY_META_KEY,
         ])?;
         // Re-point every direct-scoped table's source rows onto the real id (A3/A4 extend the
-        // A1/A2 adoption contract from `repos`/`repo_meta` to the V040 core tables and the V041
-        // GitHub papertrail tables). Runs INSIDE the same adoption transaction, keeping the
-        // insert-first ordering: on a fresh open the tables are empty and these are no-ops; on a
-        // forward-migrated DB that indexed under the placeholder (or a shallow-clone upgrade) they
-        // carry the rows onto the real id atomically with the `repos` rewrite. `git_commits` is
-        // updated here; `git_file_changes` follows via its `ON UPDATE CASCADE` FK.
+        // A1/A2 adoption contract from `repos`/`repo_meta` to the V040 core tables and the
+        // papertrail tables, provider-neutral since V060). Runs INSIDE the same adoption
+        // transaction, keeping the insert-first ordering: on a fresh open the tables are
+        // empty and these are no-ops; on a forward-migrated DB that indexed under the
+        // placeholder (or a shallow-clone upgrade) they carry the rows onto the real id
+        // atomically with the `repos` rewrite. `git_commits` is updated here;
+        // `git_file_changes` follows via its `ON UPDATE CASCADE` FK.
         for table in DIRECT_SCOPED_ADOPTION_TABLES {
             // Guard on table presence: a real consolidated DB is fully migrated (every
             // direct-scoped table exists), but the schema-bootstrap tests exercise
             // adoption against ISOLATION fixtures that seed only the subset a given
-            // migration touches (V040 core tables OR V041 github tables). Skipping an
+            // migration touches (V040 core tables OR the papertrail tables). Skipping an
             // absent table keeps adoption correct on the full schema while staying
             // robust to those partial fixtures — a table that does not exist has no
             // source rows to re-point.
@@ -440,7 +441,7 @@ fn register_repo_inner(
         // `column_exists` (no-op when the column is absent, real backfill once V042 has run — every
         // normal open applies the full ladder) so this adoption never trips "no such column". Uses
         // `source_id` (not the placeholder literal) so a shallow-clone upgrade re-points periphery
-        // rows off the `local:` incumbent too, exactly like the core/github loop above.
+        // rows off the `local:` incumbent too, exactly like the core/papertrail loop above.
         for table in A5_PERIPHERY_DIRECT_SCOPED_TABLES {
             if super::column_exists(&tx, table, "repo_id")? {
                 // `main.`-qualified for the same view-shadowing reason as the core loop above.
@@ -601,8 +602,8 @@ fn late_upgrade_is_proven(
 ///    anchor after the next index pass — exactly the consolidate posture. Tags/call-paths follow
 ///    via `memory_id`.
 ///  * DERIVED data is DROPPED, not migrated: files (cascading chunks/symbols/edges), git history,
-///    github papertrail, clones, oracle, reconcile, dream rows under `owner` are deleted — a fresh
-///    index of this root re-derives them under `target_id`, and the carried `embedding_cache`
+///    papertrail, clones, oracle, reconcile, dream rows under `owner` are deleted — a fresh index
+///    of this root re-derives them under `target_id`, and the carried `embedding_cache`
 ///    (content-addressed, global) makes re-embedding a no-op. Leaving them "for gc" was rejected:
 ///    gc sweeps are per-ACTIVE-repo, so rows under a retired id would be permanent invisible
 ///    garbage.
@@ -630,8 +631,9 @@ fn late_upgrade_is_proven(
 ///
 /// TABLE COVERAGE: [`DIRECT_SCOPED_ADOPTION_TABLES`] + [`LATE_MERGE_DERIVED_PERIPHERY_TABLES`]
 /// were audited complete against every `repo_id`-carrying table at V044; V045 widened the github
-/// CHILD tables' keys but introduced no new `repo_id` table (they were already in the direct
-/// list via V041), so the disposition is unchanged. A future migration adding a NEW
+/// CHILD tables' keys without adding a new `repo_id` table, and V060's papertrail_* successors
+/// replaced the github_* entries in the direct list 1:1, so the disposition is unchanged. A
+/// future migration adding a NEW
 /// `repo_id`-scoped table must add it to one of these lists (or the authored-move set above).
 fn merge_local_incumbent_into_registered(
     conn: &Connection,

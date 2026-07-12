@@ -100,7 +100,7 @@ pub struct ImpactSurfaceReport {
     pub text_fallback_hits: Vec<ImpactItem>,
     pub recent_commits_touching_symbol_path: Vec<ImpactItem>,
     pub files_co_changed_with_symbol_path: Vec<ImpactItem>,
-    pub github_rationale_issues_prs: Vec<ImpactItem>,
+    pub papertrail_rationale_items: Vec<ImpactItem>,
     pub repo_memories: RepoMemoryEvidenceView,
     pub completeness_and_caveats: ImpactCompleteness,
 }
@@ -248,9 +248,9 @@ pub fn impact_surface_report_for_symbol(
     // the IndexDatabase seam before this pure reader runs.
     let files_co_changed_with_symbol_path =
         if options.include_git { coupling_items(conn, &symbol.path, limit)? } else { Vec::new() };
-    let github_rationale_issues_prs = if options.include_papertrail {
-        let mut items = github_ref_items(conn, std::slice::from_ref(&symbol.path), limit)?;
-        items.extend(github_rationale_items(conn, &symbol.qualified_name, limit)?);
+    let papertrail_rationale_items = if options.include_papertrail {
+        let mut items = papertrail_ref_items(conn, std::slice::from_ref(&symbol.path), limit)?;
+        items.extend(papertrail_rationale_items_for_query(conn, &symbol.qualified_name, limit)?);
         items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         items
     } else {
@@ -305,7 +305,7 @@ pub fn impact_surface_report_for_symbol(
         ("text_fallback_hits", text_fallback_hits.len()),
         ("recent_commits_touching_symbol_path", recent_commits_touching_symbol_path.len()),
         ("files_co_changed_with_symbol_path", files_co_changed_with_symbol_path.len()),
-        ("github_rationale_issues_prs", github_rationale_issues_prs.len()),
+        ("papertrail_rationale_items", papertrail_rationale_items.len()),
     ]
     .into_iter()
     .filter(|&(_, len)| limit_usize != 0 && len >= limit_usize)
@@ -368,7 +368,7 @@ pub fn impact_surface_report_for_symbol(
         text_fallback_hits,
         recent_commits_touching_symbol_path,
         files_co_changed_with_symbol_path,
-        github_rationale_issues_prs,
+        papertrail_rationale_items,
         repo_memories,
     })
 }

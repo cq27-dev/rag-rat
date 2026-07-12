@@ -80,7 +80,7 @@ impl IndexDatabase {
             parser_failures: self.parser_failure_count()?,
             parser_failure_paths: self.parser_failure_paths()?,
             git_history: self.git_history_status()?,
-            github: self.papertrail_status()?,
+            papertrail: self.papertrail_status()?,
             llm: self.llm_status()?,
             anchor_health: crate::query::memory::anchor_health_counts(self.storage.connection())
                 .unwrap_or_default(),

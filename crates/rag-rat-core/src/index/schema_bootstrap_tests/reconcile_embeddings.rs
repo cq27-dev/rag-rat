@@ -914,7 +914,7 @@ fn search_explain_reports_weighted_score_components() {
         + components.symbol
         + components.graph
         + components.git
-        + components.github;
+        + components.papertrail;
     // `score` is rounded to 4dp for display, so compare against the rounded component sum.
     assert!((hits[0].score - crate::query::round_score(component_sum)).abs() < 1e-9);
     assert!(components.bm25 > 0.0);
@@ -925,7 +925,7 @@ fn search_explain_reports_weighted_score_components() {
     assert!(components.symbol <= 0.10);
     assert!(components.graph <= 0.05);
     assert!(components.git <= 0.03);
-    assert!(components.github <= 0.02);
+    assert!(components.papertrail <= 0.02);
     assert!(db.search("runtime shutdown", 10, false).unwrap()[0].score_components.is_none());
 
     let _ = fs::remove_dir_all(root);

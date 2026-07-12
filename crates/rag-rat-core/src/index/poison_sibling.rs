@@ -18,13 +18,14 @@
 //! by [`primary_collision_path`]) — they catch the class the distinct-path rows CANNOT: an
 //! aggregate that reads a scoped table grouped by a NON-repo key (path / source_path / (path,
 //! start_byte)) and then JOINS the result onto the active repo's rows BY THAT KEY instead of
-//! flowing repo attribution through the join. The canonical example is the V041 `github_ref_counts`
-//! CTE in `query::repo_brief::file_rows` (`SELECT source_path, COUNT(*) FROM github_refs GROUP BY
-//! source_path` then `LEFT JOIN … ON github_ref_counts.path = files.path`): a sibling's
-//! `github_refs` row at `src/lib.rs` inflates the active repo's file `src/lib.rs` unless the CTE
-//! filters `repo_id`. A distinct-path sibling ref at `zz_poison_path.rs` never joins onto a primary
-//! file, so ONLY a same-path ref exposes that leak. Same-path rows go in for `github_refs`,
-//! `files`, `git_file_changes`, `parser_failures` (V041), and — for the V042 periphery whose
+//! flowing repo attribution through the join. The canonical example is the `papertrail_ref_counts`
+//! CTE in `query::repo_brief::file_rows` (`SELECT source_path, COUNT(*) FROM papertrail_refs GROUP
+//! BY source_path` then `LEFT JOIN … ON papertrail_ref_counts.path = files.path`): a sibling's
+//! `papertrail_refs` row at `src/lib.rs` inflates the active repo's file `src/lib.rs` unless the
+//! CTE filters `repo_id`. A distinct-path sibling ref at `zz_poison_path.rs` never joins onto a
+//! primary file, so ONLY a same-path ref exposes that leak. Same-path rows go in for
+//! `papertrail_refs`, `files`, `git_file_changes`, `parser_failures` (V041), and — for the V042
+//! periphery whose
 //! readers key by path — `repo_memory_bindings` (path-bound memories joined onto files by path) and
 //! `edge_oracle` (source_path + source_start_byte joined onto files); each is pinned in
 //! [`sibling_tripwires`] by a path-INDEPENDENT sentinel column so the intact check holds regardless
@@ -34,9 +35,9 @@
 //! which scopes the V040 core tables — `repos`, `repo_roots`, `repo_meta`, `files`, `packages`,
 //! `logical_symbols`, `docs`, `parser_failures`, `git_commits`, `git_file_changes` (plus
 //! `chunks`/`symbols`/`edges_data` TRANSITIVELY via `files.id` and `logical_symbol_members` via
-//! `logical_symbols.id`) — the seven V041 GitHub papertrail tables (`github_refs`, `github_issues`,
-//! `github_comments`, `github_pull_requests`, `github_reviews`, `github_review_comments`,
-//! `github_ref_sync`) plus the `github_fts` mirror — AND the V042 periphery tables that each gained
+//! `logical_symbols.id`) — the provider-neutral papertrail tables (`papertrail_refs`,
+//! `papertrail_items`, `papertrail_comments`, `papertrail_sync_cursor`, `papertrail_item_tags`,
+//! V060) plus the `papertrail_fts` mirror — AND the V042 periphery tables that each gained
 //! their OWN `repo_id`: `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`,
 //! `logical_symbol_monikers` (now direct, no longer only transitive), `oracle_runs`, `edge_oracle`,
 //! `clone_graph_generations`, `clone_token_df`, `clone_refinements`, `dream_findings`, and
@@ -92,17 +93,13 @@ const POISON_LOGICAL_ID: i64 = 9_900_000_777;
 /// The poison sibling's git commit hash (a distinctive 40-hex-shaped sentinel).
 const POISON_COMMIT: &str = "zzpoison00000000000000000000000000000000";
 
-/// The poison sibling's GitHub issue/PR/ref number — a distinctive sentinel far outside any
-/// fixture's range, so a seeded papertrail row is unmistakable and never collides on the
-/// `UNIQUE(owner, repo, number)` / `PRIMARY KEY(owner, repo, number)` keys.
-const POISON_GH_NUMBER: i64 = 9_900_077;
+/// The poison sibling's papertrail item key — a distinctive sentinel far outside any fixture's
+/// range, so a seeded papertrail row is unmistakable and never collides on the
+/// `(repo_id, tracker, project, item_kind, item_key)` natural keys.
+const POISON_ITEM_KEY: &str = "9900077";
 
-/// Base for the EXPLICIT GitHub item ids on the five body-bearing poison rows (+1 issue, +2
-/// comment, +3 pull, +4 review, +5 review comment). `papertrail::rebuild_fts` derives
-/// `github_fts.item_id` from each base row's `id`, so the harness pins the ids rather than letting
-/// AUTOINCREMENT choose — the seeded mirror rows and a post-resync re-derived mirror then agree on
-/// every tripwire-pinned column (see `github_fts_tripwires_survive_a_papertrail_resync`).
-const POISON_GH_ITEM_ID: i64 = 9_900_077_000;
+/// The poison sibling's tracker project (an `owner/repo` path that can never match a fixture's).
+const POISON_PROJECT: &str = "zz_poison_owner/zz_poison_repo";
 
 /// SAME-PATH tripwire sentinels. The DISTINCT-PATH rows above seed under `zz_poison_`-prefixed
 /// paths that never collide with a primary-repo path, so a leak that JOINS a scoped table onto the
@@ -112,8 +109,9 @@ const POISON_GH_ITEM_ID: i64 = 9_900_077_000;
 /// join-by-path aggregate attributes the sibling's rows to the active repo and an existing read
 /// assertion trips. Each carries its own path-INDEPENDENT sentinel column value (distinct from the
 /// distinct-path rows) so the intact check pins it regardless of which primary path was chosen.
-const POISON_SAMEPATH_GH_NUMBER: i64 = 9_900_078;
-/// `github_refs.source_text` sentinel on the same-path ref (so it reads distinctly in a dump).
+const POISON_SAMEPATH_ITEM_KEY: &str = "9900078";
+/// `papertrail_refs.source_text` sentinel on the same-path ref (so it reads distinctly in a
+/// dump).
 const POISON_SAMEPATH_REFTEXT: &str = "zz_poison_samepath_reftext";
 /// `files.sha256` sentinel pinning the same-path `files` row.
 const POISON_SAMEPATH_SHA: &str = "zz_poison_samepath_sha";
@@ -339,117 +337,120 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
         ],
     )?;
 
-    // --- github papertrail (V041): the seven base tables + the standalone `github_fts` mirror each
-    // gained a `repo_id` column, so a sibling row is now valid (these caches carry NO FK to
-    // `repos`) and any unscoped papertrail read/count/delete trips a tripwire. The five
-    // body-bearing rows carry EXPLICIT item ids (`POISON_GH_ITEM_ID` + kind offset) because a
-    // papertrail resync (`papertrail::rebuild_fts`) re-derives the whole mirror from these rows —
-    // pinned ids keep the re-derived mirror identical to the seeded one. ---
-    let gh_owner = format!("{POISON_PREFIX}owner");
-    let gh_repo = format!("{POISON_PREFIX}repo");
+    // --- papertrail (V060): every provider-neutral table + the standalone `papertrail_fts`
+    // mirror carries a `repo_id` column, so a sibling row is valid (these caches carry NO FK to
+    // `repos`) and any unscoped papertrail read/count/delete trips a tripwire. The two items
+    // share `POISON_ITEM_KEY` under DIFFERENT `item_kind`s, so a read that drops the kind from
+    // the natural key also trips. ---
     conn.execute(
-        "INSERT INTO github_refs(owner, repo, number, ref_kind, source_kind, source_path, \
-         source_text, discovered_at_ms, repo_id)
-         VALUES (?1, ?2, ?3, 'closing', 'file', ?4, ?5, 0, ?6)",
+        "INSERT INTO papertrail_refs(tracker, project, item_key, ref_kind, source_kind, \
+         source_path, source_text, discovered_at_ms, repo_id)
+         VALUES ('github', ?1, ?2, 'closing', 'file', ?3, ?4, 0, ?5)",
         params![
-            gh_owner,
-            gh_repo,
-            POISON_GH_NUMBER,
+            POISON_PROJECT,
+            POISON_ITEM_KEY,
             format!("{POISON_PREFIX}path.rs"),
             format!("{POISON_PREFIX}reftext"),
             POISON_REPO_ID
         ],
     )?;
     conn.execute(
-        "INSERT INTO github_issues(id, owner, repo, number, html_url, state, title, body, \
-         synced_at_ms, repo_id)
-         VALUES (?1, ?2, ?3, ?4, 'http://x', 'open', ?5, ?6, 0, ?7)",
+        "INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, title, \
+         body, synced_at_ms, repo_id)
+         VALUES ('github', ?1, 'issue', ?2, 'http://x', 'open', ?3, ?4, 0, ?5)",
         params![
-            POISON_GH_ITEM_ID + 1,
-            gh_owner,
-            gh_repo,
-            POISON_GH_NUMBER,
+            POISON_PROJECT,
+            POISON_ITEM_KEY,
             format!("{POISON_PREFIX}title"),
             format!("{POISON_PREFIX}body"),
             POISON_REPO_ID
         ],
     )?;
     conn.execute(
-        "INSERT INTO github_comments(id, owner, repo, number, html_url, body, synced_at_ms, \
-         repo_id)
-         VALUES (?1, ?2, ?3, ?4, 'http://x', ?5, 0, ?6)",
+        "INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, title, \
+         body, merged_at, synced_at_ms, repo_id)
+         VALUES ('github', ?1, 'change_request', ?2, 'http://x', 'open', ?3, ?4, NULL, 0, ?5)",
         params![
-            POISON_GH_ITEM_ID + 2,
-            gh_owner,
-            gh_repo,
-            POISON_GH_NUMBER,
-            format!("{POISON_PREFIX}comment"),
-            POISON_REPO_ID
-        ],
-    )?;
-    conn.execute(
-        "INSERT INTO github_pull_requests(id, owner, repo, number, html_url, state, title, body, \
-         synced_at_ms, repo_id)
-         VALUES (?1, ?2, ?3, ?4, 'http://x', 'open', ?5, ?6, 0, ?7)",
-        params![
-            POISON_GH_ITEM_ID + 3,
-            gh_owner,
-            gh_repo,
-            POISON_GH_NUMBER,
+            POISON_PROJECT,
+            POISON_ITEM_KEY,
             format!("{POISON_PREFIX}prtitle"),
             format!("{POISON_PREFIX}prbody"),
             POISON_REPO_ID
         ],
     )?;
+    // The three legacy comment shapes in the unified table: a plain thread comment, a review
+    // event (review_state), and a file-anchored review comment (anchor_path).
     conn.execute(
-        "INSERT INTO github_reviews(id, owner, repo, number, state, body, synced_at_ms, repo_id)
-         VALUES (?1, ?2, ?3, ?4, 'commented', ?5, 0, ?6)",
+        "INSERT INTO papertrail_comments(tracker, project, item_kind, item_key, comment_id, url, \
+         body, synced_at_ms, repo_id)
+         VALUES ('github', ?1, 'issue', ?2, ?3, 'http://x', ?4, 0, ?5)",
         params![
-            POISON_GH_ITEM_ID + 4,
-            gh_owner,
-            gh_repo,
-            POISON_GH_NUMBER,
+            POISON_PROJECT,
+            POISON_ITEM_KEY,
+            format!("{POISON_PREFIX}comment_id_1"),
+            format!("{POISON_PREFIX}comment"),
+            POISON_REPO_ID
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO papertrail_comments(tracker, project, item_kind, item_key, comment_id, url, \
+         body, review_state, synced_at_ms, repo_id)
+         VALUES ('github', ?1, 'change_request', ?2, ?3, NULL, ?4, 'commented', 0, ?5)",
+        params![
+            POISON_PROJECT,
+            POISON_ITEM_KEY,
+            format!("{POISON_PREFIX}comment_id_2"),
             format!("{POISON_PREFIX}review"),
             POISON_REPO_ID
         ],
     )?;
     conn.execute(
-        "INSERT INTO github_review_comments(id, owner, repo, number, html_url, body, \
-         synced_at_ms, repo_id)
-         VALUES (?1, ?2, ?3, ?4, 'http://x', ?5, 0, ?6)",
+        "INSERT INTO papertrail_comments(tracker, project, item_kind, item_key, comment_id, url, \
+         body, anchor_path, synced_at_ms, repo_id)
+         VALUES ('github', ?1, 'change_request', ?2, ?3, 'http://x', ?4, ?5, 0, ?6)",
         params![
-            POISON_GH_ITEM_ID + 5,
-            gh_owner,
-            gh_repo,
-            POISON_GH_NUMBER,
+            POISON_PROJECT,
+            POISON_ITEM_KEY,
+            format!("{POISON_PREFIX}comment_id_3"),
             format!("{POISON_PREFIX}revcomment"),
+            format!("{POISON_PREFIX}anchored.rs"),
             POISON_REPO_ID
         ],
     )?;
     conn.execute(
-        "INSERT INTO github_ref_sync(owner, repo, number, status, synced_at_ms, repo_id)
-         VALUES (?1, ?2, ?3, 'ok', 0, ?4)",
-        params![gh_owner, gh_repo, POISON_GH_NUMBER, POISON_REPO_ID],
+        "INSERT INTO papertrail_sync_cursor(tracker, project, high_mark_at, repo_id)
+         VALUES ('github', ?1, ?2, ?3)",
+        params![POISON_PROJECT, format!("{POISON_PREFIX}mark"), POISON_REPO_ID],
     )?;
-    // github_fts mirror rows, seeded EXACTLY as `papertrail::rebuild_fts` derives them from the
-    // five base rows above (one row per item kind; same item_id / url / title / body slot
-    // mapping — reviews derive url = COALESCE(html_url, '') = '' and review comments derive
-    // title = COALESCE(path, '') = '' from the unseeded nullable columns). A resync DELETEs the
-    // whole mirror and re-derives it, so seeding anything else would strand the intact check on
-    // a vanished row set; `github_fts_tripwires_survive_a_papertrail_resync` pins this
+    conn.execute(
+        "INSERT INTO papertrail_item_tags(tracker, project, item_kind, item_key, tag, repo_id)
+         VALUES ('github', ?1, 'issue', ?2, ?3, ?4)",
+        params![POISON_PROJECT, POISON_ITEM_KEY, format!("{POISON_PREFIX}itemtag"), POISON_REPO_ID],
+    )?;
+    // papertrail_fts mirror rows, seeded EXACTLY as the INCREMENTAL writers (`store_item` /
+    // `store_comment`) and the whole-table `papertrail::rebuild_fts` derive them from the five
+    // base rows above: item rows carry the item title, comment rows carry COALESCE(anchor_path,
+    // '') in the title slot and COALESCE(url, '') in the url slot. A full mirror rebuild DELETEs
+    // everything and re-derives, so seeding anything else would strand the intact check on a
+    // vanished row set; `papertrail_fts_tripwires_survive_a_mirror_rebuild` pins this
     // equivalence. `classification` is recomputed by `insert_fts` (`classify_text`) at
     // re-derivation and is deliberately NOT pinned by the tripwires.
-    let insert_poison_fts = |kind: &str, item_id: i64, url: &str, title: &str, body: String| {
+    let insert_poison_fts = |item_kind: &str,
+                             doc_kind: &str,
+                             comment_id: &str,
+                             url: &str,
+                             title: &str,
+                             body: String| {
         conn.execute(
-            "INSERT INTO github_fts(owner, repo, number, item_kind, item_id, url, title, body, \
-             classification, repo_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'other', ?9)",
+            "INSERT INTO papertrail_fts(tracker, project, item_kind, item_key, doc_kind, \
+             comment_id, url, title, body, classification, repo_id)
+                 VALUES ('github', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'other', ?9)",
             params![
-                gh_owner,
-                gh_repo,
-                POISON_GH_NUMBER,
-                kind,
-                item_id.to_string(),
+                POISON_PROJECT,
+                item_kind,
+                POISON_ITEM_KEY,
+                doc_kind,
+                comment_id,
                 url,
                 title,
                 body,
@@ -459,31 +460,42 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
     };
     insert_poison_fts(
         "issue",
-        POISON_GH_ITEM_ID + 1,
+        "item",
+        "",
         "http://x",
         &format!("{POISON_PREFIX}title"),
         format!("{POISON_PREFIX}body"),
     )?;
     insert_poison_fts(
+        "change_request",
+        "item",
+        "",
+        "http://x",
+        &format!("{POISON_PREFIX}prtitle"),
+        format!("{POISON_PREFIX}prbody"),
+    )?;
+    insert_poison_fts(
+        "issue",
         "comment",
-        POISON_GH_ITEM_ID + 2,
+        &format!("{POISON_PREFIX}comment_id_1"),
         "http://x",
         "",
         format!("{POISON_PREFIX}comment"),
     )?;
     insert_poison_fts(
-        "pull",
-        POISON_GH_ITEM_ID + 3,
-        "http://x",
-        &format!("{POISON_PREFIX}prtitle"),
-        format!("{POISON_PREFIX}prbody"),
-    )?;
-    insert_poison_fts("review", POISON_GH_ITEM_ID + 4, "", "", format!("{POISON_PREFIX}review"))?;
-    insert_poison_fts(
-        "review_comment",
-        POISON_GH_ITEM_ID + 5,
-        "http://x",
+        "change_request",
+        "comment",
+        &format!("{POISON_PREFIX}comment_id_2"),
         "",
+        "",
+        format!("{POISON_PREFIX}review"),
+    )?;
+    insert_poison_fts(
+        "change_request",
+        "comment",
+        &format!("{POISON_PREFIX}comment_id_3"),
+        "http://x",
+        &format!("{POISON_PREFIX}anchored.rs"),
         format!("{POISON_PREFIX}revcomment"),
     )?;
 
@@ -655,17 +667,16 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
         "INSERT INTO parser_failures(repo_id, path, language, message) VALUES (?1, ?2, 'rust', ?3)",
         params![POISON_REPO_ID, collision_path, POISON_SAMEPATH_MSG],
     )?;
-    // github_refs at the shared source_path: THE canonical join-by-path leak (the V041
-    // `github_ref_counts` CTE in `repo_brief::file_rows`). Distinct `number` from the distinct-path
-    // ref, so the `UNIQUE(owner, repo, number, source_kind, ...)` index is satisfied.
+    // papertrail_refs at the shared source_path: THE canonical join-by-path leak (the
+    // `papertrail_ref_counts` CTE in `repo_brief::file_rows`). Distinct `item_key` from the
+    // distinct-path ref, so `idx_papertrail_refs_unique` is satisfied.
     conn.execute(
-        "INSERT INTO github_refs(owner, repo, number, ref_kind, source_kind, source_path, \
-         source_text, discovered_at_ms, repo_id)
-         VALUES (?1, ?2, ?3, 'closing', 'file', ?4, ?5, 0, ?6)",
+        "INSERT INTO papertrail_refs(tracker, project, item_key, ref_kind, source_kind, \
+         source_path, source_text, discovered_at_ms, repo_id)
+         VALUES ('github', ?1, ?2, 'closing', 'file', ?3, ?4, 0, ?5)",
         params![
-            gh_owner,
-            gh_repo,
-            POISON_SAMEPATH_GH_NUMBER,
+            POISON_PROJECT,
+            POISON_SAMEPATH_ITEM_KEY,
             collision_path,
             POISON_SAMEPATH_REFTEXT,
             POISON_REPO_ID
@@ -787,14 +798,12 @@ fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
          DELETE FROM git_file_changes WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM git_commits WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM main.files WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM github_refs WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM github_issues WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM github_comments WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM github_pull_requests WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM github_reviews WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM github_review_comments WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM github_ref_sync WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM github_fts WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM papertrail_refs WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM papertrail_items WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM papertrail_comments WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM papertrail_sync_cursor WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM papertrail_item_tags WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM papertrail_fts WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM reconcile_attempts WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM memory_reality WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM memory_summaries WHERE repo_id = '{POISON_REPO_ID}';
@@ -865,68 +874,97 @@ fn sibling_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'static str, Str
                  moniker = '{POISON_PREFIX}moniker'"
             ),
         ),
-        // github papertrail (V041): each base table + the fts mirror pinned by the sentinel
-        // number.
-        ("github_refs", format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}")),
-        ("github_issues", format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}")),
+        // papertrail (V060): each base table + the fts mirror pinned by the sentinel item key.
         (
-            "github_comments",
-            format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}"),
+            "papertrail_refs",
+            format!("repo_id = '{POISON_REPO_ID}' AND item_key = '{POISON_ITEM_KEY}'"),
         ),
         (
-            "github_pull_requests",
-            format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}"),
-        ),
-        ("github_reviews", format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}")),
-        (
-            "github_review_comments",
-            format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}"),
-        ),
-        (
-            "github_ref_sync",
-            format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}"),
-        ),
-        // github_fts: one derived mirror row per item kind, pinned by item_kind + item_id + body
-        // so a papertrail resync's re-derivation must reconverge onto exactly this set
-        // (`classification` is derivation-owned and deliberately unpinned).
-        (
-            "github_fts",
+            "papertrail_items",
             format!(
-                "repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER} AND item_kind = \
-                 'issue' AND item_id = '{}' AND body = '{POISON_PREFIX}body'",
-                POISON_GH_ITEM_ID + 1
+                "repo_id = '{POISON_REPO_ID}' AND item_kind = 'issue' AND item_key = \
+                 '{POISON_ITEM_KEY}' AND body = '{POISON_PREFIX}body'"
             ),
         ),
         (
-            "github_fts",
+            "papertrail_items",
             format!(
-                "repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER} AND item_kind = \
-                 'comment' AND item_id = '{}' AND body = '{POISON_PREFIX}comment'",
-                POISON_GH_ITEM_ID + 2
+                "repo_id = '{POISON_REPO_ID}' AND item_kind = 'change_request' AND item_key = \
+                 '{POISON_ITEM_KEY}' AND body = '{POISON_PREFIX}prbody'"
             ),
         ),
         (
-            "github_fts",
+            "papertrail_comments",
             format!(
-                "repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER} AND item_kind = \
-                 'pull' AND item_id = '{}' AND body = '{POISON_PREFIX}prbody'",
-                POISON_GH_ITEM_ID + 3
+                "repo_id = '{POISON_REPO_ID}' AND comment_id = '{POISON_PREFIX}comment_id_1' AND \
+                 body = '{POISON_PREFIX}comment' AND review_state IS NULL AND anchor_path IS NULL"
             ),
         ),
         (
-            "github_fts",
+            "papertrail_comments",
             format!(
-                "repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER} AND item_kind = \
-                 'review' AND item_id = '{}' AND body = '{POISON_PREFIX}review'",
-                POISON_GH_ITEM_ID + 4
+                "repo_id = '{POISON_REPO_ID}' AND comment_id = '{POISON_PREFIX}comment_id_2' AND \
+                 body = '{POISON_PREFIX}review' AND review_state = 'commented'"
             ),
         ),
         (
-            "github_fts",
+            "papertrail_comments",
             format!(
-                "repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER} AND item_kind = \
-                 'review_comment' AND item_id = '{}' AND body = '{POISON_PREFIX}revcomment'",
-                POISON_GH_ITEM_ID + 5
+                "repo_id = '{POISON_REPO_ID}' AND comment_id = '{POISON_PREFIX}comment_id_3' AND \
+                 body = '{POISON_PREFIX}revcomment' AND anchor_path = '{POISON_PREFIX}anchored.rs'"
+            ),
+        ),
+        (
+            "papertrail_sync_cursor",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND project = '{POISON_PROJECT}' AND high_mark_at = \
+                 '{POISON_PREFIX}mark'"
+            ),
+        ),
+        (
+            "papertrail_item_tags",
+            format!("repo_id = '{POISON_REPO_ID}' AND tag = '{POISON_PREFIX}itemtag'"),
+        ),
+        // papertrail_fts: one derived mirror row per base row above, pinned by doc_kind +
+        // item_kind/comment_id + body so a full mirror rebuild's re-derivation must reconverge
+        // onto exactly this set (`classification` is derivation-owned and deliberately unpinned).
+        (
+            "papertrail_fts",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND doc_kind = 'item' AND item_kind = 'issue' AND \
+                 item_key = '{POISON_ITEM_KEY}' AND body = '{POISON_PREFIX}body'"
+            ),
+        ),
+        (
+            "papertrail_fts",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND doc_kind = 'item' AND item_kind = \
+                 'change_request' AND item_key = '{POISON_ITEM_KEY}' AND body = \
+                 '{POISON_PREFIX}prbody'"
+            ),
+        ),
+        (
+            "papertrail_fts",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND doc_kind = 'comment' AND comment_id = \
+                 '{POISON_PREFIX}comment_id_1' AND body = '{POISON_PREFIX}comment' AND url = \
+                 'http://x' AND title = ''"
+            ),
+        ),
+        (
+            "papertrail_fts",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND doc_kind = 'comment' AND comment_id = \
+                 '{POISON_PREFIX}comment_id_2' AND body = '{POISON_PREFIX}review' AND url = '' \
+                 AND title = ''"
+            ),
+        ),
+        (
+            "papertrail_fts",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND doc_kind = 'comment' AND comment_id = \
+                 '{POISON_PREFIX}comment_id_3' AND body = '{POISON_PREFIX}revcomment' AND title = \
+                 '{POISON_PREFIX}anchored.rs'"
             ),
         ),
         // SAME-PATH tripwires (V041): pinned by a path-INDEPENDENT sentinel column (the collision
@@ -944,8 +982,8 @@ fn sibling_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'static str, Str
             format!("repo_id = '{POISON_REPO_ID}' AND message = '{POISON_SAMEPATH_MSG}'"),
         ),
         (
-            "github_refs",
-            format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_SAMEPATH_GH_NUMBER}"),
+            "papertrail_refs",
+            format!("repo_id = '{POISON_REPO_ID}' AND item_key = '{POISON_SAMEPATH_ITEM_KEY}'"),
         ),
         // A5 periphery (V042): each directly-scoped table pinned by the sibling repo_id (plus its
         // sentinel key where a table's row is otherwise ambiguous). `repo_memory_tags` scopes
@@ -1119,23 +1157,23 @@ mod tests {
             "the collision path must be a REAL primary path, got `{collision_path}`"
         );
 
-        // The UNSCOPED join-by-path shape (the pre-fix `github_ref_counts` CTE) sees the sibling's
-        // colliding ref at the primary path — the tripwire is live.
+        // The UNSCOPED join-by-path shape (the pre-fix `papertrail_ref_counts` CTE) sees the
+        // sibling's colliding ref at the primary path — the tripwire is live.
         let unscoped_refs: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM github_refs WHERE source_path = ?1",
+                "SELECT COUNT(*) FROM papertrail_refs WHERE source_path = ?1",
                 [&collision_path],
                 |row| row.get(0),
             )
             .unwrap();
         assert!(
             unscoped_refs >= 1,
-            "same-path github_refs tripwire is asleep: an unscoped path aggregate saw no sibling \
-             ref at the primary path `{collision_path}`",
+            "same-path papertrail_refs tripwire is asleep: an unscoped path aggregate saw no \
+             sibling ref at the primary path `{collision_path}`",
         );
 
-        // The SCOPED production surface must NOT leak it: the fixture repo has no github_refs of
-        // its own, so its `src/lib.rs` candidate reports zero refs.
+        // The SCOPED production surface must NOT leak it: the fixture repo has no
+        // papertrail_refs of its own, so its `src/lib.rs` candidate reports zero refs.
         let brief = db
             .repo_brief(crate::query::repo_brief::RepoBriefOptions {
                 mode: crate::query::repo_brief::RepoBriefMode::Spine,
@@ -1150,25 +1188,26 @@ mod tests {
             .find(|candidate| candidate.path == collision_path)
             .expect("the primary path must appear in the brief");
         assert_eq!(
-            primary.metrics.github_ref_count, 0,
-            "repo_brief leaked a sibling repo's github_refs across the shared path \
-             `{collision_path}` — scope the github_ref_counts CTE by repo_id",
+            primary.metrics.papertrail_ref_count, 0,
+            "repo_brief leaked a sibling repo's papertrail_refs across the shared path \
+             `{collision_path}` — scope the papertrail_ref_counts CTE by repo_id",
         );
 
         // The same-path rows are counted by the intact check too.
         assert_sibling_intact(conn);
     }
 
-    /// A papertrail resync (the github sync tail) DELETEs the whole `github_fts` mirror and
-    /// re-derives it from the base tables — every poisoned base row becomes a derived mirror row.
-    /// The harness must reconverge: the seeded mirror rows are derivation-faithful copies (same
-    /// item_id / url / title / body slots per kind), so the rebuilt mirror carries the SAME
-    /// tripwire set and `assert_sibling_intact` stays meaningful after a mid-test resync. This
-    /// pins `seed_sibling`'s fts seeding to `rebuild_fts`'s derivation — if a column mapping in
-    /// either drifts, this fails locally instead of surfacing as a phantom sibling
-    /// leak in whichever github test resyncs first.
+    /// A full mirror rebuild (the full re-walk / recovery path) DELETEs the whole
+    /// `papertrail_fts` mirror and re-derives it from the base tables — every poisoned base row
+    /// becomes a derived mirror row. The harness must reconverge: the seeded mirror rows are
+    /// derivation-faithful copies (same doc_kind / comment_id / url / title / body slots), so the
+    /// rebuilt mirror carries the SAME tripwire set and `assert_sibling_intact` stays meaningful
+    /// after a mid-test rebuild. This pins `seed_sibling`'s fts seeding to BOTH derivations (the
+    /// incremental writers and `rebuild_fts` share the slot mapping) — if a column mapping in
+    /// either drifts, this fails locally instead of surfacing as a phantom sibling leak in
+    /// whichever papertrail test rebuilds first.
     #[test]
-    fn github_fts_tripwires_survive_a_papertrail_resync() {
+    fn papertrail_fts_tripwires_survive_a_mirror_rebuild() {
         let (_root, config) = poison_test_config("poison_resync");
         let db = IndexDatabase::rebuild(&config).unwrap();
         let conn = db.storage.connection();

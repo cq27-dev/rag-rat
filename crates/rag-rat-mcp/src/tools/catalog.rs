@@ -25,12 +25,12 @@ pub const TOOL_NAMES: &[&str] = &[
     "papertrail_for_chunk",
     "papertrail_for_symbol",
     "papertrail_for_commit",
-    "github_issue_search",
-    "github_refs_for_path",
+    "papertrail_issue_search",
+    "papertrail_refs_for_path",
     "rationale_search",
     "llm_status",
     "heal_index",
-    "github_sync_status",
+    "papertrail_sync_status",
     "index_status",
     "memory_create",
     "memory_rebind",
@@ -100,7 +100,7 @@ pub fn description(name: &str) -> &'static str {
              compiler verdicts. Reports nothing when no oracle data exists for this checkout.",
         "impact_surface" =>
             "Pre-edit blast radius for a symbol or path: graph callers/callees, tests, docs, git \
-             history, GitHub papertrail, and the repo memories crossing it, with a completeness / \
+             history, tracker papertrail, and the repo memories crossing it, with a completeness / \
              risk summary. Run this before changing anything non-trivial.",
         "check_library_usage" =>
             "Dependency-contract check for the code's EXTERNAL library calls, from the SCIP \
@@ -164,36 +164,37 @@ pub fn description(name: &str) -> &'static str {
             "Hash-bound git blame for one chunk: who last touched its lines, computed lazily and \
              cached against the chunk hash.",
         "papertrail_for_chunk" =>
-            "The 'why' behind a chunk: its current text plus the cached GitHub issues/PRs/reviews \
-             that reference it.",
+            "The 'why' behind a chunk: its current text plus the cached tracker items (issues / \
+             change requests) and review comments that reference it.",
         "papertrail_for_symbol" =>
-            "Resolve a symbol, then return its current context plus the cached GitHub rationale \
-             (issues/PRs/reviews) referencing it.",
+            "Resolve a symbol, then return its current context plus the cached tracker rationale \
+             (issues / change requests / reviews) referencing it.",
         "papertrail_for_commit" =>
-            "Cached GitHub issues/PRs/reviews related to a historical commit.",
-        "github_issue_search" =>
-            "Full-text search across cached GitHub issue and PR titles and bodies.",
-        "github_refs_for_path" =>
-            "List cached GitHub issues/PRs discovered to reference a current path.",
+            "Cached tracker items (issues / change requests / reviews) related to a historical \
+             commit.",
+        "papertrail_issue_search" =>
+            "Full-text search across cached tracker issue and change-request titles and bodies.",
+        "papertrail_refs_for_path" =>
+            "List cached tracker items discovered to reference a current path.",
         "rationale_search" =>
-            "Search cached GitHub rationale snippets (review comments, PR/issue discussion) by \
-             keyword.",
+            "Search cached tracker rationale snippets (review comments, issue / change-request \
+             discussion) by keyword.",
         "llm_status" =>
             "Embedding status (local or remote/Ollama-served): model, install state, and how many \
              chunks are embedded / missing / skipped.",
         "heal_index" =>
             "Re-index stale already-indexed files and refresh FTS — repair when reads report \
              drift. Writes only to the index, never to source.",
-        "github_sync_status" =>
-            "GitHub papertrail cache status: counts of issues, PRs, comments, and refs, plus last \
-             sync time.",
+        "papertrail_sync_status" =>
+            "Papertrail cache status: counts of issues, change requests, comments, and refs, plus \
+             last sync time.",
         "index_status" =>
             "Index freshness vs HEAD: git/indexed head, per-language file counts, parser failures, \
              FTS sync state, and schema version.",
         "memory_create" =>
             "Record a durable, source-anchored repo memory (Invariant / Decision / Risk / \
-             BugPattern / …) bound to a symbol, chunk, path, edge/call-path, commit, or GitHub ref \
-             — so the rationale resurfaces for the next agent editing that code. Capture \
+             BugPattern / …) bound to a symbol, chunk, path, edge/call-path, commit, or tracker \
+             ref — so the rationale resurfaces for the next agent editing that code. Capture \
              non-obvious invariants and decisions as you discover them.",
         "memory_rebind" =>
             "Re-anchor an existing repo memory to a different symbol, chunk, path, or other source \
@@ -258,7 +259,7 @@ pub fn schema(name: &str) -> Value {
         "semantic_search"
         | "commit_search"
         | "commits_touching_query"
-        | "github_issue_search"
+        | "papertrail_issue_search"
         | "rationale_search" => schema_for::<SearchArgs>(),
         "symbol_lookup" => schema_for::<SymbolArgs>(),
         // Pure selector args, no `include` — these resolve via select_symbol (source-only) and
@@ -276,7 +277,7 @@ pub fn schema(name: &str) -> Value {
         "clones_for_symbol" => schema_for::<ClonesForSymbolArgs>(),
         "ffi_surface" => schema_for::<LimitArgs>(),
         "read_chunk" => schema_for::<ReadChunkArgs>(),
-        "git_history_for_path" | "github_refs_for_path" => schema_for::<PathHistoryArgs>(),
+        "git_history_for_path" | "papertrail_refs_for_path" => schema_for::<PathHistoryArgs>(),
         "git_blame_chunk" => schema_for::<BlameChunkArgs>(),
         "papertrail_for_chunk" => schema_for::<PapertrailChunkArgs>(),
         "papertrail_for_commit" => schema_for::<PapertrailCommitArgs>(),
@@ -289,7 +290,10 @@ pub fn schema(name: &str) -> Value {
         "memory_for_path" => schema_for::<MemoryForPathArgs>(),
         "memory_for_call_path" => schema_for::<MemoryForCallPathArgs>(),
         "memory_mark_obsolete" | "memory_show" => schema_for::<MemoryIdArgs>(),
-        "llm_status" | "github_sync_status" | "index_status" | "memory_validate"
+        "llm_status"
+        | "papertrail_sync_status"
+        | "index_status"
+        | "memory_validate"
         | "memory_doctor" => schema_for::<EmptyArgs>(),
         "memory_edge_add" => schema_for::<MemoryEdgeAddArgs>(),
         "memory_edge_remove" => schema_for::<MemoryEdgeRemoveArgs>(),

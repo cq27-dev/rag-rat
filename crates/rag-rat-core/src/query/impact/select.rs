@@ -18,7 +18,7 @@ pub(crate) fn reason_rank(reason: &str) -> u8 {
         "same_file_sibling" => 4,
         "textual_fallback" => 5,
         "git_commit_touched_file" => 6,
-        "github_papertrail" => 7,
+        "papertrail" => 7,
         _ => 8,
     }
 }

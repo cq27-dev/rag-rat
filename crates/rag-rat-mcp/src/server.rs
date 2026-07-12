@@ -674,7 +674,7 @@ mod tests {
             ("compare_graph_to_scip", json!({})),
             ("index_status", json!({})),
             ("llm_status", json!({})),
-            ("github_sync_status", json!({})),
+            ("papertrail_sync_status", json!({})),
             ("memory_validate", json!({})),
         ];
         for (name, args) in calls {

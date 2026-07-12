@@ -46,9 +46,9 @@ pub(crate) fn resolve_binding(
             chunk_id: None,
             edge_id: None,
             commit_hash: Some(commit_hash.to_string()),
-            github_owner: None,
-            github_repo: None,
-            github_number: None,
+            tracker: None,
+            project: None,
+            item_key: None,
             symbol_kind: None,
             signature_hash: None,
             call_path: None,
@@ -56,12 +56,15 @@ pub(crate) fn resolve_binding(
             anchor_status: "unverified".to_string(),
         }));
     }
-    if let (Some(owner), Some(repo), Some(number)) =
-        (bind.github_owner.as_deref(), bind.github_repo.as_deref(), bind.github_number)
+    if let (Some(tracker), Some(project), Some(item_key)) =
+        (bind.tracker.as_deref(), bind.project.as_deref(), bind.item_key.as_deref())
     {
+        // The tracker token set is CLOSED — reject an unknown provider instead of persisting a
+        // free-form string the papertrail readers would never resolve.
+        let tracker = crate::index::papertrail::Tracker::from_db_str(tracker)?;
         return Ok(Some(ResolvedBinding {
-            binding_kind: "github".to_string(),
-            binding_id: format!("{owner}/{repo}#{number}"),
+            binding_kind: "tracker".to_string(),
+            binding_id: format!("{}:{project}#{item_key}", tracker.as_db_str()),
             path: None,
             start_line: None,
             end_line: None,
@@ -70,9 +73,9 @@ pub(crate) fn resolve_binding(
             chunk_id: None,
             edge_id: None,
             commit_hash: None,
-            github_owner: Some(owner.to_string()),
-            github_repo: Some(repo.to_string()),
-            github_number: Some(number),
+            tracker: Some(tracker.as_db_str().to_string()),
+            project: Some(project.to_string()),
+            item_key: Some(item_key.to_string()),
             symbol_kind: None,
             signature_hash: None,
             call_path: None,
@@ -81,8 +84,8 @@ pub(crate) fn resolve_binding(
         }));
     }
     // Fell through every binding branch. A TRULY EMPTY target is an unanchored node (#463); a
-    // PARTIALLY populated one (e.g. github owner+repo without a number, a span without a path, or
-    // call-path metadata without an `edge_sequence_hash`/`edge_path`) is a malformed anchor —
+    // PARTIALLY populated one (e.g. a tracker+project without an item_key, a span without a path,
+    // or call-path metadata without an `edge_sequence_hash`/`edge_path`) is a malformed anchor —
     // reject it rather than silently dropping the intended binding into an invisible unanchored
     // memory.
     if bind.is_empty() {
@@ -90,8 +93,8 @@ pub(crate) fn resolve_binding(
     }
     anyhow::bail!(
         "memory_create binding is incomplete: give a full logical_symbol_id, symbol_id, chunk_id, \
-         edge_id, call path, path/span, commit_hash, or github (owner+repo+number) ref — or omit \
-         `bind` entirely to create an unanchored node"
+         edge_id, call path, path/span, commit_hash, or tracker (tracker+project+item_key) ref — \
+         or omit `bind` entirely to create an unanchored node"
     )
 }
 
@@ -118,9 +121,9 @@ pub(crate) fn resolve_dir_binding(conn: &Connection, dir: &str) -> anyhow::Resul
         chunk_id: None,
         edge_id: None,
         commit_hash: None,
-        github_owner: None,
-        github_repo: None,
-        github_number: None,
+        tracker: None,
+        project: None,
+        item_key: None,
         symbol_kind: None,
         signature_hash: None,
         call_path: None,
@@ -167,9 +170,9 @@ pub(crate) fn resolve_logical_symbol_binding(
         chunk_id: chunk.as_ref().map(|chunk| chunk.chunk_id),
         edge_id: None,
         commit_hash: None,
-        github_owner: None,
-        github_repo: None,
-        github_number: None,
+        tracker: None,
+        project: None,
+        item_key: None,
         symbol_kind: kind,
         signature_hash: sig_hash,
         call_path: None,
@@ -211,9 +214,9 @@ pub(crate) fn resolve_symbol_binding(
         chunk_id: chunk.as_ref().map(|chunk| chunk.chunk_id),
         edge_id: None,
         commit_hash: None,
-        github_owner: None,
-        github_repo: None,
-        github_number: None,
+        tracker: None,
+        project: None,
+        item_key: None,
         symbol_kind: kind,
         signature_hash: sig_hash,
         call_path: None,
@@ -240,9 +243,9 @@ pub(crate) fn resolve_chunk_binding(
         chunk_id: Some(chunk_id),
         edge_id: None,
         commit_hash: None,
-        github_owner: None,
-        github_repo: None,
-        github_number: None,
+        tracker: None,
+        project: None,
+        item_key: None,
         symbol_kind: None,
         signature_hash: None,
         call_path: None,
@@ -267,9 +270,9 @@ pub(crate) fn resolve_edge_binding(
         chunk_id: None,
         edge_id: Some(edge_id),
         commit_hash: None,
-        github_owner: None,
-        github_repo: None,
-        github_number: None,
+        tracker: None,
+        project: None,
+        item_key: None,
         symbol_kind: None,
         signature_hash: None,
         call_path: None,
@@ -307,9 +310,9 @@ pub(crate) fn resolve_call_path_binding(
         chunk_id: None,
         edge_id: None,
         commit_hash: None,
-        github_owner: None,
-        github_repo: None,
-        github_number: None,
+        tracker: None,
+        project: None,
+        item_key: None,
         symbol_kind: None,
         signature_hash: None,
         call_path: Some(ResolvedCallPath {
@@ -351,9 +354,9 @@ pub(crate) fn resolve_path_binding(
         chunk_id: None,
         edge_id: None,
         commit_hash: None,
-        github_owner: None,
-        github_repo: None,
-        github_number: None,
+        tracker: None,
+        project: None,
+        item_key: None,
         symbol_kind: None,
         signature_hash: None,
         call_path: None,
@@ -729,9 +732,9 @@ pub(crate) fn resolve_call_path_from_edges(
         chunk_id: None,
         edge_id: None,
         commit_hash: None,
-        github_owner: None,
-        github_repo: None,
-        github_number: None,
+        tracker: None,
+        project: None,
+        item_key: None,
         symbol_kind: None,
         signature_hash: None,
         call_path: Some(ResolvedCallPath {
@@ -778,7 +781,7 @@ pub(crate) fn insert_binding(
         "
         INSERT INTO repo_memory_bindings(
             memory_id, binding_kind, binding_id, path, start_line, end_line, logical_symbol_id,
-            symbol_id, chunk_id, edge_id, commit_hash, github_owner, github_repo, github_number,
+            symbol_id, chunk_id, edge_id, commit_hash, tracker, project, item_key,
             symbol_kind, signature_hash, anchor_status, created_at_ms
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
@@ -795,9 +798,9 @@ pub(crate) fn insert_binding(
             binding.chunk_id,
             binding.edge_id,
             binding.commit_hash,
-            binding.github_owner,
-            binding.github_repo,
-            binding.github_number,
+            binding.tracker,
+            binding.project,
+            binding.item_key,
             binding.symbol_kind,
             binding.signature_hash,
             binding.anchor_status,

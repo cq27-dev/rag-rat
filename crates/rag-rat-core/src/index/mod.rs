@@ -130,7 +130,7 @@ pub struct IndexDatabase {
     /// `set_context_at_generation`; every direct-scoped file INSERT stamps it. `0` until the first
     /// context is installed — the generation a fresh index and every pre-V043 row carries.
     pub active_generation: i64,
-    /// Injected GitHub repo context. Resolved from `gh` only in `open_config` (real usage);
+    /// Injected tracker repo context. Resolved from `gh` only in `open_config` (real usage);
     /// `rebuild`/`open` leave it offline, and tests set it explicitly — so the library never
     /// shells out to `gh` during tests (#60).
     papertrail: papertrail::PapertrailContext,
@@ -229,7 +229,7 @@ pub struct IndexStatus {
     pub parser_failures: u64,
     pub parser_failure_paths: Vec<ParserFailure>,
     pub git_history: GitHistoryIndexStatus,
-    pub github: PapertrailStatus,
+    pub papertrail: PapertrailStatus,
     pub llm: LlmStatus,
     pub anchor_health: AnchorHealth,
 }

@@ -618,7 +618,7 @@ pub(crate) fn rebind_memory(
     let binding = resolve_binding(conn, &bind)?.ok_or_else(|| {
         anyhow::anyhow!(
             "memory_rebind requires a binding target: logical_symbol_id, symbol_id, chunk_id, \
-             edge_id, call path, path/span, commit_hash, or github ref"
+             edge_id, call path, path/span, commit_hash, or tracker ref"
         )
     })?;
     conn.execute("DELETE FROM repo_memory_bindings WHERE memory_id = ?1", [memory_id])?;
@@ -893,7 +893,7 @@ pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDocto
 }
 
 /// Compute live candidate qualified_names for a non-current symbol/logical binding.
-/// For path/chunk/edge/commit/github bindings there are no computable candidates (empty).
+/// For path/chunk/edge/commit/tracker bindings there are no computable candidates (empty).
 /// Candidates are ranked: same `symbol_kind` AND `signature_hash` match first, then
 /// same `symbol_kind` only, then bare-name-only hits last.
 fn live_symbol_candidates(
@@ -1022,8 +1022,8 @@ pub(crate) fn validate_memories(
     let mut stmt = conn.prepare(&format!(
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line,
-               logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, github_owner,
-               github_repo, github_number, symbol_kind, signature_hash, moniker_tool,
+               logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, tracker,
+               project, item_key, symbol_kind, signature_hash, moniker_tool,
                moniker_tool_version, relocation_reason, anchor_status, created_at_ms,
                downgrade_pending_at_ms
         FROM repo_memory_bindings

@@ -623,9 +623,11 @@ pub struct MemoryBindArgs {
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
     pub commit_hash: Option<String>,
-    pub github_owner: Option<String>,
-    pub github_repo: Option<String>,
-    pub github_number: Option<i64>,
+    /// Tracker-item binding: all three of `tracker` (e.g. `github`), `project`
+    /// (e.g. `owner/repo`), and `item_key` (e.g. `588`) together.
+    pub tracker: Option<String>,
+    pub project: Option<String>,
+    pub item_key: Option<String>,
     #[serde(
         rename = "start_id",
         default,
@@ -1054,9 +1056,9 @@ impl From<MemoryBindArgs> for RepoMemoryBindTarget {
             start_line: args.start_line,
             end_line: args.end_line,
             commit_hash: args.commit_hash,
-            github_owner: args.github_owner,
-            github_repo: args.github_repo,
-            github_number: args.github_number,
+            tracker: args.tracker,
+            project: args.project,
+            item_key: args.item_key,
             start_logical_symbol_id: args.start_logical_symbol_id,
             end_logical_symbol_id: args.end_logical_symbol_id,
             edge_sequence_hash: args.edge_sequence_hash,

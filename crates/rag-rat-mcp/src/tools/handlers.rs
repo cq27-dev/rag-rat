@@ -140,15 +140,15 @@ pub(crate) fn call_tool_with_db(
             let args: PapertrailCommitArgs = serde_json::from_value(arguments)?;
             let mut value = json!(db.papertrail_for_commit(&args.commit_hash, args.limit)?);
             if !included(&args.include, PapertrailCommitInclude::Fallback, false) {
-                strip_fallback_github_evidence(&mut value);
+                strip_fallback_evidence(&mut value);
             }
             value
         },
-        "github_issue_search" => {
+        "papertrail_issue_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
             json!(db.papertrail_issue_search(&args.query, args.limit)?)
         },
-        "github_refs_for_path" => {
+        "papertrail_refs_for_path" => {
             let args: PathHistoryArgs = serde_json::from_value(arguments)?;
             json!(db.papertrail_refs_for_path(&args.path, args.limit)?)
         },
@@ -156,7 +156,7 @@ pub(crate) fn call_tool_with_db(
             let args: SearchArgs = serde_json::from_value(arguments)?;
             let mut value = json!(db.rationale_search(&args.query, args.limit)?);
             if !included(&args.include, SearchInclude::Fallback, false) {
-                keep_literal_github_refs_if_present(&mut value);
+                keep_literal_tracker_refs_if_present(&mut value);
             }
             value
         },
@@ -171,7 +171,7 @@ pub(crate) fn call_tool_with_db(
             let args: HealIndexArgs = serde_json::from_value(arguments)?;
             json!(db.heal_index(args.limit)?)
         },
-        "github_sync_status" => json!(db.papertrail_sync_status()?),
+        "papertrail_sync_status" => json!(db.papertrail_sync_status()?),
         "index_status" => {
             let mut value = json!(db.status(db.database_path())?);
             // The full migration ledger is static detail (use the CLI `doctor`/`migrate` for it),
@@ -457,9 +457,9 @@ pub(crate) fn compare_graph_to_text_tool(
     }
 }
 
-pub(crate) fn strip_fallback_github_evidence(value: &mut Value) {
+pub(crate) fn strip_fallback_evidence(value: &mut Value) {
     if let Value::Object(map) = value {
-        map.remove("fallback_github_evidence");
+        map.remove("fallback_evidence");
     }
 }
 
@@ -471,14 +471,14 @@ pub(crate) fn remove_object_key(value: &mut Value, key: &str) {
     }
 }
 
-pub(crate) fn keep_literal_github_refs_if_present(value: &mut Value) {
+pub(crate) fn keep_literal_tracker_refs_if_present(value: &mut Value) {
     let Value::Array(items) = value else {
         return;
     };
     let literal_items = items
         .iter()
         .filter(|item| {
-            item.get("evidence_kind").and_then(Value::as_str) == Some("literal_github_ref")
+            item.get("evidence_kind").and_then(Value::as_str) == Some("literal_tracker_ref")
         })
         .cloned()
         .collect::<Vec<_>>();

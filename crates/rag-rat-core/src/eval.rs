@@ -651,7 +651,7 @@ fn evaluate_query(
     if query.requires_papertrail_cache && !papertrail_cache_available(db)? {
         return Ok(skipped_report(
             query,
-            "papertrail cache is empty; run `rag-rat github sync --from-refs`",
+            "papertrail cache is empty; run `rag-rat papertrail sync --from-refs`",
         ));
     }
 
@@ -910,7 +910,7 @@ fn skipped_report(query: &EvalQuery, reason: impl Into<String>) -> EvalQueryRepo
 
 fn papertrail_cache_available(db: &IndexDatabase) -> anyhow::Result<bool> {
     let status = db.papertrail_sync_status()?;
-    Ok(status.issues + status.comments + status.pulls + status.reviews + status.review_comments > 0)
+    Ok(status.issues + status.change_requests + status.comments > 0)
 }
 
 #[derive(Debug, Clone, Copy)]

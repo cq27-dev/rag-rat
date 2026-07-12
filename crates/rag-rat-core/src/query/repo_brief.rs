@@ -118,7 +118,7 @@ pub struct RepoBriefMetrics {
     pub additions: u64,
     pub deletions: u64,
     pub churn_per_kloc: f64,
-    pub github_ref_count: u64,
+    pub papertrail_ref_count: u64,
     pub memories: RepoBriefMemoryCounts,
 }
 
@@ -150,7 +150,7 @@ pub(crate) struct FileBriefRow {
     pub(crate) recent_touch_count: u64,
     pub(crate) additions: u64,
     pub(crate) deletions: u64,
-    pub(crate) github_ref_count: u64,
+    pub(crate) papertrail_ref_count: u64,
     pub(crate) symbol_kinds: BTreeMap<String, u64>,
     pub(crate) memories: RepoBriefMemoryCounts,
 }
@@ -243,7 +243,7 @@ fn metrics_for(row: &FileBriefRow) -> RepoBriefMetrics {
         additions: row.additions,
         deletions: row.deletions,
         churn_per_kloc: churn as f64 / kloc,
-        github_ref_count: row.github_ref_count,
+        papertrail_ref_count: row.papertrail_ref_count,
         memories: row.memories.clone(),
     }
 }
@@ -260,7 +260,7 @@ fn score_for(mode: RepoBriefMode, row: &FileBriefRow) -> f64 {
     let memories = capped(
         capped(row.memories.active as f64 / 5.0) + capped(row.memories.stale as f64 / 3.0) * 0.5,
     );
-    let papertrail = capped(row.github_ref_count as f64 / 8.0);
+    let papertrail = capped(row.papertrail_ref_count as f64 / 8.0);
 
     let score = match mode {
         RepoBriefMode::Spine =>
@@ -367,10 +367,10 @@ fn why_for(
             metrics.deletions
         ));
     }
-    if metrics.github_ref_count > 0 {
+    if metrics.papertrail_ref_count > 0 {
         why.push(format!(
-            "papertrail density: {} GitHub refs mention this path",
-            metrics.github_ref_count
+            "papertrail density: {} tracker refs mention this path",
+            metrics.papertrail_ref_count
         ));
     }
     if include_memories && (metrics.memories.active > 0 || metrics.memories.stale > 0) {
@@ -477,7 +477,7 @@ fn scoring_note(mode: RepoBriefMode) -> &'static str {
     match mode {
         RepoBriefMode::Spine =>
             "weighted evidence score: graph coupling, symbol/line size, churn, memories, and \
-             GitHub refs",
+             tracker refs",
         RepoBriefMode::Churn =>
             "weighted churn score: commit touches, recent touches, additions/deletions, with \
              context signals",
@@ -544,11 +544,12 @@ pub(crate) fn file_rows(
 ) -> anyhow::Result<Vec<FileBriefRow>> {
     let newest_commit = newest_commit_time(conn)?;
     let recent_floor = newest_commit.saturating_sub(90 * 24 * 60 * 60);
-    // The `churn` (V040 `git_file_changes` / `git_commits`) and `github_ref_counts` (V041
-    // `github_refs`) CTEs both aggregate a direct-scoped table by PATH and LEFT JOIN the result
-    // onto `files` by path. Their `repo_id = ?3` predicate keeps a sibling repo's rows for a
-    // SHARED path (two repos both having `src/lib.rs`) out of this repo's brief — the outer join is
-    // by path, so the scoped `files` view alone cannot exclude a sibling's colliding-path row.
+    // The `churn` (V040 `git_file_changes` / `git_commits`) and `papertrail_ref_counts`
+    // (`papertrail_refs`) CTEs both aggregate a direct-scoped table by PATH and LEFT JOIN the
+    // result onto `files` by path. Their `repo_id = ?3` predicate keeps a sibling repo's rows
+    // for a SHARED path (two repos both having `src/lib.rs`) out of this repo's brief — the
+    // outer join is by path, so the scoped `files` view alone cannot exclude a sibling's
+    // colliding-path row.
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
@@ -590,11 +591,11 @@ pub(crate) fn file_rows(
           WHERE git_file_changes.repo_id = ?3
           GROUP BY git_file_changes.path
         ),
-        github_ref_counts AS (
+        papertrail_ref_counts AS (
           SELECT source_path AS path, COUNT(*) AS ref_count
-          FROM github_refs
+          FROM papertrail_refs
           WHERE source_path IS NOT NULL
-            AND github_refs.repo_id = ?3
+            AND papertrail_refs.repo_id = ?3
           GROUP BY source_path
         )
         SELECT files.path, files.language, files.kind, files.generated,
@@ -607,14 +608,14 @@ pub(crate) fn file_rows(
                COALESCE(churn.recent_touch_count, 0),
                COALESCE(churn.additions, 0),
                COALESCE(churn.deletions, 0),
-               COALESCE(github_ref_counts.ref_count, 0)
+               COALESCE(papertrail_ref_counts.ref_count, 0)
         FROM files
         LEFT JOIN file_size ON file_size.file_id = files.id
         LEFT JOIN symbol_counts ON symbol_counts.file_id = files.id
         LEFT JOIN graph_in ON graph_in.file_id = files.id
         LEFT JOIN graph_out ON graph_out.file_id = files.id
         LEFT JOIN churn ON churn.path = files.path
-        LEFT JOIN github_ref_counts ON github_ref_counts.path = files.path
+        LEFT JOIN papertrail_ref_counts ON papertrail_ref_counts.path = files.path
         WHERE (?2 OR files.generated = 0)
         ",
     )?;
@@ -634,7 +635,7 @@ pub(crate) fn file_rows(
             recent_touch_count: row_u64(row, 10)?,
             additions: row_u64(row, 11)?,
             deletions: row_u64(row, 12)?,
-            github_ref_count: row_u64(row, 13)?,
+            papertrail_ref_count: row_u64(row, 13)?,
             symbol_kinds: BTreeMap::new(),
             memories: RepoBriefMemoryCounts::default(),
         })

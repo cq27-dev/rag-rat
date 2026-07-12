@@ -15,23 +15,14 @@ pub(crate) fn discover_and_store_refs(
         .map(|name| name.shorten().to_string())
         .unwrap_or_default();
     for parsed in parse_refs(&branch, default_repo.as_deref()) {
-        refs.push(PapertrailRef {
-            owner: parsed.owner,
-            repo: parsed.repo,
-            number: parsed.number,
-            ref_kind: parsed.kind,
-            source_kind: "branch".to_string(),
-            source_path: None,
-            source_commit: None,
-            source_text: branch.clone(),
-        });
+        refs.push(parsed.into_ref("branch", None, None, branch.clone()));
     }
     let mut unique = BTreeSet::new();
     refs.retain(|r| {
         unique.insert((
-            r.owner.clone(),
-            r.repo.clone(),
-            r.number,
+            r.tracker.as_db_str(),
+            r.project.clone(),
+            r.item_key.clone(),
             r.source_kind.clone(),
             r.source_path.clone(),
             r.source_commit.clone(),
@@ -50,15 +41,14 @@ pub(crate) async fn sync_refs<'a, C: PapertrailClient>(
     progress: &mut impl FnMut(PapertrailSyncProgress),
 ) -> anyhow::Result<SyncRefsReport> {
     let refs = refs.collect::<Vec<_>>();
-    let total = refs
-        .iter()
-        .map(|reference| (reference.owner.clone(), reference.repo.clone(), reference.number))
-        .collect::<BTreeSet<_>>()
-        .len();
+    let identity = |reference: &PapertrailRef| {
+        (reference.tracker.as_db_str(), reference.project.clone(), reference.item_key.clone())
+    };
+    let total = refs.iter().map(|reference| identity(reference)).collect::<BTreeSet<_>>().len();
     let mut report = SyncRefsReport::default();
     let mut seen = BTreeSet::new();
     for reference in refs {
-        if !seen.insert((reference.owner.clone(), reference.repo.clone(), reference.number)) {
+        if !seen.insert(identity(reference)) {
             continue;
         }
         let current = seen.len();
@@ -71,7 +61,6 @@ pub(crate) async fn sync_refs<'a, C: PapertrailClient>(
         match sync_one_ref(conn, client, reference).await {
             Ok(items) => {
                 report.synced_items += items;
-                mark_ref_sync(conn, reference, "synced", None)?;
                 progress(sync_progress(
                     reference,
                     current,
@@ -83,12 +72,11 @@ pub(crate) async fn sync_refs<'a, C: PapertrailClient>(
             Err(err) => {
                 let message = err.to_string();
                 let status = if is_not_found_error(&message) { "not_found" } else { "failed" };
-                mark_ref_sync(conn, reference, status, Some(&message))?;
                 report.failed_refs += 1;
                 report.errors.push(PapertrailSyncError {
-                    owner: reference.owner.clone(),
-                    repo: reference.repo.clone(),
-                    number: reference.number,
+                    tracker: reference.tracker,
+                    project: reference.project.clone(),
+                    item_key: reference.item_key.clone(),
                     status: status.to_string(),
                     error: message.clone(),
                 });
@@ -102,31 +90,28 @@ pub(crate) async fn sync_refs<'a, C: PapertrailClient>(
             },
         }
     }
-    progress(PapertrailSyncProgress {
-        current: total,
-        total,
-        owner: String::new(),
-        repo: String::new(),
-        number: 0,
-        action: PapertrailSyncAction::RebuildingFts,
-        message: None,
-    });
-    rebuild_fts(conn)?;
     Ok(report)
 }
+/// Sync ONE referenced item: fetch the item AND its comments, then store both. Fetch-then-store
+/// ordering is LOAD-BEARING: the per-ref sync state machine (`github_ref_sync`) is gone, so
+/// [`papertrail_ref_synced`]'s only skip signal is "the item is cached" — a partial store (item
+/// row landed, comment fetch failed) would masquerade as a completed sync forever. Storing nothing
+/// until every fetch succeeded keeps a failed ref retryable with no state row. The FTS mirror
+/// follows incrementally inside the store writers.
 pub(crate) async fn sync_one_ref<C: PapertrailClient>(
     conn: &Connection,
     client: &C,
     reference: &PapertrailRef,
 ) -> anyhow::Result<usize> {
-    let project = format!("{}/{}", reference.owner, reference.repo);
-    let key = reference.number.to_string();
     // Discovered refs don't carry a kind (a bare `#N` could be either); ask as an issue and let
     // the provider resolve, then fetch comments under the RESOLVED kind.
-    let item = client.item(&project, ItemKind::Issue, &key).await?;
-    let mut synced = store_item(conn, &item)?;
-    for comment in client.item_comments(&project, item.item_kind, &key).await? {
-        store_comment(conn, &comment)?;
+    let item = client.item(&reference.project, ItemKind::Issue, &reference.item_key).await?;
+    let comments =
+        client.item_comments(&reference.project, item.item_kind, &reference.item_key).await?;
+    store_item(conn, reference.tracker, &item)?;
+    let mut synced = 1;
+    for comment in &comments {
+        store_comment(conn, reference.tracker, comment)?;
         synced += 1;
     }
     Ok(synced)
@@ -141,78 +126,33 @@ pub(crate) fn sync_progress(
     PapertrailSyncProgress {
         current,
         total,
-        owner: reference.owner.clone(),
-        repo: reference.repo.clone(),
-        number: reference.number,
+        project: reference.project.clone(),
+        item_key: reference.item_key.clone(),
         action,
         message,
     }
 }
+/// Whether a discovered ref's item is already cached — the ONLY skip signal now that the per-ref
+/// synced/not_found/failed state machine is deleted (`papertrail_sync_cursor` replaces it for the
+/// mirror sync; the ref lane keeps no per-ref state). No `item_kind` filter: a bare `#N` ref could
+/// name either kind, and either cached kind means the item was synced. A not-found item retries on
+/// every sync (no memo) — acceptable for the referenced-only lane the mirror sync supersedes.
 pub(crate) fn papertrail_ref_synced(
     conn: &Connection,
     reference: &PapertrailRef,
 ) -> anyhow::Result<bool> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
-    let status = conn
-        .query_row(
-            "
-            SELECT status
-            FROM github_ref_sync
-            WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND repo_id = ?4
-            ",
-            params![reference.owner, reference.repo, reference.number, repo_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    match status.as_deref() {
-        Some("synced" | "not_found") => return Ok(true),
-        // An explicit failed row MUST retry: a partial sync (item stored, comments failed)
-        // leaves a cached issue row behind, and falling through to the cached-issue probe
-        // would skip the ref forever with its comments permanently missing.
-        Some(_) => return Ok(false),
-        None => {},
-    }
-    // No sync-state row at all: trust a cached issue row (rows synced before the
-    // github_ref_sync table existed).
-    let cached_issue = conn.query_row(
+    let cached = conn.query_row(
         "
         SELECT EXISTS(
-            SELECT 1 FROM github_issues
-            WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND repo_id = ?4
+            SELECT 1 FROM papertrail_items
+            WHERE tracker = ?1 AND project = ?2 AND item_key = ?3 AND repo_id = ?4
         )
         ",
-        params![reference.owner, reference.repo, reference.number, repo_id],
+        params![reference.tracker.as_db_str(), reference.project, reference.item_key, repo_id],
         |row| row.get::<_, bool>(0),
     )?;
-    Ok(cached_issue)
-}
-pub(crate) fn mark_ref_sync(
-    conn: &Connection,
-    reference: &PapertrailRef,
-    status: &str,
-    error: Option<&str>,
-) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    conn.execute(
-        "
-        INSERT INTO github_ref_sync(owner, repo, number, status, synced_at_ms, last_error, repo_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        ON CONFLICT(repo_id, owner, repo, number) DO UPDATE SET
-            status = excluded.status,
-            synced_at_ms = excluded.synced_at_ms,
-            last_error = excluded.last_error
-        ",
-        params![
-            reference.owner,
-            reference.repo,
-            reference.number,
-            status,
-            now_ms(),
-            error,
-            repo_id
-        ],
-    )?;
-    Ok(())
+    Ok(cached)
 }
 pub(crate) fn is_not_found_error(message: &str) -> bool {
     message.contains("HTTP 404") || message.to_ascii_lowercase().contains("not found")
@@ -235,16 +175,7 @@ pub(crate) fn discover_commit_refs(
         let (hash, subject, body) = row?;
         for text in [subject, body] {
             for parsed in parse_refs(&text, default_repo) {
-                out.push(PapertrailRef {
-                    owner: parsed.owner,
-                    repo: parsed.repo,
-                    number: parsed.number,
-                    ref_kind: parsed.kind,
-                    source_kind: "commit".to_string(),
-                    source_path: None,
-                    source_commit: Some(hash.clone()),
-                    source_text: text.clone(),
-                });
+                out.push(parsed.into_ref("commit", None, Some(hash.clone()), text.clone()));
             }
         }
     }
@@ -265,16 +196,12 @@ pub(crate) fn discover_file_refs(
         };
         for line in text.lines() {
             for parsed in parse_refs(line, default_repo) {
-                out.push(PapertrailRef {
-                    owner: parsed.owner,
-                    repo: parsed.repo,
-                    number: parsed.number,
-                    ref_kind: parsed.kind,
-                    source_kind: "file".to_string(),
-                    source_path: Some(path.clone()),
-                    source_commit: None,
-                    source_text: line.trim().to_string(),
-                });
+                out.push(parsed.into_ref(
+                    "file",
+                    Some(path.clone()),
+                    None,
+                    line.trim().to_string(),
+                ));
             }
         }
     }

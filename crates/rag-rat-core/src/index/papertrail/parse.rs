@@ -22,8 +22,7 @@ pub(crate) fn parse_issue_ref(token: &str, default_repo: Option<&str>) -> Option
         let parts = rest.split('/').collect::<Vec<_>>();
         if parts.len() >= 4 && (parts[2] == "issues" || parts[2] == "pull") {
             return Some(ParsedRef {
-                owner: parts[0].to_string(),
-                repo: parts[1].to_string(),
+                project: format!("{}/{}", parts[0], parts[1]),
                 number: parts[3].parse().ok()?,
                 kind: "url".to_string(),
             });
@@ -33,27 +32,26 @@ pub(crate) fn parse_issue_ref(token: &str, default_repo: Option<&str>) -> Option
         let parts = repo_ref.split('/').collect::<Vec<_>>();
         if parts.len() == 2 {
             return Some(ParsedRef {
-                owner: parts[0].to_string(),
-                repo: parts[1].to_string(),
+                project: repo_ref.to_string(),
                 number: number.parse().ok()?,
                 kind: "cross_repo".to_string(),
             });
         }
     }
     if let Some(number) = token.strip_prefix("GH-") {
-        let (owner, repo) = split_repo(default_repo?)?;
+        // The default project must be an `owner/repo` path — reject anything else rather than
+        // storing a malformed project key.
+        split_repo(default_repo?)?;
         return Some(ParsedRef {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
+            project: default_repo?.to_string(),
             number: number.parse().ok()?,
             kind: "gh_dash".to_string(),
         });
     }
     if let Some(number) = token.strip_prefix('#') {
-        let (owner, repo) = split_repo(default_repo?)?;
+        split_repo(default_repo?)?;
         return Some(ParsedRef {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
+            project: default_repo?.to_string(),
             number: number.parse().ok()?,
             kind: "local_number".to_string(),
         });
