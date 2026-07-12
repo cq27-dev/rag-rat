@@ -71,7 +71,17 @@ After installing, approve the plugin so its tools and hooks run:
   `"permissions": { "allow": ["mcp__rag-rat__*"] }`.
 - **Codex** shows a **"Hooks need review"** prompt on the first `codex` session started *inside the
   repo* (the plugin ships grep-augmentation, clone-check, and session-digest hooks that run outside
-  the sandbox). Choose **"Trust all and continue"** to enable them.
+  the sandbox). Choose **"Trust all and continue"** to enable them. For unattended commands such as
+  `codex review`, also allow the plugin's MCP tools in `~/.codex/config.toml` so the run cannot stall
+  on a per-tool approval prompt:
+
+  ```toml
+  [plugins."rag-rat@rag-rat".mcp_servers.rag-rat]
+  default_tools_approval_mode = "approve"
+  ```
+
+  This trusts every current and future MCP tool exposed by the installed rag-rat plugin. Only enable
+  it when you trust the plugin's source and installation origin, then restart Codex.
 
 Then open the repository and ask:
 
