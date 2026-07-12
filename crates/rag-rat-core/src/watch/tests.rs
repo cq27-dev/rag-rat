@@ -1,12 +1,26 @@
-use notify::Watcher as _;
-use notify::event::{CreateKind, Flag, ModifyKind};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use notify::event::{
+    AccessKind, AccessMode, CreateKind, DataChange, EventKind, Flag, ModifyKind, RemoveKind,
+    RenameMode,
+};
+use notify::{Event, RecursiveMode, Watcher as _, recommended_watcher};
 
 use super::*;
+use crate::IndexDatabase;
 use crate::config::{
     Config, LlmConfig, RemoteBackend, RemoteEmbeddingConfig, ResolvedTarget, TargetKind,
     WatchConfig,
 };
 use crate::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
+use crate::index::ai::ReconcileOptions;
+use crate::index::ignore_rules::IgnoreMatcher;
 use crate::language::Language;
 
 fn mutation_event(path: PathBuf) -> Event {
