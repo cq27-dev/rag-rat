@@ -20,6 +20,10 @@ use super::{AccountId, fold};
 use crate::oplog::device::DevicePublic;
 use crate::oplog::op::DeviceFingerprint;
 
+type EntryHash = [u8; 32];
+type BranchKey = (u8, DeviceFingerprint, Option<EntryHash>);
+type BranchChildren = HashMap<BranchKey, Vec<EntryHash>>;
+
 /// The result of ingesting one signed account entry (§16.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IngestOutcome {
@@ -141,8 +145,7 @@ fn refold_in_tx(
         .collect();
     // Effective entries indexed by the (log, device, prev_hash) parent slot they chain from; a
     // chain root keys on `None`.
-    let mut children: HashMap<(u8, DeviceFingerprint, Option<[u8; 32]>), Vec<[u8; 32]>> =
-        HashMap::new();
+    let mut children = BranchChildren::new();
     let mut groups: HashSet<(u8, DeviceFingerprint)> = HashSet::new();
     for row in &rows {
         if effective.contains(&row.entry_hash) {
