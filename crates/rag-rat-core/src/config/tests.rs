@@ -5,13 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use path_slash::PathExt;
 
 use super::{
-    Config, ConfigError, DEFAULT_QUERY_ENDPOINT, EmbeddingRuntimeConfig, LlmConfig, LogConfig,
-    LogFormat, LogLevel, MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface,
-    OracleConfig, RawConfig, RawMemory, RawOracle, RawSearch, RawTarget, RawVersionCheck, RawWatch,
-    RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget, SearchConfig,
-    TargetKind, VersionCheckConfig, WatchConfig, anchor_root_to_main_worktree,
-    discover_config_path, endpoint_authority_has_userinfo, linked_worktree_main_root,
-    resolve_relative_cookbook_path, resolve_targets,
+    self as config, Config, ConfigError, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat,
+    LogLevel, MemoryConfig, MemorySurface, OracleConfig, RawConfig, RawMemory, RawOracle,
+    RawSearch, RawTarget, RawVersionCheck, RawWatch, RemoteBackend, RemoteDreamConfig,
+    RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, TargetKind, VersionCheckConfig,
+    WatchConfig,
 };
 use crate::language::Language;
 
@@ -256,17 +254,17 @@ fn discover_config_path_resolves_the_governing_checkout() {
     let main_c = main.canonicalize().unwrap();
 
     // Linked, no local file, main config not yet written: MAIN's path (where it belongs).
-    assert_eq!(discover_config_path(&linked), main_c.join("rag-rat.toml"));
+    assert_eq!(config::discover_config_path(&linked), main_c.join("rag-rat.toml"));
     // Main checkout: always local, present or not.
-    assert_eq!(discover_config_path(&main), main.join("rag-rat.toml"));
+    assert_eq!(config::discover_config_path(&main), main.join("rag-rat.toml"));
     // Linked WITH a local (divergent) file: the local path — the load then routes through
     // the governing seam, which warns; discovery must not silently skip that.
     std::fs::write(linked.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
-    assert_eq!(discover_config_path(&linked), linked.join("rag-rat.toml"));
+    assert_eq!(config::discover_config_path(&linked), linked.join("rag-rat.toml"));
     // Non-git: local.
     let plain = tmp.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
-    assert_eq!(discover_config_path(&plain), plain.join("rag-rat.toml"));
+    assert_eq!(config::discover_config_path(&plain), plain.join("rag-rat.toml"));
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -290,14 +288,22 @@ fn discover_config_path_walks_up_to_a_parent_repo_config() {
     // The walk returns a canonical absolute path (a found file), so compare canonically — temp
     // roots can be symlinked (macOS `/tmp` → `/private/tmp`).
     let want = repo.join("rag-rat.toml").canonicalize().unwrap();
-    assert_eq!(discover_config_path(&nested).canonicalize().unwrap(), want, "subdir → repo cfg");
-    assert_eq!(discover_config_path(&repo).canonicalize().unwrap(), want, "repo root → local");
+    assert_eq!(
+        config::discover_config_path(&nested).canonicalize().unwrap(),
+        want,
+        "subdir → repo cfg"
+    );
+    assert_eq!(
+        config::discover_config_path(&repo).canonicalize().unwrap(),
+        want,
+        "repo root → local"
+    );
 
     // A config-less tree with NO ancestor config: the local (non-existent) path, unchanged —
     // the not-found fallback returns the original `dir/rag-rat.toml` for the hint, uncanonical.
     let bare = tmp.join("bare").join("deep");
     std::fs::create_dir_all(&bare).unwrap();
-    assert_eq!(discover_config_path(&bare), bare.join("rag-rat.toml"));
+    assert_eq!(config::discover_config_path(&bare), bare.join("rag-rat.toml"));
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -325,7 +331,7 @@ fn discover_config_path_does_not_cross_a_nested_repo_boundary() {
 
     // Launched from the nested repo, discovery stays WITHIN it (no toml) → its local path,
     // never the parent's config.
-    let got = discover_config_path(&nested);
+    let got = config::discover_config_path(&nested);
     assert_eq!(got, nested.join("rag-rat.toml"), "must not adopt the parent repo's config");
     assert_ne!(
         got.canonicalize().ok(),
@@ -363,13 +369,17 @@ fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdi
     std::fs::create_dir_all(&sub).unwrap();
 
     // No branch-local config anywhere in the worktree: a subdir launch resolves to MAIN's path.
-    assert_eq!(discover_config_path(&sub), main_c.join("rag-rat.toml"), "invariant: → main");
+    assert_eq!(
+        config::discover_config_path(&sub),
+        main_c.join("rag-rat.toml"),
+        "invariant: → main"
+    );
 
     // A branch-local config at the LINKED worktree root: the subdir launch now finds IT (never
     // climbing past the worktree root into main).
     std::fs::write(linked.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
     assert_eq!(
-        discover_config_path(&sub).canonicalize().unwrap(),
+        config::discover_config_path(&sub).canonicalize().unwrap(),
         linked.join("rag-rat.toml").canonicalize().unwrap(),
         "a subdir launch must find the branch-local config, not jump to main",
     );
@@ -401,21 +411,21 @@ fn linked_worktree_main_root_derives_linkedness_from_topology() {
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
     let main_c = main.canonicalize().unwrap();
 
-    assert_eq!(linked_worktree_main_root(&main), None, "the main worktree is not linked");
+    assert_eq!(config::linked_worktree_main_root(&main), None, "the main worktree is not linked");
     assert_eq!(
-        linked_worktree_main_root(&main.join("src")),
+        config::linked_worktree_main_root(&main.join("src")),
         None,
         "a SUBDIRECTORY of main is main — not linked (the false-refusal bug)",
     );
-    assert_eq!(linked_worktree_main_root(&linked), Some(main_c.clone()));
+    assert_eq!(config::linked_worktree_main_root(&linked), Some(main_c.clone()));
     assert_eq!(
-        linked_worktree_main_root(&linked.join("src")),
+        config::linked_worktree_main_root(&linked.join("src")),
         Some(main_c),
         "a subdir of a linked checkout is still linked",
     );
     let plain = tmp.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
-    assert_eq!(linked_worktree_main_root(&plain), None, "non-git has no designated main");
+    assert_eq!(config::linked_worktree_main_root(&plain), None, "non-git has no designated main");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -1138,20 +1148,20 @@ fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
     let linked_c = linked.canonicalize().unwrap();
 
     // Main worktree (any root) resolves to itself.
-    assert_eq!(anchor_root_to_main_worktree(&main_c), main_c);
+    assert_eq!(config::anchor_root_to_main_worktree(&main_c), main_c);
     // A SUBDIR root on the main worktree is PRESERVED (not collapsed to the repo top) — the
     // #219-review regression: collapsing changed the indexed file set + failed config load.
-    assert_eq!(anchor_root_to_main_worktree(&main_c.join("src")), main_c.join("src"));
+    assert_eq!(config::anchor_root_to_main_worktree(&main_c.join("src")), main_c.join("src"));
     // Linked worktree, root=".", redirects to the main worktree → one shared base.
-    assert_eq!(anchor_root_to_main_worktree(&linked_c), main_c);
+    assert_eq!(config::anchor_root_to_main_worktree(&linked_c), main_c);
     // Linked worktree SUBDIR root rebases under the main worktree, subdir preserved.
-    assert_eq!(anchor_root_to_main_worktree(&linked_c.join("src")), main_c.join("src"));
+    assert_eq!(config::anchor_root_to_main_worktree(&linked_c.join("src")), main_c.join("src"));
 
     // A non-git directory falls back to itself.
     let plain = tmp.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
     let plain_c = plain.canonicalize().unwrap();
-    assert_eq!(anchor_root_to_main_worktree(&plain_c), plain_c);
+    assert_eq!(config::anchor_root_to_main_worktree(&plain_c), plain_c);
 
     // A linked-worktree subdir root that does NOT exist in main must NOT anchor to a missing
     // `main/<rel>` path (#219 review): the branch created `branch_only/`, which main never had.
@@ -1162,7 +1172,7 @@ fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
     let branch_only_c = branch_only.canonicalize().unwrap();
     assert!(!main_c.join("branch_only").exists(), "main never had this dir");
     assert_eq!(
-        anchor_root_to_main_worktree(&branch_only_c),
+        config::anchor_root_to_main_worktree(&branch_only_c),
         branch_only_c,
         "a branch-only root that's missing in main keeps the linked checkout's root",
     );
@@ -1183,7 +1193,7 @@ fn parses_simple_and_expanded_targets() {
         exclude: Some(vec!["**/*.map".to_string()]),
     }];
 
-    let targets = resolve_targets(&root, simple, expanded).unwrap();
+    let targets = config::resolve_targets(&root, simple, expanded).unwrap();
 
     assert_eq!(targets.len(), 2);
     assert_eq!(targets[0].language, Language::Rust);
@@ -1309,7 +1319,7 @@ fn remote_embedding_ephemeral_infers_mode_and_defaults_query_endpoint() {
     assert!(remote.is_ephemeral() && !remote.is_connect());
     assert_eq!(remote.cookbook.as_deref(), Some("@rag-rat/cookbook/modal"));
     assert_eq!(remote.endpoint, None);
-    assert_eq!(remote.query_endpoint.as_deref(), Some(DEFAULT_QUERY_ENDPOINT));
+    assert_eq!(remote.query_endpoint.as_deref(), Some(config::DEFAULT_QUERY_ENDPOINT));
     assert_eq!(remote.concurrency, 32);
 }
 
@@ -1336,7 +1346,7 @@ fn remote_embedding_ephemeral_honors_explicit_query_endpoint() {
 
 #[test]
 fn ephemeral_non_ollama_backend_requires_an_explicit_query_endpoint() {
-    // The DEFAULT_QUERY_ENDPOINT is a local OLLAMA URL; it only fits `backend = ollama`. A
+    // The config::DEFAULT_QUERY_ENDPOINT is a local OLLAMA URL; it only fits `backend = ollama`. A
     // non-ollama ephemeral backend that omits `query_endpoint` must be REJECTED (not silently
     // defaulted), or after teardown queries embed against local Ollama with the wrong route /
     // model → silent BM25 fallback. See `RemoteQueryEndpointRequiredForBackend`.
@@ -1379,7 +1389,7 @@ fn ephemeral_non_ollama_backend_requires_an_explicit_query_endpoint() {
     // ollama still defaults (its default IS a local Ollama).
     assert_eq!(
         build("ollama", "").unwrap().query_endpoint.as_deref(),
-        Some(DEFAULT_QUERY_ENDPOINT),
+        Some(config::DEFAULT_QUERY_ENDPOINT),
     );
 }
 
@@ -1542,7 +1552,7 @@ fn remote_embedding_rejects_oversized_concurrency() {
             endpoint = "http://localhost:11434"
             concurrency = {}
             "#,
-        MAX_REMOTE_EMBEDDING_CONCURRENCY + 1
+        config::MAX_REMOTE_EMBEDDING_CONCURRENCY + 1
     ))
     .unwrap();
 
@@ -1551,8 +1561,8 @@ fn remote_embedding_rejects_oversized_concurrency() {
         err,
         ConfigError::RemoteEmbeddingConcurrencyTooHigh {
             value,
-            max: MAX_REMOTE_EMBEDDING_CONCURRENCY
-        } if value == MAX_REMOTE_EMBEDDING_CONCURRENCY + 1
+            max: config::MAX_REMOTE_EMBEDDING_CONCURRENCY
+        } if value == config::MAX_REMOTE_EMBEDDING_CONCURRENCY + 1
     ));
 }
 
@@ -1661,12 +1671,12 @@ fn remote_embedding_endpoint_without_credentials_is_accepted() {
 
 #[test]
 fn endpoint_authority_has_userinfo_classifies_urls() {
-    assert!(endpoint_authority_has_userinfo("https://user:token@host:11434"));
-    assert!(endpoint_authority_has_userinfo("http://u@127.0.0.1"));
-    assert!(!endpoint_authority_has_userinfo("https://host:11434"));
-    assert!(!endpoint_authority_has_userinfo("http://127.0.0.1:11434"));
+    assert!(config::endpoint_authority_has_userinfo("https://user:token@host:11434"));
+    assert!(config::endpoint_authority_has_userinfo("http://u@127.0.0.1"));
+    assert!(!config::endpoint_authority_has_userinfo("https://host:11434"));
+    assert!(!config::endpoint_authority_has_userinfo("http://127.0.0.1:11434"));
     // An `@` in the PATH/query is not userinfo.
-    assert!(!endpoint_authority_has_userinfo("http://host:11434/path?x=a@b"));
+    assert!(!config::endpoint_authority_has_userinfo("http://host:11434/path?x=a@b"));
 }
 
 #[test]
@@ -1680,7 +1690,8 @@ fn resolve_relative_cookbook_path_anchors_relative_recipe_paths_to_config_dir() 
     // OS, so one assertion holds cross-platform without hardcoding a separator
     // rendering.
     let anchored = |spec: &str| -> (PathBuf, String) {
-        let out = resolve_relative_cookbook_path(spec, dir).expect("path-shaped spec resolves");
+        let out =
+            config::resolve_relative_cookbook_path(spec, dir).expect("path-shaped spec resolves");
         match out.split_once(' ') {
             Some((path, rest)) => (PathBuf::from(path), rest.to_string()),
             None => (PathBuf::from(out), String::new()),
@@ -1701,8 +1712,8 @@ fn resolve_relative_cookbook_path_anchors_relative_recipe_paths_to_config_dir() 
     assert_eq!(rest, "");
 
     // npm package specs and a bare token are LEFT VERBATIM (None).
-    assert_eq!(resolve_relative_cookbook_path("@rag-rat/cookbook modal", dir), None);
-    assert_eq!(resolve_relative_cookbook_path("some-pkg", dir), None);
+    assert_eq!(config::resolve_relative_cookbook_path("@rag-rat/cookbook modal", dir), None);
+    assert_eq!(config::resolve_relative_cookbook_path("some-pkg", dir), None);
     // An ALREADY-ABSOLUTE recipe path is left verbatim (None). Use a platform-absolute path: a
     // bare `/abs/...` is NOT absolute on Windows (no drive), so it wouldn't reach the
     // absolute-bailout branch there.
@@ -1710,16 +1721,16 @@ fn resolve_relative_cookbook_path_anchors_relative_recipe_paths_to_config_dir() 
     let abs_recipe = r"C:\abs\recipe.mjs runpod";
     #[cfg(not(windows))]
     let abs_recipe = "/abs/recipe.mjs runpod";
-    assert_eq!(resolve_relative_cookbook_path(abs_recipe, dir), None);
+    assert_eq!(config::resolve_relative_cookbook_path(abs_recipe, dir), None);
 
     // Drive-agnostic on Windows: a NON-C drive anchors the same way (the `E:` prefix survives
     // untouched). An absolute `E:\…` recipe is still left verbatim.
     #[cfg(windows)]
     {
-        let out = resolve_relative_cookbook_path("./r/x.mts", Path::new(r"E:\proj"))
+        let out = config::resolve_relative_cookbook_path("./r/x.mts", Path::new(r"E:\proj"))
             .expect("relative recipe on a non-C drive resolves");
         assert_eq!(PathBuf::from(out), Path::new(r"E:\proj").join("./r/x.mts"));
-        assert_eq!(resolve_relative_cookbook_path(r"E:\abs\recipe.mjs", dir), None);
+        assert_eq!(config::resolve_relative_cookbook_path(r"E:\abs\recipe.mjs", dir), None);
     }
 }
 
@@ -2334,7 +2345,7 @@ fn rejects_unknown_language() {
     let root = std::env::current_dir().unwrap();
     let simple = BTreeMap::from([("cobol".to_string(), vec![".".to_string()])]);
 
-    let err = resolve_targets(&root, simple, Vec::new()).unwrap_err();
+    let err = config::resolve_targets(&root, simple, Vec::new()).unwrap_err();
 
     assert!(err.to_string().contains("unknown language"));
 }

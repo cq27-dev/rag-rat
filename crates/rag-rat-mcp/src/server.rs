@@ -12,7 +12,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Map, Value};
 use tokio::sync::Semaphore;
 
-use crate::blocking::{ToolTimeoutPolicy, run_blocking_tool, tool_timeout, tool_workers};
+use crate::blocking::{self, ToolTimeoutPolicy};
 
 #[derive(Clone)]
 pub struct RagRatService {
@@ -56,7 +56,7 @@ impl RagRatService {
             output_format,
             #[cfg(unix)]
             inflight: crate::upgrade::Inflight::new(),
-            tool_workers: Arc::new(Semaphore::new(tool_workers())),
+            tool_workers: Arc::new(Semaphore::new(blocking::tool_workers())),
         }
     }
 
@@ -99,7 +99,7 @@ impl RagRatService {
 
     async fn call_async(&self, name: String, value: Value) -> Result<CallToolResult, ErrorData> {
         let service = self.clone();
-        let timeout = tool_timeout();
+        let timeout = blocking::tool_timeout();
         let worker_name = name.clone();
         let timeout_policy = ToolTimeoutPolicy::for_tool(&name);
         let workers = Arc::clone(&self.tool_workers);
@@ -108,7 +108,7 @@ impl RagRatService {
         // still keeps the process from hot-execing until the blocking closure actually exits.
         #[cfg(unix)]
         let inflight = self.inflight.guard();
-        run_blocking_tool(name, timeout, timeout_policy, workers, move || {
+        blocking::run_blocking_tool(name, timeout, timeout_policy, workers, move || {
             #[cfg(unix)]
             let _inflight = inflight;
             service.call(&worker_name, value)
@@ -467,7 +467,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_tool_work_does_not_starve_the_runtime() {
         let workers = test_tool_workers(2);
-        let slow = tokio::spawn(run_blocking_tool(
+        let slow = tokio::spawn(blocking::run_blocking_tool(
             "slow_test_tool".to_string(),
             Duration::from_secs(1),
             ToolTimeoutPolicy::ReturnTimeout,
@@ -481,7 +481,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         let quick = tokio::time::timeout(
             Duration::from_millis(100),
-            run_blocking_tool(
+            blocking::run_blocking_tool(
                 "quick_test_tool".to_string(),
                 Duration::from_secs(1),
                 ToolTimeoutPolicy::ReturnTimeout,
@@ -497,7 +497,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_tool_work_returns_timeout_error() {
-        let err = run_blocking_tool(
+        let err = blocking::run_blocking_tool(
             "timeout_test_tool".to_string(),
             Duration::from_millis(10),
             ToolTimeoutPolicy::ReturnTimeout,
@@ -520,7 +520,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_tool_work_applies_worker_limit() {
         let workers = test_tool_workers(1);
-        let slow = tokio::spawn(run_blocking_tool(
+        let slow = tokio::spawn(blocking::run_blocking_tool(
             "slow_test_tool".to_string(),
             Duration::from_secs(1),
             ToolTimeoutPolicy::ReturnTimeout,
@@ -532,7 +532,7 @@ mod tests {
         ));
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        let err = run_blocking_tool(
+        let err = blocking::run_blocking_tool(
             "queued_test_tool".to_string(),
             Duration::from_millis(20),
             ToolTimeoutPolicy::ReturnTimeout,
@@ -552,7 +552,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn write_tool_deadline_waits_for_blocking_work_to_finish() {
         let started = Instant::now();
-        let result = run_blocking_tool(
+        let result = blocking::run_blocking_tool(
             "memory_create".to_string(),
             Duration::from_millis(10),
             ToolTimeoutPolicy::WaitForCompletion,
@@ -574,7 +574,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_tool_work_propagates_tool_errors() {
-        let err = run_blocking_tool(
+        let err = blocking::run_blocking_tool(
             "error_test_tool".to_string(),
             Duration::from_secs(1),
             ToolTimeoutPolicy::ReturnTimeout,
@@ -593,7 +593,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_tool_work_reports_panics_as_mcp_errors() {
-        let err = run_blocking_tool(
+        let err = blocking::run_blocking_tool(
             "panic_test_tool".to_string(),
             Duration::from_secs(1),
             ToolTimeoutPolicy::ReturnTimeout,

@@ -4,9 +4,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use super::{
-    Config, ConfigError, LlmConfig, LogConfig, MemoryConfig, RawConfig, RawTarget, ResolvedTarget,
-    TargetKind, linked_worktree_main_root, main_worktree_root, normalize_existing_dir,
-    resolve_default_database, resolve_relative_cookbook_path,
+    self as config, Config, ConfigError, LlmConfig, LogConfig, MemoryConfig, RawConfig, RawTarget,
+    ResolvedTarget, TargetKind,
 };
 use crate::language::Language;
 
@@ -124,7 +123,7 @@ impl Config {
         // governance). `None` on any parse/resolution failure; that is not a second error path,
         // just a diagnostic that stays silent when it cannot be computed.
         let local_root_named: Option<PathBuf> = local_parse.as_ref().ok().and_then(|local_raw| {
-            normalize_existing_dir(
+            config::normalize_existing_dir(
                 &local_config_dir
                     .join(local_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
             )
@@ -140,7 +139,7 @@ impl Config {
         // split-brain the seam exists to prevent (Codex batch 8, finding 3). Anchoring outcomes
         // affect ROOT resolution only, never who governs.
         let (mut raw, config_dir, root, target_validation_root) =
-            match linked_worktree_main_root(local_checkout) {
+            match config::linked_worktree_main_root(local_checkout) {
                 Some(main_top) => match governing_main_config(&main_top)? {
                     Some((main_raw, main_config_dir)) => {
                         let divergent = match &local_parse {
@@ -163,7 +162,7 @@ impl Config {
                         // Re-derive root from MAIN's own config, exactly as loading it directly
                         // would (its root is already the main worktree — anchoring is identity).
                         let main_root =
-                            normalize_existing_dir(&main_config_dir.join(
+                            config::normalize_existing_dir(&main_config_dir.join(
                                 main_raw.index.root.clone().unwrap_or_else(|| ".".to_string()),
                             ))?;
                         (main_raw, main_config_dir, main_root.clone(), main_root)
@@ -180,7 +179,7 @@ impl Config {
                         // Root stays anchored so the shared index still keys off the main
                         // checkout; targets validate against the local checkout where they
                         // exist (#219).
-                        let local_root = normalize_existing_dir(&local_config_dir.join(
+                        let local_root = config::normalize_existing_dir(&local_config_dir.join(
                             local_raw.index.root.clone().unwrap_or_else(|| ".".to_string()),
                         ))?;
                         let anchored_root = anchor_root_to_main_worktree(&local_root);
@@ -193,7 +192,7 @@ impl Config {
                     // still applies for the exotic `[index] root` pointing into a linked
                     // checkout (#218/#219) — an anchoring concern, not a governance one.
                     let local_raw = local_parse?;
-                    let local_root = normalize_existing_dir(
+                    let local_root = config::normalize_existing_dir(
                         &local_config_dir
                             .join(local_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
                     )?;
@@ -216,7 +215,7 @@ impl Config {
         // Relative explicit paths (and the legacy path) resolve against the MAIN worktree TOP —
         // NOT `root`, which may be a subdirectory — so every worktree of a repo AND any
         // `root="<subdir>"` config land on the SAME index.
-        let db_base = main_worktree_root(&root).unwrap_or_else(|| root.clone());
+        let db_base = config::main_worktree_root(&root).unwrap_or_else(|| root.clone());
         let repo_id_override =
             raw.index.repo_id.take().map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
         let governing_database_key = raw.index.database.take();
@@ -227,7 +226,7 @@ impl Config {
             // The keyless default probes the repo IDENTITY (root + the governing `[index]
             // repo_id` pin): only an identity-BEARING root may land in the shared global store —
             // see `default_database_with_disposition`.
-            None => resolve_default_database(&db_base, &root, repo_id_override.as_deref()),
+            None => config::resolve_default_database(&db_base, &root, repo_id_override.as_deref()),
         };
         // The identity gate's SECOND entrance (Codex batch 8, finding 5): an explicit pin AT the
         // consolidated global store bypasses the keyless identity gate above, and an
@@ -255,7 +254,7 @@ impl Config {
         // wherever reconcile/the watcher runs — ENOENT from a subdir or a daemon.
         if let Some(remote) = llm.embedding.remote.as_mut()
             && let Some(cookbook) = remote.cookbook.as_ref()
-            && let Some(resolved) = resolve_relative_cookbook_path(cookbook, &config_dir)
+            && let Some(resolved) = config::resolve_relative_cookbook_path(cookbook, &config_dir)
         {
             remote.cookbook = Some(resolved);
         }
@@ -264,7 +263,7 @@ impl Config {
         // CWD. `remote` is not optional for dream (a local-Ollama connect default), so only the
         // ephemeral case has a cookbook to rewrite.
         if let Some(cookbook) = llm.dream.remote.cookbook.as_ref()
-            && let Some(resolved) = resolve_relative_cookbook_path(cookbook, &config_dir)
+            && let Some(resolved) = config::resolve_relative_cookbook_path(cookbook, &config_dir)
         {
             llm.dream.remote.cookbook = Some(resolved);
         }
@@ -400,7 +399,8 @@ pub(crate) fn anchor_root_to_main_worktree(root: &Path) -> PathBuf {
     let Ok(repo) = crate::index::discover_repo(root) else {
         return root.to_path_buf();
     };
-    let (Some(workdir), Some(main_root)) = (repo.workdir(), main_worktree_root(root)) else {
+    let (Some(workdir), Some(main_root)) = (repo.workdir(), config::main_worktree_root(root))
+    else {
         return root.to_path_buf();
     };
     let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());

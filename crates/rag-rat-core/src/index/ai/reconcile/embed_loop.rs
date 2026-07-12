@@ -1,9 +1,5 @@
 use super::super::*;
-use super::batch_write::{
-    automatic_reconcile_can_skip_noop, embed_and_write_jobs, empty_current_reconcile_report,
-    remote_reconcile_batch_size,
-};
-use super::policy_scan::{embedding_policy_skip_summary, maybe_heal_embedding_policy};
+use super::{batch_write, policy_scan};
 
 const RECONCILE_SELECT_ID_BATCH_LIMIT: usize = 900;
 
@@ -59,10 +55,11 @@ pub(crate) fn reconcile_with_options_progress(
         dim: embedding_dim,
         max_embedding_chars,
     };
-    let preflight_estimated_jobs = if automatic_reconcile_can_skip_noop(conn, &options) {
+    let preflight_estimated_jobs = if batch_write::automatic_reconcile_can_skip_noop(conn, &options)
+    {
         match estimated_reconcile_jobs(conn, &scan, &options) {
             Ok(0) =>
-                return Ok(empty_current_reconcile_report(
+                return Ok(batch_write::empty_current_reconcile_report(
                     active_model_id,
                     model_version,
                     embedding_dim,
@@ -138,7 +135,7 @@ pub(crate) fn reconcile_with_options_progress(
             // deferral and must stay cheap: no heal scan. (The heal itself no-ops
             // unless the stamp is stale at the DEFAULT cap.)
             if matches!(skip, ChunkEmbedder::NoEphemeralWork) {
-                maybe_heal_embedding_policy(conn, max_embedding_chars);
+                policy_scan::maybe_heal_embedding_policy(conn, max_embedding_chars);
             }
             let (status, message) = match skip {
                 ChunkEmbedder::SkipEphemeral => (
@@ -199,8 +196,8 @@ pub(crate) fn reconcile_with_options_progress(
     // Ready / NotReady: BOTH report the per-policy skip counts, so run the repo-wide policy summary
     // now. (SkipEphemeral already returned above without paying it.) Self-heal the policy column
     // first so this summary and every later reconcile/plan take the fast GROUP BY path.
-    maybe_heal_embedding_policy(conn, max_embedding_chars);
-    let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
+    policy_scan::maybe_heal_embedding_policy(conn, max_embedding_chars);
+    let skipped_by_policy = policy_scan::embedding_policy_skip_summary(conn, max_embedding_chars)?;
     let skipped_chunks = skipped_by_policy.values().sum();
     let mut report = ReconcileReport {
         processed_chunks: 0,
@@ -265,7 +262,9 @@ pub(crate) fn reconcile_with_options_progress(
     };
     let selection_batch_size = remote_config
         .as_deref()
-        .map(|remote| remote_reconcile_batch_size(remote, batch_size, options.max_seconds))
+        .map(|remote| {
+            batch_write::remote_reconcile_batch_size(remote, batch_size, options.max_seconds)
+        })
         .unwrap_or(batch_size);
     let mut progress_total_chunks = match preflight_estimated_jobs.or(acquired_estimated_jobs) {
         Some(jobs) => jobs,
@@ -380,7 +379,7 @@ pub(crate) fn reconcile_with_options_progress(
         }
 
         if !to_embed_jobs.is_empty() {
-            let (written, failed) = embed_and_write_jobs(
+            let (written, failed) = batch_write::embed_and_write_jobs(
                 conn,
                 embedder.as_ref(),
                 &model_version,
@@ -502,12 +501,7 @@ mod freshness_version_tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::super::batch_write::{
-        REMOTE_SCOPED_RETRY_CONSECUTIVE_ENDPOINT_FAILURE_LIMIT, RemoteScopedRetryError,
-        classify_remote_scoped_retry_error, group_embedding_jobs_by_input_hash,
-        write_remote_scoped_or_failed,
-    };
-    use super::*;
+    use super::{batch_write, *};
     use crate::config::RemoteEmbeddingConfig;
     use crate::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
 
@@ -1107,16 +1101,16 @@ mod freshness_version_tests {
         remote.batch_size = 256;
         remote.concurrency = 32;
 
-        assert_eq!(remote_reconcile_batch_size(&remote, 8, Some(1)), 8);
-        assert_eq!(remote_reconcile_batch_size(&remote, 8, None), 8192);
+        assert_eq!(batch_write::remote_reconcile_batch_size(&remote, 8, Some(1)), 8);
+        assert_eq!(batch_write::remote_reconcile_batch_size(&remote, 8, None), 8192);
     }
 
     #[test]
     fn remote_scoped_retry_classifies_endpoint_failures() {
         for error in ["connection refused", "failed to connect", "connect error"] {
             assert_eq!(
-                classify_remote_scoped_retry_error(error),
-                RemoteScopedRetryError::AbortImmediately,
+                batch_write::classify_remote_scoped_retry_error(error),
+                batch_write::RemoteScopedRetryError::AbortImmediately,
                 "{error}"
             );
         }
@@ -1128,16 +1122,16 @@ mod freshness_version_tests {
             "http status 504: gateway timeout",
         ] {
             assert_eq!(
-                classify_remote_scoped_retry_error(error),
-                RemoteScopedRetryError::EndpointFailure,
+                batch_write::classify_remote_scoped_retry_error(error),
+                batch_write::RemoteScopedRetryError::EndpointFailure,
                 "{error}"
             );
         }
         for error in ["http status 500: transient", "embedder model returned 2 vectors for 3 texts"]
         {
             assert_eq!(
-                classify_remote_scoped_retry_error(error),
-                RemoteScopedRetryError::Other,
+                batch_write::classify_remote_scoped_retry_error(error),
+                batch_write::RemoteScopedRetryError::Other,
                 "{error}"
             );
         }
@@ -1160,9 +1154,9 @@ mod freshness_version_tests {
             dim: spec(FASTEMBED_MODEL_ID).unwrap().dim,
             failures: 1,
         };
-        let groups = group_embedding_jobs_by_input_hash(jobs);
+        let groups = batch_write::group_embedding_jobs_by_input_hash(jobs);
 
-        let (written, failed) = write_remote_scoped_or_failed(
+        let (written, failed) = batch_write::write_remote_scoped_or_failed(
             &conn,
             &embedder,
             "test-version",
@@ -1212,9 +1206,9 @@ mod freshness_version_tests {
             dim: spec(FASTEMBED_MODEL_ID).unwrap().dim,
             failures: usize::MAX,
         };
-        let groups = group_embedding_jobs_by_input_hash(jobs);
+        let groups = batch_write::group_embedding_jobs_by_input_hash(jobs);
 
-        let (written, failed) = write_remote_scoped_or_failed(
+        let (written, failed) = batch_write::write_remote_scoped_or_failed(
             &conn,
             &embedder,
             "test-version",
@@ -1228,7 +1222,7 @@ mod freshness_version_tests {
         assert_eq!(failed, 4);
         assert_eq!(
             embedder.calls.load(Ordering::SeqCst),
-            REMOTE_SCOPED_RETRY_CONSECUTIVE_ENDPOINT_FAILURE_LIMIT,
+            batch_write::REMOTE_SCOPED_RETRY_CONSECUTIVE_ENDPOINT_FAILURE_LIMIT,
             "repeated timeout-like failures should stop before serially retrying every range"
         );
     }
@@ -1251,7 +1245,7 @@ mod freshness_version_tests {
         remote.batch_size = 1;
         remote.concurrency = 4;
 
-        let (written, failed) = embed_and_write_jobs(
+        let (written, failed) = batch_write::embed_and_write_jobs(
             &conn,
             &embedder,
             "test-version",
@@ -1297,7 +1291,8 @@ mod freshness_version_tests {
         let job = prepared_job(chunk_id, 0);
         let input_hash = job.input_hash.clone();
         let (written, failed) =
-            embed_and_write_jobs(&conn, &embedder, "v", vec![job], Some(&remote)).unwrap();
+            batch_write::embed_and_write_jobs(&conn, &embedder, "v", vec![job], Some(&remote))
+                .unwrap();
         assert_eq!((written, failed), (1, 0));
         assert!(
             find_existing_embedding(&conn, embedder.model_id(), &input_hash, dim)
@@ -1356,7 +1351,7 @@ mod freshness_version_tests {
         set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, spec.version).unwrap();
         set_repo_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{not valid json").unwrap();
         assert!(
-            !automatic_reconcile_can_skip_noop(&conn, &ReconcileOptions {
+            !batch_write::automatic_reconcile_can_skip_noop(&conn, &ReconcileOptions {
                 max_seconds: Some(1),
                 ..ReconcileOptions::default()
             },),
@@ -1744,7 +1739,7 @@ mod freshness_version_tests {
         activate_ephemeral_with_query_endpoint(&conn, Some("http://127.0.0.1:9"));
 
         assert!(
-            !automatic_reconcile_can_skip_noop(&conn, &ReconcileOptions {
+            !batch_write::automatic_reconcile_can_skip_noop(&conn, &ReconcileOptions {
                 max_seconds: Some(1),
                 provision_remote: false,
                 ..ReconcileOptions::default()

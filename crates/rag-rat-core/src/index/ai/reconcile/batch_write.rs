@@ -320,15 +320,12 @@ mod tests {
     use super::*;
     use crate::config::{RemoteBackend, RemoteEmbeddingConfig};
     use crate::embedding_models::FASTEMBED_MODEL_ID;
-    use crate::index::ai::{
-        ACTIVE_EMBEDDING_MODEL_META, ACTIVE_EMBEDDING_MODEL_VERSION_META, ReconcileReason,
-        ensure_model_manifest, set_active_remote_config, set_repo_meta,
-    };
+    use crate::index::ai::{self, ReconcileReason};
 
     fn schema_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::index::schema::apply(&conn).unwrap();
-        ensure_model_manifest(&conn).unwrap();
+        ai::ensure_model_manifest(&conn).unwrap();
         conn
     }
 
@@ -470,9 +467,9 @@ mod tests {
     fn automatic_reconcile_can_skip_when_bounded_and_remote_is_connect() {
         let conn = schema_conn();
         let spec = crate::embedding_models::spec(FASTEMBED_MODEL_ID).unwrap();
-        set_active_remote_config(&conn, &remote_at("http://127.0.0.1:11434")).unwrap();
-        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
-        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, spec.version).unwrap();
+        ai::set_active_remote_config(&conn, &remote_at("http://127.0.0.1:11434")).unwrap();
+        ai::set_repo_meta(&conn, ai::ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        ai::set_repo_meta(&conn, ai::ACTIVE_EMBEDDING_MODEL_VERSION_META, spec.version).unwrap();
 
         assert!(automatic_reconcile_can_skip_noop(&conn, &ReconcileOptions {
             max_seconds: Some(1),
@@ -498,7 +495,7 @@ mod tests {
             ..ReconcileOptions::default()
         },));
 
-        set_active_remote_config(&conn, &ephemeral_remote()).unwrap();
+        ai::set_active_remote_config(&conn, &ephemeral_remote()).unwrap();
         assert!(!automatic_reconcile_can_skip_noop(&conn, &bounded));
     }
 

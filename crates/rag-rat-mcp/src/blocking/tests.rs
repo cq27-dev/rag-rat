@@ -5,7 +5,7 @@ use rmcp::ErrorData;
 use rmcp::model::CallToolResult;
 use tokio::sync::Semaphore;
 
-use super::{ToolTimeoutPolicy, parse_tool_timeout, parse_tool_workers, run_blocking_tool};
+use super::{self as blocking, ToolTimeoutPolicy};
 
 fn ok_result() -> CallToolResult {
     CallToolResult::success(vec![])
@@ -19,15 +19,15 @@ fn tool_timeout_policy_classifies_write_tools() {
 
 #[test]
 fn parse_helpers_reject_non_positive_values() {
-    assert_eq!(parse_tool_timeout("0"), None);
-    assert_eq!(parse_tool_workers("0"), None);
-    assert_eq!(parse_tool_timeout("abc"), None);
-    assert_eq!(parse_tool_workers("abc"), None);
+    assert_eq!(blocking::parse_tool_timeout("0"), None);
+    assert_eq!(blocking::parse_tool_workers("0"), None);
+    assert_eq!(blocking::parse_tool_timeout("abc"), None);
+    assert_eq!(blocking::parse_tool_workers("abc"), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_blocking_tool_times_out_immediately_with_zero_budget() {
-    let err = run_blocking_tool(
+    let err = blocking::run_blocking_tool(
         "fast_tool".to_string(),
         Duration::ZERO,
         ToolTimeoutPolicy::ReturnTimeout,
@@ -45,7 +45,7 @@ async fn run_blocking_tool_times_out_immediately_with_zero_budget() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_blocking_tool_propagates_runner_errors() {
-    let err = run_blocking_tool(
+    let err = blocking::run_blocking_tool(
         "failing_tool".to_string(),
         Duration::from_secs(1),
         ToolTimeoutPolicy::ReturnTimeout,
