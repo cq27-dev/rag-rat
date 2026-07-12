@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use rag_rat_core::Config;
 use rmcp::model::{
@@ -12,12 +11,8 @@ use rmcp::transport::stdio;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Map, Value};
 use tokio::sync::Semaphore;
-use tokio::task::JoinError;
 
-const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
-const DEFAULT_TOOL_WORKERS: usize = 2;
-const TOOL_TIMEOUT_ENV: &str = "RAG_RAT_MCP_TOOL_TIMEOUT_SECS";
-const TOOL_WORKERS_ENV: &str = "RAG_RAT_MCP_TOOL_WORKERS";
+use crate::blocking::{ToolTimeoutPolicy, run_blocking_tool, tool_timeout, tool_workers};
 
 #[derive(Clone)]
 pub struct RagRatService {
@@ -212,171 +207,6 @@ impl ServerHandler for RagRatService {
     }
 }
 
-fn tool_timeout() -> Duration {
-    std::env::var(TOOL_TIMEOUT_ENV)
-        .ok()
-        .and_then(|raw| parse_tool_timeout(&raw))
-        .unwrap_or(DEFAULT_TOOL_TIMEOUT)
-}
-
-fn parse_tool_timeout(raw: &str) -> Option<Duration> {
-    let secs = raw.trim().parse::<u64>().ok()?;
-    (secs > 0).then(|| Duration::from_secs(secs))
-}
-
-fn tool_workers() -> usize {
-    std::env::var(TOOL_WORKERS_ENV)
-        .ok()
-        .and_then(|raw| parse_tool_workers(&raw))
-        .unwrap_or(DEFAULT_TOOL_WORKERS)
-}
-
-fn parse_tool_workers(raw: &str) -> Option<usize> {
-    let workers = raw.trim().parse::<usize>().ok()?;
-    (workers > 0).then_some(workers)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ToolTimeoutPolicy {
-    ReturnTimeout,
-    WaitForCompletion,
-}
-
-impl ToolTimeoutPolicy {
-    fn for_tool(name: &str) -> Self {
-        if crate::tools::is_write_tool(name) {
-            Self::WaitForCompletion
-        } else {
-            Self::ReturnTimeout
-        }
-    }
-}
-
-async fn run_blocking_tool(
-    name: String,
-    timeout: Duration,
-    timeout_policy: ToolTimeoutPolicy,
-    workers: Arc<Semaphore>,
-    runner: impl FnOnce() -> Result<CallToolResult, ErrorData> + Send + 'static,
-) -> Result<CallToolResult, ErrorData> {
-    let started = Instant::now();
-    tracing::debug!(
-        target: "rag_rat_mcp::server",
-        tool = %name,
-        timeout_ms = timeout.as_millis(),
-        "mcp tool call started"
-    );
-
-    let Some(wait_budget) = remaining_timeout(started, timeout) else {
-        return tool_timeout_error(&name, started, timeout);
-    };
-    let permit = match tokio::time::timeout(wait_budget, workers.acquire_owned()).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) =>
-            return Err(ErrorData::internal_error("tool worker limiter was closed", None)),
-        Err(_) => return tool_timeout_error(&name, started, timeout),
-    };
-
-    let mut handle = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        runner()
-    });
-    let Some(run_budget) = remaining_timeout(started, timeout) else {
-        return handle_elapsed_deadline(name, started, timeout, timeout_policy, &mut handle).await;
-    };
-
-    match tokio::time::timeout(run_budget, &mut handle).await {
-        Ok(joined) => finish_blocking_tool(&name, started, joined),
-        Err(_) =>
-            handle_elapsed_deadline(name, started, timeout, timeout_policy, &mut handle).await,
-    }
-}
-
-fn remaining_timeout(started: Instant, timeout: Duration) -> Option<Duration> {
-    timeout.checked_sub(started.elapsed()).filter(|remaining| !remaining.is_zero())
-}
-
-async fn handle_elapsed_deadline(
-    name: String,
-    started: Instant,
-    timeout: Duration,
-    timeout_policy: ToolTimeoutPolicy,
-    handle: &mut tokio::task::JoinHandle<Result<CallToolResult, ErrorData>>,
-) -> Result<CallToolResult, ErrorData> {
-    match timeout_policy {
-        ToolTimeoutPolicy::ReturnTimeout => tool_timeout_error(&name, started, timeout),
-        ToolTimeoutPolicy::WaitForCompletion => {
-            tracing::warn!(
-                target: "rag_rat_mcp::server",
-                tool = %name,
-                timeout_ms = timeout.as_millis(),
-                duration_ms = started.elapsed().as_millis(),
-                "mcp write tool exceeded timeout; waiting for blocking work to finish"
-            );
-            finish_blocking_tool(&name, started, handle.await)
-        },
-    }
-}
-
-fn finish_blocking_tool(
-    name: &str,
-    started: Instant,
-    joined: Result<Result<CallToolResult, ErrorData>, JoinError>,
-) -> Result<CallToolResult, ErrorData> {
-    match joined {
-        Ok(Ok(result)) => {
-            tracing::debug!(
-                target: "rag_rat_mcp::server",
-                tool = %name,
-                duration_ms = started.elapsed().as_millis(),
-                "mcp tool call finished"
-            );
-            Ok(result)
-        },
-        Ok(Err(err)) => {
-            tracing::warn!(
-                target: "rag_rat_mcp::server",
-                tool = %name,
-                duration_ms = started.elapsed().as_millis(),
-                error = ?err,
-                "mcp tool call failed"
-            );
-            Err(err)
-        },
-        Err(err) => {
-            tracing::error!(
-                target: "rag_rat_mcp::server",
-                tool = %name,
-                duration_ms = started.elapsed().as_millis(),
-                error = %err,
-                "mcp tool call panicked"
-            );
-            Err(ErrorData::internal_error(format!("tool `{name}` panicked: {err}"), None))
-        },
-    }
-}
-
-fn tool_timeout_error(
-    name: &str,
-    started: Instant,
-    timeout: Duration,
-) -> Result<CallToolResult, ErrorData> {
-    tracing::error!(
-        target: "rag_rat_mcp::server",
-        tool = %name,
-        timeout_ms = timeout.as_millis(),
-        duration_ms = started.elapsed().as_millis(),
-        "mcp tool call timed out"
-    );
-    Err(ErrorData::internal_error(
-        format!(
-            "tool `{name}` timed out after {}s; see the rag-rat MCP log for details",
-            timeout.as_secs()
-        ),
-        None,
-    ))
-}
-
 /// Serve the stdio MCP server for a RESOLVED repo config — the ACTIVE server: keeps the index fresh
 /// (watcher), serves the grep-hook listener, and (Unix) arms the SIGUSR1 hot-upgrade. Published
 /// entry point; its `run_stdio(Config, …)` signature is preserved for source compatibility. The
@@ -515,12 +345,14 @@ async fn run_stdio_unix(
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     use rag_rat_core::language::Language;
     use rag_rat_core::{Config, IndexDatabase, OutputFormat, ResolvedTarget, TargetKind};
     use serde_json::json;
 
     use super::*;
+    use crate::blocking;
 
     static N: AtomicU64 = AtomicU64::new(0);
 
@@ -574,16 +406,16 @@ mod tests {
 
     #[test]
     fn timeout_and_worker_env_ignore_blank_zero_and_invalid_values() {
-        assert_eq!(parse_tool_timeout("5"), Some(Duration::from_secs(5)));
-        assert_eq!(parse_tool_timeout(" 9 "), Some(Duration::from_secs(9)));
-        assert_eq!(parse_tool_timeout(""), None);
-        assert_eq!(parse_tool_timeout("0"), None);
-        assert_eq!(parse_tool_timeout("nope"), None);
-        assert_eq!(parse_tool_workers("3"), Some(3));
-        assert_eq!(parse_tool_workers(" 4 "), Some(4));
-        assert_eq!(parse_tool_workers(""), None);
-        assert_eq!(parse_tool_workers("0"), None);
-        assert_eq!(parse_tool_workers("nope"), None);
+        assert_eq!(blocking::parse_tool_timeout("5"), Some(Duration::from_secs(5)));
+        assert_eq!(blocking::parse_tool_timeout(" 9 "), Some(Duration::from_secs(9)));
+        assert_eq!(blocking::parse_tool_timeout(""), None);
+        assert_eq!(blocking::parse_tool_timeout("0"), None);
+        assert_eq!(blocking::parse_tool_timeout("nope"), None);
+        assert_eq!(blocking::parse_tool_workers("3"), Some(3));
+        assert_eq!(blocking::parse_tool_workers(" 4 "), Some(4));
+        assert_eq!(blocking::parse_tool_workers(""), None);
+        assert_eq!(blocking::parse_tool_workers("0"), None);
+        assert_eq!(blocking::parse_tool_workers("nope"), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
