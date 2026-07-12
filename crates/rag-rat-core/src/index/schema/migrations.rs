@@ -3868,7 +3868,12 @@ pub(crate) fn apply_account_candidate_dag(conn: &Connection) -> rusqlite::Result
              claimed_fingerprint BLOB    NOT NULL,
              raw_bytes           BLOB    NOT NULL,
              received_at_ms      INTEGER NOT NULL
-         ) STRICT;",
+         ) STRICT;
+
+         -- Promotion scans the queue by claimed_account_id while holding the ingest write lock;
+         -- index it so a backlog for OTHER accounts is never full-scanned per ingest.
+         CREATE INDEX IF NOT EXISTS account_pre_verify_account
+             ON account_pre_verify(claimed_account_id);",
     )
 }
 

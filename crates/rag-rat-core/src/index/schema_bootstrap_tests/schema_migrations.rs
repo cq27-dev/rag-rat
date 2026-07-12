@@ -1834,6 +1834,10 @@ fn migration_059_creates_the_account_candidate_dag() {
         conn_index_exists(&conn, "account_accepted_slot"),
         "V059 creates the accepted-slot partial unique index (I10a)"
     );
+    assert!(
+        conn_index_exists(&conn, "account_pre_verify_account"),
+        "V059 creates the pre-verify claimed_account_id index"
+    );
 
     // Deferred-absence in ISOLATION: a bare DB lacks the tables until the V059 applier runs, and a
     // replay is an idempotent no-op (every statement is CREATE ... IF NOT EXISTS).

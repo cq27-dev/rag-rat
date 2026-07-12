@@ -9,7 +9,7 @@
 //! [`super::super::store::append`]; the account layer is a separate signed wire layer with its own
 //! DAG.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -84,6 +84,13 @@ pub(crate) fn account_ingest(
             "genesis payload does not hash to its account_id".into(),
         ));
     }
+    // The op payload has not been decoded yet — the envelope carries it opaque. A current-version
+    // plaintext op whose payload is malformed / non-canonical is a STRUCTURAL reject and must never
+    // enter the grow-only DAG. Sealed ciphertext and future-version payloads are intentionally
+    // opaque here: their own layer/version validates them, while C1 retains their headers.
+    if let Err(err) = validate_current_plaintext_payload(&verified) {
+        return Ok(IngestOutcome::Rejected(format!("op payload decode failed: {err}")));
+    }
 
     insert_candidate(&tx, &verified, signed_bytes, now_ms)?;
     // A DeviceAdd/genesis may resolve devices that were parked — retry their pre-verify rows.
@@ -117,24 +124,48 @@ fn refold_in_tx(
     let entries: Vec<VerifiedAccountEntry> = rows.iter().map(|r| r.verified.clone()).collect();
     let history = fold::fold_account(&entries);
 
-    // Branch selection: an entry is a candidate for `accepted` iff the fold makes it effective;
-    // when two effective entries collide on one (log, device, seq) slot (an unforced fork the
-    // registers did not resolve), the lexicographically-smaller entry_hash wins the slot and
-    // the loser is `forked` (I10a). The slot key mirrors the account_accepted_slot unique index
-    // exactly — including log_id, so a future effective non-control-log entry can never be
-    // mistaken for a control-log rival at the same (device, seq). Register-named branches were
-    // already promoted inside the fold (off-branch → condemned).
-    let mut slot_winner: HashMap<(u8, DeviceFingerprint, u64), [u8; 32]> = HashMap::new();
+    // Branch selection (§16.2): project the fold's effective entries onto a single accepted
+    // hash-chain per (log, device). From the smallest-entry_hash root (an effective entry with no
+    // prev_hash) walk forward, taking the smallest-entry_hash child (an effective entry whose
+    // prev_hash cites the current head) at each step. The min-hash tiebreak resolves an unforced
+    // equivocation the registers did not; crucially, an effective entry that chains from a LOSING
+    // head is off-branch and is NOT accepted — accepting it would leave the accepted history with
+    // an entry whose parent is `forked`, i.e. no longer a single chain under equivocation (the
+    // account_accepted_slot partial unique index keeps one accepted row per slot (I10a), but chain
+    // coherence needs the whole walk). Register-named branches were already promoted inside the
+    // fold (off-branch → condemned).
+    let effective: HashSet<[u8; 32]> = rows
+        .iter()
+        .filter(|r| history.outcome(&r.entry_hash).is_some_and(|o| o.is_effective()))
+        .map(|r| r.entry_hash)
+        .collect();
+    // Effective entries indexed by the (log, device, prev_hash) parent slot they chain from; a
+    // chain root keys on `None`.
+    let mut children: HashMap<(u8, DeviceFingerprint, Option<[u8; 32]>), Vec<[u8; 32]>> =
+        HashMap::new();
+    let mut groups: HashSet<(u8, DeviceFingerprint)> = HashSet::new();
     for row in &rows {
-        if history.outcome(&row.entry_hash).is_some_and(|o| o.is_effective()) {
-            slot_winner
-                .entry((row.log_id, row.device_fingerprint, row.seq))
-                .and_modify(|best| {
-                    if row.entry_hash < *best {
-                        *best = row.entry_hash;
-                    }
-                })
-                .or_insert(row.entry_hash);
+        if effective.contains(&row.entry_hash) {
+            children
+                .entry((row.log_id, row.device_fingerprint, row.verified.header.prev_hash))
+                .or_default()
+                .push(row.entry_hash);
+            groups.insert((row.log_id, row.device_fingerprint));
+        }
+    }
+    let mut accepted_set: HashSet<[u8; 32]> = HashSet::new();
+    for (log_id, device) in groups {
+        let mut parent: Option<[u8; 32]> = None;
+        // Bounded by the candidate count; each hop advances to a strictly-higher seq (the fold's
+        // ancestry check guarantees child.seq == parent.seq + 1), so the chain cannot cycle.
+        for _ in 0..=rows.len() {
+            let Some(winner) =
+                children.get(&(log_id, device, parent)).and_then(|kids| kids.iter().min()).copied()
+            else {
+                break;
+            };
+            accepted_set.insert(winner);
+            parent = Some(winner);
         }
     }
 
@@ -146,14 +177,11 @@ fn refold_in_tx(
 
     let mut statuses: HashMap<[u8; 32], String> = HashMap::new();
     for row in &rows {
-        let effective = history.outcome(&row.entry_hash).is_some_and(|o| o.is_effective());
-        let accepted = effective
-            && slot_winner.get(&(row.log_id, row.device_fingerprint, row.seq))
-                == Some(&row.entry_hash);
+        let accepted = accepted_set.contains(&row.entry_hash);
         let (status, detail): (String, Option<String>) = if accepted {
             ("accepted".to_string(), None)
-        } else if effective {
-            // Effective but lost the slot tiebreak — an equivocation loser.
+        } else if effective.contains(&row.entry_hash) {
+            // Effective but off the accepted chain — an equivocation loser or a descendant of one.
             ("forked".to_string(), None)
         } else {
             match history.outcome(&row.entry_hash) {
@@ -372,7 +400,10 @@ fn promote_pre_verify(
                 .filter(|v| {
                     !is_genesis(&v.header)
                         || account_id_from_genesis_payload(&v.payload) == v.header.account_id
-                });
+                })
+                // Same structural gate as ingest: a malformed current plaintext payload is
+                // refuted, not promoted into the DAG (dropped from the queue below either way).
+                .filter(|v| validate_current_plaintext_payload(v).is_ok());
             if let Some(verified) = promoted {
                 insert_candidate(tx, &verified, &raw_bytes, now_ms)?;
                 // A promoted genesis/DeviceAdd certifies a device key — feed it back so the next
@@ -396,6 +427,13 @@ fn promote_pre_verify(
 
 fn is_genesis(header: &AccountEntryHeader) -> bool {
     header.entry_type == ops::entry_type::ACCOUNT_GENESIS
+}
+
+fn validate_current_plaintext_payload(entry: &VerifiedAccountEntry) -> Result<(), String> {
+    if entry.header.crypto_suite == 0 && entry.header.op_version == fold::SUPPORTED_OP_VERSION {
+        ops::decode(entry.header.entry_type, &entry.payload).map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 fn is_device_add(verified: &VerifiedAccountEntry) -> bool {
@@ -766,5 +804,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(accepted_at_slot, 1, "one accepted head per slot (I10a)");
+    }
+
+    #[test]
+    fn an_entry_that_chains_from_a_forked_head_is_not_accepted() {
+        // B equivocates at seq 0 (b0a/b0b), then authors a seq-1 entry whose prev_hash chains from
+        // the LOSING head. The fold marks that seq-1 entry effective (its own authority is valid)
+        // and it is the ONLY candidate at (B, seq 1) — yet accepting it would leave an accepted
+        // entry whose parent is `forked`, a broken chain. Branch selection must fork the descendant
+        // of a losing head, not just the losing head itself.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+        let b = Dev::new(2);
+        let (add_b_bytes, add_b) =
+            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        account_ingest(&conn, &add_b_bytes, NOW).unwrap();
+        // B's two equivocating seq-0 heads (each adds a distinct throwaway member so they differ).
+        let (t8, t9) = (Dev::new(8), Dev::new(9));
+        let (b0a_bytes, b0a) =
+            op(acct, &b, 0, None, Some(add_b), &device_add(&t8, DeviceRole::Member));
+        let (b0b_bytes, b0b) =
+            op(acct, &b, 0, None, Some(add_b), &device_add(&t9, DeviceRole::Member));
+        let ((win, win_bytes), (lose, lose_bytes)) = if b0a < b0b {
+            ((b0a, &b0a_bytes), (b0b, &b0b_bytes))
+        } else {
+            ((b0b, &b0b_bytes), (b0a, &b0a_bytes))
+        };
+        // B continues at seq 1 from the LOSING head.
+        let t7 = Dev::new(7);
+        let (b1_bytes, b1) =
+            op(acct, &b, 1, Some(lose), Some(add_b), &device_add(&t7, DeviceRole::Member));
+
+        account_ingest(&conn, win_bytes, NOW).unwrap();
+        account_ingest(&conn, lose_bytes, NOW).unwrap();
+        account_ingest(&conn, &b1_bytes, NOW).unwrap();
+
+        assert_eq!(status(&conn, &win).as_deref(), Some("accepted"), "min-hash seq-0 head wins");
+        assert_eq!(status(&conn, &lose).as_deref(), Some("forked"), "the losing seq-0 head forks");
+        assert_eq!(
+            status(&conn, &b1).as_deref(),
+            Some("forked"),
+            "a seq-1 entry chaining from the forked head is off-branch, not accepted",
+        );
+        // No accepted entry has a forked parent: nothing is accepted on B's dead branch at seq 1.
+        let accepted_seq1: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries
+                 WHERE account_id = ?1 AND device_fingerprint = ?2 AND seq = 1 AND accepted = 1",
+                params![acct.to_bytes().as_slice(), b.fp.to_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(accepted_seq1, 0, "no accepted seq-1 entry on B's forked branch");
+    }
+
+    #[test]
+    fn a_malformed_op_payload_is_rejected_not_stored() {
+        // A founder-signed DEVICE_ADD whose plaintext op payload is not decodable CBOR. The
+        // envelope + signature verify (the payload rides opaque inside the envelope), but the op is
+        // garbage — a structural reject that must never enter the grow-only DAG. Only ops::decode
+        // catches it, so ingest must gate on it before storing.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+        let header = AccountEntryHeader {
+            account_id: acct,
+            log_id: 0,
+            device_fingerprint: founder.fp,
+            seq: 1,
+            prev_hash: Some(gh),
+            parent_ref: None,
+            entry_type: ops::entry_type::DEVICE_ADD,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: Some(gh),
+        };
+        let signed = sign_account_entry(&founder.secret, &header, &[0xff, 0xff, 0xff]).unwrap();
+        let out = account_ingest(&conn, &signed.signed_bytes, NOW).unwrap();
+        assert!(
+            matches!(out, IngestOutcome::Rejected(_)),
+            "a malformed op payload is rejected: {out:?}"
+        );
+        assert_eq!(status(&conn, &signed.entry_hash), None, "and is never stored");
     }
 }

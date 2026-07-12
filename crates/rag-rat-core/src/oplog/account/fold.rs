@@ -31,7 +31,7 @@ use crate::oplog::op::DeviceFingerprint;
 const CONTROL_LOG: u8 = 0;
 /// The account-op version this fold understands. A known `entry_type` at a different version may
 /// reuse the tag with new semantics, so it is retained-unfolded rather than folded as today's op.
-const SUPPORTED_OP_VERSION: u32 = 1;
+pub(super) const SUPPORTED_OP_VERSION: u32 = 1;
 
 /// The per-entry classification (§16.3 taxonomy). `RetainedUnfolded` is an unknown `entry_type`;
 /// `Rejected` will never be effective; `Parked` is undecided pending more entries.
