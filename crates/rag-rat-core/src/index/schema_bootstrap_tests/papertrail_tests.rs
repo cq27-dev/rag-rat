@@ -861,7 +861,8 @@ fn seeded_pre_v060_legacy_db() -> rusqlite::Connection {
         INSERT INTO github_issues(owner,           repo, number, html_url, state, title, body, author,
                                   is_pull_request,           synced_at_ms, repo_id)
         VALUES ('o','r',1,'http://i1','open','issue one','sqlite stays','alice',0,11,'repo-a'),
-               ('o','r',2,'http://p2','closed','pr two','shadow body','bob',1,12,'repo-a');
+               ('o','r',2,'http://p2','closed','pr two','shadow body','bob',1,12,'repo-a'),
+               ('o','r',3,'http://i3','open','partial issue','must retry','eve',0,19,'repo-a');
         INSERT INTO github_pull_requests(owner, repo, number, html_url, state, title, body,
                                          author, merged_at, synced_at_ms, repo_id)
                   VALUES ('o','r',2,'http://p2','closed','pr two','pull body','bob',
@@ -869,7 +870,8 @@ fn seeded_pre_v060_legacy_db() -> rusqlite::Connection {
         INSERT INTO github_comments(id, owner, repo, number, html_url, body, author,
                                               synced_at_ms, repo_id)
         VALUES (10,'o','r',1,'http://c10','issue thread comment','carol',13,'repo-a'),
-               (11,'o','r',2,'http://c11','pr thread comment','carol',13,'repo-a');
+               (11,'o','r',2,'http://c11','pr thread comment','carol',13,'repo-a'),
+               (12,'o','r',3,'http://c12','partial thread comment','eve',19,'repo-a');
                   INSERT INTO github_reviews(id, owner, repo, number, html_url, state, body, author,
                                              submitted_at, synced_at_ms, repo_id)
         VALUES (10,'o','r',2,NULL,'APPROVED','ship it','dave','2026-01-04T00:00:00Z',14,'repo-a');
@@ -880,7 +882,8 @@ fn seeded_pre_v060_legacy_db() -> rusqlite::Connection {
                                 source_text, discovered_at_ms, repo_id)
                   VALUES ('o','r',1,'closing','file','docs/a.md','Fixes o/r#1',16,'repo-a');
         INSERT INTO           github_ref_sync(owner, repo, number, status, synced_at_ms, repo_id)
-        VALUES ('o','r',1,'synced',17,'repo-a');
+        VALUES ('o','r',1,'synced',17,'repo-a'),
+               ('o','r',3,'failed',19,'repo-a');
 
         -- repo-b: its own copy of an external issue — repo_id must copy VERBATIM.
                   INSERT INTO github_issues(owner, repo, number, html_url, state, title, body,
@@ -966,6 +969,39 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
         )
         .unwrap();
     assert_eq!(projects, 3, "tracker/project derive from the legacy owner/repo columns");
+
+    let migrated_ref = |item_key: &str| papertrail::PapertrailRef {
+        tracker: papertrail::Tracker::Github,
+        project: "o/r".to_string(),
+        item_key: item_key.to_string(),
+        ref_kind: "unknown".to_string(),
+        source_kind: "file".to_string(),
+        source_path: None,
+        source_commit: None,
+        source_text: String::new(),
+    };
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);
+         INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', 'repo-a');",
+    )
+    .unwrap();
+    assert!(
+        papertrail::papertrail_ref_synced(&conn, &migrated_ref("1")).unwrap(),
+        "a successful legacy sync keeps its item and remains skippable"
+    );
+    assert!(
+        !papertrail::papertrail_ref_synced(&conn, &migrated_ref("3")).unwrap(),
+        "a failed legacy sync must remain retryable after its partial item is removed"
+    );
+    let failed_children: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM papertrail_comments
+             WHERE repo_id = 'repo-a' AND project = 'o/r' AND item_key = '3'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(failed_children, 0, "partial children from a failed sync are not exposed");
 
     // Comments: the three legacy shapes unified; the PR thread comment resolved its parent kind
     // through the cached parent rows.
@@ -1114,11 +1150,6 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
 
     // Scoped readers work on the migrated data (the connection-context repo scope the production
     // reads resolve through).
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);
-         INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', 'repo-a');",
-    )
-    .unwrap();
     let hits = crate::index::papertrail::issue_search(&conn, "sqlite", 10).unwrap();
     assert_eq!(hits.len(), 1, "issue_search serves the migrated scoped cache");
     assert_eq!(hits[0].item_key, "1");

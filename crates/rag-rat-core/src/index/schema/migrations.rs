@@ -3318,6 +3318,27 @@ fn backfill_papertrail_from_github_tables(conn: &Connection) -> rusqlite::Result
                synced_at_ms, repo_id
         FROM github_review_comments;
 
+        -- A legacy failed ref sync is an explicit retry marker. The referenced-only lane now uses
+        -- the presence of a cached item as its sole completion signal, so carrying a partially
+        -- cached item across V060 would turn that failure into a permanent skip. Remove both the
+        -- item and any partial children; a successful legacy row keeps its complete cache.
+        DELETE FROM papertrail_comments
+        WHERE tracker = 'github' AND EXISTS (
+            SELECT 1 FROM github_ref_sync s
+            WHERE s.status = 'failed'
+              AND s.repo_id = papertrail_comments.repo_id
+              AND s.owner || '/' || s.repo = papertrail_comments.project
+              AND CAST(s.number AS TEXT) = papertrail_comments.item_key
+        );
+        DELETE FROM papertrail_items
+        WHERE tracker = 'github' AND EXISTS (
+            SELECT 1 FROM github_ref_sync s
+            WHERE s.status = 'failed'
+              AND s.repo_id = papertrail_items.repo_id
+              AND s.owner || '/' || s.repo = papertrail_items.project
+              AND CAST(s.number AS TEXT) = papertrail_items.item_key
+        );
+
         -- Refs copy verbatim (annotation layer). The per-ref github_ref_sync state machine is
         -- DELETED, not migrated — papertrail_sync_cursor starts empty.
         INSERT OR IGNORE INTO papertrail_refs(
