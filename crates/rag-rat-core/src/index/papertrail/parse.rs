@@ -124,7 +124,7 @@ pub(crate) fn comment_from_value(
         project: project.to_string(),
         item_kind: kind,
         item_key: key.to_string(),
-        comment_id: value["id"].as_i64().unwrap_or_default().to_string(),
+        comment_id: format!("comment:{}", value["id"].as_i64().unwrap_or_default()),
         url: value["html_url"].as_str().map(str::to_string),
         body: string_value(value, "body"),
         author: value.pointer("/user/login").and_then(Value::as_str).map(str::to_string),
@@ -140,12 +140,14 @@ pub(crate) fn review_to_comment_from_value(
     key: &str,
     value: &Value,
 ) -> PapertrailComment {
-    PapertrailComment {
+    let mut comment = PapertrailComment {
         created_at: value["submitted_at"].as_str().map(str::to_string),
         updated_at: value["submitted_at"].as_str().map(str::to_string),
         review_state: Some(string_value(value, "state")),
         ..comment_from_value(project, kind, key, value)
-    }
+    };
+    comment.comment_id = format!("review:{}", value["id"].as_i64().unwrap_or_default());
+    comment
 }
 pub(crate) fn review_comment_to_comment_from_value(
     project: &str,
@@ -153,10 +155,12 @@ pub(crate) fn review_comment_to_comment_from_value(
     key: &str,
     value: &Value,
 ) -> PapertrailComment {
-    PapertrailComment {
+    let mut comment = PapertrailComment {
         anchor_path: value["path"].as_str().map(str::to_string),
         ..comment_from_value(project, kind, key, value)
-    }
+    };
+    comment.comment_id = format!("review_comment:{}", value["id"].as_i64().unwrap_or_default());
+    comment
 }
 /// Map one entry of a repo-wide comment stream, deriving the parent item key from the payload's
 /// `issue_url` / `pull_request_url` tail. `None` when the payload names no parent. The unanchored
@@ -176,6 +180,7 @@ pub(crate) fn repo_comment_from_value(
     let key = value[parent_field].as_str()?.rsplit('/').next()?.to_string();
     let mut comment = comment_from_value(project, kind, &key, value);
     if anchored {
+        comment.comment_id = format!("review_comment:{}", value["id"].as_i64().unwrap_or_default());
         comment.anchor_path = value["path"].as_str().map(str::to_string);
     }
     Some(comment)
@@ -326,7 +331,7 @@ mod mapper_tests {
             "updated_at": "2026-01-01T00:00:00Z",
         });
         let plain = comment_from_value("o/r", ItemKind::Issue, "42", &payload);
-        assert_eq!(plain.comment_id, "9");
+        assert_eq!(plain.comment_id, "comment:9");
         assert_eq!(plain.item_kind, ItemKind::Issue);
         assert_eq!((plain.review_state, plain.anchor_path), (None, None));
 
@@ -335,13 +340,14 @@ mod mapper_tests {
             ItemKind::ChangeRequest,
             "7",
             &json!({
-                "id": 10,
+                "id": 9,
                 "state": "APPROVED",
                 "body": "b",
                 "submitted_at": "2026-01-03T00:00:00Z",
             }),
         );
         assert_eq!(review.review_state.as_deref(), Some("APPROVED"));
+        assert_eq!(review.comment_id, "review:9");
         assert_eq!(review.created_at.as_deref(), Some("2026-01-03T00:00:00Z"));
         assert_eq!(review.updated_at.as_deref(), Some("2026-01-03T00:00:00Z"));
         assert_eq!(review.anchor_path, None);
@@ -351,13 +357,14 @@ mod mapper_tests {
             ItemKind::ChangeRequest,
             "7",
             &json!({
-                "id": 11,
+                "id": 9,
                 "path": "src/lib.rs",
                 "html_url": "https://rc",
                 "body": "b",
             }),
         );
         assert_eq!(anchored.anchor_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(anchored.comment_id, "review_comment:9");
         assert_eq!(anchored.review_state, None);
     }
 

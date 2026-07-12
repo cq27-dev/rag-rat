@@ -3057,7 +3057,8 @@ pub(crate) fn create_papertrail_tables(conn: &Connection) -> rusqlite::Result<()
 
         -- One unified comment shape: a review event carries review_state, a file-anchored review
         -- comment carries anchor_path, a plain thread comment carries neither. The parent item is
-        -- named by (item_kind, item_key); uniqueness is the provider comment id.
+        -- named by (item_kind, item_key); comment_id is source-qualified by providers whose
+        -- thread-comment / review / review-comment resources have overlapping id spaces.
         CREATE TABLE IF NOT EXISTS papertrail_comments(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tracker TEXT NOT NULL,
@@ -3290,7 +3291,8 @@ fn backfill_papertrail_from_github_tables(conn: &Connection) -> rusqlite::Result
                         WHERE p.repo_id = c.repo_id AND p.owner = c.owner AND p.repo = c.repo
                           AND p.number = c.number
                     ) THEN 'change_request' ELSE 'issue' END,
-               CAST(c.number AS TEXT), CAST(c.id AS TEXT), c.html_url, c.body, c.author,
+               CAST(c.number AS TEXT), 'comment:' || CAST(c.id AS TEXT), c.html_url, c.body, \
+         c.author,
                c.created_at, c.updated_at, NULL, NULL, c.synced_at_ms, c.repo_id
         FROM github_comments c;
 
@@ -3300,7 +3302,8 @@ fn backfill_papertrail_from_github_tables(conn: &Connection) -> rusqlite::Result
             updated_at, review_state, anchor_path, synced_at_ms, repo_id
         )
         SELECT 'github', owner || '/' || repo, 'change_request', CAST(number AS TEXT),
-               CAST(id AS TEXT), html_url, body, author, submitted_at, submitted_at, state, NULL,
+               'review:' || CAST(id AS TEXT), html_url, body, author, submitted_at, submitted_at,
+               state, NULL,
                synced_at_ms, repo_id
         FROM github_reviews;
 
@@ -3310,7 +3313,8 @@ fn backfill_papertrail_from_github_tables(conn: &Connection) -> rusqlite::Result
             updated_at, review_state, anchor_path, synced_at_ms, repo_id
         )
         SELECT 'github', owner || '/' || repo, 'change_request', CAST(number AS TEXT),
-               CAST(id AS TEXT), html_url, body, author, created_at, updated_at, NULL, path,
+               'review_comment:' || CAST(id AS TEXT), html_url, body, author, created_at,
+               updated_at, NULL, path,
                synced_at_ms, repo_id
         FROM github_review_comments;
 

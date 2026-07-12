@@ -108,12 +108,16 @@ pub(crate) async fn sync_one_ref<C: PapertrailClient>(
     let item = client.item(&reference.project, ItemKind::Issue, &reference.item_key).await?;
     let comments =
         client.item_comments(&reference.project, item.item_kind, &reference.item_key).await?;
-    store_item(conn, reference.tracker, &item)?;
+    // The cached item is the ref lane's completion marker. Commit it atomically with every
+    // comment/FTS row so a failed comment write cannot leave an item that suppresses retries.
+    let tx = conn.unchecked_transaction()?;
+    store_item(&tx, reference.tracker, &item)?;
     let mut synced = 1;
     for comment in &comments {
-        store_comment(conn, reference.tracker, comment)?;
+        store_comment(&tx, reference.tracker, comment)?;
         synced += 1;
     }
+    tx.commit()?;
     Ok(synced)
 }
 pub(crate) fn sync_progress(

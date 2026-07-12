@@ -77,6 +77,17 @@ fn arg_struct_handles_survive_an_rmcp_style_serde_round_trip() {
 }
 
 #[test]
+fn memory_bind_rejects_removed_github_fields_instead_of_dropping_the_anchor() {
+    let error = serde_json::from_value::<MemoryBindArgs>(json!({
+        "github_owner": "o",
+        "github_repo": "r",
+        "github_number": 588
+    }))
+    .expect_err("legacy GitHub bind fields must not deserialize as an empty bind");
+    assert!(error.to_string().contains("unknown field"), "{error}");
+}
+
+#[test]
 fn include_accepts_a_json_string_encoded_array_from_buggy_clients() {
     // Some MCP clients serialize array args as JSON strings (Claude Code does this for array/object
     // params — anthropics/claude-code#24599), so `include` arrives as `"[\"git\"]"` not `["git"]`.

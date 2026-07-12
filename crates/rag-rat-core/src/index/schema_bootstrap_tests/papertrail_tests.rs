@@ -726,6 +726,37 @@ fn papertrail_sync_retries_a_failed_ref_instead_of_caching_a_partial_item() {
 }
 
 #[test]
+fn papertrail_sync_rolls_back_the_item_when_a_comment_store_fails() {
+    let (root, config) =
+        markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_papertrail_comment
+         BEFORE INSERT ON papertrail_comments
+         BEGIN SELECT RAISE(ABORT, 'injected comment failure'); END;",
+    )
+    .unwrap();
+
+    let failed =
+        sync_from_refs_blocking(conn, &root, Some(&MockGitHubClient), false, &test_gh_ctx())
+            .unwrap();
+    assert_eq!(failed.failed_refs, 1);
+    assert_eq!(failed.status.change_requests, 0, "the item completion marker rolls back");
+    assert_eq!(failed.status.comments, 0);
+
+    conn.execute_batch("DROP TRIGGER reject_papertrail_comment;").unwrap();
+    let retried =
+        sync_from_refs_blocking(conn, &root, Some(&MockGitHubClient), false, &test_gh_ctx())
+            .unwrap();
+    assert_eq!(retried.failed_refs, 0);
+    assert_eq!(retried.status.change_requests, 1);
+    assert_eq!(retried.status.comments, 4);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn papertrail_client_batch_surface_round_trips_through_the_trait() {
     use crate::index::papertrail::PapertrailClient;
 
@@ -841,10 +872,10 @@ fn seeded_pre_v060_legacy_db() -> rusqlite::Connection {
                (11,'o','r',2,'http://c11','pr thread comment','carol',13,'repo-a');
                   INSERT INTO github_reviews(id, owner, repo, number, html_url, state, body, author,
                                              submitted_at, synced_at_ms, repo_id)
-        VALUES (20,'o','r',2,NULL,'APPROVED','ship it','dave','2026-01-04T00:00:00Z',14,'repo-a');
+        VALUES (10,'o','r',2,NULL,'APPROVED','ship it','dave','2026-01-04T00:00:00Z',14,'repo-a');
         INSERT INTO github_review_comments(id, owner, repo, number, path, html_url, body,           author,
                                            synced_at_ms, repo_id)
-        VALUES (30,'o','r',2,'src/lib.rs','http://rc30','anchored           nit','dave',15,'repo-a');
+        VALUES (10,'o','r',2,'src/lib.rs','http://rc10','anchored           nit','dave',15,'repo-a');
         INSERT INTO github_refs(owner, repo, number, ref_kind, source_kind,           source_path,
                                 source_text, discovered_at_ms, repo_id)
                   VALUES ('o','r',1,'closing','file','docs/a.md','Fixes o/r#1',16,'repo-a');
@@ -938,11 +969,12 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
 
     // Comments: the three legacy shapes unified; the PR thread comment resolved its parent kind
     // through the cached parent rows.
-    let comments: Vec<(String, String, String, Option<String>, Option<String>)> = {
+    type MigratedCommentRow = (String, String, String, Option<String>, Option<String>);
+    let comments: Vec<MigratedCommentRow> = {
         let mut stmt = conn
             .prepare(
                 "SELECT comment_id, item_kind, item_key, review_state, anchor_path
-                 FROM papertrail_comments ORDER BY CAST(comment_id AS INTEGER)",
+                 FROM papertrail_comments ORDER BY comment_id",
             )
             .unwrap();
         let rows = stmt
@@ -951,17 +983,17 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
         rows.map(Result::unwrap).collect()
     };
     assert_eq!(comments, vec![
-        ("10".to_string(), "issue".to_string(), "1".to_string(), None, None),
-        ("11".to_string(), "change_request".to_string(), "2".to_string(), None, None),
+        ("comment:10".to_string(), "issue".to_string(), "1".to_string(), None, None),
+        ("comment:11".to_string(), "change_request".to_string(), "2".to_string(), None, None),
         (
-            "20".to_string(),
+            "review:10".to_string(),
             "change_request".to_string(),
             "2".to_string(),
             Some("APPROVED".to_string()),
             None
         ),
         (
-            "30".to_string(),
+            "review_comment:10".to_string(),
             "change_request".to_string(),
             "2".to_string(),
             None,
@@ -971,7 +1003,7 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
     // The review's submitted_at fills both timestamps.
     let (created, updated): (Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT created_at, updated_at FROM papertrail_comments WHERE comment_id = '20'",
+            "SELECT created_at, updated_at FROM papertrail_comments WHERE comment_id = 'review:10'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -1021,7 +1053,11 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
     assert_eq!(scoped_hits("repo-a"), 1);
     assert_eq!(scoped_hits("repo-b"), 1);
     let anchored_title: String = conn
-        .query_row("SELECT title FROM papertrail_fts WHERE comment_id = '30'", [], |r| r.get(0))
+        .query_row(
+            "SELECT title FROM papertrail_fts WHERE comment_id = 'review_comment:10'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(anchored_title, "src/lib.rs");
 

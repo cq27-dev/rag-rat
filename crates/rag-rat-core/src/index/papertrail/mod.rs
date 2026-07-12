@@ -241,7 +241,8 @@ pub struct PapertrailComment {
     /// (GitLab) can have an issue and a change request sharing the same key.
     pub item_kind: ItemKind,
     pub item_key: String,
-    /// Provider comment id, stringly — provider id spaces are not uniformly numeric.
+    /// Provider comment id, normalized into a source-qualified namespace when one provider has
+    /// multiple comment resources (for example `comment:9`, `review:9`, `review_comment:9`).
     pub comment_id: String,
     pub url: Option<String>,
     pub body: String,

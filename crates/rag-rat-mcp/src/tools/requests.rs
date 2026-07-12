@@ -607,6 +607,7 @@ impl McpMemorySource {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryBindArgs {
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
     #[serde(
