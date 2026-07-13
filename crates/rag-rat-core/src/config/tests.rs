@@ -232,6 +232,27 @@ fn papertrail_scheduling_table_is_rejected_until_it_is_consumed() {
 }
 
 #[test]
+fn papertrail_rate_limit_reserve_is_parsed_and_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rag-rat.toml");
+    std::fs::write(&path, "[papertrail]\nrate_limit_reserve = 0.2\n").unwrap();
+    let config = Config::load(&path).unwrap();
+    assert_eq!(config.papertrail.rate_limit_reserve, 0.2);
+
+    std::fs::write(&path, "[papertrail]\nrate_limit_reserve = 0.0\n").unwrap();
+    let config = Config::load(&path).unwrap();
+    assert_eq!(config.papertrail.rate_limit_reserve, 0.0, "zero disables the reserved slice");
+
+    for invalid in ["-0.1", "1.0", "nan"] {
+        std::fs::write(&path, format!("[papertrail]\nrate_limit_reserve = {invalid}\n")).unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::PapertrailRateLimitReserveOutOfRange(_))
+        ));
+    }
+}
+
+#[test]
 fn repo_id_override_is_parsed_and_does_not_change_the_database_path() {
     let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!("ragrat-repoid-{}-{id}", std::process::id()));

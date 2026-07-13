@@ -6,9 +6,9 @@ use serde::Deserialize;
 use super::{
     ConfigError, DEFAULT_QUERY_ENDPOINT, DreamLlmConfig, EmbeddingBackend, EmbeddingConfig,
     EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,
-    MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, RemoteBackend,
-    RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig, Tracker, TrackerAuth, TrackerConfig,
-    VersionCheckConfig, WatchConfig,
+    MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, PapertrailConfig,
+    RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig, Tracker, TrackerAuth,
+    TrackerConfig, VersionCheckConfig, WatchConfig,
 };
 use crate::embedding_models::Backend;
 
@@ -46,14 +46,42 @@ pub(crate) struct RawConfig {
     pub(crate) memory: RawMemory,
     #[serde(default, rename = "tracker")]
     pub(crate) tracker: Vec<RawTracker>,
-    /// Reserved for the provider mirror scheduler. Capture the table so config cannot silently
-    /// accept cadence/rate knobs before any production path consumes them.
+    /// Papertrail transport/scheduler settings. The transport consumes `rate_limit_reserve` now;
+    /// cadence fields are captured so they can be rejected until the scheduler consumes them.
     #[serde(default)]
-    pub(crate) papertrail: Option<toml::Value>,
+    pub(crate) papertrail: Option<RawPapertrail>,
     #[serde(default)]
     pub(crate) target_bindings: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "target")]
     pub(crate) target: Vec<RawTarget>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawPapertrail {
+    pub(crate) probe_interval_secs: Option<u64>,
+    pub(crate) sync_min_interval_secs: Option<u64>,
+    pub(crate) full_sync_interval_secs: Option<u64>,
+    pub(crate) rate_limit_reserve: Option<f64>,
+}
+
+impl TryFrom<RawPapertrail> for PapertrailConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawPapertrail) -> Result<Self, Self::Error> {
+        if raw.probe_interval_secs.is_some()
+            || raw.sync_min_interval_secs.is_some()
+            || raw.full_sync_interval_secs.is_some()
+        {
+            return Err(ConfigError::PapertrailSchedulingNotSupported);
+        }
+        let default = PapertrailConfig::default();
+        let rate_limit_reserve = raw.rate_limit_reserve.unwrap_or(default.rate_limit_reserve);
+        if !rate_limit_reserve.is_finite() || !(0.0..1.0).contains(&rate_limit_reserve) {
+            return Err(ConfigError::PapertrailRateLimitReserveOutOfRange(rate_limit_reserve));
+        }
+        Ok(PapertrailConfig { rate_limit_reserve, ..default })
+    }
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq)]

@@ -604,11 +604,21 @@ URLs; Bitbucket `#N` (issues) and `/issues/N` / `/pull-requests/N` URLs; Jira ba
 (`PROJ-123`) for the bound project. A bare `#N` resolves against the first code-host binding
 only. A self-hosted binding's URL grammar matches its own host, not the cloud host.
 
-On the `#588` schema stack, all bindings participate in production reference discovery and
-annotation lookup, but the live network client remains GitHub-only. GitLab, Bitbucket, and Jira
-refs are persisted without being sent through the GitHub client. Parallel per-binding mirror sync
-lands with the shared provider transport from `#589`; until then these settings describe the
-stable configuration/cursor contract, not an already-active non-GitHub network mirror.
+All bindings participate in production reference discovery and annotation lookup, but live
+network synchronization remains GitHub-only. GitLab, Bitbucket, and Jira refs are persisted
+without being sent through the GitHub client. The shared transport resolves each binding's
+`auth` source and governs its quota, but native provider clients and parallel per-binding mirror
+dispatch land in the later provider-client PRs; these settings do not yet activate a non-GitHub
+network mirror.
 
-The `[papertrail]` cadence and rate-governance keys land with the provider mirror scheduler; they
-are intentionally not accepted before that production path can consume them.
+The shared transport keeps part of each header-reported quota untouched for the user's own tools.
+The reserve defaults to 35% and can be changed independently of the later provider clients:
+
+```toml
+[papertrail]
+rate_limit_reserve = 0.35   # finite fraction in 0.0 <= value < 1.0
+```
+
+Cadence keys (`probe_interval_secs`, `sync_min_interval_secs`, and `full_sync_interval_secs`) are
+reserved for the provider mirror scheduler and remain rejected until that production path
+consumes them.

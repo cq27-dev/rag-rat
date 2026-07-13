@@ -162,6 +162,11 @@ pub enum ConfigError {
          is active"
     )]
     PapertrailSchedulingNotSupported,
+    #[error(
+        "[papertrail] `rate_limit_reserve` must be a finite fraction from 0.0 up to (but not \
+         including) 1.0 (got `{0}`)"
+    )]
+    PapertrailRateLimitReserveOutOfRange(f64),
 }
 
 pub use discovery::{

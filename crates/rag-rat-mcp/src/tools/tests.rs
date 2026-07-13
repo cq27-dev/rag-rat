@@ -398,7 +398,7 @@ fn mcp_tool_calls_preserve_compatibility_shapes() {
     assert!(papertrail["evidence"].is_array());
 
     let sync_status = call_tool(&config.database, "papertrail_sync_status", json!({})).unwrap();
-    assert!(sync_status["capability"].is_string());
+    assert!(sync_status["capabilities"].is_array());
 
     let llm = call_tool(&config.database, "llm_status", json!({})).unwrap();
     assert_eq!(llm["embedding"]["state"], "MissingModel");

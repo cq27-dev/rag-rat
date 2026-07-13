@@ -380,14 +380,9 @@ impl IndexDatabase {
         Ok(Some(db))
     }
 
-    /// Set the GitHub repo context explicitly (tests / non-gh callers), so the library never
-    /// shells out to `gh`.
-    pub fn set_papertrail_context(
-        &mut self,
-        default_repo: Option<&str>,
-        github_cli_available: bool,
-    ) {
-        self.papertrail = papertrail::PapertrailContext::new(default_repo, github_cli_available);
+    /// Set the GitHub repo context explicitly for tests and embedding callers.
+    pub fn set_papertrail_context(&mut self, default_repo: Option<&str>) {
+        self.papertrail = papertrail::PapertrailContext::new(default_repo);
     }
 
     pub fn migrate(path: &Path) -> anyhow::Result<schema::SchemaStatus> {

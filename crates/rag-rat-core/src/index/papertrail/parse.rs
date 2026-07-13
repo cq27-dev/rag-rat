@@ -135,16 +135,29 @@ impl TrackerParsedRef {
 /// contract; GitLab's bare `!N` is provider-explicit syntax and resolves against its own
 /// binding regardless.
 pub fn parse_tracker_refs(text: &str, trackers: &[ResolvedTracker]) -> Vec<TrackerParsedRef> {
+    parse_tracker_refs_with_bindings(text, trackers).into_iter().map(|(_, parsed)| parsed).collect()
+}
+
+/// The routing-aware form of [`parse_tracker_refs`]. The binding index is the exact binding whose
+/// grammar claimed the token under the same first-match rule, so callers can distinguish cloud
+/// GitHub from Enterprise without reconstructing provenance from the normalized project.
+pub(crate) fn parse_tracker_refs_with_bindings(
+    text: &str,
+    trackers: &[ResolvedTracker],
+) -> Vec<(usize, TrackerParsedRef)> {
     let code_host = trackers.iter().position(|tracker| tracker.provider.is_code_host());
     let mut refs = Vec::new();
     let mut previous = "";
     for token in ref_tokens(text) {
         let ref_kind = ref_kind(previous);
-        if let Some(mut parsed) = trackers.iter().enumerate().find_map(|(index, tracker)| {
-            tracker_token_ref(token, tracker, code_host == Some(index))
-        }) {
+        if let Some((binding_index, mut parsed)) =
+            trackers.iter().enumerate().find_map(|(index, tracker)| {
+                tracker_token_ref(token, tracker, code_host == Some(index))
+                    .map(|parsed| (index, parsed))
+            })
+        {
             parsed.ref_kind = ref_kind;
-            refs.push(parsed);
+            refs.push((binding_index, parsed));
         }
         previous = token;
     }
@@ -467,8 +480,16 @@ pub(crate) fn gh_api_paginated(path: &str) -> anyhow::Result<Vec<Value>> {
     }
     Ok(out)
 }
+/// The legacy GitHub sync path shells out to `gh api`; status checks ONLY executable presence.
+/// Authentication is intentionally deferred to sync, where `gh api` returns the actionable error.
 pub(crate) fn github_cli_available() -> bool {
-    Command::new("gh").arg("--version").output().is_ok_and(|output| output.status.success())
+    Command::new("gh")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 pub(crate) fn string_value(value: &Value, key: &str) -> String {
     value[key].as_str().unwrap_or_default().to_string()
@@ -507,6 +528,7 @@ mod grammar_tests {
             project: project.to_string(),
             base_url: None,
             auth: None,
+            authentication: TrackerAuthentication::AuthMissing,
             tags: Vec::new(),
         }
     }

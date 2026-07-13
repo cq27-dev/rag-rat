@@ -9,6 +9,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use super::TrackerAuthentication;
 use crate::config::{Tracker, TrackerAuth, TrackerConfig};
 
 /// One tracker binding with its `project` resolved to a concrete value — the runtime shape
@@ -24,6 +25,10 @@ pub struct ResolvedTracker {
     /// Self-hosted base URL (no trailing slash). `None` = the provider's cloud host.
     pub base_url: Option<String>,
     pub auth: Option<TrackerAuth>,
+    /// Authentication capability snapshotted when the binding is resolved. Environment sources
+    /// are checked for token presence; commands are treated as configured without executing shell
+    /// code on ordinary index opens. Transport construction resolves and fails fast at sync time.
+    pub authentication: TrackerAuthentication,
     /// Configured tags as written (trimmed, non-empty); matching and fingerprinting normalize
     /// on demand via [`normalized_tags`].
     pub tags: Vec<String>,
@@ -121,6 +126,7 @@ fn resolve_binding(binding: &TrackerConfig, root: &Path) -> Option<ResolvedTrack
         project,
         base_url: binding.base_url.clone().or(derived_base_url),
         auth: binding.auth.clone(),
+        authentication: super::transport::authentication(binding.auth.as_ref()),
         tags: binding.tags.clone(),
     })
 }
@@ -138,7 +144,14 @@ pub fn detect_tracker_from_remote_url(url: &str) -> Option<ResolvedTracker> {
     let provider = detect_provider(&parts.host)?;
     let project = remote_url_project(&parts, provider)?;
     let base_url = remote_base_url(&parts, provider);
-    Some(ResolvedTracker { provider, project, base_url, auth: None, tags: Vec::new() })
+    Some(ResolvedTracker {
+        provider,
+        project,
+        base_url,
+        auth: None,
+        authentication: TrackerAuthentication::AuthMissing,
+        tags: Vec::new(),
+    })
 }
 
 /// A self-hosted remote's authority is part of provider identity: both URL parsing and transport
@@ -273,8 +286,28 @@ mod tests {
             project: project.to_string(),
             base_url: None,
             auth: None,
+            authentication: TrackerAuthentication::AuthMissing,
             tags: Vec::new(),
         })
+    }
+
+    #[test]
+    fn resolved_binding_defers_token_commands_but_detects_missing_env() {
+        let binding = |command: &str| TrackerConfig {
+            provider: Tracker::Gitlab,
+            project: Some("group/repo".to_string()),
+            remote: "origin".to_string(),
+            base_url: None,
+            auth: Some(TrackerAuth::TokenCommand(command.to_string())),
+            tags: Vec::new(),
+        };
+        let root = Path::new(".");
+        let configured = resolve_trackers(&[binding("exit 3")], root);
+        assert_eq!(configured[0].authentication, TrackerAuthentication::AuthConfigured);
+        let mut missing_binding = binding("echo unused");
+        missing_binding.auth = Some(TrackerAuth::Env("RAG_RAT_TEST_UNSET_TOKEN_VAR".to_string()));
+        let missing = resolve_trackers(&[missing_binding], root);
+        assert_eq!(missing[0].authentication, TrackerAuthentication::AuthMissing);
     }
 
     #[test]
@@ -477,6 +510,7 @@ mod tests {
             project: "o/r".to_string(),
             base_url: None,
             auth: None,
+            authentication: TrackerAuthentication::AuthMissing,
             tags: tags.iter().map(|t| t.to_string()).collect(),
         }
     }

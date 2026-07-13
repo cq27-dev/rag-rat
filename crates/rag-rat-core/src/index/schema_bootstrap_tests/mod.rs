@@ -229,7 +229,7 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
 
 /// GitHub context for tests: the rag-rat repo itself, never the live `gh` CLI (#60).
 fn test_gh_ctx() -> papertrail::PapertrailContext {
-    papertrail::PapertrailContext::new(Some("cq27-dev/rag-rat"), false)
+    papertrail::PapertrailContext::new(Some("cq27-dev/rag-rat"))
 }
 
 /// Test-side bridge over the async sync entry point, mirroring the IndexDatabase boundary.

@@ -1728,7 +1728,7 @@ fn papertrail_sync_caches_rationale_without_query_time_crawling() {
     let mut db = IndexDatabase::rebuild(&config).unwrap();
     // Resolve the repo context explicitly so db.rationale_search("Fixes #42") qualifies the bare
     // ref without shelling out to `gh` (#60).
-    db.set_papertrail_context(Some("cq27-dev/rag-rat"), false);
+    db.set_papertrail_context(Some("cq27-dev/rag-rat"));
     let mock = MockGitHubClient;
 
     let offline = sync_from_refs_blocking::<MockGitHubClient>(

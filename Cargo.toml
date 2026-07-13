@@ -48,11 +48,16 @@ fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-
 # `rand`/`rand_core` pulled in for this), keeping `from_seed` the sole key constructor.
 getrandom = "0.3"
 gix = { version = "0.85.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
+httpdate = "1.0"
 libc = "0.2"
 # Separator-aware path→forward-slash conversion. Unlike a raw `\`→`/` replace, it only rewrites the
 # actual path SEPARATOR — so a literal backslash in a Unix filename is preserved. Used where a path
 # becomes a string for a non-filesystem consumer (a `node`/`npx` command arg, a TOML value).
 path-slash = "0.2"
+# Async HTTP for the papertrail provider clients (#589). rustls (no system OpenSSL), no default
+# features — the transport is driven on the papertrail module's private runtime at the sync
+# boundary, so nothing else in the tree grows an async dependency.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rmcp = { version = "1.8.0", features = ["transport-io"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rayon = "1.12"
@@ -68,9 +73,10 @@ sha2 = "0.11"
 stacker = "0.1"
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0"
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-std"] }
-# Minimal blocking HTTP for the crates.io version check (and future GitHub/GitLab/Bitbucket REST).
-# rustls (no system OpenSSL); gzip off — the responses are tiny. The only HTTP at the core edge.
+# `time` backs the papertrail transport's rate-limit backoff sleeps (tokio::time::sleep).
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-std", "time"] }
+# Minimal blocking HTTP for the crates.io version check. rustls (no system OpenSSL); gzip off —
+# the responses are tiny. Tracker REST traffic lives on `reqwest` (papertrail transport, #589).
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 # TOON (Token-Oriented Object Notation): the default render for CLI + MCP output. ~34% fewer tokens
 # than compact JSON on uniform-row payloads, neutral on nested ones — see rag_rat_core::output.

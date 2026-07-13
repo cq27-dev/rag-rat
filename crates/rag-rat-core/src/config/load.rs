@@ -266,7 +266,8 @@ impl Config {
         let memory = MemoryConfig::try_from(raw.memory)?;
         let trackers =
             raw.tracker.into_iter().map(TrackerConfig::try_from).collect::<Result<Vec<_>, _>>()?;
-        let papertrail = PapertrailConfig::default();
+        let papertrail =
+            raw.papertrail.map(PapertrailConfig::try_from).transpose()?.unwrap_or_default();
         let mut log = LogConfig::try_from(raw.log)?;
         // Finalize `dir`: empty (unset) → sibling of the db (`<db_parent>/logs`); a set value is
         // resolved relative to the GOVERNING config dir (absolute honored).
@@ -326,9 +327,6 @@ fn validate_raw(raw: RawConfig) -> Result<RawConfig, ConfigError> {
     }
     if raw.dream.is_some() {
         return Err(ConfigError::DreamTableMoved);
-    }
-    if raw.papertrail.is_some() {
-        return Err(ConfigError::PapertrailSchedulingNotSupported);
     }
     Ok(raw)
 }

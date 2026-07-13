@@ -19,6 +19,7 @@ x25519-dalek.workspace = true
 fastembed = { workspace = true, optional = true }
 getrandom.workspace = true
 gix.workspace = true
+httpdate.workspace = true
 ignore = "0.4.26"
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }
 notify = "8.2.0"
@@ -30,6 +31,7 @@ rusqlite.workspace = true
 # `protobuf` is scip's own transitive dep, pulled in directly so we can call `Message::parse_*`
 # on the generated SCIP types; pinned to the version scip 0.8 generates against.
 protobuf = "3.7"
+reqwest.workspace = true
 scip = "0.8.1"
 serde.workspace = true
 serde_json.workspace = true

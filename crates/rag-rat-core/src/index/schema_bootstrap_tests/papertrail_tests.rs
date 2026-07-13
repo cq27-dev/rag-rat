@@ -90,6 +90,27 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
     assert_eq!(live.synced_items, 5);
     assert_eq!(live.failed_refs, 0);
 
+    let gitlab_only_ctx = papertrail::PapertrailContext {
+        trackers: vec![papertrail::ResolvedTracker {
+            provider: papertrail::Tracker::Gitlab,
+            project: "group/repo".to_string(),
+            base_url: None,
+            auth: None,
+            authentication: papertrail::TrackerAuthentication::AuthMissing,
+            tags: Vec::new(),
+        }],
+    };
+    let explicit_without_github_binding = papertrail::block_on(papertrail::sync_issue(
+        db.storage.connection(),
+        "cq27-dev/rag-rat#43",
+        Some(&MockGitHubClient),
+        false,
+        &gitlab_only_ctx,
+    ))
+    .unwrap();
+    assert_eq!(explicit_without_github_binding.synced_items, 5);
+    assert_eq!(explicit_without_github_binding.failed_refs, 0);
+
     let offline = papertrail::block_on(papertrail::sync_issue::<MockGitHubClient>(
         db.storage.connection(),
         "cq27-dev/rag-rat#43",
@@ -139,7 +160,7 @@ fn rationale_lookup_keeps_self_contained_github_refs_without_a_binding() {
         &mut |_| {},
     ))
     .unwrap();
-    db.set_papertrail_context(None, false);
+    db.set_papertrail_context(None);
 
     let evidence = db.rationale_search("cq27-dev/rag-rat#42", 10).unwrap();
     assert!(
@@ -162,7 +183,8 @@ fn production_discovery_persists_refs_for_every_configured_tracker() {
                 provider: papertrail::Tracker::Gitlab,
                 project: "group/sub/repo".to_string(),
                 base_url: None,
-                auth: None,
+                auth: Some(crate::config::TrackerAuth::Env("GITLAB_TOKEN".to_string())),
+                authentication: papertrail::TrackerAuthentication::AuthConfigured,
                 tags: Vec::new(),
             },
             papertrail::ResolvedTracker {
@@ -170,14 +192,29 @@ fn production_discovery_persists_refs_for_every_configured_tracker() {
                 project: "PROJ".to_string(),
                 base_url: Some("https://example.atlassian.net".to_string()),
                 auth: None,
+                authentication: papertrail::TrackerAuthentication::AuthMissing,
                 tags: Vec::new(),
             },
         ],
-        github_cli_available: false,
     };
 
     sync_from_refs_blocking(db.storage.connection(), &root, Some(&MockGitHubClient), true, &ctx)
         .unwrap();
+
+    let status = papertrail::status(db.storage.connection(), &ctx).unwrap();
+    assert_eq!(status.capabilities.len(), 2);
+    assert_eq!(
+        status.capabilities[0].authentication,
+        papertrail::TrackerAuthentication::AuthConfigured
+    );
+    assert_eq!(
+        status.capabilities[0].synchronization,
+        papertrail::TrackerSynchronization::ProviderClientPending
+    );
+    assert_eq!(
+        status.capabilities[1].authentication,
+        papertrail::TrackerAuthentication::AuthMissing
+    );
 
     let refs = db.papertrail_refs_for_path("docs/search.md", 10).unwrap();
     assert!(refs.iter().any(|reference| {

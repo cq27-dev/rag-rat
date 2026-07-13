@@ -4,9 +4,14 @@ mod parse;
 mod store;
 mod sync;
 mod trackers;
+// Shared HTTP substrate for the native provider clients (#589): reqwest transport, per-
+// (provider, host, token) rate governor, env/token_command auth. `dead_code`/`unused_imports`
+// are allowed until the first native client consumes it (#591) — drop the allow there.
+#[allow(dead_code, unused_imports)]
+pub(crate) mod transport;
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 pub(crate) use api::*;
@@ -27,17 +32,14 @@ use crate::index::now_ms;
 /// Resolved tracker context, injected into the sync/query paths instead of being resolved inside
 /// the library. Resolution runs ONLY at the real-usage boundary (`IndexDatabase::open_config`)
 /// and never in tests, which pass an explicit context (#60): it reads local git state (the
-/// remote URL) plus a `gh --version` capability probe — the old `gh repo view` network shell-out
-/// is gone.
+/// remote URL). Authentication is carried per binding; there is no process-global `gh`
+/// capability bit.
 #[derive(Debug, Clone, Default)]
 pub struct PapertrailContext {
     /// Resolved tracker bindings, in config order (or the single auto-detected code host).
-    /// Production discovery and rationale lookup consume every binding. On the #588 stack the
-    /// network client remains GitHub-only; #589 supplies transport for parallel provider sync.
+    /// Production discovery and rationale lookup consume every binding. Live network sync remains
+    /// GitHub-only until the provider-client PRs build on [`transport`].
     pub trackers: Vec<ResolvedTracker>,
-    /// Whether the `gh` CLI is available (reported as a capability in status; the current
-    /// GitHub client still shells out to it until the native transport lands).
-    pub github_cli_available: bool,
 }
 
 impl PapertrailContext {
@@ -45,26 +47,24 @@ impl PapertrailContext {
     /// auto-detected from the git `origin` remote. Call ONLY at the real-usage boundary
     /// (open_config), never inside the library internals or tests.
     pub(crate) fn resolve(config: &crate::config::Config) -> Self {
-        Self {
-            trackers: resolve_trackers(&config.trackers, &config.root),
-            github_cli_available: github_cli_available(),
-        }
+        Self { trackers: resolve_trackers(&config.trackers, &config.root) }
     }
 
     /// An explicit GitHub-repo context that never touches git or `gh` — for tests and non-gh
     /// callers.
-    pub(crate) fn new(default_repo: Option<&str>, github_cli_available: bool) -> Self {
+    pub(crate) fn new(default_repo: Option<&str>) -> Self {
         let trackers = default_repo
             .map(|project| ResolvedTracker {
                 provider: Tracker::Github,
                 project: project.to_string(),
                 base_url: None,
                 auth: None,
+                authentication: TrackerAuthentication::AuthMissing,
                 tags: Vec::new(),
             })
             .into_iter()
             .collect();
-        Self { trackers, github_cli_available }
+        Self { trackers }
     }
 
     /// `owner/repo` qualifying a manually requested legacy GitHub reference. Production
@@ -84,7 +84,33 @@ pub struct PapertrailStatus {
     pub change_requests: u64,
     pub comments: u64,
     pub last_sync_ms: Option<i64>,
-    pub capability: String,
+    pub capabilities: Vec<TrackerCapability>,
+}
+
+/// Per-binding auth and live-sync capability. Environment auth reflects token presence; command
+/// auth reflects a configured source without running shell code on read paths. The transport
+/// resolves either source when a network client is built.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TrackerCapability {
+    pub tracker: Tracker,
+    pub project: String,
+    pub authentication: TrackerAuthentication,
+    pub synchronization: TrackerSynchronization,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackerAuthentication {
+    AuthConfigured,
+    AuthMissing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackerSynchronization {
+    LegacyGithubCli,
+    LegacyGithubCliMissing,
+    ProviderClientPending,
 }
 
 #[derive(Debug, Clone, Serialize)]

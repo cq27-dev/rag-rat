@@ -104,6 +104,6 @@ pub fn open_like_production(config: &Config) -> IndexDatabase {
     let mut db = IndexDatabase::open(&config.database).expect("open index");
     let (commit_sha, worktree_id) = rag_rat_core::index::resolve_git_context(&config.root);
     db.set_context(&commit_sha, &worktree_id).expect("install active-checkout scope");
-    db.set_papertrail_context(None, false);
+    db.set_papertrail_context(None);
     db
 }
