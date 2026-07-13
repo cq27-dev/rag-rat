@@ -74,9 +74,9 @@ pub fn description(name: &str) -> &'static str {
              (every hit 'lexical') when no embedding model is present.",
         "symbol_lookup" =>
             "Resolve a symbol name (or ref/id) to its definition(s) in Rust, TypeScript, Kotlin, \
-             C, C++, or Python — exact or fuzzy. Returns candidates with signatures, locations, \
-             logical-symbol grouping (cfg variants), and any bound repo memories. Use to \
-             disambiguate before a graph or read call. Generated bindings (codegen, ubrn FFI \
+             C, C++, Python, or Swift — exact or fuzzy. Returns candidates with signatures, \
+             locations, logical-symbol grouping (cfg variants), and any bound repo memories. Use \
+             to disambiguate before a graph or read call. Generated bindings (codegen, ubrn FFI \
              output) are excluded by default; pass include: [\"generated\"] to see them.",
         "find_callers" =>
             "Find what calls a symbol (reverse call graph), instead of grepping for call sites. \

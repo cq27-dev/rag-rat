@@ -1,7 +1,12 @@
-//! Rust graph-edge extraction — the `Language::Rust` arm of `syntactic_edges`. Walks the CST
-//! for calls/types/constructs/imports and the impl-header edges, and emits the dispatch facts
-//! through the sibling `rust_dispatch` module's entry points. Split out of edges/extract.
-use super::{rust_dispatch, *};
+//! Rust graph-edge extraction for the shared structural edge walk. It recognizes calls, types,
+//! constructions, imports, impl headers, and dispatch facts.
+use std::path::Path;
+
+use tree_sitter::Node;
+
+use super::dispatch;
+use crate::index::edges::extract::*;
+use crate::index::edges::*;
 
 pub(super) fn rust_edges(
     text: &str,
@@ -119,9 +124,9 @@ pub(super) fn rust_edges(
             // `crate`). `Foo::new()` / `T::CONST` are excluded (tail not PascalCase).
             if let Some(key) = node
                 .child_by_field_name("function")
-                .and_then(|f| rust_dispatch::enum_variant_key(f, text))
+                .and_then(|f| dispatch::enum_variant_key(f, text))
             {
-                out.push(rust_dispatch::dispatch_fact(
+                out.push(dispatch::dispatch_fact(
                     symbols,
                     node,
                     key,
@@ -134,11 +139,10 @@ pub(super) fn rust_edges(
         "struct_expression" =>
         // #200 dispatch construct fact: a struct enum-variant construction `Enum::Variant { .. }`.
         {
-            if let Some(key) = node
-                .child_by_field_name("name")
-                .and_then(|n| rust_dispatch::enum_variant_key(n, text))
+            if let Some(key) =
+                node.child_by_field_name("name").and_then(|n| dispatch::enum_variant_key(n, text))
             {
-                out.push(rust_dispatch::dispatch_fact(
+                out.push(dispatch::dispatch_fact(
                     symbols,
                     node,
                     key,
@@ -157,10 +161,10 @@ pub(super) fn rust_edges(
         // variant whose head is a unique in-scope `enum`, so a non-enum head never yields a
         // `dispatches` edge.
         {
-            if rust_dispatch::scoped_identifier_in_value_position(node)
-                && let Some(key) = rust_dispatch::enum_variant_key(node, text)
+            if dispatch::scoped_identifier_in_value_position(node)
+                && let Some(key) = dispatch::enum_variant_key(node, text)
             {
-                out.push(rust_dispatch::dispatch_fact(
+                out.push(dispatch::dispatch_fact(
                     symbols,
                     node,
                     key,
@@ -170,7 +174,7 @@ pub(super) fn rust_edges(
                 ));
             }
         },
-        "match_arm" => rust_dispatch::rust_dispatch_handle_facts(text, node, symbols, out),
+        "match_arm" => dispatch::rust_dispatch_handle_facts(text, node, symbols, out),
         "macro_invocation" =>
             if let Some(name) = first_identifier_text(node, text) {
                 out.push(symbol_edge_with_context(

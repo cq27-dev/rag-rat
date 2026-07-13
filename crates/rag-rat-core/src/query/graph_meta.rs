@@ -261,7 +261,8 @@ fn count_callers(conn: &Connection, symbol: &PrimarySymbol) -> anyhow::Result<u6
         SELECT COUNT(DISTINCT COALESCE(edges.from_symbol_id, -edges.id))
         FROM edges
         JOIN files source_files ON source_files.id = edges.source_file_id
-        WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_macro')
+        WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_operator', 'uses_macro')
+          AND (edges.edge_kind != 'uses_operator' OR edges.to_symbol_id IS NOT NULL)
           AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name_id = \
              (SELECT id FROM name_strings WHERE value = ?2)))
         ",
@@ -279,11 +280,15 @@ fn count_callees(conn: &Connection, symbol_id: i64) -> anyhow::Result<u64> {
         SELECT COUNT(DISTINCT COALESCE(CAST(to_symbol_id AS TEXT), to_name))
         FROM edges
         WHERE from_symbol_id = ?1
-          AND edge_kind IN ('calls_name', 'constructs', 'uses_macro')
+          AND edge_kind IN ('calls_name', 'constructs', 'uses_operator', 'uses_macro')
           AND (
               edge_kind != 'calls_name'
               OR to_symbol_id IS NOT NULL
               OR (confidence = 'Syntactic' AND target_qualified_name IS NOT NULL)
+          )
+          AND (
+              edge_kind != 'uses_operator'
+              OR to_symbol_id IS NOT NULL
           )
         ",
         )?
@@ -365,7 +370,8 @@ fn callers(
         LEFT JOIN chunks source_chunks ON source_chunks.file_id = edges.source_file_id
           AND source_symbols.start_byte >= source_chunks.start_byte
           AND source_symbols.start_byte < source_chunks.end_byte
-        WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_macro')
+        WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_operator', 'uses_macro')
+          AND (edges.edge_kind != 'uses_operator' OR edges.to_symbol_id IS NOT NULL)
           AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name_id = \
          (SELECT id FROM name_strings WHERE value = ?2)))
         ORDER BY
@@ -434,14 +440,18 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
           AND source_symbols.start_byte >= source_chunks.start_byte
           AND source_symbols.start_byte < source_chunks.end_byte
         WHERE edges.from_symbol_id = ?1
-          AND edges.edge_kind IN ('calls_name', 'constructs', 'uses_macro')
-          -- Drop unresolved name-only calls (`.map()`, `.var_os()`, std combinators): they
-          -- resolve to nothing in-repo and are pure noise in a chunk's callee summary. Keep
-          -- resolved calls and syntactically-resolvable ones, plus constructs/macros.
+          AND edges.edge_kind IN ('calls_name', 'constructs', 'uses_operator', 'uses_macro')
+          -- Drop unresolved name-only calls and operator declarations: they resolve to nothing
+          -- in-repo and are pure noise in a chunk's callee summary. Calls may retain qualified
+          -- syntactic targets; operator declarations must resolve to an indexed symbol.
           AND (
               edges.edge_kind != 'calls_name'
               OR edges.to_symbol_id IS NOT NULL
               OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
+          )
+          AND (
+              edges.edge_kind != 'uses_operator'
+              OR edges.to_symbol_id IS NOT NULL
           )
         ORDER BY
           CASE edges.confidence

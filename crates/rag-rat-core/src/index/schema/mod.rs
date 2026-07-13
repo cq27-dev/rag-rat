@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 67;
+pub const LATEST_SCHEMA_VERSION: u32 = 68;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -467,6 +467,11 @@ const MIGRATION_067_CHECKSUM: &str = "sha256:rag-rat-papertrail-binding-health-v
 const MIGRATION_067_DESCRIPTION: &str = "Persist per-binding attempt, successful probe/mirror, \
                                          and closed failure state for automatic scheduling and \
                                          status";
+const MIGRATION_068_ID: &str = "068_suppressed_edge_candidates";
+const MIGRATION_068_CHECKSUM: &str = "sha256:rag-rat-suppressed-edge-candidates-v68";
+const MIGRATION_068_DESCRIPTION: &str = "Hide suppressed unresolved edge candidates from the \
+                                         compatibility view while retaining them for later \
+                                         incremental re-resolution";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -765,7 +770,7 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         id: MIGRATION_023_ID,
         checksum: MIGRATION_023_CHECKSUM,
         description: MIGRATION_023_DESCRIPTION,
-        apply: apply_dispatch_edge_facts_view_exclusion,
+        apply: apply_edges_view_refresh,
     },
     Migration {
         id: MIGRATION_024_ID,
@@ -1030,6 +1035,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_067_CHECKSUM,
         description: MIGRATION_067_DESCRIPTION,
         apply: apply_papertrail_binding_health,
+    },
+    Migration {
+        id: MIGRATION_068_ID,
+        checksum: MIGRATION_068_CHECKSUM,
+        description: MIGRATION_068_DESCRIPTION,
+        apply: apply_edges_view_refresh,
     },
 ];
 

@@ -11,7 +11,7 @@ use super::*;
 /// stale-but-matching stamp would let the fast path serve mixed-code counts). A version mismatch
 /// instead correctly forces the slow recompute. See the freshness-model Risk memory bound to this
 /// file.
-pub(crate) const EMBEDDING_POLICY_VERSION: &str = "255dcc2c31e35a19";
+pub(crate) const EMBEDDING_POLICY_VERSION: &str = "aa8d3ccc14daf73c";
 
 /// `repo_meta` keys carrying the embedding-policy freshness stamp a full rebuild writes
 /// (`mark_embedding_policy_current`). PER-REPO, not the DB-global `index_meta`: one database can
@@ -308,36 +308,10 @@ fn span_is_plumbing(
     })
 }
 
-/// A top-level node carrying no embed-worthy signal: a comment, or a per-language import/include /
-/// package / docstring / `pass`. NOT a definition-introducing form (a C `#define` macro, a Rust
-/// `mod`, a Python `def`/`class`) — those are symbols and must keep their embedding.
+/// A top-level node carrying no embed-worthy signal according to its structural language package.
+/// Definition-introducing forms remain signal and keep their embedding.
 fn is_plumbing_node(language: Language, node: tree_sitter::Node<'_>) -> bool {
-    let kind = node.kind();
-    if kind.contains("comment") {
-        return true;
-    }
-    match language {
-        Language::Rust => kind == "use_declaration",
-        Language::TypeScript => kind == "import_statement",
-        Language::Kotlin => matches!(kind, "import_header" | "package_header"),
-        Language::C | Language::Cpp => kind == "preproc_include",
-        Language::Python =>
-            matches!(
-                kind,
-                "import_statement"
-                    | "import_from_statement"
-                    | "future_import_statement"
-                    | "pass_statement"
-            ) || is_python_docstring_statement(node),
-        Language::Markdown => true,
-    }
-}
-
-/// A Python bare docstring: an `expression_statement` whose sole child is a string literal.
-fn is_python_docstring_statement(node: tree_sitter::Node<'_>) -> bool {
-    node.kind() == "expression_statement"
-        && node.named_child_count() == 1
-        && node.named_child(0).is_some_and(|child| child.kind() == "string")
+    crate::index::languages::is_plumbing_node(language, node)
 }
 
 #[cfg(test)]
@@ -721,6 +695,15 @@ mod policy_version_tests {
                  comment line here now goes on\n",
                 "def real_function(input):\n    value = input + 1\n    result = value + \
                  compute(value)\n    return result\n",
+            ),
+            (
+                "swift",
+                "s.swift",
+                Language::Swift,
+                "import Foundation\nimport Dispatch\n// a descriptive comment line here now goes \
+                 on long enough\nimport Observation\n",
+                "func realFunction(_ input: Int) -> Int {\n    let value = input + 1\n    return \
+                 value + compute(value)\n}\n",
             ),
         ];
         for (label, path, language, plumbing, def) in span_cases {

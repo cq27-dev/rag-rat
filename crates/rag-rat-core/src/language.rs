@@ -6,6 +6,7 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[repr(u8)]
 pub enum Language {
     Rust,
     TypeScript,
@@ -13,17 +14,96 @@ pub enum Language {
     C,
     Cpp,
     Python,
+    Swift,
     Markdown,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LanguageSpec {
+    language: Language,
+    name: &'static str,
+    aliases: &'static [&'static str],
+    simple_extensions: &'static [&'static str],
+    target_extensions: &'static [&'static str],
+    supports_embeddings: bool,
+}
+
+const LANGUAGE_SPECS: [LanguageSpec; 8] = [
+    LanguageSpec {
+        language: Language::Rust,
+        name: "rust",
+        aliases: &["rs"],
+        simple_extensions: &["rs"],
+        target_extensions: &["rs"],
+        supports_embeddings: true,
+    },
+    LanguageSpec {
+        language: Language::TypeScript,
+        name: "typescript",
+        aliases: &["ts", "tsx"],
+        simple_extensions: &["ts", "tsx"],
+        target_extensions: &["ts", "tsx"],
+        supports_embeddings: true,
+    },
+    LanguageSpec {
+        language: Language::Kotlin,
+        name: "kotlin",
+        aliases: &["kt"],
+        simple_extensions: &["kt", "kts"],
+        target_extensions: &["kt", "kts"],
+        supports_embeddings: true,
+    },
+    LanguageSpec {
+        language: Language::C,
+        name: "c",
+        aliases: &[],
+        simple_extensions: &["c", "h"],
+        target_extensions: &["c", "h"],
+        supports_embeddings: true,
+    },
+    LanguageSpec {
+        language: Language::Cpp,
+        name: "cpp",
+        aliases: &["c++", "cc", "cxx"],
+        simple_extensions: &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++"],
+        target_extensions: &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "h"],
+        supports_embeddings: true,
+    },
+    LanguageSpec {
+        language: Language::Python,
+        name: "python",
+        aliases: &["py"],
+        simple_extensions: &["py", "pyi"],
+        target_extensions: &["py", "pyi"],
+        supports_embeddings: true,
+    },
+    LanguageSpec {
+        language: Language::Swift,
+        name: "swift",
+        aliases: &[],
+        simple_extensions: &["swift"],
+        target_extensions: &["swift"],
+        supports_embeddings: true,
+    },
+    LanguageSpec {
+        language: Language::Markdown,
+        name: "markdown",
+        aliases: &["md"],
+        simple_extensions: &["md", "markdown"],
+        target_extensions: &["md", "markdown"],
+        supports_embeddings: true,
+    },
+];
+
 impl Language {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Rust,
         Self::TypeScript,
         Self::Kotlin,
         Self::C,
         Self::Cpp,
         Self::Python,
+        Self::Swift,
         Self::Markdown,
     ];
 
@@ -32,15 +112,7 @@ impl Language {
     }
 
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Rust => "rust",
-            Self::TypeScript => "typescript",
-            Self::Kotlin => "kotlin",
-            Self::C => "c",
-            Self::Cpp => "cpp",
-            Self::Python => "python",
-            Self::Markdown => "markdown",
-        }
+        self.spec().name
     }
 
     /// Extensions used for **bare** language detection ([`Self::from_path`]) — the unambiguous
@@ -48,15 +120,7 @@ impl Language {
     /// default for the ambiguous C/C++ header); an explicit `cpp` binding upgrades it via
     /// [`Self::target_extensions`].
     pub fn simple_extensions(self) -> &'static [&'static str] {
-        match self {
-            Self::Rust => &["rs"],
-            Self::TypeScript => &["ts", "tsx"],
-            Self::Kotlin => &["kt", "kts"],
-            Self::C => &["c", "h"],
-            Self::Cpp => &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++"],
-            Self::Python => &["py", "pyi"],
-            Self::Markdown => &["md", "markdown"],
-        }
+        self.spec().simple_extensions
     }
 
     /// Extensions an **explicit** target/binding of this language claims for indexing. Identical to
@@ -66,10 +130,7 @@ impl Language {
     /// `.h` files — most of them — gets no header symbols, so cross-file calls resolve to
     /// nothing).
     pub fn target_extensions(self) -> &'static [&'static str] {
-        match self {
-            Self::Cpp => &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "h"],
-            _ => self.simple_extensions(),
-        }
+        self.spec().target_extensions
     }
 
     /// Whether an explicit target of this language claims a file with this extension (see
@@ -103,21 +164,16 @@ impl Language {
     }
 
     pub fn supports_embeddings(self) -> bool {
-        matches!(
-            self,
-            Self::Rust
-                | Self::TypeScript
-                | Self::Kotlin
-                | Self::C
-                | Self::Cpp
-                | Self::Python
-                | Self::Markdown
-        )
+        self.spec().supports_embeddings
     }
 
     pub fn from_path(path: &std::path::Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?;
         Self::all().iter().copied().find(|language| language.simple_extensions().contains(&ext))
+    }
+
+    fn spec(self) -> &'static LanguageSpec {
+        &LANGUAGE_SPECS[self as usize]
     }
 }
 
@@ -131,16 +187,12 @@ impl FromStr for Language {
     type Err = LanguageError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "rust" | "rs" => Ok(Self::Rust),
-            "typescript" | "ts" | "tsx" => Ok(Self::TypeScript),
-            "kotlin" | "kt" => Ok(Self::Kotlin),
-            "c" => Ok(Self::C),
-            "cpp" | "c++" | "cc" | "cxx" => Ok(Self::Cpp),
-            "python" | "py" => Ok(Self::Python),
-            "markdown" | "md" => Ok(Self::Markdown),
-            other => Err(LanguageError::Unknown(other.to_string())),
-        }
+        let normalized = value.trim().to_ascii_lowercase();
+        LANGUAGE_SPECS
+            .iter()
+            .find(|spec| spec.name == normalized || spec.aliases.contains(&normalized.as_str()))
+            .map(|spec| spec.language)
+            .ok_or(LanguageError::Unknown(normalized))
     }
 }
 
@@ -152,9 +204,38 @@ pub enum LanguageError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::Path;
+    use std::str::FromStr;
 
-    use super::Language;
+    use super::{LANGUAGE_SPECS, Language};
+
+    #[test]
+    fn language_registry_is_complete_unique_and_round_trips_every_name() {
+        assert_eq!(
+            LANGUAGE_SPECS.iter().map(|spec| spec.language).collect::<Vec<_>>(),
+            Language::all()
+        );
+        let mut names = HashSet::new();
+        for spec in LANGUAGE_SPECS {
+            assert_eq!(
+                spec.language.as_str(),
+                spec.name,
+                "Language discriminant/spec order drifted"
+            );
+            assert!(names.insert(spec.name), "duplicate canonical language name: {}", spec.name);
+            assert_eq!(Language::from_str(spec.name).unwrap(), spec.language);
+            for alias in spec.aliases {
+                assert!(names.insert(alias), "duplicate language name or alias: {alias}");
+                assert_eq!(Language::from_str(alias).unwrap(), spec.language);
+            }
+            assert!(
+                spec.simple_extensions.iter().all(|ext| spec.target_extensions.contains(ext)),
+                "target extensions must include every simple extension for {}",
+                spec.name
+            );
+        }
+    }
 
     #[test]
     fn bare_detection_resolves_h_to_c_not_cpp() {
@@ -162,6 +243,7 @@ mod tests {
         assert_eq!(Language::from_path(Path::new("a/b.h")), Some(Language::C));
         assert_eq!(Language::from_path(Path::new("a/b.cpp")), Some(Language::Cpp));
         assert_eq!(Language::from_path(Path::new("a/b.rs")), Some(Language::Rust));
+        assert_eq!(Language::from_path(Path::new("a/b.swift")), Some(Language::Swift));
         assert_eq!(Language::from_path(Path::new("a/README")), None);
     }
 

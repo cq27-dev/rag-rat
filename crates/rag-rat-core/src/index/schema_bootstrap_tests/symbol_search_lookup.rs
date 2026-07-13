@@ -60,11 +60,20 @@ fn search_and_read_chunk_attach_bounded_graph_evidence() {
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("src/lib.rs"),
-        "pub fn helper() {}\n\npub fn caller() {\n    helper();\n}\n",
+        "pub fn helper() {}\n\npub fn caller() {\n    helper();\n}\n\npub fn operator_noise() {}\n",
     )
     .unwrap();
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO edges(source_file_id, from_symbol_id, to_name, edge_kind, confidence, \
+             resolution) SELECT file_id, id, 'helper', 'uses_operator', 'NameOnly', 'unresolved' \
+             FROM symbols WHERE name = 'operator_noise'",
+            [],
+        )
+        .unwrap();
 
     let hits = db.search("helper caller", 10, false).unwrap();
     let helper_hit = hits
@@ -79,6 +88,10 @@ fn search_and_read_chunk_attach_bounded_graph_evidence() {
             && caller.callsite.span == [4, 4]
             && caller.confidence == "syntactic"
     }));
+    assert!(
+        helper_graph.top_callers.iter().all(|caller| caller.edge_kind != "uses_operator"),
+        "unresolved operator uses must not fall back to a same-named symbol: {helper_graph:#?}"
+    );
     assert!(helper_graph.callers.is_empty(), "search keeps graph compact");
 
     let caller_hit = hits
@@ -459,6 +472,225 @@ export const callRun = () => run();
         }),
         "callRun callees: {callees:?}"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn indexes_swift_symbols_chunks_and_graph_edges_end_to_end() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let source = r#"
+import Foundation
+
+protocol Worker<Element> {}
+
+@propertyWrapper
+struct Wrapper<Value> {
+    var wrappedValue: Value
+}
+
+struct Service {}
+struct Client {}
+struct T {}
+struct Vector {}
+
+@Observable struct Model {}
+@available(*, deprecated) struct LegacyModel {}
+
+enum Status { case idle }
+precedencegroup BasePrecedence {}
+precedencegroup SecondaryPrecedence {}
+precedencegroup MergePrecedence {
+    higherThan: BasePrecedence,
+        SecondaryPrecedence
+}
+infix operator <+>: MergePrecedence
+func <+>(lhs: Int, rhs: Int) -> Int { lhs + rhs }
+func +(lhs: Vector, rhs: Vector) -> Vector { lhs }
+
+func helper() {}
+func identity<T>(_ value: T) -> T { value }
+
+struct Runner: Worker<Service> {
+    @Wrapper var count: Int = 0
+
+    func fetch(_ id: Int) -> Int { id }
+    func fetch(_ name: String) -> Int { name.count }
+
+    func run() {
+        let client = Client()
+        let state = Status.idle
+        let next: Status = .idle
+        let merged = 1 <+> 2
+        helper()
+    }
+}
+"#;
+    fs::write(
+        root.join("src/Macros.swift"),
+        "@attached(member) macro Observable() = #externalMacro(module: \"Macros\", type: \
+         \"ObservableMacro\")\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/App.swift"), source).unwrap();
+    let config = source_config(root.clone(), Language::Swift);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let conn = db.storage.connection();
+    let property_names = |name: &str| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM symbols WHERE kind = 'property' AND name = ?1",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(property_names("count"), 1, "property wrapper must not replace the property name");
+    assert_eq!(property_names("Wrapper"), 0, "wrapper type must not become the property name");
+
+    let overloads = conn
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT signature) FROM symbols WHERE name = 'fetch'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(overloads, (2, 2), "overloads must retain distinct symbol rows and signatures");
+    let overload_chunks = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chunks WHERE chunk_kind = 'code' AND symbol_path LIKE '%::fetch'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(overload_chunks, 2, "each overload must retain its structural chunk");
+
+    assert_edge(&db, "src/App.swift", "Foundation", "imports", "NameOnly");
+    assert_edge(&db, "Runner", "Worker", "implements", "Syntactic");
+    assert_edge(&db, "Runner", "run", "contains", "Exact");
+    assert_edge(&db, "run", "Client", "constructs", "Syntactic");
+    assert_edge(&db, "run", "idle", "calls_name", "Exact");
+    assert_edge(&db, "run", "idle", "calls_name", "Syntactic");
+    assert_edge(&db, "run", "<+>", "calls_name", "Syntactic");
+    assert_edge(&db, "run", "<+>", "uses_operator", "Syntactic");
+    assert_edge(&db, "<+>", "MergePrecedence", "uses_precedence_group", "Syntactic");
+    assert_edge(&db, "MergePrecedence", "BasePrecedence", "uses_precedence_group", "Syntactic");
+    assert_edge(
+        &db,
+        "MergePrecedence",
+        "SecondaryPrecedence",
+        "uses_precedence_group",
+        "Syntactic",
+    );
+    assert_edge(&db, "run", "helper", "calls_name", "Syntactic");
+    assert_edge(&db, "src/App.swift", "Observable", "uses_macro", "Syntactic");
+    assert_edge(&db, "src/App.swift", "Wrapper", "references_type", "Syntactic");
+    let false_attribute_macros = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_kind = 'uses_macro' AND to_name IN \
+             ('available', 'attached', 'externalMacro')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(false_attribute_macros, 0, "unresolved attributes and compiler hooks are omitted");
+    let false_attribute_types = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_kind = 'references_type' AND to_name IN \
+             ('available', 'attached', 'externalMacro')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(false_attribute_types, 0, "unresolved attribute type candidates are omitted");
+    for (edge_kind, target_kind) in [("calls_name", "function"), ("uses_operator", "operator")] {
+        let resolved_kind = conn
+            .query_row(
+                "
+                SELECT symbols.kind
+                FROM edges
+                JOIN symbols ON symbols.id = edges.to_symbol_id
+                WHERE edges.edge_kind = ?1
+                  AND edges.to_name = '<+>'
+                  AND edges.from_name LIKE '%run%'
+                ",
+                [edge_kind],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved_kind, target_kind,
+            "operator calls and declaration uses must resolve independently"
+        );
+    }
+    let operator_function_id = conn
+        .query_row("SELECT id FROM symbols WHERE name = '<+>' AND kind = 'function'", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    for resolution_mode in [
+        crate::query::graph::GraphResolutionMode::Exact,
+        crate::query::graph::GraphResolutionMode::Syntactic,
+    ] {
+        let callees = db
+            .trace_callees_with_options("<+>", 20, &crate::query::graph::GraphTraversalOptions {
+                resolution_mode,
+                symbol_id: Some(operator_function_id),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            callees.iter().all(|edge| {
+                edge.edge_kind != "uses_operator" || edge.target.as_deref() != Some("+")
+            }),
+            "unresolved built-in operators must stay out of {resolution_mode:?} traversal: \
+             {callees:?}"
+        );
+    }
+    let resolved_builtin_operator_calls = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_kind = 'calls_name' AND to_name = '+' AND \
+             to_symbol_id IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(
+        resolved_builtin_operator_calls, 0,
+        "built-in operator syntax must not bind to a same-named local overload"
+    );
+    let generic_type_false_positives = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_kind = 'references_type' AND to_name = 'T'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(
+        generic_type_false_positives, 0,
+        "generic parameter uses must not resolve to the nominal type T"
+    );
+    let false_conformances = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_kind = 'implements' AND to_name = 'Service'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(false_conformances, 0, "generic arguments must not become conformances");
+
+    for callee in ["Client", "helper"] {
+        let (start, end) = callee_byte_range(
+            &db,
+            "run",
+            callee,
+            if callee == "Client" { "constructs" } else { "calls_name" },
+        )
+        .unwrap_or_else(|| panic!("missing persisted callee range for {callee}"));
+        assert_eq!(&source[start as usize..end as usize], callee);
+    }
 
     let _ = fs::remove_dir_all(root);
 }

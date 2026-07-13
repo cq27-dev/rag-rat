@@ -782,10 +782,10 @@ pub(crate) fn ensure_edges_data_indexes(conn: &Connection) -> rusqlite::Result<(
 /// `last_insert_rowid()` REVERTS after an INSTEAD OF trigger ends — an insert through the view
 /// cannot read back the new edge id that way. The production insert paths write `edges_data`
 /// directly with interned ids for this reason (and for bulk speed).
-/// V023 (#200): recreate the `edges` compatibility view so its definition excludes the internal
-/// dispatch FACT rows. `ensure_edges_view` is idempotent (DROP + CREATE), so this simply rebuilds
-/// the view with the new body on an existing index; the underlying `edges_data` rows are untouched.
-pub(crate) fn apply_dispatch_edge_facts_view_exclusion(conn: &Connection) -> rusqlite::Result<()> {
+/// Recreate the `edges` compatibility view after a migration changes which persisted candidates
+/// are public graph edges. `ensure_edges_view` is idempotent (DROP + CREATE), and the underlying
+/// `edges_data` rows remain available to internal indexing passes.
+pub(crate) fn apply_edges_view_refresh(conn: &Connection) -> rusqlite::Result<()> {
     ensure_edges_view(conn)
 }
 
@@ -978,6 +978,9 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
         -- planner keeps the indexed-id predicates, not a value-join string compare.
         WHERE d.edge_kind_id NOT IN (
             SELECT id FROM name_strings WHERE value IN ('dispatch_construct', 'dispatch_handle')
+        )
+        AND d.resolution_id NOT IN (
+            SELECT id FROM name_strings WHERE value = 'suppressed'
         );
 
         -- Interning per column: `INSERT OR IGNORE` + `value NOT NULL` means a NULL string is
@@ -1262,6 +1265,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_065_ID => Some(65),
             MIGRATION_066_ID => Some(66),
             MIGRATION_067_ID => Some(67),
+            MIGRATION_068_ID => Some(68),
             _ => None,
         })
         .max()
@@ -1338,6 +1342,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_065_ID
             | MIGRATION_066_ID
             | MIGRATION_067_ID
+            | MIGRATION_068_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1411,6 +1416,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_065_ID => migration.checksum != MIGRATION_065_CHECKSUM,
         MIGRATION_066_ID => migration.checksum != MIGRATION_066_CHECKSUM,
         MIGRATION_067_ID => migration.checksum != MIGRATION_067_CHECKSUM,
+        MIGRATION_068_ID => migration.checksum != MIGRATION_068_CHECKSUM,
         _ => false,
     }
 }

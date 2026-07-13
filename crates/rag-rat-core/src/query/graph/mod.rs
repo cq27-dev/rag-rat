@@ -7,20 +7,22 @@ use rusqlite::{Connection, params_from_iter};
 use serde::Serialize;
 pub(crate) use traverse::*;
 
-// `dispatches` (#200) rides with the call kinds so find_callers/trace_callees surface the
-// construct→handler dispatch hop by default — it is exactly the missing call-graph signal. The
+// `dispatches` (#200) and `uses_operator` ride with the call kinds so graph traversal surfaces the
+// synthesized handler hop and an operator declaration alongside its callable implementation. The
 // internal `dispatch_construct`/`dispatch_handle` FACT kinds are deliberately absent from every
 // set.
-const CALL_EDGE_KINDS: &[&str] = &["calls_name", "constructs", "dispatches"];
+const CALL_EDGE_KINDS: &[&str] = &["calls_name", "constructs", "dispatches", "uses_operator"];
 const MACRO_EDGE_KINDS: &[&str] = &["uses_macro"];
 const REFERENCE_EDGE_KINDS: &[&str] =
-    &["references_type", "imports", "exports", "contains", "implements"];
+    &["references_type", "uses_precedence_group", "imports", "exports", "contains", "implements"];
 const OPTIONAL_EDGE_KINDS: &[&str] = &[
     "calls_name",
     "constructs",
     "dispatches",
+    "uses_operator",
     "uses_macro",
     "references_type",
+    "uses_precedence_group",
     "imports",
     "exports",
     "contains",

@@ -1,6 +1,10 @@
-//! C / C++ graph-edge extraction — the `Language::C | Language::Cpp` arm of `syntactic_edges`.
-//! Split out of edges/extract.
-use super::*;
+//! C and C++ graph-edge extraction for the shared structural edge walk.
+use std::path::Path;
+
+use tree_sitter::Node;
+
+use crate::index::edges::extract::*;
+use crate::index::edges::*;
 
 pub(super) fn c_like_edges(
     text: &str,

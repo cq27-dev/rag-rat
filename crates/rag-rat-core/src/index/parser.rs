@@ -194,7 +194,7 @@ pub struct ParsedSymbolFact {
     pub value: String,
 }
 
-const NAME_KINDS: &[&str] = &[
+pub(super) const NAME_KINDS: &[&str] = &[
     "identifier",
     "type_identifier",
     "property_identifier",
@@ -212,24 +212,12 @@ pub enum ParserKind {
     C,
     Cpp,
     Python,
+    Swift,
     Markdown,
 }
 
 pub fn parser_kind(path: &Path, language: Language) -> ParserKind {
-    match language {
-        Language::Rust => ParserKind::Rust,
-        Language::TypeScript =>
-            if path.extension().and_then(|ext| ext.to_str()) == Some("tsx") {
-                ParserKind::Tsx
-            } else {
-                ParserKind::TypeScript
-            },
-        Language::Kotlin => ParserKind::Kotlin,
-        Language::C => ParserKind::C,
-        Language::Cpp => ParserKind::Cpp,
-        Language::Python => ParserKind::Python,
-        Language::Markdown => ParserKind::Markdown,
-    }
+    crate::index::languages::parser_backend(language).parser_kind(path)
 }
 
 const PARSE_ERROR_MESSAGE: &str =
@@ -247,6 +235,7 @@ pub(crate) fn grammar_for(kind: ParserKind) -> Option<tree_sitter::Language> {
         ParserKind::C => tree_sitter_c::LANGUAGE.into(),
         ParserKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         ParserKind::Python => tree_sitter_python::LANGUAGE.into(),
+        ParserKind::Swift => tree_sitter_swift::LANGUAGE.into(),
         ParserKind::Markdown => return None,
     })
 }
@@ -315,23 +304,34 @@ fn collect_symbols(
     root: Node<'_>,
     out: &mut Vec<ParsedSymbol>,
 ) {
+    let backend = crate::index::languages::parser_backend(language);
+    let context = SymbolBuildContext { path, backend, text };
     let mut stack = vec![root];
     let mut cursor = root.walk();
     let mut named_children = Vec::new();
     while let Some(node) = stack.pop() {
-        if node.is_error() || node.is_missing() {
+        if node.is_error() {
+            backend.for_each_recovered_symbol(node, text, &mut |span_node, (kind, name_node)| {
+                let name = backend.symbol_name(node, name_node, text);
+                if !name.is_empty() {
+                    out.push(make_symbol(&context, span_node, node, kind, name));
+                }
+            });
             continue;
         }
-        if let Some((kind, name_node)) = symbol_node(language, node, text) {
-            let name = node_text(name_node, text).unwrap_or_default();
-            if !name.is_empty() {
-                // The span (chunk/embedding) is the matched `node`; the SIGNATURE is read from the
-                // declaration node, which differs for a decorated Python def (the span starts at
-                // the decorator, but the signature must be the `def`/`class` line).
-                let signature_node = signature_source_node(language, node);
-                out.push(make_symbol(path, language, text, node, signature_node, kind, name));
-            }
+        if node.is_missing() {
+            continue;
         }
+        backend.for_each_symbol(node, text, &mut |span_node, (kind, name_node)| {
+            let name = backend.symbol_name(node, name_node, text);
+            if !name.is_empty() {
+                // The span (chunk/embedding) is the backend-selected `span_node`; the SIGNATURE is
+                // read from the declaration node. Those differ for decorated Python definitions
+                // and for each binding in a multi-property Swift declaration.
+                let signature_node = backend.signature_source_node(node);
+                out.push(make_symbol(&context, span_node, signature_node, kind, name));
+            }
+        });
         named_children.clear();
         named_children.extend(node.named_children(&mut cursor));
         for &child in named_children.iter().rev() {
@@ -340,140 +340,7 @@ fn collect_symbols(
     }
 }
 
-fn symbol_node<'a>(
-    language: Language,
-    node: Node<'a>,
-    text: &str,
-) -> Option<(&'static str, Node<'a>)> {
-    let kind = node.kind();
-    match language {
-        Language::Rust => match kind {
-            "function_item" => Some(("function", child_name(node)?)),
-            "struct_item" => Some(("struct", child_name(node)?)),
-            "enum_item" => Some(("enum", child_name(node)?)),
-            "trait_item" => Some(("trait", child_name(node)?)),
-            "impl_item" => Some(("impl", impl_name(node).unwrap_or(node))),
-            "mod_item" => Some(("module", child_name(node)?)),
-            "const_item" => Some(("const", child_name(node)?)),
-            "static_item" => Some(("static", child_name(node)?)),
-            "type_item" => Some(("type", child_name(node)?)),
-            "macro_definition" => Some(("macro", child_name(node)?)),
-            _ => None,
-        },
-        Language::TypeScript => match kind {
-            "function_declaration" | "method_definition" | "generator_function_declaration" =>
-                Some(("function", child_name(node)?)),
-            "class_declaration" => Some(("class", child_name(node)?)),
-            "interface_declaration" => Some(("interface", child_name(node)?)),
-            "type_alias_declaration" => Some(("type", child_name(node)?)),
-            "variable_declarator" | "public_field_definition" => Some(("const", child_name(node)?)),
-            _ => None,
-        },
-        Language::Kotlin => match kind {
-            "class_declaration" => Some(("class", child_name(node)?)),
-            "object_declaration" => Some(("object", child_name(node)?)),
-            "function_declaration" => Some(("function", child_name(node)?)),
-            "property_declaration" => Some(("property", kotlin_property_name(node)?)),
-            "companion_object" | "companion_object_declaration" =>
-                Some(("object", companion_name(node).unwrap_or(node))),
-            _ => None,
-        },
-        // C/C++ index DEFINITIONS, not bare declarations. A function prototype (`int foo(void);`,
-        // a `declaration` with a `function_declarator`) and a bodyless type specifier — a forward
-        // declaration (`struct X;`) or a use (`struct X *p`) — are NOT definitions, so they are not
-        // emitted as symbols. Indexing them made `references_type` edges bind to a tiny
-        // forward-decl/use occurrence instead of the real definition (#61: 18% type precision, vs
-        // 85% for calls). `has_body` distinguishes a definition (`struct X { … }`) from the rest.
-        Language::C => match kind {
-            "function_definition" =>
-                Some(("function", function_name(node).or_else(|| child_name(node))?)),
-            "struct_specifier" if has_body(node) => Some(("struct", child_name(node)?)),
-            "union_specifier" if has_body(node) => Some(("union", child_name(node)?)),
-            "enum_specifier" if has_body(node) => Some(("enum", child_name(node)?)),
-            "type_definition" => Some(("type", child_name(node)?)),
-            "preproc_function_def" => Some(("macro", child_name(node)?)),
-            _ => None,
-        },
-        Language::Cpp => match kind {
-            "function_definition" =>
-                Some(("function", function_name(node).or_else(|| child_name(node))?)),
-            "class_specifier" if has_body(node) => Some(("class", child_name(node)?)),
-            "struct_specifier" if has_body(node) => Some(("struct", child_name(node)?)),
-            "union_specifier" if has_body(node) => Some(("union", child_name(node)?)),
-            "enum_specifier" if has_body(node) => Some(("enum", child_name(node)?)),
-            "type_definition" | "alias_declaration" => Some(("type", child_name(node)?)),
-            "namespace_definition" => Some(("namespace", child_name(node)?)),
-            "preproc_function_def" => Some(("macro", child_name(node)?)),
-            _ => None,
-        },
-        Language::Python => match kind {
-            // A decorated def OWNS the symbol span (so `@app.get(...)` / `@dataclass` / `@property`
-            // decorator lines — which often define the API surface — are inside the chunk), using
-            // the inner def's name + kind. The inner `function_definition`/`class_definition` arms
-            // below are guarded so they don't ALSO emit a duplicate with the bare (decorator-less)
-            // span.
-            "decorated_definition" => {
-                let inner = node.child_by_field_name("definition")?;
-                let kind = match inner.kind() {
-                    "function_definition" => "function",
-                    "class_definition" => "class",
-                    _ => return None,
-                };
-                Some((kind, child_name(inner)?))
-            },
-            "function_definition" if !python_parent_is_decorated(node) =>
-                Some(("function", child_name(node)?)),
-            "class_definition" if !python_parent_is_decorated(node) =>
-                Some(("class", child_name(node)?)),
-            // PEP 695 type alias (`type UserId = int`) — index the alias like Rust/TS/C++ type
-            // aliases. `child_name` finds the first identifier (the alias name `UserId`).
-            "type_alias_statement" => Some(("type", child_name(node)?)),
-            // Constants are MODULE- or CLASS-level SCREAMING_SNAKE_CASE assignments only. Gating on
-            // scope keeps function-local uppercase temporaries (`TIMEOUT = compute()`) out of the
-            // symbol table, and the screaming-snake check keeps ordinary lowercase
-            // locals/attributes out.
-            "assignment" if python_assignment_is_const_scope(node) => {
-                let target = node.child_by_field_name("left")?;
-                let name = node_text(target, text)?;
-                (target.kind() == "identifier" && is_screaming_snake_case(&name))
-                    .then_some(("const", target))
-            },
-            _ => None,
-        },
-        Language::Markdown => None,
-    }
-}
-
-/// `true` for a Python constant name (SCREAMING_SNAKE_CASE): at least one ASCII uppercase letter
-/// and only uppercase / digits / underscore. Keeps `DEFAULT_NAME` but rejects `bridge_name` /
-/// `Api`.
-fn is_screaming_snake_case(name: &str) -> bool {
-    name.chars().any(|c| c.is_ascii_uppercase())
-        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-}
-
-/// Whether a Python def node's parent is a `decorated_definition` (so the parent arm owns its
-/// symbol span and the inner arm must not emit a duplicate).
-fn python_parent_is_decorated(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| parent.kind() == "decorated_definition")
-}
-
-/// Whether a Python `assignment` is at module or class scope (a constant), vs a function-local
-/// temporary. Walks ancestors to the first scope boundary: a `function_definition`/`lambda` means
-/// local (not a constant); a `class_definition`/`module` means module/class level (a constant).
-fn python_assignment_is_const_scope(node: Node<'_>) -> bool {
-    let mut ancestor = node.parent();
-    while let Some(current) = ancestor {
-        match current.kind() {
-            "function_definition" | "lambda" => return false,
-            "class_definition" | "module" => return true,
-            _ => ancestor = current.parent(),
-        }
-    }
-    false
-}
-
-fn child_name(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn child_name(node: Node<'_>) -> Option<Node<'_>> {
     if let Some(name) = node.child_by_field_name("name") {
         return Some(name);
     }
@@ -489,7 +356,10 @@ fn child_name(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).find_map(|child| first_descendant_node(child, NAME_KINDS))
 }
 
-fn first_descendant_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
+pub(super) fn first_descendant_node<'tree>(
+    node: Node<'tree>,
+    kinds: &[&str],
+) -> Option<Node<'tree>> {
     // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep subtree
     // (#543).
     crate::index::grow_stack(|| {
@@ -506,23 +376,19 @@ fn first_descendant_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Nod
     })
 }
 
-/// Whether a C/C++ `*_specifier` node carries its body (`field_declaration_list` /
-/// `enumerator_list` via the grammar's `body` field) — i.e. it is a DEFINITION (`struct X { … }`),
-/// not a forward declaration (`struct X;`) or a use (`struct X *p`). Only definitions are indexed
-/// as symbols so `references_type` edges resolve to the real definition rather than a bodyless
-/// occurrence (#61).
-fn has_body(node: Node<'_>) -> bool {
-    node.child_by_field_name("body").is_some()
-}
-
 /// The semantic scope path for a symbol node: enclosing type/module/namespace/trait names
 /// (outermost first) joined with `::`, ending in the symbol's own `name`. A top-level free function
 /// or type yields just its name. See [`ParsedSymbol::scope_path`].
-fn scope_path(language: Language, node: Node<'_>, text: &str, name: &str) -> String {
+fn scope_path(
+    backend: &dyn crate::index::languages::ParserBackend,
+    node: Node<'_>,
+    text: &str,
+    name: &str,
+) -> String {
     let mut segments = Vec::new();
     let mut current = node.parent();
     while let Some(parent) = current {
-        if let Some(segment) = scope_segment(language, parent, text) {
+        if let Some(segment) = backend.scope_segment(parent, text) {
             segments.push(segment);
         }
         current = parent.parent();
@@ -532,74 +398,10 @@ fn scope_path(language: Language, node: Node<'_>, text: &str, name: &str) -> Str
     segments.join("::")
 }
 
-/// The scope-name contributed by an ENCLOSING node, if it introduces a named scope (a module, the
-/// type an `impl` is for, a class/trait/namespace). Returns `None` for nodes that don't nest a
-/// scope, so the walk skips blocks/expressions and only collects real path segments.
-fn scope_segment(language: Language, node: Node<'_>, text: &str) -> Option<String> {
-    let name_node = match (language, node.kind()) {
-        (Language::Rust, "mod_item" | "trait_item") => child_name(node)?,
-        (Language::Rust, "impl_item") => impl_name(node)?,
-        (Language::TypeScript, "class_declaration" | "interface_declaration") => child_name(node)?,
-        (Language::TypeScript, "internal_module" | "module" | "namespace_declaration") =>
-            child_name(node)?,
-        (Language::Kotlin, "class_declaration" | "object_declaration") => child_name(node)?,
-        // Python nests methods in classes and closures in functions — both bound `scope_path`.
-        (Language::Python, "class_definition" | "function_definition") => child_name(node)?,
-        (Language::Cpp, "namespace_definition") => child_name(node)?,
-        (
-            Language::C | Language::Cpp,
-            "struct_specifier" | "union_specifier" | "class_specifier",
-        ) if has_body(node) => child_name(node)?,
-        _ => return None,
-    };
-    node_text(name_node, text)
-}
-
-fn companion_name(node: Node<'_>) -> Option<Node<'_>> {
-    for index in 0..node.child_count() {
-        let Some(index) = u32::try_from(index).ok() else {
-            continue;
-        };
-        if let Some(child) = node.child(index)
-            && child.kind() == "companion"
-        {
-            return Some(child);
-        }
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| matches!(child.kind(), "simple_identifier" | "type_identifier"))
-}
-
-fn kotlin_property_name(node: Node<'_>) -> Option<Node<'_>> {
-    child_name(kotlin_variable_declaration(node).unwrap_or(node))
-}
-
-fn kotlin_variable_declaration(node: Node<'_>) -> Option<Node<'_>> {
-    crate::index::grow_stack(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).find_map(|child| {
-            if child.kind() == "variable_declaration" {
-                Some(child)
-            } else if matches!(child.kind(), "modifiers" | "type_parameters" | "type_constraints") {
-                None
-            } else {
-                kotlin_variable_declaration(child)
-            }
-        })
-    })
-}
-
-fn function_name(node: Node<'_>) -> Option<Node<'_>> {
-    let declarator = first_descendant_node(node, &["function_declarator"]).unwrap_or(node);
-    let name_root = declarator.child_by_field_name("declarator").unwrap_or(declarator);
-    if NAME_KINDS.contains(&name_root.kind()) {
-        return Some(name_root);
-    }
-    last_descendant_node(name_root, NAME_KINDS)
-}
-
-fn last_descendant_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
+pub(super) fn last_descendant_node<'tree>(
+    node: Node<'tree>,
+    kinds: &[&str],
+) -> Option<Node<'tree>> {
     crate::index::grow_stack(|| {
         let mut cursor = node.walk();
         let mut last = None;
@@ -615,17 +417,14 @@ fn last_descendant_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node
     })
 }
 
-fn impl_name(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).find(|child| {
-        matches!(child.kind(), "type_identifier" | "generic_type" | "scoped_type_identifier")
-    })
+struct SymbolBuildContext<'a> {
+    path: &'a Path,
+    backend: &'a dyn crate::index::languages::ParserBackend,
+    text: &'a str,
 }
 
 fn make_symbol(
-    path: &Path,
-    language: Language,
-    text: &str,
+    context: &SymbolBuildContext<'_>,
     node: Node<'_>,
     // The declaration node the SIGNATURE is read from. Equals `node` except for a decorated Python
     // def, where `node` is the `decorated_definition` (so the chunk span includes the decorators)
@@ -634,14 +433,15 @@ fn make_symbol(
     kind: &str,
     name: String,
 ) -> ParsedSymbol {
+    let SymbolBuildContext { path, backend, text } = *context;
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
     // tree-sitter already computed each node's 1-based line span during the parse — read it off the
     // node (O(1) struct field) instead of rescanning the file text for newlines. `row` is 0-based.
     let start_line = node.start_position().row + 1;
     let end_line = node.end_position().row + 1;
-    let scope_path = scope_path(language, node, text, &name);
-    let is_test = detect_is_test(path, language, text, node, &scope_path, &name);
+    let scope_path = scope_path(backend, node, text, &name);
+    let is_test = is_test_path(path) || backend.is_test_symbol(text, node, &scope_path, &name);
     ParsedSymbol {
         qualified_name: format!("{}::{name}", path.to_string_lossy().replace('\\', "/")),
         scope_path,
@@ -654,43 +454,7 @@ fn make_symbol(
         signature: signature_for(text, signature_node.start_byte(), signature_node.end_byte()),
         docs: docs_before(text, start_byte),
         is_test,
-        facts: symbol_facts(language, text, node),
-    }
-}
-
-/// Whether a symbol is test code — persisted as `symbols.is_test` so clone detection can exclude
-/// it. Cross-language: a test FILE path (every language) OR a language-specific in-source marker.
-/// Tests are repetitive by construction (fixture → call → assert), so leaving them in the clone
-/// corpus floods near-clone results — the write-time clone check is the main consumer.
-fn detect_is_test(
-    path: &Path,
-    language: Language,
-    text: &str,
-    node: Node<'_>,
-    scope_path: &str,
-    name: &str,
-) -> bool {
-    if is_test_path(path) {
-        return true;
-    }
-    match language {
-        // Rust unit tests live INLINE in source files, so the path check misses them: a `#[test]`
-        // (or `#[tokio::test]`/`#[rstest]`/…) on the fn, or any ancestor `#[cfg(test)]` module
-        // (catches test helpers too).
-        Language::Rust =>
-            rust_attribute_items(text, node)
-                .iter()
-                .any(|attribute| rust_attribute_is_test(attribute))
-                || rust_in_cfg_test_module(node, text),
-        // Kotlin: a JUnit `@Test`-family annotation on the fn (path catches `*Test.kt` /
-        // `src/test/`).
-        Language::Kotlin => kotlin_has_test_annotation(text, node),
-        // Python: pytest/unittest by convention — `test_*` functions, methods of a `*Test*`/
-        // `*TestCase` class (via scope_path), or anything in `conftest.py` (path).
-        Language::Python => name.starts_with("test_") || scope_path_has_test_class(scope_path),
-        // C / C++ / TypeScript: test bodies aren't named symbols (macros / closures), so the file
-        // path conventions above carry these.
-        _ => false,
+        facts: backend.symbol_facts(text, node),
     }
 }
 
@@ -730,122 +494,7 @@ pub(crate) fn is_test_path(path: impl AsRef<Path>) -> bool {
         || stem.ends_with("TestCase")
 }
 
-/// A Rust attribute that marks a test function: `#[test]`, `#[tokio::test]`, `#[rstest]`,
-/// `#[test_case(..)]`, etc. (a `#[cfg(test)]` is the MODULE marker — handled separately so it
-/// doesn't read as a per-fn test attribute).
-fn rust_attribute_is_test(attribute: &str) -> bool {
-    let inner = attribute
-        .trim()
-        .trim_start_matches('#')
-        .trim_start_matches('!')
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    let head = inner.split(['(', '[']).next().unwrap_or_default().trim();
-    let last = head.rsplit("::").next().unwrap_or(head).trim();
-    last == "test" || last == "rstest" || last.starts_with("test_case")
-}
-
-/// Whether `node` is nested in any `#[cfg(test)]` module — catches inline unit tests AND their
-/// helpers (a fixture fn in `#[cfg(test)] mod tests` has no `#[test]` of its own).
-fn rust_in_cfg_test_module(node: Node<'_>, text: &str) -> bool {
-    let mut current = node.parent();
-    while let Some(ancestor) = current {
-        if ancestor.kind() == "mod_item"
-            && rust_attribute_items(text, ancestor)
-                .iter()
-                .any(|attribute| attribute.contains("cfg") && attribute.contains("test"))
-        {
-            return true;
-        }
-        current = ancestor.parent();
-    }
-    false
-}
-
-/// Whether a Kotlin function carries a JUnit `@Test`-family annotation (in its `modifiers`).
-fn kotlin_has_test_annotation(text: &str, node: Node<'_>) -> bool {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).any(|child| {
-        child.kind() == "modifiers"
-            && node_text(child, text).as_deref().map(kotlin_modifiers_have_test).unwrap_or(false)
-    })
-}
-
-fn kotlin_modifiers_have_test(modifiers: &str) -> bool {
-    modifiers.split('@').skip(1).any(|annotation| {
-        let name = annotation.split(['(', ' ', '\n', '\t', '\r']).next().unwrap_or_default();
-        let last = name.rsplit('.').next().unwrap_or(name);
-        matches!(last, "Test" | "ParameterizedTest" | "RepeatedTest" | "TestFactory")
-    })
-}
-
-/// Whether a Python symbol's enclosing scope is a test class (`Test*` / `*Test` / `*TestCase`),
-/// e.g. a `unittest.TestCase` subclass. `scope_path` is `Class::method`-style.
-fn scope_path_has_test_class(scope_path: &str) -> bool {
-    scope_path.split("::").any(|segment| {
-        segment.starts_with("Test") || segment.ends_with("Test") || segment.ends_with("TestCase")
-    })
-}
-
-/// The node a symbol's signature is read from. For a decorated Python def this is the inner
-/// `def`/`class` (so the signature is the declaration, not the `@decorator` line the span starts
-/// at); for everything else it's the matched node itself.
-fn signature_source_node<'a>(language: Language, node: Node<'a>) -> Node<'a> {
-    if language == Language::Python
-        && node.kind() == "decorated_definition"
-        && let Some(inner) = node.child_by_field_name("definition")
-    {
-        return inner;
-    }
-    node
-}
-
-fn symbol_facts(language: Language, text: &str, node: Node<'_>) -> Vec<ParsedSymbolFact> {
-    if language != Language::Rust {
-        return Vec::new();
-    }
-    let mut facts = Vec::new();
-    for attribute in rust_attribute_items(text, node) {
-        if rust_attribute_is_uniffi_export(&attribute) {
-            facts.push(ParsedSymbolFact {
-                kind: "rust_attr".to_string(),
-                value: "uniffi_export".to_string(),
-            });
-        }
-    }
-    facts.sort_by(|left, right| (&left.kind, &left.value).cmp(&(&right.kind, &right.value)));
-    facts.dedup();
-    facts
-}
-
-fn rust_attribute_items(text: &str, node: Node<'_>) -> Vec<String> {
-    let mut attributes = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "attribute_item" {
-            attributes.push(node_text(child, text).unwrap_or_default());
-        }
-    }
-
-    let mut preceding = Vec::new();
-    let mut sibling = node.prev_named_sibling();
-    while let Some(previous) = sibling {
-        if previous.kind() != "attribute_item" {
-            break;
-        }
-        preceding.push(node_text(previous, text).unwrap_or_default());
-        sibling = previous.prev_named_sibling();
-    }
-    preceding.reverse();
-    preceding.extend(attributes);
-    preceding
-}
-
-fn rust_attribute_is_uniffi_export(attribute: &str) -> bool {
-    attribute.contains("uniffi::export") || attribute.contains("::uniffi::export")
-}
-
-fn node_text(node: Node<'_>, text: &str) -> Option<String> {
+pub(super) fn node_text(node: Node<'_>, text: &str) -> Option<String> {
     node.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned)
 }
 

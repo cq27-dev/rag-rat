@@ -1,6 +1,10 @@
-//! Kotlin graph-edge extraction — the `Language::Kotlin` arm of `syntactic_edges`.
-//! Split out of edges/extract.
-use super::*;
+//! Kotlin graph-edge extraction for the shared structural edge walk.
+use std::path::Path;
+
+use tree_sitter::Node;
+
+use crate::index::edges::extract::*;
+use crate::index::edges::*;
 
 pub(super) fn kotlin_edges(
     text: &str,

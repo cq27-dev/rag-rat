@@ -41,10 +41,13 @@ fn init_yes_writes_a_config_that_config_load_accepts() {
     // test's temp dir so init's index build can never touch the developer's real global store.
     let data_dir = root.join("data");
     std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("Sources/App")).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
-    // A trivial Rust source tree so the scan binds `rust = ["src"]` (a non-empty plan; an empty
-    // plan would make `init` bail by design — that path is covered in `init_dir_selection.rs`).
+    // Trivial Rust and SwiftPM source trees make the scan bind both default source directories (a
+    // non-empty plan; an empty plan would make `init` bail by design — that path is covered in
+    // `init_dir_selection.rs`).
     std::fs::write(root.join("src/lib.rs"), "pub fn alpha() -> u32 {\n    1\n}\n").unwrap();
+    std::fs::write(root.join("Sources/App/App.swift"), "struct App {}\n").unwrap();
     // `init --yes` auto-accepts the git-maintenance-hook install (its pre-wizard behavior, which
     // this test pins as unchanged), and that install needs a real git repo — so make one. The
     // hooks themselves never fire here: `RAG_RAT_HOOK_DISABLE=1` short-circuits them.
@@ -100,6 +103,15 @@ fn init_yes_writes_a_config_that_config_load_accepts() {
     assert!(
         config.targets.iter().any(|t| t.language == rag_rat_core::language::Language::Rust),
         "the rust source tree must bind a rust target, got: {:?}",
+        config.targets
+    );
+    assert!(
+        config.targets.iter().any(|target| {
+            target.language == rag_rat_core::language::Language::Swift
+                && target.directories == [std::path::PathBuf::from("Sources")]
+                && target.include == ["**/*.swift"]
+        }),
+        "the SwiftPM source tree must bind a Swift target with default globs, got: {:?}",
         config.targets
     );
 

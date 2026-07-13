@@ -42,7 +42,9 @@ pub(crate) fn graph_neighbors(
         LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
         LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id
         LEFT JOIN files source_files ON source_files.id = edges.source_file_id
-        WHERE edges.edge_kind IN ('calls_name', 'constructs', 'implements')
+        WHERE edges.edge_kind IN (
+            'calls_name', 'constructs', 'uses_operator', 'uses_precedence_group', 'implements'
+        )
           AND ({predicate})
           AND {source_path_col} IS NOT NULL
         ORDER BY

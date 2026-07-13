@@ -521,7 +521,10 @@ pub(crate) fn summary_counts(conn: &Connection) -> anyhow::Result<SummaryCounts>
     let graph_edges: u64 = conn.query_row(
         "SELECT COUNT(*) FROM edges_data e
            JOIN main.files f ON f.id = e.source_file_id
-          WHERE f.repo_id = ?1 AND f.generation = ?2",
+          WHERE f.repo_id = ?1 AND f.generation = ?2
+            AND e.resolution_id NOT IN (
+                SELECT id FROM name_strings WHERE value = 'suppressed'
+            )",
         rusqlite::params![repo_id, generation],
         |row| row_u64(row, 0),
     )?;
@@ -838,4 +841,32 @@ fn add_memory_count(counts: &mut RepoBriefMemoryCounts, row: (String, u64)) {
 fn row_u64(row: &Row<'_>, idx: usize) -> rusqlite::Result<u64> {
     let value = row.get::<_, i64>(idx)?;
     Ok(u64::try_from(value.max(0)).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use rusqlite::Connection;
+
+    use super::summary_counts;
+    use crate::index::schema;
+
+    #[test]
+    fn summary_excludes_suppressed_edge_candidates() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES ('App.swift', 'swift', 'source', 'sha', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution)
+             VALUES (1, 'real', 'calls_name', 'NameOnly', 'unresolved'),
+                    (1, 'available', 'uses_macro', 'NameOnly', 'suppressed')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(summary_counts(&conn).unwrap().graph_edges, 1);
+    }
 }

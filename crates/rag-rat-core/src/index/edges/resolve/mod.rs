@@ -21,90 +21,36 @@ fn import_scope_from_row(
     })
 }
 
-/// How a Python from-import alias reference is rewritten before resolution (#174). Empty (all
-/// `None`) when nothing is an in-scope alias. The order/scope correctness lives in extraction:
-/// each alias binding's `scope_end` already stops at the next module-scope rebinding of the name,
-/// so `python_alias_target` only returns an alias that is genuinely in effect at `ref_byte`.
-#[derive(Default)]
-struct PythonAliasRebind {
-    /// Override the leaf name passed to `resolve_symbol` — a BARE alias reference (`Account()` →
-    /// resolve `User`).
-    name: Option<String>,
-    /// Override `target_qualified_name` — a QUALIFIED reference whose receiver root is an alias
-    /// (`Account.from_id` → `User.from_id`).
-    target_qualified_name: Option<String>,
-    /// Override `receiver_hint` — the rebound receiver (`Account` → `User`).
-    receiver_hint: Option<String>,
-}
-
-/// Resolve a Python from-import alias to its imported target name, or `None` (#174). Picks the
-/// alias in effect at `ref_byte` (extraction already bounded its scope at the next module-scope
-/// rebinding), then declines if the file ALSO defines the target's bare name locally — a bare
-/// rewrite could grab the local definition instead of the import, so leave it to normal resolution
-/// (no edge beats a wrong one).
-fn python_alias_target<'i>(
-    import_scope: &'i imports::ImportScope,
-    index: &SymbolIndex<'_>,
+/// Apply a language package's import-alias rewrite. The shared resolver owns scope lookup and the
+/// collision guard; the policy owns which reference shapes are rewritten.
+struct ImportAliasResolveRequest<'a> {
     file_id: i64,
-    name: &str,
+    source_language: Option<&'a str>,
+    to_name: &'a str,
+    target_qualified_name: Option<&'a str>,
+    receiver_hint: Option<&'a str>,
     ref_byte: usize,
-) -> Option<&'i str> {
-    let target = import_scope.python_alias_target(file_id, name, ref_byte)?;
-    if index.file_defines(file_id, short_name(target)) {
-        return None;
-    }
-    Some(target)
 }
 
-/// Rewrite a Python from-import alias reference before resolution (#174). A BARE reference
-/// (`Account()`) rebinds the leaf; a QUALIFIED reference rebinds only the RECEIVER root
-/// (`Account.from_id()` → `User.from_id`), never the leaf — `pkg.Account` is `pkg`'s member, not
-/// the local alias `Account`, so the leaf of a qualified reference is never treated as an alias.
-///
-/// MODEL BOUNDARY: this is a MODULE-scope alias model (#174 review). The alias's scope is bounded
-/// at the next MODULE-scope rebinding of the name (extraction's `python_next_module_binding`). It
-/// does NOT model per-nested-scope lexical shadowing: a reference inside a `def`/`class` body that
-/// has its OWN local binding of the alias name is still rebound to the module import. That is rare
-/// (a nested local class/def reusing an imported alias's exact name) and resolving it would require
-/// full lexical-scope analysis at the reference site, beyond "module-scope binding statements".
-fn python_alias_rebind(
+fn import_alias_rebind(
     import_scope: &imports::ImportScope,
     index: &SymbolIndex<'_>,
-    file_id: i64,
-    to_name: &str,
-    target_qualified_name: Option<&str>,
-    receiver_hint: Option<&str>,
-    ref_byte: usize,
-) -> PythonAliasRebind {
-    match receiver_hint {
-        Some(receiver) => {
-            let Some(target) =
-                python_alias_target(import_scope, index, file_id, receiver, ref_byte)
-            else {
-                return PythonAliasRebind::default();
-            };
-            PythonAliasRebind {
-                name: None,
-                target_qualified_name: target_qualified_name
-                    .map(|qualified| replace_qualified_root(qualified, target)),
-                receiver_hint: Some(target.to_string()),
-            }
-        },
-        None => {
-            let target =
-                python_alias_target(import_scope, index, file_id, short_name(to_name), ref_byte);
-            PythonAliasRebind { name: target.map(str::to_string), ..PythonAliasRebind::default() }
-        },
-    }
-}
-
-/// Replace the first `::`-separated segment (the receiver root) of a dotted qualified name with
-/// `root` — `replace_qualified_root("Account::from_id", "User") == "User::from_id"`.
-fn replace_qualified_root(qualified: &str, root: &str) -> String {
-    match qualified.split_once("::") {
-        Some((_, rest)) => format!("{root}::{rest}"),
-        None => root.to_string(),
-    }
+    request: ImportAliasResolveRequest<'_>,
+) -> crate::index::languages::ImportAliasRebind {
+    let Some(policy) = crate::index::languages::resolver_policy_for_name(request.source_language)
+    else {
+        return Default::default();
+    };
+    let mut lookup = |name: &str| {
+        let target = import_scope.import_alias_target(request.file_id, name, request.ref_byte)?;
+        (!index.file_defines(request.file_id, short_name(target))).then(|| target.to_string())
+    };
+    policy.rebind_import_alias(crate::index::languages::ImportAliasRequest {
+        to_name: request.to_name,
+        target_qualified_name: request.target_qualified_name,
+        receiver_hint: request.receiver_hint,
+        lookup: &mut lookup,
+    })
 }
 
 /// Load the per-package local-crate sets and COMPUTE each active file's owning package into `scope`
@@ -314,13 +260,13 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             let to_name: Option<String> = row.get(2)?;
             let evidence: Option<String> = row.get(3)?;
             let scope = import_scope_from_row(row.get(4)?, row.get(5)?, row.get(6)?);
-            if language == Language::Python.as_str() {
-                // A Python `from m import T as A` alias edge carries `evidence = A` (alias),
-                // `to_name = T` (target), and a whole-file scope (#174); non-aliased Python imports
-                // have no scope and `add_python_alias` skips them. Python imports never go through
-                // `add_use` (that parses Rust `use` text).
+            let carries_alias = crate::index::languages::resolver_policy_for_name(Some(&language))
+                .is_some_and(|policy| policy.import_edges_carry_aliases());
+            if carries_alias {
+                // Alias carriers encode `evidence = alias`, `to_name = target`, and a lexical
+                // scope. Non-aliased imports have no scope and are ignored by this path.
                 if let (Some(alias), Some(target)) = (evidence, to_name) {
-                    import_scope.add_python_alias(file_id, alias, target, scope);
+                    import_scope.add_import_alias(file_id, alias, target, scope);
                 }
             } else if let Some(evidence) = evidence {
                 import_scope.add_use(file_id, &evidence, scope);
@@ -338,7 +284,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
     // rewritten; empty for the base/incremental/full-rebuild path.
     let mut stmt = conn.prepare(&format!(
         "SELECT d.id, d.source_file_id, tn.value, tqn.value, ek.value, conf.value, d.evidence, \
-         rh.value, d.source_start_byte FROM edges_data d JOIN files ON files.id = \
+         rh.value, d.source_start_byte, files.language FROM edges_data d JOIN files ON files.id = \
          d.source_file_id LEFT JOIN name_strings tn ON tn.id = d.to_name_id LEFT JOIN \
          name_strings tqn ON tqn.id = d.target_qualified_name_id LEFT JOIN name_strings ek ON \
          ek.id = d.edge_kind_id LEFT JOIN name_strings conf ON conf.id = d.confidence_id LEFT \
@@ -356,6 +302,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
             row.get::<_, i64>(8)?,
+            row.get::<_, String>(9)?,
         ))
     })?;
     let rows = rows.collect::<Result<Vec<_>, _>>()?;
@@ -369,6 +316,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         evidence,
         receiver_hint,
         source_start_byte,
+        source_language,
     ) in rows
     {
         // #200: a `dispatch_construct` fact's `to_name` is a synthetic `Enum::Variant` key, NOT a
@@ -390,22 +338,19 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         }
         // The reference's byte position drives the module-aware covering test (#61).
         let ref_byte = usize::try_from(source_start_byte).unwrap_or(0);
-        // Python from-import alias rebind (#174): resolve a reference written under an alias using
-        // its imported TARGET — `Account()` after `from m import User as Account` binds to `User`,
-        // and `Account.from_id()` to `User.from_id`. Only reference edges — the Imports edge itself
-        // already names the real target. Non-Python files have no alias entries (cheap miss).
+        // A language-owned import-alias policy may rewrite a reference to its imported target.
+        // Imports edges retain their own target name.
         let rebind = if edge_kind == EdgeKind::Imports.as_str() {
-            PythonAliasRebind::default()
+            Default::default()
         } else {
-            python_alias_rebind(
-                &import_scope,
-                &index,
-                source_file_id,
-                &to_name,
-                target_qualified_name.as_deref(),
-                receiver_hint.as_deref(),
+            import_alias_rebind(&import_scope, &index, ImportAliasResolveRequest {
+                file_id: source_file_id,
+                source_language: Some(source_language.as_str()),
+                to_name: &to_name,
+                target_qualified_name: target_qualified_name.as_deref(),
+                receiver_hint: receiver_hint.as_deref(),
                 ref_byte,
-            )
+            })
         };
         let resolve_name = rebind.name.as_deref().unwrap_or(to_name.as_str());
         let resolve_qualified =
@@ -419,7 +364,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 evidence: evidence.as_deref(),
                 receiver_hint: resolve_receiver,
                 source_file_id,
-                source_language: index.file_language.get(&source_file_id).copied(),
+                source_language: Some(source_language.as_str()),
                 imported_external: import_scope.is_external_import(
                     source_file_id,
                     short_name(&to_name),
@@ -433,6 +378,11 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             &index,
         );
         let Some((to_symbol_id, confidence, reason)) = resolution else {
+            let suppressed =
+                crate::index::languages::resolver_policy_for_name(Some(&source_language))
+                    .is_some_and(|policy| {
+                        policy.suppress_unresolved_reference(&edge_kind, evidence.as_deref())
+                    });
             let confidence = if current_confidence == EdgeConfidence::Ambiguous.as_str() {
                 EdgeConfidence::Ambiguous
             } else {
@@ -441,7 +391,8 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             // prepare_cached: one UPDATE per edge; cache the statement so the SQL compiles once per
             // connection instead of on every call.
             let confidence_id = interner.get(conn, confidence.as_str())?;
-            let resolution_id = interner.get(conn, "unresolved")?;
+            let resolution_id =
+                interner.get(conn, if suppressed { "suppressed" } else { "unresolved" })?;
             conn.prepare_cached(
                 "UPDATE edges_data
                  SET to_symbol_id = NULL,
@@ -532,12 +483,8 @@ pub(crate) fn resolve_and_insert_edges(
     // accumulator vs DB rows).
     let mut import_scope = imports::ImportScope::new(imports::load_local_roots(conn));
     load_package_roots_into_scope(conn, &mut import_scope)?;
-    // File languages from the DB, NOT `index.file_language` (built only from files that contributed
-    // a symbol). A Python entrypoint that ONLY does `from m import X as A; A()` has no symbol row
-    // for its own file, so `index.file_language` would miss it and the alias carrier would feed
-    // neither `add_python_alias` nor `add_use` under `index --full` (#174 review); the DB row
-    // is authoritative. The incremental driver already joins `files.language`, so this keeps
-    // the two drivers in lockstep.
+    // File languages come from the DB because files without symbols still need their language
+    // policy. The incremental driver also joins `files.language`, keeping both drivers in lockstep.
     let file_language: HashMap<i64, String> = {
         let mut stmt = conn.prepare("SELECT id, language FROM files")?;
         let rows =
@@ -547,13 +494,13 @@ pub(crate) fn resolve_and_insert_edges(
     for (file_id, candidate) in &edges {
         if candidate.edge_kind == EdgeKind::Imports {
             let evidence = arena.get_opt(candidate.evidence).unwrap_or("");
-            if file_language.get(file_id).map(String::as_str) == Some(Language::Python.as_str()) {
-                // Python from-import alias carrier (#174): evidence = alias, to_name = target,
-                // whole-file scope. Non-aliased Python imports have no scope → `add_python_alias`
-                // skips them; Python imports never feed `add_use` (Rust `use`-text parsing).
+            let source_language = file_language.get(file_id).map(String::as_str);
+            let carries_alias = crate::index::languages::resolver_policy_for_name(source_language)
+                .is_some_and(|policy| policy.import_edges_carry_aliases());
+            if carries_alias {
                 let target = arena.get(candidate.to_name).trim();
                 if !evidence.is_empty() && !target.is_empty() {
-                    import_scope.add_python_alias(
+                    import_scope.add_import_alias(
                         *file_id,
                         evidence.to_string(),
                         target.to_string(),
@@ -601,22 +548,19 @@ pub(crate) fn resolve_and_insert_edges(
         // The reference's byte position drives the module-aware covering test (#61) — same input
         // the DB driver reads from `source_start_byte`.
         let ref_byte = candidate.source_span.start_byte as usize;
-        // Python from-import alias rebind (#174): mirror the DB driver — resolve a reference under
-        // its imported TARGET, so `Account()` binds to `User` and `Account.from_id()` to
-        // `User.from_id`. Imports edges keep their own target name; non-Python files have no alias
-        // entries.
+        // Mirror the DB driver: a language-owned alias policy may rewrite a reference to its
+        // imported target. Imports edges keep their own target name.
         let rebind = if candidate.edge_kind == EdgeKind::Imports {
-            PythonAliasRebind::default()
+            Default::default()
         } else {
-            python_alias_rebind(
-                &import_scope,
-                &index,
-                *file_id,
+            import_alias_rebind(&import_scope, &index, ImportAliasResolveRequest {
+                file_id: *file_id,
+                source_language: file_language.get(file_id).map(String::as_str),
                 to_name,
                 target_qualified_name,
                 receiver_hint,
                 ref_byte,
-            )
+            })
         };
         let resolve_name = rebind.name.as_deref().unwrap_or(to_name);
         let resolve_qualified = rebind.target_qualified_name.as_deref().or(target_qualified_name);
@@ -636,7 +580,7 @@ pub(crate) fn resolve_and_insert_edges(
                     evidence,
                     receiver_hint: resolve_receiver,
                     source_file_id: *file_id,
-                    source_language: index.file_language.get(file_id).copied(),
+                    source_language: file_language.get(file_id).map(String::as_str),
                     imported_external: import_scope.is_external_import(
                         *file_id,
                         short_name(to_name),
@@ -660,12 +604,24 @@ pub(crate) fn resolve_and_insert_edges(
                     reason,
                 ),
                 None => {
+                    let suppressed = crate::index::languages::resolver_policy_for_name(
+                        file_language.get(file_id).map(String::as_str),
+                    )
+                    .is_some_and(|policy| {
+                        policy.suppress_unresolved_reference(candidate.edge_kind.as_str(), evidence)
+                    });
                     let confidence = if candidate.confidence == EdgeConfidence::Ambiguous {
                         EdgeConfidence::Ambiguous
                     } else {
                         EdgeConfidence::NameOnly
                     };
-                    (None, confidence, None, None, "unresolved")
+                    (
+                        None,
+                        confidence,
+                        None,
+                        None,
+                        if suppressed { "suppressed" } else { "unresolved" },
+                    )
                 },
             };
         // NULL when the sentinel marks an absent callee range; see
@@ -742,7 +698,13 @@ pub(crate) fn resolve_symbol<'a>(
     index: &SymbolIndex<'a>,
 ) -> Option<(&'a IndexedSymbol, EdgeConfidence, &'static str)> {
     let kind_matches = |symbol: &IndexedSymbol| {
-        request.edge_kind != EdgeKind::UsesMacro.as_str() || symbol.kind == "macro"
+        (request.edge_kind != EdgeKind::UsesMacro.as_str() || symbol.kind == "macro")
+            && crate::index::languages::target_matches_policy(
+                request.source_language,
+                request.edge_kind,
+                &symbol.language,
+                &symbol.kind,
+            )
     };
     // Crate-aware import suppression (#61 Project B): the name is `use`d from an external
     // dependency crate, so it denotes that dependency's item — never a local same-named symbol.
@@ -751,24 +713,17 @@ pub(crate) fn resolve_symbol<'a>(
     // correct cross-crate binds into local workspace crates (those roots are in the local-crate
     // set, so not external).
     //
-    // EXCEPTION: an explicitly LOCAL-qualified reference (`crate::Url`, `self::Url`, `super::Url`)
-    // names a local item by construction — the qualifier overrides the bare-leaf import. Don't
-    // suppress it just because the file also imports a same-named external item; fall through so
-    // the qualified path can bind.
-    if request.imported_external && !targets_local_qualified_path(request.target_qualified_name) {
+    let policy = crate::index::languages::resolver_policy_for_name(request.source_language);
+    // A language-owned local qualifier overrides an external bare-leaf import.
+    if request.imported_external
+        && !request.target_qualified_name.and_then(|path| path.split_once("::")).is_some_and(
+            |(root, _)| policy.is_some_and(|policy| policy.is_local_qualified_root(root)),
+        )
+    {
         return None;
     }
-    // A Rust `references_type` to a GENERIC PARAMETER (`T`, `V`, `T1`) or an associated-type
-    // PROJECTION (`Self::Value`, `T::Output`, `V::Value`) has no in-corpus definition to point at —
-    // its concrete type is only known after type inference. Name-based resolution would bind it to
-    // whatever same-named concrete type happens to exist (serde has a `T` type and 50 `Value`s),
-    // asserting `Syntactic`; the SCIP oracle then counts that as a contradiction. Leave it
-    // unresolved (the edge is still recorded) instead of guessing. A real module-qualified type
-    // (`de::Deserializer`) has a lowercase path root and is NOT caught. Rust-only: TS/Kotlin/Python
-    // type parameters don't share this single-uppercase convention.
-    if request.source_language == Some(Language::Rust.as_str())
-        && request.edge_kind == EdgeKind::ReferencesType.as_str()
-        && rust_type_ref_is_unresolvable(request.name)
+    if policy
+        .is_some_and(|policy| policy.reference_is_unresolvable(request.edge_kind, request.name))
     {
         return None;
     }
@@ -864,26 +819,18 @@ pub(crate) fn resolve_symbol<'a>(
         .filter(|symbol| kind_matches(symbol))
         .collect::<Vec<_>>();
     let preferred = preferred_matches(request.edge_kind, request.source_language, &matches);
-    // In languages with separate type/value namespaces (Rust, C, C++), a `references_type`
-    // reference must resolve to a type DEFINITION (struct/enum/trait/type/…). If none of the
-    // same-named candidates is one, do NOT fall back to a non-type symbol (an `impl` block, a
-    // module, a function/const/macro) — leave it unresolved, so the graph never points a type
-    // reference at a non-type. Those fallbacks were pure contradictions (#61): when a type's real
-    // definition is external / in another crate, the only in-corpus same-named symbol is often an
-    // `impl Foo` or a module, and binding to it is always wrong. NOT applied to TS/Kotlin, where a
-    // type-position reference legitimately targets a value (a React component `const`/`function`).
+    // Language policy decides whether a type-position reference may bind a value declaration.
     if preferred.is_empty()
         && request.edge_kind == EdgeKind::ReferencesType.as_str()
-        && matches!(request.source_language, Some("rust" | "c" | "cpp"))
+        && policy.is_some_and(|policy| policy.type_reference_requires_type_definition())
     {
         return None;
     }
-    // A Python `implements` (base class) that found no in-corpus PYTHON class must NOT fall back to
-    // the all-matches set: that would bind the base to a same-named non-class or a foreign-language
-    // class (#172 review). Leave it unresolved — the ReferencesType edge still records the base.
     if preferred.is_empty()
-        && request.edge_kind == EdgeKind::Implements.as_str()
-        && request.source_language == Some(Language::Python.as_str())
+        && crate::index::languages::requires_same_language_target(
+            request.source_language,
+            request.edge_kind,
+        )
     {
         return None;
     }
@@ -927,6 +874,17 @@ pub(crate) fn same_logical_symbol(symbols: &[&IndexedSymbol]) -> bool {
     let Some(first) = symbols.first() else {
         return false;
     };
+    // A language policy can preserve ambiguity when stored identity does not distinguish distinct
+    // declarations. Languages without that restriction retain variant collapsing.
+    if first
+        .language
+        .parse::<Language>()
+        .ok()
+        .and_then(crate::index::languages::resolver_policy)
+        .is_some_and(|policy| !policy.collapse_same_named_declarations())
+    {
+        return false;
+    }
     symbols.iter().all(|symbol| {
         symbol.qualified_name == first.qualified_name
             && symbol.name == first.name
@@ -934,27 +892,6 @@ pub(crate) fn same_logical_symbol(symbols: &[&IndexedSymbol]) -> bool {
             && symbol.scope_path == first.scope_path
     })
 }
-/// Whether a Rust `references_type` target is a generic parameter or an associated-type projection
-/// — a reference name-based resolution can't (and shouldn't) bind to a concrete in-corpus type.
-/// True for a BARE generic-parameter name (`T`, `V`, `T1` — Rust's short-uppercase convention) or
-/// any PROJECTION whose root segment is `Self` or such a parameter (`Self::Value`, `T::Output`,
-/// `V::Value`). A module-qualified type (`de::Deserializer`, lowercase root) is NOT a projection.
-fn rust_type_ref_is_unresolvable(name: &str) -> bool {
-    match name.split_once("::") {
-        Some((root, _)) => root == "Self" || looks_like_type_parameter(root),
-        None => looks_like_type_parameter(name),
-    }
-}
-
-/// Rust generic-parameter NAME shape: one uppercase ASCII letter, then only digits (`T`, `K`, `V`,
-/// `T1`, `T2`). Deliberately narrow — a real two-letter type (`Id`, `IO`, `Ok`) or any longer name
-/// is NOT a parameter, so only the unambiguous single-letter convention is suppressed.
-fn looks_like_type_parameter(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars.next().is_some_and(|first| first.is_ascii_uppercase())
-        && chars.all(|rest| rest.is_ascii_digit())
-}
-
 pub(crate) fn allow_unqualified_fallback(
     edge_kind: &str,
     qualified: &str,
@@ -974,62 +911,29 @@ pub(crate) fn allow_unqualified_fallback(
         .split("::")
         .next()
         .unwrap_or_default();
-    if matches!(qualifier, "crate" | "self" | "super") {
+    let policy = crate::index::languages::resolver_policy_for_name(source_language);
+    if policy.is_some_and(|policy| policy.is_local_qualified_root(qualifier)) {
         return true;
     }
     if receiver_hint
         .is_some_and(|receiver| looks_like_type_name(receiver) && !is_common_member_name(target))
-        && matches!(source_language, Some("rust" | "kotlin"))
+        && policy.is_some_and(|policy| policy.allow_type_receiver_fallback())
     {
         return true;
     }
     if receiver_hint.is_some_and(|receiver| !matches!(receiver, "self" | "Self"))
         && evidence.is_some_and(|value| value.contains('.'))
     {
-        return source_language == Some(Language::Kotlin.as_str())
+        return policy.is_some_and(|policy| policy.allow_value_receiver_fallback())
             && !is_common_member_name(target);
     }
-    if is_external_rust_root(qualifier) {
+    if policy.is_some_and(|policy| policy.rejects_qualified_root(qualifier)) {
         return false;
     }
     if looks_like_type_name(qualifier) && is_common_member_name(target) {
         return false;
     }
     true
-}
-/// Whether an edge's `target_qualified_name` is an explicitly LOCAL-rooted path (`crate::…`,
-/// `self::…`, `super::…`) — code disambiguating a local item with a qualifier. Such a reference is
-/// exempt from crate-aware import suppression (#61 Project B) even when the file also imports a
-/// same-named external item.
-fn targets_local_qualified_path(target_qualified_name: Option<&str>) -> bool {
-    target_qualified_name
-        .and_then(|path| path.split_once("::"))
-        .is_some_and(|(root, _)| matches!(root, "crate" | "self" | "super"))
-}
-pub(crate) fn is_external_rust_root(value: &str) -> bool {
-    matches!(
-        value,
-        "std"
-            | "core"
-            | "alloc"
-            | "tokio"
-            | "serde"
-            | "serde_json"
-            | "anyhow"
-            | "thiserror"
-            | "rusqlite"
-            | "tree_sitter"
-            | "tracing"
-            | "log"
-            | "Vec"
-            | "String"
-            | "Option"
-            | "Result"
-            | "HashMap"
-            | "BTreeMap"
-            | "HashSet"
-            | "BTreeSet"
-    )
 }
 pub(crate) fn is_common_member_name(value: &str) -> bool {
     matches!(
@@ -1057,23 +961,7 @@ pub(crate) fn preferred_matches<'a>(
     source_language: Option<&str>,
     matches: &[&'a IndexedSymbol],
 ) -> Vec<&'a IndexedSymbol> {
-    // Python base-class inheritance emits an `implements` edge to a CLASS — Python has no
-    // traits/interfaces — so prefer class-like kinds for Python (#172). This case ALSO filters by
-    // LANGUAGE: the name buckets are repo-wide, so without it a Python base would bind to a
-    // same-named TS/Kotlin/C++ class or Kotlin `object` in a mixed-language index (#172 review).
-    // Kept language-scoped so Kotlin/TS are otherwise UNCHANGED (`implements`/`: I` targets an
-    // interface, and a same-named class must not be preferred over it).
-    if edge_kind == "implements" && source_language == Some(Language::Python.as_str()) {
-        return matches
-            .iter()
-            .copied()
-            .filter(|symbol| {
-                matches!(symbol.kind.as_str(), "class" | "object")
-                    && symbol.language.as_str() == Language::Python.as_str()
-            })
-            .collect();
-    }
-    let preferred_kinds: &[&str] = match edge_kind {
+    let generic_preferred_kinds: &[&str] = match edge_kind {
         // `dispatch_handle` (#200) is a call to the handler the match arm delegates to — resolve it
         // with the SAME callable preference as a direct call, so a same-named type/const never wins
         // over the handler function/method.
@@ -1084,14 +972,37 @@ pub(crate) fn preferred_matches<'a>(
         "references_type" => &["struct", "enum", "trait", "type", "class", "interface", "object"],
         _ => &[],
     };
+    let source_language = source_language.and_then(|name| name.parse::<Language>().ok());
+    let language_preference = source_language
+        .and_then(crate::index::languages::resolver_policy)
+        .and_then(|policy| policy.preferred_kinds(edge_kind));
+    let preferred_kinds = language_preference
+        .as_ref()
+        .map_or(generic_preferred_kinds, |preference| preference.symbol_kinds);
     if preferred_kinds.is_empty() {
         return Vec::new();
     }
-    matches
+    let preferred = matches
         .iter()
         .copied()
         .filter(|symbol| preferred_kinds.contains(&symbol.kind.as_str()))
-        .collect()
+        .collect::<Vec<_>>();
+    if let (Some(source_language), Some(language_preference)) =
+        (source_language, language_preference)
+    {
+        let same_language = preferred
+            .iter()
+            .copied()
+            .filter(|symbol| symbol.language == source_language.as_str())
+            .collect::<Vec<_>>();
+        if !same_language.is_empty() {
+            return same_language;
+        }
+        if language_preference.same_language_only {
+            return Vec::new();
+        }
+    }
+    preferred
 }
 
 #[cfg(test)]

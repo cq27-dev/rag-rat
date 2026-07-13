@@ -277,15 +277,17 @@ include = ["**/*.ts"]
 exclude = ["**/*.map"]
 ```
 
-Supported languages are `rust`, `typescript`, `kotlin`, `c`, `cpp`, `python`, and `markdown`. Rust,
-TypeScript/TSX, Kotlin, C, C++, and Python source use tree-sitter structural indexing when files are
-under the parser size cap.
+Supported languages are `rust`, `typescript`, `kotlin`, `c`, `cpp`, `python`, `swift`, and
+`markdown`. Rust, TypeScript/TSX, Kotlin, C, C++, Python, and Swift source use tree-sitter structural
+indexing when files are under the parser size cap.
 Markdown uses heading-section chunking and does not use tree-sitter. Supported target kinds are
 `source`, `generated`, `docs`, and `tests`; generated targets are indexed with coarse chunks and
 still obey `include_generated` filtering.
 
-Parser grammar dependencies are exact-pinned in `Cargo.toml`: `tree-sitter` 0.22.6,
-`tree-sitter-rust` 0.21.2, `tree-sitter-typescript` 0.21.2, and `tree-sitter-kotlin` 0.3.8.
+Parser grammar dependencies are exact-pinned in `Cargo.toml`: `tree-sitter` 0.26.9,
+`tree-sitter-rust` 0.24.2, `tree-sitter-typescript` 0.23.2, `tree-sitter-kotlin-ng` 1.1.0,
+`tree-sitter-c` 0.24.2, `tree-sitter-cpp` 0.23.4, `tree-sitter-python` 0.25.0, and
+`tree-sitter-swift` 0.7.3.
 
 `[llm.embedding.runtime]` controls reconcile defaults for local embedding generation. CLI flags
 still take precedence: `--batch-size` overrides `batch_size`, and `--max-embedding-chars` overrides

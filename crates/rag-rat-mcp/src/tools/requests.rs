@@ -87,6 +87,8 @@ impl McpGraphResolutionMode {
 pub enum McpGraphEdgeKind {
     CallsName,
     Constructs,
+    UsesOperator,
+    UsesPrecedenceGroup,
     Dispatches,
     UsesMacro,
     ReferencesType,
@@ -101,6 +103,8 @@ impl McpGraphEdgeKind {
         match self {
             Self::CallsName => "calls_name",
             Self::Constructs => "constructs",
+            Self::UsesOperator => "uses_operator",
+            Self::UsesPrecedenceGroup => "uses_precedence_group",
             Self::Dispatches => "dispatches",
             Self::UsesMacro => "uses_macro",
             Self::ReferencesType => "references_type",

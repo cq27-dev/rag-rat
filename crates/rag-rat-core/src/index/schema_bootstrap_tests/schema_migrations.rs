@@ -2015,6 +2015,61 @@ fn migration_066_adds_the_content_candidate_dag() {
 }
 
 #[test]
+fn migration_068_is_the_tip_and_hides_suppressed_edge_candidates() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 68, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id) VALUES ('App.swift', 'swift', 'source', 'sha', 0, 0, 'head', '')",
+        [],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence) \
+         VALUES (?1, 'Observable', 'uses_macro', 'NameOnly', 'suppressed', '@Observable')",
+        [file_id],
+    )
+    .unwrap();
+    truncate_schema_to(&conn, 67);
+    let current_view: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'edges'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let v67_view = current_view.replace(
+        "\n        AND d.resolution_id NOT IN (\n            SELECT id FROM name_strings WHERE \
+         value = 'suppressed'\n        )",
+        "",
+    );
+    assert_ne!(v67_view, current_view, "fixture must remove the V068 public-edge filter");
+    conn.execute_batch("DROP VIEW edges;").unwrap();
+    conn.execute_batch(&v67_view).unwrap();
+    let visible_before_upgrade: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap();
+    assert_eq!(visible_before_upgrade, 1, "the V067 view exposes the retained candidate");
+
+    schema::migrate_forward(&conn).unwrap();
+    let raw_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edges_data", [], |row| row.get(0)).unwrap();
+    let visible_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap();
+    assert_eq!(raw_count, 1, "suppressed candidates remain available to the resolver");
+    assert_eq!(visible_count, 0, "suppressed candidates stay out of query-layer reads");
+    let v68_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '068_suppressed_edge_candidates'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v68_recorded, 1, "the forward migration records V068");
+}
+
+#[test]
 fn migration_047_deferred_absence_and_reconverges_from_torn_state() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE memory_model_failures(leftover INTEGER);").unwrap();

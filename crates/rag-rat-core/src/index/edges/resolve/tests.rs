@@ -147,26 +147,553 @@ fn add_symbol_kind(
     qualified: &str,
     kind: &str,
 ) -> i64 {
+    add_symbol_kind_language(conn, file_id, name, qualified, kind, Language::Rust)
+}
+
+fn add_symbol_kind_language(
+    conn: &Connection,
+    file_id: i64,
+    name: &str,
+    qualified: &str,
+    kind: &str,
+    language: Language,
+) -> i64 {
     conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qualified])
         .unwrap();
     conn.execute(
         "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
          end_byte, start_line, end_line)
-         VALUES (?1, 'rust', ?2, (SELECT id FROM name_strings WHERE value = ?3), ?4, 0, 10, 1, 1)",
-        params![file_id, name, qualified, kind],
+         VALUES (?1, ?2, ?3, (SELECT id FROM name_strings WHERE value = ?4), ?5, 0, 10, 1, 1)",
+        params![file_id, language.as_str(), name, qualified, kind],
     )
     .unwrap();
     conn.last_insert_rowid()
 }
 
 fn add_type_ref_edge(conn: &Connection, source_file_id: i64, to_name: &str) -> i64 {
+    add_named_edge(conn, source_file_id, to_name, EdgeKind::ReferencesType)
+}
+
+fn add_named_edge(
+    conn: &Connection,
+    source_file_id: i64,
+    to_name: &str,
+    edge_kind: EdgeKind,
+) -> i64 {
     conn.execute(
         "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution) VALUES \
-         (?1, ?2, 'references_type', 'NameOnly', 'unresolved')",
-        params![source_file_id, to_name],
+         (?1, ?2, ?3, 'NameOnly', 'unresolved')",
+        params![source_file_id, to_name, edge_kind.as_str()],
     )
     .unwrap();
     conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
+}
+
+fn preferred_candidate(id: i64, language: Language, kind: &str) -> IndexedSymbol {
+    IndexedSymbol {
+        id,
+        file_id: id,
+        language: language.as_str().to_string(),
+        name: "Target".to_string(),
+        qualified_name: format!("target-{id}::Target"),
+        scope_path: "Target".to_string(),
+        kind: kind.to_string(),
+        start_byte: 0,
+        end_byte: 10,
+        start_line: 1,
+        end_line: 1,
+    }
+}
+
+#[test]
+fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
+    let protocol = preferred_candidate(1, Language::Swift, "protocol");
+    let foreign_trait = preferred_candidate(2, Language::Rust, "trait");
+    let actor = preferred_candidate(3, Language::Swift, "actor");
+    let foreign_struct = preferred_candidate(4, Language::Rust, "struct");
+    let swift_class = preferred_candidate(5, Language::Swift, "class");
+    let swift_macro = preferred_candidate(6, Language::Swift, "macro");
+    let foreign_macro = preferred_candidate(7, Language::Rust, "macro");
+    let swift_enum = preferred_candidate(8, Language::Swift, "enum");
+    let swift_method = preferred_candidate(9, Language::Swift, "method");
+    let foreign_function = preferred_candidate(10, Language::Rust, "function");
+    let swift_constructor = preferred_candidate(11, Language::Swift, "constructor");
+
+    let implements =
+        preferred_matches(EdgeKind::Implements.as_str(), Some(Language::Swift.as_str()), &[
+            &foreign_trait,
+            &protocol,
+        ]);
+    assert_eq!(implements.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![protocol.id]);
+
+    let inheritance =
+        preferred_matches(EdgeKind::Implements.as_str(), Some(Language::Swift.as_str()), &[
+            &foreign_trait,
+            &swift_class,
+        ]);
+    assert_eq!(inheritance.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![
+        swift_class.id
+    ]);
+
+    let protocol_reference =
+        preferred_matches(EdgeKind::ReferencesType.as_str(), Some(Language::Swift.as_str()), &[
+            &foreign_trait,
+            &protocol,
+        ]);
+    assert_eq!(protocol_reference.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![
+        protocol.id
+    ]);
+
+    for edge_kind in [EdgeKind::Constructs, EdgeKind::ReferencesType] {
+        let preferred = preferred_matches(edge_kind.as_str(), Some(Language::Swift.as_str()), &[
+            &foreign_struct,
+            &actor,
+        ]);
+        assert_eq!(
+            preferred.iter().map(|symbol| symbol.id).collect::<Vec<_>>(),
+            vec![actor.id],
+            "{edge_kind:?} must prefer the Swift actor"
+        );
+    }
+
+    let macro_use =
+        preferred_matches(EdgeKind::UsesMacro.as_str(), Some(Language::Swift.as_str()), &[
+            &foreign_macro,
+            &swift_macro,
+        ]);
+    assert_eq!(macro_use.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![swift_macro.id]);
+
+    let enum_construction =
+        preferred_matches(EdgeKind::Constructs.as_str(), Some(Language::Swift.as_str()), &[
+            &foreign_struct,
+            &swift_enum,
+        ]);
+    assert_eq!(enum_construction.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![
+        swift_enum.id
+    ]);
+
+    let call = preferred_matches(EdgeKind::CallsName.as_str(), Some(Language::Swift.as_str()), &[
+        &foreign_function,
+        &swift_method,
+    ]);
+    assert_eq!(call.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![swift_method.id]);
+
+    let initializer_call =
+        preferred_matches(EdgeKind::CallsName.as_str(), Some(Language::Swift.as_str()), &[
+            &foreign_function,
+            &swift_constructor,
+        ]);
+    assert_eq!(initializer_call.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![
+        swift_constructor.id
+    ]);
+
+    assert!(
+        preferred_matches(EdgeKind::ReferencesType.as_str(), Some(Language::Swift.as_str()), &[
+            &foreign_struct
+        ],)
+        .is_empty(),
+        "Swift type names without a Swift target must not prefer a foreign symbol"
+    );
+    assert!(
+        preferred_matches(EdgeKind::UsesMacro.as_str(), Some(Language::Swift.as_str()), &[
+            &foreign_macro
+        ],)
+        .is_empty(),
+        "Swift macro names without a Swift target must not prefer a foreign macro"
+    );
+    assert!(
+        preferred_matches(EdgeKind::CallsName.as_str(), Some(Language::Swift.as_str()), &[
+            &foreign_function
+        ],)
+        .is_empty(),
+        "Swift calls without a Swift target must not prefer a foreign function"
+    );
+}
+
+#[test]
+fn generic_resolution_does_not_prefer_swift_only_symbol_kinds() {
+    let swift_protocol = preferred_candidate(1, Language::Swift, "protocol");
+    let rust_trait = preferred_candidate(2, Language::Rust, "trait");
+    let swift_actor = preferred_candidate(3, Language::Swift, "actor");
+    let rust_struct = preferred_candidate(4, Language::Rust, "struct");
+
+    let implements =
+        preferred_matches(EdgeKind::Implements.as_str(), Some(Language::TypeScript.as_str()), &[
+            &swift_protocol,
+            &rust_trait,
+        ]);
+    assert_eq!(implements.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![rust_trait.id]);
+
+    for edge_kind in [EdgeKind::Constructs, EdgeKind::ReferencesType] {
+        let preferred =
+            preferred_matches(edge_kind.as_str(), Some(Language::TypeScript.as_str()), &[
+                &swift_actor,
+                &rust_struct,
+            ]);
+        assert_eq!(preferred.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![
+            rust_struct.id
+        ]);
+    }
+}
+
+#[test]
+fn swift_name_only_edges_do_not_fall_back_to_foreign_symbols() {
+    let conn = seeded_conn();
+    let source = add_file(&conn, "Caller.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [source]).unwrap();
+    // Top-level Swift scripts can contain calls without declaring any indexed symbol. Resolution
+    // must use the source file's language rather than inferring it from the symbol table.
+    let foreign = add_file(&conn, "foreign.rs", NEW);
+    add_symbol_kind(&conn, foreign, "URL", "foreign.rs::URL", "struct");
+    add_symbol_kind(&conn, foreign, "stringify", "foreign.rs::stringify", "macro");
+    add_symbol_kind(&conn, foreign, "parse", "foreign.rs::parse", "function");
+    add_symbol_kind_language(
+        &conn,
+        source,
+        "Foundation",
+        "Caller.swift::Foundation",
+        "struct",
+        Language::Swift,
+    );
+    let type_edge = add_type_ref_edge(&conn, source, "URL");
+    let macro_edge = add_named_edge(&conn, source, "stringify", EdgeKind::UsesMacro);
+    let call_edge = add_named_edge(&conn, source, "parse", EdgeKind::CallsName);
+    let import_edge = add_named_edge(&conn, source, "Foundation", EdgeKind::Imports);
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    for (edge, description) in [
+        (type_edge, "Swift SDK/external type"),
+        (macro_edge, "Swift external macro"),
+        (call_edge, "Swift external function"),
+        (import_edge, "Swift module import"),
+    ] {
+        let (to, _, resolution) = edge_state(&conn, edge);
+        assert_eq!(to, None, "a {description} must not bind to a foreign symbol");
+        assert_eq!(resolution, "unresolved");
+    }
+}
+
+#[test]
+fn swift_suppresses_and_re_resolves_attached_macro_candidates() {
+    let conn = seeded_conn();
+    let source = add_file(&conn, "Caller.swift", NEW);
+    let definitions = add_file(&conn, "Macros.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id IN (?1, ?2)", params![
+        source,
+        definitions
+    ])
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence) \
+         VALUES (?1, 'Observable', 'uses_macro', 'NameOnly', 'unresolved', '@Observable'), (?1, \
+         'available', 'uses_macro', 'NameOnly', 'unresolved', '@available(*, deprecated)'), (?1, \
+         'external', 'uses_macro', 'NameOnly', 'unresolved', '#external')",
+        [source],
+    )
+    .unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let suppressed_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges_data d
+             JOIN name_strings r ON r.id = d.resolution_id
+             WHERE r.value = 'suppressed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(suppressed_count, 2, "attached candidates remain available for later resolution");
+    let attached_visible_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE to_name IN ('Observable', 'available')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attached_visible_count, 0, "unresolved attributes stay out of graph queries");
+    let freestanding_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM edges WHERE to_name = 'external'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(freestanding_count, 1, "unresolved freestanding macros remain graph evidence");
+
+    let observable = add_symbol_kind_language(
+        &conn,
+        definitions,
+        "Observable",
+        "Macros.swift::Observable",
+        "macro",
+        Language::Swift,
+    );
+    resolve_all_edges(&conn).unwrap();
+    let resolved_macro: Option<i64> = conn
+        .query_row("SELECT to_symbol_id FROM edges WHERE to_name = 'Observable'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(resolved_macro, Some(observable), "a later macro definition must heal the edge");
+
+    conn.execute("DELETE FROM symbols WHERE id = ?1", [observable]).unwrap();
+    resolve_all_edges(&conn).unwrap();
+    let visible_after_removal: i64 = conn
+        .query_row("SELECT COUNT(*) FROM edges WHERE to_name = 'Observable'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(visible_after_removal, 0, "removing the macro must suppress the candidate again");
+}
+
+#[test]
+fn full_rebuild_uses_language_of_symbol_less_swift_files() {
+    let conn = seeded_conn();
+    let source = add_file(&conn, "script.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [source]).unwrap();
+    let foreign = add_file(&conn, "foreign.rs", NEW);
+    let target_id = add_symbol_kind(&conn, foreign, "parse", "foreign.rs::parse", "function");
+    let target = crate::index::symbols::Symbol {
+        name: "parse".to_string(),
+        qualified_name: "foreign.rs::parse".to_string(),
+        scope_path: "parse".to_string(),
+        kind: "function".to_string(),
+        start_byte: 0,
+        end_byte: 10,
+        start_line: 1,
+        end_line: 1,
+        signature: None,
+        docs: None,
+        is_test: false,
+        facts: Vec::new(),
+    };
+    let candidate = EdgeCandidate {
+        from_symbol_id: None,
+        from_name: Some("script.swift".to_string()),
+        to_name: "parse".to_string(),
+        target_qualified_name: None,
+        evidence: Some("parse()".to_string()),
+        receiver_hint: None,
+        source_span: EdgeSpan { start_line: 1, end_line: 1, start_byte: 0, end_byte: 7 },
+        callee_span: None,
+        import_scope: None,
+        edge_kind: EdgeKind::CallsName,
+        confidence: EdgeConfidence::NameOnly,
+    };
+    let mut graph = FullRebuildGraph::default();
+    graph.push_symbol(target_id, foreign, Language::Rust, &target);
+    graph.push_edge(source, &candidate, &[]);
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_and_insert_edges(&conn, graph).unwrap();
+
+    let edge: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+    let (to, _, resolution) = edge_state(&conn, edge);
+    assert_eq!(to, None, "the full driver must apply Swift policy without a source symbol");
+    assert_eq!(resolution, "unresolved");
+}
+
+#[test]
+fn swift_qualified_edges_do_not_bind_foreign_scope_paths() {
+    let conn = seeded_conn();
+    let source = add_file(&conn, "Caller.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [source]).unwrap();
+    let foreign = add_file(&conn, "foreign.rs", NEW);
+    add_symbol_scope_language(
+        &conn,
+        foreign,
+        "fetch",
+        "foreign.rs::fetch",
+        "Client::fetch",
+        "function",
+        Language::Rust,
+    );
+    add_symbol_scope_language(
+        &conn,
+        foreign,
+        "Request",
+        "foreign.rs::Request",
+        "API::Request",
+        "struct",
+        Language::Rust,
+    );
+    let call = add_edge(&conn, source, "fetch", "Client::fetch");
+    let type_ref = {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, target_qualified_name, edge_kind, \
+             confidence, resolution) VALUES (?1, 'Request', 'API::Request', 'references_type', \
+             'NameOnly', 'unresolved')",
+            params![source],
+        )
+        .unwrap();
+        conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
+    };
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    for edge in [call, type_ref] {
+        let (to, _, resolution) = edge_state(&conn, edge);
+        assert_eq!(to, None, "qualified Swift references must not bind foreign scope paths");
+        assert_eq!(resolution, "unresolved");
+    }
+}
+
+#[test]
+fn swift_value_receiver_calls_resolve_by_bare_name() {
+    let conn = seeded_conn();
+    let source = add_file(&conn, "Caller.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [source]).unwrap();
+    let definitions = add_file(&conn, "Client.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [definitions]).unwrap();
+    let fetch = add_symbol_scope_language(
+        &conn,
+        definitions,
+        "fetch",
+        "Client.swift::fetch",
+        "Client::fetch",
+        "function",
+        Language::Swift,
+    );
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         receiver_hint) VALUES (?1, 'fetch', 'calls_name', 'NameOnly', 'unresolved', 'client')",
+        params![source],
+    )
+    .unwrap();
+    let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, confidence, resolution) = edge_state(&conn, call);
+    assert_eq!(to, Some(fetch));
+    assert_eq!(confidence, "Syntactic");
+    assert_eq!(resolution, "target_name_fallback");
+    let receiver: String = conn
+        .query_row("SELECT receiver_hint FROM edges WHERE id = ?1", [call], |row| row.get(0))
+        .unwrap();
+    assert_eq!(receiver, "client");
+}
+
+#[test]
+fn swift_local_receivers_override_external_bare_name_suppression() {
+    let mut make = preferred_candidate(1, Language::Swift, "function");
+    make.name = "make".to_string();
+    make.qualified_name = "Store.swift::make".to_string();
+    make.scope_path = "Store::make".to_string();
+    let symbols = [make];
+    let index = SymbolIndex::build(&symbols);
+
+    for receiver in ["Self", "self", "super"] {
+        let qualified = format!("{receiver}::make");
+        let resolved = resolve_symbol(
+            ResolveSymbolRequest {
+                name: "make",
+                target_qualified_name: Some(&qualified),
+                edge_kind: EdgeKind::CallsName.as_str(),
+                evidence: Some("make()"),
+                receiver_hint: Some(receiver),
+                source_file_id: 1,
+                source_language: Some(Language::Swift.as_str()),
+                imported_external: true,
+            },
+            &index,
+        );
+        let (target, confidence, resolution) =
+            resolved.unwrap_or_else(|| panic!("{receiver} must override external suppression"));
+        assert_eq!(target.id, symbols[0].id);
+        assert_eq!(confidence, EdgeConfidence::Syntactic);
+        assert_eq!(resolution, "target_name_fallback");
+    }
+}
+
+#[test]
+fn swift_self_and_super_init_calls_resolve_to_constructors() {
+    let conn = seeded_conn();
+    let source = add_file(&conn, "Child.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [source]).unwrap();
+    let definitions = add_file(&conn, "Parent.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [definitions]).unwrap();
+    let init = add_symbol_kind_language(
+        &conn,
+        definitions,
+        "init",
+        "Parent.swift::init",
+        "constructor",
+        Language::Swift,
+    );
+    let calls = ["Self", "self", "super"].map(|receiver| {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+             receiver_hint) VALUES (?1, 'init', 'calls_name', 'NameOnly', 'unresolved', ?2)",
+            params![source, receiver],
+        )
+        .unwrap();
+        conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
+    });
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    for call in calls {
+        let (to, confidence, resolution) = edge_state(&conn, call);
+        assert_eq!(to, Some(init));
+        assert_eq!(confidence, "Syntactic");
+        assert_eq!(resolution, "target_name_fallback");
+    }
+}
+
+#[test]
+fn swift_enum_constructions_resolve_to_enum_symbols() {
+    let conn = seeded_conn();
+    let source = add_file(&conn, "Caller.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [source]).unwrap();
+    add_symbol_kind_language(
+        &conn,
+        source,
+        "caller",
+        "Caller.swift::caller",
+        "function",
+        Language::Swift,
+    );
+    let definitions = add_file(&conn, "Status.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [definitions]).unwrap();
+    let status = add_symbol_kind_language(
+        &conn,
+        definitions,
+        "Status",
+        "Status.swift::Status",
+        "enum",
+        Language::Swift,
+    );
+    let construction = add_named_edge(&conn, source, "Status", EdgeKind::Constructs);
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, confidence, resolution) = edge_state(&conn, construction);
+    assert_eq!(to, Some(status));
+    assert_eq!(confidence, "Syntactic");
+    assert_eq!(resolution, "target_name_fallback");
+}
+
+#[test]
+fn swift_overloads_do_not_collapse_to_one_logical_variant() {
+    let mut by_id = preferred_candidate(1, Language::Swift, "function");
+    by_id.name = "fetch".to_string();
+    by_id.qualified_name = "Service.swift::fetch".to_string();
+    by_id.scope_path = "Service::fetch".to_string();
+    by_id.start_byte = 10;
+    by_id.end_byte = 30;
+
+    let mut by_name = by_id.clone();
+    by_name.id = 2;
+    by_name.start_byte = 40;
+    by_name.end_byte = 65;
+
+    assert!(
+        !same_logical_symbol(&[&by_id, &by_name]),
+        "same-name Swift overloads must remain ambiguous until signatures enter stored identity"
+    );
 }
 
 /// #61: a `references_type` reference resolves only to a type DEFINITION. When the sole
@@ -178,8 +705,8 @@ fn references_type_does_not_resolve_to_a_non_type_symbol() {
     let conn = seeded_conn();
     let user = add_file(&conn, "a.rs", NEW);
     let defs = add_file(&conn, "b.rs", NEW);
-    // A symbol in the source file so the index knows it's Rust (source_language drives the
-    // type/value-namespace strictness; a real source file always has at least the caller).
+    // The source function owns the type-reference edges; `files.language` selects Rust's strict
+    // type namespace policy.
     add_symbol(&conn, user, "user_fn", "crate::a::user_fn");
     // Only same-named candidate for `Widget` is an impl block (no struct/enum/trait in-corpus).
     add_symbol_kind(&conn, defs, "Widget", "crate::b::Widget", "impl");
@@ -311,14 +838,33 @@ fn add_symbol_scope(
     qualified: &str,
     scope_path: &str,
 ) -> i64 {
+    add_symbol_scope_language(
+        conn,
+        file_id,
+        name,
+        qualified,
+        scope_path,
+        "function",
+        Language::Rust,
+    )
+}
+
+fn add_symbol_scope_language(
+    conn: &Connection,
+    file_id: i64,
+    name: &str,
+    qualified: &str,
+    scope_path: &str,
+    kind: &str,
+    language: Language,
+) -> i64 {
     conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qualified])
         .unwrap();
     conn.execute(
         "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, kind, \
          start_byte, end_byte, start_line, end_line)
-         VALUES (?1, 'rust', ?2, (SELECT id FROM name_strings WHERE value = ?3), ?4, 'function', \
-         0, 10, 1, 1)",
-        params![file_id, name, qualified, scope_path],
+         VALUES (?1, ?2, ?3, (SELECT id FROM name_strings WHERE value = ?4), ?5, ?6, 0, 10, 1, 1)",
+        params![file_id, language.as_str(), name, qualified, scope_path, kind],
     )
     .unwrap();
     conn.last_insert_rowid()
@@ -742,9 +1288,7 @@ fn python_implements_prefers_a_base_class_over_a_non_class() {
     let sub = py_source(&conn, "sub.py");
     let base = py_source(&conn, "base.py");
     let other = py_source(&conn, "other.py");
-    // A symbol in sub.py so the resolver knows the reference's source language is Python (a file's
-    // language is inferred from its symbols, and the language-scoped `implements` preference is
-    // what this exercises).
+    // The subclass declaration owns the edge; `files.language` selects Python's class preference.
     py_sym(&conn, sub, "Sub", "sub.py::Sub", "class");
     // The real base class, and a DECOY same-named non-class (a module-level function `Base`).
     let base_class = py_sym(&conn, base, "Base", "base.py::Base", "class");

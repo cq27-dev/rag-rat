@@ -97,6 +97,7 @@ tree-sitter-cpp = "=0.23.4"
 tree-sitter-kotlin = { package = "tree-sitter-kotlin-ng", version = "1.1.0" }
 tree-sitter-python = "=0.25.0"
 tree-sitter-rust = "=0.24.2"
+tree-sitter-swift = "=0.7.3"
 tree-sitter-typescript = "=0.23.2"
 # Secret-material hygiene for the op-log device seed — `Zeroizing<[u8; 32]>` scrubs the seed copy on
 # drop (already in the tree transitively via ed25519-dalek; pinned here as a direct dep).

@@ -1,6 +1,10 @@
-//! TypeScript graph-edge extraction — the `Language::TypeScript` arm of `syntactic_edges`.
-//! Split out of edges/extract.
-use super::*;
+//! TypeScript graph-edge extraction for the shared structural edge walk.
+use std::path::Path;
+
+use tree_sitter::Node;
+
+use crate::index::edges::extract::*;
+use crate::index::edges::*;
 
 pub(super) fn typescript_edges(
     text: &str,

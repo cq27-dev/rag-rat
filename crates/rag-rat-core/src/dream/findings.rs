@@ -183,7 +183,10 @@ pub(super) fn coverage_gap(conn: &Connection, limit: usize) -> anyhow::Result<Ve
     let inbound: HashSet<i64> = conn
         .prepare(
             "SELECT DISTINCT d.to_symbol_id FROM edges_data d JOIN files ON files.id = \
-             d.source_file_id WHERE d.to_symbol_id IS NOT NULL AND d.from_symbol_id IS NOT NULL",
+             d.source_file_id WHERE d.to_symbol_id IS NOT NULL AND d.from_symbol_id IS NOT NULL
+             AND d.resolution_id NOT IN (
+                 SELECT id FROM name_strings WHERE value = 'suppressed'
+             )",
         )?
         .query_map([], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<_>>()?;

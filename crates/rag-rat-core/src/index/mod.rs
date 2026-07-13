@@ -4,6 +4,7 @@ pub mod chunker;
 pub mod edges;
 pub mod git_history;
 pub mod ignore_rules;
+mod languages;
 pub mod oracle;
 pub mod papertrail;
 pub mod parser;

@@ -222,6 +222,26 @@ fn indexing_reentry_preserves_disabled_detected_languages() {
 }
 
 #[test]
+fn indexing_exposes_and_preselects_detected_swiftpm_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("Sources/App")).unwrap();
+    std::fs::write(dir.path().join("Sources/App/App.swift"), "struct App {}\n").unwrap();
+    let scan = scan_repo(dir.path()).unwrap();
+    let draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
+    let mut state = WizardState::new(draft, scan);
+
+    state.step = Some(init_step(StepId::Indexing, &state));
+
+    assert_eq!(language_toggle(&state, Language::Swift), Some(true));
+    assert!(
+        candidates_for(Language::Swift, &state)
+            .iter()
+            .any(|candidate| candidate.path == std::path::Path::new("Sources") && candidate.default),
+        "the wizard should preselect the SwiftPM Sources directory"
+    );
+}
+
+#[test]
 fn indexing_tree_page_down_moves_selection() {
     let (_dir, mut state) = rust_state(18);
     step_handle_key(StepId::Indexing, key(KeyCode::Tab), &mut state);

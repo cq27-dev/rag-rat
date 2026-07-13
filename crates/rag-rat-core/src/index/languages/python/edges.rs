@@ -1,9 +1,12 @@
-//! Python graph-edge extraction — the `Language::Python` arm of `syntactic_edges`, split out
-//! of the edges/extract god-module. `python_edges` walks the CST; the `python_*` helpers +
-//! `emit_python_type_refs` are its closed-recognizer internals (PEP 604 unions, the
-//! static-base allowlist, relative-import normalization). The CST-edge design principles and
-//! the #172/#... Python bug patterns are captured as repo memories bound here and on the parent.
-use super::*;
+//! Python graph-edge extraction, co-located with Python's parser and resolver policy.
+//! `python_edges` walks the CST. Its private helpers recognize PEP 604 unions, static base types,
+//! and relative imports.
+use std::path::Path;
+
+use tree_sitter::Node;
+
+use crate::index::edges::extract::*;
+use crate::index::edges::*;
 
 pub(super) fn python_edges(
     text: &str,
@@ -584,7 +587,7 @@ fn python_import_target(
 mod python_edge_tests {
     use std::path::Path;
 
-    use super::super::*;
+    use super::*;
     use crate::language::Language;
 
     fn edges(src: &str) -> Vec<EdgeCandidate> {

@@ -319,6 +319,31 @@ mod tests {
     }
 
     #[test]
+    fn rendered_swift_binding_round_trips_with_default_glob() {
+        let root = std::env::temp_dir().join(format!("ragrat-render-swift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Sources/App")).unwrap();
+        std::fs::write(root.join("Sources/App/App.swift"), "struct App {}\n").unwrap();
+        let plan = InitPlan {
+            root_value: ".".to_string(),
+            languages: vec![Language::Swift],
+            bindings: BTreeMap::from([(Language::Swift, vec![PathBuf::from("Sources")])]),
+            backend: EmbeddingBackend::fast_embed(),
+            oracle_auto_run: false,
+        };
+
+        let text = render_config(&plan);
+        assert!(text.contains("swift = [\"Sources\"]"));
+        std::fs::write(root.join("rag-rat.toml"), text).unwrap();
+        let config = Config::load(root.join("rag-rat.toml")).unwrap();
+        assert_eq!(config.targets.len(), 1);
+        assert_eq!(config.targets[0].language, Language::Swift);
+        assert_eq!(config.targets[0].directories, vec![PathBuf::from("Sources")]);
+        assert_eq!(config.targets[0].include, vec!["**/*.swift"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn render_config_emits_full_commented_surface_that_round_trips() {
         // The generated config documents the full surface (commented), still parses via
         // Config::load, and the example [[target]] / [watch] / [version_check] tables stay

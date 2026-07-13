@@ -212,6 +212,12 @@ pub(crate) fn default_dir(scan: &RepoScan, language: Language, path: &Path) -> b
                     || text.ends_with("/src")
                     || directly_contains_source(scan, language, path)
                     || python_root_has_direct_source(scan, path)),
+        Language::Swift =>
+            !text.split('/').any(|component| component == ".build")
+                && (text == "Sources"
+                    || text.ends_with("/Sources")
+                    || text == "src"
+                    || text.ends_with("/src")),
         Language::Markdown => text == "docs" || text == ".",
     }
 }
@@ -337,6 +343,74 @@ mod header_assignment_tests {
         assert_eq!(scan.language_counts.get(&Language::Cpp).copied().unwrap_or(0), 0, "no C++");
 
         fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod swift_dir_tests {
+    use super::*;
+
+    #[test]
+    fn swiftpm_sources_is_the_default_binding() {
+        let scan = RepoScan::default();
+        assert!(default_dir(&scan, Language::Swift, Path::new("Sources")));
+        assert!(default_dir(&scan, Language::Swift, Path::new("Packages/Feature/Sources")));
+        assert!(!default_dir(
+            &scan,
+            Language::Swift,
+            Path::new(".build/checkouts/Dependency/Sources")
+        ));
+        assert!(!default_dir(&scan, Language::Swift, Path::new("Tests")));
+    }
+
+    #[test]
+    fn swiftpm_build_checkouts_are_not_scanned_as_project_source() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("Sources/App")).unwrap();
+        fs::write(root.path().join("Sources/App/Main.swift"), "struct App {}\n").unwrap();
+        fs::create_dir_all(root.path().join(".build/checkouts/Dep/Sources/Dep")).unwrap();
+        fs::write(
+            root.path().join(".build/checkouts/Dep/Sources/Dep/Dep.swift"),
+            "struct Dependency {}\n",
+        )
+        .unwrap();
+
+        let scan = scan_repo(root.path()).unwrap();
+        assert_eq!(scan.language_counts.get(&Language::Swift), Some(&1));
+        assert!(
+            candidate_dirs(&scan, Language::Swift)
+                .iter()
+                .all(|candidate| !candidate.path.starts_with(".build")),
+            "SwiftPM build checkouts must not become init candidates"
+        );
+    }
+
+    #[test]
+    fn swift_root_fallback_remains_safe_for_the_indexer() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("Main.swift"), "struct App {}\n").unwrap();
+        fs::create_dir_all(root.path().join(".build/checkouts/Dep/Sources/Dep")).unwrap();
+        fs::write(
+            root.path().join(".build/checkouts/Dep/Sources/Dep/Dep.swift"),
+            "struct Dependency {}\n",
+        )
+        .unwrap();
+
+        let scan = scan_repo(root.path()).unwrap();
+        let candidates = candidate_dirs(&scan, Language::Swift);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.path == Path::new(".") && candidate.default),
+            "a non-SwiftPM layout should exercise the generated root fallback: {candidates:#?}"
+        );
+
+        let matcher = IgnoreMatcher::compile(root.path(), &[PathBuf::from(".")]);
+        assert!(matcher.is_ignored(
+            &root.path().join(".build/checkouts/Dep/Sources/Dep/Dep.swift"),
+            false,
+        ));
+        assert!(!matcher.is_ignored(&root.path().join("Main.swift"), false));
     }
 }
 

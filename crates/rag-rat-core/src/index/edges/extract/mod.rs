@@ -1,12 +1,5 @@
 use super::*;
 
-mod c_like;
-mod kotlin;
-mod python;
-mod rust;
-mod rust_dispatch;
-mod typescript;
-
 pub(crate) fn index_file_edges(
     conn: &Connection,
     file_id: i64,
@@ -33,7 +26,7 @@ pub(crate) fn edge_candidates(
     text: &str,
     symbols: &[IndexedSymbol],
 ) -> anyhow::Result<Vec<EdgeCandidate>> {
-    if language == Language::Markdown {
+    if crate::index::languages::edge_backend(language).is_none() {
         return Ok(Vec::new());
     }
     let mut candidates = contains_edges(symbols);
@@ -50,7 +43,7 @@ pub(crate) fn edge_candidates_from_root(
     root: Node<'_>,
     symbols: &[IndexedSymbol],
 ) -> Vec<EdgeCandidate> {
-    if language == Language::Markdown {
+    if crate::index::languages::edge_backend(language).is_none() {
         return Vec::new();
     }
     let mut candidates = contains_edges(symbols);
@@ -121,8 +114,7 @@ pub(crate) fn syntactic_edges(
     text: &str,
     symbols: &[IndexedSymbol],
 ) -> anyhow::Result<Vec<EdgeCandidate>> {
-    // Single source of truth for the grammar mapping (#519); `None` (Markdown / no grammar) yields
-    // no edges, same as the old `ParserKind::Markdown` arm.
+    // The parser registry owns grammar selection; a language without a grammar yields no edges.
     let Some(grammar) = parser::grammar_for(parser::parser_kind(path, language)) else {
         return Ok(Vec::new());
     };
@@ -142,12 +134,9 @@ pub(crate) fn syntactic_edges(
 }
 /// Pre-order DFS over the named nodes of `root`, running the per-language edge extractor at each.
 ///
-/// Iterative (#520): the old per-node recursion allocated a fresh `node.walk()` cursor each frame
-/// and recursed to full tree depth, overflowing the stack on a deeply-nested 512 KB file. An
-/// explicit heap stack keeps the call stack O(1); one reused cursor + one reused child buffer keep
-/// it single-allocation. The per-language extractors are unchanged. Error/missing subtrees are
-/// pruned and named children pop in document order — same visit set/order, so edges are emitted
-/// identically.
+/// An explicit heap stack keeps the call stack O(1) on deeply nested files. One reused cursor and
+/// child buffer keep traversal single-allocation; error/missing subtrees are pruned and named
+/// children are visited in document order.
 pub(crate) fn collect_edges(
     language: Language,
     text: &str,
@@ -156,6 +145,9 @@ pub(crate) fn collect_edges(
     path: &Path,
     out: &mut Vec<EdgeCandidate>,
 ) {
+    let Some(backend) = crate::index::languages::edge_backend(language) else {
+        return;
+    };
     let mut stack = vec![root];
     let mut cursor = root.walk();
     let mut named_children = Vec::new();
@@ -163,14 +155,7 @@ pub(crate) fn collect_edges(
         if node.is_error() || node.is_missing() {
             continue;
         }
-        match language {
-            Language::Rust => rust::rust_edges(text, node, symbols, path, out),
-            Language::TypeScript => typescript::typescript_edges(text, node, symbols, path, out),
-            Language::Kotlin => kotlin::kotlin_edges(text, node, symbols, path, out),
-            Language::C | Language::Cpp => c_like::c_like_edges(text, node, symbols, path, out),
-            Language::Python => python::python_edges(text, node, symbols, path, out),
-            Language::Markdown => {},
-        }
+        backend.edges(text, node, symbols, path, out);
         named_children.clear();
         named_children.extend(node.named_children(&mut cursor));
         for &child in named_children.iter().rev() {

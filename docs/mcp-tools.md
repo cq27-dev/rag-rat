@@ -236,7 +236,8 @@ caller knows whether embeddings contributed without setting `explain`. It is `le
 hit when no embedding model is active.
 
 Graph tools are backed by tree-sitter-derived syntax edges. Edge kinds are `imports`, `exports`,
-`calls_name`, `constructs`, `uses_macro`, `references_type`, `implements`, and `contains`; confidence is reported as
+`calls_name`, `constructs`, `dispatches`, `uses_macro`, `uses_operator`, `uses_precedence_group`,
+`references_type`, `implements`, and `contains`; confidence is reported as
 `edge_confidence` (`confidence` is retained as the compatibility alias) with values `Exact`,
 `Syntactic`, `NameOnly`, or `Ambiguous`. Graph evidence is syntactic, confidence-labeled evidence,
 not compiler-grade name resolution or hard truth. Search results default to compact graph evidence

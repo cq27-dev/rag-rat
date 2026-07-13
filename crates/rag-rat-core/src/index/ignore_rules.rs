@@ -67,6 +67,9 @@ const FLOOR_DIRS: &[&str] = &[
     "target",
     "dist",
     "build",
+    // SwiftPM's build tree contains generated output and dependency checkouts whose nested
+    // `Sources/` directories otherwise look indistinguishable from first-party Swift packages.
+    ".build",
     "coverage",
     // Python virtualenv / dependency / cache trees: never project source. `site-packages` is the
     // load-bearing one — installed deps live there regardless of the venv dir's name (`.venv`,
@@ -441,6 +444,7 @@ mod tests {
         assert!(m.is_ignored(&tmp.join(".claude/settings.json"), false));
         assert!(m.is_ignored(&tmp.join(".codex/config.toml"), false));
         assert!(m.is_ignored(&tmp.join("node_modules/pkg/index.ts"), false));
+        assert!(m.is_ignored(&tmp.join(".build/checkouts/Dep/Sources/Dep.swift"), false));
         assert!(!m.is_ignored(&tmp.join("src/lib.rs"), false));
         fs::remove_dir_all(&tmp).ok();
     }

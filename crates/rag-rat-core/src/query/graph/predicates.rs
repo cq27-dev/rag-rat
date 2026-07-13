@@ -227,8 +227,12 @@ pub(crate) fn forward_visibility_filter(options: &GraphTraversalOptions) -> &'st
                 edges.edge_kind = 'constructs'
                 AND edges.to_symbol_id IS NOT NULL
             )
+            OR (
+                edges.edge_kind = 'uses_operator'
+                AND edges.to_symbol_id IS NOT NULL
+            )
             OR edges.edge_kind = 'uses_macro'
-            OR edges.edge_kind NOT IN ('calls_name', 'constructs')
+            OR edges.edge_kind NOT IN ('calls_name', 'constructs', 'uses_operator')
             ",
         (false, true, false) =>
             "
@@ -252,8 +256,12 @@ pub(crate) fn forward_visibility_filter(options: &GraphTraversalOptions) -> &'st
                 edges.edge_kind = 'constructs'
                 AND edges.to_symbol_id IS NOT NULL
             )
+            OR (
+                edges.edge_kind = 'uses_operator'
+                AND edges.to_symbol_id IS NOT NULL
+            )
             OR edges.edge_kind = 'uses_macro'
-            OR edges.edge_kind NOT IN ('calls_name', 'constructs')
+            OR edges.edge_kind NOT IN ('calls_name', 'constructs', 'uses_operator')
             ",
         (false, false, true) =>
             "
@@ -271,7 +279,11 @@ pub(crate) fn forward_visibility_filter(options: &GraphTraversalOptions) -> &'st
                     edges.edge_kind = 'constructs'
                     AND edges.to_symbol_id IS NOT NULL
                 )
-                OR edges.edge_kind NOT IN ('calls_name', 'constructs')
+                OR (
+                    edges.edge_kind = 'uses_operator'
+                    AND edges.to_symbol_id IS NOT NULL
+                )
+                OR edges.edge_kind NOT IN ('calls_name', 'constructs', 'uses_operator')
             )
             ",
         (false, false, false) =>
@@ -299,7 +311,11 @@ pub(crate) fn forward_visibility_filter(options: &GraphTraversalOptions) -> &'st
                     edges.edge_kind = 'constructs'
                     AND edges.to_symbol_id IS NOT NULL
                 )
-                OR edges.edge_kind NOT IN ('calls_name', 'constructs')
+                OR (
+                    edges.edge_kind = 'uses_operator'
+                    AND edges.to_symbol_id IS NOT NULL
+                )
+                OR edges.edge_kind NOT IN ('calls_name', 'constructs', 'uses_operator')
             )
             ",
     }

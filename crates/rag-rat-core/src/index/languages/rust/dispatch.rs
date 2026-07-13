@@ -1,10 +1,12 @@
 //! Rust dispatch-edge synthesis (#200/#207/#208) — emits the actor-channel
-//! `dispatch_construct` / `dispatch_handle` graph facts, split out of edges/extract. `rust_edges`
+//! `dispatch_construct` / `dispatch_handle` graph facts. `rust_edges`
 //! calls the four `pub(super)` entry points (`enum_variant_key`, `dispatch_fact`,
 //! `scoped_identifier_in_value_position`, `rust_dispatch_handle_facts`); everything else is the
 //! CLOSED conservative handler-call recognizer (`result_handler_calls` & friends) whose
 //! false-edge-is-a-bug contract is documented in the repo memories bound here and on the parent.
-use super::*;
+use tree_sitter::Node;
+
+use crate::index::edges::*;
 
 /// PascalCase test for the enum/variant convention (#200): first char uppercase AND at least one
 /// lowercase — so `MlReq`/`Upsert` qualify but `new`, a SCREAMING `CONST`, and a bare `T` do not.

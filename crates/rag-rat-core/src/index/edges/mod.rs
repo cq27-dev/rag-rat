@@ -1,4 +1,4 @@
-mod extract;
+pub(in crate::index) mod extract;
 mod helpers;
 mod imports;
 mod intern;
@@ -27,6 +27,11 @@ pub enum EdgeKind {
     Exports,
     CallsName,
     Constructs,
+    /// A language-level operator token references its declaration independently of the callable
+    /// implementation reached by the companion `calls_name` edge.
+    UsesOperator,
+    /// An operator declaration depends on the precedence group that defines its parse behavior.
+    UsesPrecedenceGroup,
     UsesMacro,
     ReferencesType,
     Implements,
@@ -54,6 +59,8 @@ impl EdgeKind {
             Self::Exports => "exports",
             Self::CallsName => "calls_name",
             Self::Constructs => "constructs",
+            Self::UsesOperator => "uses_operator",
+            Self::UsesPrecedenceGroup => "uses_precedence_group",
             Self::UsesMacro => "uses_macro",
             Self::ReferencesType => "references_type",
             Self::Implements => "implements",
@@ -93,8 +100,8 @@ impl EdgeConfidence {
 /// file-level / `contains` edges and for constructs where a clean identifier node isn't available.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CalleeRange {
-    start_byte: usize,
-    end_byte: usize,
+    pub(in crate::index) start_byte: usize,
+    pub(in crate::index) end_byte: usize,
 }
 
 impl CalleeRange {
@@ -125,36 +132,36 @@ pub(crate) const MOD_FILE_ROOT: i64 = -1;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeCandidate {
-    from_symbol_id: Option<i64>,
-    from_name: Option<String>,
-    to_name: String,
-    target_qualified_name: Option<String>,
-    evidence: Option<String>,
-    receiver_hint: Option<String>,
-    source_span: EdgeSpan,
+    pub(in crate::index) from_symbol_id: Option<i64>,
+    pub(in crate::index) from_name: Option<String>,
+    pub(in crate::index) to_name: String,
+    pub(in crate::index) target_qualified_name: Option<String>,
+    pub(in crate::index) evidence: Option<String>,
+    pub(in crate::index) receiver_hint: Option<String>,
+    pub(in crate::index) source_span: EdgeSpan,
     /// Byte range of the callee identifier token; see [`CalleeRange`]. `None` for non-symbol
     /// edges.
-    callee_span: Option<CalleeRange>,
+    pub(in crate::index) callee_span: Option<CalleeRange>,
     /// Module-aware import scope; see [`ImportScopeRange`]. `Some` only for Rust Imports edges (a
     /// `use`'s enclosing scope, or an inline `mod`'s body range); `None` for every other edge.
-    import_scope: Option<ImportScopeRange>,
-    edge_kind: EdgeKind,
-    confidence: EdgeConfidence,
+    pub(in crate::index) import_scope: Option<ImportScopeRange>,
+    pub(in crate::index) edge_kind: EdgeKind,
+    pub(in crate::index) confidence: EdgeConfidence,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct IndexedSymbol {
-    id: i64,
-    file_id: i64,
-    language: String,
-    name: String,
-    qualified_name: String,
-    scope_path: String,
-    kind: String,
-    start_byte: usize,
-    end_byte: usize,
-    start_line: i64,
-    end_line: i64,
+    pub(in crate::index) id: i64,
+    pub(in crate::index) file_id: i64,
+    pub(in crate::index) language: String,
+    pub(in crate::index) name: String,
+    pub(in crate::index) qualified_name: String,
+    pub(in crate::index) scope_path: String,
+    pub(in crate::index) kind: String,
+    pub(in crate::index) start_byte: usize,
+    pub(in crate::index) end_byte: usize,
+    pub(in crate::index) start_line: i64,
+    pub(in crate::index) end_line: i64,
 }
 
 impl IndexedSymbol {
@@ -435,16 +442,16 @@ impl FullRebuildGraph {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EdgeSpan {
-    start_line: i64,
-    end_line: i64,
-    start_byte: i64,
-    end_byte: i64,
+    pub(in crate::index) start_line: i64,
+    pub(in crate::index) end_line: i64,
+    pub(in crate::index) start_byte: i64,
+    pub(in crate::index) end_byte: i64,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EdgeContext {
-    target_qualified_name: Option<String>,
-    receiver_hint: Option<String>,
+    pub(in crate::index) target_qualified_name: Option<String>,
+    pub(in crate::index) receiver_hint: Option<String>,
 }
 
 impl IndexedSymbol {
@@ -476,8 +483,6 @@ pub(crate) struct SymbolIndex<'a> {
     /// `::`-segment of the qualified name (a name ending in `::{q}` necessarily shares `q`'s
     /// tail).
     by_qn_tail: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
-    /// Language of each source file (first symbol seen for the file).
-    file_language: HashMap<i64, &'a str>,
 }
 
 impl<'a> SymbolIndex<'a> {
@@ -486,19 +491,17 @@ impl<'a> SymbolIndex<'a> {
         let mut by_scope_path: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_qn_tail: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
-        let mut file_language: HashMap<i64, &str> = HashMap::new();
         for symbol in symbols {
             by_qualified.entry(symbol.qualified_name.as_str()).or_default().push(symbol);
             by_scope_path.entry(symbol.scope_path.as_str()).or_default().push(symbol);
             by_name.entry(symbol.name.as_str()).or_default().push(symbol);
             by_qn_tail.entry(qn_tail(&symbol.qualified_name)).or_default().push(symbol);
-            file_language.entry(symbol.file_id).or_insert(symbol.language.as_str());
         }
-        Self { by_qualified, by_scope_path, by_name, by_qn_tail, file_language }
+        Self { by_qualified, by_scope_path, by_name, by_qn_tail }
     }
 
-    /// Whether `file_id` itself defines a symbol named `name`. The Python alias rebind uses this to
-    /// DEFER when the imported target's bare name is ALSO defined locally (#174 review): a bare
+    /// Whether `file_id` itself defines a symbol named `name`. Import-alias rebinding defers when
+    /// the imported target's bare name is also defined locally: a bare
     /// rewrite of `Account` → `User` could grab a same-file `User` instead of the import, so leave
     /// it to normal resolution. (The alias-shadow ordering — a same-module `class Account` /
     /// `Account = …` after the import reassigning the name — is handled at extraction by bounding

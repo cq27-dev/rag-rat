@@ -636,6 +636,9 @@ pub(crate) fn clear_edge_oracle_for_tool(
               AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
               AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
               AND ek.value = edge_oracle.edge_kind
+              AND edges_data.resolution_id NOT IN (
+                  SELECT id FROM name_strings WHERE value = 'suppressed'
+              )
               AND {scope}
           )
         ",
@@ -1439,6 +1442,9 @@ pub(crate) fn prune_edge_oracle_without_live_edge(conn: &Connection) -> anyhow::
               AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
               AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
               AND ek.value = edge_oracle.edge_kind
+              AND edges_data.resolution_id NOT IN (
+                  SELECT id FROM name_strings WHERE value = 'suppressed'
+              )
         ){repo_clause}
         "
         ),

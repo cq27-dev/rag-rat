@@ -39,7 +39,9 @@ pub(crate) fn edge_weight(kind: &str) -> f64 {
         // so they contribute nothing even if a query forgets to exclude them (defense in depth).
         "dispatch_construct" | "dispatch_handle" => 0.0,
         "references_type" | "constructs" => 0.7,
-        "uses_macro" => 0.5,
+        // Operator syntax emits a full-weight call to its implementation plus a declaration-use
+        // edge; downweight the latter so one expression does not count as two direct calls.
+        "uses_macro" | "uses_operator" | "uses_precedence_group" => 0.5,
         "imports" | "exports" => 0.3,
         "contains" => 0.2,
         _ => 1.0,
@@ -332,6 +334,9 @@ pub fn important_symbols(
          JOIN name_strings ek ON ek.id = d.edge_kind_id
          JOIN name_strings cf ON cf.id = d.confidence_id
          WHERE d.from_symbol_id IS NOT NULL
+           AND d.resolution_id NOT IN (
+               SELECT id FROM name_strings WHERE value = 'suppressed'
+           )
            -- Internal dispatch FACT rows (#200) are synthesis inputs, not real edges — they'd
            -- double-count (the handle fact duplicates the dispatcher's existing calls_name) and
            -- inflate rank. The synthesized `dispatches` edge IS counted (it's a real dependency).
@@ -545,6 +550,7 @@ mod tests {
     fn edge_weight_downweights_weak_kinds() {
         assert!(edge_weight("calls_name") > edge_weight("imports"));
         assert!(edge_weight("implements") > edge_weight("contains"));
+        assert!(edge_weight("calls_name") > edge_weight("uses_operator"));
         assert_eq!(edge_weight("something_new"), 1.0, "unknown kinds default to full weight");
     }
 
@@ -593,6 +599,32 @@ mod tests {
         let bare = Connection::open_in_memory().unwrap();
         schema::apply(&bare).unwrap();
         assert!(important_symbols(&bare, opts(10, &[])).unwrap().symbols.is_empty());
+    }
+
+    #[test]
+    fn important_symbols_ignores_suppressed_edges() {
+        let conn = conf_conn(2, &[]);
+        conn.execute(
+            "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,
+                               target_qualified_name, edge_kind, confidence, resolution)
+             VALUES (1, 1, NULL, 's2', 'a::s2', 'uses_macro', 'NameOnly', 'suppressed')",
+            [],
+        )
+        .unwrap();
+        let edge_id: i64 =
+            conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+        let effects = HashMap::from([(edge_id, EdgeOracleEffect::Retarget(2))]);
+        assert!(
+            important_symbols(&conn, ImportanceOptions {
+                limit: 10,
+                personalize_to: &[],
+                oracle_effects: Some(&effects),
+            })
+            .unwrap()
+            .symbols
+            .is_empty(),
+            "even a stale oracle retarget cannot revive a suppressed candidate"
+        );
     }
 
     /// Insert `n` symbols (`s1..sn`, ids `1..=n`) plus `edges` as `(from_id, to_id)` calls, all in

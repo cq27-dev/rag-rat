@@ -38,8 +38,9 @@ sequenceDiagram
   are *not* assistant memory: they are versioned, local, source-anchored facts about **this**
   repository that any future agent retrieves with evidence.
 - **A real code graph.** tree-sitter callers/callees/imports across Rust, TypeScript/TSX, Kotlin,
-  C/C++, and Python — with an optional [compiler-grade SCIP oracle](docs/oracle.md) that upgrades
-  edges to `Compiler` confidence and ranks the load-bearing symbols.
+  C/C++, Python, and Swift — with an optional [compiler-grade SCIP oracle](docs/oracle.md) for
+  configured toolchains that upgrades edges to `Compiler` confidence and ranks the load-bearing
+  symbols.
 - **History as evidence.** Git history, lazy chunk blame, and cached GitHub issue/PR/review
   rationale, all queryable.
 - **Rides your existing grep.** A [PreToolUse hook](docs/grep-augmentation.md) injects the memories

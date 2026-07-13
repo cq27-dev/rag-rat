@@ -645,6 +645,9 @@ fn graph_boost(
         JOIN name_strings tn ON tn.id = d.to_name_id
         WHERE (d.from_name_id IN (SELECT id FROM name_strings WHERE value IN (?1, ?2))
             OR d.to_name_id IN (SELECT id FROM name_strings WHERE value IN (?1, ?2)))
+          AND d.resolution_id NOT IN (
+              SELECT id FROM name_strings WHERE value = 'suppressed'
+          )
           AND EXISTS (SELECT 1 FROM main.files f
                        WHERE f.id = d.source_file_id AND f.repo_id = ?3)
         ORDER BY
@@ -732,7 +735,8 @@ fn confidence_weight(confidence: &str) -> f64 {
 
 fn relation_weight(edge_kind: &str) -> f64 {
     match edge_kind {
-        "calls_name" | "constructs" | "uses_macro" => 1.0,
+        "calls_name" | "constructs" | "uses_operator" | "uses_precedence_group" | "uses_macro" =>
+            1.0,
         "imports" | "exports" => 0.60,
         "references_type" | "implements" | "extends" => 0.40,
         "contains" => 0.20,
@@ -999,6 +1003,9 @@ mod tests {
                  JOIN name_strings ek ON ek.id = d.edge_kind_id
                  WHERE (d.from_name_id IN (SELECT id FROM name_strings WHERE value IN ('a', 'b'))
                      OR d.to_name_id IN (SELECT id FROM name_strings WHERE value IN ('a', 'b')))
+                   AND d.resolution_id NOT IN (
+                       SELECT id FROM name_strings WHERE value = 'suppressed'
+                   )
                    AND EXISTS (SELECT 1 FROM main.files f
                                 WHERE f.id = d.source_file_id AND f.repo_id = 'r')",
             )
@@ -1021,6 +1028,37 @@ mod tests {
             !plan.contains("SCAN f"),
             "graph_boost repo scope must PK-search files, not scan it, got plan:\n{plan}"
         );
+    }
+
+    #[test]
+    fn graph_boost_ignores_suppressed_edge_candidates() {
+        let conn = seeded_conn();
+        conn.execute(
+            "INSERT INTO edges(source_file_id, from_name, to_name, edge_kind, confidence,
+                               resolution, evidence)
+             VALUES (1, 'watcher_main', 'available', 'uses_macro', 'NameOnly', 'suppressed',
+                     '@available')",
+            [],
+        )
+        .unwrap();
+        let hit = SearchHit {
+            chunk_id: 1,
+            path: "src/watch.rs".to_string(),
+            language: "rust".to_string(),
+            kind: "symbol".to_string(),
+            start_line: 1,
+            end_line: 20,
+            symbol_path: Some("watcher_main".to_string()),
+            score: 0.0,
+            retrieval_mode: "lexical".to_string(),
+            summary: String::new(),
+            graph: None,
+            score_components: None,
+            importance: None,
+        };
+        let repo_id = schema::active_repo_id(&conn).unwrap();
+        let boost = graph_boost(&conn, &hit, &["available".to_string()], &repo_id).unwrap();
+        assert_eq!(boost, 0.0, "suppressed resolver candidates are not ranking evidence");
     }
 
     /// The pre-materialization bm25 JOIN shape (joins the scope VIEW `files` directly, no CTE) —
