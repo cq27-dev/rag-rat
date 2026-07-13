@@ -20,10 +20,11 @@ use super::candidate::{self, Ancestry, CutCoordinate, HeaderView, JoinResult, Un
 use super::cut::{Cut, beyond};
 use super::envelope::{AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
-use super::ops::{self, AccountOp, ChainKind, DecodedAccountOp, DeviceRole};
+use super::ops::{self, AccountOp, ChainKind, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::registers::RegisterKey;
 use crate::oplog::cbor;
 use crate::oplog::op::DeviceFingerprint;
+use crate::oplog::stream::{self, StreamId};
 
 /// The account CONTROL log the fold operates on (§11) — its registers are control-log scoped
 /// (`log: 0`). A known op on the secrets (1) or content (2) log is not a control op and is retained
@@ -73,6 +74,7 @@ impl Outcome {
                     ParkReason::UnknownCutTarget => "unknown_cut_target",
                     ParkReason::IncompleteCutAncestry => "incomplete_cut_ancestry",
                     ParkReason::ContestedSubject => "contested_subject",
+                    ParkReason::AuthLenAhead => "auth_len_ahead",
                     ParkReason::DeferredStreamAuthorization => "deferred_stream_authorization",
                 }),
             ),
@@ -90,6 +92,7 @@ impl Outcome {
                     RejectReason::WrongDevice => "wrong_device",
                     RejectReason::Malformed => "malformed",
                     RejectReason::NonGenesisOrigin => "non_genesis_origin",
+                    RejectReason::InvalidStreamSpec => "invalid_stream_spec",
                     RejectReason::Ineffective => "ineffective",
                 }),
             ),
@@ -139,6 +142,9 @@ pub(super) enum RejectReason {
     /// A seq-0 origin entry on the FOUNDER's chain that is not the genesis — a second seq-0 slot
     /// competing with the root (equivocation). The founder's origin slot is the genesis alone.
     NonGenesisOrigin,
+    /// A `StreamOwn` preimage is not the canonical owner-bound `/2` spec named by its account and
+    /// `stream_id`.
+    InvalidStreamSpec,
     /// A duplicate / no-op / self-referential op with no effect — incl. an `AccountReRoot` in a
     /// `Live` account (admissible only as the terminal recovery op once contested, §12).
     Ineffective,
@@ -157,10 +163,10 @@ pub(super) enum ParkReason {
     /// The entry's author is a subject of a residue cut op in a `contested` account (§12) — parked,
     /// quota-bounded, reclassified if the account recovers.
     ContestedSubject,
-    /// A `StreamOwn` / `StreamGrant` / `StreamRevoke`: stream ownership + grant authority is folded
-    /// by the C2 content-chain acceptance predicate (which owns the `/2` spec decoder and the
-    /// grant registers), not the C1 control fold. Parked here so C1 trusts NOTHING from an
-    /// unvalidated stream op; C2 reclassifies it.
+    /// The entry asserts a control-fold length not yet present locally. This is recoverable:
+    /// refetch missing control ancestry and refold; the counter never grants authority.
+    AuthLenAhead,
+    /// A secrets/content cut whose target register belongs to a later phase.
     DeferredStreamAuthorization,
 }
 
@@ -180,6 +186,91 @@ pub(super) struct AccountAuthHistory {
     /// — the smallest `successor_account_id` by byte order among the admitted re-roots (§12).
     /// `None` when the account is `Live` or no pre-contest owner has re-rooted yet.
     contested_successor: Option<AccountId>,
+    effective_count: u64,
+    roster_refs: HashMap<[u8; 32], RosterFact>,
+    owner_incarnations: HashMap<[u8; 32], OwnerIncarnationFact>,
+    stream_ownership: HashMap<StreamId, StreamOwnershipFact>,
+    grants: HashMap<[u8; 32], GrantFact>,
+    grant_cuts: HashMap<[u8; 32], Vec<DeviceCut>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorityQuery<T> {
+    Effective(T),
+    Parked(AuthorityParkReason),
+    Invalid(AuthorityInvalidReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorityParkReason {
+    AuthLenAhead,
+    UnknownReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorityInvalidReason {
+    WrongSubject,
+    ReferencedEntryNotEffective,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RosterAuthority {
+    pub(crate) device_fingerprint: DeviceFingerprint,
+    pub(crate) role: DeviceRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnerAuthority {
+    pub(crate) device_fingerprint: DeviceFingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GrantAuthority {
+    pub(crate) stream_id: StreamId,
+    pub(crate) grantee_account_id: AccountId,
+    pub(crate) role: GrantRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantDeviceAuthority {
+    pub(crate) grant: GrantAuthority,
+    pub(crate) boundary: GrantDeviceBoundary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GrantDeviceBoundary {
+    Open,
+    Cut(DeviceCut),
+    /// The grant is revoked and this device was not named in its prefix-preserving cuts. A fresh
+    /// or unlisted device gets the empty register: no content entry is admissible.
+    Closed,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RosterFact {
+    pub(super) authority: RosterAuthority,
+    pub(super) effective_at: u64,
+    pub(super) closed_at: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct OwnerIncarnationFact {
+    pub(super) authority: OwnerAuthority,
+    pub(super) effective_at: u64,
+    pub(super) closed_at: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StreamOwnershipFact {
+    pub(super) own_id: [u8; 32],
+    pub(super) effective_at: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct GrantFact {
+    pub(super) authority: GrantAuthority,
+    pub(super) effective_at: u64,
+    pub(super) closed_at: Option<u64>,
 }
 
 impl AccountAuthHistory {
@@ -197,9 +288,135 @@ impl AccountAuthHistory {
         self.contested_successor
     }
 
+    pub(super) fn effective_count(&self) -> u64 {
+        self.effective_count
+    }
+
+    pub(super) fn roster_facts(&self) -> impl Iterator<Item = (&[u8; 32], &RosterFact)> {
+        self.roster_refs.iter()
+    }
+
+    pub(super) fn owner_incarnation_facts(
+        &self,
+    ) -> impl Iterator<Item = (&[u8; 32], &OwnerIncarnationFact)> {
+        self.owner_incarnations.iter()
+    }
+
+    pub(super) fn stream_ownership_facts(
+        &self,
+    ) -> impl Iterator<Item = (&StreamId, &StreamOwnershipFact)> {
+        self.stream_ownership.iter()
+    }
+
+    pub(super) fn grant_facts(&self) -> impl Iterator<Item = (&[u8; 32], &GrantFact)> {
+        self.grants.iter()
+    }
+
+    pub(super) fn grant_cuts(&self) -> impl Iterator<Item = (&[u8; 32], &[DeviceCut])> {
+        self.grant_cuts.iter().map(|(grant_id, cuts)| (grant_id, cuts.as_slice()))
+    }
+
+    pub(super) fn roster_ref_effective(
+        &self,
+        roster_ref: [u8; 32],
+        device_fingerprint: DeviceFingerprint,
+        auth_len: u64,
+    ) -> AuthorityQuery<RosterAuthority> {
+        query_fact(
+            self.effective_count,
+            auth_len,
+            self.roster_refs
+                .get(&roster_ref)
+                .filter(|fact| fact.closed_at.is_none())
+                .map(|fact| (fact.authority, fact.authority.device_fingerprint)),
+            device_fingerprint,
+            self.outcomes.contains_key(&roster_ref),
+        )
+    }
+
+    pub(super) fn owner_incarnation_effective(
+        &self,
+        owner_id: [u8; 32],
+        device_fingerprint: DeviceFingerprint,
+        auth_len: u64,
+    ) -> AuthorityQuery<OwnerAuthority> {
+        query_fact(
+            self.effective_count,
+            auth_len,
+            self.owner_incarnations
+                .get(&owner_id)
+                .filter(|fact| fact.closed_at.is_none())
+                .map(|fact| (fact.authority, fact.authority.device_fingerprint)),
+            device_fingerprint,
+            self.outcomes.contains_key(&owner_id),
+        )
+    }
+
+    pub(super) fn grant_effective(
+        &self,
+        grant_id: [u8; 32],
+        stream_id: StreamId,
+        grantee_account_id: AccountId,
+        auth_len: u64,
+    ) -> AuthorityQuery<GrantAuthority> {
+        if auth_len > self.effective_count {
+            return AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead);
+        }
+        let Some(fact) = self.grants.get(&grant_id) else {
+            return if self.outcomes.contains_key(&grant_id) {
+                AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
+            } else {
+                AuthorityQuery::Parked(AuthorityParkReason::UnknownReference)
+            };
+        };
+        if fact.authority.stream_id != stream_id
+            || fact.authority.grantee_account_id != grantee_account_id
+        {
+            return AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject);
+        }
+        AuthorityQuery::Effective(fact.authority)
+    }
+
+    pub(super) fn stream_owner_effective(
+        &self,
+        stream_id: StreamId,
+        auth_len: u64,
+    ) -> AuthorityQuery<[u8; 32]> {
+        if auth_len > self.effective_count {
+            return AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead);
+        }
+        let Some(fact) = self.stream_ownership.get(&stream_id) else {
+            return AuthorityQuery::Parked(AuthorityParkReason::UnknownReference);
+        };
+        AuthorityQuery::Effective(fact.own_id)
+    }
+
     fn is_effective(&self, entry_hash: &[u8; 32]) -> bool {
         self.outcome(entry_hash).is_some_and(|o| o.is_effective())
     }
+}
+
+fn query_fact<T: Copy, S: PartialEq>(
+    effective_count: u64,
+    auth_len: u64,
+    fact: Option<(T, S)>,
+    expected_subject: S,
+    reference_is_known: bool,
+) -> AuthorityQuery<T> {
+    if auth_len > effective_count {
+        return AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead);
+    }
+    let Some((authority, subject)) = fact else {
+        return if reference_is_known {
+            AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
+        } else {
+            AuthorityQuery::Parked(AuthorityParkReason::UnknownReference)
+        };
+    };
+    if subject != expected_subject {
+        return AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject);
+    }
+    AuthorityQuery::Effective(authority)
 }
 
 /// A structurally-valid, signature-valid candidate the fold considers: the verified entry + its
@@ -347,6 +564,19 @@ struct FoldState {
     genesis_seen: bool,
     /// 0-based effective index assigned as `auth_epoch`.
     next_auth_epoch: u64,
+    /// Effective immutable stream ownership roots, keyed by owner-bound stream id.
+    stream_ownership: HashMap<StreamId, [u8; 32]>,
+    /// Effective grant incarnations. A revoke closes exactly one id; a later grant gets a fresh
+    /// hash and remains independent.
+    grants: HashMap<[u8; 32], LiveGrant>,
+}
+
+#[derive(Clone, Copy)]
+struct LiveGrant {
+    stream_id: StreamId,
+    grantee_account_id: AccountId,
+    role: GrantRole,
+    open: bool,
 }
 
 /// A hash-keyed [`HeaderView`] over ALL verified entries — the ancestry walk + cut-target binding
@@ -572,6 +802,34 @@ fn join_register(
 /// MUST share `account_id` (the caller groups by account). Order-independent: the result is
 /// identical under every permutation of `entries`.
 pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHistory {
+    // Readiness is monotone: once an entry proves it was authored ahead of the locally folded
+    // authority history (or depends on authority that did not survive the fold), it cannot
+    // contribute a register or phase-E mutation in this fold. Re-run the frozen stratified pass
+    // with those entries held out until no new readiness exclusions appear. This is not a graph
+    // fixpoint: each pass still performs exactly the §11.1 one-way, per-depth register fold, and
+    // exclusions only grow.
+    let mut readiness_exclusions = HashMap::new();
+    loop {
+        let (history, discovered) = fold_account_pass(entries, &readiness_exclusions);
+        let mut changed = false;
+        for (hash, outcome) in discovered {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                readiness_exclusions.entry(hash)
+            {
+                entry.insert(outcome);
+                changed = true;
+            }
+        }
+        if !changed {
+            return history;
+        }
+    }
+}
+
+fn fold_account_pass(
+    entries: &[VerifiedAccountEntry],
+    readiness_exclusions: &HashMap<[u8; 32], Outcome>,
+) -> (AccountAuthHistory, HashMap<[u8; 32], Outcome>) {
     let mut outcomes: HashMap<[u8; 32], Outcome> = HashMap::new();
 
     // Decode once, then classify. `candidates` are the ops the fold actually folds; `all_headers`
@@ -626,11 +884,20 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         for c in &candidates {
             outcomes.insert(c.hash(), Outcome::Parked(ParkReason::UnknownOwnerRef));
         }
-        return AccountAuthHistory {
-            outcomes,
-            classification: AccountClassification::Live,
-            contested_successor: None,
-        };
+        return (
+            AccountAuthHistory {
+                outcomes,
+                classification: AccountClassification::Live,
+                contested_successor: None,
+                effective_count: 0,
+                roster_refs: HashMap::new(),
+                owner_incarnations: HashMap::new(),
+                stream_ownership: HashMap::new(),
+                grants: HashMap::new(),
+                grant_cuts: HashMap::new(),
+            },
+            HashMap::new(),
+        );
     };
     let genesis_owner_id = genesis.hash();
     let genesis_founder = genesis.subject_device();
@@ -640,6 +907,10 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     // Group resolvable candidates by author-depth; unresolvable citations park.
     let mut strata: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (idx, c) in candidates.iter().enumerate() {
+        if let Some(outcome) = readiness_exclusions.get(&c.hash()) {
+            outcomes.insert(c.hash(), *outcome);
+            continue;
+        }
         // The founder's seq-0 origin slot is the genesis ALONE. A second seq-0 entry on the
         // founder's chain is an origin equivocation with the root — reject it (else, sorting before
         // genesis by hash, it could take auth_epoch 0 and mutate state before the root is applied).
@@ -661,22 +932,20 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     // A single per-depth pass over the strata (§11.1): each depth admits its live cut ops'
     // registers, detects contested, condemns/parks against the registers so far, then runs the
     // effect pass. A CutExtend re-blesses its cone via the same-depth `⊔` join (cross-depth
-    // recovery is the deferred fixpoint's job — a global recompute could preserve a register
-    // whose creator the fold condemns).
+    // recovery is deliberately excluded by the stratified model).
     let mut state = FoldState { live: HashSet::from([genesis_owner_id]), ..Default::default() };
     // The revocation registers accumulated so far (extend-only, joined by `⊔`), every entry a
     // register condemns (grows monotonically — a lower-depth decision is final, no oscillation) /
     // parks (rebuilt fresh each depth), and the cut ops decided in the register pass (a binding
-    // failure / I2). Per-depth monotone, matching §11.1 — a CutExtend re-blesses its cone via the
-    // same-depth `⊔` join, not a global recompute (a global seed could preserve a register whose
-    // creator the fold later condemns).
+    // failure / I2).
     let mut registers: HashMap<RegisterKey, Cut> = HashMap::new();
     let mut condemned: HashMap<[u8; 32], CondemnedReason> = HashMap::new();
     let mut parked: HashMap<[u8; 32], ParkReason> = HashMap::new();
     let mut cut_verdicts: HashMap<[u8; 32], Outcome> = HashMap::new();
+    let mut register_contributors: HashSet<[u8; 32]> = HashSet::new();
     let mut classification = AccountClassification::Live;
 
-    'depths: for (depth, idxs) in strata {
+    'depths: for (&depth, idxs) in &strata {
         let view = CandidateView { headers: &all_headers };
 
         // (a) REGISTER PASS. A cut op installs a register iff its author is AUTHORIZED
@@ -685,7 +954,7 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         // owner impersonation), it passes cut-target binding (§11.3), and — for
         // OwnerDemote — its target `owner_id` names its subject device.
         let mut admitted: Vec<AdmittedCut<'_>> = Vec::new();
-        for &i in &idxs {
+        for &i in idxs {
             let c = &candidates[i];
             // A condemned OR parked cut op installs nothing — parked authority (its own chain is
             // under a not-yet-decided watermark) must not have register side effects before it is
@@ -788,7 +1057,9 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         // this) are a same-depth mutual condemnation ⇒ contested, never a chosen hash.
         for a in &admitted {
             match join_register(&mut registers, a.key.clone(), a.cut.clone(), &view) {
-                RegisterJoin::Applied => {},
+                RegisterJoin::Applied => {
+                    register_contributors.insert(a.op.hash());
+                },
                 RegisterJoin::Contested => {
                     classification = AccountClassification::Contested { state_before_depth: depth };
                     break 'depths;
@@ -808,7 +1079,7 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         // bare extend). An extend for a not-yet-established register parks until
         // the creator syncs.
         let mut extends: Vec<(&Candidate, RegisterKey, Cut)> = Vec::new();
-        for &i in &idxs {
+        for &i in idxs {
             let c = &candidates[i];
             if condemned.contains_key(&c.hash()) || parked.contains_key(&c.hash()) {
                 continue;
@@ -835,7 +1106,9 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         extends.sort_by_key(|(c, _, _)| c.hash());
         for (c, key, cut) in extends {
             match join_register(&mut registers, key, cut, &view) {
-                RegisterJoin::Applied => {},
+                RegisterJoin::Applied => {
+                    register_contributors.insert(c.hash());
+                },
                 RegisterJoin::Contested => {
                     classification = AccountClassification::Contested { state_before_depth: depth };
                     break 'depths;
@@ -847,21 +1120,8 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         }
 
         // Re-derive condemnation + parking against the current registers. Condemnation grows
-        // monotonically (a lower-depth decision is never revised); parking is rebuilt fresh (a
-        // withheld watermark parks the under-cut prefix — I11). Pruning a condemned MINT from
-        // `live` kills its dependents transitively (they cite an owner_id no longer live →
-        // stale).
-        //
-        // BOUNDARY (per-depth model): a register that retroactively condemns an already-effective
-        // NON-mint entry (e.g. a member DeviceAdd) is reflected in that entry's outcome (the final
-        // overlay), but its roster/tombstone side effect is not rolled back, and a same-depth
-        // dependent may read the stale roster. Reaching that state requires an OWNER surgically
-        // cutting a co-owner's incarnation to strand a member it is concurrently promoting —
-        // Byzantine owner behaviour, which the trusted-owner threat model puts out of automated
-        // resolution (owner-key compromise ⇒ `contested`, never silently reconciled). A full
-        // effect-state rebuild + register-provenance fixpoint would close it and is the natural
-        // home for cross-depth `CutExtend` recovery too; both are deferred with that model in
-        // force.
+        // monotonically: the frozen stratified model never lets a deeper authority revise a
+        // lower-depth decision. Parking is rebuilt because missing ancestry can arrive later.
         parked.clear();
         for c in &candidates {
             // The genesis is the account's ROOT axiom — it can never be condemned, else a cut on
@@ -906,7 +1166,7 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         // (b) EFFECT PASS over the stratum in (chain, seq, hash) order — a TOTAL order, so an
         // equivocation (same device + seq, different content) sorts identically under every
         // arrival permutation (I9).
-        let mut ordered = idxs;
+        let mut ordered = idxs.clone();
         ordered.sort_by_key(|&i| {
             let h = candidates[i].header();
             (h.device_fingerprint.to_bytes(), h.seq, candidates[i].hash())
@@ -932,6 +1192,26 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
             outcomes.insert(c.hash(), outcome);
         }
     }
+
+    // Registers and their per-depth condemnation decisions are now final. Rebuild ONLY phase-E
+    // state against those fixed verdicts so a retroactively condemned non-mint cannot leave a
+    // roster, tombstone, ownership, or grant mutation behind. This is deliberately not a graph
+    // fixpoint: no register is added/removed and no lower-depth condemnation is revised.
+    let replay_before_depth = match classification {
+        AccountClassification::Live => None,
+        AccountClassification::Contested { state_before_depth } => Some(state_before_depth),
+    };
+    state = replay_effect_state(
+        &candidates,
+        &strata,
+        &incarnations,
+        genesis_owner_id,
+        replay_before_depth,
+        &condemned,
+        &parked,
+        &cut_verdicts,
+        &mut outcomes,
+    );
 
     // Overlay the FINAL register verdicts: a candidate effective at a shallow depth but
     // condemned / parked by a later register reflects that here (the strictest verdict
@@ -995,7 +1275,335 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         }
     }
 
-    AccountAuthHistory { outcomes, classification, contested_successor }
+    let mut discovered = close_final_authority_dependencies(&candidates, &mut outcomes);
+    if matches!(classification, AccountClassification::Contested { .. }) {
+        contested_successor = candidates
+            .iter()
+            .filter(|candidate| outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective))
+            .filter_map(|candidate| match candidate.op {
+                AccountOp::AccountReRoot { successor_account_id, .. } => Some(successor_account_id),
+                _ => None,
+            })
+            .min_by_key(|account_id| account_id.to_bytes());
+    }
+    let effective_count = normalize_auth_epochs(&mut outcomes);
+    // Effective candidates use `effective_count - 1` inside the closure above. Also inspect
+    // condemned, contested, and actual register contributors against the fully-folded count: a
+    // mint can provisionally authorize the descendant cut that later condemns it; mutually-
+    // condemning ahead cuts can manufacture `Contested`; and a cut may install a register before
+    // phase E rejects it as ineffective (for example, removing a never-enrolled device).
+    // Structurally rejected and ordinarily parked candidates retain their stronger verdict when
+    // they contributed neither state nor a register.
+    for candidate in &candidates {
+        if !readiness_exclusions.contains_key(&candidate.hash())
+            && (register_contributors.contains(&candidate.hash())
+                || matches!(
+                    outcomes.get(&candidate.hash()),
+                    Some(Outcome::Condemned(_) | Outcome::Parked(ParkReason::ContestedSubject))
+                ))
+            && candidate.header().auth_len > effective_count
+        {
+            discovered.insert(candidate.hash(), Outcome::Parked(ParkReason::AuthLenAhead));
+        }
+    }
+    let facts = derive_authority_facts(&candidates, &outcomes);
+    (
+        AccountAuthHistory {
+            outcomes,
+            classification,
+            contested_successor,
+            effective_count,
+            roster_refs: facts.roster_refs,
+            owner_incarnations: facts.owner_incarnations,
+            stream_ownership: facts.stream_ownership,
+            grants: facts.grants,
+            grant_cuts: facts.grant_cuts,
+        },
+        discovered,
+    )
+}
+
+#[expect(clippy::too_many_arguments, reason = "fixed fold verdicts are explicit replay inputs")]
+fn replay_effect_state(
+    candidates: &[Candidate],
+    strata: &BTreeMap<usize, Vec<usize>>,
+    incarnations: &Incarnations<'_>,
+    genesis_owner_id: [u8; 32],
+    before_depth: Option<usize>,
+    condemned: &HashMap<[u8; 32], CondemnedReason>,
+    parked: &HashMap<[u8; 32], ParkReason>,
+    cut_verdicts: &HashMap<[u8; 32], Outcome>,
+    outcomes: &mut HashMap<[u8; 32], Outcome>,
+) -> FoldState {
+    let mut state = FoldState { live: HashSet::from([genesis_owner_id]), ..Default::default() };
+    for (&depth, idxs) in strata {
+        if before_depth.is_some_and(|limit| depth >= limit) {
+            break;
+        }
+        let mut ordered = idxs.clone();
+        ordered.sort_by_key(|&i| {
+            let header = candidates[i].header();
+            (header.device_fingerprint.to_bytes(), header.seq, candidates[i].hash())
+        });
+        for i in ordered {
+            let candidate = &candidates[i];
+            let outcome = if let Some(reason) = condemned.get(&candidate.hash()) {
+                Outcome::Condemned(*reason)
+            } else if let Some(reason) = parked.get(&candidate.hash()) {
+                Outcome::Parked(*reason)
+            } else if let Some(verdict) = cut_verdicts.get(&candidate.hash()) {
+                *verdict
+            } else {
+                classify_effect(candidate, incarnations, &state, parked)
+            };
+            if outcome.is_effective() {
+                apply_effect(candidate, &mut state);
+            }
+            outcomes.insert(candidate.hash(), outcome);
+        }
+    }
+    state
+}
+
+fn normalize_auth_epochs(outcomes: &mut HashMap<[u8; 32], Outcome>) -> u64 {
+    let mut effective: Vec<([u8; 32], u64)> = outcomes
+        .iter()
+        .filter_map(|(hash, outcome)| match outcome {
+            Outcome::Effective { auth_epoch } => Some((*hash, *auth_epoch)),
+            _ => None,
+        })
+        .collect();
+    effective.sort_by_key(|(hash, old_epoch)| (*old_epoch, *hash));
+    for (new_epoch, (hash, _)) in effective.iter().enumerate() {
+        outcomes.insert(*hash, Outcome::Effective { auth_epoch: new_epoch as u64 });
+    }
+    effective.len() as u64
+}
+
+/// Final fail-closed dependency closure after fixed-register phase-E replay. No authority fact may
+/// survive without its final-effective roster / ownership / grant prerequisite. Freshness is also
+/// decided against the fully folded count here — never against transient hash iteration order, and
+/// never as an authority input.
+fn close_final_authority_dependencies(
+    candidates: &[Candidate],
+    outcomes: &mut HashMap<[u8; 32], Outcome>,
+) -> HashMap<[u8; 32], Outcome> {
+    let mut discovered = HashMap::new();
+    loop {
+        let effective_count = normalize_auth_epochs(outcomes);
+        let effective_roster: HashSet<DeviceFingerprint> = candidates
+            .iter()
+            .filter(|candidate| outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective))
+            .filter_map(|candidate| match candidate.op {
+                AccountOp::AccountGenesis { .. } => Some(candidate.header().device_fingerprint),
+                AccountOp::DeviceAdd { device_fingerprint, .. } => Some(device_fingerprint),
+                _ => None,
+            })
+            .collect();
+        let effective_ownership: HashSet<StreamId> = candidates
+            .iter()
+            .filter(|candidate| outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective))
+            .filter_map(|candidate| match candidate.op {
+                AccountOp::StreamOwn { stream_id, .. } => Some(stream_id),
+                _ => None,
+            })
+            .collect();
+        let effective_grants: HashMap<[u8; 32], (StreamId, AccountId)> = candidates
+            .iter()
+            .filter(|candidate| outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective))
+            .filter_map(|candidate| match candidate.op {
+                AccountOp::StreamGrant { stream_id, grantee_account_id, .. } =>
+                    Some((candidate.hash(), (stream_id, grantee_account_id))),
+                _ => None,
+            })
+            .collect();
+
+        let mut changed = false;
+        for candidate in candidates {
+            if !outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective) {
+                continue;
+            }
+            let replacement = if candidate.header().auth_len > effective_count.saturating_sub(1) {
+                Some(Outcome::Parked(ParkReason::AuthLenAhead))
+            } else if let Some(authority_ref) = candidate.header().authority_ref
+                && !outcomes.get(&authority_ref).is_some_and(Outcome::is_effective)
+            {
+                Some(match outcomes.get(&authority_ref) {
+                    Some(Outcome::Parked(reason)) => Outcome::Parked(*reason),
+                    _ => Outcome::Rejected(RejectReason::StaleAuthority),
+                })
+            } else {
+                match &candidate.op {
+                    AccountOp::OwnerPromote { device_fingerprint }
+                        if !effective_roster.contains(device_fingerprint) =>
+                        Some(Outcome::Rejected(RejectReason::Ineffective)),
+                    AccountOp::StreamGrant { stream_id, .. }
+                        if !effective_ownership.contains(stream_id) =>
+                        Some(Outcome::Rejected(RejectReason::Ineffective)),
+                    AccountOp::StreamRevoke { stream_id, grantee_account_id, grant_id, .. }
+                        if effective_grants.get(grant_id)
+                            != Some(&(*stream_id, *grantee_account_id)) =>
+                        Some(Outcome::Rejected(RejectReason::Ineffective)),
+                    _ => None,
+                }
+            };
+            if let Some(replacement) = replacement {
+                outcomes.insert(candidate.hash(), replacement);
+                // Only freshness is monotone across readiness passes. A stale citation or failed
+                // state precondition can recover after an ahead competing effect is excluded, so
+                // those verdicts must be recomputed rather than permanently held out.
+                if replacement == Outcome::Parked(ParkReason::AuthLenAhead) {
+                    discovered.insert(candidate.hash(), replacement);
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    discovered
+}
+
+#[derive(Default)]
+struct AuthorityFacts {
+    roster_refs: HashMap<[u8; 32], RosterFact>,
+    owner_incarnations: HashMap<[u8; 32], OwnerIncarnationFact>,
+    stream_ownership: HashMap<StreamId, StreamOwnershipFact>,
+    grants: HashMap<[u8; 32], GrantFact>,
+    grant_cuts: HashMap<[u8; 32], Vec<DeviceCut>>,
+}
+
+fn derive_authority_facts(
+    candidates: &[Candidate],
+    outcomes: &HashMap<[u8; 32], Outcome>,
+) -> AuthorityFacts {
+    let mut effective: Vec<(&Candidate, u64)> = candidates
+        .iter()
+        .filter_map(|candidate| match outcomes.get(&candidate.hash()) {
+            Some(Outcome::Effective { auth_epoch }) => Some((candidate, *auth_epoch)),
+            _ => None,
+        })
+        .collect();
+    effective.sort_by_key(|(candidate, epoch)| (*epoch, candidate.hash()));
+
+    let mut facts = AuthorityFacts::default();
+    let mut roster = HashMap::<DeviceFingerprint, [u8; 32]>::new();
+    let mut owners = HashMap::<DeviceFingerprint, [u8; 32]>::new();
+    for (candidate, epoch) in effective {
+        match &candidate.op {
+            AccountOp::AccountGenesis { .. } => {
+                let device = candidate.subject_device();
+                let hash = candidate.hash();
+                facts.roster_refs.insert(hash, RosterFact {
+                    authority: RosterAuthority {
+                        device_fingerprint: device,
+                        role: DeviceRole::Owner,
+                    },
+                    effective_at: epoch,
+                    closed_at: None,
+                });
+                facts.owner_incarnations.insert(hash, OwnerIncarnationFact {
+                    authority: OwnerAuthority { device_fingerprint: device },
+                    effective_at: epoch,
+                    closed_at: None,
+                });
+                roster.insert(device, hash);
+                owners.insert(device, hash);
+            },
+            AccountOp::DeviceAdd { device_fingerprint, role, .. } => {
+                let hash = candidate.hash();
+                facts.roster_refs.insert(hash, RosterFact {
+                    authority: RosterAuthority {
+                        device_fingerprint: *device_fingerprint,
+                        role: *role,
+                    },
+                    effective_at: epoch,
+                    closed_at: None,
+                });
+                roster.insert(*device_fingerprint, hash);
+                if *role == DeviceRole::Owner {
+                    facts.owner_incarnations.insert(hash, OwnerIncarnationFact {
+                        authority: OwnerAuthority { device_fingerprint: *device_fingerprint },
+                        effective_at: epoch,
+                        closed_at: None,
+                    });
+                    owners.insert(*device_fingerprint, hash);
+                }
+            },
+            AccountOp::OwnerPromote { device_fingerprint } => {
+                let hash = candidate.hash();
+                let roster_ref = roster
+                    .get(device_fingerprint)
+                    .expect("promoted device has an active roster fact");
+                facts.roster_refs.get_mut(roster_ref).expect("active roster fact").authority.role =
+                    DeviceRole::Owner;
+                facts.owner_incarnations.insert(hash, OwnerIncarnationFact {
+                    authority: OwnerAuthority { device_fingerprint: *device_fingerprint },
+                    effective_at: epoch,
+                    closed_at: None,
+                });
+                owners.insert(*device_fingerprint, hash);
+            },
+            AccountOp::DeviceRemove { device_fingerprint, .. } => {
+                if let Some(roster_ref) = roster.remove(device_fingerprint) {
+                    facts.roster_refs.get_mut(&roster_ref).expect("active roster fact").closed_at =
+                        Some(epoch);
+                }
+                if let Some(owner_id) = owners.remove(device_fingerprint) {
+                    facts
+                        .owner_incarnations
+                        .get_mut(&owner_id)
+                        .expect("active owner fact")
+                        .closed_at = Some(epoch);
+                }
+            },
+            AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } => {
+                if owners.get(device_fingerprint) == Some(owner_id) {
+                    owners.remove(device_fingerprint);
+                    let roster_ref = roster
+                        .get(device_fingerprint)
+                        .expect("demoted device has an active roster fact");
+                    facts
+                        .roster_refs
+                        .get_mut(roster_ref)
+                        .expect("active roster fact")
+                        .authority
+                        .role = DeviceRole::Member;
+                    facts
+                        .owner_incarnations
+                        .get_mut(owner_id)
+                        .expect("active owner fact")
+                        .closed_at = Some(epoch);
+                }
+            },
+            AccountOp::StreamOwn { stream_id, .. } => {
+                facts.stream_ownership.insert(*stream_id, StreamOwnershipFact {
+                    own_id: candidate.hash(),
+                    effective_at: epoch,
+                });
+            },
+            AccountOp::StreamGrant { stream_id, grantee_account_id, grant_role } => {
+                facts.grants.insert(candidate.hash(), GrantFact {
+                    authority: GrantAuthority {
+                        stream_id: *stream_id,
+                        grantee_account_id: *grantee_account_id,
+                        role: *grant_role,
+                    },
+                    effective_at: epoch,
+                    closed_at: None,
+                });
+            },
+            AccountOp::StreamRevoke { grant_id, device_cuts, .. } => {
+                if let Some(grant) = facts.grants.get_mut(grant_id) {
+                    grant.closed_at = Some(epoch);
+                    facts.grant_cuts.insert(*grant_id, device_cuts.clone());
+                }
+            },
+            AccountOp::CutExtend { .. } | AccountOp::AccountReRoot { .. } => {},
+        }
+    }
+    facts
 }
 
 /// The genesis candidate: an `AccountGenesis` whose payload hashes to the shared `account_id` (§4)
@@ -1132,13 +1740,49 @@ fn classify_effect(
                 Outcome::Rejected(RejectReason::BadPromote)
             }
         },
-        // Stream ownership + grant authority (self-certifying `/2` spec, grant registers, content
-        // chains) is folded by the C2 predicate — C1 defers it rather than trust an unvalidated
-        // stream op.
-        AccountOp::StreamOwn { .. }
-        | AccountOp::StreamGrant { .. }
-        | AccountOp::StreamRevoke { .. } =>
-            Outcome::Parked(ParkReason::DeferredStreamAuthorization),
+        AccountOp::StreamOwn { stream_id, stream_spec_bytes } => {
+            let valid = stream::decode_spec_v2(stream_spec_bytes)
+                .and_then(|spec| {
+                    anyhow::ensure!(spec.owner_account_id == c.header().account_id);
+                    Ok(stream::derive_v2(&spec)? == *stream_id)
+                })
+                .unwrap_or(false);
+            if !valid {
+                Outcome::Rejected(RejectReason::InvalidStreamSpec)
+            } else if state.stream_ownership.contains_key(stream_id) {
+                Outcome::Rejected(RejectReason::Ineffective)
+            } else {
+                effective(state)
+            }
+        },
+        AccountOp::StreamGrant { stream_id, grantee_account_id, grant_role } => {
+            let duplicate = state.grants.values().any(|grant| {
+                grant.open
+                    && grant.stream_id == *stream_id
+                    && grant.grantee_account_id == *grantee_account_id
+                    && grant.role == *grant_role
+            });
+            if !state.stream_ownership.contains_key(stream_id)
+                || *grantee_account_id == c.header().account_id
+                || duplicate
+            {
+                Outcome::Rejected(RejectReason::Ineffective)
+            } else {
+                effective(state)
+            }
+        },
+        AccountOp::StreamRevoke { stream_id, grantee_account_id, grant_id, .. } => {
+            let matches_open_grant = state.grants.get(grant_id).is_some_and(|grant| {
+                grant.open
+                    && grant.stream_id == *stream_id
+                    && grant.grantee_account_id == *grantee_account_id
+            });
+            if state.stream_ownership.contains_key(stream_id) && matches_open_grant {
+                effective(state)
+            } else {
+                Outcome::Rejected(RejectReason::Ineffective)
+            }
+        },
         // `AccountReRoot` is admissible ONLY as the terminal recovery op once the account is
         // contested (§12) — the contested path admits it. In a `Live` account it has no effect.
         AccountOp::AccountReRoot { .. } => Outcome::Rejected(RejectReason::Ineffective),
@@ -1192,6 +1836,22 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
             state.owners.insert(*device_fingerprint, c.hash());
             state.live.insert(c.hash());
         },
+        AccountOp::StreamOwn { stream_id, .. } => {
+            state.stream_ownership.insert(*stream_id, c.hash());
+        },
+        AccountOp::StreamGrant { stream_id, grantee_account_id, grant_role } => {
+            state.grants.insert(c.hash(), LiveGrant {
+                stream_id: *stream_id,
+                grantee_account_id: *grantee_account_id,
+                role: *grant_role,
+                open: true,
+            });
+        },
+        AccountOp::StreamRevoke { grant_id, .. } => {
+            if let Some(grant) = state.grants.get_mut(grant_id) {
+                grant.open = false;
+            }
+        },
         // An effective removal tombstones the device (I4: never re-enroll) and drops it from the
         // roster/owner sets. The register it installed handles condemning its beyond-cut entries.
         AccountOp::DeviceRemove { device_fingerprint, .. } => {
@@ -1213,11 +1873,10 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oplog::account::AccountId;
     use crate::oplog::account::envelope::{sign_account_entry, verify_account_signed};
-    use crate::oplog::account::ops::{encode, entry_type, entry_type_of};
+    use crate::oplog::account::{AccountId, ops as account_ops};
     use crate::oplog::device::{DeviceSecret, DeviceX25519Secret};
-    use crate::oplog::stream::StreamId;
+    use crate::oplog::stream::{StreamId, StreamSpec, StreamSpecV2};
 
     /// A seed-deterministic test device: its ed25519 signer + fingerprint + the pubkeys a
     /// Genesis/DeviceAdd op carries.
@@ -1270,7 +1929,7 @@ mod tests {
                 created_at_ms: 1_700_000_000_000,
                 label: None,
             };
-            let payload = encode(&op).unwrap();
+            let payload = account_ops::encode(&op).unwrap();
             let account_id = account_id_from_genesis_payload(&payload);
             let header = AccountEntryHeader {
                 account_id,
@@ -1279,7 +1938,7 @@ mod tests {
                 seq: 0,
                 prev_hash: None,
                 parent_ref: None,
-                entry_type: entry_type::ACCOUNT_GENESIS,
+                entry_type: account_ops::entry_type::ACCOUNT_GENESIS,
                 op_version: 1,
                 crypto_suite: 0,
                 auth_len: 0,
@@ -1304,7 +1963,17 @@ mod tests {
             authority_ref: Option<[u8; 32]>,
             op: &AccountOp,
         ) -> [u8; 32] {
-            let payload = encode(op).unwrap();
+            self.author_at_auth_len(author, authority_ref, op, 1)
+        }
+
+        fn author_at_auth_len(
+            &mut self,
+            author: &Dev,
+            authority_ref: Option<[u8; 32]>,
+            op: &AccountOp,
+            auth_len: u64,
+        ) -> [u8; 32] {
+            let payload = account_ops::encode(op).unwrap();
             let (seq, prev) = self.chains.get(&author.fp.to_bytes()).copied().unwrap_or((0, None));
             let header = AccountEntryHeader {
                 account_id: self.account_id,
@@ -1313,9 +1982,9 @@ mod tests {
                 seq,
                 prev_hash: prev,
                 parent_ref: Some(self.genesis_hash),
-                entry_type: entry_type_of(op),
+                entry_type: account_ops::entry_type_of(op),
                 op_version: 1,
-                auth_len: 1,
+                auth_len,
                 crypto_suite: 0,
                 key_id: None,
                 authority_ref,
@@ -1340,7 +2009,7 @@ mod tests {
             seq: u64,
             prev_hash: Option<[u8; 32]>,
         ) -> [u8; 32] {
-            let payload = encode(op).unwrap();
+            let payload = account_ops::encode(op).unwrap();
             let header = AccountEntryHeader {
                 account_id: self.account_id,
                 log_id: 0,
@@ -1348,7 +2017,7 @@ mod tests {
                 seq,
                 prev_hash,
                 parent_ref: Some(self.genesis_hash),
-                entry_type: entry_type_of(op),
+                entry_type: account_ops::entry_type_of(op),
                 op_version: 1,
                 auth_len: 1,
                 crypto_suite: 0,
@@ -1425,8 +2094,19 @@ mod tests {
         AccountOp::AccountReRoot { successor_account_id: successor, note: None }
     }
 
-    fn stream_own(stream: StreamId) -> AccountOp {
-        AccountOp::StreamOwn { stream_id: stream, stream_spec_bytes: vec![0x80] }
+    fn stream_own(account_id: AccountId) -> (StreamId, AccountOp) {
+        let spec = StreamSpecV2 {
+            owner_account_id: account_id,
+            policy: StreamSpec {
+                repo_set: vec!["repo-a".to_string()],
+                kind_allow_list: None,
+                relation_policy: None,
+                node_overrides: Vec::new(),
+            },
+        };
+        let stream_id = stream::derive_v2(&spec).unwrap();
+        let stream_spec_bytes = stream::canonical_spec_v2_bytes(&spec).unwrap();
+        (stream_id, AccountOp::StreamOwn { stream_id, stream_spec_bytes })
     }
 
     fn stream_grant(stream: StreamId, grantee: AccountId) -> AccountOp {
@@ -1434,6 +2114,16 @@ mod tests {
             stream_id: stream,
             grantee_account_id: grantee,
             grant_role: ops::GrantRole::Reader,
+        }
+    }
+
+    fn stream_revoke(stream: StreamId, grantee: AccountId, grant_id: [u8; 32]) -> AccountOp {
+        AccountOp::StreamRevoke {
+            stream_id: stream,
+            grantee_account_id: grantee,
+            grant_id,
+            device_cuts: Vec::new(),
+            reason: "access ended".to_string(),
         }
     }
 
@@ -1464,6 +2154,192 @@ mod tests {
         let h = f.fold();
         assert!(h.is_effective(&f.genesis_hash), "the genesis is effective");
         assert_eq!(h.classification(), AccountClassification::Live);
+    }
+
+    #[test]
+    fn auth_len_ahead_parks_but_a_behind_assertion_never_grants_or_denies_authority() {
+        let founder = Dev::new(1);
+        let ahead_device = Dev::new(2);
+        let behind_device = Dev::new(3);
+        let mut f = Fixture::genesis(&founder);
+        let ahead = f.author_at_auth_len(
+            &founder,
+            Some(f.genesis_hash),
+            &device_add(&ahead_device, DeviceRole::Member),
+            10,
+        );
+        let behind = f.author_at_auth_len(
+            &founder,
+            Some(f.genesis_hash),
+            &device_add(&behind_device, DeviceRole::Member),
+            0,
+        );
+
+        let h = f.fold();
+        assert_eq!(h.outcome(&ahead), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(
+            h.roster_ref_effective(ahead, ahead_device.fp, h.effective_count()),
+            AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
+            "an ahead candidate must not leave a projected roster mutation",
+        );
+        assert!(h.is_effective(&behind), "a stale count is informational, never authority");
+    }
+
+    #[test]
+    fn a_candidate_cannot_satisfy_its_own_auth_len() {
+        let (founder, device) = (Dev::new(1), Dev::new(2));
+        let mut f = Fixture::genesis(&founder);
+        let ahead = f.author_at_auth_len(
+            &founder,
+            Some(f.genesis_hash),
+            &device_add(&device, DeviceRole::Member),
+            2,
+        );
+
+        let h = f.fold();
+        assert_eq!(h.effective_count(), 1, "only genesis preceded the candidate");
+        assert_eq!(h.outcome(&ahead), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+    }
+
+    #[test]
+    fn an_auth_len_ahead_cut_has_no_register_side_effect() {
+        let (founder, b, member) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&founder);
+        let add_b = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let ahead_remove = f.author_at_auth_len(
+            &founder,
+            Some(f.genesis_hash),
+            &device_remove(&b, Cut::Empty),
+            u64::MAX,
+        );
+        let add_member = f.author(&b, Some(add_b), &device_add(&member, DeviceRole::Member));
+
+        let h = f.fold();
+        assert_eq!(h.outcome(&ahead_remove), Some(Outcome::Parked(ParkReason::AuthLenAhead)),);
+        assert!(h.is_effective(&add_member), "a parked cut must not condemn B's chain");
+        assert_eq!(h.classification(), AccountClassification::Live);
+    }
+
+    #[test]
+    fn an_ahead_ineffective_cut_cannot_poison_a_later_enrollment() {
+        let (founder, device, member) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&founder);
+        let ahead_remove = f.author_at_auth_len(
+            &founder,
+            Some(f.genesis_hash),
+            &device_remove(&device, Cut::Empty),
+            u64::MAX,
+        );
+        let add_device =
+            f.author(&founder, Some(f.genesis_hash), &device_add(&device, DeviceRole::Owner));
+        let add_member =
+            f.author(&device, Some(add_device), &device_add(&member, DeviceRole::Member));
+
+        let h = f.fold();
+        assert_eq!(
+            h.outcome(&ahead_remove),
+            Some(Outcome::Parked(ParkReason::AuthLenAhead)),
+            "freshness dominates the phase-E ineffective verdict for a register contributor",
+        );
+        assert!(h.is_effective(&add_device));
+        assert!(
+            h.is_effective(&add_member),
+            "the rejected ahead cut must leave no empty register on the enrolled device",
+        );
+    }
+
+    #[test]
+    fn an_auth_len_ahead_owner_mint_cannot_authorize_a_descendant_cut() {
+        let (founder, b) = (Dev::new(1), Dev::new(2));
+        let mut f = Fixture::genesis(&founder);
+        let ahead_add = f.author_at_auth_len(
+            &founder,
+            Some(f.genesis_hash),
+            &device_add(&b, DeviceRole::Owner),
+            u64::MAX,
+        );
+        let remove_founder = f.author(&b, Some(ahead_add), &device_remove(&founder, Cut::Empty));
+
+        let h = f.fold();
+        assert_eq!(h.outcome(&ahead_add), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(
+            h.outcome(&remove_founder),
+            Some(Outcome::Rejected(RejectReason::StaleAuthority)),
+            "an excluded mint cannot launder authority into its descendant",
+        );
+        assert_eq!(h.classification(), AccountClassification::Live);
+        assert!(h.is_effective(&f.genesis_hash));
+    }
+
+    #[test]
+    fn an_auth_len_ahead_effect_cannot_poison_a_valid_successor_or_its_dependent() {
+        let (founder, device) = (Dev::new(1), Dev::new(2));
+        let mut f = Fixture::genesis(&founder);
+        let ahead = f.author_at_auth_len(
+            &founder,
+            Some(f.genesis_hash),
+            &device_add(&device, DeviceRole::Member),
+            u64::MAX,
+        );
+        let valid =
+            f.author(&founder, Some(f.genesis_hash), &device_add(&device, DeviceRole::Member));
+        let promote = f.author(&founder, Some(f.genesis_hash), &owner_promote(&device));
+
+        let h = f.fold();
+        assert_eq!(h.outcome(&ahead), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(h.is_effective(&valid), "the parked add must not cause DuplicateAdd");
+        assert!(
+            h.is_effective(&promote),
+            "the promotion must recover with the valid enrollment on the next readiness pass",
+        );
+        assert_eq!(
+            h.roster_ref_effective(valid, device.fp, h.effective_count()),
+            AuthorityQuery::Effective(RosterAuthority {
+                device_fingerprint: device.fp,
+                role: DeviceRole::Owner,
+            }),
+        );
+        assert_eq!(
+            h.owner_incarnation_effective(promote, device.fp, h.effective_count()),
+            AuthorityQuery::Effective(OwnerAuthority { device_fingerprint: device.fp }),
+        );
+    }
+
+    #[test]
+    fn a_dependent_grant_recovers_after_an_ahead_ownership_competitor_is_excluded() {
+        let founder = Dev::new(1);
+        let grantee = AccountId::from_bytes([0x44; 32]);
+        let mut f = Fixture::genesis(&founder);
+        let (stream, own) = stream_own(f.account_id);
+        let ahead_own = f.author_at_auth_len(&founder, Some(f.genesis_hash), &own, u64::MAX);
+        let valid_own = f.author(&founder, Some(f.genesis_hash), &own);
+        let grant = f.author(&founder, Some(f.genesis_hash), &stream_grant(stream, grantee));
+
+        let h = f.fold();
+        assert_eq!(h.outcome(&ahead_own), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(h.is_effective(&valid_own), "the valid StreamOwn must replace its ahead twin");
+        assert!(
+            h.is_effective(&grant),
+            "a state-dependent grant must be recomputed, not permanently readiness-excluded",
+        );
+    }
+
+    #[test]
+    fn mutually_condemning_ahead_cuts_do_not_manufacture_contested() {
+        let (founder, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&founder);
+        let add_a = f.author(&founder, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let remove_b =
+            f.author_at_auth_len(&a, Some(add_a), &device_remove(&b, Cut::Empty), u64::MAX);
+        let remove_a =
+            f.author_at_auth_len(&b, Some(add_b), &device_remove(&a, Cut::Empty), u64::MAX);
+
+        let h = f.fold();
+        assert_eq!(h.classification(), AccountClassification::Live);
+        assert_eq!(h.outcome(&remove_a), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(h.outcome(&remove_b), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(h.is_effective(&add_a) && h.is_effective(&add_b));
     }
 
     #[test]
@@ -1661,6 +2537,25 @@ mod tests {
             );
             assert_eq!(r.contested_successor(), Some(small), "rotation {rot} successor");
         }
+    }
+
+    #[test]
+    fn an_auth_len_ahead_reroot_cannot_select_the_contested_successor() {
+        let (founder, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let (ahead_small, valid_big) =
+            (AccountId::from_bytes([0x11; 32]), AccountId::from_bytes([0x22; 32]));
+        let mut f = Fixture::genesis(&founder);
+        let add_a = f.author(&founder, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        f.author(&a, Some(add_a), &device_remove(&b, Cut::Empty));
+        f.author(&b, Some(add_b), &device_remove(&a, Cut::Empty));
+        let ahead = f.author_at_auth_len(&a, Some(add_a), &account_reroot(ahead_small), u64::MAX);
+        let valid = f.author(&a, Some(add_a), &account_reroot(valid_big));
+
+        let h = f.fold();
+        assert_eq!(h.outcome(&ahead), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(h.is_effective(&valid));
+        assert_eq!(h.contested_successor(), Some(valid_big));
     }
 
     #[test]
@@ -1920,27 +2815,328 @@ mod tests {
     }
 
     #[test]
-    fn stream_ops_are_deferred_to_c2_not_folded_as_authority() {
-        // Stream ownership + grant authority (the self-certifying `/2` spec, grant registers,
-        // content chains) is folded by the C2 predicate, not the C1 control fold. So StreamOwn /
-        // StreamGrant establish NO authority here — they park, and C1 trusts nothing from an
-        // unvalidated stream op (P11's floor: a grant is never effective before its owner because
-        // neither is ever effective in C1).
+    fn stream_ownership_grant_and_revoke_are_folded_as_citation_authority() {
         let fdr = Dev::new(1);
-        let stream = StreamId::from_bytes([0x33; 32]);
         let grantee = AccountId::from_bytes([0x44; 32]);
         let mut f = Fixture::genesis(&fdr);
-        let own = f.author(&fdr, Some(f.genesis_hash), &stream_own(stream));
+        let (stream, own_op) = stream_own(f.account_id);
+        let own = f.author(&fdr, Some(f.genesis_hash), &own_op);
         let grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
+        let revoke = f.author(&fdr, Some(f.genesis_hash), &stream_revoke(stream, grantee, grant));
 
         let h = f.fold();
-        for (op, label) in [(own, "StreamOwn"), (grant, "StreamGrant")] {
+        assert!(h.is_effective(&own));
+        assert!(h.is_effective(&grant));
+        assert!(h.is_effective(&revoke));
+        assert_eq!(h.effective_count(), 4);
+        assert_eq!(
+            h.grant_effective(grant, stream, grantee, 2),
+            AuthorityQuery::Effective(GrantAuthority {
+                stream_id: stream,
+                grantee_account_id: grantee,
+                role: GrantRole::Reader,
+            }),
+            "a behind auth_len is informational and cannot deny an exact citation",
+        );
+        assert!(matches!(
+            h.grant_effective(grant, stream, grantee, 3),
+            AuthorityQuery::Effective(GrantAuthority { role: GrantRole::Reader, .. })
+        ));
+        assert_eq!(
+            h.grant_effective(grant, stream, grantee, 4),
+            AuthorityQuery::Effective(GrantAuthority {
+                stream_id: stream,
+                grantee_account_id: grantee,
+                role: GrantRole::Reader,
+            }),
+            "revocation bounds content through cuts; stale auth_len cannot reopen or close a grant",
+        );
+        assert_eq!(
+            h.grant_effective(grant, stream, grantee, 5),
+            AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead),
+        );
+        assert_eq!(h.stream_owner_effective(stream, 2), AuthorityQuery::Effective(own));
+    }
+
+    #[test]
+    fn stream_preconditions_fail_closed_without_minting_authority_p11() {
+        let fdr = Dev::new(1);
+        let grantee = AccountId::from_bytes([0x44; 32]);
+        let mut f = Fixture::genesis(&fdr);
+        let (stream, own_op) = stream_own(f.account_id);
+        let early_grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
+        let own = f.author(&fdr, Some(f.genesis_hash), &own_op);
+        let duplicate_own = f.author(&fdr, Some(f.genesis_hash), &own_op);
+        let self_grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, f.account_id));
+        let grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
+        let duplicate_grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
+        let wrong_revoke = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &stream_revoke(stream, AccountId::from_bytes([0x55; 32]), grant),
+        );
+
+        let h = f.fold();
+        assert!(h.is_effective(&own));
+        assert!(h.is_effective(&grant));
+        assert_eq!(
+            h.grant_effective(early_grant, stream, grantee, h.effective_count()),
+            AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
+            "a held but ineffective grant is invalid, not parked as if it were missing",
+        );
+        for (hash, label) in [
+            (early_grant, "grant before ownership"),
+            (duplicate_own, "duplicate ownership"),
+            (self_grant, "self grant"),
+            (duplicate_grant, "duplicate same-role grant"),
+            (wrong_revoke, "revoke with mismatched grantee"),
+        ] {
             assert_eq!(
-                h.outcome(&op),
-                Some(Outcome::Parked(ParkReason::DeferredStreamAuthorization)),
-                "{label} is deferred to C2, never authority-bearing in C1",
+                h.outcome(&hash),
+                Some(Outcome::Rejected(RejectReason::Ineffective)),
+                "{label}",
             );
         }
+    }
+
+    #[test]
+    fn retroactive_ownership_condemnation_transitively_invalidates_a_grant() {
+        let (founder, owner) = (Dev::new(1), Dev::new(2));
+        let grantee = AccountId::from_bytes([0x44; 32]);
+        let mut f = Fixture::genesis(&founder);
+        let add_owner =
+            f.author(&founder, Some(f.genesis_hash), &device_add(&owner, DeviceRole::Owner));
+        let (stream, own_op) = stream_own(f.account_id);
+        let own = f.author(&founder, Some(f.genesis_hash), &own_op);
+        let remove_founder = f.author(
+            &owner,
+            Some(add_owner),
+            &device_remove(&founder, Cut::At { seq: 1, hash: add_owner }),
+        );
+        let grant = f.author(&owner, Some(add_owner), &stream_grant(stream, grantee));
+
+        let expected = f.fold();
+        assert_eq!(expected.outcome(&own), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
+        assert!(expected.is_effective(&remove_founder));
+        assert_eq!(expected.outcome(&grant), Some(Outcome::Rejected(RejectReason::Ineffective)));
+        assert_eq!(
+            expected.grant_effective(grant, stream, grantee, expected.effective_count()),
+            AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
+        );
+        assert_eq!(
+            expected.stream_owner_effective(stream, expected.effective_count()),
+            AuthorityQuery::Parked(AuthorityParkReason::UnknownReference),
+        );
+        for rotation in 1..f.entries.len() {
+            assert_eq!(f.fold_rotated(rotation).outcomes, expected.outcomes);
+        }
+    }
+
+    #[test]
+    fn retroactive_enrollment_condemnation_removes_a_promotion_side_effect() {
+        let (founder, owner, member) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&founder);
+        let add_owner =
+            f.author(&founder, Some(f.genesis_hash), &device_add(&owner, DeviceRole::Owner));
+        let add_member =
+            f.author(&founder, Some(f.genesis_hash), &device_add(&member, DeviceRole::Member));
+        let promote = f.author(&owner, Some(add_owner), &owner_promote(&member));
+        let cut = f.author(
+            &owner,
+            Some(add_owner),
+            &device_remove(&founder, Cut::At { seq: 1, hash: add_owner }),
+        );
+
+        let expected = f.fold();
+        assert!(expected.is_effective(&cut));
+        assert_eq!(
+            expected.outcome(&add_member),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+        );
+        assert!(!expected.is_effective(&promote));
+        assert_eq!(
+            expected.owner_incarnation_effective(promote, member.fp, expected.effective_count(),),
+            AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
+            "a promotion cannot survive solely through a condemned enrollment mutation",
+        );
+        for rotation in 1..f.entries.len() {
+            assert_eq!(f.fold_rotated(rotation).outcomes, expected.outcomes);
+        }
+    }
+
+    #[test]
+    fn fixed_register_replay_removes_a_condemned_tombstone_side_effect() {
+        let (founder, owner, member) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&founder);
+        let add_owner =
+            f.author(&founder, Some(f.genesis_hash), &device_add(&owner, DeviceRole::Owner));
+        let add_member =
+            f.author(&founder, Some(f.genesis_hash), &device_add(&member, DeviceRole::Member));
+        let remove_member =
+            f.author(&founder, Some(f.genesis_hash), &device_remove(&member, Cut::Empty));
+        f.author(
+            &owner,
+            Some(add_owner),
+            &device_remove(&founder, Cut::At { seq: 2, hash: add_member }),
+        );
+        let promote = f.author(&owner, Some(add_owner), &owner_promote(&member));
+
+        let expected = f.fold();
+        assert_eq!(
+            expected.outcome(&remove_member),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+        );
+        assert!(
+            expected.is_effective(&promote),
+            "phase-E replay restores the enrolled member after its tombstone op is condemned",
+        );
+        for rotation in 1..f.entries.len() {
+            assert_eq!(f.fold_rotated(rotation).outcomes, expected.outcomes);
+        }
+    }
+
+    #[test]
+    fn retroactive_grant_condemnation_invalidates_revoke_without_stale_cut_facts() {
+        let (founder, owner) = (Dev::new(1), Dev::new(2));
+        let grantee = AccountId::from_bytes([0x44; 32]);
+        let mut f = Fixture::genesis(&founder);
+        let add_owner =
+            f.author(&founder, Some(f.genesis_hash), &device_add(&owner, DeviceRole::Owner));
+        let (stream, own_op) = stream_own(f.account_id);
+        let own = f.author(&founder, Some(f.genesis_hash), &own_op);
+        let grant = f.author(&founder, Some(f.genesis_hash), &stream_grant(stream, grantee));
+        let remove_founder = f.author(
+            &owner,
+            Some(add_owner),
+            &device_remove(&founder, Cut::At { seq: 2, hash: own }),
+        );
+        let revoke = f.author(&owner, Some(add_owner), &stream_revoke(stream, grantee, grant));
+
+        let expected = f.fold();
+        assert!(expected.is_effective(&own));
+        assert_eq!(expected.outcome(&grant), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
+        assert!(expected.is_effective(&remove_founder));
+        assert_eq!(expected.outcome(&revoke), Some(Outcome::Rejected(RejectReason::Ineffective)));
+        assert_eq!(
+            expected.grant_effective(grant, stream, grantee, expected.effective_count()),
+            AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
+        );
+        assert!(expected.grant_cuts.is_empty());
+        for rotation in 1..f.entries.len() {
+            assert_eq!(f.fold_rotated(rotation).outcomes, expected.outcomes);
+        }
+    }
+
+    #[test]
+    fn final_auth_len_closure_is_independent_of_device_order() {
+        let mut saw_orderings = HashSet::new();
+        for e_is_a in [true, false] {
+            let (founder, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
+            let mut f = Fixture::genesis(&founder);
+            let add_a =
+                f.author(&founder, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+            let add_b =
+                f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+            let (e_author, e_ref, x_author, x_ref) =
+                if e_is_a { (&a, add_a, &b, add_b) } else { (&b, add_b, &a, add_a) };
+            saw_orderings.insert(e_author.fp < x_author.fp);
+            let x = f.author_at_auth_len(
+                x_author,
+                Some(x_ref),
+                &device_add(&Dev::new(4), DeviceRole::Member),
+                3,
+            );
+            let e = f.author_at_auth_len(
+                e_author,
+                Some(e_ref),
+                &device_add(&Dev::new(5), DeviceRole::Member),
+                4,
+            );
+
+            let expected = f.fold();
+            assert!(expected.is_effective(&x));
+            assert!(expected.is_effective(&e));
+            assert_eq!(expected.effective_count(), 5);
+            for rotation in 1..f.entries.len() {
+                assert_eq!(f.fold_rotated(rotation).outcomes, expected.outcomes);
+            }
+        }
+        assert_eq!(saw_orderings, HashSet::from([false, true]));
+    }
+
+    #[test]
+    fn stream_own_rejects_wrong_owner_wrong_hash_and_malformed_preimages() {
+        let fdr = Dev::new(1);
+        let mut f = Fixture::genesis(&fdr);
+        let (stream, valid) = stream_own(f.account_id);
+        let AccountOp::StreamOwn { stream_spec_bytes, .. } = valid else { unreachable!() };
+        let wrong_hash = f.author(&fdr, Some(f.genesis_hash), &AccountOp::StreamOwn {
+            stream_id: StreamId::from_bytes([0x77; 32]),
+            stream_spec_bytes: stream_spec_bytes.clone(),
+        });
+        let (_, wrong_owner_op) = stream_own(AccountId::from_bytes([0x66; 32]));
+        let wrong_owner = f.author(&fdr, Some(f.genesis_hash), &wrong_owner_op);
+        let malformed = f.author(&fdr, Some(f.genesis_hash), &AccountOp::StreamOwn {
+            stream_id: stream,
+            stream_spec_bytes: vec![0x80],
+        });
+
+        let h = f.fold();
+        for hash in [wrong_hash, wrong_owner, malformed] {
+            assert_eq!(h.outcome(&hash), Some(Outcome::Rejected(RejectReason::InvalidStreamSpec)),);
+        }
+    }
+
+    #[test]
+    fn roster_and_owner_queries_are_citation_time_and_subject_bound() {
+        let fdr = Dev::new(1);
+        let member = Dev::new(2);
+        let mut f = Fixture::genesis(&fdr);
+        let add = f.author(&fdr, Some(f.genesis_hash), &device_add(&member, DeviceRole::Member));
+        let promote = f.author(&fdr, Some(f.genesis_hash), &owner_promote(&member));
+        let h = f.fold();
+
+        assert_eq!(
+            h.roster_ref_effective(add, member.fp, 2),
+            AuthorityQuery::Effective(RosterAuthority {
+                device_fingerprint: member.fp,
+                role: DeviceRole::Owner,
+            }),
+        );
+        assert_eq!(
+            h.roster_ref_effective(add, fdr.fp, 2),
+            AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject),
+        );
+        assert_eq!(
+            h.owner_incarnation_effective(promote, member.fp, 2),
+            AuthorityQuery::Effective(OwnerAuthority { device_fingerprint: member.fp }),
+            "a behind auth_len does not deny an exact owner citation",
+        );
+        assert_eq!(
+            h.owner_incarnation_effective(promote, member.fp, 3),
+            AuthorityQuery::Effective(OwnerAuthority { device_fingerprint: member.fp }),
+        );
+
+        f.author(&fdr, Some(f.genesis_hash), &owner_demote(&member, promote, Cut::Empty));
+        let h = f.fold();
+        assert_eq!(
+            h.roster_ref_effective(add, member.fp, 4),
+            AuthorityQuery::Effective(RosterAuthority {
+                device_fingerprint: member.fp,
+                role: DeviceRole::Member,
+            }),
+        );
+        assert_eq!(
+            h.owner_incarnation_effective(promote, member.fp, 4),
+            AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
+        );
+
+        f.author(&fdr, Some(f.genesis_hash), &device_remove(&member, Cut::Empty));
+        let h = f.fold();
+        assert_eq!(
+            h.roster_ref_effective(add, member.fp, 5),
+            AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
+        );
     }
 
     #[test]
@@ -1950,9 +3146,8 @@ mod tests {
         // same-depth `⊔`, covered by `cut_extend_reblesses_a_condemned_cone_p7`). Here F removes B
         // at depth 0 (condemning b1/b2) and a DEEPER owner A (depth 1) extends the cut — because
         // A's extend lands a stratum later than the depth-0 condemnation, the cone stays
-        // condemned in this fold. (A global recompute would fix this but could preserve a
-        // register whose creator the fold later condemns — a laundering hole — so we stay
-        // faithful to the per-depth model.)
+        // condemned in this fold. A global graph fixpoint is forbidden by the frozen v5 model
+        // because it can preserve register power for an already-condemned creator.
         let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let (d, e, g) = (Dev::new(5), Dev::new(6), Dev::new(7));
         let mut f = Fixture::genesis(&fdr);
@@ -1970,7 +3165,7 @@ mod tests {
         assert_eq!(
             h.outcome(&b1),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
-            "a deeper-depth extend does not re-bless a shallower depth's condemnation",
+            "a deeper-depth extend does not revise a shallower depth's final condemnation",
         );
     }
 
@@ -2100,7 +3295,7 @@ mod tests {
             created_at_ms: 1_700_000_000_000,
             label: None,
         };
-        let payload = encode(&op).unwrap();
+        let payload = account_ops::encode(&op).unwrap();
         let account_id = account_id_from_genesis_payload(&payload);
         let genesis_header = |signer: &Dev| AccountEntryHeader {
             account_id,
@@ -2109,7 +3304,7 @@ mod tests {
             seq: 0,
             prev_hash: None,
             parent_ref: None,
-            entry_type: entry_type::ACCOUNT_GENESIS,
+            entry_type: account_ops::entry_type::ACCOUNT_GENESIS,
             op_version: 1,
             crypto_suite: 0,
             auth_len: 0,
@@ -2125,7 +3320,7 @@ mod tests {
         let forged = signed(&attacker, &genesis_header(&attacker), &payload);
         // The attacker adds itself as owner, citing its forged genesis.
         let add_op = device_add(&x, DeviceRole::Owner);
-        let add_payload = encode(&add_op).unwrap();
+        let add_payload = account_ops::encode(&add_op).unwrap();
         let add_header = AccountEntryHeader {
             account_id,
             log_id: 0,
@@ -2133,7 +3328,7 @@ mod tests {
             seq: 1,
             prev_hash: Some(forged.entry_hash),
             parent_ref: Some(forged.entry_hash),
-            entry_type: entry_type_of(&add_op),
+            entry_type: account_ops::entry_type_of(&add_op),
             op_version: 1,
             auth_len: 1,
             crypto_suite: 0,
@@ -2184,7 +3379,7 @@ mod tests {
         let (fdr, x) = (Dev::new(1), Dev::new(2));
         let f = Fixture::genesis(&fdr);
         let op = device_add(&x, DeviceRole::Owner);
-        let payload = encode(&op).unwrap();
+        let payload = account_ops::encode(&op).unwrap();
         let header = AccountEntryHeader {
             account_id: f.account_id,
             log_id: 1, // secrets log — not the control log
@@ -2192,7 +3387,7 @@ mod tests {
             seq: 1,
             prev_hash: Some(f.genesis_hash),
             parent_ref: Some(f.genesis_hash),
-            entry_type: entry_type_of(&op),
+            entry_type: account_ops::entry_type_of(&op),
             op_version: 1,
             auth_len: 1,
             crypto_suite: 0,
@@ -2219,7 +3414,7 @@ mod tests {
         let (fdr, x) = (Dev::new(1), Dev::new(2));
         let f = Fixture::genesis(&fdr);
         let op = device_add(&x, DeviceRole::Owner);
-        let payload = encode(&op).unwrap();
+        let payload = account_ops::encode(&op).unwrap();
         let header = AccountEntryHeader {
             account_id: f.account_id,
             log_id: 0,
@@ -2227,7 +3422,7 @@ mod tests {
             seq: 1,
             prev_hash: Some(f.genesis_hash),
             parent_ref: Some(f.genesis_hash),
-            entry_type: entry_type_of(&op),
+            entry_type: account_ops::entry_type_of(&op),
             op_version: 2, // future version
             auth_len: 1,
             crypto_suite: 0,
@@ -2326,7 +3521,7 @@ mod tests {
             created_at_ms: 1_700_000_000_000,
             label: None,
         };
-        let payload = encode(&op).unwrap();
+        let payload = account_ops::encode(&op).unwrap();
         let account_id = account_id_from_genesis_payload(&payload);
         let header = AccountEntryHeader {
             account_id,
@@ -2335,7 +3530,7 @@ mod tests {
             seq: 0,
             prev_hash: None,
             parent_ref: Some([0x01; 32]), // a root has no parent
-            entry_type: entry_type::ACCOUNT_GENESIS,
+            entry_type: account_ops::entry_type::ACCOUNT_GENESIS,
             op_version: 1,
             auth_len: 0,
             crypto_suite: 0,
@@ -2364,7 +3559,7 @@ mod tests {
         let (fdr, x) = (Dev::new(1), Dev::new(2));
         let f = Fixture::genesis(&fdr);
         let op = device_add(&x, DeviceRole::Owner);
-        let payload = encode(&op).unwrap();
+        let payload = account_ops::encode(&op).unwrap();
         let header = AccountEntryHeader {
             account_id: f.account_id,
             log_id: 0,
@@ -2372,7 +3567,7 @@ mod tests {
             seq: 0,
             prev_hash: None,
             parent_ref: Some(f.genesis_hash),
-            entry_type: entry_type_of(&op),
+            entry_type: account_ops::entry_type_of(&op),
             op_version: 1,
             auth_len: 1,
             crypto_suite: 0,
@@ -2406,7 +3601,7 @@ mod tests {
             seq: 1,
             prev_hash: Some(f.genesis_hash),
             parent_ref: Some(f.genesis_hash),
-            entry_type: entry_type::DEVICE_ADD,
+            entry_type: account_ops::entry_type::DEVICE_ADD,
             op_version: 1,
             auth_len: 1,
             crypto_suite: 1,          // sealed
@@ -2441,7 +3636,7 @@ mod tests {
             seq: 1,
             prev_hash: Some(f.genesis_hash),
             parent_ref: Some(f.genesis_hash),
-            entry_type: entry_type::DEVICE_ADD,
+            entry_type: account_ops::entry_type::DEVICE_ADD,
             op_version: 1,
             auth_len: 1,
             crypto_suite: 0,
@@ -2469,7 +3664,7 @@ mod tests {
         let (fdr, x) = (Dev::new(1), Dev::new(2));
         let f = Fixture::genesis(&fdr);
         let op = device_add(&x, DeviceRole::Owner);
-        let payload = encode(&op).unwrap(); // valid DeviceAdd bytes, but the header marks it sealed
+        let payload = account_ops::encode(&op).unwrap(); // valid DeviceAdd bytes, but the header marks it sealed
         let header = AccountEntryHeader {
             account_id: f.account_id,
             log_id: 0,
@@ -2477,7 +3672,7 @@ mod tests {
             seq: 1,
             prev_hash: Some(f.genesis_hash),
             parent_ref: Some(f.genesis_hash),
-            entry_type: entry_type_of(&op),
+            entry_type: account_ops::entry_type_of(&op),
             op_version: 1,
             auth_len: 1,
             crypto_suite: 1,
@@ -2560,6 +3755,7 @@ mod tests {
                 ("parked", Some("incomplete_cut_ancestry")),
             ),
             (Outcome::Parked(ParkReason::ContestedSubject), ("parked", Some("contested_subject"))),
+            (Outcome::Parked(ParkReason::AuthLenAhead), ("parked", Some("auth_len_ahead"))),
             (
                 Outcome::Parked(ParkReason::DeferredStreamAuthorization),
                 ("parked", Some("deferred_stream_authorization")),
@@ -2592,6 +3788,10 @@ mod tests {
             (
                 Outcome::Rejected(RejectReason::NonGenesisOrigin),
                 ("rejected", Some("non_genesis_origin")),
+            ),
+            (
+                Outcome::Rejected(RejectReason::InvalidStreamSpec),
+                ("rejected", Some("invalid_stream_spec")),
             ),
             (Outcome::Rejected(RejectReason::Ineffective), ("rejected", Some("ineffective"))),
         ];

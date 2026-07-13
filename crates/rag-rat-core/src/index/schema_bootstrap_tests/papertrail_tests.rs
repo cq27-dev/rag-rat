@@ -627,8 +627,7 @@ fn v060_creates_the_papertrail_tables_on_fresh_apply() {
 }
 
 #[test]
-fn migration_063_is_the_tip_and_persists_mirror_resume_state() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 63, "move this pin with the next schema migration");
+fn migration_063_persists_mirror_resume_state() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
     let columns = conn_table_columns(&conn, "papertrail_sync_cursor");

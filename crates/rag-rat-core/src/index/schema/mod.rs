@@ -16,10 +16,10 @@ pub(crate) use registry::{
     sole_repo_id,
 };
 pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_read_only};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 63;
+pub const LATEST_SCHEMA_VERSION: u32 = 64;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -446,6 +446,13 @@ const MIGRATION_063_CHECKSUM: &str = "sha256:rag-rat-papertrail-mirror-resume-st
 const MIGRATION_063_DESCRIPTION: &str =
     "Persist item-page, item-thread, Search-tie, per-stream comment-scan, immutable item-delta \
      windows, and full-rewalk state so every stored unit resumes without replay or lost pruning";
+const MIGRATION_064_ID: &str = "064_account_authority_projection";
+const MIGRATION_064_CHECKSUM: &str = "sha256:rag-rat-account-authority-projection-v64b";
+const MIGRATION_064_DESCRIPTION: &str =
+    "Persist the fully folded account classification, roster and owner incarnations, immutable \
+     stream ownership, exact grant incarnations, and revoke device cuts. refold_account rewrites \
+     these shadow tables in the same IMMEDIATE transaction as accepted/status, so /3 authority \
+     checks never rescan the bounded candidate DAG";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -571,8 +578,7 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     // Every additive migration in order. A fresh DB runs them all; data backfills on empty tables
     // are no-ops. (An EXISTING DB takes the forward-only path via `migrate_forward`, not this.)
     for step in ADDITIVE_MIGRATIONS {
-        (step.apply)(conn)?;
-        record_migration(conn, step.id, step.checksum, step.description)?;
+        apply_and_record_migration(conn, step)?;
     }
     // `index --full` is the sanctioned recovery the Dirty refusal names, and apply is its schema
     // step: every migration just re-ran to completion, so a `__dirty__` marker that still
@@ -595,6 +601,23 @@ struct Migration {
     checksum: &'static str,
     description: &'static str,
     apply: fn(&Connection) -> rusqlite::Result<()>,
+}
+
+/// Apply one migration and stamp its ledger row. V064 is special because it projects existing
+/// grow-only account history: DDL, source snapshot, all-account refold, and the ledger stamp must
+/// share one IMMEDIATE transaction so older writers cannot land an unprojected candidate in a
+/// migration race.
+fn apply_and_record_migration(conn: &Connection, step: &Migration) -> rusqlite::Result<()> {
+    if step.id != MIGRATION_064_ID {
+        (step.apply)(conn)?;
+        return record_migration(conn, step.id, step.checksum, step.description);
+    }
+
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    (step.apply)(&tx)?;
+    crate::oplog::backfill_authority_projection(&tx)?;
+    record_migration(&tx, step.id, step.checksum, step.description)?;
+    tx.commit()
 }
 
 const ADDITIVE_MIGRATIONS: &[Migration] = &[
@@ -970,6 +993,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_063_DESCRIPTION,
         apply: apply_papertrail_mirror_resume_state,
     },
+    Migration {
+        id: MIGRATION_064_ID,
+        checksum: MIGRATION_064_CHECKSUM,
+        description: MIGRATION_064_DESCRIPTION,
+        apply: apply_account_authority_projection,
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -997,8 +1026,7 @@ pub fn migrate_forward(conn: &Connection) -> anyhow::Result<()> {
     provision_baseline(conn)?;
     for step in ADDITIVE_MIGRATIONS {
         if !applied.contains(step.id) {
-            (step.apply)(conn)?;
-            record_migration(conn, step.id, step.checksum, step.description)?;
+            apply_and_record_migration(conn, step)?;
         }
     }
     // #585: this path only runs when a forward migration actually happened (early-returned above

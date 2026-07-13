@@ -48,12 +48,27 @@ pub(super) mod entry_type {
 /// A device's role in an account roster (§9). Owner holds all control/secrets ops; a member authors
 /// content on granted streams only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DeviceRole {
+pub(crate) enum DeviceRole {
     Member,
     Owner,
 }
 
 impl DeviceRole {
+    pub(super) fn as_db_str(self) -> &'static str {
+        match self {
+            DeviceRole::Member => "member",
+            DeviceRole::Owner => "owner",
+        }
+    }
+
+    pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "member" => Ok(DeviceRole::Member),
+            "owner" => Ok(DeviceRole::Owner),
+            other => anyhow::bail!("unknown persisted device role `{other}`"),
+        }
+    }
+
     fn as_u8(self) -> u8 {
         match self {
             DeviceRole::Member => 1,
@@ -73,12 +88,27 @@ impl DeviceRole {
 /// A cross-account grant's role on a stream (§9). Reader = wrap recipient (sealed) / free (public);
 /// writer = reader + content accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GrantRole {
+pub(crate) enum GrantRole {
     Reader,
     Writer,
 }
 
 impl GrantRole {
+    pub(super) fn as_db_str(self) -> &'static str {
+        match self {
+            GrantRole::Reader => "reader",
+            GrantRole::Writer => "writer",
+        }
+    }
+
+    pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "reader" => Ok(GrantRole::Reader),
+            "writer" => Ok(GrantRole::Writer),
+            other => anyhow::bail!("unknown persisted grant role `{other}`"),
+        }
+    }
+
     fn as_u8(self) -> u8 {
         match self {
             GrantRole::Reader => 1,
@@ -133,10 +163,10 @@ pub(super) struct ContentCut {
 
 /// One device-chain cut inside a `StreamRevoke`: `[device_fingerprint, seq, entry_hash]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct DeviceCut {
-    pub(super) device_fingerprint: DeviceFingerprint,
-    pub(super) seq: u64,
-    pub(super) hash: [u8; 32],
+pub(crate) struct DeviceCut {
+    pub(crate) device_fingerprint: DeviceFingerprint,
+    pub(crate) seq: u64,
+    pub(crate) hash: [u8; 32],
 }
 
 /// The ten control-log ops (§10). Field order is the frozen wire order; goldens pin the bytes.
@@ -853,6 +883,21 @@ mod tests {
         for et in 0..=9u32 {
             round_trip(&sample(et));
         }
+    }
+
+    #[test]
+    fn persisted_role_tokens_round_trip_and_reject_unknown_values() {
+        for (role, token) in [(DeviceRole::Member, "member"), (DeviceRole::Owner, "owner")] {
+            assert_eq!(role.as_db_str(), token);
+            assert_eq!(DeviceRole::from_db_str(token).unwrap(), role);
+        }
+        assert!(DeviceRole::from_db_str("admin").is_err());
+
+        for (role, token) in [(GrantRole::Reader, "reader"), (GrantRole::Writer, "writer")] {
+            assert_eq!(role.as_db_str(), token);
+            assert_eq!(GrantRole::from_db_str(token).unwrap(), role);
+        }
+        assert!(GrantRole::from_db_str("owner").is_err());
     }
 
     #[test]

@@ -15,15 +15,6 @@
 //! - [`id`]: [`AccountId`] + the §4 genesis commitment.
 //! - [`limits`]: §18a protocol-validity constants + the account-layer domain strings.
 //! - [`envelope`]: the 13-part signed account-entry envelope (§6).
-//!
-//! **Build-time lint posture.** The account subsystem is built bottom-up over the C1 slices: a
-//! lower layer (envelope, ops, cut, registers) is consumed only by a higher one (fold, storage) or
-//! by a later phase (C2–C5), so a freshly-landed layer reads as `dead_code` until its consumer
-//! arrives. This blanket allow spans the build; it is REMOVED at Phase 6 (surface wire-up), where
-//! the final `-D warnings` clippy gate + the reviewer catch anything genuinely unreachable, and the
-//! handful of truly C2–C5-deferred seams get precise per-item allows.
-#![allow(dead_code)]
-
 mod candidate;
 mod cut;
 mod envelope;
@@ -34,4 +25,14 @@ mod ops;
 mod registers;
 mod storage;
 
+pub(crate) use fold::{
+    AuthorityInvalidReason, AuthorityParkReason, AuthorityQuery, GrantAuthority,
+    GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, RosterAuthority,
+};
 pub(crate) use id::AccountId;
+pub(crate) use ops::{DeviceCut, DeviceRole, GrantRole};
+pub(crate) use storage::{
+    CapacityScope, IngestOutcome, account_ingest, backfill_authority_projection,
+    grant_effective_for_device, owner_incarnation_effective, roster_ref_effective,
+    stream_owner_effective,
+};

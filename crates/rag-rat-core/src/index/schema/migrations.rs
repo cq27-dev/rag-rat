@@ -1258,6 +1258,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_061_ID => Some(61),
             MIGRATION_062_ID => Some(62),
             MIGRATION_063_ID => Some(63),
+            MIGRATION_064_ID => Some(64),
             _ => None,
         })
         .max()
@@ -1330,6 +1331,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_061_ID
             | MIGRATION_062_ID
             | MIGRATION_063_ID
+            | MIGRATION_064_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1399,6 +1401,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_061_ID => migration.checksum != MIGRATION_061_CHECKSUM,
         MIGRATION_062_ID => migration.checksum != MIGRATION_062_CHECKSUM,
         MIGRATION_063_ID => migration.checksum != MIGRATION_063_CHECKSUM,
+        MIGRATION_064_ID => migration.checksum != MIGRATION_064_CHECKSUM,
         _ => false,
     }
 }
@@ -4353,6 +4356,80 @@ pub(crate) fn apply_account_candidate_dag(conn: &Connection) -> rusqlite::Result
          -- index it so a backlog for OTHER accounts is never full-scanned per ingest.
          CREATE INDEX IF NOT EXISTS account_pre_verify_account
              ON account_pre_verify(claimed_account_id);",
+    )
+}
+
+/// V064 (sync phase C1, §16): query-ready authority facts derived from the accepted account fold.
+/// These are shadow tables, never independent sources of truth: `refold_account` deletes and
+/// rewrites every row for one account inside the SAME IMMEDIATE transaction as accepted/status.
+/// History intervals (`effective_at`, `closed_at`) preserve audit/projection facts. `auth_len` is
+/// only a synchronization assertion: ahead parks for refetch, while behind is informational and
+/// never selects historical authority. Exact citations and device cuts make authorization keyed
+/// lookups instead of adversary-amplified replay of up to 4096 candidates.
+pub(crate) fn apply_account_authority_projection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_auth_state(
+             account_id        BLOB PRIMARY KEY,
+             classification    TEXT NOT NULL,
+             contested_depth   INTEGER,
+             successor_account_id BLOB,
+             effective_count   INTEGER NOT NULL
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS account_roster_history(
+             roster_ref         BLOB PRIMARY KEY,
+             account_id         BLOB NOT NULL,
+             device_fingerprint BLOB NOT NULL,
+             role               TEXT NOT NULL,
+             effective_at       INTEGER NOT NULL,
+             closed_at          INTEGER
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS account_roster_history_account
+             ON account_roster_history(account_id, device_fingerprint);
+
+         CREATE TABLE IF NOT EXISTS account_owner_incarnations(
+             owner_id           BLOB PRIMARY KEY,
+             account_id         BLOB NOT NULL,
+             device_fingerprint BLOB NOT NULL,
+             effective_at       INTEGER NOT NULL,
+             closed_at          INTEGER
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS account_owner_incarnations_account
+             ON account_owner_incarnations(account_id, device_fingerprint);
+
+         CREATE TABLE IF NOT EXISTS account_stream_ownership(
+             stream_id      BLOB PRIMARY KEY,
+             account_id     BLOB NOT NULL,
+             own_id         BLOB NOT NULL,
+             effective_at   INTEGER NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS account_stream_ownership_account
+             ON account_stream_ownership(account_id);
+
+         CREATE TABLE IF NOT EXISTS account_stream_grants(
+             grant_id           BLOB PRIMARY KEY,
+             owner_account_id   BLOB NOT NULL,
+             stream_id          BLOB NOT NULL,
+             grantee_account_id BLOB NOT NULL,
+             role               TEXT NOT NULL,
+             effective_at       INTEGER NOT NULL,
+             closed_at          INTEGER
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS account_stream_grants_owner
+             ON account_stream_grants(owner_account_id, stream_id, grantee_account_id);
+
+         CREATE TABLE IF NOT EXISTS account_stream_grant_cuts(
+             grant_id           BLOB NOT NULL,
+             owner_account_id   BLOB NOT NULL,
+             device_fingerprint BLOB NOT NULL,
+             -- Fixed-width big-endian bytes preserve the full protocol u64 domain and sort in
+             -- unsigned numeric order; SQLite INTEGER is signed and would reject high cuts.
+             seq                BLOB NOT NULL CHECK(length(seq) = 8),
+             entry_hash         BLOB NOT NULL,
+             PRIMARY KEY(grant_id, device_fingerprint)
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS account_stream_grant_cuts_owner
+             ON account_stream_grant_cuts(owner_account_id, grant_id);",
     )
 }
 

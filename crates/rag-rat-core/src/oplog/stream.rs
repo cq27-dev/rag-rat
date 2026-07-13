@@ -31,10 +31,12 @@
 //! inside the hash so a synced `/3` content entry transitively names its owner. C1 adds `/2`
 //! ALONGSIDE `/1` (byte-unchanged); nothing switches the live path until C3 adoption.
 
-use minicbor::Encoder;
+use minicbor::data::Type;
+use minicbor::{Decoder, Encoder};
 use sha2::{Digest, Sha256};
 
 use super::account::AccountId;
+use super::cbor;
 
 /// Domain tag + version for the stream-identity derivation. Bump only when the canonical rule
 /// itself changes — never when a kind/relation token is added.
@@ -200,9 +202,6 @@ pub(crate) struct StreamSpecV2 {
 /// owner_account_id (b32), repo_set, kind_allow_list|null, relation_policy|null, override_set]))`.
 /// C1 ships this ALONGSIDE [`owner_stream`] / [`derive`] (`/1`), which the live phase-B authoring
 /// path keeps using until C3 adoption — nothing switches the live path here.
-///
-/// Consumed by `StreamOwn` validation in the fold (Phase 4); the allow drops when that lands.
-#[allow(dead_code)]
 pub(crate) fn derive_v2(spec: &StreamSpecV2) -> anyhow::Result<StreamId> {
     let bytes = canonical_spec_v2_bytes(spec)?;
     let mut out = [0u8; 32];
@@ -213,7 +212,7 @@ pub(crate) fn derive_v2(spec: &StreamSpecV2) -> anyhow::Result<StreamId> {
 /// The canonical CBOR tuple the `/2` identity hashes — `[domain, owner_account_id (b32), repo_set,
 /// kind_allow_list | null, relation_policy | null, override_pairs]`. The owner sits between the
 /// domain and the shared policy tail.
-fn canonical_spec_v2_bytes(spec: &StreamSpecV2) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn canonical_spec_v2_bytes(spec: &StreamSpecV2) -> anyhow::Result<Vec<u8>> {
     let policy = canonical_policy(&spec.policy)?;
     let mut buf = Vec::with_capacity(128);
     {
@@ -224,6 +223,73 @@ fn canonical_spec_v2_bytes(spec: &StreamSpecV2) -> anyhow::Result<Vec<u8>> {
         encode_policy(&mut enc, &policy);
     }
     Ok(buf)
+}
+
+/// Decode and validate a canonical owner-bound `/2` stream specification. `StreamOwn` carries
+/// these bytes as a self-certifying preimage, so accepting merely a matching SHA-256 digest is not
+/// enough: the tuple must have the frozen shape, contain a valid policy, and already be in its
+/// unique canonical encoding.
+pub(crate) fn decode_spec_v2(bytes: &[u8]) -> anyhow::Result<StreamSpecV2> {
+    cbor::require_canonical_cbor(bytes)?;
+    let mut dec = Decoder::new(bytes);
+    anyhow::ensure!(dec.array()? == Some(6), "stream/2 spec must be a 6-element array");
+    anyhow::ensure!(dec.str()? == STREAM_V2_DOMAIN, "unknown stream spec domain");
+    let owner_account_id = AccountId::from_bytes(decode_fixed::<32>(&mut dec, "owner account")?);
+    let policy = StreamSpec {
+        repo_set: decode_str_array(&mut dec)?,
+        kind_allow_list: decode_optional_str_array(&mut dec)?,
+        relation_policy: decode_optional_str_array(&mut dec)?,
+        node_overrides: decode_overrides(&mut dec)?,
+    };
+    anyhow::ensure!(dec.position() == bytes.len(), "trailing bytes in stream/2 spec");
+    let spec = StreamSpecV2 { owner_account_id, policy };
+    anyhow::ensure!(
+        canonical_spec_v2_bytes(&spec)? == bytes,
+        "stream/2 spec is not in canonical set order"
+    );
+    Ok(spec)
+}
+
+fn decode_fixed<const N: usize>(
+    dec: &mut Decoder<'_>,
+    field: &'static str,
+) -> anyhow::Result<[u8; N]> {
+    let value = dec.bytes()?;
+    value.try_into().map_err(|_| anyhow::anyhow!("{field} must be {N} bytes"))
+}
+
+fn decode_str_array(dec: &mut Decoder<'_>) -> anyhow::Result<Vec<String>> {
+    let len = dec.array()?.ok_or_else(|| anyhow::anyhow!("indefinite arrays are not canonical"))?;
+    let mut values = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        values.push(dec.str()?.to_string());
+    }
+    Ok(values)
+}
+
+fn decode_optional_str_array(dec: &mut Decoder<'_>) -> anyhow::Result<Option<Vec<String>>> {
+    if dec.datatype()? == Type::Null {
+        dec.null()?;
+        Ok(None)
+    } else {
+        Ok(Some(decode_str_array(dec)?))
+    }
+}
+
+fn decode_overrides(dec: &mut Decoder<'_>) -> anyhow::Result<Vec<NodeOverride>> {
+    let len = dec.array()?.ok_or_else(|| anyhow::anyhow!("indefinite arrays are not canonical"))?;
+    let mut overrides = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        anyhow::ensure!(dec.array()? == Some(2), "stream override must be a 2-element array");
+        let node_id = dec.str()?.to_string();
+        let action = match dec.str()? {
+            "include" => NodeOverrideAction::Include,
+            "exclude" => NodeOverrideAction::Exclude,
+            other => anyhow::bail!("unknown stream override action `{other}`"),
+        };
+        overrides.push(NodeOverride { node_id, action });
+    }
+    Ok(overrides)
 }
 
 /// Byte-sort + dedup a token list into canonical SET order (the same rule as `NodeContent` tags).
@@ -461,6 +527,108 @@ mod tests {
         assert_eq!(bytes[62], 0x80, "empty override set");
         assert_eq!(bytes.len(), 63);
         cbor::require_canonical_cbor(&bytes).expect("stream/2 tuple is canonical CBOR");
+        assert_eq!(decode_spec_v2(&bytes).unwrap(), StreamSpecV2 {
+            owner_account_id: AccountId::from_bytes([0x11; 32]),
+            policy: StreamSpec {
+                repo_set: vec!["repo-a".to_string()],
+                kind_allow_list: None,
+                relation_policy: None,
+                node_overrides: Vec::new(),
+            },
+        });
+    }
+
+    #[test]
+    fn stream_v2_decoder_round_trips_every_policy_dimension() {
+        let expected = spec_v2();
+        let bytes = canonical_spec_v2_bytes(&expected).unwrap();
+        let decoded = decode_spec_v2(&bytes).unwrap();
+        assert_eq!(decoded.owner_account_id, expected.owner_account_id);
+        assert_eq!(decoded.policy.repo_set, ["repo-a", "repo-b"]);
+        assert_eq!(
+            decoded.policy.kind_allow_list.as_deref(),
+            Some(["Decision".to_string(), "Invariant".to_string()].as_slice()),
+        );
+        assert_eq!(
+            decoded.policy.relation_policy.as_deref(),
+            Some(["tracks".to_string()].as_slice())
+        );
+        assert_eq!(decoded.policy.node_overrides, expected.policy.node_overrides);
+        assert_eq!(canonical_spec_v2_bytes(&decoded).unwrap(), bytes);
+    }
+
+    fn raw_v2(domain: &str, owner: &[u8], repos: &[&str], overrides: &[(&str, &str)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut enc = Encoder::new(&mut bytes);
+        enc.array(6).unwrap();
+        enc.str(domain).unwrap();
+        enc.bytes(owner).unwrap();
+        enc.array(repos.len() as u64).unwrap();
+        for repo in repos {
+            enc.str(repo).unwrap();
+        }
+        enc.null().unwrap();
+        enc.null().unwrap();
+        enc.array(overrides.len() as u64).unwrap();
+        for (node, action) in overrides {
+            enc.array(2).unwrap();
+            enc.str(node).unwrap();
+            enc.str(action).unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn stream_v2_decoder_rejects_malformed_self_certifying_preimages() {
+        let owner = owner().to_bytes();
+        let mut trailing = raw_v2(STREAM_V2_DOMAIN, &owner, &["repo-a"], &[]);
+        trailing.push(0x00);
+        let cases = [
+            ("wrong domain", raw_v2(STREAM_DOMAIN, &owner, &["repo-a"], &[])),
+            ("short owner", raw_v2(STREAM_V2_DOMAIN, &[0x11; 31], &["repo-a"], &[])),
+            (
+                "unknown override action",
+                raw_v2(STREAM_V2_DOMAIN, &owner, &["repo-a"], &[("mem-1", "unknown")]),
+            ),
+            (
+                "conflicting override",
+                raw_v2(STREAM_V2_DOMAIN, &owner, &["repo-a"], &[
+                    ("mem-1", "exclude"),
+                    ("mem-1", "include"),
+                ]),
+            ),
+            ("trailing bytes", trailing),
+        ];
+        for (label, bytes) in cases {
+            assert!(decode_spec_v2(&bytes).is_err(), "accepted {label}");
+        }
+    }
+
+    #[test]
+    fn stream_v2_decoder_rejects_structural_cbor_that_is_not_in_canonical_set_order() {
+        let mut bytes = canonical_spec_v2_bytes(&StreamSpecV2 {
+            owner_account_id: owner(),
+            policy: StreamSpec {
+                repo_set: vec!["repo-a".to_string(), "repo-b".to_string()],
+                kind_allow_list: None,
+                relation_policy: None,
+                node_overrides: Vec::new(),
+            },
+        })
+        .unwrap();
+        let a = bytes.windows(6).position(|window| window == b"repo-a").unwrap();
+        let b = bytes.windows(6).position(|window| window == b"repo-b").unwrap();
+        let repo_a = bytes[a..a + 6].to_vec();
+        let repo_b = bytes[b..b + 6].to_vec();
+        bytes[a..a + 6].copy_from_slice(&repo_b);
+        bytes[b..b + 6].copy_from_slice(&repo_a);
+
+        cbor::require_canonical_cbor(&bytes)
+            .expect("the CBOR itself remains structurally canonical");
+        assert!(
+            decode_spec_v2(&bytes).is_err(),
+            "semantic set ordering is part of the stream identity's canonical preimage",
+        );
     }
 
     #[test]

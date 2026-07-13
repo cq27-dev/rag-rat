@@ -1865,6 +1865,60 @@ fn migration_059_creates_the_account_candidate_dag() {
 }
 
 #[test]
+fn migration_064_is_the_tip_and_creates_account_authority_shadow_tables() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 64, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    for table in [
+        "account_auth_state",
+        "account_roster_history",
+        "account_owner_incarnations",
+        "account_stream_ownership",
+        "account_stream_grants",
+        "account_stream_grant_cuts",
+    ] {
+        assert!(conn_table_exists(&conn, table), "V064 creates {table}");
+    }
+    let isolated = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_account_authority_projection(&isolated).unwrap();
+    schema::apply_account_authority_projection(&isolated).expect("V064 replay is idempotent");
+    assert!(conn_table_exists(&isolated, "account_auth_state"));
+    let seq_type: String = isolated
+        .query_row(
+            "SELECT type FROM pragma_table_info('account_stream_grant_cuts') WHERE name = 'seq'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(seq_type, "BLOB", "device cuts retain the full unsigned u64 domain");
+    assert!(
+        isolated
+            .execute(
+                "INSERT INTO account_stream_grant_cuts(
+                     grant_id, owner_account_id, device_fingerprint, seq, entry_hash
+                 ) VALUES (?1, ?1, ?1, ?2, ?1)",
+                rusqlite::params![[0u8; 32].as_slice(), [0u8; 7].as_slice()],
+            )
+            .is_err(),
+        "the fixed-width cut coordinate rejects corrupt stored values",
+    );
+
+    truncate_schema_to(&conn, 63);
+    conn.execute_batch(
+        "DROP TABLE account_stream_grant_cuts;
+         DROP TABLE account_stream_grants;
+         DROP TABLE account_stream_ownership;
+         DROP TABLE account_owner_incarnations;
+         DROP TABLE account_roster_history;
+         DROP TABLE account_auth_state;",
+    )
+    .unwrap();
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, 64);
+    assert!(conn_table_exists(&conn, "account_auth_state"));
+}
+
+#[test]
 fn migration_047_deferred_absence_and_reconverges_from_torn_state() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE memory_model_failures(leftover INTEGER);").unwrap();

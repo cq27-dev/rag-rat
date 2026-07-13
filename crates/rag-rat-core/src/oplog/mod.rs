@@ -42,10 +42,21 @@ mod project;
 mod store;
 mod stream;
 
-// The op-log's first crate-internal API surface (#524): the MINTING primitives + the op vocabulary
-// the memory subsystem needs to author + backfill entries. Every submodule above is otherwise
-// private, so this curated re-export is the ONE seam `query::memory` reaches through — and the only
-// direction of the dependency (`oplog` never depends back on `query::memory`).
+// C1's curated authority seam for the C2 `/3` content envelope and candidate DAG. The account
+// implementation stays private; only typed ingest results and snapshot-consistent point queries
+// cross the phase boundary.
+#[expect(unused_imports, reason = "C2 authority seam is frozen before its caller lands")]
+pub(crate) use account::{
+    AccountId, AuthorityInvalidReason, AuthorityParkReason, AuthorityQuery, CapacityScope,
+    DeviceCut, DeviceRole, GrantAuthority, GrantDeviceAuthority, GrantDeviceBoundary, GrantRole,
+    IngestOutcome, OwnerAuthority, RosterAuthority, account_ingest, backfill_authority_projection,
+    grant_effective_for_device, owner_incarnation_effective, roster_ref_effective,
+    stream_owner_effective,
+};
+// The op-log's first crate-internal API surface (#524): the MINTING primitives + the op
+// vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is
+// otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
+// — and the only direction of the dependency (`oplog` never depends back on `query::memory`).
 pub(crate) use identity::local_device;
 pub(crate) use op::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
 // The reconcile's tests read the materialized shadow projection as a `ProjectedState` via

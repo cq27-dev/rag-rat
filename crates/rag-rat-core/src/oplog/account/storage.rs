@@ -15,11 +15,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
-use super::ops::{self, AccountOp, DecodedAccountOp};
+use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::{AccountId, fold};
 use crate::oplog::cbor;
 use crate::oplog::device::DevicePublic;
 use crate::oplog::op::DeviceFingerprint;
+use crate::oplog::stream::StreamId;
 
 type EntryHash = [u8; 32];
 type BranchKey = (u8, DeviceFingerprint, Option<EntryHash>);
@@ -237,11 +238,352 @@ fn stored_status_for_exact_envelope(
 /// selection §16.2), and rewrite `accepted` + `account_entry_status` in one IMMEDIATE transaction
 /// so the `account_accepted_slot` partial unique index (I10a) never transiently double-accepts a
 /// slot.
-pub(super) fn refold_account(conn: &Connection, account_id: AccountId) -> anyhow::Result<()> {
+pub(crate) fn refold_account(conn: &Connection, account_id: AccountId) -> anyhow::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     refold_in_tx(&tx, account_id)?;
     tx.commit()?;
     Ok(())
+}
+
+/// Populate V064's derived authority tables from every account already present in the V059
+/// candidate DAG. The migration owns `tx`; replaying all accounts and recording V064 therefore
+/// commits as one writer-locked unit, with no source-history gap between the scan and ledger.
+pub(crate) fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let account_ids = {
+        let mut stmt =
+            tx.prepare("SELECT DISTINCT account_id FROM account_entries ORDER BY account_id")?;
+        stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for account_bytes in account_ids {
+        let result = fixed(&account_bytes)
+            .map(AccountId::from_bytes)
+            .and_then(|account_id| refold_in_tx(tx, account_id));
+        if let Err(err) = result {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                format!("V064 authority backfill failed: {err:#}"),
+            ))));
+        }
+    }
+    Ok(())
+}
+
+/// Exact roster citation lookup over the V064 shadow projection. This is the hot-path seam for
+/// `/3` ingest: a keyed read, never a candidate-DAG replay. `auth_len` only detects a caller ahead
+/// of the local fold; a behind value is informational and never selects historical authority.
+pub(crate) fn roster_ref_effective(
+    conn: &Connection,
+    account_id: AccountId,
+    roster_ref: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+    auth_len: u64,
+) -> anyhow::Result<fold::AuthorityQuery<fold::RosterAuthority>> {
+    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let conn: &Connection = &read_tx;
+    if let Some(reason) = auth_len_preflight(conn, account_id, auth_len)? {
+        return Ok(fold::AuthorityQuery::Parked(reason));
+    }
+    let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT device_fingerprint, role, effective_at, closed_at
+             FROM account_roster_history WHERE account_id = ?1 AND roster_ref = ?2",
+            params![account_id.to_bytes().as_slice(), roster_ref.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((device, role, effective_at, closed_at)) = row else {
+        return missing_reference(conn, account_id, &roster_ref);
+    };
+    let authority = fold::RosterAuthority {
+        device_fingerprint: DeviceFingerprint::from_bytes(fixed(&device)?),
+        role: DeviceRole::from_db_str(&role)?,
+    };
+    if authority.device_fingerprint != device_fingerprint {
+        return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
+    }
+    validated_open_fact(authority, effective_at, closed_at)
+}
+
+pub(crate) fn owner_incarnation_effective(
+    conn: &Connection,
+    account_id: AccountId,
+    owner_id: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+    auth_len: u64,
+) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerAuthority>> {
+    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let conn: &Connection = &read_tx;
+    if let Some(reason) = auth_len_preflight(conn, account_id, auth_len)? {
+        return Ok(fold::AuthorityQuery::Parked(reason));
+    }
+    let row: Option<(Vec<u8>, i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT device_fingerprint, effective_at, closed_at
+             FROM account_owner_incarnations WHERE account_id = ?1 AND owner_id = ?2",
+            params![account_id.to_bytes().as_slice(), owner_id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((device, effective_at, closed_at)) = row else {
+        return missing_reference(conn, account_id, &owner_id);
+    };
+    let authority =
+        fold::OwnerAuthority { device_fingerprint: DeviceFingerprint::from_bytes(fixed(&device)?) };
+    if authority.device_fingerprint != device_fingerprint {
+        return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
+    }
+    validated_open_fact(authority, effective_at, closed_at)
+}
+
+type StoredGrantRow = (Vec<u8>, Vec<u8>, String, i64, Option<i64>);
+
+pub(crate) fn grant_effective(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    grant_id: EntryHash,
+    stream_id: StreamId,
+    grantee_account_id: AccountId,
+    auth_len: u64,
+) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
+    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let conn: &Connection = &read_tx;
+    if let Some(reason) = auth_len_preflight(conn, owner_account_id, auth_len)? {
+        return Ok(fold::AuthorityQuery::Parked(reason));
+    }
+    let row: Option<StoredGrantRow> = conn
+        .query_row(
+            "SELECT stream_id, grantee_account_id, role, effective_at, closed_at
+             FROM account_stream_grants WHERE owner_account_id = ?1 AND grant_id = ?2",
+            params![owner_account_id.to_bytes().as_slice(), grant_id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((stored_stream, stored_grantee, role, effective_at, closed_at)) = row else {
+        return missing_reference(conn, owner_account_id, &grant_id);
+    };
+    let authority = fold::GrantAuthority {
+        stream_id: StreamId::from_bytes(fixed(&stored_stream)?),
+        grantee_account_id: AccountId::from_bytes(fixed(&stored_grantee)?),
+        role: GrantRole::from_db_str(&role)?,
+    };
+    if authority.stream_id != stream_id || authority.grantee_account_id != grantee_account_id {
+        return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
+    }
+    validated_fact(authority, effective_at, closed_at)
+}
+
+/// Resolve a grant and the requesting device's revoke cut as ONE authorization decision. C2 must
+/// use this combined seam when admitting content: two independent calls could otherwise straddle
+/// a refold and combine an old effective grant with a new (or absent) cut projection.
+pub(crate) fn grant_effective_for_device(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    grant_id: EntryHash,
+    stream_id: StreamId,
+    grantee_account_id: AccountId,
+    device_fingerprint: DeviceFingerprint,
+    auth_len: u64,
+) -> anyhow::Result<fold::AuthorityQuery<fold::GrantDeviceAuthority>> {
+    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    grant_effective_for_device_in_snapshot(
+        &read_tx,
+        owner_account_id,
+        grant_id,
+        stream_id,
+        grantee_account_id,
+        device_fingerprint,
+        auth_len,
+    )
+}
+
+fn grant_effective_for_device_in_snapshot(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    grant_id: EntryHash,
+    stream_id: StreamId,
+    grantee_account_id: AccountId,
+    device_fingerprint: DeviceFingerprint,
+    auth_len: u64,
+) -> anyhow::Result<fold::AuthorityQuery<fold::GrantDeviceAuthority>> {
+    if let Some(reason) = auth_len_preflight(conn, owner_account_id, auth_len)? {
+        return Ok(fold::AuthorityQuery::Parked(reason));
+    }
+    let row: Option<StoredGrantRow> = conn
+        .query_row(
+            "SELECT stream_id, grantee_account_id, role, effective_at, closed_at
+             FROM account_stream_grants WHERE owner_account_id = ?1 AND grant_id = ?2",
+            params![owner_account_id.to_bytes().as_slice(), grant_id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((stored_stream, stored_grantee, role, effective_at, closed_at)) = row else {
+        return missing_reference(conn, owner_account_id, &grant_id);
+    };
+    let grant = fold::GrantAuthority {
+        stream_id: StreamId::from_bytes(fixed(&stored_stream)?),
+        grantee_account_id: AccountId::from_bytes(fixed(&stored_grantee)?),
+        role: GrantRole::from_db_str(&role)?,
+    };
+    if grant.stream_id != stream_id || grant.grantee_account_id != grantee_account_id {
+        return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
+    }
+    let _ = validated_fact(grant, effective_at, closed_at)?;
+    let device_cut = load_grant_device_cut(conn, owner_account_id, grant_id, device_fingerprint)?;
+    let boundary = match (closed_at, device_cut) {
+        (None, None) => fold::GrantDeviceBoundary::Open,
+        (None, Some(_)) => anyhow::bail!("open grant unexpectedly has a persisted device cut"),
+        (Some(_), Some(cut)) => fold::GrantDeviceBoundary::Cut(cut),
+        (Some(_), None) => fold::GrantDeviceBoundary::Closed,
+    };
+    Ok(fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority { grant, boundary }))
+}
+
+/// Resolve the owner-bound `StreamOwn` fact from the same authority snapshot as the `auth_len`
+/// preflight. A missing ownership fact is recoverable: the caller may simply be ahead of us.
+pub(crate) fn stream_owner_effective(
+    conn: &Connection,
+    account_id: AccountId,
+    stream_id: StreamId,
+    auth_len: u64,
+) -> anyhow::Result<fold::AuthorityQuery<EntryHash>> {
+    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let conn: &Connection = &read_tx;
+    if let Some(reason) = auth_len_preflight(conn, account_id, auth_len)? {
+        return Ok(fold::AuthorityQuery::Parked(reason));
+    }
+    let row: Option<(Vec<u8>, i64)> = conn
+        .query_row(
+            "SELECT own_id, effective_at FROM account_stream_ownership
+             WHERE account_id = ?1 AND stream_id = ?2",
+            params![account_id.to_bytes().as_slice(), stream_id.to_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((own_id, effective_at)) = row else {
+        return Ok(fold::AuthorityQuery::Parked(fold::AuthorityParkReason::UnknownReference));
+    };
+    validated_fact(fixed(&own_id)?, effective_at, None)
+}
+
+/// Keyed per-device cut lookup for C2 content authorization. The grant's final effectiveness and
+/// the optional cut are read from one SQLite snapshot, so a concurrent refold cannot mix rounds.
+pub(super) fn grant_device_cut(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    grant_id: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+    auth_len: u64,
+) -> anyhow::Result<fold::AuthorityQuery<Option<DeviceCut>>> {
+    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let conn: &Connection = &read_tx;
+    if let Some(reason) = auth_len_preflight(conn, owner_account_id, auth_len)? {
+        return Ok(fold::AuthorityQuery::Parked(reason));
+    }
+    let grant_exists: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM account_stream_grants
+             WHERE owner_account_id = ?1 AND grant_id = ?2
+         )",
+        params![owner_account_id.to_bytes().as_slice(), grant_id.as_slice()],
+        |row| row.get(0),
+    )?;
+    if !grant_exists {
+        return missing_reference(conn, owner_account_id, &grant_id);
+    }
+    let cut = load_grant_device_cut(conn, owner_account_id, grant_id, device_fingerprint)?;
+    Ok(fold::AuthorityQuery::Effective(cut))
+}
+
+fn load_grant_device_cut(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    grant_id: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+) -> anyhow::Result<Option<DeviceCut>> {
+    let row: Option<(Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT seq, entry_hash FROM account_stream_grant_cuts
+             WHERE owner_account_id = ?1 AND grant_id = ?2 AND device_fingerprint = ?3",
+            params![
+                owner_account_id.to_bytes().as_slice(),
+                grant_id.as_slice(),
+                device_fingerprint.to_bytes().as_slice(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(seq, hash)| -> anyhow::Result<DeviceCut> {
+        Ok(DeviceCut {
+            device_fingerprint,
+            seq: u64::from_be_bytes(fixed(&seq)?),
+            hash: fixed(&hash)?,
+        })
+    })
+    .transpose()
+}
+
+fn auth_len_preflight(
+    conn: &Connection,
+    account_id: AccountId,
+    auth_len: u64,
+) -> anyhow::Result<Option<fold::AuthorityParkReason>> {
+    let effective_count: Option<i64> = conn
+        .query_row(
+            "SELECT effective_count FROM account_auth_state WHERE account_id = ?1",
+            [account_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(effective_count) = effective_count else {
+        return Ok(Some(fold::AuthorityParkReason::UnknownReference));
+    };
+    if auth_len > u64::try_from(effective_count)? {
+        Ok(Some(fold::AuthorityParkReason::AuthLenAhead))
+    } else {
+        Ok(None)
+    }
+}
+
+fn missing_reference<T>(
+    conn: &Connection,
+    account_id: AccountId,
+    reference: &EntryHash,
+) -> anyhow::Result<fold::AuthorityQuery<T>> {
+    let stored_account: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT account_id FROM account_entries WHERE entry_hash = ?1",
+            [reference.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match stored_account {
+        None => fold::AuthorityQuery::Parked(fold::AuthorityParkReason::UnknownReference),
+        Some(stored) if fixed(&stored)? != account_id.to_bytes() =>
+            fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject),
+        Some(_) =>
+            fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::ReferencedEntryNotEffective),
+    })
+}
+
+fn validated_fact<T>(
+    authority: T,
+    effective_at: i64,
+    closed_at: Option<i64>,
+) -> anyhow::Result<fold::AuthorityQuery<T>> {
+    let _ = (u64::try_from(effective_at)?, closed_at.map(u64::try_from).transpose()?);
+    Ok(fold::AuthorityQuery::Effective(authority))
+}
+
+fn validated_open_fact<T>(
+    authority: T,
+    effective_at: i64,
+    closed_at: Option<i64>,
+) -> anyhow::Result<fold::AuthorityQuery<T>> {
+    let fact = validated_fact(authority, effective_at, closed_at)?;
+    Ok(if closed_at.is_some() {
+        fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::ReferencedEntryNotEffective)
+    } else {
+        fact
+    })
 }
 
 /// The refold body (caller owns the txn). Returns each entry_hash → its projected status.
@@ -287,7 +629,129 @@ fn refold_in_tx(
         )?;
         statuses.insert(row.entry_hash, status);
     }
+    rewrite_authority_projection(tx, account_id, &projection.history)?;
     Ok(statuses)
+}
+
+/// Replace every query-ready authority fact for this account. The caller's IMMEDIATE refold txn
+/// also owns accepted/status, so readers can never observe authority from a different fold round.
+fn rewrite_authority_projection(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    history: &fold::AccountAuthHistory,
+) -> anyhow::Result<()> {
+    let account = account_id.to_bytes();
+    for table in [
+        "account_roster_history",
+        "account_owner_incarnations",
+        "account_stream_ownership",
+        "account_stream_grants",
+        "account_stream_grant_cuts",
+        "account_auth_state",
+    ] {
+        let account_column = match table {
+            "account_stream_grants" | "account_stream_grant_cuts" => "owner_account_id",
+            _ => "account_id",
+        };
+        tx.execute(&format!("DELETE FROM {table} WHERE {account_column} = ?1"), [
+            account.as_slice()
+        ])?;
+    }
+
+    let (classification, contested_depth) = match history.classification() {
+        fold::AccountClassification::Live => ("live", None),
+        fold::AccountClassification::Contested { state_before_depth } =>
+            ("contested", Some(i64::try_from(state_before_depth)?)),
+    };
+    let successor = history.contested_successor().map(AccountId::to_bytes);
+    tx.execute(
+        "INSERT INTO account_auth_state(
+             account_id, classification, contested_depth, successor_account_id, effective_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            account.as_slice(),
+            classification,
+            contested_depth,
+            successor.as_ref().map(<[u8; 32]>::as_slice),
+            i64::try_from(history.effective_count())?,
+        ],
+    )?;
+
+    for (roster_ref, fact) in history.roster_facts() {
+        tx.execute(
+            "INSERT INTO account_roster_history(
+                 roster_ref, account_id, device_fingerprint, role, effective_at, closed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                roster_ref.as_slice(),
+                account.as_slice(),
+                fact.authority.device_fingerprint.to_bytes().as_slice(),
+                fact.authority.role.as_db_str(),
+                i64::try_from(fact.effective_at)?,
+                fact.closed_at.map(i64::try_from).transpose()?,
+            ],
+        )?;
+    }
+    for (owner_id, fact) in history.owner_incarnation_facts() {
+        tx.execute(
+            "INSERT INTO account_owner_incarnations(
+                 owner_id, account_id, device_fingerprint, effective_at, closed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                owner_id.as_slice(),
+                account.as_slice(),
+                fact.authority.device_fingerprint.to_bytes().as_slice(),
+                i64::try_from(fact.effective_at)?,
+                fact.closed_at.map(i64::try_from).transpose()?,
+            ],
+        )?;
+    }
+    for (stream_id, fact) in history.stream_ownership_facts() {
+        tx.execute(
+            "INSERT INTO account_stream_ownership(stream_id, account_id, own_id, effective_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                stream_id.to_bytes().as_slice(),
+                account.as_slice(),
+                fact.own_id.as_slice(),
+                i64::try_from(fact.effective_at)?,
+            ],
+        )?;
+    }
+    for (grant_id, fact) in history.grant_facts() {
+        tx.execute(
+            "INSERT INTO account_stream_grants(
+                 grant_id, owner_account_id, stream_id, grantee_account_id, role, effective_at,
+                 closed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                grant_id.as_slice(),
+                account.as_slice(),
+                fact.authority.stream_id.to_bytes().as_slice(),
+                fact.authority.grantee_account_id.to_bytes().as_slice(),
+                fact.authority.role.as_db_str(),
+                i64::try_from(fact.effective_at)?,
+                fact.closed_at.map(i64::try_from).transpose()?,
+            ],
+        )?;
+    }
+    for (grant_id, cuts) in history.grant_cuts() {
+        for cut in cuts {
+            tx.execute(
+                "INSERT INTO account_stream_grant_cuts(
+                     grant_id, owner_account_id, device_fingerprint, seq, entry_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    grant_id.as_slice(),
+                    account.as_slice(),
+                    cut.device_fingerprint.to_bytes().as_slice(),
+                    cut.seq.to_be_bytes().as_slice(),
+                    cut.hash.as_slice(),
+                ],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Derive an author-chain-coherent, authority-closed projection without touching storage.
@@ -786,9 +1250,9 @@ fn is_device_add(verified: &VerifiedAccountEntry) -> bool {
     verified.header.entry_type == ops::entry_type::DEVICE_ADD
 }
 
-/// A stored 32-byte column as a fixed array (errors, never panics, on a wrong-length blob).
-fn fixed(bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
-    bytes.try_into().map_err(|_| anyhow::anyhow!("stored hash is {} bytes, not 32", bytes.len()))
+/// A stored fixed-width blob as an array (errors, never panics, on a wrong-length value).
+fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
+    bytes.try_into().map_err(|_| anyhow::anyhow!("stored blob is {} bytes, not {N}", bytes.len()))
 }
 
 /// The projected status of a single entry (§16.3), or `None` if the entry isn't stored (e.g. it is
@@ -815,8 +1279,9 @@ mod tests {
     use super::*;
     use crate::index::schema;
     use crate::oplog::account::envelope::sign_account_entry;
-    use crate::oplog::account::ops::{DeviceRole, encode, entry_type_of};
+    use crate::oplog::account::ops::{DeviceCut, DeviceRole, GrantRole};
     use crate::oplog::device::{DeviceSecret, DeviceX25519Secret};
+    use crate::oplog::stream::{self, StreamSpec, StreamSpecV2};
 
     const NOW: i64 = 1_700_000_000_000;
 
@@ -851,7 +1316,7 @@ mod tests {
             created_at_ms: NOW as u64,
             label: None,
         };
-        let payload = encode(&op).unwrap();
+        let payload = ops::encode(&op).unwrap();
         let account_id = account_id_from_genesis_payload(&payload);
         let header = AccountEntryHeader {
             account_id,
@@ -880,7 +1345,7 @@ mod tests {
         authority_ref: Option<[u8; 32]>,
         op: &AccountOp,
     ) -> (Vec<u8>, [u8; 32]) {
-        let payload = encode(op).unwrap();
+        let payload = ops::encode(op).unwrap();
         let header = AccountEntryHeader {
             account_id,
             log_id: 0,
@@ -888,7 +1353,7 @@ mod tests {
             seq,
             prev_hash: prev,
             parent_ref: None,
-            entry_type: entry_type_of(op),
+            entry_type: ops::entry_type_of(op),
             op_version: 1,
             crypto_suite: 0,
             auth_len: 1,
@@ -909,6 +1374,21 @@ mod tests {
         }
     }
 
+    fn stream_own(account_id: AccountId) -> (crate::oplog::stream::StreamId, AccountOp) {
+        let spec = StreamSpecV2 {
+            owner_account_id: account_id,
+            policy: StreamSpec {
+                repo_set: vec!["repo-a".to_string()],
+                kind_allow_list: None,
+                relation_policy: None,
+                node_overrides: Vec::new(),
+            },
+        };
+        let stream_id = stream::derive_v2(&spec).unwrap();
+        let stream_spec_bytes = stream::canonical_spec_v2_bytes(&spec).unwrap();
+        (stream_id, AccountOp::StreamOwn { stream_id, stream_spec_bytes })
+    }
+
     fn device_remove(dev: &Dev, control_cut: super::super::cut::Cut) -> AccountOp {
         AccountOp::DeviceRemove {
             device_fingerprint: dev.fp,
@@ -926,6 +1406,23 @@ mod tests {
             control_cut: super::super::cut::Cut::Empty,
             secrets_cut: super::super::cut::Cut::Empty,
             reason: "demoted".to_string(),
+        }
+    }
+
+    fn cut_extend_ctrl(
+        account_id: AccountId,
+        subject: &Dev,
+        new_seq: u64,
+        new_entry_hash: EntryHash,
+    ) -> AccountOp {
+        AccountOp::CutExtend {
+            chain_kind: super::super::ops::ChainKind::Ctrl,
+            stream_id: None,
+            incarnation_id: None,
+            subject_account_id: account_id,
+            device_fingerprint: subject.fp,
+            new_seq,
+            new_entry_hash,
         }
     }
 
@@ -987,6 +1484,517 @@ mod tests {
     }
 
     #[test]
+    fn refold_projects_stream_authority_and_revoke_cuts_for_keyed_queries() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let grantee_device = Dev::new(2);
+        let grantee = AccountId::from_bytes([0x44; 32]);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        let (stream_id, own_op) = stream_own(account_id);
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
+        let grant_op = AccountOp::StreamGrant {
+            stream_id,
+            grantee_account_id: grantee,
+            grant_role: GrantRole::Writer,
+        };
+        let (grant_bytes, grant_id) =
+            op(account_id, &founder, 2, Some(own_hash), Some(genesis_hash), &grant_op);
+        account_ingest(&conn, &grant_bytes, NOW + 2).unwrap();
+        assert!(matches!(
+            grant_effective_for_device(
+                &conn,
+                account_id,
+                grant_id,
+                stream_id,
+                grantee,
+                grantee_device.fp,
+                3,
+            )
+            .unwrap(),
+            fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority {
+                boundary: fold::GrantDeviceBoundary::Open,
+                ..
+            }),
+        ));
+        let cut_hash = [0x99; 32];
+        let revoke_op = AccountOp::StreamRevoke {
+            stream_id,
+            grantee_account_id: grantee,
+            grant_id,
+            device_cuts: vec![DeviceCut {
+                device_fingerprint: grantee_device.fp,
+                seq: u64::MAX,
+                hash: cut_hash,
+            }],
+            reason: "access ended".to_string(),
+        };
+        let (revoke_bytes, _) =
+            op(account_id, &founder, 3, Some(grant_id), Some(genesis_hash), &revoke_op);
+        account_ingest(&conn, &revoke_bytes, NOW + 3).unwrap();
+
+        let state: (String, i64) = conn
+            .query_row(
+                "SELECT classification, effective_count FROM account_auth_state
+                 WHERE account_id = ?1",
+                [account_id.to_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("live".to_string(), 4));
+        let grant: (String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT role, effective_at, closed_at FROM account_stream_grants
+                 WHERE grant_id = ?1",
+                [grant_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(grant, ("writer".to_string(), 2, Some(3)));
+        let cut: (Vec<u8>, Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT device_fingerprint, seq, entry_hash
+                 FROM account_stream_grant_cuts WHERE grant_id = ?1",
+                [grant_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            cut,
+            (
+                grantee_device.fp.to_bytes().to_vec(),
+                u64::MAX.to_be_bytes().to_vec(),
+                cut_hash.to_vec(),
+            ),
+        );
+        assert_eq!(
+            stream_owner_effective(&conn, account_id, stream_id, 4).unwrap(),
+            fold::AuthorityQuery::Effective(own_hash),
+        );
+        assert_eq!(
+            grant_device_cut(&conn, account_id, grant_id, grantee_device.fp, 4).unwrap(),
+            fold::AuthorityQuery::Effective(Some(DeviceCut {
+                device_fingerprint: grantee_device.fp,
+                seq: u64::MAX,
+                hash: cut_hash,
+            })),
+        );
+        assert_eq!(
+            grant_effective_for_device(
+                &conn,
+                account_id,
+                grant_id,
+                stream_id,
+                grantee,
+                grantee_device.fp,
+                4,
+            )
+            .unwrap(),
+            fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority {
+                grant: fold::GrantAuthority {
+                    stream_id,
+                    grantee_account_id: grantee,
+                    role: GrantRole::Writer,
+                },
+                boundary: fold::GrantDeviceBoundary::Cut(DeviceCut {
+                    device_fingerprint: grantee_device.fp,
+                    seq: u64::MAX,
+                    hash: cut_hash,
+                }),
+            }),
+        );
+        assert_eq!(
+            grant_device_cut(&conn, account_id, grant_id, Dev::new(3).fp, 4).unwrap(),
+            fold::AuthorityQuery::Effective(None),
+        );
+        assert!(matches!(
+            grant_effective_for_device(
+                &conn,
+                account_id,
+                grant_id,
+                stream_id,
+                grantee,
+                Dev::new(3).fp,
+                4,
+            )
+            .unwrap(),
+            fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority {
+                boundary: fold::GrantDeviceBoundary::Closed,
+                ..
+            }),
+        ));
+        assert_eq!(
+            grant_device_cut(
+                &conn,
+                AccountId::from_bytes([0x66; 32]),
+                grant_id,
+                grantee_device.fp,
+                0,
+            )
+            .unwrap(),
+            fold::AuthorityQuery::Parked(fold::AuthorityParkReason::UnknownReference),
+        );
+        assert!(matches!(
+            grant_effective(&conn, account_id, grant_id, stream_id, grantee, 3).unwrap(),
+            fold::AuthorityQuery::Effective(fold::GrantAuthority { role: GrantRole::Writer, .. })
+        ));
+        assert_eq!(
+            grant_effective(&conn, account_id, grant_id, stream_id, grantee, 4).unwrap(),
+            fold::AuthorityQuery::Effective(fold::GrantAuthority {
+                stream_id,
+                grantee_account_id: grantee,
+                role: GrantRole::Writer,
+            }),
+        );
+        assert!(matches!(
+            roster_ref_effective(&conn, account_id, genesis_hash, founder.fp, 1).unwrap(),
+            fold::AuthorityQuery::Effective(fold::RosterAuthority { role: DeviceRole::Owner, .. })
+        ));
+        assert!(matches!(
+            owner_incarnation_effective(&conn, account_id, genesis_hash, founder.fp, 1).unwrap(),
+            fold::AuthorityQuery::Effective(_)
+        ));
+        assert_eq!(
+            grant_effective(&conn, account_id, [0xaa; 32], stream_id, grantee, 4).unwrap(),
+            fold::AuthorityQuery::Parked(fold::AuthorityParkReason::UnknownReference),
+        );
+
+        // Corrupt projection state must fail closed: an open grant cannot legitimately retain a
+        // revoke cut from an older projection round.
+        conn.execute(
+            "UPDATE account_stream_grants SET closed_at = NULL
+             WHERE owner_account_id = ?1 AND grant_id = ?2",
+            params![account_id.to_bytes().as_slice(), grant_id.as_slice()],
+        )
+        .unwrap();
+        let error = grant_effective_for_device(
+            &conn,
+            account_id,
+            grant_id,
+            stream_id,
+            grantee,
+            grantee_device.fp,
+            4,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("open grant unexpectedly has a persisted device cut"),
+            "unexpected corrupt-projection error: {error:#}",
+        );
+    }
+
+    #[test]
+    fn combined_grant_query_never_mixes_projection_rounds_across_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grant-snapshot.db");
+        let setup = Connection::open(&path).unwrap();
+        schema::apply(&setup).unwrap();
+        setup.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+
+        let founder = Dev::new(1);
+        let grantee_device = Dev::new(2);
+        let grantee = AccountId::from_bytes([0x44; 32]);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&setup, &genesis_bytes, NOW).unwrap();
+        let (stream_id, own_op) = stream_own(account_id);
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        account_ingest(&setup, &own_bytes, NOW + 1).unwrap();
+        let grant_op = AccountOp::StreamGrant {
+            stream_id,
+            grantee_account_id: grantee,
+            grant_role: GrantRole::Writer,
+        };
+        let (grant_bytes, grant_id) =
+            op(account_id, &founder, 2, Some(own_hash), Some(genesis_hash), &grant_op);
+        account_ingest(&setup, &grant_bytes, NOW + 2).unwrap();
+        let cut_hash = [0x99; 32];
+        let revoke_op = AccountOp::StreamRevoke {
+            stream_id,
+            grantee_account_id: grantee,
+            grant_id,
+            device_cuts: vec![DeviceCut {
+                device_fingerprint: grantee_device.fp,
+                seq: 7,
+                hash: cut_hash,
+            }],
+            reason: "access ended".to_string(),
+        };
+        let (revoke_bytes, _) =
+            op(account_id, &founder, 3, Some(grant_id), Some(genesis_hash), &revoke_op);
+        account_ingest(&setup, &revoke_bytes, NOW + 3).unwrap();
+        drop(setup);
+
+        let reader = Connection::open(&path).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        let snapshot = Transaction::new_unchecked(&reader, TransactionBehavior::Deferred).unwrap();
+        assert_eq!(auth_len_preflight(&snapshot, account_id, 4).unwrap(), None);
+
+        let write_tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).unwrap();
+        write_tx
+            .execute(
+                "DELETE FROM account_stream_grant_cuts
+                 WHERE owner_account_id = ?1 AND grant_id = ?2",
+                params![account_id.to_bytes().as_slice(), grant_id.as_slice()],
+            )
+            .unwrap();
+        write_tx
+            .execute(
+                "UPDATE account_stream_grants SET closed_at = NULL
+                 WHERE owner_account_id = ?1 AND grant_id = ?2",
+                params![account_id.to_bytes().as_slice(), grant_id.as_slice()],
+            )
+            .unwrap();
+        write_tx.commit().unwrap();
+
+        let old_round = grant_effective_for_device_in_snapshot(
+            &snapshot,
+            account_id,
+            grant_id,
+            stream_id,
+            grantee,
+            grantee_device.fp,
+            4,
+        )
+        .unwrap();
+        assert!(matches!(
+            old_round,
+            fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority {
+                boundary: fold::GrantDeviceBoundary::Cut(DeviceCut { seq: 7, hash, .. }),
+                ..
+            }) if hash == cut_hash
+        ));
+        drop(snapshot);
+
+        assert!(matches!(
+            grant_effective_for_device(
+                &reader,
+                account_id,
+                grant_id,
+                stream_id,
+                grantee,
+                grantee_device.fp,
+                4,
+            )
+            .unwrap(),
+            fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority {
+                boundary: fold::GrantDeviceBoundary::Open,
+                ..
+            }),
+        ));
+    }
+
+    #[test]
+    fn authority_projection_failure_rolls_back_candidate_status_and_prior_shadow_state() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_stream_authority_projection
+             BEFORE INSERT ON account_stream_ownership
+             BEGIN SELECT RAISE(ABORT, 'injected authority projection failure'); END;",
+        )
+        .unwrap();
+        let (_, own_op) = stream_own(account_id);
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+
+        assert!(account_ingest(&conn, &own_bytes, NOW + 1).is_err());
+        let candidate_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE account_id = ?1",
+                [account_id.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(candidate_count, 1, "the newly inserted candidate rolled back");
+        assert_eq!(status(&conn, &own_hash), None, "its projected status rolled back");
+        let effective_count: i64 = conn
+            .query_row(
+                "SELECT effective_count FROM account_auth_state WHERE account_id = ?1",
+                [account_id.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(effective_count, 1, "the prior shadow projection survived intact");
+    }
+
+    #[test]
+    fn v064_forward_migration_backfills_populated_account_histories() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (stream_id, own_op) = stream_own(account_id);
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
+
+        conn.execute("DELETE FROM schema_version WHERE id = '064_account_authority_projection'", [
+        ])
+        .unwrap();
+        conn.execute_batch(
+            "DROP TABLE account_stream_grant_cuts;
+             DROP TABLE account_stream_grants;
+             DROP TABLE account_stream_ownership;
+             DROP TABLE account_owner_incarnations;
+             DROP TABLE account_roster_history;
+             DROP TABLE account_auth_state;",
+        )
+        .unwrap();
+
+        schema::migrate_forward(&conn).unwrap();
+        assert_eq!(
+            stream_owner_effective(&conn, account_id, stream_id, 2).unwrap(),
+            fold::AuthorityQuery::Effective(own_hash),
+        );
+        assert!(matches!(
+            roster_ref_effective(&conn, account_id, genesis_hash, founder.fp, 2).unwrap(),
+            fold::AuthorityQuery::Effective(fold::RosterAuthority { role: DeviceRole::Owner, .. })
+        ));
+        assert_eq!(schema::status(&conn).unwrap().current_version, 64);
+    }
+
+    #[test]
+    fn v064_backfill_failure_rolls_back_ddl_projection_and_ledger_together() {
+        let conn = db();
+        conn.execute("DELETE FROM schema_version WHERE id = '064_account_authority_projection'", [
+        ])
+        .unwrap();
+        conn.execute_batch(
+            "DROP TABLE account_stream_grant_cuts;
+             DROP TABLE account_stream_grants;
+             DROP TABLE account_stream_ownership;
+             DROP TABLE account_owner_incarnations;
+             DROP TABLE account_roster_history;
+             DROP TABLE account_auth_state;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_entries(
+                 entry_hash, account_id, log_id, device_fingerprint, seq, entry_type,
+                 accepted, signed_bytes, received_at_ms
+             ) VALUES (?1, ?2, 0, ?1, 0, 99, 0, X'00', 0)",
+            params![[0x11u8; 32].as_slice(), [0x22u8; 31].as_slice()],
+        )
+        .unwrap();
+
+        assert!(schema::migrate_forward(&conn).is_err());
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'account_auth_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0, "V064 DDL rolled back with the failed backfill");
+        let ledger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_version
+                 WHERE id = '064_account_authority_projection'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ledger_count, 0, "a failed projection never claims V064 was applied");
+    }
+
+    #[test]
+    fn authority_queries_fail_closed_on_subject_mismatch_ahead_state_and_corrupt_rows() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let grantee = AccountId::from_bytes([0x44; 32]);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (stream_id, own_op) = stream_own(account_id);
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
+        let (grant_bytes, grant_id) = op(
+            account_id,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(genesis_hash),
+            &AccountOp::StreamGrant {
+                stream_id,
+                grantee_account_id: grantee,
+                grant_role: GrantRole::Reader,
+            },
+        );
+        account_ingest(&conn, &grant_bytes, NOW + 2).unwrap();
+        let (self_grant_bytes, self_grant_id) = op(
+            account_id,
+            &founder,
+            3,
+            Some(grant_id),
+            Some(genesis_hash),
+            &AccountOp::StreamGrant {
+                stream_id,
+                grantee_account_id: account_id,
+                grant_role: GrantRole::Reader,
+            },
+        );
+        account_ingest(&conn, &self_grant_bytes, NOW + 3).unwrap();
+
+        assert_eq!(
+            grant_effective(&conn, account_id, grant_id, stream_id, grantee, 99).unwrap(),
+            fold::AuthorityQuery::Parked(fold::AuthorityParkReason::AuthLenAhead),
+        );
+        assert_eq!(
+            grant_effective(
+                &conn,
+                account_id,
+                grant_id,
+                crate::oplog::stream::StreamId::from_bytes([0x55; 32]),
+                grantee,
+                3,
+            )
+            .unwrap(),
+            fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject),
+        );
+        assert_eq!(
+            grant_effective(&conn, account_id, self_grant_id, stream_id, account_id, 3).unwrap(),
+            fold::AuthorityQuery::Invalid(
+                fold::AuthorityInvalidReason::ReferencedEntryNotEffective,
+            ),
+        );
+
+        conn.execute("UPDATE account_stream_grants SET role = 'admin' WHERE grant_id = ?1", [
+            grant_id.as_slice(),
+        ])
+        .unwrap();
+        assert!(grant_effective(&conn, account_id, grant_id, stream_id, grantee, 3).is_err());
+        conn.execute(
+            "UPDATE account_stream_grants SET role = 'reader', effective_at = -1
+             WHERE grant_id = ?1",
+            [grant_id.as_slice()],
+        )
+        .unwrap();
+        assert!(grant_effective(&conn, account_id, grant_id, stream_id, grantee, 3).is_err());
+        conn.execute("UPDATE account_stream_grants SET effective_at = 2 WHERE grant_id = ?1", [
+            grant_id.as_slice(),
+        ])
+        .unwrap();
+        conn.execute(
+            "UPDATE account_stream_ownership SET own_id = ?2 WHERE stream_id = ?1",
+            params![stream_id.to_bytes().as_slice(), [0u8; 31].as_slice()],
+        )
+        .unwrap();
+        assert!(stream_owner_effective(&conn, account_id, stream_id, 3).is_err());
+        conn.execute("UPDATE account_auth_state SET effective_count = -1 WHERE account_id = ?1", [
+            account_id.to_bytes().as_slice(),
+        ])
+        .unwrap();
+        assert!(roster_ref_effective(&conn, account_id, genesis_hash, founder.fp, 0).is_err());
+    }
+
+    #[test]
     fn malformed_envelopes_and_wrong_genesis_self_hashes_never_touch_storage() {
         let conn = db();
         assert!(matches!(account_ingest(&conn, &[0xff], NOW).unwrap(), IngestOutcome::Rejected(_)));
@@ -999,7 +2007,7 @@ mod tests {
             created_at_ms: NOW as u64,
             label: None,
         };
-        let payload = encode(&genesis_op).unwrap();
+        let payload = ops::encode(&genesis_op).unwrap();
         let wrong_account = AccountId::from_bytes([0x55; 32]);
         assert_ne!(wrong_account, account_id_from_genesis_payload(&payload));
         let header = AccountEntryHeader {
@@ -1045,7 +2053,7 @@ mod tests {
             created_at_ms: NOW as u64,
             label: None,
         };
-        let payload = encode(&op).unwrap();
+        let payload = ops::encode(&op).unwrap();
         let header = AccountEntryHeader {
             account_id: acct,
             log_id: 0,
@@ -1749,6 +2757,147 @@ mod tests {
     }
 
     #[test]
+    fn late_cut_and_extend_atomically_remove_then_restore_authority_shadow_rows() {
+        let conn = db();
+        let (founder, owner, d, e, g) =
+            (Dev::new(1), Dev::new(2), Dev::new(5), Dev::new(6), Dev::new(7));
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (add_owner_bytes, add_owner) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&owner, DeviceRole::Owner),
+        );
+        account_ingest(&conn, &add_owner_bytes, NOW + 1).unwrap();
+        let (b0_bytes, b0) =
+            op(account_id, &owner, 0, None, Some(add_owner), &device_add(&d, DeviceRole::Member));
+        let (b1_bytes, b1) = op(
+            account_id,
+            &owner,
+            1,
+            Some(b0),
+            Some(add_owner),
+            &device_add(&e, DeviceRole::Member),
+        );
+        let (b2_bytes, b2) = op(
+            account_id,
+            &owner,
+            2,
+            Some(b1),
+            Some(add_owner),
+            &device_add(&g, DeviceRole::Member),
+        );
+        for (offset, bytes) in [&b0_bytes, &b1_bytes, &b2_bytes].into_iter().enumerate() {
+            account_ingest(&conn, bytes, NOW + 2 + i64::try_from(offset).unwrap()).unwrap();
+        }
+        assert!(matches!(
+            roster_ref_effective(&conn, account_id, b2, g.fp, 5).unwrap(),
+            fold::AuthorityQuery::Effective(_)
+        ));
+
+        let (remove_bytes, remove_hash) = op(
+            account_id,
+            &founder,
+            2,
+            Some(add_owner),
+            Some(genesis_hash),
+            &device_remove(&owner, super::super::cut::Cut::At { seq: 0, hash: b0 }),
+        );
+        account_ingest(&conn, &remove_bytes, NOW + 5).unwrap();
+        assert_eq!(status(&conn, &b1).as_deref(), Some("condemned"));
+        assert_eq!(status(&conn, &b2).as_deref(), Some("condemned"));
+        assert_eq!(
+            roster_ref_effective(&conn, account_id, b2, g.fp, 4).unwrap(),
+            fold::AuthorityQuery::Invalid(
+                fold::AuthorityInvalidReason::ReferencedEntryNotEffective
+            ),
+        );
+
+        let (extend_bytes, _) = op(
+            account_id,
+            &founder,
+            3,
+            Some(remove_hash),
+            Some(genesis_hash),
+            &cut_extend_ctrl(account_id, &owner, 2, b2),
+        );
+        account_ingest(&conn, &extend_bytes, NOW + 6).unwrap();
+        assert_eq!(status(&conn, &b1).as_deref(), Some("accepted"));
+        assert_eq!(status(&conn, &b2).as_deref(), Some("accepted"));
+        assert!(matches!(
+            roster_ref_effective(&conn, account_id, b2, g.fp, 7).unwrap(),
+            fold::AuthorityQuery::Effective(_)
+        ));
+    }
+
+    #[test]
+    fn contested_fold_persists_the_state_before_depth_and_halts_authority_mutation() {
+        let conn = db();
+        let (founder, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (add_a_bytes, add_a) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&a, DeviceRole::Owner),
+        );
+        let (add_b_bytes, add_b) = op(
+            account_id,
+            &founder,
+            2,
+            Some(add_a),
+            Some(genesis_hash),
+            &device_add(&b, DeviceRole::Owner),
+        );
+        account_ingest(&conn, &add_a_bytes, NOW + 1).unwrap();
+        account_ingest(&conn, &add_b_bytes, NOW + 2).unwrap();
+        let (remove_b_bytes, remove_b) = op(
+            account_id,
+            &a,
+            0,
+            None,
+            Some(add_a),
+            &device_remove(&b, super::super::cut::Cut::Empty),
+        );
+        let (remove_a_bytes, remove_a) = op(
+            account_id,
+            &b,
+            0,
+            None,
+            Some(add_b),
+            &device_remove(&a, super::super::cut::Cut::Empty),
+        );
+        account_ingest(&conn, &remove_b_bytes, NOW + 3).unwrap();
+        account_ingest(&conn, &remove_a_bytes, NOW + 4).unwrap();
+
+        let state: (String, Option<i64>, Option<Vec<u8>>, i64) = conn
+            .query_row(
+                "SELECT classification, contested_depth, successor_account_id, effective_count
+                 FROM account_auth_state WHERE account_id = ?1",
+                [account_id.to_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("contested".to_string(), Some(1), None, 3));
+        assert_eq!(status(&conn, &remove_a).as_deref(), Some("parked"));
+        assert_eq!(status(&conn, &remove_b).as_deref(), Some("parked"));
+        let owner_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_owner_incarnations WHERE account_id = ?1",
+                [account_id.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner_count, 3, "only state-before owner incarnations are projected");
+    }
+
+    #[test]
     fn an_equivocation_accepts_one_head_and_forks_the_other() {
         // The founder equivocates: two DIFFERENT seq-1 entries on its own chain. Both fold
         // effective, but only one can occupy the (device, seq) slot (I10a) — the smaller
@@ -1841,6 +2990,76 @@ mod tests {
             assert_eq!(status(&conn, &add_c).as_deref(), Some("forked"));
             assert_eq!(status(&conn, &add_d).as_deref(), Some("forked"));
         }
+    }
+
+    #[test]
+    fn roster_and_owner_projection_tracks_role_changes_and_closures() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let member = Dev::new(2);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        let (add_bytes, add) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&member, DeviceRole::Member),
+        );
+        account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
+        let (promote_bytes, promote) =
+            op(account_id, &founder, 2, Some(add), Some(genesis_hash), &AccountOp::OwnerPromote {
+                device_fingerprint: member.fp,
+            });
+        account_ingest(&conn, &promote_bytes, NOW + 2).unwrap();
+        assert_eq!(
+            roster_ref_effective(&conn, account_id, add, member.fp, 3).unwrap(),
+            fold::AuthorityQuery::Effective(fold::RosterAuthority {
+                device_fingerprint: member.fp,
+                role: DeviceRole::Owner,
+            }),
+        );
+
+        let (demote_bytes, demote) = op(
+            account_id,
+            &founder,
+            3,
+            Some(promote),
+            Some(genesis_hash),
+            &owner_demote(&member, promote),
+        );
+        account_ingest(&conn, &demote_bytes, NOW + 3).unwrap();
+        assert_eq!(
+            roster_ref_effective(&conn, account_id, add, member.fp, 4).unwrap(),
+            fold::AuthorityQuery::Effective(fold::RosterAuthority {
+                device_fingerprint: member.fp,
+                role: DeviceRole::Member,
+            }),
+        );
+        assert_eq!(
+            owner_incarnation_effective(&conn, account_id, promote, member.fp, 4).unwrap(),
+            fold::AuthorityQuery::Invalid(
+                fold::AuthorityInvalidReason::ReferencedEntryNotEffective,
+            ),
+        );
+
+        let (remove_bytes, _) = op(
+            account_id,
+            &founder,
+            4,
+            Some(demote),
+            Some(genesis_hash),
+            &device_remove(&member, super::super::cut::Cut::Empty),
+        );
+        account_ingest(&conn, &remove_bytes, NOW + 4).unwrap();
+        assert_eq!(
+            roster_ref_effective(&conn, account_id, add, member.fp, 5).unwrap(),
+            fold::AuthorityQuery::Invalid(
+                fold::AuthorityInvalidReason::ReferencedEntryNotEffective,
+            ),
+        );
     }
 
     #[test]
@@ -2062,7 +3281,7 @@ mod tests {
         let (acct, gbytes, gh) = genesis(&founder);
         account_ingest(&conn, &gbytes, NOW).unwrap();
         let b = Dev::new(2);
-        let payload = encode(&device_add(&b, DeviceRole::Member)).unwrap();
+        let payload = ops::encode(&device_add(&b, DeviceRole::Member)).unwrap();
         let gap_header = AccountEntryHeader {
             account_id: acct,
             log_id: 0,
@@ -2099,7 +3318,7 @@ mod tests {
         let founder = Dev::new(1);
         let (acct, _gbytes, gh) = genesis(&founder);
         let b = Dev::new(2);
-        let payload = encode(&device_add(&b, DeviceRole::Member)).unwrap();
+        let payload = ops::encode(&device_add(&b, DeviceRole::Member)).unwrap();
         let header = AccountEntryHeader {
             account_id: acct,
             log_id: 0,
@@ -2187,7 +3406,7 @@ mod tests {
         let founder = Dev::new(1);
         let (acct, _gbytes, gh) = genesis(&founder);
         let b = Dev::new(2);
-        let payload = encode(&device_add(&b, DeviceRole::Owner)).unwrap();
+        let payload = ops::encode(&device_add(&b, DeviceRole::Owner)).unwrap();
         let header = AccountEntryHeader {
             account_id: acct,
             log_id: 0,
