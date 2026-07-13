@@ -40,17 +40,10 @@ pub(crate) async fn sync_mirror(
             Ok(client) => match mirror_binding(conn, binding, &client, full).await {
                 Ok(report) => {
                     synced_items += report.stored_items;
+                    if let Some(operation) = completed_mirror_operation(&report, full) {
+                        record_success(conn, binding, operation, now_ms())?;
+                    }
                     bindings.push(report);
-                    record_success(
-                        conn,
-                        binding,
-                        if full {
-                            SuccessfulOperation::FullMirror
-                        } else {
-                            SuccessfulOperation::IncrementalMirror
-                        },
-                        now_ms(),
-                    )?;
                 },
                 Err(error) => {
                     record_failure(
@@ -96,6 +89,20 @@ pub(crate) async fn sync_mirror(
         bindings,
         errors,
         status: status(conn, ctx)?,
+    })
+}
+
+fn completed_mirror_operation(
+    report: &MirrorBindingReport,
+    full: bool,
+) -> Option<SuccessfulOperation> {
+    if report.paused_until_ms.is_some() {
+        return None;
+    }
+    Some(if full {
+        SuccessfulOperation::FullMirror
+    } else {
+        SuccessfulOperation::IncrementalMirror
     })
 }
 
@@ -476,6 +483,31 @@ mod capability_tests {
         assert_eq!(
             tracker_synchronization(&enterprise.trackers[0]),
             TrackerSynchronization::Native
+        );
+    }
+
+    #[test]
+    fn paused_mirror_is_not_a_successful_operation() {
+        let report = MirrorBindingReport {
+            tracker: Tracker::Github,
+            project: "o/r".to_string(),
+            stored_items: 1,
+            stored_comments: 0,
+            pruned_items: 0,
+            paused_until_ms: Some(42),
+            pause_reason: Some("rate_limited".to_string()),
+        };
+        assert_eq!(completed_mirror_operation(&report, false), None);
+        assert_eq!(completed_mirror_operation(&report, true), None);
+
+        let completed = MirrorBindingReport { paused_until_ms: None, ..report };
+        assert_eq!(
+            completed_mirror_operation(&completed, false),
+            Some(SuccessfulOperation::IncrementalMirror)
+        );
+        assert_eq!(
+            completed_mirror_operation(&completed, true),
+            Some(SuccessfulOperation::FullMirror)
         );
     }
 

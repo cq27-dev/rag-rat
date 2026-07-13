@@ -65,11 +65,11 @@ pub(crate) fn decide_schedule(
     let elapsed = |then: Option<i64>, interval_secs: u64| {
         then.is_none_or(|then| now_ms.saturating_sub(then) >= millis(interval_secs))
     };
-    if elapsed(state.last_full_walk_ms, config.full_sync_interval_secs) {
-        return ScheduleDecision::Full;
-    }
     if !elapsed(state.last_attempt_ms, config.sync_min_interval_secs) {
         return ScheduleDecision::Skip;
+    }
+    if elapsed(state.last_full_walk_ms, config.full_sync_interval_secs) {
+        return ScheduleDecision::Full;
     }
     if change_detected {
         return ScheduleDecision::Incremental;
@@ -230,6 +230,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(decide_schedule(20_000, &config(), state, true), ScheduleDecision::Skip);
+    }
+
+    #[test]
+    fn minimum_interval_suppresses_failed_initial_full_retry() {
+        let state = BindingScheduleState { last_attempt_ms: Some(10_000), ..Default::default() };
+        assert_eq!(decide_schedule(20_000, &config(), state, false), ScheduleDecision::Skip);
+        assert_eq!(decide_schedule(910_000, &config(), state, false), ScheduleDecision::Full);
     }
 
     #[test]
