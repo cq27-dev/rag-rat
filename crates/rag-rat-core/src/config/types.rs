@@ -110,8 +110,7 @@ pub enum TrackerAuth {
     TokenCommand(String),
 }
 
-/// Papertrail transport and reserved scheduler settings. `rate_limit_reserve` is live in the
-/// shared transport; user cadence overrides remain rejected until the scheduler consumes them.
+/// Papertrail transport and automatic synchronization settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PapertrailConfig {
     pub probe_interval_secs: u64,

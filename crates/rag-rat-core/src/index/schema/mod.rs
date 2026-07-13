@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 66;
+pub const LATEST_SCHEMA_VERSION: u32 = 67;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -462,6 +462,11 @@ const MIGRATION_066_CHECKSUM: &str = "sha256:rag-rat-content-candidate-dag-v66a"
 const MIGRATION_066_DESCRIPTION: &str =
     "Persist every structurally valid /3 content candidate, bounded pre-verification work, and \
      derived status while reserving accepted-slot uniqueness for C3 authority acceptance";
+const MIGRATION_067_ID: &str = "067_papertrail_binding_health";
+const MIGRATION_067_CHECKSUM: &str = "sha256:rag-rat-papertrail-binding-health-v67";
+const MIGRATION_067_DESCRIPTION: &str = "Persist per-binding attempt, successful probe/mirror, \
+                                         and closed failure state for automatic scheduling and \
+                                         status";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1019,6 +1024,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_066_CHECKSUM,
         description: MIGRATION_066_DESCRIPTION,
         apply: apply_content_candidate_dag,
+    },
+    Migration {
+        id: MIGRATION_067_ID,
+        checksum: MIGRATION_067_CHECKSUM,
+        description: MIGRATION_067_DESCRIPTION,
+        apply: apply_papertrail_binding_health,
     },
 ];
 

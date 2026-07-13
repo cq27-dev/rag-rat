@@ -15,7 +15,15 @@ pub(crate) async fn sync_mirror(
     let mut bindings = Vec::new();
     let mut errors = Vec::new();
     for binding in &ctx.trackers {
+        let attempted_at = now_ms();
+        record_attempt(conn, binding, attempted_at)?;
         if binding.provider != Tracker::Github {
+            record_failure(
+                conn,
+                binding,
+                PapertrailErrorClass::Provider,
+                Some("provider mirror client is not implemented"),
+            )?;
             errors.push(PapertrailSyncError {
                 tracker: binding.provider,
                 project: binding.project.clone(),
@@ -33,22 +41,48 @@ pub(crate) async fn sync_mirror(
                 Ok(report) => {
                     synced_items += report.stored_items;
                     bindings.push(report);
+                    record_success(
+                        conn,
+                        binding,
+                        if full {
+                            SuccessfulOperation::FullMirror
+                        } else {
+                            SuccessfulOperation::IncrementalMirror
+                        },
+                        now_ms(),
+                    )?;
                 },
-                Err(error) => errors.push(PapertrailSyncError {
+                Err(error) => {
+                    record_failure(
+                        conn,
+                        binding,
+                        PapertrailErrorClass::Provider,
+                        Some(&error.to_string()),
+                    )?;
+                    errors.push(PapertrailSyncError {
+                        tracker: binding.provider,
+                        project: binding.project.clone(),
+                        item_key: String::new(),
+                        status: "failed".to_string(),
+                        error: error.to_string(),
+                    });
+                },
+            },
+            Err(error) => {
+                record_failure(
+                    conn,
+                    binding,
+                    PapertrailErrorClass::Authentication,
+                    Some(&error.to_string()),
+                )?;
+                errors.push(PapertrailSyncError {
                     tracker: binding.provider,
                     project: binding.project.clone(),
                     item_key: String::new(),
-                    status: "failed".to_string(),
+                    status: "authentication_or_transport".to_string(),
                     error: error.to_string(),
-                }),
+                });
             },
-            Err(error) => errors.push(PapertrailSyncError {
-                tracker: binding.provider,
-                project: binding.project.clone(),
-                item_key: String::new(),
-                status: "authentication_or_transport".to_string(),
-                error: error.to_string(),
-            }),
         }
     }
     let repo_id = schema::active_repo_id(conn)?;
@@ -188,6 +222,29 @@ pub(crate) fn status(
         )?;
         Ok(u64::try_from(count).unwrap_or_default())
     };
+    let now = now_ms();
+    let bindings = ctx
+        .trackers
+        .iter()
+        .map(|binding| {
+            let (health, error_class, error_detail) =
+                load_persisted_health(conn, &repo_id, binding.provider, &binding.project)?;
+            let overdue =
+                decide_schedule(now, &ctx.schedule, health, false) != ScheduleDecision::Skip;
+            Ok(PapertrailBindingStatus {
+                tracker: binding.provider,
+                project: binding.project.clone(),
+                last_attempt_ms: health.last_attempt_ms,
+                last_successful_probe_ms: health.last_successful_probe_ms,
+                last_successful_mirror_ms: health.last_successful_mirror_ms,
+                last_full_walk_ms: health.last_full_walk_ms,
+                error_class,
+                error_detail,
+                overdue,
+                failed: error_class.is_some(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(PapertrailStatus {
         refs: scoped_table_row_count(conn, "papertrail_refs", &repo_id)?,
         issues: items_by_kind(ItemKind::Issue)?,
@@ -205,6 +262,7 @@ pub(crate) fn status(
                 synchronization: tracker_synchronization(binding),
             })
             .collect(),
+        bindings,
     })
 }
 

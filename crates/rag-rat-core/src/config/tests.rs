@@ -227,14 +227,14 @@ fn tracker_base_url_rejects_credentials_and_normalizes_trailing_slashes() {
 }
 
 #[test]
-fn papertrail_scheduling_table_is_rejected_until_it_is_consumed() {
+fn papertrail_scheduling_intervals_are_parsed() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("rag-rat.toml"), "[papertrail]\nprobe_interval_secs = 60\n")
         .unwrap();
-    assert!(matches!(
-        Config::load(dir.path().join("rag-rat.toml")),
-        Err(ConfigError::PapertrailSchedulingNotSupported)
-    ));
+    let config = Config::load(dir.path().join("rag-rat.toml")).unwrap();
+    assert_eq!(config.papertrail.probe_interval_secs, 60);
+    assert_eq!(config.papertrail.sync_min_interval_secs, 900);
+    assert_eq!(config.papertrail.full_sync_interval_secs, 86_400);
 }
 
 #[test]
@@ -2692,10 +2692,7 @@ fn config_load_rejects_reserved_papertrail_table_from_governing_main() {
     )
     .unwrap();
 
-    assert!(matches!(
-        Config::load(linked.join("rag-rat.toml")),
-        Err(ConfigError::PapertrailSchedulingNotSupported)
-    ));
+    Config::load(linked.join("rag-rat.toml")).unwrap();
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

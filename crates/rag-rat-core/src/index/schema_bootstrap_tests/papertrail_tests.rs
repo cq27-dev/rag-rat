@@ -657,6 +657,23 @@ fn migration_063_persists_mirror_resume_state() {
 }
 
 #[test]
+fn migration_064_is_the_tip_and_persists_binding_health() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 64, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    let columns = conn_table_columns(&conn, "papertrail_sync_cursor");
+    for name in [
+        "last_attempt_ms",
+        "last_successful_probe_ms",
+        "last_successful_mirror_ms",
+        "error_class",
+        "error_detail",
+    ] {
+        assert!(columns.contains(&name.to_string()), "missing {name}");
+    }
+}
+
+#[test]
 fn migration_063_checksum_replays_the_pre_replay_flag_shape() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();

@@ -158,11 +158,6 @@ pub enum ConfigError {
     #[error("[[tracker]] `base_url` must not embed credentials in the URL")]
     TrackerBaseUrlHasCredentials,
     #[error(
-        "[papertrail] scheduling settings are not supported until the provider mirror scheduler \
-         is active"
-    )]
-    PapertrailSchedulingNotSupported,
-    #[error(
         "[papertrail] `rate_limit_reserve` must be a finite fraction from 0.0 up to (but not \
          including) 1.0 (got `{0}`)"
     )]

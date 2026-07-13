@@ -46,8 +46,7 @@ pub(crate) struct RawConfig {
     pub(crate) memory: RawMemory,
     #[serde(default, rename = "tracker")]
     pub(crate) tracker: Vec<RawTracker>,
-    /// Papertrail transport/scheduler settings. The transport consumes `rate_limit_reserve` now;
-    /// cadence fields are captured so they can be rejected until the scheduler consumes them.
+    /// Papertrail transport and automatic synchronization settings.
     #[serde(default)]
     pub(crate) papertrail: Option<RawPapertrail>,
     #[serde(default)]
@@ -69,18 +68,22 @@ impl TryFrom<RawPapertrail> for PapertrailConfig {
     type Error = ConfigError;
 
     fn try_from(raw: RawPapertrail) -> Result<Self, Self::Error> {
-        if raw.probe_interval_secs.is_some()
-            || raw.sync_min_interval_secs.is_some()
-            || raw.full_sync_interval_secs.is_some()
-        {
-            return Err(ConfigError::PapertrailSchedulingNotSupported);
-        }
         let default = PapertrailConfig::default();
+        let probe_interval_secs = raw.probe_interval_secs.unwrap_or(default.probe_interval_secs);
+        let sync_min_interval_secs =
+            raw.sync_min_interval_secs.unwrap_or(default.sync_min_interval_secs);
+        let full_sync_interval_secs =
+            raw.full_sync_interval_secs.unwrap_or(default.full_sync_interval_secs);
         let rate_limit_reserve = raw.rate_limit_reserve.unwrap_or(default.rate_limit_reserve);
         if !rate_limit_reserve.is_finite() || !(0.0..1.0).contains(&rate_limit_reserve) {
             return Err(ConfigError::PapertrailRateLimitReserveOutOfRange(rate_limit_reserve));
         }
-        Ok(PapertrailConfig { rate_limit_reserve, ..default })
+        Ok(PapertrailConfig {
+            probe_interval_secs,
+            sync_min_interval_secs,
+            full_sync_interval_secs,
+            rate_limit_reserve,
+        })
     }
 }
 
