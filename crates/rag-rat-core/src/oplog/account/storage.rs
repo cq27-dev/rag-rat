@@ -937,13 +937,13 @@ mod tests {
         conn: &Connection,
         account_id: AccountId,
         fingerprint: DeviceFingerprint,
-        salt: u64,
+        fixture_namespace: u64,
         count: usize,
     ) {
         for ordinal in 0..count {
             let entry_hash = cbor::sha256(
                 &[
-                    salt.to_be_bytes().as_slice(),
+                    fixture_namespace.to_be_bytes().as_slice(),
                     u64::try_from(ordinal).unwrap().to_be_bytes().as_slice(),
                 ]
                 .concat(),
@@ -964,14 +964,14 @@ mod tests {
         }
     }
 
-    fn seed_global_candidate_rows(conn: &Connection, mut count: usize, salt_start: u64) {
+    fn seed_global_candidate_rows(conn: &Connection, mut count: usize, namespace_start: u64) {
         let fingerprint = Dev::new(9).fp;
         let mut account_ordinal = 0u64;
         while count > 0 {
-            let salt = salt_start + account_ordinal;
-            let account_id = AccountId::from_bytes(cbor::sha256(&salt.to_be_bytes()));
+            let fixture_namespace = namespace_start + account_ordinal;
+            let account_id = AccountId::from_bytes(cbor::sha256(&fixture_namespace.to_be_bytes()));
             let account_count = count.min(CANDIDATES_PER_ACCOUNT_MAX);
-            seed_candidate_rows(conn, account_id, fingerprint, salt, account_count);
+            seed_candidate_rows(conn, account_id, fingerprint, fixture_namespace, account_count);
             count -= account_count;
             account_ordinal += 1;
         }
