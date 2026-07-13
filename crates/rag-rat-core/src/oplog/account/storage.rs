@@ -27,12 +27,16 @@ type BranchChild = (u64, EntryHash);
 type BranchChildren = HashMap<BranchKey, Vec<BranchChild>>;
 
 // Operational admission limits, not wire-validity limits. At the §18a envelope maximum these cap
-// unauthenticated parked bytes at 4 MiB/account and 16 MiB globally. Candidate history is larger
-// because it is signature-authenticated, but still finite so full refold work cannot grow without
-// bound before the incremental projector exists.
+// unauthenticated parked bytes at 4 MiB/account and 16 MiB globally. Candidate admission has both
+// count and aggregate-byte limits: refolding materializes every candidate, so a count-only ceiling
+// would still permit hundreds of MiB in one writer transaction. Admission rejects rather than
+// evicts: deleting grow-only history would break replica convergence.
 const PRE_VERIFY_PER_ACCOUNT_MAX: usize = 64;
 const PRE_VERIFY_GLOBAL_MAX: usize = 256;
 const CANDIDATES_PER_ACCOUNT_MAX: usize = 4_096;
+const CANDIDATES_GLOBAL_MAX: usize = 16_384;
+const CANDIDATE_BYTES_PER_ACCOUNT_MAX: usize = 16 * 1024 * 1024;
+const CANDIDATE_BYTES_GLOBAL_MAX: usize = 64 * 1024 * 1024;
 
 struct AccountProjection {
     history: fold::AccountAuthHistory,
@@ -44,7 +48,30 @@ struct AccountProjection {
 enum CandidateInsert {
     Inserted,
     AlreadyPresent,
-    AtCapacity,
+    AtCapacity(CapacityScope),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreVerifyInsert {
+    Parked { evicted: Vec<CapacityScope> },
+    AtCapacity(CapacityScope),
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct PromotionOutcome {
+    scope: Option<CapacityScope>,
+    entry_hashes: Vec<EntryHash>,
+}
+
+/// The operational admission budget that prevented an otherwise valid ingest from being stored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CapacityScope {
+    PreVerifyAccount,
+    PreVerifyGlobal,
+    CandidateAccount,
+    CandidateGlobal,
+    CandidateAccountBytes,
+    CandidateGlobalBytes,
 }
 
 /// The result of ingesting one signed account entry (§16.2).
@@ -56,8 +83,20 @@ pub(crate) enum IngestOutcome {
     /// The signing device is not yet resolvable (`sha256(pk)` matches no known fingerprint) — held
     /// durably in `account_pre_verify`, retried when a later DeviceAdd/AccountGenesis arrives.
     PreVerify,
+    /// Parked successfully, but admitting it displaced older parked work at these queue budgets.
+    PreVerifyWithEviction { scopes: Vec<CapacityScope> },
+    /// Structurally valid input could not be retained within an operational admission budget.
+    CapacityReached { scope: CapacityScope },
     /// Stored as a candidate; `status` is its post-refold §16.3 taxonomy label.
     Ingested { status: String },
+    /// This entry was stored, but valid parked entries hit terminal grow-only candidate capacity.
+    /// They were removed from the unauthenticated queue; request these hashes again if capacity is
+    /// raised or storage is rebuilt under a larger operational budget.
+    IngestedWithRejectedPromotions {
+        status: String,
+        scope: CapacityScope,
+        entry_hashes: Vec<EntryHash>,
+    },
 }
 
 /// Ingest one signed account entry: structural decode → content-addressed device resolution →
@@ -79,59 +118,119 @@ pub(crate) fn account_ingest(
         return Ok(IngestOutcome::Rejected(err));
     }
 
-    // One IMMEDIATE transaction spans resolution → park-or-store → promote → refold. The write
-    // lock is what makes the park decision race-free: a concurrent ingest on another connection
-    // cannot commit a resolving DeviceAdd between our device-set read and our pre-verify insert,
-    // so an entry is never parked after its only promotion trigger has already passed.
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-
-    // Resolve the signer's ed25519 pubkey content-addressedly: from stored genesis/DeviceAdd
-    // candidates for this account, plus THIS entry if it self-certifies (a genesis / a DeviceAdd of
-    // its own signer). Unresolvable ⇒ pre-verify queue (durably, under the same lock).
-    let mut pubkeys = stored_device_pubkeys(&tx, account_id)?;
-    add_self_pubkey(&mut pubkeys, &signed.header, &signed.payload);
-    let Some(pubkey_bytes) = pubkeys.get(&device_fp).copied() else {
-        let parked = insert_pre_verify(
-            &tx,
-            &signed.entry_hash,
-            account_id,
-            device_fp,
-            signed_bytes,
-            now_ms,
-        )?;
-        tx.commit()?;
-        return Ok(if parked {
-            IngestOutcome::PreVerify
-        } else {
-            IngestOutcome::Rejected("pre-verify queue capacity reached".into())
-        });
-    };
-
-    // Verify the signature under the resolved key (also re-binds fingerprint == sha256(pk)). A
-    // failure here has written nothing, so dropping the txn rolls back cleanly.
-    let Ok(pubkey) = DevicePublic::from_bytes(&pubkey_bytes) else {
-        return Ok(IngestOutcome::Rejected("resolved device key is not a valid point".into()));
-    };
-    let verified = match envelope::verify_account_signed(signed_bytes, &pubkey) {
-        Ok(verified) => verified,
-        Err(err) => return Ok(IngestOutcome::Rejected(err.to_string())),
-    };
-    if let Err(err) = validate_authenticated_entry(&verified) {
-        return Ok(IngestOutcome::Rejected(err));
+    // An exact byte-for-byte replay was already signature-checked on first insert. Return its
+    // durable projection without taking the writer lock, rediscovering keys, or refolding up to the
+    // entire account. A different envelope for the same entry hash still follows full verification.
+    if let Some(status) = stored_status_for_exact_envelope(conn, &signed.entry_hash, signed_bytes)?
+    {
+        return Ok(IngestOutcome::Ingested { status });
     }
 
-    if insert_candidate(&tx, &verified, signed_bytes, now_ms)? == CandidateInsert::AtCapacity {
-        return Ok(IngestOutcome::Rejected("account candidate limit reached".into()));
+    // Known-key signatures can be rejected before taking SQLite's process-wide writer lock. Stored
+    // candidates are grow-only, so a key resolved by this optimistic read cannot disappear. The
+    // unresolved path is re-read under IMMEDIATE below to preserve the park/promotion lost-wakeup
+    // invariant.
+    let mut optimistic_pubkeys = stored_device_pubkeys(conn, account_id)?;
+    add_self_pubkey(&mut optimistic_pubkeys, &signed.header, &signed.payload);
+    let optimistic_verified = optimistic_pubkeys
+        .get(&device_fp)
+        .copied()
+        .map(|pubkey_bytes| authenticate_entry(signed_bytes, &pubkey_bytes))
+        .transpose();
+    let optimistic_verified = match optimistic_verified {
+        Ok(verified) => verified,
+        Err(err) => return Ok(IngestOutcome::Rejected(err)),
+    };
+
+    // One IMMEDIATE transaction spans the race-sensitive resolution → park-or-store decision,
+    // promotion, and refold. Count/byte checks and insertion are therefore one serialized unit.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let verified = if let Some(verified) = optimistic_verified {
+        verified
+    } else {
+        let mut pubkeys = stored_device_pubkeys(&tx, account_id)?;
+        add_self_pubkey(&mut pubkeys, &signed.header, &signed.payload);
+        let Some(pubkey_bytes) = pubkeys.get(&device_fp).copied() else {
+            let parked = insert_pre_verify(
+                &tx,
+                &signed.entry_hash,
+                account_id,
+                device_fp,
+                signed_bytes,
+                now_ms,
+            )?;
+            tx.commit()?;
+            return Ok(match parked {
+                PreVerifyInsert::Parked { evicted } if evicted.is_empty() =>
+                    IngestOutcome::PreVerify,
+                PreVerifyInsert::Parked { evicted } =>
+                    IngestOutcome::PreVerifyWithEviction { scopes: evicted },
+                PreVerifyInsert::AtCapacity(scope) => IngestOutcome::CapacityReached { scope },
+            });
+        };
+        match authenticate_entry(signed_bytes, &pubkey_bytes) {
+            Ok(verified) => verified,
+            Err(err) => return Ok(IngestOutcome::Rejected(err)),
+        }
+    };
+
+    match insert_candidate(&tx, &verified, signed_bytes, now_ms)? {
+        CandidateInsert::AtCapacity(scope) => {
+            return Ok(IngestOutcome::CapacityReached { scope });
+        },
+        CandidateInsert::AlreadyPresent => {
+            if let Some((status, _)) = entry_status(&tx, &verified.entry_hash)? {
+                tx.commit()?;
+                return Ok(IngestOutcome::Ingested { status });
+            }
+        },
+        CandidateInsert::Inserted => {},
     }
     // A DeviceAdd/genesis may resolve devices that were parked — retry their pre-verify rows.
-    if is_genesis(&verified.header) || is_device_add(&verified) {
-        promote_pre_verify(&tx, account_id, now_ms)?;
-    }
+    let rejected_promotions = if is_genesis(&verified.header) || is_device_add(&verified) {
+        promote_pre_verify(&tx, account_id, now_ms)?
+    } else {
+        PromotionOutcome::default()
+    };
     let status = refold_in_tx(&tx, account_id)?;
     tx.commit()?;
-    Ok(IngestOutcome::Ingested {
-        status: status.get(&verified.entry_hash).cloned().unwrap_or_else(|| "unknown".into()),
+    let status = status.get(&verified.entry_hash).cloned().unwrap_or_else(|| "unknown".into());
+    Ok(match rejected_promotions.scope {
+        Some(scope) => IngestOutcome::IngestedWithRejectedPromotions {
+            status,
+            scope,
+            entry_hashes: rejected_promotions.entry_hashes,
+        },
+        None => IngestOutcome::Ingested { status },
     })
+}
+
+fn authenticate_entry(
+    signed_bytes: &[u8],
+    pubkey_bytes: &[u8; 32],
+) -> Result<VerifiedAccountEntry, String> {
+    let pubkey = DevicePublic::from_bytes(pubkey_bytes)
+        .map_err(|_| "resolved device key is not a valid point".to_string())?;
+    let verified =
+        envelope::verify_account_signed(signed_bytes, &pubkey).map_err(|err| err.to_string())?;
+    validate_authenticated_entry(&verified)?;
+    Ok(verified)
+}
+
+fn stored_status_for_exact_envelope(
+    conn: &Connection,
+    entry_hash: &EntryHash,
+    signed_bytes: &[u8],
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT s.status
+         FROM account_entries e
+         JOIN account_entry_status s ON s.entry_hash = e.entry_hash
+         WHERE e.entry_hash = ?1 AND e.signed_bytes = ?2",
+        params![entry_hash.as_slice(), signed_bytes],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Re-derive the whole account: fold the candidate set, resolve accepted-slot uniqueness (branch
@@ -360,7 +459,33 @@ fn insert_candidate(
         |row| row.get(0),
     )?;
     if candidate_count >= CANDIDATES_PER_ACCOUNT_MAX as i64 {
-        return Ok(CandidateInsert::AtCapacity);
+        return Ok(CandidateInsert::AtCapacity(CapacityScope::CandidateAccount));
+    }
+    let candidate_bytes: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(length(signed_bytes)), 0)
+         FROM account_entries WHERE account_id = ?1",
+        params![h.account_id.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if candidate_bytes.saturating_add(signed_bytes.len() as i64)
+        > CANDIDATE_BYTES_PER_ACCOUNT_MAX as i64
+    {
+        return Ok(CandidateInsert::AtCapacity(CapacityScope::CandidateAccountBytes));
+    }
+    let global_candidate_count: i64 =
+        tx.query_row("SELECT COUNT(*) FROM account_entries", [], |row| row.get(0))?;
+    if global_candidate_count >= CANDIDATES_GLOBAL_MAX as i64 {
+        return Ok(CandidateInsert::AtCapacity(CapacityScope::CandidateGlobal));
+    }
+    let global_candidate_bytes: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(length(signed_bytes)), 0) FROM account_entries",
+        [],
+        |row| row.get(0),
+    )?;
+    if global_candidate_bytes.saturating_add(signed_bytes.len() as i64)
+        > CANDIDATE_BYTES_GLOBAL_MAX as i64
+    {
+        return Ok(CandidateInsert::AtCapacity(CapacityScope::CandidateGlobalBytes));
     }
     // INSERT OR IGNORE on the entry_hash PK: idempotent, and the candidate table has NO
     // seq-uniqueness — an equivocation head at an already-occupied slot is a first-class candidate.
@@ -451,9 +576,9 @@ fn insert_pre_verify(
     fingerprint: DeviceFingerprint,
     signed_bytes: &[u8],
     now_ms: i64,
-) -> rusqlite::Result<bool> {
+) -> rusqlite::Result<PreVerifyInsert> {
     let signed_hash = cbor::sha256(signed_bytes);
-    conn.execute(
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO account_pre_verify(
              signed_hash, entry_hash, claimed_account_id, claimed_fingerprint, raw_bytes,
              received_at_ms)
@@ -467,7 +592,13 @@ fn insert_pre_verify(
             now_ms,
         ],
     )?;
-    enforce_pre_verify_budget(conn, account_id)?;
+    if inserted == 0 {
+        return Ok(PreVerifyInsert::Parked { evicted: Vec::new() });
+    }
+    enforce_pre_verify_budget(conn, account_id, &signed_hash)
+}
+
+fn pre_verify_contains(conn: &Connection, signed_hash: &EntryHash) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM account_pre_verify WHERE signed_hash = ?1)",
         params![signed_hash.as_slice()],
@@ -477,16 +608,32 @@ fn insert_pre_verify(
 
 /// Keep the unauthenticated queue within deterministic oldest-first account and global budgets.
 /// Ties use `signed_hash`, so replicas with the same rows and timestamps retain the same set.
-fn enforce_pre_verify_budget(conn: &Connection, account_id: AccountId) -> rusqlite::Result<()> {
-    evict_oldest_pre_verify(conn, Some(account_id), PRE_VERIFY_PER_ACCOUNT_MAX)?;
-    evict_oldest_pre_verify(conn, None, PRE_VERIFY_GLOBAL_MAX)
+fn enforce_pre_verify_budget(
+    conn: &Connection,
+    account_id: AccountId,
+    inserted_signed_hash: &EntryHash,
+) -> rusqlite::Result<PreVerifyInsert> {
+    let mut evicted = Vec::new();
+    if evict_oldest_pre_verify(conn, Some(account_id), PRE_VERIFY_PER_ACCOUNT_MAX)? > 0 {
+        evicted.push(CapacityScope::PreVerifyAccount);
+    }
+    if !pre_verify_contains(conn, inserted_signed_hash)? {
+        return Ok(PreVerifyInsert::AtCapacity(CapacityScope::PreVerifyAccount));
+    }
+    if evict_oldest_pre_verify(conn, None, PRE_VERIFY_GLOBAL_MAX)? > 0 {
+        evicted.push(CapacityScope::PreVerifyGlobal);
+    }
+    if !pre_verify_contains(conn, inserted_signed_hash)? {
+        return Ok(PreVerifyInsert::AtCapacity(CapacityScope::PreVerifyGlobal));
+    }
+    Ok(PreVerifyInsert::Parked { evicted })
 }
 
 fn evict_oldest_pre_verify(
     conn: &Connection,
     account_id: Option<AccountId>,
     limit: usize,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<usize> {
     let account_bytes = account_id.map(AccountId::to_bytes);
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM account_pre_verify
@@ -495,7 +642,7 @@ fn evict_oldest_pre_verify(
         |row| row.get(0),
     )?;
     if count <= limit as i64 {
-        return Ok(());
+        return Ok(0);
     }
     let excess = count - limit as i64;
     conn.execute(
@@ -506,8 +653,7 @@ fn evict_oldest_pre_verify(
              LIMIT ?2
          )",
         params![account_bytes.as_ref().map(<[u8; 32]>::as_slice), excess,],
-    )?;
-    Ok(())
+    )
 }
 
 /// Retry every pre-verify row for the account against the now-larger device set: a row whose signer
@@ -516,18 +662,20 @@ fn promote_pre_verify(
     tx: &Transaction<'_>,
     account_id: AccountId,
     now_ms: i64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PromotionOutcome> {
     // Fixpoint: a promoted genesis/DeviceAdd enlarges the resolvable device set, which can in turn
     // resolve a DEEPER parked entry (a device chain — founder→B→C — delivered before its
     // authorizers). Feed each promoted key back and re-scan until a full pass promotes nothing.
     // Snapshotting the device set once would strand depth≥2 chains forever, so two peers that
     // received the same entries in different orders would converge on different accepted sets.
     let mut pubkeys = stored_device_pubkeys(tx, account_id)?;
+    let mut outcome = PromotionOutcome::default();
     loop {
         let pending: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = {
             let mut stmt = tx.prepare(
                 "SELECT signed_hash, claimed_fingerprint, raw_bytes
-                 FROM account_pre_verify WHERE claimed_account_id = ?1",
+                 FROM account_pre_verify WHERE claimed_account_id = ?1
+                 ORDER BY signed_hash",
             )?;
             stmt.query_map(params![account_id.to_bytes().as_slice()], |row| {
                 Ok((
@@ -551,19 +699,30 @@ fn promote_pre_verify(
                     validate_storable_header_payload(&v.header, &v.payload).is_ok()
                         && validate_authenticated_entry(v).is_ok()
                 });
-            if let Some(verified) = promoted {
-                let inserted = insert_candidate(tx, &verified, &raw_bytes, now_ms)?;
-                // A promoted genesis/DeviceAdd certifies a device key — feed it back so the next
-                // round can resolve entries that were waiting on it.
-                if inserted != CandidateInsert::AtCapacity {
+            let Some(verified) = promoted else {
+                // The signer resolved but the signature or authenticated payload was invalid.
+                delete_pre_verify(tx, &signed_hash)?;
+                continue;
+            };
+            match insert_candidate(tx, &verified, &raw_bytes, now_ms)? {
+                CandidateInsert::AtCapacity(scope) => {
+                    // Candidate history is grow-only, so this capacity state cannot recover by
+                    // itself. Remove the row from the unauthenticated queue and return its entry
+                    // hash so the transport can request redelivery if the operational budget is
+                    // later raised or the store is rebuilt. Retaining it would only strand it until
+                    // a later park-budget eviction silently discarded it.
+                    outcome.scope.get_or_insert(scope);
+                    outcome.entry_hashes.push(verified.entry_hash);
+                    delete_pre_verify(tx, &signed_hash)?;
+                },
+                CandidateInsert::Inserted | CandidateInsert::AlreadyPresent => {
+                    // A promoted genesis/DeviceAdd certifies a device key — feed it back so the
+                    // next round can resolve entries that were waiting on it.
                     add_self_pubkey(&mut pubkeys, &verified.header, &verified.payload);
                     promoted_any = true;
-                }
+                    delete_pre_verify(tx, &signed_hash)?;
+                },
             }
-            // Resolved (promoted) or refuted (verify failed): clear it from the queue either way.
-            tx.execute("DELETE FROM account_pre_verify WHERE signed_hash = ?1", params![
-                signed_hash.as_slice()
-            ])?;
         }
         // A round advances the queue only by promoting (each promotion deletes ≥1 pending row and
         // adds ≥1 key), so this terminates; a round that promotes nothing new is the fixpoint.
@@ -571,6 +730,11 @@ fn promote_pre_verify(
             break;
         }
     }
+    Ok(outcome)
+}
+
+fn delete_pre_verify(conn: &Connection, signed_hash: &[u8]) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM account_pre_verify WHERE signed_hash = ?1", params![signed_hash])?;
     Ok(())
 }
 
@@ -644,6 +808,10 @@ pub(super) fn entry_status(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
     use crate::index::schema;
     use crate::oplog::account::envelope::sign_account_entry;
@@ -763,6 +931,50 @@ mod tests {
 
     fn status(conn: &Connection, hash: &[u8; 32]) -> Option<String> {
         entry_status(conn, hash).unwrap().map(|(s, _)| s)
+    }
+
+    fn seed_candidate_rows(
+        conn: &Connection,
+        account_id: AccountId,
+        fingerprint: DeviceFingerprint,
+        salt: u64,
+        count: usize,
+    ) {
+        for ordinal in 0..count {
+            let entry_hash = cbor::sha256(
+                &[
+                    salt.to_be_bytes().as_slice(),
+                    u64::try_from(ordinal).unwrap().to_be_bytes().as_slice(),
+                ]
+                .concat(),
+            );
+            conn.execute(
+                "INSERT INTO account_entries(
+                     entry_hash, account_id, log_id, device_fingerprint, seq, entry_type,
+                     accepted, signed_bytes, received_at_ms)
+                 VALUES (?1, ?2, 0, ?3, ?4, 99, 0, X'00', ?4)",
+                params![
+                    entry_hash.as_slice(),
+                    account_id.to_bytes().as_slice(),
+                    fingerprint.to_bytes().as_slice(),
+                    i64::try_from(ordinal).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn seed_global_candidate_rows(conn: &Connection, mut count: usize, salt_start: u64) {
+        let fingerprint = Dev::new(9).fp;
+        let mut account_ordinal = 0u64;
+        while count > 0 {
+            let salt = salt_start + account_ordinal;
+            let account_id = AccountId::from_bytes(cbor::sha256(&salt.to_be_bytes()));
+            let account_count = count.min(CANDIDATES_PER_ACCOUNT_MAX);
+            seed_candidate_rows(conn, account_id, fingerprint, salt, account_count);
+            count -= account_count;
+            account_ordinal += 1;
+        }
     }
 
     #[test]
@@ -967,8 +1179,8 @@ mod tests {
         assert_eq!(account_a_remaining, 0, "global eviction removes the globally oldest rows");
 
         let evicted_raw = [0xfe, 0xed];
-        assert!(
-            !insert_pre_verify(
+        assert_eq!(
+            insert_pre_verify(
                 &conn,
                 &cbor::sha256(&evicted_raw),
                 AccountId::from_bytes([0xcc; 32]),
@@ -977,8 +1189,152 @@ mod tests {
                 -1,
             )
             .unwrap(),
-            "the insert result must report when global eviction removes the new row",
+            PreVerifyInsert::AtCapacity(CapacityScope::PreVerifyGlobal),
+            "the insert result reports which budget evicted the new row",
         );
+    }
+
+    #[test]
+    fn pre_verify_oldest_ties_are_broken_by_signed_hash() {
+        let conn = db();
+        let account_id = AccountId::from_bytes([0xd1; 32]);
+        let mut expected_hashes = Vec::new();
+        for ordinal in 0..=PRE_VERIFY_PER_ACCOUNT_MAX {
+            let raw = ordinal.to_be_bytes();
+            let signed_hash = cbor::sha256(&raw);
+            expected_hashes.push(signed_hash);
+            insert_pre_verify(
+                &conn,
+                &cbor::sha256(&signed_hash),
+                account_id,
+                Dev::new(2).fp,
+                &raw,
+                NOW,
+            )
+            .unwrap();
+        }
+        expected_hashes.sort_unstable();
+        expected_hashes.remove(0);
+        let mut retained = conn
+            .prepare(
+                "SELECT signed_hash FROM account_pre_verify
+                 WHERE claimed_account_id = ?1 ORDER BY signed_hash",
+            )
+            .unwrap()
+            .query_map(params![account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|row| fixed(&row.unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        retained.sort_unstable();
+        assert_eq!(retained, expected_hashes);
+    }
+
+    #[test]
+    fn account_ingest_reports_the_budget_that_evicted_its_pre_verify_row() {
+        let founder = Dev::new(1);
+        let (account_id, _genesis_bytes, genesis_hash) = genesis(&founder);
+        let added = Dev::new(2);
+        let (pending_bytes, _) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&added, DeviceRole::Owner),
+        );
+
+        let per_account = db();
+        for ordinal in 0..PRE_VERIFY_PER_ACCOUNT_MAX {
+            let raw = ordinal.to_be_bytes();
+            assert_eq!(
+                insert_pre_verify(
+                    &per_account,
+                    &cbor::sha256(&raw),
+                    account_id,
+                    Dev::new(3).fp,
+                    &raw,
+                    NOW + 1,
+                )
+                .unwrap(),
+                PreVerifyInsert::Parked { evicted: Vec::new() },
+            );
+        }
+        assert_eq!(
+            account_ingest(&per_account, &pending_bytes, NOW).unwrap(),
+            IngestOutcome::CapacityReached { scope: CapacityScope::PreVerifyAccount },
+        );
+
+        let global = db();
+        for account_byte in 0..PRE_VERIFY_GLOBAL_MAX / PRE_VERIFY_PER_ACCOUNT_MAX {
+            let parked_account = AccountId::from_bytes([account_byte as u8; 32]);
+            for ordinal in 0..PRE_VERIFY_PER_ACCOUNT_MAX {
+                let raw = [account_byte as u8, ordinal as u8];
+                assert_eq!(
+                    insert_pre_verify(
+                        &global,
+                        &cbor::sha256(&raw),
+                        parked_account,
+                        Dev::new(4).fp,
+                        &raw,
+                        NOW + 1,
+                    )
+                    .unwrap(),
+                    PreVerifyInsert::Parked { evicted: Vec::new() },
+                );
+            }
+        }
+        assert_eq!(
+            account_ingest(&global, &pending_bytes, NOW).unwrap(),
+            IngestOutcome::CapacityReached { scope: CapacityScope::PreVerifyGlobal },
+        );
+    }
+
+    #[test]
+    fn newer_pre_verify_admission_surfaces_collateral_oldest_eviction() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account_id, _genesis_bytes, genesis_hash) = genesis(&founder);
+        let added = Dev::new(2);
+        let (pending_bytes, _) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&added, DeviceRole::Owner),
+        );
+        let mut oldest_signed_hash = None;
+        for ordinal in 0..PRE_VERIFY_PER_ACCOUNT_MAX {
+            let raw = ordinal.to_be_bytes();
+            oldest_signed_hash.get_or_insert_with(|| cbor::sha256(&raw));
+            assert_eq!(
+                insert_pre_verify(
+                    &conn,
+                    &cbor::sha256(&raw),
+                    account_id,
+                    Dev::new(3).fp,
+                    &raw,
+                    NOW + i64::try_from(ordinal).unwrap(),
+                )
+                .unwrap(),
+                PreVerifyInsert::Parked { evicted: Vec::new() },
+            );
+        }
+
+        assert_eq!(
+            account_ingest(&conn, &pending_bytes, NOW + 1_000).unwrap(),
+            IngestOutcome::PreVerifyWithEviction { scopes: vec![CapacityScope::PreVerifyAccount] },
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_pre_verify WHERE claimed_account_id = ?1",
+                params![account_id.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, PRE_VERIFY_PER_ACCOUNT_MAX as i64);
+        assert!(pre_verify_contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
+        assert!(!pre_verify_contains(&conn, &oldest_signed_hash.unwrap()).unwrap());
     }
 
     #[test]
@@ -989,31 +1345,314 @@ mod tests {
         let verified =
             envelope::verify_account_signed(&genesis_bytes, &founder.secret.public()).unwrap();
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        for ordinal in 0..CANDIDATES_PER_ACCOUNT_MAX {
-            let entry_hash = cbor::sha256(&ordinal.to_be_bytes());
-            tx.execute(
-                "INSERT INTO account_entries(
-                     entry_hash, account_id, log_id, device_fingerprint, seq, entry_type,
-                     accepted, signed_bytes, received_at_ms)
-                 VALUES (?1, ?2, 0, ?3, ?4, 99, 0, X'00', ?4)",
-                params![
-                    entry_hash.as_slice(),
-                    account_id.to_bytes().as_slice(),
-                    founder.fp.to_bytes().as_slice(),
-                    i64::try_from(ordinal).unwrap(),
-                ],
-            )
-            .unwrap();
-        }
+        seed_candidate_rows(&tx, account_id, founder.fp, 0, CANDIDATES_PER_ACCOUNT_MAX);
         assert_eq!(
             insert_candidate(&tx, &verified, &genesis_bytes, NOW).unwrap(),
-            CandidateInsert::AtCapacity,
+            CandidateInsert::AtCapacity(CapacityScope::CandidateAccount),
         );
         tx.commit().unwrap();
         assert_eq!(
             account_ingest(&conn, &genesis_bytes, NOW).unwrap(),
-            IngestOutcome::Rejected("account candidate limit reached".into()),
+            IngestOutcome::CapacityReached { scope: CapacityScope::CandidateAccount },
         );
+    }
+
+    #[test]
+    fn candidate_byte_budgets_bound_refold_materialization_even_below_count_limits() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account_id, genesis_bytes, _) = genesis(&founder);
+        let verified =
+            envelope::verify_account_signed(&genesis_bytes, &founder.secret.public()).unwrap();
+
+        seed_candidate_rows(&conn, account_id, founder.fp, 0, 1);
+        conn.execute("UPDATE account_entries SET signed_bytes = zeroblob(?1)", [i64::try_from(
+            CANDIDATE_BYTES_PER_ACCOUNT_MAX - genesis_bytes.len() + 1,
+        )
+        .unwrap()])
+            .unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        assert_eq!(
+            insert_candidate(&tx, &verified, &genesis_bytes, NOW).unwrap(),
+            CandidateInsert::AtCapacity(CapacityScope::CandidateAccountBytes),
+        );
+        tx.rollback().unwrap();
+
+        let conn = db();
+        let other_account = AccountId::from_bytes([0x55; 32]);
+        seed_candidate_rows(&conn, other_account, founder.fp, 0, 1);
+        conn.execute("UPDATE account_entries SET signed_bytes = zeroblob(?1)", [i64::try_from(
+            CANDIDATE_BYTES_GLOBAL_MAX - genesis_bytes.len() + 1,
+        )
+        .unwrap()])
+            .unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        assert_eq!(
+            insert_candidate(&tx, &verified, &genesis_bytes, NOW).unwrap(),
+            CandidateInsert::AtCapacity(CapacityScope::CandidateGlobalBytes),
+        );
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn global_candidate_ceiling_bounds_many_attacker_created_accounts() {
+        let conn = db();
+        seed_global_candidate_rows(&conn, CANDIDATES_GLOBAL_MAX, 0);
+
+        let founder = Dev::new(1);
+        let (_account_id, genesis_bytes, _) = genesis(&founder);
+        assert_eq!(
+            account_ingest(&conn, &genesis_bytes, NOW).unwrap(),
+            IngestOutcome::CapacityReached { scope: CapacityScope::CandidateGlobal },
+        );
+        let stored: i64 =
+            conn.query_row("SELECT COUNT(*) FROM account_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(stored, CANDIDATES_GLOBAL_MAX as i64);
+    }
+
+    #[test]
+    fn concurrent_candidate_admission_cannot_overshoot_the_global_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-cap.db");
+        let setup = Connection::open(&path).unwrap();
+        schema::apply(&setup).unwrap();
+        let tx = Transaction::new_unchecked(&setup, TransactionBehavior::Immediate).unwrap();
+        seed_global_candidate_rows(&tx, CANDIDATES_GLOBAL_MAX - 1, 0);
+        tx.commit().unwrap();
+        drop(setup);
+
+        let first = genesis(&Dev::new(1)).1;
+        let second = genesis(&Dev::new(2)).1;
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = [first, second].map(|bytes| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let conn = Connection::open(path).unwrap();
+                conn.busy_timeout(Duration::from_secs(5)).unwrap();
+                barrier.wait();
+                account_ingest(&conn, &bytes, NOW).unwrap()
+            })
+        });
+        let outcomes = handles.map(|handle| handle.join().unwrap());
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, IngestOutcome::Ingested { .. }))
+                .count(),
+            1,
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, IngestOutcome::CapacityReached {
+                    scope: CapacityScope::CandidateGlobal,
+                }))
+                .count(),
+            1,
+        );
+        let conn = Connection::open(path).unwrap();
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM account_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, CANDIDATES_GLOBAL_MAX as i64);
+    }
+
+    #[test]
+    fn a_bad_known_key_signature_is_rejected_without_waiting_for_the_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known-key.db");
+        let setup = Connection::open(&path).unwrap();
+        schema::apply(&setup).unwrap();
+        let founder = Dev::new(1);
+        let (_account_id, mut forged, _) = genesis(&founder);
+        account_ingest(&setup, &forged, NOW).unwrap();
+        *forged.last_mut().unwrap() ^= 1;
+
+        let holder = Connection::open(&path).unwrap();
+        let tx = Transaction::new_unchecked(&holder, TransactionBehavior::Immediate).unwrap();
+        let contender = Connection::open(&path).unwrap();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        assert!(matches!(
+            account_ingest(&contender, &forged, NOW + 1).unwrap(),
+            IngestOutcome::Rejected(_),
+        ));
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn ingest_reports_valid_promotions_rejected_at_terminal_global_capacity() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        let pending_device = Dev::new(2);
+        let (pending_bytes, pending_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&pending_device, DeviceRole::Owner),
+        );
+        assert_eq!(
+            insert_pre_verify(&conn, &pending_hash, account_id, founder.fp, &pending_bytes, NOW,)
+                .unwrap(),
+            PreVerifyInsert::Parked { evicted: Vec::new() },
+        );
+
+        // Leave exactly one global slot. The trigger occupies it, so promotion must remove and
+        // identify the valid row that cannot enter terminal grow-only candidate storage.
+        seed_global_candidate_rows(&conn, CANDIDATES_GLOBAL_MAX - 2, 100);
+        let trigger_device = Dev::new(3);
+        let (trigger_bytes, trigger_hash) = op(
+            account_id,
+            &founder,
+            2,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&trigger_device, DeviceRole::Member),
+        );
+        let outcome = account_ingest(&conn, &trigger_bytes, NOW + 1).unwrap();
+        assert_eq!(outcome, IngestOutcome::IngestedWithRejectedPromotions {
+            status: "forked".into(),
+            scope: CapacityScope::CandidateGlobal,
+            entry_hashes: vec![pending_hash],
+        },);
+        assert!(!pre_verify_contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
+        assert_eq!(status(&conn, &trigger_hash), Some("forked".into()));
+        assert_eq!(status(&conn, &pending_hash), None, "the rejected row was not half-promoted");
+    }
+
+    #[test]
+    fn exact_candidate_redelivery_is_idempotent_at_capacity_but_a_re_signature_is_verified() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        assert_eq!(account_ingest(&conn, &genesis_bytes, NOW).unwrap(), IngestOutcome::Ingested {
+            status: "accepted".into()
+        },);
+        seed_candidate_rows(&conn, account_id, founder.fp, 1, CANDIDATES_PER_ACCOUNT_MAX - 1);
+        assert_eq!(
+            account_ingest(&conn, &genesis_bytes, NOW + 1).unwrap(),
+            IngestOutcome::Ingested { status: "accepted".into() },
+        );
+
+        let mut forged_envelope = genesis_bytes.clone();
+        *forged_envelope.last_mut().unwrap() ^= 1;
+        let forged = envelope::decode_account_signed(&forged_envelope).unwrap();
+        assert_eq!(forged.entry_hash, genesis_hash, "signature bytes are outside the entry hash");
+        assert!(matches!(
+            account_ingest(&conn, &forged_envelope, NOW + 2).unwrap(),
+            IngestOutcome::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn exact_redelivery_repairs_a_missing_projection_row() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (_account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        conn.execute("DELETE FROM account_entry_status WHERE entry_hash = ?1", params![
+            genesis_hash.as_slice()
+        ])
+        .unwrap();
+
+        assert_eq!(
+            account_ingest(&conn, &genesis_bytes, NOW + 1).unwrap(),
+            IngestOutcome::Ingested { status: "accepted".into() },
+        );
+        assert_eq!(status(&conn, &genesis_hash), Some("accepted".into()));
+    }
+
+    #[test]
+    fn capacity_blocked_promotion_returns_redelivery_hash_and_clears_terminal_queue_state() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let added = Dev::new(2);
+        let (pending_bytes, pending_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&added, DeviceRole::Owner),
+        );
+        assert_eq!(
+            insert_pre_verify(&conn, &pending_hash, account_id, founder.fp, &pending_bytes, NOW,)
+                .unwrap(),
+            PreVerifyInsert::Parked { evicted: Vec::new() },
+        );
+        seed_candidate_rows(&conn, account_id, founder.fp, 2, CANDIDATES_PER_ACCOUNT_MAX - 1);
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        assert_eq!(promote_pre_verify(&tx, account_id, NOW + 1).unwrap(), PromotionOutcome {
+            scope: Some(CapacityScope::CandidateAccount),
+            entry_hashes: vec![pending_hash],
+        },);
+        tx.commit().unwrap();
+        assert!(!pre_verify_contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
+        assert_eq!(status(&conn, &pending_hash), None, "the blocked row was not half-promoted");
+    }
+
+    #[test]
+    fn promotion_at_the_last_slot_is_stable_across_opposite_arrival_orders() {
+        let run = |reverse: bool| {
+            let conn = db();
+            let founder = Dev::new(1);
+            let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+            account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+            let a = Dev::new(2);
+            let b = Dev::new(3);
+            let first = op(
+                account_id,
+                &founder,
+                1,
+                Some(genesis_hash),
+                Some(genesis_hash),
+                &device_add(&a, DeviceRole::Member),
+            );
+            let second = op(
+                account_id,
+                &founder,
+                2,
+                Some(genesis_hash),
+                Some(genesis_hash),
+                &device_add(&b, DeviceRole::Member),
+            );
+            let rows = if reverse { [&second, &first] } else { [&first, &second] };
+            for (bytes, hash) in rows {
+                assert_eq!(
+                    insert_pre_verify(&conn, hash, account_id, founder.fp, bytes, NOW).unwrap(),
+                    PreVerifyInsert::Parked { evicted: Vec::new() },
+                );
+            }
+            seed_candidate_rows(&conn, account_id, founder.fp, 50, CANDIDATES_PER_ACCOUNT_MAX - 2);
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let outcome = promote_pre_verify(&tx, account_id, NOW + 1).unwrap();
+            tx.commit().unwrap();
+            let admitted = [first.1, second.1]
+                .into_iter()
+                .find(|hash| {
+                    conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM account_entries WHERE entry_hash = ?1)",
+                        params![hash.as_slice()],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+                })
+                .unwrap();
+            (admitted, outcome)
+        };
+
+        let forward = run(false);
+        let reverse = run(true);
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.1.scope, Some(CapacityScope::CandidateAccount));
+        assert_eq!(forward.1.entry_hashes.len(), 1);
     }
 
     #[test]
