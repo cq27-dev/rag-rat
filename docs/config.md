@@ -604,15 +604,17 @@ URLs; Bitbucket `#N` (issues) and `/issues/N` / `/pull-requests/N` URLs; Jira ba
 (`PROJ-123`) for the bound project. A bare `#N` resolves against the first code-host binding
 only. A self-hosted binding's URL grammar matches its own host, not the cloud host.
 
-All bindings participate in production reference discovery and annotation lookup, but live
-network synchronization remains GitHub-only. GitLab, Bitbucket, and Jira refs are persisted
-without being sent through the GitHub client. The shared transport resolves each binding's
-`auth` source and governs its quota, but native provider clients and parallel per-binding mirror
-dispatch land in the later provider-client PRs; these settings do not yet activate a non-GitHub
-network mirror.
+All bindings participate in production reference discovery, annotation lookup, and manual mirror
+dispatch. GitHub bindings use the native client now; GitLab, Bitbucket, and Jira bindings report a
+provider-client-pending result until their provider PRs land, and are never sent through the GitHub
+client. The shared runner keeps every result, cursor, auth source, and quota governor scoped to its
+binding. A repository may have at most one resolved binding for a given `(provider, project)`:
+the mirror rejects duplicates before dispatch because API origin and tag filters are not part of
+the persisted item/cache cursor identity. Use one binding and one combined tag set for that
+provider project.
 
 The shared transport keeps part of each header-reported quota untouched for the user's own tools.
-The reserve defaults to 35% and can be changed independently of the later provider clients:
+The reserve defaults to 35% and can be changed independently of provider clients:
 
 ```toml
 [papertrail]

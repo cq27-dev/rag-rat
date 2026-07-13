@@ -1,26 +1,25 @@
 mod api;
 mod evidence;
+mod github;
+mod mirror;
 mod parse;
 mod store;
 mod sync;
 mod trackers;
-// Shared HTTP substrate for the native provider clients (#589): reqwest transport, per-
-// (provider, host, token) rate governor, env/token_command auth. `dead_code`/`unused_imports`
-// are allowed until the first native client consumes it (#591) — drop the allow there.
-#[allow(dead_code, unused_imports)]
 pub(crate) mod transport;
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 pub(crate) use api::*;
 pub(crate) use evidence::*;
+pub(crate) use github::*;
+pub use mirror::MirrorBindingReport;
+pub(crate) use mirror::mirror_binding;
 pub(crate) use parse::*;
 pub use parse::{TrackerParsedRef, parse_tracker_refs};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 pub(crate) use store::*;
 pub(crate) use sync::*;
 pub(crate) use trackers::resolve_trackers;
@@ -37,9 +36,9 @@ use crate::index::now_ms;
 #[derive(Debug, Clone, Default)]
 pub struct PapertrailContext {
     /// Resolved tracker bindings, in config order (or the single auto-detected code host).
-    /// Production discovery and rationale lookup consume every binding. Live network sync remains
-    /// GitHub-only until the provider-client PRs build on [`transport`].
+    /// Production discovery, rationale lookup, and manual mirror sync consume every binding.
     pub trackers: Vec<ResolvedTracker>,
+    pub(crate) transport_options: transport::TransportOptions,
 }
 
 impl PapertrailContext {
@@ -47,7 +46,15 @@ impl PapertrailContext {
     /// auto-detected from the git `origin` remote. Call ONLY at the real-usage boundary
     /// (open_config), never inside the library internals or tests.
     pub(crate) fn resolve(config: &crate::config::Config) -> Self {
-        Self { trackers: resolve_trackers(&config.trackers, &config.root) }
+        let mut trackers = resolve_trackers(&config.trackers, &config.root);
+        // GitHub's provider-native fallback is environment auth. Materialize the ENV-VAR NAME
+        // into the binding (never its value) so status and transport use the same per-binding
+        // capability instead of a process-global `gh_available` bit.
+        apply_implicit_github_auth(&mut trackers, |name| std::env::var(name).ok());
+        Self {
+            trackers,
+            transport_options: transport::TransportOptions::from(&config.papertrail),
+        }
     }
 
     /// An explicit GitHub-repo context that never touches git or `gh` — for tests and non-gh
@@ -64,16 +71,35 @@ impl PapertrailContext {
             })
             .into_iter()
             .collect();
-        Self { trackers }
+        Self { trackers, transport_options: transport::TransportOptions::default() }
     }
 
     /// `owner/repo` qualifying a manually requested legacy GitHub reference. Production
     /// discovery and rationale parsing use all bindings through [`parse_tracker_refs`].
+    #[cfg(test)]
     fn default_repo(&self) -> Option<&str> {
         self.trackers
             .iter()
             .find(|tracker| tracker.provider == Tracker::Github)
             .map(|tracker| tracker.project.as_str())
+    }
+}
+
+fn apply_implicit_github_auth(
+    trackers: &mut [ResolvedTracker],
+    env: impl Fn(&str) -> Option<String>,
+) {
+    for tracker in trackers {
+        if tracker.provider == Tracker::Github
+            && tracker.base_url.is_none()
+            && tracker.auth.is_none()
+            && let Some(name) = ["GH_TOKEN", "GITHUB_TOKEN"]
+                .into_iter()
+                .find(|name| env(name).is_some_and(|value| !value.trim().is_empty()))
+        {
+            tracker.auth = Some(crate::config::TrackerAuth::Env(name.to_string()));
+            tracker.authentication = TrackerAuthentication::AuthConfigured;
+        }
     }
 }
 
@@ -108,8 +134,7 @@ pub enum TrackerAuthentication {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrackerSynchronization {
-    LegacyGithubCli,
-    LegacyGithubCliMissing,
+    Native,
     ProviderClientPending,
 }
 
@@ -120,6 +145,8 @@ pub struct PapertrailSyncReport {
     pub skipped_refs: usize,
     pub failed_refs: usize,
     pub synced_items: usize,
+    /// One resumable outcome per dispatched binding, including rate-governed pauses.
+    pub bindings: Vec<MirrorBindingReport>,
     pub errors: Vec<PapertrailSyncError>,
     pub status: PapertrailStatus,
 }
@@ -133,6 +160,7 @@ pub struct PapertrailSyncError {
     pub error: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct PapertrailSyncProgress {
     pub current: usize,
@@ -143,6 +171,7 @@ pub struct PapertrailSyncProgress {
     pub message: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PapertrailSyncAction {
     Syncing,
@@ -250,6 +279,8 @@ pub struct PapertrailItem {
     pub updated_at: Option<String>,
     /// Change requests only; `None` for issues and unmerged change requests.
     pub merged_at: Option<String>,
+    /// Provider facets used by the binding's client-side OR filter (GitHub labels today).
+    pub tags: Vec<String>,
 }
 
 /// One comment on a tracker item, unified across the provider review models: a plain thread
@@ -278,24 +309,58 @@ pub struct PapertrailComment {
 
 /// Position in a provider's `updated_at`-ordered item/comment stream. The mirror sync keeps one
 /// persisted cursor per (tracker, project); a page fetch returns the cursor to continue from.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageCursor {
+    /// Provider-defined logical stream within an operation (for example GitHub issue comments
+    /// versus review comments). Each stream owns independent durable progress.
+    pub stream: Option<String>,
     /// Fetch entries updated at-or-after this provider-format timestamp.
     pub updated_since: Option<String>,
+    /// Strict upper boundary for newest-first historical descent.
+    pub updated_before: Option<String>,
     /// Provider-opaque continuation token, when the provider paginates by token.
     pub page_token: Option<String>,
+    /// Provider-opaque state needed to interpret a continuation (for example a Search tie
+    /// boundary and the number of results already observed). The mirror persists but never
+    /// interprets this value.
+    pub provider_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FreshnessProbe {
+    pub updated_since: Option<String>,
+    pub etag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FreshnessResult {
+    pub latest: Option<String>,
+    pub etag: Option<String>,
+    pub not_modified: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ItemsPage {
     pub items: Vec<PapertrailItem>,
     pub next: Option<PageCursor>,
+    /// Provider-confirmed strict boundary below every item consumed in this logical backfill
+    /// page. Compound provider streams may need this because the last physical response does not
+    /// necessarily contain the oldest item observed across the whole page.
+    pub backfill_boundary: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CommentsPage {
     pub comments: Vec<PapertrailComment>,
     pub next: Option<PageCursor>,
+}
+
+/// Provider outcomes that affect mirror control flow rather than representing a retryable
+/// transport or payload failure.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PapertrailClientError {
+    #[error("tracker item not found")]
+    ItemNotFound,
 }
 
 /// Advance decision for a freshness probe: the newest `updated_at` the provider reported vs the
@@ -333,9 +398,40 @@ pub trait PapertrailClient {
         kind: ItemKind,
         key: &str,
     ) -> anyhow::Result<Vec<PapertrailComment>>;
+    /// Stable logical comment streams for one item. Providers with several independently paged
+    /// resources expose each one here so the mirror can checkpoint after every returned page.
+    fn item_comment_streams(&self, _kind: ItemKind) -> &'static [&'static str] {
+        &["default"]
+    }
+
+    /// One page from exactly one [`Self::item_comment_streams`] lane. The default adapts legacy
+    /// clients that return a whole thread in one call; native paginated clients override it.
+    async fn item_comments_page(
+        &self,
+        project: &str,
+        kind: ItemKind,
+        key: &str,
+        cursor: &PageCursor,
+    ) -> anyhow::Result<CommentsPage> {
+        anyhow::ensure!(cursor.page_token.is_none(), "legacy item comments cannot resume a page");
+        Ok(CommentsPage { comments: self.item_comments(project, kind, key).await?, next: None })
+    }
+    /// Complete provider-specific item fields before the mirror starts the item's durable thread.
+    /// The mirror invokes this one item at a time and checkpoints each completed item, so a
+    /// transport pause cannot force an entire provider page to be enriched again.
+    async fn enrich_item(&self, _item: &mut PapertrailItem) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// A page of items updated since the cursor, newest first (mirror backfill/delta).
     async fn items_page(&self, project: &str, cursor: &PageCursor) -> anyhow::Result<ItemsPage>;
-    /// A page of comments updated since the cursor (mirror delta).
+    /// Stable logical comment streams whose cursors must advance independently.
+    fn comment_streams(&self) -> &'static [&'static str] {
+        &["default"]
+    }
+
+    /// A page of comments from exactly one [`Self::comment_streams`] lane. Implementations must not
+    /// advance into another stream through `next`; the mirror persists each stream
+    /// independently.
     async fn comments_page(
         &self,
         project: &str,
@@ -346,8 +442,8 @@ pub trait PapertrailClient {
     async fn freshness_probe(
         &self,
         project: &str,
-        cursor: &PageCursor,
-    ) -> anyhow::Result<Option<String>>;
+        probe: &FreshnessProbe,
+    ) -> anyhow::Result<FreshnessResult>;
 }
 
 /// Drive a papertrail future to completion from the synchronous call paths (CLI, maintenance).
@@ -377,112 +473,7 @@ pub(crate) fn block_on<T>(
     }
 }
 
-/// The GitHub provider, currently backed by the `gh` CLI (`gh api`); replaced by a native HTTP
-/// client when the mirror sync lands. The subprocess calls block inside the async methods, which
-/// is acceptable on the private [`block_on`] runtime — nothing else shares it.
-pub struct GitHubClient;
-
-impl PapertrailClient for GitHubClient {
-    async fn item(
-        &self,
-        project: &str,
-        _kind: ItemKind,
-        key: &str,
-    ) -> anyhow::Result<PapertrailItem> {
-        // GitHub numbers issues and PRs in one namespace, so the requested kind is advisory:
-        // the issues endpoint resolves either, and the returned item carries the real kind.
-        let value = gh_api_json(&format!("repos/{project}/issues/{key}"))?;
-        let mut item = item_from_issue_value(project, &value);
-        if item.item_kind == ItemKind::ChangeRequest {
-            enrich_item_from_pull_value(
-                &mut item,
-                &gh_api_json(&format!("repos/{project}/pulls/{key}"))?,
-            );
-        }
-        Ok(item)
-    }
-
-    async fn item_comments(
-        &self,
-        project: &str,
-        kind: ItemKind,
-        key: &str,
-    ) -> anyhow::Result<Vec<PapertrailComment>> {
-        let mut comments = Vec::new();
-        for value in gh_api_paginated(&format!("repos/{project}/issues/{key}/comments"))? {
-            comments.push(comment_from_value(project, kind, key, &value));
-        }
-        // Review endpoints exist only for change requests; the caller passes the RESOLVED kind,
-        // so any failure here (rate limit, auth, network) is a real failure and must propagate —
-        // swallowing it would cache an incomplete comment list and mark the ref synced forever.
-        if kind == ItemKind::ChangeRequest {
-            for value in gh_api_paginated(&format!("repos/{project}/pulls/{key}/reviews"))? {
-                comments.push(review_to_comment_from_value(project, kind, key, &value));
-            }
-            for value in gh_api_paginated(&format!("repos/{project}/pulls/{key}/comments"))? {
-                comments.push(review_comment_to_comment_from_value(project, kind, key, &value));
-            }
-        }
-        Ok(comments)
-    }
-
-    async fn items_page(&self, project: &str, cursor: &PageCursor) -> anyhow::Result<ItemsPage> {
-        // `gh api --paginate` drains every page in one call, so the returned cursor is always
-        // terminal. The native client replaces this with true per-page fetches.
-        let mut path =
-            format!("repos/{project}/issues?state=all&sort=updated&direction=desc&per_page=100");
-        if let Some(since) = cursor.updated_since.as_deref() {
-            path.push_str(&format!("&since={since}"));
-        }
-        let items = gh_api_paginated(&path)?
-            .iter()
-            .map(|value| item_from_issue_value(project, value))
-            .collect();
-        Ok(ItemsPage { items, next: None })
-    }
-
-    async fn comments_page(
-        &self,
-        project: &str,
-        cursor: &PageCursor,
-    ) -> anyhow::Result<CommentsPage> {
-        // Repo-wide comment streams; review *events* have no repo-wide updated-since endpoint,
-        // so the mirror delta re-walks changed items for those (native-client concern).
-        let since = cursor
-            .updated_since
-            .as_deref()
-            .map(|since| format!("?since={since}"))
-            .unwrap_or_default();
-        let mut comments = Vec::new();
-        for value in gh_api_paginated(&format!("repos/{project}/issues/comments{since}"))? {
-            if let Some(comment) = repo_comment_from_value(project, &value, false) {
-                comments.push(comment);
-            }
-        }
-        for value in gh_api_paginated(&format!("repos/{project}/pulls/comments{since}"))? {
-            if let Some(comment) = repo_comment_from_value(project, &value, true) {
-                comments.push(comment);
-            }
-        }
-        Ok(CommentsPage { comments, next: None })
-    }
-
-    async fn freshness_probe(
-        &self,
-        project: &str,
-        cursor: &PageCursor,
-    ) -> anyhow::Result<Option<String>> {
-        let value = gh_api_json(&format!(
-            "repos/{project}/issues?state=all&sort=updated&direction=desc&per_page=1"
-        ))?;
-        let latest = value
-            .as_array()
-            .and_then(|items| items.first())
-            .and_then(|item| item["updated_at"].as_str())
-            .map(str::to_string);
-        Ok(probe_advance(latest, cursor.updated_since.as_deref()))
-    }
-}
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct SyncRefsReport {
     synced_items: usize,
@@ -574,6 +565,30 @@ mod token_tests {
         for rejected in ["Issue", "pull", "change-request", " issue", ""] {
             assert!(ItemKind::from_db_str(rejected).is_err(), "must reject `{rejected}`");
         }
+    }
+
+    #[test]
+    fn implicit_cloud_token_never_crosses_an_enterprise_binding() {
+        let tracker = |base_url: Option<&str>| ResolvedTracker {
+            provider: Tracker::Github,
+            project: "o/r".to_string(),
+            base_url: base_url.map(str::to_string),
+            auth: None,
+            authentication: TrackerAuthentication::AuthMissing,
+            tags: Vec::new(),
+        };
+        let mut trackers = vec![tracker(None), tracker(Some("https://github.example.com"))];
+        apply_implicit_github_auth(&mut trackers, |name| {
+            (name == "GH_TOKEN").then(|| "cloud-secret".to_string())
+        });
+
+        assert!(matches!(
+            trackers[0].auth,
+            Some(crate::config::TrackerAuth::Env(ref name)) if name == "GH_TOKEN"
+        ));
+        assert_eq!(trackers[0].authentication, TrackerAuthentication::AuthConfigured);
+        assert!(trackers[1].auth.is_none());
+        assert_eq!(trackers[1].authentication, TrackerAuthentication::AuthMissing);
     }
 }
 

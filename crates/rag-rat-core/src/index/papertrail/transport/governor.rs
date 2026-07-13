@@ -1,4 +1,5 @@
-//! Rate governance for the papertrail transport, one governor per (provider, host, token).
+//! Rate governance for the papertrail transport, one governor per
+//! (provider, host, token, provider quota lane).
 //!
 //! Header-driven where the provider reports quota (GitHub `x-ratelimit-*`, GitLab `RateLimit-*`):
 //! after each response the governor updates its view and stops consuming once
@@ -43,15 +44,61 @@ pub(crate) struct GovernorKey {
     pub host: String,
     /// Fingerprint of the resolved token — never the token itself; `anonymous` without one.
     pub token_fingerprint: String,
+    /// Provider quota resource (`core`, `search`, ...). GitHub reports these as independent
+    /// windows; mixing their response headers would let one lane corrupt the other's budget.
+    pub lane: String,
 }
 
 impl GovernorKey {
-    pub(crate) fn new(provider: &str, host: &str, token: Option<&str>) -> Self {
+    pub(crate) fn new(provider: &str, host: &str, token: Option<&str>, lane: &str) -> Self {
         Self {
             provider: provider.to_string(),
             host: host.to_string(),
             token_fingerprint: token_fingerprint(token),
+            lane: lane.to_string(),
         }
+    }
+
+    fn retry_hold_key(&self) -> RetryHoldKey {
+        RetryHoldKey {
+            provider: self.provider.clone(),
+            host: self.host.clone(),
+            token_fingerprint: self.token_fingerprint.clone(),
+        }
+    }
+}
+
+/// Secondary/abuse limits are scoped more broadly than provider primary-quota lanes. This key
+/// deliberately omits `lane`, so core and search transports for one host/token stand down
+/// together without mixing their independent quota headers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RetryHoldKey {
+    provider: String,
+    host: String,
+    token_fingerprint: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RetryHold {
+    until_ms: Mutex<Option<i64>>,
+}
+
+impl RetryHold {
+    pub(crate) fn paused_until(&self, now_ms: i64) -> Option<i64> {
+        let mut hold = self.until_ms.lock().expect("retry-hold mutex");
+        match *hold {
+            Some(until) if now_ms < until => Some(until),
+            Some(_) => {
+                *hold = None;
+                None
+            },
+            None => None,
+        }
+    }
+
+    pub(crate) fn record(&self, until_ms: i64) {
+        let mut hold = self.until_ms.lock().expect("retry-hold mutex");
+        *hold = Some(hold.map_or(until_ms, |current| current.max(until_ms)));
     }
 }
 
@@ -263,6 +310,17 @@ impl RateGovernor {
         Admission::Proceed
     }
 
+    /// Undo one completed admission that the provider explicitly documents as quota-free (GitHub
+    /// authenticated conditional `304`). This is never used for failed/timed-out requests.
+    pub(crate) fn refund_admission(&self) {
+        let mut state = self.state.lock().expect("governor mutex");
+        if let Some(quota) = state.quota.as_mut() {
+            quota.remaining = quota.remaining.saturating_add(1).min(quota.limit);
+        } else {
+            state.window_requests = state.window_requests.saturating_sub(1);
+        }
+    }
+
     /// Record the quota view a response reported. Merged monotonically: within the same provider
     /// window `remaining` only ratchets DOWN — an out-of-order older response cannot raise it
     /// back. Resetless views and nearby reset horizons are the same live window; an older window
@@ -317,6 +375,7 @@ pub(crate) fn backoff_delay_ms(attempt: u32, retry_after_ms: Option<i64>, base_m
 #[derive(Debug, Default)]
 pub(crate) struct GovernorRegistry {
     inner: Mutex<HashMap<GovernorKey, Arc<RateGovernor>>>,
+    retry_holds: Mutex<HashMap<RetryHoldKey, Arc<RetryHold>>>,
 }
 
 impl GovernorRegistry {
@@ -327,6 +386,16 @@ impl GovernorRegistry {
                 .expect("governor registry mutex")
                 .entry(key)
                 .or_insert_with(|| Arc::new(RateGovernor::new(config.clone()))),
+        )
+    }
+
+    pub(crate) fn retry_hold(&self, key: &GovernorKey) -> Arc<RetryHold> {
+        Arc::clone(
+            self.retry_holds
+                .lock()
+                .expect("retry-hold registry mutex")
+                .entry(key.retry_hold_key())
+                .or_default(),
         )
     }
 }
@@ -716,6 +785,18 @@ mod tests {
     }
 
     #[test]
+    fn refund_restores_header_quota_without_exceeding_the_limit() {
+        let governor = governor(0.0, DEFAULT_FALLBACK_BUDGET);
+        governor.record_quota(QuotaSnapshot { limit: 10, remaining: 8, reset_at_ms: None });
+        assert_eq!(governor.admit(T0), Admission::Proceed);
+        governor.refund_admission();
+        governor.refund_admission();
+        governor.refund_admission();
+        let state = governor.state.lock().unwrap();
+        assert_eq!(state.quota.as_ref().unwrap().remaining, 10);
+    }
+
+    #[test]
     fn backoff_grows_exponentially_and_retry_after_wins_when_longer() {
         assert_eq!(backoff_delay_ms(0, None, 1_000), 1_000);
         assert_eq!(backoff_delay_ms(1, None, 1_000), 2_000);
@@ -732,18 +813,24 @@ mod tests {
 
     #[test]
     fn governor_key_fingerprints_tokens_without_storing_them() {
-        let with_token = GovernorKey::new("github", "api.github.com", Some("ghp_secret_token"));
-        let same_token = GovernorKey::new("github", "api.github.com", Some("ghp_secret_token"));
-        let other_token = GovernorKey::new("github", "api.github.com", Some("ghp_other_token"));
-        let anonymous = GovernorKey::new("github", "api.github.com", None);
+        let with_token =
+            GovernorKey::new("github", "api.github.com", Some("ghp_secret_token"), "core");
+        let same_token =
+            GovernorKey::new("github", "api.github.com", Some("ghp_secret_token"), "core");
+        let other_token =
+            GovernorKey::new("github", "api.github.com", Some("ghp_other_token"), "core");
+        let anonymous = GovernorKey::new("github", "api.github.com", None, "core");
+        let search =
+            GovernorKey::new("github", "api.github.com", Some("ghp_secret_token"), "search");
         assert_eq!(with_token, same_token);
         assert_ne!(with_token, other_token);
+        assert_ne!(with_token, search, "provider quota lanes are independent");
         assert_eq!(anonymous.token_fingerprint, "anonymous");
         assert!(!with_token.token_fingerprint.contains("secret"), "never the token itself");
         assert_eq!(with_token.token_fingerprint.len(), 16, "8 digest bytes as hex");
         // Blank tokens govern as anonymous, not as a distinct pool.
         assert_eq!(
-            GovernorKey::new("github", "api.github.com", Some("  ")).token_fingerprint,
+            GovernorKey::new("github", "api.github.com", Some("  "), "core").token_fingerprint,
             "anonymous"
         );
     }
@@ -751,12 +838,13 @@ mod tests {
     #[test]
     fn registry_shares_one_governor_per_key() {
         let registry = GovernorRegistry::default();
-        let key = GovernorKey::new("github", "api.github.com", Some("tok"));
+        let key = GovernorKey::new("github", "api.github.com", Some("tok"), "core");
         let config = GovernorConfig::default();
         let first = registry.governor(key.clone(), &config);
         let second = registry.governor(key, &config);
         assert!(Arc::ptr_eq(&first, &second), "same key → same governor");
-        let other = registry.governor(GovernorKey::new("github", "api.github.com", None), &config);
+        let other =
+            registry.governor(GovernorKey::new("github", "api.github.com", None, "core"), &config);
         assert!(!Arc::ptr_eq(&first, &other), "different token → separate accounting");
     }
 }

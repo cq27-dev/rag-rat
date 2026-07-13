@@ -234,6 +234,7 @@ pub(crate) fn ref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PapertrailRef
         source_text: row.get(8)?,
     })
 }
+#[cfg(test)]
 pub(crate) fn refs(conn: &Connection) -> anyhow::Result<Vec<PapertrailRef>> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(

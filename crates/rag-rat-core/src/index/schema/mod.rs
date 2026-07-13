@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 61;
+pub const LATEST_SCHEMA_VERSION: u32 = 63;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -436,6 +436,16 @@ const MIGRATION_061_CHECKSUM: &str = "sha256:rag-rat-papertrail-ref-item-kind-v6
 const MIGRATION_061_DESCRIPTION: &str = "Preserve the nullable item_kind on papertrail_refs so \
                                          providers with separate issue/change-request namespaces \
                                          cannot collapse #N and !N annotations";
+const MIGRATION_062_ID: &str = "062_papertrail_comment_cursor";
+const MIGRATION_062_CHECKSUM: &str = "sha256:rag-rat-papertrail-comment-cursor-v62";
+const MIGRATION_062_DESCRIPTION: &str = "Split repo-wide comment progress from the item watermark \
+                                         and persist comment pagination only after each stored \
+                                         page";
+const MIGRATION_063_ID: &str = "063_papertrail_mirror_resume_state";
+const MIGRATION_063_CHECKSUM: &str = "sha256:rag-rat-papertrail-mirror-resume-state-v63e";
+const MIGRATION_063_DESCRIPTION: &str =
+    "Persist item-page, item-thread, Search-tie, per-stream comment-scan, immutable item-delta \
+     windows, and full-rewalk state so every stored unit resumes without replay or lost pruning";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -947,6 +957,18 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_061_CHECKSUM,
         description: MIGRATION_061_DESCRIPTION,
         apply: apply_papertrail_ref_item_kind,
+    },
+    Migration {
+        id: MIGRATION_062_ID,
+        checksum: MIGRATION_062_CHECKSUM,
+        description: MIGRATION_062_DESCRIPTION,
+        apply: apply_papertrail_comment_cursor,
+    },
+    Migration {
+        id: MIGRATION_063_ID,
+        checksum: MIGRATION_063_CHECKSUM,
+        description: MIGRATION_063_DESCRIPTION,
+        apply: apply_papertrail_mirror_resume_state,
     },
 ];
 

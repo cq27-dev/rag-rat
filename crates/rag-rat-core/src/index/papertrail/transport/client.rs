@@ -11,7 +11,7 @@ use reqwest::header::{self, HeaderMap};
 use super::auth;
 use super::governor::{
     Admission, GovernorConfig, GovernorKey, GovernorRegistry, PauseReason, QuotaSnapshot,
-    RateGovernor, backoff_delay_ms,
+    RateGovernor, RetryHold, backoff_delay_ms,
 };
 use crate::config::{PapertrailConfig, TrackerAuth};
 use crate::index::util::now_ms;
@@ -93,9 +93,12 @@ impl From<&PapertrailConfig> for TransportOptions {
 pub(crate) struct TransportParams<'a> {
     /// Provider id (`github`, `gitlab`, …).
     pub provider: &'a str,
+    /// Provider quota resource. GitHub Search and core REST are independent lanes.
+    pub lane: &'a str,
     /// Authority the binding talks to — `api.github.com`, `gitlab.example.com:8443`, never a
     /// URL. Keys the governor AND pins every request: a URL outside it is refused.
     pub host: &'a str,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub auth: Option<&'a TrackerAuth>,
     /// Shared registry so sibling bindings on the same (provider, host, token) share one
     /// governor and jointly account their consumption.
@@ -110,6 +113,7 @@ type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 pub(crate) struct Transport {
     client: reqwest::Client,
     governor: Arc<RateGovernor>,
+    retry_hold: Arc<RetryHold>,
     /// Prebuilt `Authorization` value; `None` for anonymous bindings.
     auth_header: Option<String>,
     /// The binding's pinned authority (lowercased host, optional port) — every request URL must
@@ -127,20 +131,39 @@ impl Transport {
     /// Build the transport for one binding: resolves the token (fails fast on a configured-but-
     /// missing one), joins the shared governor for (provider, host, token), and constructs the
     /// rustls HTTP client. The pass's wall-clock deadline starts here.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(params: TransportParams<'_>) -> anyhow::Result<Self> {
         Self::with_clock(params, Arc::new(now_ms))
     }
 
+    /// Build a sibling quota lane from one already-resolved binding credential. Provider clients
+    /// with several lanes must snapshot auth once so token commands cannot yield split identities.
+    pub(crate) fn new_with_token(
+        params: TransportParams<'_>,
+        token: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::with_clock_and_token(params, Arc::new(now_ms), token.map(str::to_string))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_clock(params: TransportParams<'_>, clock: Clock) -> anyhow::Result<Self> {
         let token = auth::resolve_token(params.auth)?;
+        Self::with_clock_and_token(params, clock, token)
+    }
+
+    fn with_clock_and_token(
+        params: TransportParams<'_>,
+        clock: Clock,
+        token: Option<String>,
+    ) -> anyhow::Result<Self> {
         let auth_header =
             token.as_deref().map(|token| format!("{} {token}", params.options.auth_scheme));
         let (bound_host, bound_port) = parse_bound_authority(params.host)?;
         let governor_authority = canonical_governor_authority(&bound_host, bound_port);
-        let governor = params.registry.governor(
-            GovernorKey::new(params.provider, &governor_authority, token.as_deref()),
-            &params.options.governor,
-        );
+        let governor_key =
+            GovernorKey::new(params.provider, &governor_authority, token.as_deref(), params.lane);
+        let retry_hold = params.registry.retry_hold(&governor_key);
+        let governor = params.registry.governor(governor_key, &params.options.governor);
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(params.options.request_timeout_s))
             // Redirects are provider semantics. Following them here would bypass the per-hop URL
@@ -156,6 +179,7 @@ impl Transport {
         Ok(Self {
             client: builder.build()?,
             governor,
+            retry_hold,
             auth_header,
             bound_host,
             bound_port,
@@ -189,6 +213,12 @@ impl Transport {
                     reason: PauseReason::PassBudget,
                 });
             }
+            if let Some(resume_at_ms) = self.retry_hold.paused_until(now) {
+                return Err(TransportError::Paused {
+                    resume_at_ms,
+                    reason: PauseReason::RetryAfter,
+                });
+            }
             if let Admission::PausedUntil { resume_at_ms, reason } = self.governor.admit(now) {
                 return Err(TransportError::Paused { resume_at_ms, reason });
             }
@@ -209,6 +239,15 @@ impl Transport {
             // Drain the body on every path — a rate-limited reply carries one too, and leaving
             // it unread can abort the connection.
             let body = response.text().await?;
+            let conditional_not_modified = self.is_github
+                && self.auth_header.is_some()
+                && status == 304
+                && extra_headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(header::IF_NONE_MATCH.as_str()));
+            if conditional_not_modified {
+                self.governor.refund_admission();
+            }
             let github_secondary = self.is_github && is_github_secondary_limit(status, &body);
             if !is_rate_limited(status, &headers, now) && !github_secondary {
                 return Ok(TransportResponse { status, headers, body });
@@ -218,9 +257,15 @@ impl Transport {
             let delay_ms = backoff_delay_ms(attempt, retry_after_ms, self.backoff_base_ms);
             attempt += 1;
             let resume_at_ms = now.saturating_add(delay_ms);
-            // Hold the whole (provider, host, token) key, not just this request — a sibling
-            // fetch on the same token must also stand down.
-            self.governor.record_hold(resume_at_ms);
+            // GitHub secondary/abuse limits cover REST as a whole, while primary quota windows
+            // remain lane-specific. Other providers retain the conservative lane-local hold.
+            let shared_github_hold = self.is_github
+                && (github_secondary || status == 429 || headers.contains_key(header::RETRY_AFTER));
+            if shared_github_hold {
+                self.retry_hold.record(resume_at_ms);
+            } else {
+                self.governor.record_hold(resume_at_ms);
+            }
             if resume_at_ms > self.pass_deadline_ms {
                 return Err(TransportError::Paused {
                     resume_at_ms,
@@ -364,6 +409,7 @@ fn retry_after_ms(headers: &HeaderMap, now_ms: i64) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::governor;
     use super::super::stub::{StubResponse, spawn_script_stub};
     use super::*;
 
@@ -379,12 +425,23 @@ mod tests {
 
     fn transport(url: &str, auth: Option<&TrackerAuth>, options: TransportOptions) -> Transport {
         let registry = GovernorRegistry::default();
+        transport_in_lane(url, auth, options, &registry, "core")
+    }
+
+    fn transport_in_lane(
+        url: &str,
+        auth: Option<&TrackerAuth>,
+        options: TransportOptions,
+        registry: &GovernorRegistry,
+        lane: &str,
+    ) -> Transport {
         let host = url.trim_start_matches("http://").split(':').next().unwrap().to_string();
         Transport::new(TransportParams {
             provider: "github",
+            lane,
             host: &host,
             auth,
-            registry: &registry,
+            registry,
             options,
         })
         .expect("transport")
@@ -403,6 +460,29 @@ mod tests {
             options.governor.fallback_budget.max_requests,
             TransportOptions::default().governor.fallback_budget.max_requests
         );
+    }
+
+    #[test]
+    fn authenticated_github_conditional_304_refunds_the_local_budget() {
+        let (url, handle) = spawn_script_stub(vec![
+            StubResponse::status("304 Not Modified", ""),
+            StubResponse::ok(r#"{"ok":true}"#),
+        ]);
+        let mut options = fast_options();
+        options.governor.fallback_budget =
+            governor::BudgetPolicy { max_requests: 1, window_ms: 60_000 };
+        let auth = TrackerAuth::TokenCommand("echo stub-token".to_string());
+        let transport = transport(&url, Some(&auth), options);
+        drive(async {
+            let first = transport
+                .get(&format!("{url}/probe"), &[(header::IF_NONE_MATCH.as_str(), "\"v1\"")])
+                .await
+                .unwrap();
+            assert_eq!(first.status, 304);
+            let second = transport.get(&format!("{url}/items"), &[]).await.unwrap();
+            assert_eq!(second.status, 200);
+        });
+        assert_eq!(handle.join().unwrap().len(), 2);
     }
 
     #[test]
@@ -500,6 +580,26 @@ mod tests {
     }
 
     #[test]
+    fn a_github_secondary_hold_stops_sibling_quota_lanes_before_they_send() {
+        let (url, handle) = spawn_script_stub(vec![StubResponse::status(
+            "403 Forbidden",
+            "You have exceeded a secondary rate limit.",
+        )]);
+        let options = TransportOptions { pass_budget_ms: 1_000, ..fast_options() };
+        let registry = GovernorRegistry::default();
+        let core = transport_in_lane(&url, None, options.clone(), &registry, "core");
+        let search = transport_in_lane(&url, None, options, &registry, "search");
+
+        let core_error = drive(async { core.get(&format!("{url}/issues"), &[]).await })
+            .expect_err("secondary limit pauses core");
+        assert!(matches!(core_error, TransportError::Paused { .. }));
+        let search_error = drive(async { search.get(&format!("{url}/search"), &[]).await })
+            .expect_err("shared secondary hold pauses search");
+        assert!(matches!(search_error, TransportError::Paused { .. }));
+        assert_eq!(handle.join().unwrap().len(), 1, "search never touched the network");
+    }
+
+    #[test]
     fn a_plain_403_is_returned_to_the_caller_not_retried() {
         let (url, handle) =
             spawn_script_stub(vec![StubResponse::status("403 Forbidden", "no access")]);
@@ -515,6 +615,7 @@ mod tests {
         let registry = GovernorRegistry::default();
         let transport = Transport::new(TransportParams {
             provider: "github",
+            lane: "core",
             host: "api.github.com",
             auth: None,
             registry: &registry,
@@ -556,6 +657,7 @@ mod tests {
         let build = |host: &str| {
             Transport::new(TransportParams {
                 provider: "github",
+                lane: "core",
                 host,
                 auth: None,
                 registry: &registry,
@@ -573,6 +675,7 @@ mod tests {
         let registry = GovernorRegistry::default();
         let transport = Transport::new(TransportParams {
             provider: "gitlab",
+            lane: "core",
             host: "gitlab.example.com:8443",
             auth: None,
             registry: &registry,
@@ -597,6 +700,7 @@ mod tests {
         let transport = Transport::with_clock(
             TransportParams {
                 provider: "github",
+                lane: "core",
                 host: "127.0.0.1",
                 auth: None,
                 registry: &registry,
@@ -651,6 +755,7 @@ mod tests {
         let registry = GovernorRegistry::default();
         let err = Transport::new(TransportParams {
             provider: "gitlab",
+            lane: "core",
             host: "gitlab.example.com:not-a-port",
             auth: None,
             registry: &registry,
@@ -666,6 +771,7 @@ mod tests {
         let registry = GovernorRegistry::default();
         let err = Transport::new(TransportParams {
             provider: "github",
+            lane: "core",
             host: "api.github.com",
             auth: Some(&TrackerAuth::Env("RAG_RAT_TEST_UNSET_TOKEN_VAR".to_string())),
             registry: &registry,

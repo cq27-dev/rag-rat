@@ -99,6 +99,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
             authentication: papertrail::TrackerAuthentication::AuthMissing,
             tags: Vec::new(),
         }],
+        ..papertrail::PapertrailContext::default()
     };
     let explicit_without_github_binding = papertrail::block_on(papertrail::sync_issue(
         db.storage.connection(),
@@ -196,6 +197,7 @@ fn production_discovery_persists_refs_for_every_configured_tracker() {
                 tags: Vec::new(),
             },
         ],
+        ..papertrail::PapertrailContext::default()
     };
 
     sync_from_refs_blocking(db.storage.connection(), &root, Some(&MockGitHubClient), true, &ctx)
@@ -612,6 +614,9 @@ fn v060_creates_the_papertrail_tables_on_fresh_apply() {
         conn_index_exists(&conn, "idx_papertrail_comments_natural_key"),
         "comments natural key"
     );
+    let cursor_columns = conn_table_columns(&conn, "papertrail_sync_cursor");
+    assert!(cursor_columns.contains(&"comment_high_mark_at".to_string()));
+    assert!(cursor_columns.contains(&"comment_page_token".to_string()));
     schema::apply(&conn).unwrap();
     assert!(conn_table_exists(&conn, "papertrail_items"), "survives re-apply");
 
@@ -619,6 +624,60 @@ fn v060_creates_the_papertrail_tables_on_fresh_apply() {
     truncate_schema_to(&conn, 59);
     schema::migrate_forward(&conn).unwrap();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+}
+
+#[test]
+fn migration_063_is_the_tip_and_persists_mirror_resume_state() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 63, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    let columns = conn_table_columns(&conn, "papertrail_sync_cursor");
+    assert!(columns.contains(&"comment_high_mark_at".to_string()));
+    assert!(columns.contains(&"comment_page_token".to_string()));
+    for column in [
+        "comment_scan_since",
+        "comment_stream_cursors",
+        "item_delta_page_token",
+        "item_delta_scan_since",
+        "item_delta_high_mark_at",
+        "backfill_page_cursor",
+        "item_thread_cursor",
+        "item_delta_in_progress",
+        "item_delta_replay_required",
+        "delta_processed_keys",
+        "backfill_processed_keys",
+        "full_rewalk",
+    ] {
+        assert!(columns.contains(&column.to_string()), "cursor has {column}");
+    }
+    assert!(
+        conn_table_columns(&conn, "papertrail_items").contains(&"full_rewalk_seen".to_string())
+    );
+    schema::apply_papertrail_mirror_resume_state(&conn).unwrap();
+    assert_eq!(conn_table_columns(&conn, "papertrail_sync_cursor"), columns, "V063 is idempotent");
+}
+
+#[test]
+fn migration_063_checksum_replays_the_pre_replay_flag_shape() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    conn.execute("ALTER TABLE papertrail_sync_cursor DROP COLUMN item_delta_replay_required", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE schema_version
+         SET checksum = 'sha256:rag-rat-papertrail-mirror-resume-state-v63d'
+         WHERE id = '063_papertrail_mirror_resume_state'",
+        [],
+    )
+    .unwrap();
+
+    schema::apply(&conn).unwrap();
+
+    assert!(
+        conn_table_columns(&conn, "papertrail_sync_cursor")
+            .contains(&"item_delta_replay_required".to_string())
+    );
+    assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Compatible);
 }
 
 /// The load-bearing multi-repo invariant carried over from V044/V045: two repos can each cache
@@ -903,9 +962,9 @@ impl papertrail::PapertrailClient for RecoveringCommentsClient {
     async fn freshness_probe(
         &self,
         project: &str,
-        cursor: &papertrail::PageCursor,
-    ) -> anyhow::Result<Option<String>> {
-        MockGitHubClient.freshness_probe(project, cursor).await
+        probe: &papertrail::FreshnessProbe,
+    ) -> anyhow::Result<papertrail::FreshnessResult> {
+        MockGitHubClient.freshness_probe(project, probe).await
     }
 }
 
@@ -1011,15 +1070,18 @@ fn papertrail_client_batch_surface_round_trips_through_the_trait() {
     assert_eq!(comments.comments.iter().filter(|c| c.review_state.is_some()).count(), 1);
     assert_eq!(comments.comments.iter().filter(|c| c.anchor_path.is_some()).count(), 1);
 
-    let moved = papertrail::block_on(MockGitHubClient.freshness_probe("o/r", &cursor)).unwrap();
-    assert_eq!(moved.as_deref(), Some("2026-01-02T00:00:00Z"));
-    let quiet_cursor = papertrail::PageCursor {
+    let moved = papertrail::block_on(
+        MockGitHubClient.freshness_probe("o/r", &papertrail::FreshnessProbe::default()),
+    )
+    .unwrap();
+    assert_eq!(moved.latest.as_deref(), Some("2026-01-02T00:00:00Z"));
+    let quiet_probe = papertrail::FreshnessProbe {
         updated_since: Some("2026-01-02T00:00:00Z".into()),
-        page_token: None,
+        etag: None,
     };
     let quiet =
-        papertrail::block_on(MockGitHubClient.freshness_probe("o/r", &quiet_cursor)).unwrap();
-    assert_eq!(quiet, None, "a probe at the cursor position reports no movement");
+        papertrail::block_on(MockGitHubClient.freshness_probe("o/r", &quiet_probe)).unwrap();
+    assert_eq!(quiet.latest, None, "a probe at the cursor position reports no movement");
 }
 
 // --- V060: the github_* -> papertrail_* backfill against a POPULATED pre-migration DB ---

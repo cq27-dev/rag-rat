@@ -147,62 +147,18 @@ impl IndexDatabase {
         Ok(Some(summary))
     }
 
-    pub fn papertrail_sync_from_refs(&self, offline: bool) -> anyhow::Result<PapertrailSyncReport> {
-        self.papertrail_sync_from_refs_with_progress(offline, |_| {})
-    }
-
-    pub fn papertrail_sync_from_refs_with_progress(
-        &self,
-        offline: bool,
-        progress: impl FnMut(papertrail::PapertrailSyncProgress),
-    ) -> anyhow::Result<PapertrailSyncReport> {
+    /// Mirror every resolved tracker binding. References remain an annotation layer and do not
+    /// select the network fetch set.
+    pub fn papertrail_sync(&self, full: bool) -> anyhow::Result<PapertrailSyncReport> {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("index has no source_root metadata; rebuild required");
         };
-        if offline {
-            papertrail::block_on(papertrail::sync_from_refs::<papertrail::GitHubClient>(
-                self.storage.connection(),
-                root,
-                None,
-                true,
-                &self.papertrail,
-            ))
-        } else {
-            let client = papertrail::GitHubClient;
-            papertrail::block_on(papertrail::sync_from_refs_with_progress(
-                self.storage.connection(),
-                root,
-                Some(&client),
-                false,
-                &self.papertrail,
-                progress,
-            ))
-        }
-    }
-
-    pub fn papertrail_sync_issue(
-        &self,
-        issue_ref: &str,
-        offline: bool,
-    ) -> anyhow::Result<PapertrailSyncReport> {
-        if offline {
-            papertrail::block_on(papertrail::sync_issue::<papertrail::GitHubClient>(
-                self.storage.connection(),
-                issue_ref,
-                None,
-                true,
-                &self.papertrail,
-            ))
-        } else {
-            let client = papertrail::GitHubClient;
-            papertrail::block_on(papertrail::sync_issue(
-                self.storage.connection(),
-                issue_ref,
-                Some(&client),
-                false,
-                &self.papertrail,
-            ))
-        }
+        papertrail::block_on(papertrail::sync_mirror(
+            self.storage.connection(),
+            root,
+            full,
+            &self.papertrail,
+        ))
     }
 
     pub fn papertrail_issue_search(

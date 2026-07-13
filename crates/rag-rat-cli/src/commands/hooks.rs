@@ -6,23 +6,14 @@ use std::fs;
 use rag_rat_core::Config;
 
 use crate::cli::{HookAction, HooksArgs, PapertrailArgs, PapertrailCommand};
-use crate::render::{print_output, render_papertrail_sync_progress};
+use crate::render::print_output;
 use crate::{MANAGED_HOOKS, git_paths, install_hook, is_rag_rat_hook, open_index};
 
 pub(crate) fn papertrail(config: &Config, args: &PapertrailArgs) -> anyhow::Result<()> {
     match &args.command {
-        PapertrailCommand::Sync { from_refs, issue, offline } => {
+        PapertrailCommand::Sync { full } => {
             let db = open_index(config)?;
-            let report = if let Some(issue) = issue {
-                db.papertrail_sync_issue(issue, *offline)?
-            } else if *from_refs {
-                db.papertrail_sync_from_refs_with_progress(
-                    *offline,
-                    render_papertrail_sync_progress,
-                )?
-            } else {
-                anyhow::bail!("papertrail sync needs --from-refs or --issue <owner/repo#number>");
-            };
+            let report = db.papertrail_sync(*full)?;
             print_output(&report)
         },
     }

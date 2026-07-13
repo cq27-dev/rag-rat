@@ -1,3 +1,5 @@
+use serde_json::Value;
+
 use super::*;
 
 /// Ref-bearing tokens of `text` — the shared tokenizer of the legacy GitHub-only lane
@@ -366,7 +368,7 @@ pub(crate) fn item_from_issue_value(project: &str, value: &Value) -> PapertrailI
     PapertrailItem {
         project: project.to_string(),
         item_kind: if shadow.is_some() { ItemKind::ChangeRequest } else { ItemKind::Issue },
-        item_key: value["number"].as_i64().unwrap_or_default().to_string(),
+        item_key: value["number"].as_u64().unwrap_or_default().to_string(),
         url: string_value(value, "html_url"),
         state: string_value(value, "state"),
         title: string_value(value, "title"),
@@ -375,6 +377,12 @@ pub(crate) fn item_from_issue_value(project: &str, value: &Value) -> PapertrailI
         created_at: value["created_at"].as_str().map(str::to_string),
         updated_at: value["updated_at"].as_str().map(str::to_string),
         merged_at: shadow.and_then(|shadow| shadow["merged_at"].as_str()).map(str::to_string),
+        tags: value["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|label| label["name"].as_str().map(str::to_string))
+            .collect(),
     }
 }
 /// Fold the richer pulls-endpoint payload into a change request built from its issue shadow.
@@ -396,7 +404,7 @@ pub(crate) fn comment_from_value(
         project: project.to_string(),
         item_kind: kind,
         item_key: key.to_string(),
-        comment_id: format!("comment:{}", value["id"].as_i64().unwrap_or_default()),
+        comment_id: format!("comment:{}", value["id"].as_u64().unwrap_or_default()),
         url: value["html_url"].as_str().map(str::to_string),
         body: string_value(value, "body"),
         author: value.pointer("/user/login").and_then(Value::as_str).map(str::to_string),
@@ -418,7 +426,7 @@ pub(crate) fn review_to_comment_from_value(
         review_state: Some(string_value(value, "state")),
         ..comment_from_value(project, kind, key, value)
     };
-    comment.comment_id = format!("review:{}", value["id"].as_i64().unwrap_or_default());
+    comment.comment_id = format!("review:{}", value["id"].as_u64().unwrap_or_default());
     comment
 }
 pub(crate) fn review_comment_to_comment_from_value(
@@ -431,7 +439,7 @@ pub(crate) fn review_comment_to_comment_from_value(
         anchor_path: value["path"].as_str().map(str::to_string),
         ..comment_from_value(project, kind, key, value)
     };
-    comment.comment_id = format!("review_comment:{}", value["id"].as_i64().unwrap_or_default());
+    comment.comment_id = format!("review_comment:{}", value["id"].as_u64().unwrap_or_default());
     comment
 }
 /// Map one entry of a repo-wide comment stream, deriving the parent item key from the payload's
@@ -456,40 +464,6 @@ pub(crate) fn repo_comment_from_value(
         comment.anchor_path = value["path"].as_str().map(str::to_string);
     }
     Some(comment)
-}
-pub(crate) fn gh_api_json(path: &str) -> anyhow::Result<Value> {
-    let output = Command::new("gh").args(["api", path]).output()?;
-    if !output.status.success() {
-        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
-pub(crate) fn gh_api_paginated(path: &str) -> anyhow::Result<Vec<Value>> {
-    let output = Command::new("gh").args(["api", "--paginate", "--slurp", path]).output()?;
-    if !output.status.success() {
-        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    let value: Value = serde_json::from_slice(&output.stdout)?;
-    let mut out = Vec::new();
-    if let Some(pages) = value.as_array() {
-        for page in pages {
-            if let Some(items) = page.as_array() {
-                out.extend(items.iter().cloned());
-            }
-        }
-    }
-    Ok(out)
-}
-/// The legacy GitHub sync path shells out to `gh api`; status checks ONLY executable presence.
-/// Authentication is intentionally deferred to sync, where `gh api` returns the actionable error.
-pub(crate) fn github_cli_available() -> bool {
-    Command::new("gh")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 pub(crate) fn string_value(value: &Value, key: &str) -> String {
     value[key].as_str().unwrap_or_default().to_string()

@@ -192,32 +192,6 @@ pub(crate) fn render_reconcile_progress(progress: rag_rat_core::index::ai::Recon
 pub(crate) fn progress_percent(current: u64, total: u64) -> u64 {
     current.saturating_mul(100).checked_div(total).unwrap_or(100).min(100)
 }
-pub(crate) fn render_papertrail_sync_progress(
-    progress: rag_rat_core::index::papertrail::PapertrailSyncProgress,
-) {
-    match progress.action {
-        PapertrailSyncAction::Syncing => eprintln!(
-            "papertrail sync: {}/{} fetching {}#{}",
-            progress.current, progress.total, progress.project, progress.item_key
-        ),
-        PapertrailSyncAction::Skipped => eprintln!(
-            "papertrail sync: {}/{} skip cached {}#{}",
-            progress.current, progress.total, progress.project, progress.item_key
-        ),
-        PapertrailSyncAction::Synced => eprintln!(
-            "papertrail sync: {}/{} synced {}#{}",
-            progress.current, progress.total, progress.project, progress.item_key
-        ),
-        PapertrailSyncAction::Failed => eprintln!(
-            "papertrail sync: {}/{} failed {}#{}: {}",
-            progress.current,
-            progress.total,
-            progress.project,
-            progress.item_key,
-            progress.message.unwrap_or_else(|| "unknown error".to_string())
-        ),
-    }
-}
 /// Print a serializable result in the process-wide output format (TOON by default, JSON under
 /// `--json`). Renamed from `print_json` because it is no longer always JSON — the format is the
 /// global flag's choice, read from `output_format()`.

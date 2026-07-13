@@ -421,9 +421,10 @@ and caches it by `source_text_hash`.
 commit count, and file-change count. Non-git roots report unavailable history without failing source
 or docs indexing.
 
-Papertrail tools read the local cache only. `rag-rat papertrail sync --from-refs` discovers refs
-and fetches through `gh api --paginate`; `rag-rat papertrail sync --issue owner/repo#123` fetches
-one item thread; `--offline` updates discovered refs and reports cache status without network use.
+Papertrail tools read the local cache only. `rag-rat papertrail sync` mirrors every resolved
+tracker binding through its native provider client; `--full` forces a complete historical re-walk
+to heal cached rows. Source and commit references remain annotations and do not select what the
+mirror fetches.
 
 Papertrail outputs keep `current_source` separate from `evidence`. Cached snippets are labeled as
 historical tracker evidence (`historical_tracker` / `literal_tracker_ref`) and classified as
@@ -432,7 +433,7 @@ row names its `tracker` (`github`), `project` (`owner/repo`), `item_kind` (`issu
 `change_request`), `item_key`, and `doc_kind` (`item` | `comment`).
 
 `index_status.papertrail` reports cached refs, issues, change requests, comments, last sync time,
-and whether the `gh` CLI capability is available.
+and each binding's authentication and native synchronization capability.
 `papertrail_sync_status` returns that cache section directly. `heal_index` repairs or removes
 already-indexed files whose current source no longer matches the stored SQLite index, then refreshes
 SQLite FTS. It does not discover brand-new files; run `rag-rat index` for discovery.

@@ -11,23 +11,23 @@ use std::time::{Duration, Instant};
 
 /// One scripted response. The stub serves them in order, one connection each
 /// (`Connection: close`).
-pub(super) struct StubResponse {
+pub(crate) struct StubResponse {
     pub status: &'static str,
     pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
 impl StubResponse {
-    pub(super) fn ok(body: &str) -> Self {
+    pub(crate) fn ok(body: &str) -> Self {
         Self::status("200 OK", body)
     }
 
-    pub(super) fn status(status: &'static str, body: &str) -> Self {
+    pub(crate) fn status(status: &'static str, body: &str) -> Self {
         Self { status, headers: Vec::new(), body: body.to_string() }
     }
 
     /// A `200 OK` carrying GitHub-style quota headers.
-    pub(super) fn ok_with_quota(
+    pub(crate) fn ok_with_quota(
         body: &str,
         limit: i64,
         remaining: i64,
@@ -49,7 +49,7 @@ impl StubResponse {
 /// connection per response — and returns the base URL plus a join handle yielding the captured
 /// request HEADS (request line + headers) in arrival order, so tests can assert the exact page
 /// sequence. Accepts poll with a deadline so a client-side bug can't hang the join forever.
-pub(super) fn spawn_script_stub(
+pub(crate) fn spawn_script_stub(
     responses: Vec<StubResponse>,
 ) -> (String, thread::JoinHandle<Vec<String>>) {
     spawn_script_stub_with_timeout(responses, Duration::from_secs(10))
@@ -62,6 +62,17 @@ fn spawn_script_stub_with_timeout(
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.set_nonblocking(true).expect("nonblocking listener");
     let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let responses = responses
+        .into_iter()
+        .map(|mut response| {
+            response.body = response.body.replace("{BASE}", &base);
+            for (_, value) in &mut response.headers {
+                *value = value.replace("{BASE}", &base);
+            }
+            response
+        })
+        .collect::<Vec<_>>();
     let handle = thread::spawn(move || {
         let mut captured = Vec::new();
         for response in responses {
@@ -93,7 +104,7 @@ fn spawn_script_stub_with_timeout(
         }
         captured
     });
-    (format!("http://127.0.0.1:{port}"), handle)
+    (base, handle)
 }
 
 /// Read the request head + its full `Content-Length` body (drained, discarded), returning the

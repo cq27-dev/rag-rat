@@ -127,10 +127,12 @@ impl TryFrom<RawTracker> for TrackerConfig {
                     return Err(ConfigError::TrackerBaseUrlNotHttp(url));
                 };
                 let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                let suffix = &rest[authority.len()..];
                 if !matches!(scheme, "http" | "https")
                     || authority.is_empty()
                     || authority.starts_with(':')
                     || authority.chars().any(char::is_whitespace)
+                    || !suffix.chars().all(|ch| ch == '/')
                 {
                     return Err(ConfigError::TrackerBaseUrlNotHttp(url));
                 }
@@ -161,10 +163,17 @@ impl TryFrom<RawTracker> for TrackerConfig {
 
 fn valid_tracker_project(provider: Tracker, project: &str) -> bool {
     let parts = project.split('/').collect::<Vec<_>>();
+    let valid_code_host_segment = |part: &&str| {
+        !part.is_empty()
+            && !matches!(*part, "." | "..")
+            && part.chars().all(|ch| {
+                !ch.is_control() && !ch.is_whitespace() && !matches!(ch, '?' | '#' | '%' | '\\')
+            })
+    };
     match provider {
         Tracker::Github | Tracker::Bitbucket =>
-            parts.len() == 2 && parts.iter().all(|part| !part.is_empty()),
-        Tracker::Gitlab => parts.len() >= 2 && parts.iter().all(|part| !part.is_empty()),
+            parts.len() == 2 && parts.iter().all(valid_code_host_segment),
+        Tracker::Gitlab => parts.len() >= 2 && parts.iter().all(valid_code_host_segment),
         Tracker::Jira =>
             project.chars().count() >= 2
                 && project.chars().next().is_some_and(|first| first.is_ascii_uppercase())

@@ -1,6 +1,85 @@
 use super::*;
 use crate::index::{repo_meta, schema, scoped_table_row_count, set_repo_meta};
 
+pub(crate) async fn sync_mirror(
+    conn: &Connection,
+    root: &Path,
+    full: bool,
+    ctx: &PapertrailContext,
+) -> anyhow::Result<PapertrailSyncReport> {
+    ensure_unique_mirror_bindings(&ctx.trackers)?;
+    let refs = discover_and_store_refs(conn, root, ctx)?;
+    let registry = transport::GovernorRegistry::default();
+    let options = ctx.transport_options.clone();
+    let mut synced_items = 0;
+    let mut bindings = Vec::new();
+    let mut errors = Vec::new();
+    for binding in &ctx.trackers {
+        if binding.provider != Tracker::Github {
+            errors.push(PapertrailSyncError {
+                tracker: binding.provider,
+                project: binding.project.clone(),
+                item_key: String::new(),
+                status: "provider_client_pending".to_string(),
+                error: format!(
+                    "{} mirror client is not implemented yet",
+                    binding.provider.as_db_str()
+                ),
+            });
+            continue;
+        }
+        match GitHubClient::new(binding, &registry, options.clone()) {
+            Ok(client) => match mirror_binding(conn, binding, &client, full).await {
+                Ok(report) => {
+                    synced_items += report.stored_items;
+                    bindings.push(report);
+                },
+                Err(error) => errors.push(PapertrailSyncError {
+                    tracker: binding.provider,
+                    project: binding.project.clone(),
+                    item_key: String::new(),
+                    status: "failed".to_string(),
+                    error: error.to_string(),
+                }),
+            },
+            Err(error) => errors.push(PapertrailSyncError {
+                tracker: binding.provider,
+                project: binding.project.clone(),
+                item_key: String::new(),
+                status: "authentication_or_transport".to_string(),
+                error: error.to_string(),
+            }),
+        }
+    }
+    let repo_id = schema::active_repo_id(conn)?;
+    set_repo_meta(conn, &repo_id, "papertrail_last_sync_ms", &now_ms().to_string())?;
+    Ok(PapertrailSyncReport {
+        offline: false,
+        discovered_refs: refs.len(),
+        skipped_refs: 0,
+        failed_refs: errors.len(),
+        synced_items,
+        bindings,
+        errors,
+        status: status(conn, ctx)?,
+    })
+}
+
+fn ensure_unique_mirror_bindings(trackers: &[ResolvedTracker]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for binding in trackers {
+        anyhow::ensure!(
+            seen.insert((binding.provider.as_db_str(), binding.project.as_str())),
+            "duplicate papertrail binding for {} project `{}`; mirror cache and cursor identity \
+             require one binding per provider/project",
+            binding.provider.as_db_str(),
+            binding.project
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) async fn sync_from_refs<C: PapertrailClient>(
     conn: &Connection,
     root: &Path,
@@ -10,6 +89,7 @@ pub(crate) async fn sync_from_refs<C: PapertrailClient>(
 ) -> anyhow::Result<PapertrailSyncReport> {
     sync_from_refs_with_progress(conn, root, client, offline, ctx, |_| {}).await
 }
+#[cfg(test)]
 pub(crate) async fn sync_from_refs_with_progress<C: PapertrailClient>(
     conn: &Connection,
     root: &Path,
@@ -43,10 +123,12 @@ pub(crate) async fn sync_from_refs_with_progress<C: PapertrailClient>(
         skipped_refs: sync.skipped_refs,
         failed_refs: sync.failed_refs,
         synced_items: sync.synced_items,
+        bindings: Vec::new(),
         errors: sync.errors,
         status: status(conn, ctx)?,
     })
 }
+#[cfg(test)]
 pub(crate) async fn sync_issue<C: PapertrailClient>(
     conn: &Connection,
     issue_ref: &str,
@@ -86,6 +168,7 @@ pub(crate) async fn sync_issue<C: PapertrailClient>(
         skipped_refs: sync.skipped_refs,
         failed_refs: sync.failed_refs,
         synced_items: sync.synced_items,
+        bindings: Vec::new(),
         errors: sync.errors,
         status: status(conn, ctx)?,
     })
@@ -105,11 +188,6 @@ pub(crate) fn status(
         )?;
         Ok(u64::try_from(count).unwrap_or_default())
     };
-    let needs_github_cli = ctx
-        .trackers
-        .iter()
-        .any(|binding| binding.provider == Tracker::Github && binding.base_url.is_none());
-    let github_cli_available = needs_github_cli && github_cli_available();
     Ok(PapertrailStatus {
         refs: scoped_table_row_count(conn, "papertrail_refs", &repo_id)?,
         issues: items_by_kind(ItemKind::Issue)?,
@@ -124,15 +202,15 @@ pub(crate) fn status(
                 tracker: binding.provider,
                 project: binding.project.clone(),
                 authentication: binding.authentication,
-                synchronization: tracker_synchronization(binding, github_cli_available),
+                synchronization: tracker_synchronization(binding),
             })
             .collect(),
     })
 }
 
-/// The legacy `gh api` client is cloud-GitHub-only. Discovered refs follow the binding that claimed
-/// their source text, so a self-hosted binding waits for its native provider client rather than
-/// accidentally querying github.com. Explicit manual refs are routed directly by [`sync_issue`].
+/// Test-only compatibility routing for the retired reference-driven sync fixtures. Production
+/// synchronization uses [`sync_mirror`]; references are annotations only.
+#[cfg(test)]
 fn discovered_ref_uses_legacy_github_client(
     ctx: &PapertrailContext,
     reference: &PapertrailRef,
@@ -158,13 +236,9 @@ fn discovered_ref_uses_legacy_github_client(
         .is_some_and(|(binding_index, _)| ctx.trackers[binding_index].base_url.is_none())
 }
 
-fn tracker_synchronization(
-    binding: &ResolvedTracker,
-    github_cli_available: bool,
-) -> TrackerSynchronization {
-    match (binding.provider, binding.base_url.is_none(), github_cli_available) {
-        (Tracker::Github, true, true) => TrackerSynchronization::LegacyGithubCli,
-        (Tracker::Github, true, false) => TrackerSynchronization::LegacyGithubCliMissing,
+fn tracker_synchronization(binding: &ResolvedTracker) -> TrackerSynchronization {
+    match binding.provider {
+        Tracker::Github => TrackerSynchronization::Native,
         _ => TrackerSynchronization::ProviderClientPending,
     }
 }
@@ -319,7 +393,9 @@ pub(crate) fn mark_fallback_evidence(evidence: &mut [PapertrailEvidence]) {
 
 #[cfg(test)]
 mod capability_tests {
+    use super::super::transport::stub::{StubResponse, spawn_script_stub};
     use super::*;
+    use crate::index::schema;
 
     fn github(base_url: Option<&str>) -> ResolvedTracker {
         ResolvedTracker {
@@ -332,73 +408,110 @@ mod capability_tests {
         }
     }
 
-    fn reference() -> PapertrailRef {
-        PapertrailRef {
-            tracker: Tracker::Github,
-            project: "o/r".to_string(),
-            item_key: "1".to_string(),
-            item_kind: Some(ItemKind::Issue),
-            ref_kind: "explicit".to_string(),
-            source_kind: "test".to_string(),
-            source_path: None,
-            source_commit: None,
-            source_text: "o/r#1".to_string(),
-        }
+    #[test]
+    fn synchronization_reports_native_github_for_cloud_and_enterprise() {
+        assert_eq!(tracker_synchronization(&github(None)), TrackerSynchronization::Native);
+        let enterprise = PapertrailContext {
+            trackers: vec![github(Some("https://github.example.com"))],
+            ..PapertrailContext::default()
+        };
+        assert_eq!(
+            tracker_synchronization(&enterprise.trackers[0]),
+            TrackerSynchronization::Native
+        );
     }
 
     #[test]
-    fn synchronization_reports_missing_gh_and_keeps_enterprise_off_the_legacy_path() {
-        assert_eq!(
-            tracker_synchronization(&github(None), false),
-            TrackerSynchronization::LegacyGithubCliMissing
-        );
-        assert_eq!(
-            tracker_synchronization(&github(None), true),
-            TrackerSynchronization::LegacyGithubCli
-        );
-        let enterprise =
-            PapertrailContext { trackers: vec![github(Some("https://github.example.com"))] };
-        assert_eq!(
-            tracker_synchronization(&enterprise.trackers[0], true),
-            TrackerSynchronization::ProviderClientPending
-        );
-        assert!(!discovered_ref_uses_legacy_github_client(&enterprise, &reference()));
-        assert!(discovered_ref_uses_legacy_github_client(
-            &PapertrailContext::default(),
-            &reference()
-        ));
-
-        let cloud = PapertrailContext { trackers: vec![github(None)] };
-        let mut cross_repo = reference();
-        cross_repo.project = "other/repo".to_string();
-        cross_repo.item_kind = None;
-        cross_repo.source_text = "https://github.com/other/repo/issues/1".to_string();
-        assert!(
-            discovered_ref_uses_legacy_github_client(&cloud, &cross_repo),
-            "fully-qualified cloud refs can be fetched by gh regardless of the binding project"
-        );
-
-        let mixed = PapertrailContext {
-            trackers: vec![github(None), ResolvedTracker {
-                project: "enterprise/repo".to_string(),
-                ..github(Some("https://github.example.com"))
-            }],
+    fn manual_mirror_dispatches_every_resolved_github_binding() {
+        let script = |project: &str| {
+            vec![
+                StubResponse::ok(&format!(
+                    r#"{{"incomplete_results":false,"items":[{{"number":1,"html_url":"https://example.test/{project}/issues/1","state":"open","title":"{project}","body":"","updated_at":"2026-01-01T00:00:00Z","labels":[]}}]}}"#
+                )),
+                StubResponse::ok("[]"),
+                StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+                StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+                StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+                StubResponse::ok("[]"),
+                StubResponse::ok("[]"),
+            ]
         };
-        let mut enterprise = reference();
-        enterprise.project = "enterprise/other".to_string();
-        enterprise.item_kind = None;
-        enterprise.source_text = "https://github.example.com/enterprise/other/issues/1".to_string();
-        assert!(
-            !discovered_ref_uses_legacy_github_client(&mixed, &enterprise),
-            "the Enterprise binding that claimed the URL keeps it off github.com"
-        );
+        let (first_url, first_handle) = spawn_script_stub(script("a/one"));
+        let (second_url, second_handle) = spawn_script_stub(script("b/two"));
+        let binding = |project: &str, base_url: String| ResolvedTracker {
+            provider: Tracker::Github,
+            project: project.to_string(),
+            base_url: Some(base_url),
+            auth: None,
+            authentication: TrackerAuthentication::AuthMissing,
+            tags: Vec::new(),
+        };
+        let ctx = PapertrailContext {
+            trackers: vec![binding("a/one", first_url), binding("b/two", second_url)],
+            ..PapertrailContext::default()
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        let report = block_on(sync_mirror(&conn, Path::new("."), false, &ctx)).unwrap();
+        assert_eq!(report.synced_items, 2);
+        assert_eq!(report.bindings.len(), 2);
+        assert_eq!(report.bindings[0].project, "a/one");
+        assert_eq!(report.bindings[1].project, "b/two");
+        assert_eq!(report.status.issues, 2);
+        assert_eq!(first_handle.join().unwrap().len(), 7);
+        assert_eq!(second_handle.join().unwrap().len(), 7);
+    }
 
-        let mut migrated_pull = reference();
-        migrated_pull.item_kind = None;
-        migrated_pull.source_text = "https://github.com/o/r/pull/1".to_string();
+    #[test]
+    fn manual_mirror_rejects_duplicate_provider_projects_before_dispatch() {
+        let mut first = github(Some("https://github.com"));
+        first.tags = vec!["first".to_string()];
+        let mut second = github(Some("https://github.example.com"));
+        second.tags = vec!["second".to_string()];
+        let ctx =
+            PapertrailContext { trackers: vec![first, second], ..PapertrailContext::default() };
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+
+        let error = block_on(sync_mirror(&conn, Path::new("."), false, &ctx)).unwrap_err();
         assert!(
-            discovered_ref_uses_legacy_github_client(&cloud, &migrated_pull),
-            "a migrated NULL kind remains compatible with syntax that now identifies a PR"
+            error.to_string().contains("duplicate papertrail binding for github project `o/r`")
         );
+        let refs: i64 =
+            conn.query_row("SELECT COUNT(*) FROM papertrail_refs", [], |row| row.get(0)).unwrap();
+        assert_eq!(refs, 0);
+    }
+
+    #[test]
+    fn manual_mirror_reports_pending_invalid_and_failed_bindings_independently() {
+        let (failed_url, failed_handle) =
+            spawn_script_stub(vec![StubResponse::status("500 Internal Server Error", "boom")]);
+        let tracker = |provider, project: &str, base_url: Option<String>| ResolvedTracker {
+            provider,
+            project: project.to_string(),
+            base_url,
+            auth: None,
+            authentication: TrackerAuthentication::AuthMissing,
+            tags: Vec::new(),
+        };
+        let ctx = PapertrailContext {
+            trackers: vec![
+                tracker(Tracker::Gitlab, "group/repo", Some("https://gitlab.com".to_string())),
+                tracker(Tracker::Github, "bad/origin", Some("not an absolute URL".to_string())),
+                tracker(Tracker::Github, "fails/http", Some(failed_url)),
+            ],
+            ..PapertrailContext::default()
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+
+        let report = block_on(sync_mirror(&conn, Path::new("."), false, &ctx)).unwrap();
+        assert_eq!(report.bindings.len(), 0);
+        assert_eq!(report.failed_refs, 3);
+        assert_eq!(
+            report.errors.iter().map(|error| error.status.as_str()).collect::<Vec<_>>(),
+            vec!["provider_client_pending", "authentication_or_transport", "failed"]
+        );
+        assert_eq!(failed_handle.join().unwrap().len(), 1);
     }
 }

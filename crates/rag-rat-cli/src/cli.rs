@@ -608,15 +608,9 @@ pub(crate) struct PapertrailArgs {
 pub(crate) enum PapertrailCommand {
     /// Sync tracker items (issues / change requests) into the papertrail.
     Sync {
-        /// Sync only refs already mentioned in indexed source/commits.
+        /// Force a complete historical re-walk to heal cached rows.
         #[arg(long)]
-        from_refs: bool,
-        /// Sync a single item (owner/repo#number).
-        #[arg(long)]
-        issue: Option<String>,
-        /// Do not hit the network; use cached evidence only.
-        #[arg(long)]
-        offline: bool,
+        full: bool,
     },
 }
 

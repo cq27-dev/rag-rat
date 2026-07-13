@@ -2752,6 +2752,7 @@ fn a_syncing_repo_is_isolated_from_stranded_placeholder_papertrail_rows() {
             created_at: None,
             updated_at: None,
             merged_at: None,
+            tags: Vec::new(),
         },
     )
     .unwrap();

@@ -16,7 +16,7 @@ pub(crate) use client::*;
 pub(crate) use governor::*;
 
 #[cfg(test)]
-mod stub;
+pub(super) mod stub;
 
 #[cfg(test)]
 mod pagination_tests {
@@ -88,6 +88,7 @@ mod pagination_tests {
         let transport = Transport::with_clock(
             TransportParams {
                 provider: "github",
+                lane: "core",
                 host: "127.0.0.1",
                 auth: None,
                 registry: &registry,

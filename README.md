@@ -489,7 +489,7 @@ rag-rat clusters --limit 10
 rag-rat oracle run | status        # compiler-grade resolution (docs/oracle.md)
 rag-rat models list | install <model>
 rag-rat reconcile --changed-first --max-seconds 60 --batch-size 64
-rag-rat papertrail sync --from-refs
+rag-rat papertrail sync            # add --full to force a historical healing pass
 rag-rat memory list | show <id> | doctor | rebind <id>    # inspect / re-anchor repo memories
 rag-rat dream [--verify|--compact] [<id> --accept|--dismiss|--reset]   # memory-maintenance worklist
 rag-rat consolidate                # import a legacy per-repo index into the global store

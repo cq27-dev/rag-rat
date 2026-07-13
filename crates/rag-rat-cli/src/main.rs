@@ -15,7 +15,6 @@ pub(crate) use commands::*;
 pub(crate) use fs_atomic::*;
 pub(crate) use hooks_support::*;
 use rag_rat_core::index::IndexProgress;
-use rag_rat_core::index::papertrail::PapertrailSyncAction;
 use rag_rat_core::search::lexical::SearchHit;
 use rag_rat_core::{Config, IndexDatabase};
 pub(crate) use render::*;

@@ -273,6 +273,7 @@ mod fts_mirror_tests {
             created_at: None,
             updated_at: None,
             merged_at: None,
+            tags: Vec::new(),
         }
     }
 

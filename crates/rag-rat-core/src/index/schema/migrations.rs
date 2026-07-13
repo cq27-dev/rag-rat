@@ -1256,6 +1256,8 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_059_ID => Some(59),
             MIGRATION_060_ID => Some(60),
             MIGRATION_061_ID => Some(61),
+            MIGRATION_062_ID => Some(62),
+            MIGRATION_063_ID => Some(63),
             _ => None,
         })
         .max()
@@ -1326,6 +1328,8 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_059_ID
             | MIGRATION_060_ID
             | MIGRATION_061_ID
+            | MIGRATION_062_ID
+            | MIGRATION_063_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1393,6 +1397,8 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_059_ID => migration.checksum != MIGRATION_059_CHECKSUM,
         MIGRATION_060_ID => migration.checksum != MIGRATION_060_CHECKSUM,
         MIGRATION_061_ID => migration.checksum != MIGRATION_061_CHECKSUM,
+        MIGRATION_062_ID => migration.checksum != MIGRATION_062_CHECKSUM,
+        MIGRATION_063_ID => migration.checksum != MIGRATION_063_CHECKSUM,
         _ => false,
     }
 }
@@ -3257,6 +3263,56 @@ pub(crate) fn apply_papertrail_ref_item_kind(conn: &Connection) -> rusqlite::Res
                                 source_kind, COALESCE(source_path, ''),
                                 COALESCE(source_commit, ''), source_text);",
     )
+}
+
+/// V062 (#591): repo-wide comments have an independent timestamp lane and a page token that is
+/// committed only after its page is stored. Existing cursors start with no comment watermark, so
+/// the first native pass safely replays the comment streams instead of inheriting the item mark.
+pub(crate) fn apply_papertrail_comment_cursor(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "papertrail_sync_cursor", "comment_high_mark_at", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "comment_page_token", "TEXT")?;
+    Ok(())
+}
+
+/// V063 (#591): every multi-request mirror lane persists enough state to resume after a governed
+/// pause. The processed-key sets are bounded by one provider page; `full_rewalk_seen` lives on the
+/// item row so a full walk can mark/sweep across arbitrarily many invocations without a giant
+/// in-memory set.
+pub(crate) fn apply_papertrail_mirror_resume_state(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "papertrail_sync_cursor", "comment_scan_since", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "comment_stream_cursors", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "item_delta_page_token", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "item_delta_scan_since", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "item_delta_high_mark_at", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "backfill_page_cursor", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "item_thread_cursor", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "papertrail_sync_cursor",
+        "item_delta_in_progress",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "papertrail_sync_cursor",
+        "item_delta_replay_required",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "delta_processed_keys", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "backfill_processed_keys", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "papertrail_sync_cursor",
+        "full_rewalk",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "papertrail_items",
+        "full_rewalk_seen",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
 }
 
 /// The V060 base-table backfill (step 2 of [`apply_papertrail_provider_neutral_schema`]): runs

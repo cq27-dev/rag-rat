@@ -147,6 +147,9 @@ fn tracker_projects_are_validated_by_provider() {
         ("github", "org/team/repo"),
         ("bitbucket", "workspace/repo/extra"),
         ("gitlab", "repo"),
+        ("github", "org/repo?query=1"),
+        ("github", "org/%2e%2e"),
+        ("gitlab", "group/../repo"),
         ("jira", "Proj"),
         ("jira", "A"),
     ] {
@@ -184,6 +187,9 @@ fn tracker_base_url_requires_a_nonempty_authority() {
         "gitlab.example.com",
         "https://:8443",
         "https://gitlab example.com",
+        "https://gitlab.example.com/path",
+        "https://gitlab.example.com?query=1",
+        "https://gitlab.example.com#fragment",
     ] {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(

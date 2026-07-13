@@ -579,6 +579,7 @@ impl MockGitHubClient {
             created_at: Some("2026-01-01T00:00:00Z".to_string()),
             updated_at: Some("2026-01-02T00:00:00Z".to_string()),
             merged_at: None,
+            tags: Vec::new(),
         }
     }
 
@@ -638,7 +639,11 @@ impl papertrail::PapertrailClient for MockGitHubClient {
         project: &str,
         _cursor: &papertrail::PageCursor,
     ) -> anyhow::Result<papertrail::ItemsPage> {
-        Ok(papertrail::ItemsPage { items: vec![Self::mock_item(project, "42")], next: None })
+        Ok(papertrail::ItemsPage {
+            items: vec![Self::mock_item(project, "42")],
+            next: None,
+            backfill_boundary: None,
+        })
     }
 
     async fn comments_page(
@@ -652,12 +657,13 @@ impl papertrail::PapertrailClient for MockGitHubClient {
     async fn freshness_probe(
         &self,
         _project: &str,
-        cursor: &papertrail::PageCursor,
-    ) -> anyhow::Result<Option<String>> {
-        Ok(match cursor.updated_since.as_deref() {
+        probe: &papertrail::FreshnessProbe,
+    ) -> anyhow::Result<papertrail::FreshnessResult> {
+        let latest = match probe.updated_since.as_deref() {
             Some(since) if since >= "2026-01-02T00:00:00Z" => None,
             _ => Some("2026-01-02T00:00:00Z".to_string()),
-        })
+        };
+        Ok(papertrail::FreshnessResult { latest, etag: None, not_modified: false })
     }
 }
 
@@ -704,9 +710,9 @@ impl papertrail::PapertrailClient for PartiallyFailingGitHubClient {
     async fn freshness_probe(
         &self,
         project: &str,
-        cursor: &papertrail::PageCursor,
-    ) -> anyhow::Result<Option<String>> {
-        MockGitHubClient.freshness_probe(project, cursor).await
+        probe: &papertrail::FreshnessProbe,
+    ) -> anyhow::Result<papertrail::FreshnessResult> {
+        MockGitHubClient.freshness_probe(project, probe).await
     }
 }
 

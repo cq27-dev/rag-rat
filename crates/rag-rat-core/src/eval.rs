@@ -651,7 +651,7 @@ fn evaluate_query(
     if query.requires_papertrail_cache && !papertrail_cache_available(db)? {
         return Ok(skipped_report(
             query,
-            "papertrail cache is empty; run `rag-rat papertrail sync --from-refs`",
+            "papertrail cache is empty; run `rag-rat papertrail sync`",
         ));
     }
 
