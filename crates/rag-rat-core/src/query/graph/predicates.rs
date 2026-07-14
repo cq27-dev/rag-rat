@@ -9,6 +9,24 @@ use super::*;
 // name_strings WHERE value = ?3)`) are an edge-side pool lookup and are independent of these symbol
 // joins.
 
+/// The guard EVERY query that admits `uses_operator` edges must carry.
+///
+/// An UNRESOLVED `uses_operator` row is a BUILT-IN operator token — Swift emits one for every `+`,
+/// `==`, `!` in the repo — not a use of an in-repo `operator` declaration. Admitting those rows
+/// into a query that falls back to matching by NAME makes every `Int + Int` expression a "caller"
+/// of any same-named custom operator, flooding callers/impact with dependencies that do not exist.
+/// A resolved row (`to_symbol_id IS NOT NULL`) is by definition bound to a real operator symbol, so
+/// requiring resolution is what separates the two.
+///
+/// Valid wherever the edges table is named or aliased `edges`. `forward_visibility_filter` /
+/// `reverse_visibility_filter` below encode the same rule in positive form, inside their OR-chains,
+/// and `graph_meta` splices this guard directly.
+/// `search_and_read_chunk_attach_bounded_graph_evidence` poisons the index with one unresolved
+/// operator edge and asserts EVERY consumer — search graph metadata and all three `impact_surface`
+/// resolution modes — leaves it out; impact was the lane that had been missing the guard.
+pub(crate) const RESOLVED_OPERATOR_ONLY: &str =
+    "(edges.edge_kind != 'uses_operator' OR edges.to_symbol_id IS NOT NULL)";
+
 pub(crate) fn validate_edge_kinds(edge_kinds: &[String]) -> anyhow::Result<()> {
     for edge_kind in edge_kinds {
         if !OPTIONAL_EDGE_KINDS.contains(&edge_kind.as_str()) {

@@ -537,6 +537,83 @@ fn swift_qualified_edges_do_not_bind_foreign_scope_paths() {
     }
 }
 
+/// An enum case is bindable by BARE NAME only through Swift's shorthand `.idle`, the one shape that
+/// evidences a case. A value-receiver method call (`client.idle()`) and a static member read
+/// (`Config.idle`) share the same `calls_name` edge kind but carry a receiver/qualifier — binding
+/// those to an unrelated `enum Status { case idle }` would report an ordinary call or property read
+/// as a caller of that case. Poisons the index with ONLY the case symbol, so a resolution can come
+/// from nowhere else: without the bare-shape rule the receiver/qualified edges bind it and this
+/// fails.
+#[test]
+fn swift_enum_cases_bind_by_bare_name_only_for_the_shorthand_shape() {
+    let conn = seeded_conn();
+    let source = add_file(&conn, "Caller.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [source]).unwrap();
+    let definitions = add_file(&conn, "Status.swift", NEW);
+    conn.execute("UPDATE main.files SET language = 'swift' WHERE id = ?1", [definitions]).unwrap();
+    // The ONLY `idle` in the repo is an enum case.
+    let idle = add_symbol_scope_language(
+        &conn,
+        definitions,
+        "idle",
+        "Status.swift::idle",
+        "Status::idle",
+        "enum_case",
+        Language::Swift,
+    );
+
+    // `client.idle()` — a value receiver, not a case.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         receiver_hint) VALUES (?1, 'idle', 'calls_name', 'NameOnly', 'unresolved', 'client')",
+        params![source],
+    )
+    .unwrap();
+    let receiver_call: i64 =
+        conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+
+    // `Config.idle` — a static member read of a type that has no such member.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         target_qualified_name, receiver_hint) VALUES (?1, 'idle', 'calls_name', 'NameOnly', \
+         'unresolved', 'Config::idle', 'Config')",
+        params![source],
+    )
+    .unwrap();
+    let static_read: i64 =
+        conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+
+    // `.idle` — the shorthand: no qualifier, no receiver. This one IS the case.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution) VALUES \
+         (?1, 'idle', 'calls_name', 'NameOnly', 'unresolved')",
+        params![source],
+    )
+    .unwrap();
+    let shorthand: i64 =
+        conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (receiver_target, ..) = edge_state(&conn, receiver_call);
+    assert_eq!(
+        receiver_target, None,
+        "a value-receiver call must not bind an enum case by bare name"
+    );
+    let (static_target, ..) = edge_state(&conn, static_read);
+    assert_eq!(
+        static_target, None,
+        "a static member read must not bind an unrelated enum case by bare name"
+    );
+    let (shorthand_target, ..) = edge_state(&conn, shorthand);
+    assert_eq!(
+        shorthand_target,
+        Some(idle),
+        "the shorthand `.idle` shape still resolves to the case"
+    );
+}
+
 #[test]
 fn swift_value_receiver_calls_resolve_by_bare_name() {
     let conn = seeded_conn();

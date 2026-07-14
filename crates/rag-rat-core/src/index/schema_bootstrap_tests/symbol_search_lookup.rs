@@ -94,6 +94,31 @@ fn search_and_read_chunk_attach_bounded_graph_evidence() {
     );
     assert!(helper_graph.callers.is_empty(), "search keeps graph compact");
 
+    // The SAME poisoned edge must be invisible to `impact_surface`, whose Fuzzy mode matches by
+    // NAME — the last consumer still admitting it. An unresolved `uses_operator` row is a BUILT-IN
+    // operator token (Swift emits one per `+` / `==`), so letting it through reports every
+    // arithmetic expression as a direct caller of any same-named symbol. `operator_noise` only ever
+    // "calls" `helper` through that poisoned edge, so its presence here is exactly the bug.
+    for resolution_mode in [
+        crate::query::graph::GraphResolutionMode::Exact,
+        crate::query::graph::GraphResolutionMode::Syntactic,
+        crate::query::graph::GraphResolutionMode::Fuzzy,
+    ] {
+        let items = db.impact_surface_with_options("helper", 20, resolution_mode).unwrap();
+        // The graph lane records the edge kind in its evidence ("<kind> edge to <symbol>"), so an
+        // admitted operator edge is visible there. `operator_noise` still legitimately appears via
+        // OTHER lanes (it is a same-file sibling of `helper`), which is why this asserts on the
+        // evidence rather than on the symbol's mere presence.
+        assert!(
+            items
+                .iter()
+                .flat_map(|item| &item.evidence)
+                .all(|evidence| !evidence.contains("uses_operator")),
+            "an unresolved operator use must not surface as an impact neighbor \
+             ({resolution_mode:?}): {items:#?}"
+        );
+    }
+
     let caller_hit = hits
         .iter()
         .find(|hit| hit.symbol_path.as_deref().is_some_and(|path| path.ends_with("caller")))

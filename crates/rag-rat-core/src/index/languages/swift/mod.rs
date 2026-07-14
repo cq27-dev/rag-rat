@@ -119,7 +119,7 @@ impl ParserBackend for Swift {
     /// already overrides this; Swift declared none.
     fn is_test_symbol(&self, text: &str, node: Node<'_>, scope_path: &str, name: &str) -> bool {
         has_test_attribute(node, text)
-            || inherits_xctest_case(node, text)
+            || enclosed_by_xctest_case(node, text)
             || (name.starts_with("test") && scope_path_has_test_type(scope_path))
     }
 
@@ -149,9 +149,22 @@ fn has_test_attribute(node: Node<'_>, text: &str) -> bool {
         })
 }
 
-/// An XCTest base class in this type's inheritance clause (`class FooTests: XCTestCase`). The
+/// This declaration IS an XCTest class (`class FooTests: XCTestCase`) or lives INSIDE one. The
 /// conformance list is where XCTest declares itself; there is no attribute to key on.
-fn inherits_xctest_case(node: Node<'_>, text: &str) -> bool {
+///
+/// Walking ancestors (not just the node) is what keeps a test class's MEMBERS out of production
+/// symbols. The class-name suffix check below can't do it: `class LoginFlow: XCTestCase` gives its
+/// methods the scope path `LoginFlow::testLogin`, whose root ends in neither `Tests` nor
+/// `TestCase`, so a sidecar XCTest living outside a `Tests/` directory would have had its methods —
+/// and its helpers — indexed as production code and fed to embeddings and clone analysis.
+/// Everything inside an XCTestCase is test scaffolding, `test`-prefixed or not.
+fn enclosed_by_xctest_case(node: Node<'_>, text: &str) -> bool {
+    std::iter::successors(Some(node), |current| current.parent())
+        .any(|ancestor| declares_xctest_case(ancestor, text))
+}
+
+/// One declaration node whose own inheritance clause names an XCTest base class.
+fn declares_xctest_case(node: Node<'_>, text: &str) -> bool {
     if node.kind() != "class_declaration" {
         return false;
     }
@@ -292,6 +305,21 @@ impl ResolverPolicy for Swift {
 
     fn reference_is_unresolvable(&self, edge_kind: &str, name: &str) -> bool {
         edge_kind == "imports" || (edge_kind == "calls_name" && operator_has_builtin_meaning(name))
+    }
+
+    /// An enum case is reachable by BARE NAME only through Swift's shorthand `.idle` — the one
+    /// shape that is evidence of a case (the enum is inferred, so no qualifier exists to match
+    /// on).
+    ///
+    /// Everything else that lands on `calls_name` shares that AST shape without being a case: a
+    /// value-receiver method call (`client.idle()`) and a static member read (`Config.idle`) both
+    /// carry a receiver/qualifier. Those resolve through the qualified path when the member really
+    /// exists; when it does NOT, the bare-name fallback would otherwise bind them to an unrelated
+    /// `enum Status { case idle }` and report an ordinary property read or method call as a caller
+    /// of that case. Enum cases cannot be invoked through an arbitrary value receiver, so the bind
+    /// is never right — require the bare shape.
+    fn kind_requires_unqualified_reference(&self, edge_kind: &str, target_kind: &str) -> bool {
+        edge_kind == "calls_name" && target_kind == "enum_case"
     }
 
     fn suppress_unresolved_reference(&self, edge_kind: &str, evidence: Option<&str>) -> bool {

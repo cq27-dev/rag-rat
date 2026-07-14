@@ -121,6 +121,17 @@ pub(super) trait ResolverPolicy: Sync {
         false
     }
 
+    /// A target kind the BARE-NAME fallback may bind only when the reference itself carried no
+    /// qualifier and no receiver — i.e. only for the syntactic shape that is actual evidence for
+    /// that kind.
+    ///
+    /// The qualified/receiver-bearing shapes are unaffected: they resolve through the qualified
+    /// path (`Status.idle` → the `Status::idle` case) and only fall back to the bare name when
+    /// that path finds nothing — which is exactly where a wrong bind would be manufactured.
+    fn kind_requires_unqualified_reference(&self, _edge_kind: &str, _target_kind: &str) -> bool {
+        false
+    }
+
     fn suppress_unresolved_reference(&self, _edge_kind: &str, _evidence: Option<&str>) -> bool {
         false
     }

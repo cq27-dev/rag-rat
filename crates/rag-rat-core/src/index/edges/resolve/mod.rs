@@ -810,13 +810,27 @@ pub(crate) fn resolve_symbol<'a>(
         }
     }
     let short = short_name(request.name);
+    // A reference that carried a qualifier or a receiver has already had its qualified shape tried
+    // above; reaching the bare-name fallback means that shape found nothing. Some target kinds are
+    // only ever evidenced by the BARE shape (a Swift enum case, reachable by bare name only through
+    // shorthand `.idle`), so binding one to a qualified/receiver-bearing reference here would
+    // manufacture a dependency the source never expressed — `client.idle()` becoming a "caller" of
+    // `enum Status { case idle }`. Let the language policy exclude those kinds from this fallback.
+    let reference_is_bare = request.target_qualified_name.is_none_or(str::is_empty)
+        && request.receiver_hint.is_none_or(str::is_empty);
+    let bare_shape_ok = |symbol: &IndexedSymbol| {
+        reference_is_bare
+            || !policy.is_some_and(|policy| {
+                policy.kind_requires_unqualified_reference(request.edge_kind, &symbol.kind)
+            })
+    };
     let matches = index
         .by_name
         .get(short)
         .into_iter()
         .flatten()
         .copied()
-        .filter(|symbol| kind_matches(symbol))
+        .filter(|symbol| kind_matches(symbol) && bare_shape_ok(symbol))
         .collect::<Vec<_>>();
     let preferred = preferred_matches(request.edge_kind, request.source_language, &matches);
     // Language policy decides whether a type-position reference may bind a value declaration.

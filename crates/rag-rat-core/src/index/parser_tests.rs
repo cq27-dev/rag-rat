@@ -364,6 +364,13 @@ class ClientTests: XCTestCase {
     func testFetchSucceeds() {}
 }
 
+// An XCTestCase whose name carries NO `Tests`/`TestCase` suffix: its members are still test code,
+// and only an ancestor walk can see that (their scope path root is just `LoginFlow`).
+class LoginFlow: XCTestCase {
+    func testLogin() {}
+    func makeFixture() -> Int { 1 }
+}
+
 @TestHarness struct NotATest {}
 
 func realWork() -> Int { 1 }
@@ -385,6 +392,11 @@ func realWork() -> Int { 1 }
     assert!(is_test("checksAnother"), "@Test method inside a suite is a test symbol");
     assert!(is_test("ClientTests"), "an XCTestCase subclass is a test symbol");
     assert!(is_test("testFetchSucceeds"), "a test* method of an XCTestCase is a test symbol");
+    // Members of an XCTestCase are test code even when the class name carries no `Tests` suffix —
+    // the scope path alone cannot tell (`LoginFlow::testLogin`), so this needs the ancestor walk.
+    assert!(is_test("LoginFlow"), "an XCTestCase named without a Tests suffix is still a test");
+    assert!(is_test("testLogin"), "a test method of a suffix-less XCTestCase is a test symbol");
+    assert!(is_test("makeFixture"), "a HELPER inside an XCTestCase is test scaffolding too");
     // Neither a lookalike attribute nor ordinary code is a test.
     assert!(!is_test("NotATest"), "@TestHarness is not @Test");
     assert!(!is_test("realWork"), "production code in a non-test path stays production code");

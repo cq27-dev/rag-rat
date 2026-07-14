@@ -70,6 +70,12 @@ const FLOOR_DIRS: &[&str] = &[
     // SwiftPM's build tree contains generated output and dependency checkouts whose nested
     // `Sources/` directories otherwise look indistinguishable from first-party Swift packages.
     ".build",
+    // CocoaPods' vendored dependency tree — the same hazard as `.build/checkouts`, and worse for
+    // an app with no `Sources/`-style layout (root `AppDelegate.swift`), where the Swift
+    // target can fall back to `.` and swallow every pod's source as first-party. Flooring it
+    // here covers BOTH the `init` scan and the indexer, which is why the floor is the right
+    // seam: excluding it in only one of them leaves the other ingesting vendored code.
+    "Pods",
     "coverage",
     // Python virtualenv / dependency / cache trees: never project source. `site-packages` is the
     // load-bearing one — installed deps live there regardless of the venv dir's name (`.venv`,

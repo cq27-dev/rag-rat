@@ -1,3 +1,6 @@
+use rusqlite::params_from_iter;
+use rusqlite::types::Value;
+
 use super::*;
 
 pub(crate) fn graph_neighbors(
@@ -30,6 +33,12 @@ pub(crate) fn graph_neighbors(
         "COALESCE(to_qn.value, edges.to_name)"
     };
     let predicate = impact_graph_predicate(reverse, resolution_mode);
+    // Impact's Fuzzy predicate falls back to matching by NAME (`edges.to_name_id = …`), so without
+    // this guard every built-in `+` / `==` token — which Swift emits as an unresolved
+    // `uses_operator` edge — would surface as a direct caller of any same-named custom
+    // operator. Graph traversal and graph metadata already require a resolved operator target;
+    // impact must too.
+    let resolved_operator_only = crate::query::graph::RESOLVED_OPERATOR_ONLY;
     let sql = format!(
         "
         SELECT {source_path_col}, {source_language_col}, {source_kind_col},
@@ -45,6 +54,7 @@ pub(crate) fn graph_neighbors(
         WHERE edges.edge_kind IN (
             'calls_name', 'constructs', 'uses_operator', 'uses_precedence_group', 'implements'
         )
+          AND {resolved_operator_only}
           AND ({predicate})
           AND {source_path_col} IS NOT NULL
         ORDER BY
@@ -60,8 +70,18 @@ pub(crate) fn graph_neighbors(
         ",
     );
     let mut stmt = conn.prepare(&sql)?;
+    // Bind exactly the placeholders the CHOSEN predicate references. Every arm uses `?1` (the
+    // symbol id), but only the name-matching arms use `?2` — the two `Exact` arms match on the id
+    // alone. Binding an unreferenced `?2` makes rusqlite reject the statement outright ("Wrong
+    // number of parameters passed to query. Got 2, needed 1"), which is why `impact_surface` with
+    // `resolution = exact` returned an error instead of a surface.
+    let binds_name = predicate.contains("?2");
     for target in targets {
-        let rows = stmt.query_map(params![target.id, target.qualified_name], |row| {
+        let mut args = vec![Value::Integer(target.id)];
+        if binds_name {
+            args.push(Value::Text(target.qualified_name.clone()));
+        }
+        let rows = stmt.query_map(params_from_iter(args), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -82,7 +102,11 @@ pub(crate) fn graph_neighbors(
         }
     }
     for name in target_names {
-        if resolution_mode != GraphResolutionMode::Fuzzy && !is_qualified_symbol(name) {
+        // Without a `?2` the predicate cannot match on a name at all, so the name pass has nothing
+        // to contribute (an id-only `Exact` predicate against a NULL id matches nothing).
+        if !binds_name
+            || (resolution_mode != GraphResolutionMode::Fuzzy && !is_qualified_symbol(name))
+        {
             continue;
         }
         let rows = stmt.query_map(params![Option::<i64>::None, name], |row| {
