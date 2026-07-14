@@ -254,6 +254,11 @@ async fn mirror_binding_inner<C: PapertrailClient>(
             cursor.backfill_done = true;
             cursor.high_mark_at.get_or_insert_with(|| EMPTY_PROJECT_HIGH_MARK.to_string());
             cursor.backfill_processed_keys.clear();
+            // The consumed continuation must not outlive the walk: a chained provider leg (the
+            // request that produced THIS empty page) was persisted as `backfill_page_cursor` on
+            // the previous iteration, and leaving it behind makes `continuation()` misread the
+            // COMPLETED walk as interrupted work forever.
+            cursor.backfill_page_cursor = None;
             save_cursor(conn, binding, cursor, false)?;
             break;
         }

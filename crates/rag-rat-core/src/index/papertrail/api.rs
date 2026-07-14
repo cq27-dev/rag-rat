@@ -1210,4 +1210,187 @@ mod scheduled_tests {
         assert_eq!(first_handle.join().unwrap().len(), 3);
         assert_eq!(second_handle.join().unwrap().len(), 3);
     }
+
+    /// A walk interrupted by a provider failure persists its cursor and failure class; the next
+    /// due dispatch resumes from that cursor and completes the walk, clearing the failure.
+    #[test]
+    fn interrupted_walk_resumes_from_the_persisted_cursor_on_the_next_dispatch() {
+        let conn = open_schema();
+        // First dispatch: the first logical backfill page lands completely (issue leg with one
+        // item, its comment thread, then the empty pull leg), and the SECOND page's first
+        // request explodes — the walk is interrupted at a clean page boundary with its low mark
+        // persisted.
+        let (first_url, first_handle) = spawn_script_stub(vec![
+            StubResponse::ok(
+                r#"{"incomplete_results":false,"items":[{"number":1,"html_url":"https://example.test/o/r/issues/1","state":"open","title":"one","body":"","updated_at":"2026-01-01T00:00:00Z","labels":[]}]}"#,
+            ),
+            StubResponse::ok("[]"),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::status("500 Internal Server Error", "boom"),
+        ]);
+        let binding = github_binding("o/r", &first_url);
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+        let report =
+            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Incremental)).unwrap();
+        assert_eq!(report.errors.len(), 1, "the interruption surfaces as a binding error");
+        let interrupted = persisted(&conn, &binding);
+        // The first walk of a fresh binding is a FULL walk; its interruption must stay a Full
+        // decision (never degrade to incremental) so the healing walk actually completes.
+        assert_eq!(interrupted.continuation, MirrorContinuation::Full);
+        assert_eq!(first_handle.join().unwrap().len(), 4);
+
+        // The minimum attempt interval gates the immediate retry...
+        let gated =
+            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Incremental)).unwrap();
+        assert!(gated.bindings.is_empty() && gated.errors.is_empty());
+
+        // ...and once it elapses, the next dispatch resumes the descent from the persisted
+        // low mark and completes the full walk, clearing the failure.
+        conn.execute(
+            "UPDATE papertrail_sync_cursor SET last_attempt_ms = last_attempt_ms - 1200000",
+            [],
+        )
+        .unwrap();
+        // A full-rewalk continuation skips the probe entirely: the resumed descent continues
+        // below the persisted low mark (empty issue + pull legs), then the repo-comment streams
+        // close the walk out.
+        let (resume_url, resume_handle) = spawn_script_stub(vec![
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok("[]"),
+            StubResponse::ok("[]"),
+        ]);
+        let resumed_binding = github_binding("o/r", &resume_url);
+        let ctx = PapertrailContext {
+            trackers: vec![resumed_binding.clone()],
+            ..PapertrailContext::default()
+        };
+        let report =
+            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Evaluate)).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.bindings.len(), 1);
+        assert!(report.bindings[0].completed_full_walk, "the resumed descent completes the walk");
+        let healed = persisted(&conn, &resumed_binding);
+        // Regression guard: a walk completing on a CHAINED empty provider leg must clear the
+        // consumed page cursor, or the policy misreads the completed walk as interrupted work
+        // forever (perpetual incremental dispatches instead of probes).
+        assert_eq!(healed.continuation, MirrorContinuation::None);
+        assert!(healed.last_full_walk_ms.is_some());
+        assert_eq!(resume_handle.join().unwrap().len(), 4);
+        // The item stored before the interruption was marked seen by the SAME walk, so the
+        // completing rewalk's prune keeps it.
+        let repo_id = schema::active_repo_id(&conn).unwrap();
+        let items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM papertrail_items WHERE repo_id = ?1",
+                params![repo_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(items, 1);
+        let (_, error, _, _) = load_persisted_health(&conn, &repo_id, &resumed_binding).unwrap();
+        assert_eq!(error, None, "a completed walk clears the persisted failure");
+    }
+
+    /// A quota-reserve pause persists a retry horizon; later evaluations skip the binding until
+    /// the horizon passes — even under an explicit Full request — and the pause is reported as a
+    /// paused binding, never as a failure.
+    #[test]
+    fn rate_paused_binding_persists_a_retry_horizon_that_gates_later_dispatches() {
+        let conn = open_schema();
+        let reset_epoch_s = now_ms() / 1000 + 3600;
+        // Quota is governed per LANE: the search-lane backfill pages are unaffected, but the
+        // item's comment-thread response (core lane) reports the user reserve reached
+        // (30 <= 35% of 100), so the next CORE request — the repo-comment stream — pauses
+        // until the provider reset.
+        let (url, handle) = spawn_script_stub(vec![
+            StubResponse::ok(
+                r#"{"incomplete_results":false,"items":[{"number":1,"html_url":"https://example.test/o/r/issues/1","state":"open","title":"one","body":"","updated_at":"2026-01-01T00:00:00Z","labels":[]}]}"#,
+            ),
+            StubResponse::ok_with_quota("[]", 100, 30, reset_epoch_s),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+        ]);
+        let binding = github_binding("o/r", &url);
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+
+        let report =
+            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Incremental)).unwrap();
+        assert!(report.errors.is_empty(), "a pause is not a failure: {:?}", report.errors);
+        assert_eq!(report.bindings.len(), 1);
+        assert_eq!(report.bindings[0].paused_until_ms, Some(reset_epoch_s * 1000));
+        assert_eq!(report.bindings[0].stored_items, 1, "work before the pause is kept");
+        assert_eq!(handle.join().unwrap().len(), 5, "the pause lands before the next CORE request");
+        let paused = persisted(&conn, &binding);
+        assert_eq!(paused.retry_not_before_ms, Some(reset_epoch_s * 1000));
+
+        // Past the attempt interval but inside the retry horizon: nothing dispatches, for any
+        // request strength. The stub is gone, so an escaped dispatch would surface as an error.
+        conn.execute(
+            "UPDATE papertrail_sync_cursor SET last_attempt_ms = last_attempt_ms - 1200000",
+            [],
+        )
+        .unwrap();
+        for request in [AutosyncRequest::Evaluate, AutosyncRequest::Full] {
+            let gated = block_on(sync_mirror_scheduled(&conn, &ctx, request)).unwrap();
+            assert!(
+                gated.bindings.is_empty() && gated.errors.is_empty(),
+                "{request:?} must stay gated by the retry horizon"
+            );
+        }
+    }
+
+    /// A changed tag filter is a change signal in its own right: even with fresh probe and
+    /// mirror freshness, the next evaluation dispatches and the mirror restarts its walk under
+    /// the new filter (the fingerprint reset is what re-scopes the cache).
+    #[test]
+    fn filter_fingerprint_change_dispatches_despite_fresh_probe_and_mirror_timestamps() {
+        let conn = open_schema();
+        // The filter change dispatches an ordinary incremental run; inside it the mirror resets
+        // the backfill under the new fingerprint: probe (not modified) -> repo-comment streams
+        // -> re-descent from scratch (one page + its thread) -> done.
+        let (url, _handle) = spawn_script_stub(vec![
+            StubResponse::status("304 Not Modified", ""),
+            StubResponse::ok("[]"),
+            StubResponse::ok("[]"),
+            StubResponse::ok(
+                r#"{"incomplete_results":false,"items":[{"number":1,"html_url":"https://example.test/o/r/issues/1","state":"open","title":"bugged","body":"","updated_at":"2026-01-01T00:00:00Z","labels":[{"name":"bug"}]}]}"#,
+            ),
+            StubResponse::ok("[]"),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+        ]);
+        let mut binding = github_binding("o/r", &url);
+        binding.tags = vec!["bug".to_string()];
+        let now = now_ms();
+        // The stored cursor was fingerprinted under a DIFFERENT (empty) tag filter.
+        record_attempt(&conn, &binding, 0).unwrap();
+        conn.execute(
+            "UPDATE papertrail_sync_cursor
+             SET backfill_done=1, high_mark_at=?1, filter_fingerprint=''",
+            params![HIGH_MARK],
+        )
+        .unwrap();
+        seed_health(&conn, &binding, &SeededHealth {
+            attempt: now - HOUR_MS,
+            probe: now - 60_000,
+            mirror: now - 60_000,
+            full: now - HOUR_MS,
+        });
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+
+        let report =
+            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Evaluate)).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.bindings.len(), 1, "the filter change alone must dispatch");
+        assert!(
+            report.bindings[0].completed_full_walk,
+            "a re-scoped filter restarts and completes the walk"
+        );
+    }
 }
