@@ -16,7 +16,7 @@ pub(crate) use api::*;
 pub(crate) use evidence::*;
 pub(crate) use github::*;
 pub use mirror::MirrorBindingReport;
-pub(crate) use mirror::mirror_binding;
+pub(crate) use mirror::{MirrorContinuation, load_mirror_continuation, mirror_binding};
 pub(crate) use parse::*;
 pub use parse::{TrackerParsedRef, parse_tracker_refs};
 use rusqlite::{Connection, OptionalExtension, params};

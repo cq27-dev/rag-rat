@@ -69,6 +69,41 @@ struct MirrorCursor {
     full_rewalk: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MirrorContinuation {
+    #[default]
+    None,
+    Incremental,
+    Full,
+}
+
+impl MirrorCursor {
+    fn continuation(&self) -> MirrorContinuation {
+        if self.full_rewalk {
+            return MirrorContinuation::Full;
+        }
+        if !self.backfill_done
+            || self.item_delta_in_progress
+            || self.item_delta_replay_required
+            || self.item_delta_page_token.is_some()
+            || self.backfill_page_cursor.is_some()
+            || self.item_thread_cursor.is_some()
+            || self.comment_page_token.is_some()
+            || self.comment_stream_cursors.values().any(|stream| stream.page_token.is_some())
+        {
+            return MirrorContinuation::Incremental;
+        }
+        MirrorContinuation::None
+    }
+}
+
+pub(crate) fn load_mirror_continuation(
+    conn: &Connection,
+    binding: &ResolvedTracker,
+) -> anyhow::Result<MirrorContinuation> {
+    Ok(load_cursor(conn, binding)?.continuation())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MirrorBindingReport {
     pub tracker: Tracker,
@@ -88,6 +123,7 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
     full: bool,
 ) -> anyhow::Result<MirrorBindingReport> {
     let mut cursor = load_cursor(conn, binding)?;
+    let resumed_continuation = cursor.continuation();
     let had_completed_backfill = cursor.backfill_done;
     let fingerprint = binding.filter_fingerprint();
     let filter_changed = cursor.filter_fingerprint != fingerprint;
@@ -145,7 +181,10 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
     match result {
         Ok(()) => {
             report.completed_full_walk = cursor.backfill_done
-                && (!had_completed_backfill || starting_full_rewalk || filter_changed);
+                && (!had_completed_backfill
+                    || starting_full_rewalk
+                    || resumed_continuation == MirrorContinuation::Full
+                    || filter_changed);
             Ok(report)
         },
         Err(error) if pause(&error).is_some() => {
@@ -1935,9 +1974,28 @@ mod tests {
 
         let resumed = ScriptClient::new(vec![page(Vec::new())]);
         let report = block_on(mirror_binding(&conn, &binding, &resumed, false)).unwrap();
+        assert!(report.completed_full_walk);
         assert_eq!(report.pruned_items, 1);
         assert!(!load_cursor(&conn, &binding).unwrap().full_rewalk);
         assert_eq!(keys(&conn), vec!["1"]);
+    }
+
+    #[test]
+    fn continuation_classification_covers_every_persisted_resume_lane() {
+        let mut cursor = MirrorCursor { backfill_done: true, ..Default::default() };
+        assert_eq!(cursor.continuation(), MirrorContinuation::None);
+
+        cursor.item_delta_replay_required = true;
+        assert_eq!(cursor.continuation(), MirrorContinuation::Incremental);
+        cursor.item_delta_replay_required = false;
+        cursor.comment_stream_cursors.insert("default".to_string(), CommentStreamCursor {
+            page_token: Some("next".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(cursor.continuation(), MirrorContinuation::Incremental);
+
+        cursor.full_rewalk = true;
+        assert_eq!(cursor.continuation(), MirrorContinuation::Full);
     }
 
     #[test]

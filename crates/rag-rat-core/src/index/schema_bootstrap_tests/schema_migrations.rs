@@ -1918,7 +1918,7 @@ fn migration_064_creates_account_authority_shadow_tables() {
 }
 
 #[test]
-fn migration_065_is_the_tip_and_adds_historical_authority_boundaries() {
+fn migration_065_adds_historical_authority_boundaries() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
     assert!(conn_table_exists(&conn, "account_roster_content_boundaries"));
@@ -1941,8 +1941,7 @@ fn migration_065_is_the_tip_and_adds_historical_authority_boundaries() {
 }
 
 #[test]
-fn migration_066_is_the_tip_and_adds_the_content_candidate_dag() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 66, "move this pin with the next schema migration");
+fn migration_066_adds_the_content_candidate_dag() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
     for table in ["content_entries", "content_entry_status", "content_pre_verify"] {

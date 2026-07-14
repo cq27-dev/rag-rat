@@ -18,12 +18,6 @@ pub(crate) async fn sync_mirror(
         let attempted_at = now_ms();
         record_attempt(conn, binding, attempted_at)?;
         if binding.provider != Tracker::Github {
-            record_failure(
-                conn,
-                binding,
-                PapertrailErrorClass::Provider,
-                Some("provider mirror client is not implemented"),
-            )?;
             errors.push(PapertrailSyncError {
                 tracker: binding.provider,
                 project: binding.project.clone(),
@@ -249,7 +243,7 @@ pub(crate) fn status(
         .iter()
         .map(|binding| {
             let (health, error_class, error_detail, stored_filter_fingerprint) =
-                load_persisted_health(conn, &repo_id, binding.provider, &binding.project)?;
+                load_persisted_health(conn, &repo_id, binding)?;
             let filter_changed = stored_filter_fingerprint != binding.filter_fingerprint();
             let overdue = decide_schedule(now, &ctx.schedule, health, filter_changed)
                 != ScheduleDecision::Skip;
@@ -261,7 +255,7 @@ pub(crate) fn status(
                 last_successful_mirror_ms: health.last_successful_mirror_ms,
                 last_full_walk_ms: health.last_full_walk_ms,
                 retry_not_before_ms: health.retry_not_before_ms,
-                full_walk_in_progress: health.full_walk_in_progress,
+                full_walk_in_progress: health.continuation == MirrorContinuation::Full,
                 error_class,
                 error_detail,
                 overdue,
@@ -653,5 +647,9 @@ mod capability_tests {
             vec!["provider_client_pending", "authentication_or_transport", "failed"]
         );
         assert_eq!(failed_handle.join().unwrap().len(), 1);
+        let pending =
+            report.status.bindings.iter().find(|binding| binding.project == "group/repo").unwrap();
+        assert!(!pending.failed);
+        assert_eq!(pending.error_class, None);
     }
 }
