@@ -18,6 +18,7 @@ pub(crate) struct BindingScheduleState {
     pub last_successful_probe_ms: Option<i64>,
     pub last_successful_mirror_ms: Option<i64>,
     pub last_full_walk_ms: Option<i64>,
+    pub retry_not_before_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -65,6 +66,9 @@ pub(crate) fn decide_schedule(
     let elapsed = |then: Option<i64>, interval_secs: u64| {
         then.is_none_or(|then| now_ms.saturating_sub(then) >= millis(interval_secs))
     };
+    if state.retry_not_before_ms.is_some_and(|resume_at_ms| now_ms < resume_at_ms) {
+        return ScheduleDecision::Skip;
+    }
     if !elapsed(state.last_attempt_ms, config.sync_min_interval_secs) {
         return ScheduleDecision::Skip;
     }
@@ -110,15 +114,26 @@ pub(crate) fn record_success(
     ensure_health_row(conn, binding)?;
     let assignment = match operation {
         SuccessfulOperation::Probe => "last_successful_probe_ms=?4",
-        SuccessfulOperation::IncrementalMirror => "last_successful_mirror_ms=?4",
-        SuccessfulOperation::FullMirror => "last_successful_mirror_ms=?4, last_full_sync_ms=?4",
+        SuccessfulOperation::IncrementalMirror =>
+            "last_successful_probe_ms=?4, last_successful_mirror_ms=?4",
+        SuccessfulOperation::FullMirror =>
+            "last_successful_probe_ms=?4, last_successful_mirror_ms=?4, last_full_sync_ms=?4",
     };
     update_health(
         conn,
         binding,
-        &format!("{assignment}, error_class=NULL, error_detail=NULL"),
+        &format!("{assignment}, retry_not_before_ms=NULL, error_class=NULL, error_detail=NULL"),
         at_ms,
     )
+}
+
+pub(crate) fn record_pause(
+    conn: &Connection,
+    binding: &ResolvedTracker,
+    resume_at_ms: i64,
+) -> anyhow::Result<()> {
+    ensure_health_row(conn, binding)?;
+    update_health(conn, binding, "retry_not_before_ms=?4", resume_at_ms)
 }
 
 pub(crate) fn record_failure(
@@ -186,21 +201,22 @@ pub(crate) fn load_persisted_health(
     Ok(conn
         .query_row(
             "SELECT last_attempt_ms, last_successful_probe_ms, last_successful_mirror_ms,
-                    last_full_sync_ms, error_class, error_detail
+                    last_full_sync_ms, retry_not_before_ms, error_class, error_detail
              FROM papertrail_sync_cursor
              WHERE repo_id=?1 AND tracker=?2 AND project=?3",
             params![repo_id, tracker.as_db_str(), project],
             |row| {
-                let error: Option<String> = row.get(4)?;
+                let error: Option<String> = row.get(5)?;
                 Ok((
                     BindingScheduleState {
                         last_attempt_ms: row.get(0)?,
                         last_successful_probe_ms: row.get(1)?,
                         last_successful_mirror_ms: row.get(2)?,
                         last_full_walk_ms: row.get(3)?,
+                        retry_not_before_ms: row.get(4)?,
                     },
                     error.as_deref().and_then(PapertrailErrorClass::from_db_str),
-                    row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
@@ -211,9 +227,22 @@ pub(crate) fn load_persisted_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::papertrail::TrackerAuthentication;
+    use crate::index::schema;
 
     fn config() -> PapertrailConfig {
         PapertrailConfig::default()
+    }
+
+    fn binding() -> ResolvedTracker {
+        ResolvedTracker {
+            provider: Tracker::Github,
+            project: "o/r".to_string(),
+            base_url: None,
+            auth: None,
+            authentication: TrackerAuthentication::AuthMissing,
+            tags: Vec::new(),
+        }
     }
 
     #[test]
@@ -249,6 +278,44 @@ mod tests {
         };
         assert_eq!(decide_schedule(900_000, &config(), state, false), ScheduleDecision::Probe);
         assert_eq!(decide_schedule(900_000, &config(), state, true), ScheduleDecision::Incremental);
+    }
+
+    #[test]
+    fn persisted_provider_pause_gates_all_work_until_resume_time() {
+        let state = BindingScheduleState {
+            last_attempt_ms: Some(0),
+            retry_not_before_ms: Some(10_000),
+            ..Default::default()
+        };
+        assert_eq!(decide_schedule(9_999, &config(), state, true), ScheduleDecision::Skip);
+        assert_eq!(decide_schedule(900_000, &config(), state, true), ScheduleDecision::Full);
+    }
+
+    #[test]
+    fn mirror_success_advances_probe_freshness_and_clears_pause() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        let binding = binding();
+        record_pause(&conn, &binding, 20_000).unwrap();
+        record_success(&conn, &binding, SuccessfulOperation::IncrementalMirror, 10_000).unwrap();
+        let repo_id = schema::active_repo_id(&conn).unwrap();
+        let (state, error, _) =
+            load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
+        assert_eq!(state.last_successful_probe_ms, Some(10_000));
+        assert_eq!(state.last_successful_mirror_ms, Some(10_000));
+        assert_eq!(state.retry_not_before_ms, None);
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn provider_pause_round_trips_through_binding_health() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        let binding = binding();
+        record_pause(&conn, &binding, 20_000).unwrap();
+        let repo_id = schema::active_repo_id(&conn).unwrap();
+        let (state, _, _) = load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
+        assert_eq!(state.retry_not_before_ms, Some(20_000));
     }
 
     #[test]

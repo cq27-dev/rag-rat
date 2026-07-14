@@ -666,6 +666,7 @@ fn migration_064_is_the_tip_and_persists_binding_health() {
         "last_attempt_ms",
         "last_successful_probe_ms",
         "last_successful_mirror_ms",
+        "retry_not_before_ms",
         "error_class",
         "error_detail",
     ] {

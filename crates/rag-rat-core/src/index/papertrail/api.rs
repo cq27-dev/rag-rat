@@ -42,6 +42,8 @@ pub(crate) async fn sync_mirror(
                     synced_items += report.stored_items;
                     if let Some(operation) = completed_mirror_operation(&report, full) {
                         record_success(conn, binding, operation, now_ms())?;
+                    } else if let Some(resume_at_ms) = report.paused_until_ms {
+                        record_pause(conn, binding, resume_at_ms)?;
                     }
                     bindings.push(report);
                 },
@@ -245,6 +247,7 @@ pub(crate) fn status(
                 last_successful_probe_ms: health.last_successful_probe_ms,
                 last_successful_mirror_ms: health.last_successful_mirror_ms,
                 last_full_walk_ms: health.last_full_walk_ms,
+                retry_not_before_ms: health.retry_not_before_ms,
                 error_class,
                 error_detail,
                 overdue,

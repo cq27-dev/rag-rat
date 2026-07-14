@@ -3333,6 +3333,7 @@ pub(crate) fn apply_papertrail_binding_health(conn: &Connection) -> rusqlite::Re
     add_column_if_missing(conn, "papertrail_sync_cursor", "last_attempt_ms", "INTEGER")?;
     add_column_if_missing(conn, "papertrail_sync_cursor", "last_successful_probe_ms", "INTEGER")?;
     add_column_if_missing(conn, "papertrail_sync_cursor", "last_successful_mirror_ms", "INTEGER")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "retry_not_before_ms", "INTEGER")?;
     add_column_if_missing(conn, "papertrail_sync_cursor", "error_class", "TEXT")?;
     add_column_if_missing(conn, "papertrail_sync_cursor", "error_detail", "TEXT")?;
     Ok(())
