@@ -136,8 +136,14 @@ pub(super) struct BranchPin {
 /// on `None`. Several entries under one key are an equivocation — the slot selection resolves them.
 type BranchChildren = HashMap<(ChainCoordinate, Option<EntryHash>), Vec<(u64, EntryHash)>>;
 
-/// The branch-selection verdict for one refold: the entries on each chain's accepted branch, and
-/// the equivocation losers (`forked` — terminal unless a later watermark selects them).
+/// The branch-selection verdict for one refold.
+///
+/// The two sets do NOT partition the eligible candidates, and that is the point. An entry is
+/// `forked` only if it reaches its chain root through held entries and still lost a slot — a real
+/// equivocation loser, terminal unless a later watermark selects it. An entry stranded above a gap
+/// in the dense chain (its predecessor has not arrived) is in NEITHER set: it lost nothing, and the
+/// arrival of the missing predecessor can make it contiguous. Calling that `forked` would discard
+/// valid work for being late; the acceptance predicate parks it as `missing_predecessor` instead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct BranchSelection {
     pub(super) accepted: HashSet<EntryHash>,
@@ -176,6 +182,7 @@ pub(super) fn select_accepted_branch(
     }
 
     let mut accepted = HashSet::new();
+    let mut rooted = HashSet::new();
     for chain in chains {
         let pinned = pinned_branch(chain, pins, view);
         let mut parent: Option<EntryHash> = None;
@@ -195,14 +202,40 @@ pub(super) fn select_accepted_branch(
             accepted.insert(winner);
             parent = Some(winner);
         }
+        collect_rooted(chain, &children, &mut rooted);
     }
 
-    let forked = candidates
-        .iter()
-        .filter(|c| eligible.contains(&c.entry_hash) && !accepted.contains(&c.entry_hash))
-        .map(|c| c.entry_hash)
-        .collect();
+    // Only an entry that reaches its chain root through held entries can have LOST anything: it had
+    // a slot to contest. One stranded above a gap never entered a contest, so it is not a loser —
+    // leave it out of both sets and let the caller park it until its predecessor arrives.
+    let forked = rooted.difference(&accepted).copied().collect();
     BranchSelection { accepted, forked }
+}
+
+/// Every eligible entry reachable from a chain root by contiguous `prev_hash` links — the entries
+/// that are dense-complete back to seq 0, and so are decidable at all.
+fn collect_rooted(
+    chain: ChainCoordinate,
+    children: &BranchChildren,
+    rooted: &mut HashSet<EntryHash>,
+) {
+    // Breadth-first from the roots (`prev_hash` null at seq 0), stepping exactly one slot per link,
+    // so a gap in the chain simply strands everything above it.
+    let mut frontier: Vec<(Option<EntryHash>, u64)> = vec![(None, 0)];
+    while let Some((parent, slot)) = frontier.pop() {
+        let Some(kids) = children.get(&(chain, parent)) else {
+            continue;
+        };
+        for (seq, hash) in kids.iter().filter(|(seq, _)| *seq == slot) {
+            if !rooted.insert(*hash) {
+                continue;
+            }
+            // A dense chain cannot reach past `u64::MAX`; there is no next slot to walk to.
+            if let Some(next) = seq.checked_add(1) {
+                frontier.push((Some(*hash), next));
+            }
+        }
+    }
 }
 
 /// The entries on the branch a register pins for `chain` — empty when no cut pins it, or when the
@@ -289,9 +322,11 @@ fn walk_back(
             return WalkEnd::Origin;
         };
         // A dense chain is contiguous, so a held predecessor MUST be the exactly-preceding slot; a
-        // link that skips slots (5 → 3) is forged, not a real parent.
+        // link that skips slots (5 → 3) is forged, not a real parent. `checked_add` because `seq`
+        // is a peer-supplied `u64`: a candidate parked at `u64::MAX` is reachable by any peer, and
+        // `+ 1` would panic in a debug build rather than reject the link it is meant to reject.
         if let Some(prev_header) = view.header(&prev)
-            && prev_header.seq + 1 != header.seq
+            && prev_header.seq.checked_add(1) != Some(header.seq)
         {
             return WalkEnd::ForgedLink;
         }
@@ -427,14 +462,59 @@ mod tests {
     }
 
     #[test]
-    fn selection_takes_one_contiguous_chain_and_stops_at_the_first_empty_slot() {
+    fn an_entry_stranded_above_a_gap_is_neither_accepted_nor_forked() {
         let mut view = linear();
-        // A seq-4 entry with slot 3 missing: the dense chain ends at 2, so it cannot be accepted.
+        // A seq-4 entry whose seq-3 predecessor has not arrived: the dense chain ends at 2, so it
+        // cannot be accepted.
         view.insert([0x0e; 32], header(4, Some([0x0d; 32])));
         let rows = candidates(&view);
         let selection = select_accepted_branch(&rows, &all(&view), &[], &view);
-        assert_eq!(selection.accepted, HashSet::from([[0x0a; 32], [0x0b; 32], [0x0c; 32]]),);
-        assert_eq!(selection.forked, HashSet::from([[0x0e; 32]]));
+        assert_eq!(selection.accepted, HashSet::from([[0x0a; 32], [0x0b; 32], [0x0c; 32]]));
+        // But it is NOT forked: it lost no contest, it is merely early. `forked` is terminal, so
+        // calling a late-arriving entry an equivocation loser would discard valid work — the
+        // missing predecessor can still arrive and make it contiguous. The acceptance predicate
+        // parks it as `missing_predecessor` instead.
+        assert!(selection.forked.is_empty(), "a gap strands an entry; it does not fork it");
+    }
+
+    #[test]
+    fn a_gap_and_a_real_equivocation_loser_do_not_collapse_into_each_other() {
+        let mut view = linear();
+        // A genuine loser at seq 1 (0x1b > 0x0b) with a descendant, AND an entry stranded above a
+        // gap. The loser's cone is terminal; the stranded entry is still undecided. Neither state
+        // may be relabelled as the other.
+        view.insert([0x1b; 32], header(1, Some([0x0a; 32])));
+        view.insert([0x1c; 32], header(2, Some([0x1b; 32])));
+        view.insert([0x0e; 32], header(4, Some([0x0d; 32])));
+        let rows = candidates(&view);
+
+        let selection = select_accepted_branch(&rows, &all(&view), &[], &view);
+        assert_eq!(selection.accepted, HashSet::from([[0x0a; 32], [0x0b; 32], [0x0c; 32]]));
+        assert_eq!(
+            selection.forked,
+            HashSet::from([[0x1b; 32], [0x1c; 32]]),
+            "the losing branch reaches the root and lost its slot: terminal",
+        );
+        assert!(!selection.forked.contains(&[0x0e; 32]), "the stranded entry is still undecided");
+    }
+
+    #[test]
+    fn a_peer_supplied_seq_at_the_u64_ceiling_cannot_panic_the_walk() {
+        // `seq` is peer-supplied, so a candidate can sit at `u64::MAX`. A child claiming to follow
+        // it must be REJECTED as a forged link, not overflow the contiguity check — `+ 1` there
+        // would panic in a debug build instead of returning the verdict it exists to return.
+        let view = HashMap::from([
+            ([0xf0; 32], header(0, Some([0xff; 32]))),
+            ([0xff; 32], header(u64::MAX, None)),
+        ]);
+        assert_eq!(ancestry(&[0xff; 32], &[0xf0; 32], &view), AncestryRelation::OffBranch);
+
+        let rows = candidates(&view);
+        let selection = select_accepted_branch(&rows, &all(&view), &[], &view);
+        assert!(
+            !selection.accepted.contains(&[0xf0; 32]),
+            "a child of a u64::MAX entry is not contiguous with slot 0 and cannot be accepted",
+        );
     }
 
     #[test]
