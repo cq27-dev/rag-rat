@@ -16,6 +16,7 @@
 //! - [`limits`]: §18a protocol-validity constants + the account-layer domain strings.
 //! - [`envelope`]: the 13-part signed account-entry envelope (§6).
 mod candidate;
+mod content;
 mod cut;
 mod envelope;
 mod fold;
@@ -25,6 +26,11 @@ mod ops;
 mod registers;
 mod storage;
 
+#[allow(unused_imports, reason = "C2 envelope is frozen before candidate storage lands")]
+pub(in crate::oplog) use content::{
+    ContentEntryHeader, SignedContentEntry, VerifiedContentEntry, decode_content_signed,
+    sign_content_entry, verify_content_signed,
+};
 pub(crate) use fold::{
     AuthorityBoundary, AuthorityInvalidReason, AuthorityParkReason, AuthorityQuery, GrantAuthority,
     GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,

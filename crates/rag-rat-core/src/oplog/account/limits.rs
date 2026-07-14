@@ -16,6 +16,10 @@
 pub(super) const ACCOUNT_ENTRY_DOMAIN: &str = "rag-rat/account-entry/1";
 /// Domain tag for the outer signed account-entry transport envelope (body + signature).
 pub(super) const ACCOUNT_SIGNED_DOMAIN: &str = "rag-rat/account-signed/1";
+/// Domain tag for the `/3` content-entry header (§8).
+pub(super) const CONTENT_ENTRY_DOMAIN: &str = "rag-rat/entry/3";
+/// Domain tag shared by signed content-entry transport envelopes.
+pub(super) const CONTENT_SIGNED_DOMAIN: &str = "rag-rat/signed-entry/1";
 /// Domain tag committed into the `account_id` genesis hash (§4).
 pub(super) const ACCOUNT_ID_DOMAIN: &str = "rag-rat/account/1";
 
@@ -44,6 +48,8 @@ mod tests {
         // misread it. These strings are the security boundary; pin them exactly.
         assert_eq!(ACCOUNT_ENTRY_DOMAIN, "rag-rat/account-entry/1");
         assert_eq!(ACCOUNT_SIGNED_DOMAIN, "rag-rat/account-signed/1");
+        assert_eq!(CONTENT_ENTRY_DOMAIN, "rag-rat/entry/3");
+        assert_eq!(CONTENT_SIGNED_DOMAIN, "rag-rat/signed-entry/1");
         assert_eq!(ACCOUNT_ID_DOMAIN, "rag-rat/account/1");
     }
 
