@@ -3342,6 +3342,15 @@ pub(crate) fn apply_papertrail_binding_health(conn: &Connection) -> rusqlite::Re
          WHERE last_successful_probe_ms IS NULL AND last_probe_ms IS NOT NULL",
         [],
     )?;
+    // Before V066, an ordinary initial backfill was a complete project walk but only forced
+    // `--full` runs populated `last_full_sync_ms`. Preserve that completed-walk fact using the
+    // cursor's last successful provider contact; incomplete cursors must remain due for healing.
+    conn.execute(
+        "UPDATE papertrail_sync_cursor
+         SET last_full_sync_ms=last_probe_ms
+         WHERE backfill_done=1 AND last_full_sync_ms IS NULL AND last_probe_ms IS NOT NULL",
+        [],
+    )?;
     Ok(())
 }
 
