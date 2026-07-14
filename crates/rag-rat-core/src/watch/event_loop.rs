@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use notify::recommended_watcher;
 
 use super::overlay::OverlayScope;
+use super::papertrail::{self, PapertrailClock, PapertrailScheduler};
 use super::pass::{
     Debounce, LoopMsg, PassRequest, PassScheduler, SKIP_TIMEOUT, SweepClock,
     maintenance_pass_scoped, spawn_pass_worker, startup_catchup_pass,
@@ -22,6 +23,7 @@ use crate::config::Config;
 use crate::fleet;
 use crate::index::IndexDatabase;
 use crate::index::ignore_rules::IgnoreMatcher;
+use crate::index::papertrail::{AutosyncRequest, autosync};
 use crate::locks::{self, FileLock};
 
 pub(crate) const FLEET_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -162,6 +164,32 @@ fn watcher_main(
         fleet_bin.as_deref(),
     );
 
+    // Papertrail auto-sync (#592): its own worker + queue, deliberately separate from the pass
+    // worker — a mirror flight waits on the network (pages, rate-governor sleeps) and must
+    // neither delay index passes nor be delayed by them. `None` interval (no resolved tracker
+    // bindings) disables the trigger entirely. The worker handle is dropped, never joined; see
+    // `spawn_papertrail_worker` for why shutdown stays bounded anyway.
+    let papertrail_interval = papertrail::papertrail_tick_interval(&config);
+    let mut papertrail_tx = None;
+    if papertrail_interval.is_some() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let spawned = papertrail::spawn_papertrail_worker(request_rx, tx.clone(), {
+            let config = config.clone();
+            move |request| {
+                if let Err(error) = autosync::run(&config, request) {
+                    tracing::warn!(
+                        target: "rag_rat_core::papertrail",
+                        error = %error,
+                        "papertrail auto-sync failed; a later trigger retries"
+                    );
+                }
+            }
+        });
+        if spawned.is_some() {
+            papertrail_tx = Some(request_tx);
+        }
+    }
+
     // Maintenance passes run on the worker thread (#506); see `spawn_pass_worker` for why.
     let (pass_tx, pass_rx) = std::sync::mpsc::channel();
     let Some(pass_worker) = spawn_pass_worker(pass_rx, tx, {
@@ -198,13 +226,17 @@ fn watcher_main(
         rx,
         pass_tx: &pass_tx,
         scheduler: &mut scheduler,
+        papertrail_tx: papertrail_tx.as_ref(),
+        papertrail_interval,
         stop,
         fleet_trigger: &mut fire_fleet_trigger,
     }
     .run();
 
     // Let an in-flight pass finish (bounded by the pass itself, exactly as when passes ran
-    // inline), then release the worker.
+    // inline), then release the worker. The papertrail worker is only released (its channel
+    // closed), never joined — a mirror flight can be network-bound far past any shutdown grace.
+    drop(papertrail_tx);
     drop(pass_tx);
     let _ = pass_worker.join();
 
@@ -232,6 +264,9 @@ pub(crate) struct EventLoop<'a, W: notify::Watcher> {
     pub(crate) rx: Receiver<LoopMsg>,
     pub(crate) pass_tx: &'a Sender<PassRequest>,
     pub(crate) scheduler: &'a mut PassScheduler,
+    /// `None` disables the papertrail trigger (no tracker bindings, or no worker thread).
+    pub(crate) papertrail_tx: Option<&'a Sender<AutosyncRequest>>,
+    pub(crate) papertrail_interval: Option<Duration>,
     pub(crate) stop: &'a AtomicBool,
     /// Injected so tests can observe the fleet firing; production wires [`fleet::trigger`].
     pub(crate) fleet_trigger: &'a mut (dyn FnMut(&Path) + Send),
@@ -252,6 +287,11 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
         let periodic = (self.config.watch.periodic_sweep_secs > 0)
             .then(|| Duration::from_secs(self.config.watch.periodic_sweep_secs));
         let mut sweep = SweepClock::new(periodic, Instant::now());
+        // The papertrail evaluation deadline (#592): fires even on a filesystem-idle watcher, so
+        // the freshness probe and the daily full-walk backstop run on time without any events.
+        let mut papertrail_clock =
+            PapertrailClock::new(self.papertrail_tx.and(self.papertrail_interval), Instant::now());
+        let mut papertrail_scheduler = PapertrailScheduler::new();
         // The overlay scope accumulated while the debounce is armed (#577): every firing event
         // merges its contribution, and the union rides the next dispatched pass. Cleared ONLY on
         // dispatch, like the debounce itself — mid-pass events keep accumulating for the
@@ -265,15 +305,26 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
             // While a pass is in flight its fire condition stays due (the debounce only resets on
             // dispatch), so recomputing those deadlines would spin the loop — the `PassDone`
             // message is what wakes it. The fleet debounce still shapes the wait: the trigger
-            // must fire DURING a long pass, not after it (#506).
+            // must fire DURING a long pass, not after it (#506). The papertrail deadline shapes
+            // BOTH branches for the same reason: an in-flight maintenance pass must not postpone
+            // a due probe (#592).
             let wait = if self.scheduler.in_flight() {
-                fleet_debounce.due_in(now).unwrap_or(IDLE_WAIT)
-            } else {
-                [debounce.due_in(now), fleet_debounce.due_in(now), sweep.due_in(now)]
+                [fleet_debounce.due_in(now), papertrail_clock.due_in(now)]
                     .into_iter()
                     .flatten()
                     .min()
                     .unwrap_or(IDLE_WAIT)
+            } else {
+                [
+                    debounce.due_in(now),
+                    fleet_debounce.due_in(now),
+                    sweep.due_in(now),
+                    papertrail_clock.due_in(now),
+                ]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(IDLE_WAIT)
             };
             match self.rx.recv_timeout(wait) {
                 Ok(LoopMsg::Fs(Ok(event))) => {
@@ -350,11 +401,32 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                         self.linked_worktrees,
                     );
                 },
+                Ok(LoopMsg::PapertrailDone) => {
+                    if let Some(request_tx) = self.papertrail_tx
+                        && let Some(follow_up) = papertrail_scheduler.on_done()
+                    {
+                        let _ = request_tx.send(follow_up);
+                    }
+                },
                 Ok(LoopMsg::Wake) => {},
                 Err(RecvTimeoutError::Timeout) => {},
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             let now = Instant::now();
+            // The papertrail tick enqueues a schedule EVALUATION, never an unconditional mirror:
+            // the per-binding policy decides skip / probe / incremental / full, and the daily
+            // full-walk backstop rides the same evaluation. Independent of the debounce and of
+            // `scheduler.in_flight()`, so ordinary maintenance never delays it; redundant ticks
+            // coalesce in `PapertrailScheduler` (and cross-process in the flight's pending
+            // marker).
+            if papertrail_clock.due(now) {
+                papertrail_clock.on_tick(now);
+                if let Some(request_tx) = self.papertrail_tx
+                    && let Some(request) = papertrail_scheduler.admit(AutosyncRequest::Evaluate)
+                {
+                    let _ = request_tx.send(request);
+                }
+            }
             let periodic_due = sweep.due(now);
             if debounce.should_fire(now) || periodic_due {
                 // The periodic sweep is the missed-event backstop, so it refreshes every overlay;

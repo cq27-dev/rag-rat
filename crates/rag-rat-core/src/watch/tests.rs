@@ -2069,6 +2069,8 @@ fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
         rx,
         pass_tx: &pass_tx,
         scheduler: &mut scheduler,
+        papertrail_tx: None,
+        papertrail_interval: None,
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2859,6 +2861,8 @@ fn event_loop_ignores_fs_errors_and_exits_on_disconnect() {
         rx,
         pass_tx: &pass_tx_for_loop,
         scheduler: &mut scheduler,
+        papertrail_tx: None,
+        papertrail_interval: None,
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2908,6 +2912,8 @@ fn periodic_sweep_dispatches_all_overlay_scope() {
         rx,
         pass_tx: &pass_tx_for_loop,
         scheduler: &mut scheduler,
+        papertrail_tx: None,
+        papertrail_interval: None,
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2961,4 +2967,187 @@ fn shutdown_discover_skips_when_write_lock_is_held() {
     );
     release.store(true, Ordering::Relaxed);
     holder.join().unwrap();
+}
+
+#[test]
+fn papertrail_clock_is_never_due_without_an_interval_and_rearms_on_tick() {
+    let start = Instant::now();
+    let disabled = PapertrailClock::new(None, start);
+    assert!(!disabled.due(start + Duration::from_secs(86_400)));
+    assert_eq!(disabled.due_in(start), None);
+
+    let mut clock = PapertrailClock::new(Some(Duration::from_secs(900)), start);
+    assert!(!clock.due(start + Duration::from_secs(899)));
+    assert!(clock.due(start + Duration::from_secs(900)));
+    clock.on_tick(start + Duration::from_secs(900));
+    assert!(!clock.due(start + Duration::from_secs(1_799)));
+    assert!(clock.due(start + Duration::from_secs(1_800)));
+}
+
+#[test]
+fn papertrail_scheduler_single_flights_and_coalesces_max_wins() {
+    use crate::index::papertrail::AutosyncRequest;
+    let mut scheduler = PapertrailScheduler::new();
+    // Idle → dispatch immediately.
+    assert_eq!(scheduler.admit(AutosyncRequest::Evaluate), Some(AutosyncRequest::Evaluate));
+    // In flight → any number of requests coalesce into ONE pending follow-up, strongest wins —
+    // and a later weaker request must not weaken it.
+    assert_eq!(scheduler.admit(AutosyncRequest::Incremental), None);
+    assert_eq!(scheduler.admit(AutosyncRequest::Full), None);
+    assert_eq!(scheduler.admit(AutosyncRequest::Evaluate), None);
+    // Completion dispatches the coalesced follow-up (the scheduler is in flight again)...
+    assert_eq!(scheduler.on_done(), Some(AutosyncRequest::Full));
+    // ...and the next completion, with nothing queued, dispatches nothing.
+    assert_eq!(scheduler.on_done(), None);
+    assert_eq!(scheduler.admit(AutosyncRequest::Evaluate), Some(AutosyncRequest::Evaluate));
+}
+
+#[test]
+fn papertrail_tick_interval_requires_bindings_and_takes_the_tightest_cadence() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // No `[[tracker]]` bindings and no git remote to auto-detect one from → disabled.
+    let mut config = whole_root_config(tmp.path(), &[PathBuf::from("src")]);
+    assert_eq!(papertrail_tick_interval(&config), None);
+
+    config.trackers = vec![crate::config::TrackerConfig {
+        provider: crate::config::Tracker::Github,
+        project: Some("o/r".to_string()),
+        remote: "origin".to_string(),
+        base_url: None,
+        auth: None,
+        tags: Vec::new(),
+    }];
+    assert_eq!(papertrail_tick_interval(&config), Some(Duration::from_secs(900)));
+    // The daily full-walk backstop shares the wake-up: a tighter full interval tightens it.
+    config.papertrail.full_sync_interval_secs = 600;
+    assert_eq!(papertrail_tick_interval(&config), Some(Duration::from_secs(600)));
+}
+
+#[test]
+fn idle_watcher_enqueues_papertrail_evaluation_without_filesystem_activity() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    config.watch.debounce_ms = 60_000;
+    config.watch.max_latency_ms = 60_000;
+    config.watch.periodic_sweep_secs = 0;
+    let target_dirs = config.target_directories();
+    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+    let mut linked_worktrees = LinkedWorktreeWatches::default();
+    let mut notify_watcher =
+        <RecordingWatcher as notify::Watcher>::new(|_| {}, notify::Config::default()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (pass_tx, _pass_rx) = std::sync::mpsc::channel();
+    let (papertrail_tx, papertrail_rx) = std::sync::mpsc::channel();
+    let mut scheduler = PassScheduler::new();
+    let stop = AtomicBool::new(false);
+    let mut fleet_trigger = |_: &Path| {};
+
+    let event_loop = EventLoop {
+        config: &config,
+        target_dirs: &target_dirs,
+        fleet_bin: None,
+        notify_watcher: &mut notify_watcher,
+        ignore: &mut ignore,
+        linked_worktrees: &mut linked_worktrees,
+        worktree_registry: None,
+        rx,
+        pass_tx: &pass_tx,
+        scheduler: &mut scheduler,
+        papertrail_tx: Some(&papertrail_tx),
+        papertrail_interval: Some(Duration::from_millis(50)),
+        stop: &stop,
+        fleet_trigger: &mut fleet_trigger,
+    };
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(move || event_loop.run());
+        // No filesystem events at all: the deadline alone must enqueue an evaluation.
+        assert_eq!(
+            papertrail_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(crate::index::papertrail::AutosyncRequest::Evaluate),
+        );
+        stop.store(true, Ordering::Relaxed);
+        tx.send(LoopMsg::Wake).unwrap();
+        drop(tx);
+        let _ = handle.join();
+    });
+}
+
+#[test]
+fn papertrail_deadline_fires_during_an_in_flight_pass_and_ticks_coalesce() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    config.watch.debounce_ms = 10;
+    config.watch.max_latency_ms = 50;
+    config.watch.periodic_sweep_secs = 0;
+    let target_dirs = config.target_directories();
+    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+    let mut linked_worktrees = LinkedWorktreeWatches::default();
+    let mut notify_watcher =
+        <RecordingWatcher as notify::Watcher>::new(|_| {}, notify::Config::default()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (pass_tx, pass_rx) = std::sync::mpsc::channel();
+    let pass_tx_for_loop = pass_tx.clone();
+    let (papertrail_tx, papertrail_rx) = std::sync::mpsc::channel();
+    let mut scheduler = PassScheduler::new();
+    let stop = AtomicBool::new(false);
+    let mut fleet_trigger = |_: &Path| {};
+
+    let event_loop = EventLoop {
+        config: &config,
+        target_dirs: &target_dirs,
+        fleet_bin: None,
+        notify_watcher: &mut notify_watcher,
+        ignore: &mut ignore,
+        linked_worktrees: &mut linked_worktrees,
+        worktree_registry: None,
+        rx,
+        pass_tx: &pass_tx_for_loop,
+        scheduler: &mut scheduler,
+        papertrail_tx: Some(&papertrail_tx),
+        papertrail_interval: Some(Duration::from_millis(100)),
+        stop: &stop,
+        fleet_trigger: &mut fleet_trigger,
+    };
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(move || event_loop.run());
+
+        // Put an ordinary maintenance pass in flight (this test plays the worker and does NOT
+        // complete it).
+        tx.send(LoopMsg::Fs(Ok(mutation_event(root.join("src/lib.rs"))))).unwrap();
+        assert!(pass_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+
+        // The papertrail deadline still fires — an in-flight pass must not postpone it.
+        assert_eq!(
+            papertrail_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(crate::index::papertrail::AutosyncRequest::Evaluate),
+            "the papertrail deadline must fire during an in-flight maintenance pass",
+        );
+
+        // Several more deadline ticks elapse while the papertrail flight is in the air (no
+        // PapertrailDone): they must coalesce, not queue.
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(
+            papertrail_rx.try_recv().is_err(),
+            "ticks during an in-flight papertrail run must coalesce into one follow-up",
+        );
+
+        // Completing the flight dispatches exactly the one coalesced follow-up.
+        tx.send(LoopMsg::PapertrailDone).unwrap();
+        assert_eq!(
+            papertrail_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(crate::index::papertrail::AutosyncRequest::Evaluate),
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        tx.send(LoopMsg::Wake).unwrap();
+        drop(tx);
+        drop(pass_tx);
+        let _ = handle.join();
+    });
 }

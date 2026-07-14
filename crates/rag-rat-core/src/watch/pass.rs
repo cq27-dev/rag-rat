@@ -123,13 +123,15 @@ pub(crate) enum PassRequest {
     },
 }
 
-/// Everything that wakes the event loop: filesystem events from notify, pass completions from the
-/// worker thread, and the drop-time wake that makes `stop` observable immediately instead of at
-/// the next recv timeout (idle waits stretch to the periodic-sweep interval).
+/// Everything that wakes the event loop: filesystem events from notify, pass completions from
+/// the worker thread, papertrail flight completions from the auto-sync worker (#592), and the
+/// drop-time wake that makes `stop` observable immediately instead of at the next recv timeout
+/// (idle waits stretch to the periodic-sweep interval).
 #[derive(Debug)]
 pub(crate) enum LoopMsg {
     Fs(notify::Result<Event>),
     PassDone,
+    PapertrailDone,
     Wake,
 }
 

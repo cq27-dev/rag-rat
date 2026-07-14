@@ -14,9 +14,13 @@
 //!   (cold embedding backlog, clone-graph rebuild) or a blocked write-lock acquisition must not
 //!   stop events from classifying or the fleet hot-upgrade trigger from firing. One pass in flight
 //!   at a time; fire conditions that arrive mid-pass coalesce into the armed debounce.
+//! - Papertrail auto-sync (#592) runs on its OWN worker with its own periodic deadline: the
+//!   freshness probe and daily full-walk backstop fire even on a filesystem-idle watcher and are
+//!   never postponed by an in-flight maintenance pass.
 
 mod event_loop;
 mod overlay;
+mod papertrail;
 mod pass;
 mod placement;
 
@@ -26,6 +30,8 @@ pub(crate) use event_loop::{EventLoop, shutdown_discover};
 #[cfg(test)]
 pub(crate) use overlay::{OverlayBasisAction, overlay_basis_action, overlay_needs_embed};
 pub use overlay::{OverlayScope, ReconcileBudget, refresh_worktree_overlays};
+#[cfg(test)]
+pub(crate) use papertrail::{PapertrailClock, PapertrailScheduler, papertrail_tick_interval};
 pub use pass::{CLONE_GRAPH_QUIET_MS, maintenance_pass, maintenance_pass_or_skip};
 #[cfg(test)]
 pub(crate) use pass::{
