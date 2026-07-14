@@ -33,12 +33,19 @@ impl PapertrailClock {
         self.last_tick = now;
     }
 
+    /// `None` when disabled OR when the configured cadence overflows `Instant` arithmetic — a
+    /// deadline beyond the platform's monotonic range never arrives, and a bare `+` would panic
+    /// the watcher on its first wait computation.
+    fn deadline(&self) -> Option<Instant> {
+        self.interval.and_then(|interval| self.last_tick.checked_add(interval))
+    }
+
     pub(crate) fn due(&self, now: Instant) -> bool {
-        self.interval.is_some_and(|interval| now >= self.last_tick + interval)
+        self.deadline().is_some_and(|at| now >= at)
     }
 
     pub(crate) fn due_in(&self, now: Instant) -> Option<Duration> {
-        self.interval.map(|interval| (self.last_tick + interval).saturating_duration_since(now))
+        self.deadline().map(|at| at.saturating_duration_since(now))
     }
 }
 

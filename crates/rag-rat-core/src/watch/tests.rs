@@ -2982,6 +2982,12 @@ fn papertrail_clock_is_never_due_without_an_interval_and_rearms_on_tick() {
     clock.on_tick(start + Duration::from_secs(900));
     assert!(!clock.due(start + Duration::from_secs(1_799)));
     assert!(clock.due(start + Duration::from_secs(1_800)));
+
+    // A cadence that overflows Instant arithmetic is a deadline that never arrives — it must
+    // not panic the watcher's wait computation.
+    let oversized = PapertrailClock::new(Some(Duration::from_secs(u64::MAX)), start);
+    assert!(!oversized.due(start + Duration::from_secs(86_400)));
+    assert_eq!(oversized.due_in(start), None);
 }
 
 #[test]
