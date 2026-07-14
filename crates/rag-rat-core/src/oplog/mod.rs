@@ -47,10 +47,10 @@ mod stream;
 // cross the phase boundary.
 #[expect(unused_imports, reason = "C2 authority seam is frozen before its caller lands")]
 pub(crate) use account::{
-    AccountId, AuthorityBoundary, AuthorityInvalidReason, AuthorityParkReason, AuthorityQuery,
+    AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
     CapacityScope, DeviceCut, DeviceRole, GrantAuthority, GrantDeviceAuthority,
     GrantDeviceBoundary, GrantRole, IngestOutcome, OwnerAuthority, OwnerChainAuthority,
-    RosterContentAuthority, account_ingest, backfill_authority_projection,
+    RosterContentAuthority, account_ingest, auth_len_freshness, backfill_authority_projection,
     grant_effective_for_device, owner_control_authority, owner_secrets_authority,
     roster_content_authority, stream_owner_effective,
 };

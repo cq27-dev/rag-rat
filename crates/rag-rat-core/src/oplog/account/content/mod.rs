@@ -6,10 +6,10 @@ mod storage;
 
 #[allow(unused_imports, reason = "C3.1 freezes the pure evaluator before C3.2 storage wiring")]
 pub(crate) use acceptance::{
-    AncestryRelation, AuthorityFreshness, CitedFreshness, CitedGrantAuthority, CitedOwnership,
-    CitedRosterAuthority, ContentAcceptance, ContentAcceptanceInput, ContentAcceptanceInputError,
-    ContentCondemnReason, ContentParkReason, ContentRejectReason, ResolvedAuthority,
-    SubjectAuthorityHold, evaluate_content_acceptance,
+    AncestryRelation, CitedFreshness, CitedGrantAuthority, CitedOwnership, CitedRosterAuthority,
+    ContentAcceptance, ContentAcceptanceInput, ContentAcceptanceInputError, ContentCondemnReason,
+    ContentParkReason, ContentRejectReason, SubjectAuthorityHold, UnknownAncestry,
+    evaluate_content_acceptance,
 };
 pub(in crate::oplog) use envelope::{
     ContentEntryHeader, SignedContentEntry, VerifiedContentEntry, decode_content_signed,

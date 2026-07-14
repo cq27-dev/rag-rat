@@ -194,22 +194,38 @@ pub(super) struct AccountAuthHistory {
     grant_cuts: HashMap<[u8; 32], Vec<DeviceCut>>,
 }
 
+/// One authority fact resolved against the CURRENT fold. There is exactly one snapshot to resolve
+/// against — `auth_len` selects no historical view (§7: it is never an authority input), so a fact
+/// query answers from what we have folded and says nothing about the author's own control length.
+/// Freshness is a separate axis ([`AuthorityFreshness`]) the caller applies in its own phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthorityQuery<T> {
     Effective(T),
-    Parked(AuthorityParkReason),
+    /// The citation names an entry our fold does not hold. Recoverable: refetch and re-evaluate.
+    Unknown,
     Invalid(AuthorityInvalidReason),
 }
 
+/// The author's asserted control-fold length measured against ours (§7). `auth_len` is never an
+/// authority input; it only tells us whether the author folded ops we have not. Ahead ⇒ park +
+/// refetch, never a rejection — the missing ops are recoverable and may still re-bless a citation
+/// our fold currently reads as ineffective (§11.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthorityParkReason {
-    AuthLenAhead,
-    UnknownReference,
+pub(crate) enum AuthorityFreshness {
+    /// The author cites a control log no longer than the one we hold.
+    CurrentOrBehind,
+    /// The author cites effective ops we have not folded yet.
+    Ahead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthorityInvalidReason {
+    /// The cited entry's own header names a different subject than the citation claims. Decided by
+    /// bytes we already hold, so a deeper control log can never overturn it.
     WrongSubject,
+    /// The cited entry is held but our fold reads it as ineffective. This one is FOLD-DEPENDENT: a
+    /// `CutExtend` we have not folded can re-bless it (§11.4), so a caller that is behind the
+    /// author ([`AuthorityFreshness::Ahead`]) must park on it rather than treat it as a lie.
     ReferencedEntryNotEffective,
 }
 
@@ -347,15 +363,23 @@ impl AccountAuthHistory {
         self.grant_cuts.iter().map(|(grant_id, cuts)| (grant_id, cuts.as_slice()))
     }
 
+    /// Measure an asserted control-fold length against ours (§7). This is the ONE seam that reads
+    /// `auth_len`; the fact queries below never see it, so an ahead counter can neither select a
+    /// historical authority view nor pre-empt a verdict the current fold already decides.
+    pub(super) fn auth_len_freshness(&self, asserted_auth_len: u64) -> AuthorityFreshness {
+        if asserted_auth_len > self.effective_count {
+            AuthorityFreshness::Ahead
+        } else {
+            AuthorityFreshness::CurrentOrBehind
+        }
+    }
+
     pub(super) fn roster_ref_effective(
         &self,
         roster_ref: [u8; 32],
         device_fingerprint: DeviceFingerprint,
-        auth_len: u64,
     ) -> AuthorityQuery<RosterAuthority> {
         query_fact(
-            self.effective_count,
-            auth_len,
             self.roster_refs
                 .get(&roster_ref)
                 .filter(|fact| fact.closed_at.is_none())
@@ -370,16 +394,12 @@ impl AccountAuthHistory {
         roster_ref: [u8; 32],
         device_fingerprint: DeviceFingerprint,
         stream_id: StreamId,
-        auth_len: u64,
     ) -> AuthorityQuery<RosterContentAuthority> {
-        if auth_len > self.effective_count {
-            return AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead);
-        }
         let Some(fact) = self.roster_refs.get(&roster_ref) else {
             return if self.outcomes.contains_key(&roster_ref) {
                 AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
             } else {
-                AuthorityQuery::Parked(AuthorityParkReason::UnknownReference)
+                AuthorityQuery::Unknown
             };
         };
         if fact.authority.device_fingerprint != device_fingerprint {
@@ -402,11 +422,8 @@ impl AccountAuthHistory {
         &self,
         owner_id: [u8; 32],
         device_fingerprint: DeviceFingerprint,
-        auth_len: u64,
     ) -> AuthorityQuery<OwnerAuthority> {
         query_fact(
-            self.effective_count,
-            auth_len,
             self.owner_incarnations
                 .get(&owner_id)
                 .filter(|fact| fact.closed_at.is_none())
@@ -420,12 +437,10 @@ impl AccountAuthHistory {
         &self,
         owner_id: [u8; 32],
         device_fingerprint: DeviceFingerprint,
-        auth_len: u64,
     ) -> AuthorityQuery<OwnerChainAuthority> {
         self.owner_chain_authority(
             owner_id,
             device_fingerprint,
-            auth_len,
             |fact| fact.control_boundary,
             |fact| fact.control_boundary,
         )
@@ -435,12 +450,10 @@ impl AccountAuthHistory {
         &self,
         owner_id: [u8; 32],
         device_fingerprint: DeviceFingerprint,
-        auth_len: u64,
     ) -> AuthorityQuery<OwnerChainAuthority> {
         self.owner_chain_authority(
             owner_id,
             device_fingerprint,
-            auth_len,
             |fact| fact.secrets_boundary,
             |fact| fact.secrets_boundary,
         )
@@ -450,18 +463,14 @@ impl AccountAuthHistory {
         &self,
         owner_id: [u8; 32],
         device_fingerprint: DeviceFingerprint,
-        auth_len: u64,
         device_boundary: impl Fn(&RosterFact) -> AuthorityBoundary,
         incarnation_boundary: impl Fn(&OwnerIncarnationFact) -> AuthorityBoundary,
     ) -> AuthorityQuery<OwnerChainAuthority> {
-        if auth_len > self.effective_count {
-            return AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead);
-        }
         let Some(owner) = self.owner_incarnations.get(&owner_id) else {
             return if self.outcomes.contains_key(&owner_id) {
                 AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
             } else {
-                AuthorityQuery::Parked(AuthorityParkReason::UnknownReference)
+                AuthorityQuery::Unknown
             };
         };
         if owner.authority.device_fingerprint != device_fingerprint {
@@ -484,16 +493,12 @@ impl AccountAuthHistory {
         grant_id: [u8; 32],
         stream_id: StreamId,
         grantee_account_id: AccountId,
-        auth_len: u64,
     ) -> AuthorityQuery<GrantAuthority> {
-        if auth_len > self.effective_count {
-            return AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead);
-        }
         let Some(fact) = self.grants.get(&grant_id) else {
             return if self.outcomes.contains_key(&grant_id) {
                 AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
             } else {
-                AuthorityQuery::Parked(AuthorityParkReason::UnknownReference)
+                AuthorityQuery::Unknown
             };
         };
         if fact.authority.stream_id != stream_id
@@ -504,16 +509,9 @@ impl AccountAuthHistory {
         AuthorityQuery::Effective(fact.authority)
     }
 
-    pub(super) fn stream_owner_effective(
-        &self,
-        stream_id: StreamId,
-        auth_len: u64,
-    ) -> AuthorityQuery<[u8; 32]> {
-        if auth_len > self.effective_count {
-            return AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead);
-        }
+    pub(super) fn stream_owner_effective(&self, stream_id: StreamId) -> AuthorityQuery<[u8; 32]> {
         let Some(fact) = self.stream_ownership.get(&stream_id) else {
-            return AuthorityQuery::Parked(AuthorityParkReason::UnknownReference);
+            return AuthorityQuery::Unknown;
         };
         AuthorityQuery::Effective(fact.own_id)
     }
@@ -524,20 +522,15 @@ impl AccountAuthHistory {
 }
 
 fn query_fact<T: Copy, S: PartialEq>(
-    effective_count: u64,
-    auth_len: u64,
     fact: Option<(T, S)>,
     expected_subject: S,
     reference_is_known: bool,
 ) -> AuthorityQuery<T> {
-    if auth_len > effective_count {
-        return AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead);
-    }
     let Some((authority, subject)) = fact else {
         return if reference_is_known {
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
         } else {
-            AuthorityQuery::Parked(AuthorityParkReason::UnknownReference)
+            AuthorityQuery::Unknown
         };
     };
     if subject != expected_subject {
@@ -2364,7 +2357,7 @@ mod tests {
         let h = f.fold();
         assert_eq!(h.outcome(&ahead), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
         assert_eq!(
-            h.roster_ref_effective(ahead, ahead_device.fp, h.effective_count()),
+            h.roster_ref_effective(ahead, ahead_device.fp),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
             "an ahead candidate must not leave a projected roster mutation",
         );
@@ -2479,14 +2472,14 @@ mod tests {
             "the promotion must recover with the valid enrollment on the next readiness pass",
         );
         assert_eq!(
-            h.roster_ref_effective(valid, device.fp, h.effective_count()),
+            h.roster_ref_effective(valid, device.fp),
             AuthorityQuery::Effective(RosterAuthority {
                 device_fingerprint: device.fp,
                 current_role: DeviceRole::Owner,
             }),
         );
         assert_eq!(
-            h.owner_incarnation_effective(promote, device.fp, h.effective_count()),
+            h.owner_incarnation_effective(promote, device.fp),
             AuthorityQuery::Effective(OwnerAuthority { device_fingerprint: device.fp }),
         );
     }
@@ -3015,33 +3008,25 @@ mod tests {
         assert!(h.is_effective(&grant));
         assert!(h.is_effective(&revoke));
         assert_eq!(h.effective_count(), 4);
+        // The exact citation resolves against the fold we hold, and NOTHING else: revocation bounds
+        // content through cuts, so no assertion the author makes about its own control length can
+        // reopen, close, or deny this grant. That counter is a separate, purely informational axis.
         assert_eq!(
-            h.grant_effective(grant, stream, grantee, 2),
+            h.grant_effective(grant, stream, grantee),
             AuthorityQuery::Effective(GrantAuthority {
                 stream_id: stream,
                 grantee_account_id: grantee,
                 role: GrantRole::Reader,
             }),
-            "a behind auth_len is informational and cannot deny an exact citation",
         );
-        assert!(matches!(
-            h.grant_effective(grant, stream, grantee, 3),
-            AuthorityQuery::Effective(GrantAuthority { role: GrantRole::Reader, .. })
-        ));
+        assert_eq!(h.auth_len_freshness(3), AuthorityFreshness::CurrentOrBehind);
+        assert_eq!(h.auth_len_freshness(4), AuthorityFreshness::CurrentOrBehind);
         assert_eq!(
-            h.grant_effective(grant, stream, grantee, 4),
-            AuthorityQuery::Effective(GrantAuthority {
-                stream_id: stream,
-                grantee_account_id: grantee,
-                role: GrantRole::Reader,
-            }),
-            "revocation bounds content through cuts; stale auth_len cannot reopen or close a grant",
+            h.auth_len_freshness(5),
+            AuthorityFreshness::Ahead,
+            "an author citing more effective ops than we folded is a refetch signal, not a verdict",
         );
-        assert_eq!(
-            h.grant_effective(grant, stream, grantee, 5),
-            AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead),
-        );
-        assert_eq!(h.stream_owner_effective(stream, 2), AuthorityQuery::Effective(own));
+        assert_eq!(h.stream_owner_effective(stream), AuthorityQuery::Effective(own));
     }
 
     #[test]
@@ -3066,7 +3051,7 @@ mod tests {
         assert!(h.is_effective(&own));
         assert!(h.is_effective(&grant));
         assert_eq!(
-            h.grant_effective(early_grant, stream, grantee, h.effective_count()),
+            h.grant_effective(early_grant, stream, grantee),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
             "a held but ineffective grant is invalid, not parked as if it were missing",
         );
@@ -3106,13 +3091,10 @@ mod tests {
         assert!(expected.is_effective(&remove_founder));
         assert_eq!(expected.outcome(&grant), Some(Outcome::Rejected(RejectReason::Ineffective)));
         assert_eq!(
-            expected.grant_effective(grant, stream, grantee, expected.effective_count()),
+            expected.grant_effective(grant, stream, grantee),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
         );
-        assert_eq!(
-            expected.stream_owner_effective(stream, expected.effective_count()),
-            AuthorityQuery::Parked(AuthorityParkReason::UnknownReference),
-        );
+        assert_eq!(expected.stream_owner_effective(stream), AuthorityQuery::Unknown);
         for rotation in 1..f.entries.len() {
             assert_eq!(f.fold_rotated(rotation).outcomes, expected.outcomes);
         }
@@ -3141,7 +3123,7 @@ mod tests {
         );
         assert!(!expected.is_effective(&promote));
         assert_eq!(
-            expected.owner_incarnation_effective(promote, member.fp, expected.effective_count(),),
+            expected.owner_incarnation_effective(promote, member.fp,),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
             "a promotion cannot survive solely through a condemned enrollment mutation",
         );
@@ -3204,7 +3186,7 @@ mod tests {
         assert!(expected.is_effective(&remove_founder));
         assert_eq!(expected.outcome(&revoke), Some(Outcome::Rejected(RejectReason::Ineffective)));
         assert_eq!(
-            expected.grant_effective(grant, stream, grantee, expected.effective_count()),
+            expected.grant_effective(grant, stream, grantee),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
         );
         assert!(expected.grant_cuts.is_empty());
@@ -3283,44 +3265,44 @@ mod tests {
         let h = f.fold();
 
         assert_eq!(
-            h.roster_ref_effective(add, member.fp, 2),
+            h.roster_ref_effective(add, member.fp),
             AuthorityQuery::Effective(RosterAuthority {
                 device_fingerprint: member.fp,
                 current_role: DeviceRole::Owner,
             }),
         );
         assert_eq!(
-            h.roster_ref_effective(add, fdr.fp, 2),
+            h.roster_ref_effective(add, fdr.fp),
             AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject),
         );
         assert_eq!(
-            h.owner_incarnation_effective(promote, member.fp, 2),
+            h.owner_incarnation_effective(promote, member.fp),
             AuthorityQuery::Effective(OwnerAuthority { device_fingerprint: member.fp }),
             "a behind auth_len does not deny an exact owner citation",
         );
         assert_eq!(
-            h.owner_incarnation_effective(promote, member.fp, 3),
+            h.owner_incarnation_effective(promote, member.fp),
             AuthorityQuery::Effective(OwnerAuthority { device_fingerprint: member.fp }),
         );
 
         f.author(&fdr, Some(f.genesis_hash), &owner_demote(&member, promote, Cut::Empty));
         let h = f.fold();
         assert_eq!(
-            h.roster_ref_effective(add, member.fp, 4),
+            h.roster_ref_effective(add, member.fp),
             AuthorityQuery::Effective(RosterAuthority {
                 device_fingerprint: member.fp,
                 current_role: DeviceRole::Member,
             }),
         );
         assert_eq!(
-            h.owner_incarnation_effective(promote, member.fp, 4),
+            h.owner_incarnation_effective(promote, member.fp),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
         );
 
         f.author(&fdr, Some(f.genesis_hash), &device_remove(&member, Cut::Empty));
         let h = f.fold();
         assert_eq!(
-            h.roster_ref_effective(add, member.fp, 5),
+            h.roster_ref_effective(add, member.fp),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
         );
     }

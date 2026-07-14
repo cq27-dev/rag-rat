@@ -33,14 +33,14 @@ pub(in crate::oplog) use content::{
     verify_content_signed,
 };
 pub(crate) use fold::{
-    AuthorityBoundary, AuthorityInvalidReason, AuthorityParkReason, AuthorityQuery, GrantAuthority,
+    AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, GrantAuthority,
     GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,
     RosterContentAuthority,
 };
 pub(crate) use id::AccountId;
 pub(crate) use ops::{DeviceCut, DeviceRole, GrantRole};
 pub(crate) use storage::{
-    CapacityScope, IngestOutcome, account_ingest, backfill_authority_projection,
-    grant_effective_for_device, owner_control_authority, owner_secrets_authority,
-    roster_content_authority, stream_owner_effective,
+    CapacityScope, IngestOutcome, account_ingest, auth_len_freshness,
+    backfill_authority_projection, grant_effective_for_device, owner_control_authority,
+    owner_secrets_authority, roster_content_authority, stream_owner_effective,
 };

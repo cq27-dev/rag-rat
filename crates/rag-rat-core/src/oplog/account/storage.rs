@@ -298,20 +298,17 @@ pub(crate) fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::R
 }
 
 /// Exact roster citation lookup over the V064 shadow projection. This is the hot-path seam for
-/// `/3` ingest: a keyed read, never a candidate-DAG replay. `auth_len` only detects a caller ahead
-/// of the local fold; a behind value is informational and never selects historical authority.
+/// `/3` ingest: a keyed read, never a candidate-DAG replay. It resolves against the current fold —
+/// the only authority snapshot there is (§7) — and says nothing about the citing author's own
+/// control length; that is [`auth_len_freshness`]'s separate job.
 pub(crate) fn roster_ref_effective(
     conn: &Connection,
     account_id: AccountId,
     roster_ref: EntryHash,
     device_fingerprint: DeviceFingerprint,
-    auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     let conn: &Connection = &read_tx;
-    if let Some(reason) = auth_len_preflight(conn, account_id, auth_len)? {
-        return Ok(fold::AuthorityQuery::Parked(reason));
-    }
     let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
         .query_row(
             "SELECT device_fingerprint, role, effective_at, closed_at
@@ -339,13 +336,9 @@ pub(crate) fn roster_content_authority(
     roster_ref: EntryHash,
     device_fingerprint: DeviceFingerprint,
     stream_id: StreamId,
-    auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterContentAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     let conn: &Connection = &read_tx;
-    if let Some(reason) = auth_len_preflight(conn, account_id, auth_len)? {
-        return Ok(fold::AuthorityQuery::Parked(reason));
-    }
     let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
         .query_row(
             "SELECT device_fingerprint, role, effective_at, closed_at
@@ -396,9 +389,8 @@ pub(crate) fn owner_control_authority(
     account_id: AccountId,
     owner_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
-    auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
-    owner_chain_authority(conn, account_id, owner_id, device_fingerprint, auth_len, "control")
+    owner_chain_authority(conn, account_id, owner_id, device_fingerprint, "control")
 }
 
 pub(crate) fn owner_secrets_authority(
@@ -406,9 +398,8 @@ pub(crate) fn owner_secrets_authority(
     account_id: AccountId,
     owner_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
-    auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
-    owner_chain_authority(conn, account_id, owner_id, device_fingerprint, auth_len, "secrets")
+    owner_chain_authority(conn, account_id, owner_id, device_fingerprint, "secrets")
 }
 
 fn owner_chain_authority(
@@ -416,14 +407,10 @@ fn owner_chain_authority(
     account_id: AccountId,
     owner_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
-    auth_len: u64,
     chain: &str,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     let conn: &Connection = &read_tx;
-    if let Some(reason) = auth_len_preflight(conn, account_id, auth_len)? {
-        return Ok(fold::AuthorityQuery::Parked(reason));
-    }
     let sql = format!(
         "SELECT o.device_fingerprint, o.effective_at, o.closed_at,
                 o.{chain}_boundary, o.{chain}_seq, o.{chain}_hash,
@@ -515,13 +502,9 @@ pub(crate) fn owner_incarnation_effective(
     account_id: AccountId,
     owner_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
-    auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     let conn: &Connection = &read_tx;
-    if let Some(reason) = auth_len_preflight(conn, account_id, auth_len)? {
-        return Ok(fold::AuthorityQuery::Parked(reason));
-    }
     let row: Option<(Vec<u8>, i64, Option<i64>)> = conn
         .query_row(
             "SELECT device_fingerprint, effective_at, closed_at
@@ -549,13 +532,9 @@ pub(crate) fn grant_effective(
     grant_id: EntryHash,
     stream_id: StreamId,
     grantee_account_id: AccountId,
-    auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     let conn: &Connection = &read_tx;
-    if let Some(reason) = auth_len_preflight(conn, owner_account_id, auth_len)? {
-        return Ok(fold::AuthorityQuery::Parked(reason));
-    }
     let row: Option<StoredGrantRow> = conn
         .query_row(
             "SELECT stream_id, grantee_account_id, role, effective_at, closed_at
@@ -588,7 +567,6 @@ pub(crate) fn grant_effective_for_device(
     stream_id: StreamId,
     grantee_account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
-    auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantDeviceAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     grant_effective_for_device_in_snapshot(
@@ -598,7 +576,6 @@ pub(crate) fn grant_effective_for_device(
         stream_id,
         grantee_account_id,
         device_fingerprint,
-        auth_len,
     )
 }
 
@@ -609,11 +586,7 @@ fn grant_effective_for_device_in_snapshot(
     stream_id: StreamId,
     grantee_account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
-    auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantDeviceAuthority>> {
-    if let Some(reason) = auth_len_preflight(conn, owner_account_id, auth_len)? {
-        return Ok(fold::AuthorityQuery::Parked(reason));
-    }
     let row: Option<StoredGrantRow> = conn
         .query_row(
             "SELECT stream_id, grantee_account_id, role, effective_at, closed_at
@@ -644,19 +617,15 @@ fn grant_effective_for_device_in_snapshot(
     Ok(fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority { grant, boundary }))
 }
 
-/// Resolve the owner-bound `StreamOwn` fact from the same authority snapshot as the `auth_len`
-/// preflight. A missing ownership fact is recoverable: the caller may simply be ahead of us.
+/// Resolve the owner-bound `StreamOwn` fact from the current fold. A missing ownership fact is
+/// recoverable: the citing author may simply hold control ops we have not folded yet.
 pub(crate) fn stream_owner_effective(
     conn: &Connection,
     account_id: AccountId,
     stream_id: StreamId,
-    auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityQuery<EntryHash>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     let conn: &Connection = &read_tx;
-    if let Some(reason) = auth_len_preflight(conn, account_id, auth_len)? {
-        return Ok(fold::AuthorityQuery::Parked(reason));
-    }
     let row: Option<(Vec<u8>, i64)> = conn
         .query_row(
             "SELECT own_id, effective_at FROM account_stream_ownership
@@ -666,7 +635,7 @@ pub(crate) fn stream_owner_effective(
         )
         .optional()?;
     let Some((own_id, effective_at)) = row else {
-        return Ok(fold::AuthorityQuery::Parked(fold::AuthorityParkReason::UnknownReference));
+        return Ok(fold::AuthorityQuery::Unknown);
     };
     validated_fact(fixed(&own_id)?, effective_at, None)
 }
@@ -678,13 +647,9 @@ pub(super) fn grant_device_cut(
     owner_account_id: AccountId,
     grant_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
-    auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityQuery<Option<DeviceCut>>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     let conn: &Connection = &read_tx;
-    if let Some(reason) = auth_len_preflight(conn, owner_account_id, auth_len)? {
-        return Ok(fold::AuthorityQuery::Parked(reason));
-    }
     let grant_exists: bool = conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM account_stream_grants
@@ -728,11 +693,17 @@ fn load_grant_device_cut(
     .transpose()
 }
 
-fn auth_len_preflight(
+/// Measure an asserted control-fold length against our own folded view (§7) — the ONE seam that
+/// reads `auth_len`. Keeping it out of the fact queries above is what stops a counter from acting
+/// as an authority input: facts always answer from the current fold, and the caller applies this
+/// verdict as its own phase, where an `Ahead` author parks rather than pre-empting a decision the
+/// fold has already made. An account we hold nothing for has folded zero effective ops (its facts
+/// resolve `Unknown` long before freshness is consulted).
+pub(crate) fn auth_len_freshness(
     conn: &Connection,
     account_id: AccountId,
-    auth_len: u64,
-) -> anyhow::Result<Option<fold::AuthorityParkReason>> {
+    asserted_auth_len: u64,
+) -> anyhow::Result<fold::AuthorityFreshness> {
     let effective_count: Option<i64> = conn
         .query_row(
             "SELECT effective_count FROM account_auth_state WHERE account_id = ?1",
@@ -740,14 +711,12 @@ fn auth_len_preflight(
             |row| row.get(0),
         )
         .optional()?;
-    let Some(effective_count) = effective_count else {
-        return Ok(Some(fold::AuthorityParkReason::UnknownReference));
-    };
-    if auth_len > u64::try_from(effective_count)? {
-        Ok(Some(fold::AuthorityParkReason::AuthLenAhead))
+    let effective_count = effective_count.map(u64::try_from).transpose()?.unwrap_or_default();
+    Ok(if asserted_auth_len > effective_count {
+        fold::AuthorityFreshness::Ahead
     } else {
-        Ok(None)
-    }
+        fold::AuthorityFreshness::CurrentOrBehind
+    })
 }
 
 fn missing_reference<T>(
@@ -763,7 +732,7 @@ fn missing_reference<T>(
         )
         .optional()?;
     Ok(match stored_account {
-        None => fold::AuthorityQuery::Parked(fold::AuthorityParkReason::UnknownReference),
+        None => fold::AuthorityQuery::Unknown,
         Some(stored) if fixed(&stored)? != account_id.to_bytes() =>
             fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject),
         Some(_) =>
@@ -1796,7 +1765,6 @@ mod tests {
                 stream_id,
                 grantee,
                 grantee_device.fp,
-                3,
             )
             .unwrap(),
             fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority {
@@ -1855,11 +1823,11 @@ mod tests {
             ),
         );
         assert_eq!(
-            stream_owner_effective(&conn, account_id, stream_id, 4).unwrap(),
+            stream_owner_effective(&conn, account_id, stream_id).unwrap(),
             fold::AuthorityQuery::Effective(own_hash),
         );
         assert_eq!(
-            grant_device_cut(&conn, account_id, grant_id, grantee_device.fp, 4).unwrap(),
+            grant_device_cut(&conn, account_id, grant_id, grantee_device.fp).unwrap(),
             fold::AuthorityQuery::Effective(Some(DeviceCut {
                 device_fingerprint: grantee_device.fp,
                 seq: u64::MAX,
@@ -1874,7 +1842,6 @@ mod tests {
                 stream_id,
                 grantee,
                 grantee_device.fp,
-                4,
             )
             .unwrap(),
             fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority {
@@ -1891,7 +1858,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            grant_device_cut(&conn, account_id, grant_id, Dev::new(3).fp, 4).unwrap(),
+            grant_device_cut(&conn, account_id, grant_id, Dev::new(3).fp).unwrap(),
             fold::AuthorityQuery::Effective(None),
         );
         assert!(matches!(
@@ -1902,7 +1869,6 @@ mod tests {
                 stream_id,
                 grantee,
                 Dev::new(3).fp,
-                4,
             )
             .unwrap(),
             fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority {
@@ -1910,23 +1876,37 @@ mod tests {
                 ..
             }),
         ));
+        // A citation that files a grant we DO hold under an account it does not belong to is
+        // refuted by the entry's own bytes, so it is a wrong subject — not an unknown reference.
+        // (The account-wide `auth_len` preflight used to mask this as `Unknown` whenever we
+        // happened to hold no authority state for the claimed account.)
         assert_eq!(
             grant_device_cut(
                 &conn,
                 AccountId::from_bytes([0x66; 32]),
                 grant_id,
                 grantee_device.fp,
-                0,
             )
             .unwrap(),
-            fold::AuthorityQuery::Parked(fold::AuthorityParkReason::UnknownReference),
+            fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject),
+        );
+        // A grant we hold nothing about stays recoverable: refetch and re-evaluate.
+        assert_eq!(
+            grant_device_cut(
+                &conn,
+                AccountId::from_bytes([0x66; 32]),
+                [0x77; 32],
+                grantee_device.fp,
+            )
+            .unwrap(),
+            fold::AuthorityQuery::Unknown,
         );
         assert!(matches!(
-            grant_effective(&conn, account_id, grant_id, stream_id, grantee, 3).unwrap(),
+            grant_effective(&conn, account_id, grant_id, stream_id, grantee).unwrap(),
             fold::AuthorityQuery::Effective(fold::GrantAuthority { role: GrantRole::Writer, .. })
         ));
         assert_eq!(
-            grant_effective(&conn, account_id, grant_id, stream_id, grantee, 4).unwrap(),
+            grant_effective(&conn, account_id, grant_id, stream_id, grantee).unwrap(),
             fold::AuthorityQuery::Effective(fold::GrantAuthority {
                 stream_id,
                 grantee_account_id: grantee,
@@ -1934,19 +1914,19 @@ mod tests {
             }),
         );
         assert!(matches!(
-            roster_ref_effective(&conn, account_id, genesis_hash, founder.fp, 1).unwrap(),
+            roster_ref_effective(&conn, account_id, genesis_hash, founder.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterAuthority {
                 current_role: DeviceRole::Owner,
                 ..
             })
         ));
         assert!(matches!(
-            owner_incarnation_effective(&conn, account_id, genesis_hash, founder.fp, 1).unwrap(),
+            owner_incarnation_effective(&conn, account_id, genesis_hash, founder.fp).unwrap(),
             fold::AuthorityQuery::Effective(_)
         ));
         assert_eq!(
-            grant_effective(&conn, account_id, [0xaa; 32], stream_id, grantee, 4).unwrap(),
-            fold::AuthorityQuery::Parked(fold::AuthorityParkReason::UnknownReference),
+            grant_effective(&conn, account_id, [0xaa; 32], stream_id, grantee).unwrap(),
+            fold::AuthorityQuery::Unknown,
         );
 
         // Corrupt projection state must fail closed: an open grant cannot legitimately retain a
@@ -1964,7 +1944,6 @@ mod tests {
             stream_id,
             grantee,
             grantee_device.fp,
-            4,
         )
         .unwrap_err();
         assert!(
@@ -2018,7 +1997,10 @@ mod tests {
         let reader = Connection::open(&path).unwrap();
         let writer = Connection::open(&path).unwrap();
         let snapshot = Transaction::new_unchecked(&reader, TransactionBehavior::Deferred).unwrap();
-        assert_eq!(auth_len_preflight(&snapshot, account_id, 4).unwrap(), None);
+        assert_eq!(
+            auth_len_freshness(&snapshot, account_id, 4).unwrap(),
+            fold::AuthorityFreshness::CurrentOrBehind,
+        );
 
         let write_tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).unwrap();
         write_tx
@@ -2044,7 +2026,6 @@ mod tests {
             stream_id,
             grantee,
             grantee_device.fp,
-            4,
         )
         .unwrap();
         assert!(matches!(
@@ -2064,7 +2045,6 @@ mod tests {
                 stream_id,
                 grantee,
                 grantee_device.fp,
-                4,
             )
             .unwrap(),
             fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority {
@@ -2136,11 +2116,11 @@ mod tests {
 
         schema::migrate_forward(&conn).unwrap();
         assert_eq!(
-            stream_owner_effective(&conn, account_id, stream_id, 2).unwrap(),
+            stream_owner_effective(&conn, account_id, stream_id).unwrap(),
             fold::AuthorityQuery::Effective(own_hash),
         );
         assert!(matches!(
-            roster_ref_effective(&conn, account_id, genesis_hash, founder.fp, 2).unwrap(),
+            roster_ref_effective(&conn, account_id, genesis_hash, founder.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterAuthority {
                 current_role: DeviceRole::Owner,
                 ..
@@ -2232,9 +2212,25 @@ mod tests {
         );
         account_ingest(&conn, &self_grant_bytes, NOW + 3).unwrap();
 
+        // Freshness is its own seam: an ahead assertion is measured against the fold, and it does
+        // NOT reach into the fact queries — the grant resolves from the current fold either way, so
+        // an ahead counter can neither hide nor manufacture an authority verdict.
         assert_eq!(
-            grant_effective(&conn, account_id, grant_id, stream_id, grantee, 99).unwrap(),
-            fold::AuthorityQuery::Parked(fold::AuthorityParkReason::AuthLenAhead),
+            auth_len_freshness(&conn, account_id, 99).unwrap(),
+            fold::AuthorityFreshness::Ahead,
+        );
+        assert_eq!(
+            auth_len_freshness(&conn, account_id, 3).unwrap(),
+            fold::AuthorityFreshness::CurrentOrBehind,
+        );
+        assert!(matches!(
+            grant_effective(&conn, account_id, grant_id, stream_id, grantee).unwrap(),
+            fold::AuthorityQuery::Effective(_),
+        ));
+        assert_eq!(
+            auth_len_freshness(&conn, AccountId::from_bytes([0x7e; 32]), 1).unwrap(),
+            fold::AuthorityFreshness::Ahead,
+            "an account we hold nothing for has folded zero effective ops",
         );
         assert_eq!(
             grant_effective(
@@ -2243,13 +2239,12 @@ mod tests {
                 grant_id,
                 crate::oplog::stream::StreamId::from_bytes([0x55; 32]),
                 grantee,
-                3,
             )
             .unwrap(),
             fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject),
         );
         assert_eq!(
-            grant_effective(&conn, account_id, self_grant_id, stream_id, account_id, 3).unwrap(),
+            grant_effective(&conn, account_id, self_grant_id, stream_id, account_id).unwrap(),
             fold::AuthorityQuery::Invalid(
                 fold::AuthorityInvalidReason::ReferencedEntryNotEffective,
             ),
@@ -2259,14 +2254,14 @@ mod tests {
             grant_id.as_slice(),
         ])
         .unwrap();
-        assert!(grant_effective(&conn, account_id, grant_id, stream_id, grantee, 3).is_err());
+        assert!(grant_effective(&conn, account_id, grant_id, stream_id, grantee).is_err());
         conn.execute(
             "UPDATE account_stream_grants SET role = 'reader', effective_at = -1
              WHERE grant_id = ?1",
             [grant_id.as_slice()],
         )
         .unwrap();
-        assert!(grant_effective(&conn, account_id, grant_id, stream_id, grantee, 3).is_err());
+        assert!(grant_effective(&conn, account_id, grant_id, stream_id, grantee).is_err());
         conn.execute("UPDATE account_stream_grants SET effective_at = 2 WHERE grant_id = ?1", [
             grant_id.as_slice(),
         ])
@@ -2276,12 +2271,12 @@ mod tests {
             params![stream_id.to_bytes().as_slice(), [0u8; 31].as_slice()],
         )
         .unwrap();
-        assert!(stream_owner_effective(&conn, account_id, stream_id, 3).is_err());
+        assert!(stream_owner_effective(&conn, account_id, stream_id).is_err());
         conn.execute("UPDATE account_auth_state SET effective_count = -1 WHERE account_id = ?1", [
             account_id.to_bytes().as_slice(),
         ])
         .unwrap();
-        assert!(roster_ref_effective(&conn, account_id, genesis_hash, founder.fp, 0).is_err());
+        assert!(auth_len_freshness(&conn, account_id, 0).is_err());
     }
 
     #[test]
@@ -3084,7 +3079,7 @@ mod tests {
             account_ingest(&conn, bytes, NOW + 2 + i64::try_from(offset).unwrap()).unwrap();
         }
         assert!(matches!(
-            roster_ref_effective(&conn, account_id, b2, g.fp, 5).unwrap(),
+            roster_ref_effective(&conn, account_id, b2, g.fp).unwrap(),
             fold::AuthorityQuery::Effective(_)
         ));
 
@@ -3100,7 +3095,7 @@ mod tests {
         assert_eq!(status(&conn, &b1).as_deref(), Some("condemned"));
         assert_eq!(status(&conn, &b2).as_deref(), Some("condemned"));
         assert_eq!(
-            roster_ref_effective(&conn, account_id, b2, g.fp, 4).unwrap(),
+            roster_ref_effective(&conn, account_id, b2, g.fp).unwrap(),
             fold::AuthorityQuery::Invalid(
                 fold::AuthorityInvalidReason::ReferencedEntryNotEffective
             ),
@@ -3118,11 +3113,11 @@ mod tests {
         assert_eq!(status(&conn, &b1).as_deref(), Some("accepted"));
         assert_eq!(status(&conn, &b2).as_deref(), Some("accepted"));
         assert!(matches!(
-            roster_ref_effective(&conn, account_id, b2, g.fp, 7).unwrap(),
+            roster_ref_effective(&conn, account_id, b2, g.fp).unwrap(),
             fold::AuthorityQuery::Effective(_)
         ));
         assert_eq!(
-            owner_control_authority(&conn, account_id, add_owner, owner.fp, 7).unwrap(),
+            owner_control_authority(&conn, account_id, add_owner, owner.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::OwnerChainAuthority {
                 owner: fold::OwnerAuthority { device_fingerprint: owner.fp },
                 device_boundary: fold::AuthorityBoundary::Cut { seq: 2, hash: b2 },
@@ -3146,7 +3141,7 @@ mod tests {
         .unwrap();
         schema::migrate_forward(&conn).unwrap();
         assert!(matches!(
-            owner_control_authority(&conn, account_id, add_owner, owner.fp, 7).unwrap(),
+            owner_control_authority(&conn, account_id, add_owner, owner.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::OwnerChainAuthority {
                 device_boundary: fold::AuthorityBoundary::Cut { seq: 2, hash },
                 ..
@@ -3277,7 +3272,7 @@ mod tests {
             })
         };
         assert_eq!(
-            owner_control_authority(&conn, account, owner_id, owner.fp, 0).unwrap(),
+            owner_control_authority(&conn, account, owner_id, owner.fp).unwrap(),
             expected(
                 fold::AuthorityBoundary::Cut { seq: 1, hash: heads[1] },
                 fold::AuthorityBoundary::Cut { seq: 0, hash: heads[0] },
@@ -3296,7 +3291,7 @@ mod tests {
             op(account, &founder, 4, Some(remove_hash), Some(genesis), &extend_incarnation);
         account_ingest(&conn, &bytes, NOW + 7).unwrap();
         assert_eq!(
-            owner_control_authority(&conn, account, owner_id, owner.fp, 0).unwrap(),
+            owner_control_authority(&conn, account, owner_id, owner.fp).unwrap(),
             expected(
                 fold::AuthorityBoundary::Cut { seq: 1, hash: heads[1] },
                 fold::AuthorityBoundary::Cut { seq: 2, hash: heads[2] },
@@ -3313,7 +3308,7 @@ mod tests {
         );
         account_ingest(&conn, &bytes, NOW + 8).unwrap();
         assert_eq!(
-            owner_control_authority(&conn, account, owner_id, owner.fp, 0).unwrap(),
+            owner_control_authority(&conn, account, owner_id, owner.fp).unwrap(),
             expected(
                 fold::AuthorityBoundary::Cut { seq: 2, hash: heads[2] },
                 fold::AuthorityBoundary::Cut { seq: 2, hash: heads[2] },
@@ -3440,7 +3435,7 @@ mod tests {
             });
         account_ingest(&conn, &promote_bytes, NOW + 2).unwrap();
         assert_eq!(
-            roster_ref_effective(&conn, account_id, add, member.fp, 3).unwrap(),
+            roster_ref_effective(&conn, account_id, add, member.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterAuthority {
                 device_fingerprint: member.fp,
                 current_role: DeviceRole::Owner,
@@ -3457,14 +3452,14 @@ mod tests {
         );
         account_ingest(&conn, &demote_bytes, NOW + 3).unwrap();
         assert_eq!(
-            roster_ref_effective(&conn, account_id, add, member.fp, 4).unwrap(),
+            roster_ref_effective(&conn, account_id, add, member.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterAuthority {
                 device_fingerprint: member.fp,
                 current_role: DeviceRole::Member,
             }),
         );
         assert_eq!(
-            owner_incarnation_effective(&conn, account_id, promote, member.fp, 4).unwrap(),
+            owner_incarnation_effective(&conn, account_id, promote, member.fp).unwrap(),
             fold::AuthorityQuery::Invalid(
                 fold::AuthorityInvalidReason::ReferencedEntryNotEffective,
             ),
@@ -3480,7 +3475,7 @@ mod tests {
         );
         account_ingest(&conn, &remove_bytes, NOW + 4).unwrap();
         assert_eq!(
-            roster_ref_effective(&conn, account_id, add, member.fp, 5).unwrap(),
+            roster_ref_effective(&conn, account_id, add, member.fp).unwrap(),
             fold::AuthorityQuery::Invalid(
                 fold::AuthorityInvalidReason::ReferencedEntryNotEffective,
             ),
@@ -3937,14 +3932,14 @@ mod tests {
         account_ingest(&conn, &remove_bytes, NOW + 2).unwrap();
 
         assert_eq!(
-            roster_content_authority(&conn, account, roster_ref, member.fp, listed, 3).unwrap(),
+            roster_content_authority(&conn, account, roster_ref, member.fp, listed).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterContentAuthority {
                 device_fingerprint: member.fp,
                 boundary: fold::AuthorityBoundary::Cut { seq: u64::MAX, hash: [0xa5; 32] },
             }),
         );
         assert_eq!(
-            roster_content_authority(&conn, account, roster_ref, member.fp, unlisted, 3).unwrap(),
+            roster_content_authority(&conn, account, roster_ref, member.fp, unlisted).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterContentAuthority {
                 device_fingerprint: member.fp,
                 boundary: fold::AuthorityBoundary::Closed,
@@ -3967,7 +3962,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            owner_control_authority(&conn, account, owner_id, founder.fp, 1).is_err(),
+            owner_control_authority(&conn, account, owner_id, founder.fp).is_err(),
             "a partial cut tuple must never become open authority",
         );
         conn.execute(
@@ -3978,7 +3973,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            owner_control_authority(&conn, account, owner_id, founder.fp, 1).is_err(),
+            owner_control_authority(&conn, account, owner_id, founder.fp).is_err(),
             "negative fact epochs fail closed",
         );
         conn.execute(
@@ -3992,7 +3987,7 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            owner_control_authority(&conn, account, owner_id, founder.fp, 1).is_err(),
+            owner_control_authority(&conn, account, owner_id, founder.fp).is_err(),
             "a closed roster and owner cannot jointly retain Open/Open authority",
         );
     }
