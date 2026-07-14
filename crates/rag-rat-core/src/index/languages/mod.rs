@@ -4,6 +4,8 @@
 //! resolver policy in one package. The parser walk, edge walk, and resolver orchestration stay in
 //! their subsystem modules and depend only on the narrow traits defined here.
 
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use tree_sitter::Node;
@@ -26,6 +28,16 @@ pub(super) type SymbolMatch<'tree> = (&'static str, Node<'tree>);
 /// walk.
 pub(super) trait ParserBackend: Sync {
     fn parser_kind(&self, path: &Path) -> ParserKind;
+
+    /// Every symbol kind this backend can emit — the declared contract behind [`all_symbol_kinds`].
+    ///
+    /// Required (not defaulted) on purpose: downstream consumers rank and filter by symbol kind,
+    /// and a kind nobody downstream knows about silently sorts into the "unknown" bucket.
+    /// Making this part of the trait means a new language cannot be added without stating its
+    /// kinds, and `symbol_kind_rank_covers_every_indexed_kind` then fails until the ranking
+    /// accounts for them. The parser walk debug-asserts that what a backend emits is what it
+    /// declared here.
+    fn symbol_kinds(&self) -> &'static [&'static str];
 
     fn symbol_node<'tree>(&self, node: Node<'tree>, text: &str) -> Option<SymbolMatch<'tree>>;
 
@@ -213,6 +225,24 @@ pub(super) fn resolver_policy_for_name(
 
 pub(super) fn is_plumbing_node(language: Language, node: Node<'_>) -> bool {
     parser_backend(language).is_plumbing_node(node)
+}
+
+/// Every symbol kind ANY registered language can emit, deduplicated and sorted — the single source
+/// of truth for the completeness tests guarding downstream code that must handle the full kind
+/// universe (today: the `symbol_lookup` kind ranking). Derived from the backends themselves, so
+/// registering a language adds its kinds here automatically and the consumers' completeness tests
+/// fail until they account for them.
+///
+/// Test-only: the production consumer is a static table, and this exists to PROVE that table covers
+/// the registry. [`ParserBackend::symbol_kinds`] itself is live in every build — the parser walk
+/// debug-asserts each emitted kind against it.
+#[cfg(test)]
+pub(crate) fn all_symbol_kinds() -> BTreeSet<&'static str> {
+    Language::all()
+        .iter()
+        .flat_map(|&language| parser_backend(language).symbol_kinds())
+        .copied()
+        .collect()
 }
 
 pub(super) fn requires_same_language_target(

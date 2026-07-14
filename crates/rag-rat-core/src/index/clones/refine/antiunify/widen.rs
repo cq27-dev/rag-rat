@@ -6,8 +6,22 @@ use super::spans::subtree_token_count;
 /// `LIT_STRING_CONTENT` / `LIT_STRING_FRAGMENT`): Rust/Python `string_content` and TS/JS
 /// `string_fragment` (#232 #2a). Both are the inner text leaf that needs widening to its enclosing
 /// quote-bearing node so the hole covers the WHOLE `"hello"`.
+///
+/// Swift's are `line_str_text` / `multi_line_str_text` (the `"…"` and `"""…"""` bodies) and
+/// `raw_str_part` / `raw_str_end_part` (the `#"…"#` body — an UNINTERPOLATED raw string arrives as
+/// a single `raw_str_end_part` leaf carrying its own delimiters). They must widen for the same
+/// reason every other language's do: a hole over the bare text leaf, with the quotes left as fixed
+/// template text, does not describe the `&str` value that actually varies.
 fn is_string_body_leaf_kind(kind: &str) -> bool {
-    matches!(kind, "string_content" | "string_fragment")
+    matches!(
+        kind,
+        "string_content"
+            | "string_fragment"
+            | "line_str_text"
+            | "multi_line_str_text"
+            | "raw_str_part"
+            | "raw_str_end_part"
+    )
 }
 
 /// The quote-bearing string-NODE kinds that wrap a string-body leaf: Rust/Python `string_literal`,
@@ -21,8 +35,21 @@ fn is_string_body_leaf_kind(kind: &str) -> bool {
 /// by REFUSING to widen to any string node whose subtree carries a `template_substitution` — the
 /// bare fragment run is left as-is (an honest under-report, never an over-claim). So this predicate
 /// stays a simple kind test; the interpolation safety lives in the widen gate.
+///
+/// Swift's quote-bearing nodes are `line_string_literal` (`"…"`), `multi_line_string_literal`
+/// (`"""…"""`), and `raw_string_literal` (`#"…"#`). They carry the SAME interpolation hazard as a
+/// template string — Swift's `\(x)` — so the widen gate rejects them on the same grounds; see
+/// [`string_node_has_interpolation`].
 pub(super) fn is_string_node_kind(kind: &str) -> bool {
-    matches!(kind, "string_literal" | "string" | "template_string")
+    matches!(
+        kind,
+        "string_literal"
+            | "string"
+            | "template_string"
+            | "line_string_literal"
+            | "multi_line_string_literal"
+            | "raw_string_literal"
+    )
 }
 
 /// `true` for a leaf that can legitimately sit INSIDE a quote-bearing string node — either the
@@ -35,21 +62,28 @@ pub(super) fn is_string_node_kind(kind: &str) -> bool {
 /// inside a non-empty literal are also string-internal and widen the same way.
 ///
 /// NOT a `template_substitution` delimiter (`${` / `}`): those bound an interpolation, which the
-/// widen gate refuses to cross — see [`is_string_node_kind`].
+/// widen gate refuses to cross — see [`is_string_node_kind`]. Same for Swift's `\(` interpolation
+/// start; its `"""` multi-line delimiter and `str_escaped_char` escape leaf ARE string-internal and
+/// widen like every other grammar's.
 fn is_string_delimiter_or_body_leaf_kind(kind: &str) -> bool {
-    is_string_body_leaf_kind(kind) || matches!(kind, "\"" | "`" | "'" | "escape_sequence")
+    is_string_body_leaf_kind(kind)
+        || matches!(kind, "\"" | "`" | "'" | "\"\"\"" | "escape_sequence" | "str_escaped_char")
 }
 
-/// `true` when the anchor subtree rooted at `str_col` contains a `template_substitution` — i.e. it
-/// is an INTERPOLATED template literal (`` `hi${x}lo` ``). Widening a fragment/quote run to such a
-/// node would swallow the `${…}` interpolation into the hole, so [`widen_string_content_run`] does
-/// not widen across it (#254 caution). Walks the contiguous pre-order subtree by byte containment,
-/// mirroring [`subtree_token_count`].
+/// `true` when the anchor subtree rooted at `str_col` contains an interpolation — a TS/JS
+/// `template_substitution` (`` `hi${x}lo` ``), or Swift's `interpolated_expression` /
+/// `raw_str_interpolation` (`"hi\(x)lo"`, `#"r\#(y)s"#`). Widening a fragment/quote run to such a
+/// node would swallow the interpolated EXPRESSION — live code, not a value — into the hole, so
+/// [`widen_string_content_run`] does not widen across it (#254 caution). Walks the contiguous
+/// pre-order subtree by byte containment, mirroring [`subtree_token_count`].
 fn string_node_has_interpolation(anchor: &RefineMember, str_col: usize) -> bool {
     let root_end = anchor.node_spans[str_col].end_byte;
     let mut k = str_col + 1;
     while k < anchor.node_spans.len() && anchor.node_spans[k].start_byte < root_end {
-        if anchor.node_spans[k].kind == "template_substitution" {
+        if matches!(
+            anchor.node_spans[k].kind,
+            "template_substitution" | "interpolated_expression" | "raw_str_interpolation"
+        ) {
             return true;
         }
         k += 1;

@@ -18,6 +18,25 @@ fn is_local_qualified_root(root: &str) -> bool {
 }
 
 impl ParserBackend for Swift {
+    fn symbol_kinds(&self) -> &'static [&'static str] {
+        &[
+            "actor",
+            "class",
+            "constructor",
+            "enum",
+            "enum_case",
+            "extension",
+            "function",
+            "macro",
+            "operator",
+            "precedence_group",
+            "property",
+            "protocol",
+            "struct",
+            "type",
+        ]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Swift
     }
@@ -91,9 +110,65 @@ impl ParserBackend for Swift {
         }
     }
 
+    /// Swift's two test frameworks, neither of which the path heuristic alone catches:
+    /// swift-testing marks tests with an `@Test` / `@Suite` ATTRIBUTE, and XCTest by inheriting
+    /// `XCTestCase` with `test`-prefixed methods. A test living outside a `Tests/` directory —
+    /// an XCTestCase beside the code it exercises, a `@Test` in a sample target — is otherwise
+    /// indexed as production source and never demoted in search or `repo_brief`. Every other
+    /// language with a test convention (Rust `#[test]`, Kotlin `@Test`, Python `test_*`)
+    /// already overrides this; Swift declared none.
+    fn is_test_symbol(&self, text: &str, node: Node<'_>, scope_path: &str, name: &str) -> bool {
+        has_test_attribute(node, text)
+            || inherits_xctest_case(node, text)
+            || (name.starts_with("test") && scope_path_has_test_type(scope_path))
+    }
+
     fn is_plumbing_node(&self, node: Node<'_>) -> bool {
         node.kind().contains("comment") || node.kind() == "import_declaration"
     }
+}
+
+/// A swift-testing `@Test` / `@Suite` attribute on this declaration. tree-sitter-swift nests
+/// attributes under a `modifiers` child (`modifiers` → `attribute` → `user_type`), so this descends
+/// one level rather than scanning the declaration's direct children. Matched on the attribute's own
+/// name node, so `@TestHarness` does not read as `@Test`.
+fn has_test_attribute(node: Node<'_>, text: &str) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|child| child.kind() == "modifiers")
+        .flat_map(|modifiers| {
+            let mut inner = modifiers.walk();
+            modifiers.children(&mut inner).collect::<Vec<_>>()
+        })
+        .filter(|child| child.kind() == "attribute")
+        .any(|attribute| {
+            syntax::identifier_nodes(attribute)
+                .first()
+                .and_then(|name| parser::node_text(*name, text))
+                .is_some_and(|name| matches!(name.as_str(), "Test" | "Suite"))
+        })
+}
+
+/// An XCTest base class in this type's inheritance clause (`class FooTests: XCTestCase`). The
+/// conformance list is where XCTest declares itself; there is no attribute to key on.
+fn inherits_xctest_case(node: Node<'_>, text: &str) -> bool {
+    if node.kind() != "class_declaration" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|child| child.kind() == "inheritance_specifier")
+        .filter_map(|specifier| parser::node_text(specifier, text))
+        .any(|specifier| specifier.trim_end_matches("()").ends_with("XCTestCase"))
+}
+
+/// A `test`-prefixed method inside a type whose name reads as a test type (`FooTests`,
+/// `FooTestCase`) — the XCTest convention, mirroring the Python backend's
+/// `scope_path_has_test_class` for members of a class the parser sees only by name.
+fn scope_path_has_test_type(scope_path: &str) -> bool {
+    scope_path
+        .split("::")
+        .any(|segment| segment.ends_with("Tests") || segment.ends_with("TestCase"))
 }
 
 fn recovered_precedence_group_name<'tree>(node: Node<'tree>, text: &str) -> Option<Node<'tree>> {

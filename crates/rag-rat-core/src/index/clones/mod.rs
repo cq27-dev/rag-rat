@@ -31,7 +31,17 @@ use tree_sitter::Node;
 /// instead of alpha-renaming; (2) the C/C++ `char_literal` VALUE leaf (`character`) now buckets to
 /// `LIT_CHARACTER` instead of leaking the char value verbatim. Same auto-exclude-then-recompute
 /// path as the v2 bump (no schema migration); a bump forces re-fingerprinting on the next reindex.
-pub(crate) const NORM_VERSION: i64 = 3;
+///
+/// `4` (#635): Swift's string-BODY leaves (`line_str_text`, `multi_line_str_text`, `raw_str_part`,
+/// `raw_str_end_part`, `str_escaped_char`) now bucket instead of leaking their VALUE verbatim.
+/// tree-sitter-swift wraps them in an internal `line_string_literal` node, and only LEAVES bucket,
+/// so the `ends_with("literal")` arm never fired for the value — two Swift bodies differing only in
+/// a string constant failed to normalize equal. Partition-contained like the v3 bump (missed-clone
+/// recall, never false positives). Also widens the fingerprintable set: Swift closure properties
+/// (`let f = { … }`) and `constructor` (`init`) bodies now fingerprint like every other function
+/// body. Same auto-exclude-then-recompute path; the bump forces re-fingerprinting on the next
+/// reindex.
+pub(crate) const NORM_VERSION: i64 = 4;
 /// Bumped when the LCS alignment / refinement algorithm changes; participates in the content-
 /// addressed `refinement_key` and in the `clone_refinements` cache freshness predicate, so a bump
 /// invalidates every cached refinement without a schema migration (the same discipline as
@@ -105,19 +115,24 @@ pub(crate) fn fingerprint_symbol(
 
 /// `true` when a symbol's AST node is a FUNCTION-VALUED declarator: a `variable_declarator`
 /// (`const f = () => {…}`, `let f = function(){…}`) or `public_field_definition` (a class-field
-/// arrow handler) whose `value` child is an `arrow_function` / `function_expression` (#232 #5).
+/// arrow handler) whose `value` child is an `arrow_function` / `function_expression` (#232 #5), or
+/// Swift's `property_declaration` whose `value` is a `lambda_literal`
+/// (`let handler: (Int) -> Void = { … }`).
 ///
-/// These carry symbol `kind = "const"` in `parser.rs` (NOT changed — `kind` drives chunking, graph
-/// edges, and search facets; see the plan's invariant) but ARE real function bodies worth
-/// fingerprinting: two `const x = () => {…}` clones match each other (same declarator shape). The
-/// node-level check is what keeps a plain-value `const x = 5;` excluded — its `value` child is a
-/// `number`, not a function. Probe-confirmed against the wired TS grammar: matches const-arrow,
-/// const-func-expr, let-async-arrow, and class-field-arrow; rejects destructure / number / object.
+/// These carry symbol `kind = "const"` / `"property"` in `parser.rs` (NOT changed — `kind` drives
+/// chunking, graph edges, and search facets; see the plan's invariant) but ARE real function bodies
+/// worth fingerprinting: two `const x = () => {…}` clones match each other (same declarator shape).
+/// The node-level check is what keeps a plain-value `const x = 5;` / `let plain = 5` excluded — its
+/// `value` child is a `number` / `integer_literal`, not a function. Probe-confirmed against the
+/// wired grammars: matches TS const-arrow, const-func-expr, let-async-arrow, class-field-arrow and
+/// Swift closure properties; rejects destructure / number / object.
 fn symbol_is_function_valued(node: Node<'_>) -> bool {
-    matches!(node.kind(), "variable_declarator" | "public_field_definition")
-        && node
-            .child_by_field_name("value")
-            .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression"))
+    matches!(
+        node.kind(),
+        "variable_declarator" | "public_field_definition" | "property_declaration"
+    ) && node.child_by_field_name("value").is_some_and(|v| {
+        matches!(v.kind(), "arrow_function" | "function_expression" | "lambda_literal")
+    })
 }
 
 /// Baseline fingerprints for a file's fingerprintable symbols, walking the SHARED parse tree (no
@@ -139,9 +154,13 @@ pub(crate) fn fingerprint_symbols(
         let Some(node) = root.descendant_for_byte_range(symbol.start_byte, symbol.end_byte) else {
             continue;
         };
-        // Fingerprint a `function` symbol OR a function-valued declarator (the node check rejects
-        // plain-value consts — `const x = 5;` — so symbol `kind` stays unchanged, #232 #5 / R2).
-        if symbol.kind != "function" && !symbol_is_function_valued(node) {
+        // Fingerprint a `function` symbol, a `constructor` (Swift `init` — a real function body,
+        // and the direct analog of a Rust `fn new()`, which fingerprints as a `function`),
+        // OR a function-valued declarator (the node check rejects plain-value consts —
+        // `const x = 5;` — so symbol `kind` stays unchanged, #232 #5 / R2).
+        if !matches!(symbol.kind.as_str(), "function" | "constructor")
+            && !symbol_is_function_valued(node)
+        {
             continue;
         }
         if let Some(fp) = fingerprint_symbol(node, text, lang) {
@@ -198,13 +217,53 @@ mod tests {
     }
 
     #[test]
-    fn norm_version_is_3() {
-        // #253: the Kotlin boolean/null leaf-text override + the C/C++ `character` value bucket
-        // changed the normalization stream again (on top of the #232 comment-skip + multi-language
-        // bucketing that took it to 2), so NORM_VERSION must be 3. The read filter + content-
+    fn norm_version_is_4() {
+        // #635: Swift string-body leaves now bucket (their VALUE used to leak into the stream), and
+        // Swift closure properties + `init` bodies joined the fingerprintable set — a stream change
+        // on top of the #253 Kotlin/C++ bucketing that took it to 3. The read filter + content-
         // addressed refinement key both key off this constant, so a stream change without the bump
         // silently serves stale fingerprints/refinements.
-        assert_eq!(NORM_VERSION, 3);
+        assert_eq!(NORM_VERSION, 4);
+    }
+
+    /// Swift closure-valued properties and `init` bodies are fingerprintable function bodies, and a
+    /// plain-value property is not — the `value`-field check is what separates them.
+    #[test]
+    fn swift_closure_properties_and_inits_fingerprint_but_plain_values_do_not() {
+        let closure = "struct S {\n  let handler: (Int) -> Void = { value in\n    let a = \
+                       compute(value)\n    let b = transform(a)\n    let c = combine(a, b)\n    \
+                       report(c)\n  }\n}\n";
+        assert!(
+            fp_lang(closure, "S.swift", Language::Swift).is_some(),
+            "a Swift closure-valued property is a real function body"
+        );
+
+        let init = "struct S {\n  init(seed: Int) {\n    let a = compute(seed)\n    let b = \
+                    transform(a)\n    let c = combine(a, b)\n    report(c)\n  }\n}\n";
+        assert!(
+            fp_lang(init, "S.swift", Language::Swift).is_some(),
+            "a Swift init is a real function body (the analog of a Rust `fn new()`)"
+        );
+
+        // A plain-value property has an `integer_literal` value, not a closure: not
+        // fingerprintable.
+        let parsed = parser::parse_file(
+            Path::new("S.swift"),
+            Language::Swift,
+            "struct S {\n  let plain = 5\n}\n",
+        )
+        .expect("parse");
+        let symbols = symbols::from_parsed(&parsed.symbols);
+        let fingerprints = fingerprint_symbols(
+            parsed.root(),
+            "struct S {\n  let plain = 5\n}\n",
+            Language::Swift,
+            &symbols,
+        );
+        assert!(
+            fingerprints.is_empty(),
+            "a plain-value Swift property must not be fingerprinted: {fingerprints:?}"
+        );
     }
 
     #[test]

@@ -14,6 +14,13 @@ pub(super) static SUPPORT: Rust = Rust;
 pub(super) struct Rust;
 
 impl ParserBackend for Rust {
+    fn symbol_kinds(&self) -> &'static [&'static str] {
+        &[
+            "const", "enum", "function", "impl", "macro", "module", "static", "struct", "trait",
+            "type",
+        ]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Rust
     }

@@ -264,6 +264,61 @@ fn candidates_for_selector(
     Ok(hits)
 }
 
+/// Tie-break order for same-named `symbol_lookup` candidates, by symbol kind: the definition a
+/// human most likely meant, first. Nominal types (0) before named/abstract types (1) before
+/// callables (2) before members and values (3) before namespaces (4); a container that merely
+/// EXTENDS a type someone else declared (Rust `impl`, Swift `extension`) sorts near-last (8), and
+/// an unranked kind last (9).
+///
+/// Covers every kind ANY backend can emit — `symbol_kind_rank_covers_every_indexed_kind` proves it
+/// against `languages::all_symbol_kinds()`. That completeness is the point: this used to be a
+/// literal SQL `CASE` that knew only the Rust/TS/Kotlin kinds, so a Swift `protocol` or `actor`, a
+/// C++ `namespace` or `union`, and a Rust `module` or `macro` all fell into the unknown bucket and
+/// ranked BELOW `impl` — a `protocol Foo` losing to an unrelated `const Foo`.
+const SYMBOL_KIND_RANK: &[(&str, i64)] = &[
+    // Nominal aggregate types.
+    ("struct", 0),
+    ("class", 0),
+    ("object", 0),
+    ("actor", 0),
+    ("union", 0),
+    // Named and abstract types.
+    ("enum", 1),
+    ("trait", 1),
+    ("interface", 1),
+    ("protocol", 1),
+    ("type", 1),
+    // Callables.
+    ("function", 2),
+    ("method", 2),
+    ("constructor", 2),
+    ("macro", 2),
+    ("operator", 2),
+    // Members and values.
+    ("const", 3),
+    ("property", 3),
+    ("static", 3),
+    ("enum_case", 3),
+    ("precedence_group", 3),
+    // Namespaces.
+    ("module", 4),
+    ("namespace", 4),
+    // Extenders of a type declared elsewhere.
+    ("impl", 8),
+    ("extension", 8),
+];
+
+/// [`SYMBOL_KIND_RANK`] as the SQL `CASE` expression the lookup's `ORDER BY` uses. Generated rather
+/// than hand-written so the table stays the single source of truth.
+fn symbol_kind_rank_sql() -> String {
+    let arms = SYMBOL_KIND_RANK
+        .iter()
+        .map(|(kind, rank)| format!("WHEN '{kind}' THEN {rank}"))
+        .collect::<Vec<_>>()
+        .join("\n            ");
+    format!("CASE symbols.kind\n            {arms}\n            ELSE 9\n          END")
+}
+
 fn lookup_name(
     conn: &Connection,
     name: &str,
@@ -293,31 +348,17 @@ fn lookup_name(
     if language.is_some() {
         sql.push_str(" AND symbols.language = ?3");
     }
-    sql.push_str(
+    sql.push_str(&format!(
         "
         ORDER BY
           CASE WHEN symbols.name = ?1 THEN 0 ELSE 1 END,
-          CASE symbols.kind
-            WHEN 'struct' THEN 0
-            WHEN 'class' THEN 0
-            WHEN 'object' THEN 0
-            WHEN 'enum' THEN 1
-            WHEN 'trait' THEN 1
-            WHEN 'interface' THEN 1
-            WHEN 'type' THEN 1
-            WHEN 'function' THEN 2
-            WHEN 'method' THEN 2
-            WHEN 'const' THEN 3
-            WHEN 'property' THEN 3
-            WHEN 'static' THEN 3
-            WHEN 'impl' THEN 8
-            ELSE 9
-          END,
+          {},
           files.path,
           symbols.start_byte
         LIMIT ?
         ",
-    );
+        symbol_kind_rank_sql(),
+    ));
 
     let fuzzy = format!("%{name}%");
     let mut stmt = conn.prepare(&sql)?;
@@ -543,7 +584,48 @@ fn enrich_symbol_hit(conn: &Connection, hit: &mut SymbolHit) -> anyhow::Result<(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+
+    /// The class tripwire (#635): EVERY symbol kind any language backend can emit must carry an
+    /// explicit rank. Driven off `languages::all_symbol_kinds()` — the backends' own declaration —
+    /// so registering a language with a new kind (a Swift `protocol`, a C++ `namespace`) reddens
+    /// HERE, at the point the ranking would silently dump it into the unknown bucket, instead of
+    /// shipping a lookup that sorts it below `impl`. Ranking is a downstream consumer of the
+    /// language registry; this is what keeps the two from drifting.
+    #[test]
+    fn symbol_kind_rank_covers_every_indexed_kind() {
+        let ranked: HashSet<&str> = SYMBOL_KIND_RANK.iter().map(|(kind, _)| *kind).collect();
+        let unranked: Vec<&str> = crate::index::languages::all_symbol_kinds()
+            .into_iter()
+            .filter(|kind| !ranked.contains(kind))
+            .collect();
+        assert!(
+            unranked.is_empty(),
+            "symbol kinds emitted by a language backend but never ranked in SYMBOL_KIND_RANK \
+             (they would sort into the unknown bucket, below `impl`): {unranked:?}"
+        );
+    }
+
+    /// The rank table is a tie-break, so it is only meaningful if the kinds actually order against
+    /// each other: a nominal type outranks a callable outranks a member, and both outrank the
+    /// extender/unknown buckets.
+    #[test]
+    fn symbol_kind_rank_orders_types_before_callables_before_extenders() {
+        let rank = |kind: &str| {
+            SYMBOL_KIND_RANK.iter().find(|(name, _)| *name == kind).map_or(9, |(_, rank)| *rank)
+        };
+        assert!(rank("actor") < rank("function"), "a type outranks a callable");
+        assert!(rank("protocol") < rank("function"), "a protocol outranks a callable");
+        assert!(rank("function") < rank("property"), "a callable outranks a member");
+        assert!(rank("enum_case") < rank("extension"), "a member outranks a bare extension");
+        assert!(rank("extension") < rank("nonexistent_kind"), "a known kind outranks an unknown");
+        // The generated SQL keeps the table's arms and the unknown fallback.
+        let sql = symbol_kind_rank_sql();
+        assert!(sql.contains("WHEN 'protocol' THEN 1"), "{sql}");
+        assert!(sql.contains("ELSE 9"), "{sql}");
+    }
 
     fn selector(logical_symbol_id: Option<i64>, symbol_path: Option<&str>) -> SymbolSelector {
         SymbolSelector {

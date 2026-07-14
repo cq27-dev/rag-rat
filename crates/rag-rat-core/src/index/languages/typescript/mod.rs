@@ -13,6 +13,10 @@ pub(super) static SUPPORT: TypeScript = TypeScript;
 pub(super) struct TypeScript;
 
 impl ParserBackend for TypeScript {
+    fn symbol_kinds(&self) -> &'static [&'static str] {
+        &["class", "const", "function", "interface", "type"]
+    }
+
     fn parser_kind(&self, path: &Path) -> ParserKind {
         if path.extension().and_then(|ext| ext.to_str()) == Some("tsx") {
             ParserKind::Tsx

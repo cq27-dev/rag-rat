@@ -1,4 +1,5 @@
 use super::*;
+use crate::index::parser;
 
 /// Behavior version of the embedding-policy classifier. It certifies that a persisted
 /// `chunks.embedding_policy` value reflects the CURRENT classifier — the reconcile skip-summary
@@ -11,7 +12,7 @@ use super::*;
 /// stale-but-matching stamp would let the fast path serve mixed-code counts). A version mismatch
 /// instead correctly forces the slow recompute. See the freshness-model Risk memory bound to this
 /// file.
-pub(crate) const EMBEDDING_POLICY_VERSION: &str = "aa8d3ccc14daf73c";
+pub(crate) const EMBEDDING_POLICY_VERSION: &str = "c426172dd063e4c0";
 
 /// `repo_meta` keys carrying the embedding-policy freshness stamp a full rebuild writes
 /// (`mark_embedding_policy_current`). PER-REPO, not the DB-global `index_meta`: one database can
@@ -166,23 +167,28 @@ pub(crate) fn policy_for_job(
     )
 }
 
+/// Embedding budget order: source symbols (0) before docs (1) before tests (2).
+///
+/// Test detection is the CANONICAL [`parser::is_test_path`], not a local list. The local copy this
+/// replaced knew only lowercase `tests/`/`test/` segments and Rust/TS filename suffixes, so SwiftPM
+/// layouts (`Tests/AppTests/AppTests.swift` — capitalized directory, `*Tests` stem) read as
+/// production source and competed with it for the priority-0 budget, while the rest of the system
+/// (`staleness`, `repo_brief`, the graph's test-callsite filter, `symbols.is_test`) called the very
+/// same file a test. One predicate, one answer, every language.
 pub(crate) fn embedding_priority(
     path: &str,
     language: &str,
     chunk_kind: &str,
     symbol_path: Option<&str>,
 ) -> i64 {
-    if symbol_path.is_some()
-        && matches!(chunk_kind, "code")
-        && !is_test_path(path)
-        && language != "markdown"
-    {
+    let is_test = parser::is_test_path(path);
+    if symbol_path.is_some() && matches!(chunk_kind, "code") && !is_test && language != "markdown" {
         return 0;
     }
     if language == "markdown" {
         return 1;
     }
-    if is_test_path(path) {
+    if is_test {
         return 2;
     }
     1
@@ -199,24 +205,21 @@ pub(crate) fn priority_label(priority: i64) -> &'static str {
     }
 }
 
+/// Build output and dependency trees, plus the lockfiles that sit at their root. `/.build/` and
+/// `Package.resolved` are SwiftPM's `target/`+`Cargo.lock`; `Pods/` is CocoaPods' vendored
+/// dependency tree.
 pub(crate) fn looks_generated_path(path: &str) -> bool {
     path.contains("/generated/")
         || path.contains("/src/generated/")
         || path.contains("/target/")
+        || path.contains("/.build/")
+        || path.starts_with(".build/")
+        || path.contains("/Pods/")
+        || path.starts_with("Pods/")
         || path.ends_with("Cargo.lock")
         || path.ends_with("package-lock.json")
         || path.ends_with("pnpm-lock.yaml")
-}
-
-pub(crate) fn is_test_path(path: &str) -> bool {
-    path.contains("/tests/")
-        || path.contains("/test/")
-        || path.contains("__tests__")
-        || path.ends_with("_test.rs")
-        || path.ends_with(".test.ts")
-        || path.ends_with(".spec.ts")
-        || path.ends_with(".test.tsx")
-        || path.ends_with(".spec.tsx")
+        || path.ends_with("Package.resolved")
 }
 
 pub(crate) fn is_test_fixture_path(path: &str) -> bool {
@@ -465,6 +468,7 @@ mod low_signal_span_tests {
 /// `chunks.embedding_policy` column, so it must move whenever the classifier's output could.
 #[cfg(test)]
 mod policy_version_tests {
+    use std::collections::HashSet;
     use std::fmt::Write as _;
     use std::path::Path;
 
@@ -605,29 +609,56 @@ mod policy_version_tests {
         // edit to any one of them flips the hash (the two path cases above only sample
         // `/target/` and `/fixtures/`). A non-generated, non-fixture path is the code
         // default and is already covered by `embed_plain` / the span cases.
-        let path_cases: &[&str] = &[
-            "pkg/generated/a.rs",
-            "pkg/src/generated/a.rs",
-            "pkg/target/a.rs",
-            "Cargo.lock",
-            "some/dir/package-lock.json",
-            "some/dir/pnpm-lock.yaml",
-            "pkg/fixtures/a.rs",
-            "pkg/__fixtures__/a.rs",
-            "pkg/testdata/a.rs",
-            "pkg/snapshots/a.rs",
-            "pkg/thing.snap",
+        //
+        // ALSO the `embedding_priority` test-path branch, which nothing pinned before: every case
+        // here carries a symbol and real (>= MIN) source text, so a non-skipped path records
+        // priority 0 (source) vs 2 (test) and the CANONICAL `parser::is_test_path` is under the
+        // hash. It has to be — a local test-path copy silently drifted from the canonical one and
+        // mis-ranked every SwiftPM `Tests/` file as production source, with no test to catch it.
+        // Cases run in their OWN language so the `FromText` low-signal re-parse sees code it can
+        // actually parse.
+        const RUST_SRC: &str = "fn real_function(input: i64) -> i64 {\n    let value = input * 2 \
+                                + 1;\n    another_call(value)\n}\n";
+        const SWIFT_SRC: &str = "func realFunction(_ input: Int) -> Int {\n    let value = input \
+                                 + 1\n    return value + compute(value)\n}\n";
+        const MD_SRC: &str = "# Guide\n\nThis document explains how the indexer resolves \
+                              candidate edges to real symbols.\n";
+        let path_cases: &[(&str, &str, &str)] = &[
+            ("pkg/generated/a.rs", "rust", RUST_SRC),
+            ("pkg/src/generated/a.rs", "rust", RUST_SRC),
+            ("pkg/target/a.rs", "rust", RUST_SRC),
+            ("Cargo.lock", "rust", RUST_SRC),
+            ("some/dir/package-lock.json", "rust", RUST_SRC),
+            ("some/dir/pnpm-lock.yaml", "rust", RUST_SRC),
+            ("pkg/fixtures/a.rs", "rust", RUST_SRC),
+            ("pkg/__fixtures__/a.rs", "rust", RUST_SRC),
+            ("pkg/testdata/a.rs", "rust", RUST_SRC),
+            ("pkg/snapshots/a.rs", "rust", RUST_SRC),
+            ("pkg/thing.snap", "rust", RUST_SRC),
+            // SwiftPM / CocoaPods build + dependency trees (`looks_generated_path`).
+            ("app/.build/checkouts/dep/Sources/dep/a.swift", "swift", SWIFT_SRC),
+            (".build/checkouts/dep/Sources/dep/a.swift", "swift", SWIFT_SRC),
+            ("Package.resolved", "swift", SWIFT_SRC),
+            ("Pods/Alamofire/Source/a.swift", "swift", SWIFT_SRC),
+            // Test paths (priority 2) vs production source (priority 0), per language convention.
+            ("pkg/tests/a.rs", "rust", RUST_SRC),
+            ("pkg/src/a_test.rs", "rust", RUST_SRC),
+            ("Tests/AppTests/AppTests.swift", "swift", SWIFT_SRC),
+            ("Sources/App/ClientTests.swift", "swift", SWIFT_SRC),
+            ("Sources/App/Client.swift", "swift", SWIFT_SRC),
+            ("pkg/src/thing.rs", "rust", RUST_SRC),
+            // Docs (priority 1) — the remaining `embedding_priority` branch.
+            ("docs/guide.md", "markdown", MD_SRC),
         ];
-        for path in path_cases {
-            // A path gate fires before the low-signal check, so the text and cap are immaterial
-            // here.
+        for (path, lang, text) in path_cases {
+            // A path gate fires before the low-signal check, so the cap is immaterial here.
             let d = embedding_policy_for_chunk(
                 Path::new(path),
-                "rust",
+                lang,
                 "source",
                 "code",
                 Some("s"),
-                "fn a() { let value = compute(); process(value); }",
+                text,
                 4000,
                 LowSignalCheck::FromText,
             );
@@ -788,6 +819,21 @@ mod policy_version_tests {
                 sig.contains(&format!("|{expected}|")),
                 "the version corpus must exercise {expected} — otherwise the hash guard covers \
                  less than it appears to"
+            );
+        }
+        // ...and every embedding PRIORITY, so the test-path predicate the priority depends on is
+        // under the hash too. It wasn't: no corpus case was a test path, so `embedding_priority`'s
+        // test branch went unpinned — and a local test-path copy drifted from the canonical
+        // predicate, mis-ranking every SwiftPM `Tests/` file as priority-0 production source, with
+        // nothing to redden. `record` writes `label|policy|priority|eligible`.
+        let priorities: HashSet<&str> =
+            sig.lines().filter_map(|line| line.split('|').nth(2)).collect();
+        for expected in ["0", "1", "2"] {
+            assert!(
+                priorities.contains(expected),
+                "the version corpus must exercise embedding priority {expected} ({}) — otherwise \
+                 a change to the test-path predicate that decides it cannot flip the hash",
+                super::priority_label(expected.parse().unwrap()),
             );
         }
     }

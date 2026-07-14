@@ -10,6 +10,11 @@ pub(super) static SUPPORT: Markdown = Markdown;
 pub(super) struct Markdown;
 
 impl ParserBackend for Markdown {
+    /// Prose is chunked, never symbolized — markdown emits no declarations.
+    fn symbol_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Markdown
     }

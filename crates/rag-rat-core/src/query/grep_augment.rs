@@ -151,6 +151,26 @@ const DEFINITION_KEYWORDS: &[&str] = &[
     "unsafe",
     "where",
     "dyn",
+    // Swift. Without these, `protocol Fetcher` / `actor Store` / `extension Client` leave two
+    // identifier-shaped tokens, so the pattern reads as ambiguous and drops to the lexical lane —
+    // while `func Fetcher` (a keyword we already knew) correctly reached the symbol lane.
+    "protocol",
+    "actor",
+    "extension",
+    "init",
+    "deinit",
+    "subscript",
+    "operator",
+    "precedencegroup",
+    "macro",
+    "open",
+    "internal",
+    "fileprivate",
+    "mutating",
+    "nonmutating",
+    "inout",
+    "some",
+    "any",
 ];
 
 /// The single identifier a pattern targets, for the symbol lane. A lone identifier is used
@@ -812,6 +832,21 @@ mod tests {
         assert_eq!(extract_symbol_identifier("election retry loop"), None);
         // Free text token (not keyword, not identifier-shaped) → lexical lane.
         assert_eq!(extract_symbol_identifier("foo == bar"), None);
+    }
+
+    /// Swift's declaration keywords reach the symbol lane like every other language's. Before they
+    /// were known keywords, `protocol Fetcher` read as two identifiers and fell to the lexical lane
+    /// — even though `func Fetcher` did not, which is the tell that the list, not the pattern, was
+    /// wrong.
+    #[test]
+    fn extract_symbol_identifier_handles_swift_definition_patterns() {
+        assert_eq!(extract_symbol_identifier("protocol Fetcher"), Some("Fetcher"));
+        assert_eq!(extract_symbol_identifier("actor Store"), Some("Store"));
+        assert_eq!(extract_symbol_identifier("extension Client"), Some("Client"));
+        assert_eq!(extract_symbol_identifier("public actor SyncStore"), Some("SyncStore"));
+        assert_eq!(extract_symbol_identifier("mutating func reset"), Some("reset"));
+        assert_eq!(extract_symbol_identifier("open class ViewModel"), Some("ViewModel"));
+        assert_eq!(extract_symbol_identifier("macro stringify"), Some("stringify"));
     }
 
     #[test]

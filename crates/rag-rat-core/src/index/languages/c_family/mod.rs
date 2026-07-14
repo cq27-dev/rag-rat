@@ -15,6 +15,10 @@ pub(super) struct C;
 pub(super) struct Cpp;
 
 impl ParserBackend for C {
+    fn symbol_kinds(&self) -> &'static [&'static str] {
+        &["enum", "function", "macro", "struct", "type", "union"]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::C
     }
@@ -48,6 +52,10 @@ impl ParserBackend for C {
 }
 
 impl ParserBackend for Cpp {
+    fn symbol_kinds(&self) -> &'static [&'static str] {
+        &["class", "enum", "function", "macro", "namespace", "struct", "type", "union"]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Cpp
     }

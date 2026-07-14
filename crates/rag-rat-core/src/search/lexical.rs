@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use crate::index::text_compression::ChunkTextRow;
 use crate::index::{ai, text_compression};
+use crate::language::Language;
 use crate::query::graph_meta::GraphEvidence;
 
 const BM25_WEIGHT: f64 = 0.45;
@@ -714,11 +716,24 @@ impl GraphEdgeEvidence {
     }
 }
 
+/// The bare qualified name (`Type::method`) inside an indexed symbol path
+/// (`src/thing.rs::Type::method`) — the form graph edges store as an endpoint name, so
+/// `graph_boost` can match a search hit against its incoming/outgoing edges.
+///
+/// The file/name boundary is found by testing each `::` against the LANGUAGE REGISTRY rather than a
+/// hardcoded extension list. A literal list silently skips whichever language nobody remembered to
+/// add — it was missing `.swift`, `.py`, `.c`, and `.cpp`, so hits in those languages kept the
+/// whole path as their name, matched no edge endpoint, and got zero graph boost. Deriving the
+/// boundary from [`Language`] means a language registered later is covered without touching this
+/// function.
 fn qualified_symbol_name(symbol_path: &str) -> &str {
-    for marker in [".rs::", ".ts::", ".tsx::", ".kt::", ".kts::"] {
-        if let Some(index) = symbol_path.find(marker) {
-            return &symbol_path[(index + marker.len())..];
+    let mut cursor = 0;
+    while let Some(offset) = symbol_path[cursor..].find("::") {
+        let split = cursor + offset;
+        if Language::from_path(Path::new(&symbol_path[..split])).is_some() {
+            return &symbol_path[split + "::".len()..];
         }
+        cursor = split + "::".len();
     }
     symbol_path
 }
@@ -1059,6 +1074,30 @@ mod tests {
         let repo_id = schema::active_repo_id(&conn).unwrap();
         let boost = graph_boost(&conn, &hit, &["available".to_string()], &repo_id).unwrap();
         assert_eq!(boost, 0.0, "suppressed resolver candidates are not ranking evidence");
+    }
+
+    /// Registry-driven tripwire: `qualified_symbol_name` must strip the file prefix for EVERY
+    /// indexed language, not just the ones a literal list happened to name. Drives the assertion
+    /// off `Language::all()` × `target_extensions()`, so registering a language without
+    /// teaching the stripper about it reddens here instead of silently costing that language
+    /// its graph boost (which is how `.swift`, `.py`, `.c`, and `.cpp` were all missing at
+    /// once).
+    #[test]
+    fn qualified_symbol_name_strips_the_file_prefix_for_every_registered_language() {
+        for language in Language::all() {
+            for ext in language.target_extensions() {
+                let path = format!("crates/pkg/src/thing.{ext}::Type::method");
+                assert_eq!(
+                    qualified_symbol_name(&path),
+                    "Type::method",
+                    "{language} (.{ext}) symbol paths must reduce to the bare qualified name"
+                );
+            }
+        }
+        // A bare name (no file prefix) and an unindexed extension are both passed through
+        // unchanged.
+        assert_eq!(qualified_symbol_name("Type::method"), "Type::method");
+        assert_eq!(qualified_symbol_name("notes.txt::heading"), "notes.txt::heading");
     }
 
     /// The pre-materialization bm25 JOIN shape (joins the scope VIEW `files` directly, no CTE) —

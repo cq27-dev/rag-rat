@@ -13,6 +13,10 @@ pub(super) static SUPPORT: Kotlin = Kotlin;
 pub(super) struct Kotlin;
 
 impl ParserBackend for Kotlin {
+    fn symbol_kinds(&self) -> &'static [&'static str] {
+        &["class", "function", "object", "property"]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Kotlin
     }

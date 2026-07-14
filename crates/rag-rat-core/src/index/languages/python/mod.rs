@@ -16,6 +16,10 @@ pub(super) static SUPPORT: Python = Python;
 pub(super) struct Python;
 
 impl ParserBackend for Python {
+    fn symbol_kinds(&self) -> &'static [&'static str] {
+        &["class", "const", "function", "type"]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Python
     }

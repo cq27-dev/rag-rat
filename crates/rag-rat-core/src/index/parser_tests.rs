@@ -343,6 +343,53 @@ macro stringify<T>(_ value: T) = #externalMacro(module: "Macros", type: "Stringi
     assert_no_symbol(&symbols, "macro", "module");
 }
 
+/// Swift test symbols are recognized by their FRAMEWORK, not just by living under a `Tests/` path:
+/// swift-testing's `@Test`/`@Suite` attributes and XCTest's `XCTestCase` inheritance. The fixture
+/// path here deliberately has NO test segment (`Sources/App/…`), so a passing assertion can only
+/// come from symbol-level detection — an XCTestCase beside the code it exercises would otherwise be
+/// indexed as production source and never demoted in search or `repo_brief`.
+#[test]
+fn swift_test_symbols_are_detected_by_framework_not_only_by_path() {
+    let text = r#"
+import Testing
+import XCTest
+
+@Test func checksTheThing() {}
+
+@Suite struct ClientSuite {
+    @Test func checksAnother() {}
+}
+
+class ClientTests: XCTestCase {
+    func testFetchSucceeds() {}
+}
+
+@TestHarness struct NotATest {}
+
+func realWork() -> Int { 1 }
+"#;
+    let symbols =
+        parser::parse_symbols(Path::new("Sources/App/Client.swift"), Language::Swift, text)
+            .expect("Swift fixture parses");
+
+    let is_test = |name: &str| {
+        symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap_or_else(|| panic!("missing symbol {name}: {symbols:#?}"))
+            .is_test
+    };
+
+    assert!(is_test("checksTheThing"), "@Test function is a test symbol");
+    assert!(is_test("ClientSuite"), "@Suite type is a test symbol");
+    assert!(is_test("checksAnother"), "@Test method inside a suite is a test symbol");
+    assert!(is_test("ClientTests"), "an XCTestCase subclass is a test symbol");
+    assert!(is_test("testFetchSucceeds"), "a test* method of an XCTestCase is a test symbol");
+    // Neither a lookalike attribute nor ordinary code is a test.
+    assert!(!is_test("NotATest"), "@TestHarness is not @Test");
+    assert!(!is_test("realWork"), "production code in a non-test path stays production code");
+}
+
 #[test]
 fn qualified_swift_extension_members_use_canonical_scope_paths() {
     let text = r#"

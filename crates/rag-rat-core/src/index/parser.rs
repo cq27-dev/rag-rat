@@ -434,6 +434,15 @@ fn make_symbol(
     name: String,
 ) -> ParsedSymbol {
     let SymbolBuildContext { path, backend, text } = *context;
+    // Every emitted kind must be one the backend DECLARED in `symbol_kinds()` — that declaration is
+    // what downstream consumers (the `symbol_lookup` kind ranking) are completeness-tested against,
+    // so an undeclared kind would sort into the unknown bucket with nothing to catch it.
+    // Debug-only: this is a contract check on our own backends, not input validation, and it
+    // runs on every symbol of every parse in the test suite and the corpus evals.
+    debug_assert!(
+        backend.symbol_kinds().contains(&kind),
+        "{kind} is not declared in this backend's symbol_kinds(); add it there and rank it",
+    );
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
     // tree-sitter already computed each node's 1-based line span during the parse — read it off the

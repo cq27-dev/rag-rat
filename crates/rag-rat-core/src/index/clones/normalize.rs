@@ -24,11 +24,33 @@ fn is_identifier_kind(kind: &str) -> bool {
 /// (#253). GATED to C/C++ via `lang`: `character` is a generic-enough kind name that we only bucket
 /// it where it's known to be the char-literal value leaf, never speculatively across other
 /// grammars.
+///
+/// `line_str_text` / `multi_line_str_text` / `raw_str_part` / `raw_str_end_part` /
+/// `str_escaped_char` are Swift's string-body leaves — the counterparts to Python's
+/// `string_content` and TS's `string_fragment`. tree-sitter-swift wraps them in a
+/// `line_string_literal` (an INTERNAL node: quote, text, quote), and only LEAVES are bucketed, so
+/// the wrapper's `ends_with("literal")` never fires for the value: without these names the text
+/// leaf falls through to the keep-verbatim branch and the string's VALUE lands in the normalized
+/// token stream. Two Swift bodies differing only in a string constant would then fail to normalize
+/// equal — silently costing Swift clone recall that every other language has. (Interpolation
+/// segments are internal nodes and still recurse as real code.) `raw_str_end_part` carries the
+/// delimiters as well as the text — an uninterpolated `#"one"#` arrives as ONE leaf — which is why
+/// it must bucket rather than pass through as punctuation.
 fn is_literal_kind(kind: &str, lang: Language) -> bool {
     kind.ends_with("literal")
         || matches!(
             kind,
-            "string_content" | "string_fragment" | "integer" | "float" | "number" | "char"
+            "string_content"
+                | "string_fragment"
+                | "line_str_text"
+                | "multi_line_str_text"
+                | "raw_str_part"
+                | "raw_str_end_part"
+                | "str_escaped_char"
+                | "integer"
+                | "float"
+                | "number"
+                | "char"
         )
         || (matches!(lang, Language::C | Language::Cpp) && kind == "character")
 }
@@ -372,6 +394,61 @@ mod tests {
         let nf = norm_lang(b_false, "t.ts", Language::TypeScript);
         assert_eq!(nt, nf, "TS true/false-only diff must normalize equal (LIT_BOOL)");
         assert!(nt.iter().any(|t| t == "LIT_BOOL"), "TS boolean must emit LIT_BOOL: {nt:?}");
+    }
+
+    /// Swift string bodies bucket like every other language's: two bodies differing ONLY in string
+    /// contents normalize equal. Swift wraps its text leaf (`line_str_text`) in an INTERNAL
+    /// `line_string_literal` node, so the `ends_with("literal")` arm — which only ever fires on a
+    /// LEAF — never saw the value, and the string contents leaked verbatim into the token stream.
+    /// Covers the line, multi-line, and raw string leaves, plus the escaped-char leaf.
+    #[test]
+    fn swift_strings_and_booleans_bucket() {
+        let s1 = "func f() -> Int { let a = log(\"hello\"); let b = log(\"world\"); return a }";
+        let s2 = "func f() -> Int { let a = log(\"foo\"); let b = log(\"bar\"); return a }";
+        let n1 = norm_lang(s1, "t.swift", Language::Swift);
+        assert_eq!(
+            n1,
+            norm_lang(s2, "t.swift", Language::Swift),
+            "Swift string-content-only diff must normalize equal (line_str_text bucketed)"
+        );
+        assert!(
+            !n1.iter().any(|t| t == "hello" || t == "world"),
+            "Swift string VALUES must never reach the normalized stream: {n1:?}"
+        );
+
+        // Escaped chars are value-bearing leaves of their own (`str_escaped_char`).
+        let e1 = "func f() -> Int { let a = log(\"a\\nb\"); let b = log(\"c\"); return a }";
+        let e2 = "func f() -> Int { let a = log(\"x\\ty\"); let b = log(\"z\"); return a }";
+        assert_eq!(
+            norm_lang(e1, "t.swift", Language::Swift),
+            norm_lang(e2, "t.swift", Language::Swift),
+            "Swift escaped-char-only diff must normalize equal (str_escaped_char bucketed)"
+        );
+
+        // Raw strings (`raw_str_part`) and multi-line strings (`multi_line_str_text`).
+        let r1 = "func f() -> Int { let a = log(#\"one\"#); let b = log(#\"two\"#); return a }";
+        let r2 = "func f() -> Int { let a = log(#\"three\"#); let b = log(#\"four\"#); return a }";
+        let nr = norm_lang(r1, "t.swift", Language::Swift);
+        assert_eq!(
+            nr,
+            norm_lang(r2, "t.swift", Language::Swift),
+            "Swift raw-string-only diff must normalize equal (raw_str_part bucketed)"
+        );
+        assert!(
+            !nr.iter().any(|t| t == "one" || t == "two"),
+            "Swift raw-string VALUES must never reach the normalized stream: {nr:?}"
+        );
+
+        // Booleans already bucket via the shared `true`/`false` leaf kinds — pin it for Swift too.
+        let b_true = "func f() -> Bool { let x = check(); let y = x; return true }";
+        let b_false = "func f() -> Bool { let x = check(); let y = x; return false }";
+        let nt = norm_lang(b_true, "t.swift", Language::Swift);
+        assert_eq!(
+            nt,
+            norm_lang(b_false, "t.swift", Language::Swift),
+            "Swift true/false-only diff must normalize equal (LIT_BOOL)"
+        );
+        assert!(nt.iter().any(|t| t == "LIT_BOOL"), "Swift boolean must emit LIT_BOOL: {nt:?}");
     }
 
     /// Python booleans (`True`/`False`, leaf kinds `true`/`false`) bucket to `LIT_BOOL`; `None`
