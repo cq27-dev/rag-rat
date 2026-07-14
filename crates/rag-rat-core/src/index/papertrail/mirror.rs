@@ -82,12 +82,15 @@ impl MirrorCursor {
         if self.full_rewalk {
             return MirrorContinuation::Full;
         }
-        if !self.backfill_done
-            || self.item_delta_in_progress
+        if self.item_delta_in_progress
             || self.item_delta_replay_required
             || self.item_delta_page_token.is_some()
             || self.backfill_page_cursor.is_some()
             || self.item_thread_cursor.is_some()
+            || (!self.backfill_done
+                && (self.low_mark_at.is_some()
+                    || self.high_mark_at.is_some()
+                    || !self.backfill_processed_keys.is_empty()))
             || self.comment_page_token.is_some()
             || self.comment_stream_cursors.values().any(|stream| stream.page_token.is_some())
         {
@@ -1982,6 +1985,7 @@ mod tests {
 
     #[test]
     fn continuation_classification_covers_every_persisted_resume_lane() {
+        assert_eq!(MirrorCursor::default().continuation(), MirrorContinuation::None);
         let mut cursor = MirrorCursor { backfill_done: true, ..Default::default() };
         assert_eq!(cursor.continuation(), MirrorContinuation::None);
 
@@ -1996,6 +2000,12 @@ mod tests {
 
         cursor.full_rewalk = true;
         assert_eq!(cursor.continuation(), MirrorContinuation::Full);
+
+        let partial_backfill = MirrorCursor {
+            low_mark_at: Some("2026-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(partial_backfill.continuation(), MirrorContinuation::Incremental);
     }
 
     #[test]

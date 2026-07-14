@@ -2011,7 +2011,7 @@ fn migration_066_adds_the_content_candidate_dag() {
     assert!(conn_index_exists(&conn, "content_accepted_slot"));
     assert!(conn_index_exists(&conn, "content_pre_verify_author"));
     schema::migrate_forward(&conn).expect("a second V066 forward migration is a no-op");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 66);
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 }
 
 #[test]

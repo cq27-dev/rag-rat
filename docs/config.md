@@ -621,6 +621,14 @@ The reserve defaults to 35% and can be changed independently of provider clients
 rate_limit_reserve = 0.35   # finite fraction in 0.0 <= value < 1.0
 ```
 
-Cadence keys (`probe_interval_secs`, `sync_min_interval_secs`, and `full_sync_interval_secs`) are
-reserved for the provider mirror scheduler and remain rejected until that production path
-consumes them.
+The provider mirror scheduler accepts three cadence keys. Decisions are per binding: attempts are
+coalesced by the minimum interval, lightweight probes run on the probe cadence, and a full walk
+periodically heals historical drift. Persisted rate-limit horizons and unfinished cursor work take
+priority over these ordinary cadences.
+
+```toml
+[papertrail]
+probe_interval_secs = 900       # default: 15 minutes
+sync_min_interval_secs = 900    # default: 15 minutes between attempts
+full_sync_interval_secs = 86400 # default: daily healing walk
+```

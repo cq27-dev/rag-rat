@@ -42,12 +42,8 @@ pub(crate) async fn sync_mirror(
                     bindings.push(report);
                 },
                 Err(error) => {
-                    record_failure(
-                        conn,
-                        binding,
-                        PapertrailErrorClass::Provider,
-                        Some(&error.to_string()),
-                    )?;
+                    let class = classify_mirror_failure(&error);
+                    record_failure(conn, binding, class, Some(&error.to_string()))?;
                     errors.push(PapertrailSyncError {
                         tracker: binding.provider,
                         project: binding.project.clone(),
@@ -98,6 +94,26 @@ fn authentication_failure_detail(
             Some("configured token command failed".to_string()),
         _ => Some(error.to_string()),
     }
+}
+
+fn classify_mirror_failure(error: &anyhow::Error) -> PapertrailErrorClass {
+    for cause in error.chain() {
+        if cause.downcast_ref::<rusqlite::Error>().is_some() {
+            return PapertrailErrorClass::Storage;
+        }
+        if let Some(transport) = cause.downcast_ref::<transport::TransportError>() {
+            return match transport {
+                transport::TransportError::Http(_) => PapertrailErrorClass::Network,
+                transport::TransportError::Paused { .. } => PapertrailErrorClass::RateLimited,
+                transport::TransportError::UrlOutsideBinding { .. } =>
+                    PapertrailErrorClass::Provider,
+            };
+        }
+        if cause.downcast_ref::<reqwest::Error>().is_some() {
+            return PapertrailErrorClass::Network;
+        }
+    }
+    PapertrailErrorClass::Provider
 }
 
 fn completed_mirror_operation(
@@ -672,6 +688,21 @@ mod capability_tests {
             authentication_failure_detail(&binding, &error).as_deref(),
             Some("configured token command failed")
         );
+    }
+
+    #[test]
+    fn mirror_failure_classification_uses_the_error_chain() {
+        let storage =
+            anyhow::Error::new(rusqlite::Error::InvalidQuery).context("commit mirror page");
+        assert_eq!(classify_mirror_failure(&storage), PapertrailErrorClass::Storage);
+
+        let network =
+            anyhow::Error::new(reqwest::Client::new().get("://invalid").build().unwrap_err())
+                .context("fetch mirror page");
+        assert_eq!(classify_mirror_failure(&network), PapertrailErrorClass::Network);
+
+        let provider = anyhow::anyhow!("provider payload did not match the expected schema");
+        assert_eq!(classify_mirror_failure(&provider), PapertrailErrorClass::Provider);
     }
 
     #[test]

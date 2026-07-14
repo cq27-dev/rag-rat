@@ -463,7 +463,7 @@ const MIGRATION_066_DESCRIPTION: &str =
     "Persist every structurally valid /3 content candidate, bounded pre-verification work, and \
      derived status while reserving accepted-slot uniqueness for C3 authority acceptance";
 const MIGRATION_067_ID: &str = "067_papertrail_binding_health";
-const MIGRATION_067_CHECKSUM: &str = "sha256:rag-rat-papertrail-binding-health-v67d";
+const MIGRATION_067_CHECKSUM: &str = "sha256:rag-rat-papertrail-binding-health-v67e";
 const MIGRATION_067_DESCRIPTION: &str = "Persist per-binding attempt, successful probe/mirror, \
                                          and closed failure state for automatic scheduling and \
                                          status";

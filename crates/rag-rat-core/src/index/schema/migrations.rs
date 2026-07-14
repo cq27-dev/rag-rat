@@ -3327,7 +3327,7 @@ pub(crate) fn apply_papertrail_mirror_resume_state(conn: &Connection) -> rusqlit
     Ok(())
 }
 
-/// V066 (#592): scheduling and failures are binding-local. Error classes are stable machine
+/// V067 (#592): scheduling and failures are binding-local. Error classes are stable machine
 /// values; detail is sanitized and bounded by the recording API rather than used for policy.
 pub(crate) fn apply_papertrail_binding_health(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "papertrail_sync_cursor", "last_attempt_ms", "INTEGER")?;
@@ -3349,6 +3349,14 @@ pub(crate) fn apply_papertrail_binding_health(conn: &Connection) -> rusqlite::Re
         "UPDATE papertrail_sync_cursor
          SET last_full_sync_ms=last_probe_ms
          WHERE backfill_done=1 AND last_full_sync_ms IS NULL AND last_probe_ms IS NOT NULL",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE papertrail_sync_cursor
+         SET last_successful_mirror_ms=last_probe_ms
+         WHERE backfill_done=1
+           AND last_successful_mirror_ms IS NULL
+           AND last_probe_ms IS NOT NULL",
         [],
     )?;
     Ok(())

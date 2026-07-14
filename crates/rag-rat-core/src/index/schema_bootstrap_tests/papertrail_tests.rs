@@ -657,8 +657,8 @@ fn migration_063_persists_mirror_resume_state() {
 }
 
 #[test]
-fn migration_066_is_the_tip_and_persists_binding_health() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 66, "move this pin with the next schema migration");
+fn migration_067_is_the_tip_and_persists_binding_health() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 67, "move this pin with the next schema migration");
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
     let columns = conn_table_columns(&conn, "papertrail_sync_cursor");
@@ -681,15 +681,16 @@ fn migration_066_is_the_tip_and_persists_binding_health() {
     )
     .unwrap();
     schema::apply_papertrail_binding_health(&conn).unwrap();
-    let (probe, full): (Option<i64>, Option<i64>) = conn
+    let (probe, mirror, full): (Option<i64>, Option<i64>, Option<i64>) = conn
         .query_row(
-            "SELECT last_successful_probe_ms, last_full_sync_ms
+            "SELECT last_successful_probe_ms, last_successful_mirror_ms, last_full_sync_ms
              FROM papertrail_sync_cursor WHERE project='o/complete'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert_eq!(probe, Some(1234));
+    assert_eq!(mirror, Some(1234));
     assert_eq!(full, Some(1234));
     let incomplete_full: Option<i64> = conn
         .query_row(
