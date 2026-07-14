@@ -1,6 +1,9 @@
 use super::*;
 use crate::index::{repo_meta, schema, scoped_table_row_count, set_repo_meta};
 
+/// Mirror every resolved binding, unconditionally (the explicit `papertrail sync` command).
+/// Provider-client-pending and unauthenticatable bindings surface as report errors so the
+/// operator sees exactly what a manual run could not do.
 pub(crate) async fn sync_mirror(
     conn: &Connection,
     root: &Path,
@@ -10,72 +13,213 @@ pub(crate) async fn sync_mirror(
     ensure_unique_mirror_bindings(&ctx.trackers)?;
     let refs = discover_and_store_refs(conn, root, ctx)?;
     let registry = transport::GovernorRegistry::default();
-    let options = ctx.transport_options.clone();
-    let mut synced_items = 0;
-    let mut bindings = Vec::new();
     let mut errors = Vec::new();
+    let mut jobs = Vec::new();
     for binding in &ctx.trackers {
-        let attempted_at = now_ms();
-        record_attempt(conn, binding, attempted_at)?;
+        record_attempt(conn, binding, now_ms())?;
         if binding.provider != Tracker::Github {
-            errors.push(PapertrailSyncError {
-                tracker: binding.provider,
-                project: binding.project.clone(),
-                item_key: String::new(),
-                status: "provider_client_pending".to_string(),
-                error: format!(
-                    "{} mirror client is not implemented yet",
-                    binding.provider.as_db_str()
-                ),
-            });
+            errors.push(binding_error(
+                binding,
+                "provider_client_pending",
+                format!("{} mirror client is not implemented yet", binding.provider.as_db_str()),
+            ));
             continue;
         }
-        match GitHubClient::new(binding, &registry, options.clone()) {
-            Ok(client) => match mirror_binding(conn, binding, &client, full).await {
-                Ok(report) => {
-                    synced_items += report.stored_items;
-                    if let Some(operation) = completed_mirror_operation(&report, full) {
-                        record_success(conn, binding, operation, now_ms())?;
-                    } else if let Some(resume_at_ms) = report.paused_until_ms {
-                        record_pause(conn, binding, resume_at_ms)?;
-                    }
-                    bindings.push(report);
-                },
-                Err(error) => {
-                    let class = classify_mirror_failure(&error);
-                    record_failure(conn, binding, class, Some(&error.to_string()))?;
-                    errors.push(PapertrailSyncError {
-                        tracker: binding.provider,
-                        project: binding.project.clone(),
-                        item_key: String::new(),
-                        status: "failed".to_string(),
-                        error: error.to_string(),
-                    });
-                },
-            },
-            Err(error) => {
-                let persisted_detail = authentication_failure_detail(binding, &error);
-                record_failure(
-                    conn,
-                    binding,
-                    PapertrailErrorClass::Authentication,
-                    persisted_detail.as_deref(),
-                )?;
-                errors.push(PapertrailSyncError {
-                    tracker: binding.provider,
-                    project: binding.project.clone(),
-                    item_key: String::new(),
-                    status: "authentication_or_transport".to_string(),
-                    error: error.to_string(),
-                });
-            },
+        if let Some(job) = prepare_binding_job(
+            conn,
+            binding,
+            &registry,
+            &ctx.transport_options,
+            full,
+            &mut errors,
+        )? {
+            jobs.push(job);
         }
+    }
+    let outcomes = run_binding_jobs(conn, jobs).await?;
+    assemble_mirror_report(conn, ctx, refs.len(), outcomes, errors)
+}
+
+/// Mirror the bindings the scheduling policy says are due, all evaluated against ONE clock
+/// snapshot (the automatic watcher/hook path). Differences from the manual [`sync_mirror`]:
+/// provider-client-pending bindings are silently filtered (an automatic tick must not log the
+/// same capability gap every 15 minutes — `status` reports it), `Skip` decisions never record an
+/// attempt, and reference discovery does not run (it re-reads every indexed file from disk; the
+/// annotation layer refreshes on manual sync).
+pub(crate) async fn sync_mirror_scheduled(
+    conn: &Connection,
+    ctx: &PapertrailContext,
+    request: AutosyncRequest,
+) -> anyhow::Result<PapertrailSyncReport> {
+    ensure_unique_mirror_bindings(&ctx.trackers)?;
+    let repo_id = schema::active_repo_id(conn)?;
+    let registry = transport::GovernorRegistry::default();
+    let now = now_ms();
+    let mut errors = Vec::new();
+    let mut jobs = Vec::new();
+    for binding in &ctx.trackers {
+        if tracker_synchronization(binding) != TrackerSynchronization::Native {
+            continue;
+        }
+        let (health, _, _, stored_fingerprint) = load_persisted_health(conn, &repo_id, binding)?;
+        let filter_changed = stored_fingerprint != binding.filter_fingerprint();
+        let change_detected = filter_changed || request >= AutosyncRequest::Incremental;
+        let decision = decide_schedule(now, &ctx.schedule, health, change_detected);
+        let Some(full) = scheduled_walk_depth(decision, request) else {
+            continue;
+        };
+        record_attempt(conn, binding, now)?;
+        if let Some(job) = prepare_binding_job(
+            conn,
+            binding,
+            &registry,
+            &ctx.transport_options,
+            full,
+            &mut errors,
+        )? {
+            jobs.push(job);
+        }
+    }
+    if jobs.is_empty() && errors.is_empty() {
+        // Nothing was due: report current status without stamping a sync that never ran.
+        return Ok(PapertrailSyncReport {
+            offline: false,
+            discovered_refs: 0,
+            skipped_refs: 0,
+            failed_refs: 0,
+            synced_items: 0,
+            bindings: Vec::new(),
+            errors: Vec::new(),
+            status: status(conn, ctx)?,
+        });
+    }
+    let outcomes = run_binding_jobs(conn, jobs).await?;
+    assemble_mirror_report(conn, ctx, 0, outcomes, errors)
+}
+
+/// Walk depth for one binding the policy evaluated: `None` = do not dispatch, `Some(full)`
+/// otherwise. A `Full` request upgrades any allowed decision — a daily/full trigger must never
+/// be weakened by a weaker concurrent one — while `Skip` always wins: persisted pauses and the
+/// minimum attempt interval gate even explicitly requested work.
+fn scheduled_walk_depth(decision: ScheduleDecision, request: AutosyncRequest) -> Option<bool> {
+    match decision {
+        ScheduleDecision::Skip => None,
+        ScheduleDecision::Full => Some(true),
+        ScheduleDecision::Probe | ScheduleDecision::Incremental =>
+            Some(request == AutosyncRequest::Full),
+    }
+}
+
+/// One dispatchable per-binding mirror run: the provider client is already constructed and the
+/// walk depth decided. Skipped and provider-client-pending bindings never become jobs.
+struct BindingJob<'a> {
+    binding: &'a ResolvedTracker,
+    client: GitHubClient,
+    full: bool,
+}
+
+/// What one dispatched binding produced: a resumable report, or the error entry to surface.
+/// Health rows are already updated either way; a failed binding never cancels its siblings.
+struct BindingOutcome {
+    report: Option<MirrorBindingReport>,
+    error: Option<PapertrailSyncError>,
+}
+
+/// Build the binding's client, or record the authentication failure and surface it into
+/// `errors`. `None` = not dispatchable this run. Only a storage-layer error propagates.
+fn prepare_binding_job<'a>(
+    conn: &Connection,
+    binding: &'a ResolvedTracker,
+    registry: &transport::GovernorRegistry,
+    options: &transport::TransportOptions,
+    full: bool,
+    errors: &mut Vec<PapertrailSyncError>,
+) -> anyhow::Result<Option<BindingJob<'a>>> {
+    match GitHubClient::new(binding, registry, options.clone()) {
+        Ok(client) => Ok(Some(BindingJob { binding, client, full })),
+        Err(error) => {
+            let persisted_detail = authentication_failure_detail(binding, &error);
+            record_failure(
+                conn,
+                binding,
+                PapertrailErrorClass::Authentication,
+                persisted_detail.as_deref(),
+            )?;
+            errors.push(binding_error(binding, "authentication_or_transport", error.to_string()));
+            Ok(None)
+        },
+    }
+}
+
+/// Run every prepared job CONCURRENTLY on the papertrail current-thread runtime. Network waits
+/// (page fetches, rate-governor sleeps) overlap across bindings, while every database commit
+/// stays a short synchronous transaction between awaits on the single driving thread — commits
+/// are serialized by construction, and no SQLite transaction, connection guard, or repository
+/// write lock ever spans an await. Each job records its own success / pause / failure health, so
+/// one binding's provider failure never cancels a sibling; only a storage-layer error (the
+/// connection itself is broken) propagates, after every job has finished.
+async fn run_binding_jobs(
+    conn: &Connection,
+    jobs: Vec<BindingJob<'_>>,
+) -> anyhow::Result<Vec<BindingOutcome>> {
+    futures_util::future::join_all(jobs.into_iter().map(|job| run_binding_job(conn, job)))
+        .await
+        .into_iter()
+        .collect()
+}
+
+async fn run_binding_job(conn: &Connection, job: BindingJob<'_>) -> anyhow::Result<BindingOutcome> {
+    match mirror_binding(conn, job.binding, &job.client, job.full).await {
+        Ok(report) => {
+            if let Some(operation) = completed_mirror_operation(&report, job.full) {
+                record_success(conn, job.binding, operation, now_ms())?;
+            } else if let Some(resume_at_ms) = report.paused_until_ms {
+                record_pause(conn, job.binding, resume_at_ms)?;
+            }
+            Ok(BindingOutcome { report: Some(report), error: None })
+        },
+        Err(error) => {
+            let class = classify_mirror_failure(&error);
+            record_failure(conn, job.binding, class, Some(&error.to_string()))?;
+            Ok(BindingOutcome {
+                report: None,
+                error: Some(binding_error(job.binding, "failed", error.to_string())),
+            })
+        },
+    }
+}
+
+fn binding_error(binding: &ResolvedTracker, status: &str, error: String) -> PapertrailSyncError {
+    PapertrailSyncError {
+        tracker: binding.provider,
+        project: binding.project.clone(),
+        item_key: String::new(),
+        status: status.to_string(),
+        error,
+    }
+}
+
+fn assemble_mirror_report(
+    conn: &Connection,
+    ctx: &PapertrailContext,
+    discovered_refs: usize,
+    outcomes: Vec<BindingOutcome>,
+    mut errors: Vec<PapertrailSyncError>,
+) -> anyhow::Result<PapertrailSyncReport> {
+    let mut synced_items = 0;
+    let mut bindings = Vec::new();
+    for outcome in outcomes {
+        if let Some(report) = outcome.report {
+            synced_items += report.stored_items;
+            bindings.push(report);
+        }
+        errors.extend(outcome.error);
     }
     let repo_id = schema::active_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, "papertrail_last_sync_ms", &now_ms().to_string())?;
     Ok(PapertrailSyncReport {
         offline: false,
-        discovered_refs: refs.len(),
+        discovered_refs,
         skipped_refs: 0,
         failed_refs: errors.len(),
         synced_items,
@@ -123,8 +267,18 @@ fn completed_mirror_operation(
     if report.paused_until_ms.is_some() {
         return None;
     }
-    Some(if full || report.completed_full_walk {
-        SuccessfulOperation::FullMirror
+    if full || report.completed_full_walk {
+        return Some(SuccessfulOperation::FullMirror);
+    }
+    // A run whose item probe answered not-modified AND that stored / pruned nothing verified
+    // freshness without mirroring anything: advance probe freshness only, so
+    // `last_successful_mirror_ms` keeps meaning "content actually moved".
+    let probe_only = report.probe_not_modified
+        && report.stored_items == 0
+        && report.stored_comments == 0
+        && report.pruned_items == 0;
+    Some(if probe_only {
+        SuccessfulOperation::Probe
     } else {
         SuccessfulOperation::IncrementalMirror
     })
@@ -582,6 +736,7 @@ mod capability_tests {
             paused_until_ms: Some(42),
             pause_reason: Some("rate_limited".to_string()),
             completed_full_walk: false,
+            probe_not_modified: false,
         };
         assert_eq!(completed_mirror_operation(&report, false), None);
         assert_eq!(completed_mirror_operation(&report, true), None);
@@ -608,11 +763,53 @@ mod capability_tests {
             paused_until_ms: None,
             pause_reason: None,
             completed_full_walk: true,
+            probe_not_modified: false,
         };
         assert_eq!(
             completed_mirror_operation(&report, false),
             Some(SuccessfulOperation::FullMirror)
         );
+    }
+
+    #[test]
+    fn quiet_probe_run_is_a_probe_success_but_any_stored_work_is_a_mirror() {
+        let quiet = MirrorBindingReport {
+            tracker: Tracker::Github,
+            project: "o/r".to_string(),
+            stored_items: 0,
+            stored_comments: 0,
+            pruned_items: 0,
+            paused_until_ms: None,
+            pause_reason: None,
+            completed_full_walk: false,
+            probe_not_modified: true,
+        };
+        assert_eq!(completed_mirror_operation(&quiet, false), Some(SuccessfulOperation::Probe));
+        // Comment deltas can move even when the item probe answers not-modified; stored work
+        // makes the run a real mirror.
+        let stored_comments = MirrorBindingReport { stored_comments: 2, ..quiet.clone() };
+        assert_eq!(
+            completed_mirror_operation(&stored_comments, false),
+            Some(SuccessfulOperation::IncrementalMirror)
+        );
+        // An explicitly requested full walk is never downgraded by a quiet probe.
+        assert_eq!(completed_mirror_operation(&quiet, true), Some(SuccessfulOperation::FullMirror));
+    }
+
+    #[test]
+    fn scheduled_walk_depth_upgrades_on_full_requests_and_respects_skip() {
+        use ScheduleDecision::{Full, Incremental, Probe, Skip};
+        for request in
+            [AutosyncRequest::Evaluate, AutosyncRequest::Incremental, AutosyncRequest::Full]
+        {
+            assert_eq!(scheduled_walk_depth(Skip, request), None, "Skip gates {request:?}");
+            assert_eq!(scheduled_walk_depth(Full, request), Some(true));
+        }
+        for decision in [Probe, Incremental] {
+            assert_eq!(scheduled_walk_depth(decision, AutosyncRequest::Evaluate), Some(false));
+            assert_eq!(scheduled_walk_depth(decision, AutosyncRequest::Incremental), Some(false));
+            assert_eq!(scheduled_walk_depth(decision, AutosyncRequest::Full), Some(true));
+        }
     }
 
     #[test]
@@ -741,5 +938,276 @@ mod capability_tests {
         assert!(!pending.failed);
         assert!(!pending.overdue);
         assert_eq!(pending.error_class, None);
+    }
+}
+
+#[cfg(test)]
+mod scheduled_tests {
+    use super::super::transport::stub::{
+        StubResponse, spawn_script_stub, spawn_script_stub_coordinated,
+    };
+    use super::*;
+    use crate::index::schema;
+
+    const HOUR_MS: i64 = 3_600_000;
+    const HIGH_MARK: &str = "2026-01-01T00:00:00Z";
+
+    fn github_binding(project: &str, base_url: &str) -> ResolvedTracker {
+        ResolvedTracker {
+            provider: Tracker::Github,
+            project: project.to_string(),
+            base_url: Some(base_url.to_string()),
+            auth: None,
+            authentication: TrackerAuthentication::AuthMissing,
+            tags: Vec::new(),
+        }
+    }
+
+    fn open_schema() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn
+    }
+
+    /// Persist a completed-backfill cursor whose filter fingerprint matches the binding, so a
+    /// scheduled run enters the ordinary probe/delta lane instead of a first-walk backfill.
+    fn seed_quiet_cursor(conn: &Connection, binding: &ResolvedTracker) {
+        record_attempt(conn, binding, 0).unwrap();
+        conn.execute(
+            "UPDATE papertrail_sync_cursor
+             SET backfill_done=1, high_mark_at=?1, filter_fingerprint=?2",
+            params![HIGH_MARK, binding.filter_fingerprint()],
+        )
+        .unwrap();
+    }
+
+    struct SeededHealth {
+        attempt: i64,
+        probe: i64,
+        mirror: i64,
+        full: i64,
+    }
+
+    fn seed_health(conn: &Connection, binding: &ResolvedTracker, health: &SeededHealth) {
+        record_attempt(conn, binding, health.attempt).unwrap();
+        conn.execute(
+            "UPDATE papertrail_sync_cursor
+             SET last_successful_probe_ms=?1, last_successful_mirror_ms=?2, last_full_sync_ms=?3",
+            params![health.probe, health.mirror, health.full],
+        )
+        .unwrap();
+    }
+
+    fn persisted(conn: &Connection, binding: &ResolvedTracker) -> BindingScheduleState {
+        let repo_id = schema::active_repo_id(conn).unwrap();
+        load_persisted_health(conn, &repo_id, binding).unwrap().0
+    }
+
+    /// The wire shape of a quiet probe run: a not-modified item probe, then one empty page per
+    /// repo-comment stream.
+    fn probe_script() -> Vec<StubResponse> {
+        vec![
+            StubResponse::status("304 Not Modified", ""),
+            StubResponse::ok("[]"),
+            StubResponse::ok("[]"),
+        ]
+    }
+
+    fn full_walk_script(project: &str) -> Vec<StubResponse> {
+        vec![
+            StubResponse::ok(&format!(
+                r#"{{"incomplete_results":false,"items":[{{"number":1,"html_url":"https://example.test/{project}/issues/1","state":"open","title":"{project}","body":"","updated_at":"2026-01-01T00:00:00Z","labels":[]}}]}}"#
+            )),
+            StubResponse::ok("[]"),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok("[]"),
+            StubResponse::ok("[]"),
+        ]
+    }
+
+    #[test]
+    fn bindings_inside_the_minimum_attempt_interval_are_skipped_for_every_request() {
+        let conn = open_schema();
+        let (url, handle) = spawn_script_stub(Vec::new());
+        let binding = github_binding("o/r", &url);
+        let now = now_ms();
+        seed_quiet_cursor(&conn, &binding);
+        seed_health(&conn, &binding, &SeededHealth {
+            attempt: now - 1_000,
+            probe: now - 2 * HOUR_MS,
+            mirror: now - 2 * HOUR_MS,
+            full: now - 2 * HOUR_MS,
+        });
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+
+        for request in
+            [AutosyncRequest::Evaluate, AutosyncRequest::Incremental, AutosyncRequest::Full]
+        {
+            let report = block_on(sync_mirror_scheduled(&conn, &ctx, request)).unwrap();
+            assert!(report.bindings.is_empty(), "{request:?} must not dispatch");
+            assert!(report.errors.is_empty());
+            assert_eq!(report.synced_items, 0);
+        }
+        // The recent attempt is untouched — a skipped binding records nothing.
+        assert_eq!(persisted(&conn, &binding).last_attempt_ms, Some(now - 1_000));
+        assert!(handle.join().unwrap().is_empty(), "no network request may be made");
+    }
+
+    #[test]
+    fn due_probe_advances_probe_freshness_without_touching_mirror_timestamps() {
+        let conn = open_schema();
+        let (url, handle) = spawn_script_stub(probe_script());
+        let binding = github_binding("o/r", &url);
+        let now = now_ms();
+        seed_quiet_cursor(&conn, &binding);
+        let seeded = SeededHealth {
+            attempt: now - HOUR_MS,
+            probe: now - HOUR_MS,
+            mirror: now - HOUR_MS,
+            full: now - 2 * HOUR_MS,
+        };
+        seed_health(&conn, &binding, &seeded);
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+
+        let report =
+            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Evaluate)).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.bindings.len(), 1);
+        assert!(report.bindings[0].probe_not_modified);
+        assert_eq!(report.synced_items, 0);
+
+        let health = persisted(&conn, &binding);
+        assert!(health.last_successful_probe_ms.unwrap() >= now, "probe freshness advances");
+        assert_eq!(health.last_successful_mirror_ms, Some(seeded.mirror), "mirror is untouched");
+        assert_eq!(health.last_full_walk_ms, Some(seeded.full), "full walk is untouched");
+        assert_eq!(handle.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn overdue_full_backstop_dominates_a_fresh_probe_and_completes_a_full_walk() {
+        let conn = open_schema();
+        let (url, _handle) = spawn_script_stub(full_walk_script("o/r"));
+        let binding = github_binding("o/r", &url);
+        let now = now_ms();
+        seed_quiet_cursor(&conn, &binding);
+        seed_health(&conn, &binding, &SeededHealth {
+            attempt: now - 2 * HOUR_MS,
+            probe: now - 60_000, // fresh probe: the daily backstop must still win
+            mirror: now - 2 * HOUR_MS,
+            full: now - 25 * HOUR_MS,
+        });
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+
+        let report =
+            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Evaluate)).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.bindings.len(), 1);
+        assert!(report.bindings[0].completed_full_walk, "the backstop runs a FULL walk");
+        assert_eq!(report.synced_items, 1);
+        let health = persisted(&conn, &binding);
+        assert!(health.last_full_walk_ms.unwrap() >= now, "full-walk freshness advances");
+    }
+
+    #[test]
+    fn scheduled_bindings_fail_independently_and_persist_health() {
+        let conn = open_schema();
+        let (failing_url, failing_handle) =
+            spawn_script_stub(vec![StubResponse::status("500 Internal Server Error", "boom")]);
+        let (good_url, _good_handle) = spawn_script_stub(full_walk_script("b/two"));
+        let failing = github_binding("a/one", &failing_url);
+        let good = github_binding("b/two", &good_url);
+        let ctx = PapertrailContext {
+            trackers: vec![failing.clone(), good.clone()],
+            ..PapertrailContext::default()
+        };
+
+        let report =
+            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Incremental)).unwrap();
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].project, "a/one");
+        assert_eq!(report.errors[0].status, "failed");
+        assert_eq!(report.bindings.len(), 1, "the sibling binding completes");
+        assert_eq!(report.bindings[0].project, "b/two");
+        assert!(report.bindings[0].completed_full_walk);
+
+        let failing_status =
+            report.status.bindings.iter().find(|binding| binding.project == "a/one").unwrap();
+        assert!(failing_status.error_class.is_some(), "the failure class is persisted");
+        let good_status =
+            report.status.bindings.iter().find(|binding| binding.project == "b/two").unwrap();
+        assert_eq!(good_status.error_class, None);
+        assert!(good_status.last_full_walk_ms.is_some());
+        assert_eq!(failing_handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn provider_client_pending_bindings_are_silently_filtered_from_scheduled_runs() {
+        let conn = open_schema();
+        let binding = ResolvedTracker {
+            provider: Tracker::Gitlab,
+            project: "group/repo".to_string(),
+            base_url: Some("https://gitlab.com".to_string()),
+            auth: None,
+            authentication: TrackerAuthentication::AuthMissing,
+            tags: Vec::new(),
+        };
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+
+        let report = block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Full)).unwrap();
+        assert!(report.errors.is_empty(), "an automatic tick must not log the capability gap");
+        assert!(report.bindings.is_empty());
+        // No attempt is recorded either — the binding was never evaluated for dispatch.
+        assert_eq!(persisted(&conn, &binding).last_attempt_ms, None);
+    }
+
+    #[test]
+    fn due_bindings_overlap_network_requests_while_commits_stay_serialized() {
+        let conn = open_schema();
+        // Stub A holds its FIRST response until stub B has RECEIVED a request: if the two
+        // binding jobs ran serially, A's probe would block the whole run and the gate would time
+        // out into a 500 the assertions below catch. Overlapping network futures are the only
+        // way both probes complete cleanly.
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (first_url, first_handle) =
+            spawn_script_stub_coordinated(probe_script(), None, Some(gate_rx));
+        let (second_url, second_handle) =
+            spawn_script_stub_coordinated(probe_script(), Some(gate_tx), None);
+        let first = github_binding("a/one", &first_url);
+        let second = github_binding("b/two", &second_url);
+        let now = now_ms();
+        for binding in [&first, &second] {
+            seed_quiet_cursor(&conn, binding);
+            seed_health(&conn, binding, &SeededHealth {
+                attempt: now - HOUR_MS,
+                probe: now - HOUR_MS,
+                mirror: now - HOUR_MS,
+                full: now - 2 * HOUR_MS,
+            });
+        }
+        let ctx = PapertrailContext {
+            trackers: vec![first.clone(), second.clone()],
+            ..PapertrailContext::default()
+        };
+
+        let report =
+            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Evaluate)).unwrap();
+        assert!(
+            report.errors.is_empty(),
+            "serial dispatch would gate-timeout: {:?}",
+            report.errors
+        );
+        assert_eq!(report.bindings.len(), 2);
+        assert!(report.bindings.iter().all(|binding| binding.probe_not_modified));
+        for binding in [&first, &second] {
+            assert!(persisted(&conn, binding).last_successful_probe_ms.unwrap() >= now);
+        }
+        assert_eq!(first_handle.join().unwrap().len(), 3);
+        assert_eq!(second_handle.join().unwrap().len(), 3);
     }
 }

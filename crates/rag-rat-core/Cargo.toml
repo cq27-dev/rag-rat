@@ -18,6 +18,7 @@ ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
 fastembed = { workspace = true, optional = true }
 getrandom.workspace = true
+futures-util.workspace = true
 gix.workspace = true
 httpdate.workspace = true
 ignore = "0.4.26"

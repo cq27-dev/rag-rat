@@ -161,6 +161,19 @@ impl IndexDatabase {
         ))
     }
 
+    /// Mirror only the bindings the scheduling policy says are due (the automatic watcher / hook
+    /// path); [`Self::papertrail_sync`] is the unconditional manual pass.
+    pub fn papertrail_sync_scheduled(
+        &self,
+        request: papertrail::AutosyncRequest,
+    ) -> anyhow::Result<PapertrailSyncReport> {
+        papertrail::block_on(papertrail::sync_mirror_scheduled(
+            self.storage.connection(),
+            &self.papertrail,
+            request,
+        ))
+    }
+
     pub fn papertrail_issue_search(
         &self,
         query: &str,

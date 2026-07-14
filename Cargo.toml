@@ -43,6 +43,9 @@ ed25519-dalek = "2"
 # persists, and validates the key (rejecting small-order / identity public keys); ECDH + HKDF is C4.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+# `join_all` drives the per-binding mirror jobs concurrently on the papertrail
+# current-thread runtime (reqwest already pulls futures-util transitively).
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 # OS CSPRNG for the op-log device key: fills a 32-byte ed25519 seed at first use, which then flows
 # through the existing deterministic `SigningKey::from_bytes`. The lowest-level entropy source (no
 # `rand`/`rand_core` pulled in for this), keeping `from_seed` the sole key constructor.

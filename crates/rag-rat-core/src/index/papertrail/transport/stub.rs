@@ -55,9 +55,36 @@ pub(crate) fn spawn_script_stub(
     spawn_script_stub_with_timeout(responses, Duration::from_secs(10))
 }
 
+/// [`spawn_script_stub`] with cross-stub coordination for concurrency tests:
+/// `notify_first_request` fires after the FIRST request head is read, and `gate_first_response`
+/// holds the FIRST response until the paired stub signals. A gate that times out serves a `500`
+/// instead of hanging the test — a serial (non-overlapping) client then observes a failure the
+/// test can assert on.
+pub(crate) fn spawn_script_stub_coordinated(
+    responses: Vec<StubResponse>,
+    notify_first_request: Option<std::sync::mpsc::Sender<()>>,
+    gate_first_response: Option<std::sync::mpsc::Receiver<()>>,
+) -> (String, thread::JoinHandle<Vec<String>>) {
+    spawn_script_stub_inner(
+        responses,
+        Duration::from_secs(10),
+        notify_first_request,
+        gate_first_response,
+    )
+}
+
 fn spawn_script_stub_with_timeout(
     responses: Vec<StubResponse>,
     accept_timeout: Duration,
+) -> (String, thread::JoinHandle<Vec<String>>) {
+    spawn_script_stub_inner(responses, accept_timeout, None, None)
+}
+
+fn spawn_script_stub_inner(
+    responses: Vec<StubResponse>,
+    accept_timeout: Duration,
+    notify_first_request: Option<std::sync::mpsc::Sender<()>>,
+    gate_first_response: Option<std::sync::mpsc::Receiver<()>>,
 ) -> (String, thread::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.set_nonblocking(true).expect("nonblocking listener");
@@ -75,7 +102,9 @@ fn spawn_script_stub_with_timeout(
         .collect::<Vec<_>>();
     let handle = thread::spawn(move || {
         let mut captured = Vec::new();
-        for response in responses {
+        let mut notify_first_request = notify_first_request;
+        let mut gate_first_response = gate_first_response;
+        for mut response in responses {
             let deadline = Instant::now() + accept_timeout;
             let mut stream = loop {
                 match listener.accept() {
@@ -86,6 +115,14 @@ fn spawn_script_stub_with_timeout(
             };
             if let Some(head) = read_full_request(&mut stream) {
                 captured.push(head);
+            }
+            if let Some(notify) = notify_first_request.take() {
+                let _ = notify.send(());
+            }
+            if let Some(gate) = gate_first_response.take()
+                && gate.recv_timeout(Duration::from_secs(5)).is_err()
+            {
+                response = StubResponse::status("500 Internal Server Error", "gate timed out");
             }
             let payload = format!(
                 "HTTP/1.1 {}\r\n{}Content-Type: application/json\r\nContent-Length: \

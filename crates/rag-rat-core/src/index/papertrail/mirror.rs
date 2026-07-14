@@ -117,6 +117,10 @@ pub struct MirrorBindingReport {
     pub paused_until_ms: Option<i64>,
     pub pause_reason: Option<String>,
     pub completed_full_walk: bool,
+    /// The item freshness probe answered not-modified. Combined with zero stored / pruned work
+    /// this classifies the run as a successful PROBE — advancing probe freshness only, never the
+    /// mirror or full-walk timestamps.
+    pub probe_not_modified: bool,
 }
 
 pub(crate) async fn mirror_binding<C: PapertrailClient>(
@@ -174,6 +178,7 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
         paused_until_ms: None,
         pause_reason: None,
         completed_full_walk: false,
+        probe_not_modified: false,
     };
     if filter_changed {
         report.pruned_items += prune_unmatched(conn, binding)?;
@@ -230,6 +235,7 @@ async fn mirror_binding_inner<C: PapertrailClient>(
                 save_cursor(conn, binding, cursor, false)?;
                 sync_item_delta(conn, binding, client, cursor, report).await?;
             } else {
+                report.probe_not_modified = true;
                 save_cursor(conn, binding, cursor, false)?;
             }
         }

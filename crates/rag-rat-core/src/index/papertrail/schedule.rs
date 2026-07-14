@@ -96,10 +96,49 @@ fn millis(seconds: u64) -> i64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SuccessfulOperation {
-    #[allow(dead_code, reason = "the watcher probe worker lands in the dependent #592 slice")]
     Probe,
     IncrementalMirror,
     FullMirror,
+}
+
+/// A coalescible automatic-sync trigger. The variant order IS the strength order (`Ord`): when
+/// triggers coalesce — in the in-process worker queue or through the cross-process pending
+/// marker — the merged request is the maximum, so a daily/full trigger is never weakened by a
+/// later incremental or evaluation tick.
+///
+/// - `Evaluate` — a timer tick: let [`decide_schedule`] pick per binding (probe when due, the full
+///   backstop when overdue, resuming interrupted work first).
+/// - `Incremental` — an external change signal (a git hook fired): bindings due for any work run a
+///   delta walk without waiting for probe cadence.
+/// - `Full` — a healing walk was explicitly requested; bindings not gated by pauses or the minimum
+///   attempt interval run a full re-walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AutosyncRequest {
+    Evaluate,
+    Incremental,
+    Full,
+}
+
+impl AutosyncRequest {
+    /// The exact token persisted in the cross-process pending marker file.
+    pub(crate) fn as_marker_str(self) -> &'static str {
+        match self {
+            Self::Evaluate => "evaluate",
+            Self::Incremental => "incremental",
+            Self::Full => "full",
+        }
+    }
+
+    /// Parse a pending-marker token. Unknown content (a torn write, a future token) degrades to
+    /// `Evaluate`: the scheduling policy re-decides everything an evaluation can, and interrupted
+    /// work resumes from the persisted cursor regardless.
+    pub(crate) fn from_marker_str(value: &str) -> Self {
+        match value.trim() {
+            "incremental" => Self::Incremental,
+            "full" => Self::Full,
+            _ => Self::Evaluate,
+        }
+    }
 }
 
 pub(crate) fn record_attempt(
