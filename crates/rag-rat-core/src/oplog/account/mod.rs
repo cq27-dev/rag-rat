@@ -26,10 +26,11 @@ mod ops;
 mod registers;
 mod storage;
 
-#[allow(unused_imports, reason = "C2 envelope is frozen before candidate storage lands")]
+#[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub(in crate::oplog) use content::{
-    ContentEntryHeader, SignedContentEntry, VerifiedContentEntry, decode_content_signed,
-    sign_content_entry, verify_content_signed,
+    ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, SignedContentEntry,
+    VerifiedContentEntry, content_ingest, decode_content_signed, sign_content_entry,
+    verify_content_signed,
 };
 pub(crate) use fold::{
     AuthorityBoundary, AuthorityInvalidReason, AuthorityParkReason, AuthorityQuery, GrantAuthority,

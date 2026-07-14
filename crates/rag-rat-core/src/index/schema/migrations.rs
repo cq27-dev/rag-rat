@@ -1260,6 +1260,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_063_ID => Some(63),
             MIGRATION_064_ID => Some(64),
             MIGRATION_065_ID => Some(65),
+            MIGRATION_066_ID => Some(66),
             _ => None,
         })
         .max()
@@ -1334,6 +1335,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_063_ID
             | MIGRATION_064_ID
             | MIGRATION_065_ID
+            | MIGRATION_066_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1405,6 +1407,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_063_ID => migration.checksum != MIGRATION_063_CHECKSUM,
         MIGRATION_064_ID => migration.checksum != MIGRATION_064_CHECKSUM,
         MIGRATION_065_ID => migration.checksum != MIGRATION_065_CHECKSUM,
+        MIGRATION_066_ID => migration.checksum != MIGRATION_066_CHECKSUM,
         _ => false,
     }
 }
@@ -4359,6 +4362,63 @@ pub(crate) fn apply_account_candidate_dag(conn: &Connection) -> rusqlite::Result
          -- index it so a backlog for OTHER accounts is never full-scanned per ingest.
          CREATE INDEX IF NOT EXISTS account_pre_verify_account
              ON account_pre_verify(claimed_account_id);",
+    )
+}
+
+/// V066 (sync phase C2, §16): the owner-bound `/3` content candidate DAG.
+///
+/// Full-width unsigned wire counters are fixed-width big-endian blobs. SQLite INTEGER is signed
+/// i64 and would reject or truncate valid `u64` sequence/authentication counters. Lexicographic
+/// ordering of equal-width big-endian blobs is the unsigned numeric ordering required by dense
+/// chain queries.
+pub(crate) fn apply_content_candidate_dag(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS content_entries(
+             entry_hash          BLOB    PRIMARY KEY CHECK(length(entry_hash) = 32),
+             stream_id           BLOB    NOT NULL CHECK(length(stream_id) = 32),
+             author_account_id   BLOB    NOT NULL CHECK(length(author_account_id) = 32),
+             device_fingerprint  BLOB    NOT NULL CHECK(length(device_fingerprint) = 32),
+             seq                 BLOB    NOT NULL CHECK(length(seq) = 8),
+             prev_hash           BLOB    CHECK(prev_hash IS NULL OR length(prev_hash) = 32),
+             grant_id            BLOB    CHECK(grant_id IS NULL OR length(grant_id) = 32),
+             roster_ref          BLOB    NOT NULL CHECK(length(roster_ref) = 32),
+             owner_auth_len      BLOB    NOT NULL CHECK(length(owner_auth_len) = 8),
+             author_auth_len     BLOB    NOT NULL CHECK(length(author_auth_len) = 8),
+             accepted            INTEGER NOT NULL DEFAULT 0 CHECK(accepted IN (0, 1)),
+             signed_bytes        BLOB    NOT NULL,
+             received_at_ms      INTEGER NOT NULL
+         ) STRICT;
+
+         -- Candidate history is grow-only: equivocations share a coordinate and remain distinct.
+         CREATE INDEX IF NOT EXISTS content_entries_chain
+             ON content_entries(stream_id, author_account_id, device_fingerprint, seq);
+         CREATE INDEX IF NOT EXISTS content_entries_predecessor
+             ON content_entries(prev_hash, stream_id, author_account_id, device_fingerprint);
+
+         -- C2 never sets accepted=1. C3 owns the atomic authority+branch refold that activates it.
+         CREATE UNIQUE INDEX IF NOT EXISTS content_accepted_slot
+             ON content_entries(stream_id, author_account_id, device_fingerprint, seq)
+             WHERE accepted = 1;
+
+         CREATE TABLE IF NOT EXISTS content_entry_status(
+             entry_hash BLOB PRIMARY KEY CHECK(length(entry_hash) = 32),
+             status     TEXT NOT NULL,
+             detail     TEXT
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS content_pre_verify(
+             signed_hash               BLOB    PRIMARY KEY CHECK(length(signed_hash) = 32),
+             entry_hash                BLOB    NOT NULL CHECK(length(entry_hash) = 32),
+             claimed_stream_id         BLOB    NOT NULL CHECK(length(claimed_stream_id) = 32),
+             claimed_author_account_id BLOB    NOT NULL CHECK(length(claimed_author_account_id) = \
+         32),
+             claimed_fingerprint       BLOB    NOT NULL CHECK(length(claimed_fingerprint) = 32),
+             roster_ref                BLOB    NOT NULL CHECK(length(roster_ref) = 32),
+             raw_bytes                 BLOB    NOT NULL,
+             received_at_ms            INTEGER NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS content_pre_verify_author
+             ON content_pre_verify(claimed_author_account_id, roster_ref);",
     )
 }
 

@@ -1919,7 +1919,6 @@ fn migration_064_creates_account_authority_shadow_tables() {
 
 #[test]
 fn migration_065_is_the_tip_and_adds_historical_authority_boundaries() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 65, "move this pin with the next schema migration");
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
     assert!(conn_table_exists(&conn, "account_roster_content_boundaries"));
@@ -1939,6 +1938,81 @@ fn migration_065_is_the_tip_and_adds_historical_authority_boundaries() {
         }
     }
     schema::apply_account_authority_boundaries(&conn).expect("V065 replay is idempotent");
+}
+
+#[test]
+fn migration_066_is_the_tip_and_adds_the_content_candidate_dag() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 66, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    for table in ["content_entries", "content_entry_status", "content_pre_verify"] {
+        assert!(conn_table_exists(&conn, table), "V066 creates {table}");
+    }
+    let columns = conn_table_columns(&conn, "content_entries");
+    for column in [
+        "stream_id",
+        "author_account_id",
+        "device_fingerprint",
+        "seq",
+        "prev_hash",
+        "grant_id",
+        "roster_ref",
+        "owner_auth_len",
+        "author_auth_len",
+        "accepted",
+        "signed_bytes",
+    ] {
+        assert!(columns.contains(&column.to_string()), "V066 adds content_entries.{column}");
+    }
+    schema::apply_content_candidate_dag(&conn).expect("V066 replay is idempotent");
+    let insert = |hash: u8, seq_width: usize| {
+        conn.execute(
+            "INSERT INTO content_entries(
+                 entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?8, 0, ?9, 0)",
+            rusqlite::params![
+                vec![hash; 32],
+                vec![1_u8; 32],
+                vec![2_u8; 32],
+                vec![3_u8; 32],
+                vec![0_u8; seq_width],
+                vec![4_u8; 32],
+                vec![0_u8; 8],
+                vec![0_u8; 8],
+                vec![hash],
+            ],
+        )
+    };
+    assert!(insert(1, 7).is_err(), "V066 rejects truncated unsigned counters");
+    insert(1, 8).unwrap();
+    insert(2, 8).expect("equivocating candidates are first-class while unaccepted");
+    conn.execute("UPDATE content_entries SET accepted = 1 WHERE entry_hash = ?1", [vec![1; 32]])
+        .unwrap();
+    assert!(
+        conn.execute("UPDATE content_entries SET accepted = 1 WHERE entry_hash = ?1", [vec![
+            2;
+            32
+        ]])
+        .is_err(),
+        "V066 permits at most one accepted candidate per dense slot"
+    );
+    truncate_schema_to(&conn, 65);
+    conn.execute_batch(
+        "DROP TABLE content_pre_verify;
+         DROP TABLE content_entry_status;
+         DROP TABLE content_entries;",
+    )
+    .unwrap();
+    assert!(!conn_table_exists(&conn, "content_entries"));
+    schema::migrate_forward(&conn).expect("V065 upgrades through V066");
+    assert!(conn_index_exists(&conn, "content_entries_chain"));
+    assert!(conn_index_exists(&conn, "content_entries_predecessor"));
+    assert!(conn_index_exists(&conn, "content_accepted_slot"));
+    assert!(conn_index_exists(&conn, "content_pre_verify_author"));
+    schema::migrate_forward(&conn).expect("a second V066 forward migration is a no-op");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 66);
 }
 
 #[test]

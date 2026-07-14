@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
-use super::{AccountId, fold};
+use super::{AccountId, content, fold};
 use crate::oplog::cbor;
 use crate::oplog::device::DevicePublic;
 use crate::oplog::op::DeviceFingerprint;
@@ -97,6 +97,18 @@ pub(crate) enum IngestOutcome {
         status: String,
         scope: CapacityScope,
         entry_hashes: Vec<EntryHash>,
+    },
+    IngestedWithRejectedContentPromotions {
+        status: String,
+        scope: content::ContentCapacityScope,
+        entry_hashes: Vec<EntryHash>,
+    },
+    IngestedWithRejectedAccountAndContentPromotions {
+        status: String,
+        account_scope: CapacityScope,
+        account_entry_hashes: Vec<EntryHash>,
+        content_scope: content::ContentCapacityScope,
+        content_entry_hashes: Vec<EntryHash>,
     },
 }
 
@@ -193,16 +205,34 @@ pub(crate) fn account_ingest(
     } else {
         PromotionOutcome::default()
     };
+    let rejected_content_promotions = if is_genesis(&verified.header) || is_device_add(&verified) {
+        content::promote_pre_verify_for_account(&tx, account_id, now_ms)?
+    } else {
+        Default::default()
+    };
     let status = refold_in_tx(&tx, account_id)?;
     tx.commit()?;
     let status = status.get(&verified.entry_hash).cloned().unwrap_or_else(|| "unknown".into());
-    Ok(match rejected_promotions.scope {
-        Some(scope) => IngestOutcome::IngestedWithRejectedPromotions {
+    Ok(match (rejected_promotions.scope, rejected_content_promotions.scope) {
+        (Some(account_scope), Some(content_scope)) =>
+            IngestOutcome::IngestedWithRejectedAccountAndContentPromotions {
+                status,
+                account_scope,
+                account_entry_hashes: rejected_promotions.entry_hashes,
+                content_scope,
+                content_entry_hashes: rejected_content_promotions.entry_hashes,
+            },
+        (Some(scope), None) => IngestOutcome::IngestedWithRejectedPromotions {
             status,
             scope,
             entry_hashes: rejected_promotions.entry_hashes,
         },
-        None => IngestOutcome::Ingested { status },
+        (None, Some(scope)) => IngestOutcome::IngestedWithRejectedContentPromotions {
+            status,
+            scope,
+            entry_hashes: rejected_content_promotions.entry_hashes,
+        },
+        (None, None) => IngestOutcome::Ingested { status },
     })
 }
 

@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 65;
+pub const LATEST_SCHEMA_VERSION: u32 = 66;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -457,6 +457,11 @@ const MIGRATION_065_ID: &str = "065_account_authority_boundaries";
 const MIGRATION_065_CHECKSUM: &str = "sha256:rag-rat-account-authority-boundaries-v65a";
 const MIGRATION_065_DESCRIPTION: &str =
     "Persist closed roster and owner chain boundaries for bounded historical citations";
+const MIGRATION_066_ID: &str = "066_content_candidate_dag";
+const MIGRATION_066_CHECKSUM: &str = "sha256:rag-rat-content-candidate-dag-v66a";
+const MIGRATION_066_DESCRIPTION: &str =
+    "Persist every structurally valid /3 content candidate, bounded pre-verification work, and \
+     derived status while reserving accepted-slot uniqueness for C3 authority acceptance";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1008,6 +1013,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_065_CHECKSUM,
         description: MIGRATION_065_DESCRIPTION,
         apply: apply_account_authority_boundaries,
+    },
+    Migration {
+        id: MIGRATION_066_ID,
+        checksum: MIGRATION_066_CHECKSUM,
+        description: MIGRATION_066_DESCRIPTION,
+        apply: apply_content_candidate_dag,
     },
 ];
 
