@@ -132,6 +132,10 @@ pub(super) struct BranchPin {
     pub(super) watermark: EntryHash,
 }
 
+/// Eligible entries indexed by the `(chain, prev_hash)` parent slot they extend; a chain root keys
+/// on `None`. Several entries under one key are an equivocation — the slot selection resolves them.
+type BranchChildren = HashMap<(ChainCoordinate, Option<EntryHash>), Vec<(u64, EntryHash)>>;
+
 /// The branch-selection verdict for one refold: the entries on each chain's accepted branch, and
 /// the equivocation losers (`forked` — terminal unless a later watermark selects them).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -160,8 +164,7 @@ pub(super) fn select_accepted_branch(
     pins: &[BranchPin],
     view: &dyn HeaderView,
 ) -> BranchSelection {
-    let mut children: HashMap<(ChainCoordinate, Option<EntryHash>), Vec<(u64, EntryHash)>> =
-        HashMap::new();
+    let mut children = BranchChildren::new();
     let mut chains: HashSet<ChainCoordinate> = HashSet::new();
     for candidate in candidates.iter().filter(|c| eligible.contains(&c.entry_hash)) {
         let coordinate = ChainCoordinate::of(&candidate.header);
