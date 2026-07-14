@@ -630,9 +630,9 @@ priority over these ordinary cadences.
 
 ```toml
 [papertrail]
-probe_interval_secs = 900       # default: 15 minutes
-sync_min_interval_secs = 900    # default: 15 minutes between attempts
-full_sync_interval_secs = 86400 # default: daily healing walk
+probe_interval_secs = 900       # default: 15 minutes; must be positive
+sync_min_interval_secs = 900    # default: 15 minutes between attempts; 0 = no attempt gate
+full_sync_interval_secs = 86400 # default: daily healing walk; must be positive
 ```
 
 Synchronization is **automatic** once an index exists — no cron entry and no manual sync command

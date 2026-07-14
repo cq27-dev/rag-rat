@@ -162,6 +162,11 @@ pub enum ConfigError {
          including) 1.0 (got `{0}`)"
     )]
     PapertrailRateLimitReserveOutOfRange(f64),
+    #[error(
+        "[papertrail] `{0}` must be positive — a zero cadence would silently disable automatic \
+         sync"
+    )]
+    PapertrailIntervalZero(&'static str),
 }
 
 pub use discovery::{

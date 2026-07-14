@@ -78,6 +78,18 @@ impl TryFrom<RawPapertrail> for PapertrailConfig {
         if !rate_limit_reserve.is_finite() || !(0.0..1.0).contains(&rate_limit_reserve) {
             return Err(ConfigError::PapertrailRateLimitReserveOutOfRange(rate_limit_reserve));
         }
+        // The wake cadences must be positive: the watcher derives its evaluation deadline from
+        // their minimum, so an accepted zero would silently disable automatic sync — including
+        // the OTHER, positive cadence. (`sync_min_interval_secs = 0` stays legal: it only
+        // removes the attempt gate, disabling nothing.)
+        for (key, value) in [
+            ("probe_interval_secs", probe_interval_secs),
+            ("full_sync_interval_secs", full_sync_interval_secs),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::PapertrailIntervalZero(key));
+            }
+        }
         Ok(PapertrailConfig {
             probe_interval_secs,
             sync_min_interval_secs,

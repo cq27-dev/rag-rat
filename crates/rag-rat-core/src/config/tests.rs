@@ -238,6 +238,24 @@ fn papertrail_scheduling_intervals_are_parsed() {
 }
 
 #[test]
+fn papertrail_wake_cadences_reject_zero_but_the_attempt_gate_may_be_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rag-rat.toml");
+    // A zero wake cadence would silently disable automatic sync (the watcher's deadline is the
+    // minimum of the two), so both are rejected at load.
+    for key in ["probe_interval_secs", "full_sync_interval_secs"] {
+        std::fs::write(&path, format!("[papertrail]\n{key} = 0\n")).unwrap();
+        assert!(
+            matches!(Config::load(&path), Err(ConfigError::PapertrailIntervalZero(rejected)) if rejected == key),
+            "`{key} = 0` must be rejected"
+        );
+    }
+    // The minimum attempt interval only gates retries; zero disables nothing and stays legal.
+    std::fs::write(&path, "[papertrail]\nsync_min_interval_secs = 0\n").unwrap();
+    assert_eq!(Config::load(&path).unwrap().papertrail.sync_min_interval_secs, 0);
+}
+
+#[test]
 fn papertrail_rate_limit_reserve_is_parsed_and_validated() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rag-rat.toml");
