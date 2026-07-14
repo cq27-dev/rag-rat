@@ -96,3 +96,58 @@ drives it:
   gate fails the PR.
 - **heavy tier** (release / dispatch): the big corpora on the self-hosted box, converted to BMF
   (`tools/oracle-report-bmf.py`) and pushed to Bencher as the headline resolution series.
+
+## The SwiftPM corpus (Swift phase 2)
+
+`tests/fixtures/swift-corpus` is a real, buildable two-target SwiftPM package (`Renderer` depends on
+`CoreKit`), not a pile of loose `.swift` files. It exists so Swift resolution can be *measured*
+rather than asserted: SourceKit-LSP resolves against a **built module graph**, so a fixture that only
+parses would send the semantic work chasing itself.
+
+It is deliberately full of things a name-only resolver cannot get right:
+
+- **cross-module calls** — `Renderer.render` calls `CoreKit.Store.load(id:)`, while
+  `Renderer.Cache.load(id:)` shares the bare name;
+- **overloads** — `Service.fetch(_: Int)` / `Service.fetch(_: String)` differ only by parameter type;
+- **non-ASCII source** — `Text.swift` puts `"🚀☕"` before a call so the callee's byte offset and its
+  LSP UTF-16 `character` offset diverge (an emoji is 2 UTF-16 units, 4 bytes), with an ASCII-only
+  call as the control;
+- **both test frameworks** — XCTest (`XCTestCase` inheritance) and swift-testing (`@Test` / `@Suite`).
+
+`crates/rag-rat-core/src/index/schema_bootstrap_tests/swift_corpus.rs` pins two things, and the
+second is the load-bearing one:
+
+1. what the tree-sitter baseline **gets right** — symbol kinds, containment, edge confidence, test
+   detection;
+2. what it must **leave unresolved** rather than guess — the cross-module and overloaded calls. These
+   are exactly the edges the SourceKit-LSP oracle has to upgrade, so a "resolver" that improved the
+   numbers by guessing would fail this suite instead of looking like progress.
+
+### Running it
+
+The indexing assertions need **no toolchain** and run in the normal suite:
+
+```bash
+cargo nextest run -p rag-rat-core -E 'test(swift_corpus)'
+```
+
+Building the package is **opt-in** — a cold SwiftPM build costs minutes, and no CI runner is required
+to carry a Swift toolchain:
+
+```bash
+RAG_RAT_SWIFT_BUILD=1 cargo nextest run -p rag-rat-core swift_corpus_builds
+# or directly:
+swift build --build-tests --package-path tests/fixtures/swift-corpus
+swift test  --package-path tests/fixtures/swift-corpus
+```
+
+Without the flag the build test prints a visible `SKIP`; **with** the flag and no toolchain it
+**fails** rather than passing quietly — a Swift build is never reported as green without a compiler
+behind it. The test echoes `swift --version` as the toolchain provenance for the run.
+
+Verified on **Swift 6.3.3** (`swift-6.3.3-RELEASE`, x86_64 Linux, installed via `swiftly`);
+`sourcekit-lsp` ships inside the same toolchain, which is what the next phase consumes.
+
+The corpus is intentionally **not** in `tools/oracle-corpora.toml` yet: those entries pin an external
+repo *and a SCIP tool*, and there is no Swift oracle tool to run against it until the SourceKit-LSP
+backend lands.

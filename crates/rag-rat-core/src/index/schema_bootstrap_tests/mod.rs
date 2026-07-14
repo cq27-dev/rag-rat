@@ -352,6 +352,12 @@ pub(crate) fn poison_test_config(tag: &str) -> (PathBuf, Config) {
 }
 
 fn source_config(root: PathBuf, language: Language) -> Config {
+    source_config_dirs(root, language, &["src"])
+}
+
+/// `source_config` for a layout that isn't `src/` — SwiftPM puts first-party code under `Sources/`
+/// and its test targets under `Tests/`.
+fn source_config_dirs(root: PathBuf, language: Language, dirs: &[&str]) -> Config {
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
@@ -362,8 +368,8 @@ fn source_config(root: PathBuf, language: Language) -> Config {
         targets: vec![ResolvedTarget {
             name: language.as_str().to_string(),
             language,
-            directories: vec![PathBuf::from("src")],
-            include: vec!["src/".to_string()],
+            directories: dirs.iter().map(PathBuf::from).collect(),
+            include: dirs.iter().map(|dir| format!("{dir}/")).collect(),
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
@@ -928,5 +934,6 @@ mod reconcile_embeddings;
 mod repo_memory;
 mod repo_registry;
 mod schema_migrations;
+mod swift_corpus;
 mod symbol_search_lookup;
 mod worktree_overlay;

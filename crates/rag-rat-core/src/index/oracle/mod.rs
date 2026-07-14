@@ -22,7 +22,7 @@ mod auto_run;
 mod corpus;
 mod join;
 mod library_usage;
-mod lsp;
+pub(crate) mod lsp;
 mod manifest;
 mod report;
 mod run;

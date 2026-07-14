@@ -18,6 +18,6 @@
 #![allow(dead_code)] // Slice-1 substrate: the maintenance pass wires this in slice 2 (#74).
 
 mod client;
-mod position;
+pub(crate) mod position;
 mod protocol;
 mod resolve;

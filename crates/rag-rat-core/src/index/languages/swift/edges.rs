@@ -221,7 +221,7 @@ fn swift_call_edges(
     out: &mut Vec<EdgeCandidate>,
 ) {
     if swift_subscript_suffix(node, text).is_some() {
-        let Some(target) = swift_call_target(node) else {
+        let Some(target) = swift_call_target(node).map(swift_callee_operand) else {
             return;
         };
         let Some((mut identifiers, _)) = swift_call_target_parts(target, text) else {
@@ -236,7 +236,7 @@ fn swift_call_edges(
         emit_swift_call_edges(text, node, symbols, out, identifiers, None, false);
         return;
     }
-    let Some(target) = swift_call_target(node) else {
+    let Some(target) = swift_call_target(node).map(swift_callee_operand) else {
         return;
     };
     let Some((identifiers, callee_range)) = swift_call_target_parts(target, text) else {
@@ -741,10 +741,103 @@ fn swift_call_target(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).find(|child| child.kind() != "call_suffix")
 }
 
+/// Swift binary-operator expressions that can end up holding a call's CALLEE.
+const BINARY_OPERATOR_EXPRESSIONS: &[&str] = &[
+    "additive_expression",
+    "bitwise_operation",
+    "comparison_expression",
+    "conjunction_expression",
+    "disjunction_expression",
+    "equality_expression",
+    "infix_expression",
+    "multiplicative_expression",
+    "nil_coalescing_expression",
+    "range_expression",
+];
+
+/// The real callee of a call whose TARGET is a binary-operator expression.
+///
+/// tree-sitter-swift binds the argument list to the WHOLE expression on the operator's left, so
+/// `p + g()` parses as `call_expression(additive_expression(p + g), call_suffix(()))` — the call's
+/// target is the OPERATOR node, not `g`. Swift evaluates that as `p + (g())`, so the callee is the
+/// operator expression's RIGHTMOST operand.
+///
+/// Without this unwrap `swift_call_target_parts` refuses the operator node (it is not a callable
+/// static path) and the call is DROPPED — silently losing every call that appears on the right of a
+/// binary operator: `total + item.price()`, `x == compute()`, `value ?? fallback()`. That is a
+/// large share of real call sites, and nothing about the missing edge is visible downstream: the
+/// call just never enters the graph. Nested operators (`a + b + g()`) unwrap repeatedly.
+fn swift_callee_operand(target: Node<'_>) -> Node<'_> {
+    let mut current = target;
+    while BINARY_OPERATOR_EXPRESSIONS.contains(&current.kind()) {
+        let mut cursor = current.walk();
+        let Some(rightmost) = current.named_children(&mut cursor).last() else {
+            break;
+        };
+        current = rightmost;
+    }
+    current
+}
+
+/// The callee path for a call whose TARGET carries a binary operator on its left spine.
+/// `total + item.price()` parses as `call_expression(navigation_expression(additive(total + item),
+/// price), ())`, and `base + Module.Client.make()` nests one level deeper —
+/// `navigation(navigation(additive(base + Module), Client), make)`. In both, the target itself
+/// contains the operator, so `swift_callable_is_static_path` refuses it and the whole call is
+/// dropped — losing the single most common shape there is: a method call added to something.
+///
+/// [`swift_operator_stripped_path`] peels the navigation layers off the target, strips the
+/// operator's LEFT operand (Swift evaluates `base + X.y()` as `base + (X.y())`), and returns the
+/// ordered identifier nodes of the real call path (`item.price`, `Module.Client.make`). Those run
+/// through the SAME [`swift_normalize_call_path`] as the plain arm, so `base + Service.init()`
+/// collapses to a construction of `Service` exactly as `Service.init()` does.
+///
+/// `None` when there is no operator on the target's left spine (ordinary paths keep their existing
+/// naming), or when the receiver is DYNAMIC (`base + foo().bar()`, `x + a[0].m()`) — a value
+/// receiver with no nameable path, which the baseline drops with or without the operator.
+fn swift_operator_receiver_call_parts(
+    target: Node<'_>,
+    text: &str,
+) -> Option<(Vec<String>, Option<CalleeRange>)> {
+    let identifier_nodes = swift_operator_stripped_path(target)?;
+    swift_normalize_call_path(identifier_nodes, text)
+}
+
+/// The ordered identifier nodes of a call target with a binary operator on its left spine, minus
+/// the operator's left operand — or `None` when the spine holds no operator, or a dynamic (call /
+/// subscript) receiver that is not a nameable static path.
+///
+/// Recurses down the leftmost `navigation_expression` chain, appending each suffix, until it
+/// reaches the operator; the operator's RIGHTMOST operand is where the real path begins. A base
+/// case that is neither a navigation nor an operator (a bare identifier, a call, a subscript)
+/// yields `None`, so an operator-free path and a dynamic receiver both fall through to the normal
+/// arm.
+fn swift_operator_stripped_path(target: Node<'_>) -> Option<Vec<Node<'_>>> {
+    if BINARY_OPERATOR_EXPRESSIONS.contains(&target.kind()) {
+        let operand = swift_callee_operand(target);
+        // `base + foo().bar` bottoms out here with a dynamic operand — not a qualifiable path.
+        return swift_callable_is_static_path(operand).then(|| syntax::identifier_nodes(operand));
+    }
+    if target.kind() == "navigation_expression" {
+        let mut cursor = target.walk();
+        let children = target.named_children(&mut cursor).collect::<Vec<_>>();
+        let (&receiver, &suffix) = (children.first()?, children.last()?);
+        // A pathological left-leaning navigation chain (`a.b.c.d…` thousands deep) recurses to full
+        // depth; grow the stack rather than overflow the indexer on hostile input.
+        let mut path = crate::index::grow_stack(|| swift_operator_stripped_path(receiver))?;
+        path.push(syntax::identifier_nodes(suffix).last().copied()?);
+        return Some(path);
+    }
+    None
+}
+
 fn swift_call_target_parts(
     target: Node<'_>,
     text: &str,
 ) -> Option<(Vec<String>, Option<CalleeRange>)> {
+    if let Some(parts) = swift_operator_receiver_call_parts(target, text) {
+        return Some(parts);
+    }
     match target.kind() {
         "array_type" | "array_literal" =>
             Some((vec!["Array".to_string()], Some(CalleeRange::of_node(target)))),
@@ -754,22 +847,39 @@ fn swift_call_target_parts(
             if !swift_callable_is_static_path(target) {
                 return None;
             }
-            let mut identifier_nodes = syntax::identifier_nodes(target);
-            if identifier_nodes.len() > 1
-                && identifier_nodes.last().is_some_and(|&node| node_text(node, text) == "init")
-                && identifier_nodes.get(identifier_nodes.len() - 2).is_some_and(|&node| {
-                    let receiver = node_text(node, text);
-                    looks_like_type_name(&receiver) && !super::is_local_qualified_root(&receiver)
-                })
-            {
-                identifier_nodes.pop();
-            }
-            let identifiers =
-                identifier_nodes.iter().map(|&node| node_text(node, text)).collect::<Vec<_>>();
-            let callee_range = identifier_nodes.last().copied().map(CalleeRange::of_node);
-            Some((identifiers, callee_range))
+            swift_normalize_call_path(syntax::identifier_nodes(target), text)
         },
     }
+}
+
+/// Turn an ordered call-path identifier list into `(names, callee range)`, applying the
+/// `Type.init` → construction collapse: a trailing `init` preceded by a type name is dropped so the
+/// caller emits a `Constructs`/type edge to the TYPE, not a `calls_name` to `init`.
+///
+/// Shared by the plain static-path arm and the operator-RHS recovery so both treat `init` the same
+/// way. Extracting it is the fix for #650: the operator path hand-rolled its own identifier
+/// collection and skipped this, so `base + Service.init()` emitted `calls_name → init` instead of
+/// `Constructs → Service`.
+fn swift_normalize_call_path(
+    mut identifier_nodes: Vec<Node<'_>>,
+    text: &str,
+) -> Option<(Vec<String>, Option<CalleeRange>)> {
+    if identifier_nodes.is_empty() {
+        return None;
+    }
+    if identifier_nodes.len() > 1
+        && identifier_nodes.last().is_some_and(|&node| node_text(node, text) == "init")
+        && identifier_nodes.get(identifier_nodes.len() - 2).is_some_and(|&node| {
+            let receiver = node_text(node, text);
+            looks_like_type_name(&receiver) && !super::is_local_qualified_root(&receiver)
+        })
+    {
+        identifier_nodes.pop();
+    }
+    let identifiers =
+        identifier_nodes.iter().map(|&node| node_text(node, text)).collect::<Vec<_>>();
+    let callee_range = identifier_nodes.last().copied().map(CalleeRange::of_node);
+    Some((identifiers, callee_range))
 }
 
 fn swift_callable_is_static_path(root: Node<'_>) -> bool {
@@ -1657,6 +1767,116 @@ super.finish()
             !has(&edges, EdgeKind::CallsName, "key")
                 && !has(&edges, EdgeKind::CallsName, "handlers"),
             "subscripted/dynamic callable must not invent a named outer call: {edges:#?}"
+        );
+    }
+
+    /// tree-sitter-swift binds a call's argument list to the WHOLE binary expression on the
+    /// operator's left — `p + g()` parses as `call_expression(additive_expression(p + g), ())` — so
+    /// the call target is the operator node, not the callee. Every call on the right of a binary
+    /// operator used to be dropped outright (the operator node is not a callable path), losing
+    /// `total + item.price()`, `x == compute()`, `value ?? fallback()` and friends from the graph.
+    /// The callee is the operator expression's rightmost operand.
+    #[test]
+    fn calls_on_the_right_of_a_binary_operator_are_not_dropped() {
+        // A bare call and a call inside an additive expression must BOTH reach the graph.
+        let additive = edges("func f() -> String { return p + g() }");
+        assert!(
+            has(&additive, EdgeKind::CallsName, "g"),
+            "a call on the right of `+` must still be a call: {additive:#?}"
+        );
+
+        // Both operands are calls; the right one used to vanish.
+        let both = edges("func f() -> String { return s.g(1) + s.h(2) }");
+        assert!(has(&both, EdgeKind::CallsName, "g"), "left operand call: {both:#?}");
+        assert!(has(&both, EdgeKind::CallsName, "h"), "right operand call: {both:#?}");
+
+        // The callee range still lands on the callee itself, not on the operator expression.
+        let src = "func f() -> String { return p + résumé() }";
+        let accented = edges(src);
+        let call = accented
+            .iter()
+            .find(|edge| edge.edge_kind == EdgeKind::CallsName && edge.to_name == "résumé")
+            .unwrap_or_else(|| panic!("missing call: {accented:#?}"));
+        assert_eq!(
+            callee_text(call, src),
+            Some("résumé"),
+            "the callee range must cover the callee, not the operator expression"
+        );
+
+        // Chained operators unwrap all the way to the rightmost operand.
+        let chained = edges("func f() -> Int { return a + b + tail() }");
+        assert!(has(&chained, EdgeKind::CallsName, "tail"), "chained operators: {chained:#?}");
+
+        // Nil-coalescing is the same shape.
+        let coalescing = edges("func f() -> Int { return value ?? fallback() }");
+        assert!(
+            has(&coalescing, EdgeKind::CallsName, "fallback"),
+            "nil-coalescing: {coalescing:#?}"
+        );
+
+        // A construction on the right of an operator is still a construction.
+        let constructed = edges("func f() -> Int { return base + Service() }");
+        assert!(
+            has(&constructed, EdgeKind::Constructs, "Service"),
+            "construction: {constructed:#?}"
+        );
+
+        // An EXPLICIT initializer on the right of an operator is a construction too —
+        // `Service.init` must collapse to `Constructs → Service`, never a `calls_name →
+        // init` (the operator path must run the SAME `.init` normalization as a plain
+        // `Service.init()`).
+        let explicit_init = edges("func f() -> Int { return base + Service.init() }");
+        assert!(
+            has(&explicit_init, EdgeKind::Constructs, "Service"),
+            "explicit init on operator RHS constructs the type: {explicit_init:#?}"
+        );
+        assert!(
+            !has(&explicit_init, EdgeKind::CallsName, "init"),
+            "explicit init must not become a call to `init`: {explicit_init:#?}"
+        );
+
+        // A qualified type method on the operator RHS keeps its receiver qualifier.
+        let qualified = edges("func f() -> Int { return total + Factory.make() }");
+        assert!(has(&qualified, EdgeKind::CallsName, "make"), "qualified method: {qualified:#?}");
+
+        // A MULTI-SEGMENT receiver on the operator RHS: tree-sitter nests the operator under an
+        // inner navigation, so the operator is not the direct receiver. These must still be
+        // recovered — unlike the dynamic case, `Module.Client.make()` WITHOUT the operator resolves
+        // fine, so dropping the operator form would be a real gap, not baseline parity.
+        let nested = edges("func f() -> Int { return base + Module.Client.make() }");
+        assert!(has(&nested, EdgeKind::CallsName, "make"), "nested-navigation method: {nested:#?}");
+        let deep = edges("func f() -> Int { return total + config.section.value() }");
+        assert!(has(&deep, EdgeKind::CallsName, "value"), "value-receiver chain: {deep:#?}");
+        // Init normalization survives the nested case too: `Module.Service.init()` constructs.
+        let nested_init = edges("func f() -> Int { return base + Module.Service.init() }");
+        assert!(
+            has(&nested_init, EdgeKind::Constructs, "Service"),
+            "nested init constructs the type: {nested_init:#?}"
+        );
+        assert!(
+            !has(&nested_init, EdgeKind::CallsName, "init"),
+            "nested init must not be a call to `init`: {nested_init:#?}"
+        );
+
+        // A DYNAMIC receiver on the operator RHS (`make().render()`) must behave EXACTLY as it does
+        // WITHOUT the operator: the inner `make()` is emitted, and the outer `.render` on a
+        // dynamic (call/subscript) receiver is dropped. The baseline never emits an outer call on a
+        // non-nameable receiver, so the operator case must match it — not manufacture a bogus
+        // qualifier, and not diverge by emitting an edge the plain form wouldn't. The plain form is
+        // the control. (A vacuous `.all()` over a missing `render` edge would hide exactly this, so
+        // both directions are asserted explicitly.)
+        let dynamic = edges("func f() -> Int { return base + make().render() }");
+        assert!(has(&dynamic, EdgeKind::CallsName, "make"), "inner dynamic call: {dynamic:#?}");
+        assert!(
+            !has(&dynamic, EdgeKind::CallsName, "render"),
+            "an outer call on a dynamic receiver is dropped, same as the non-operator baseline: \
+             {dynamic:#?}"
+        );
+        let control = edges("func f() -> Int { return make().render() }");
+        assert!(has(&control, EdgeKind::CallsName, "make"), "control inner call: {control:#?}");
+        assert!(
+            !has(&control, EdgeKind::CallsName, "render"),
+            "control: the baseline also drops the outer dynamic-receiver call: {control:#?}"
         );
     }
 }
