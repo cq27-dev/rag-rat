@@ -3336,6 +3336,12 @@ pub(crate) fn apply_papertrail_binding_health(conn: &Connection) -> rusqlite::Re
     add_column_if_missing(conn, "papertrail_sync_cursor", "retry_not_before_ms", "INTEGER")?;
     add_column_if_missing(conn, "papertrail_sync_cursor", "error_class", "TEXT")?;
     add_column_if_missing(conn, "papertrail_sync_cursor", "error_detail", "TEXT")?;
+    conn.execute(
+        "UPDATE papertrail_sync_cursor
+         SET last_successful_probe_ms=last_probe_ms
+         WHERE last_successful_probe_ms IS NULL AND last_probe_ms IS NOT NULL",
+        [],
+    )?;
     Ok(())
 }
 

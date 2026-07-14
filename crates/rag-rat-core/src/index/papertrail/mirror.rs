@@ -78,6 +78,7 @@ pub struct MirrorBindingReport {
     pub pruned_items: usize,
     pub paused_until_ms: Option<i64>,
     pub pause_reason: Option<String>,
+    pub completed_full_walk: bool,
 }
 
 pub(crate) async fn mirror_binding<C: PapertrailClient>(
@@ -87,6 +88,7 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
     full: bool,
 ) -> anyhow::Result<MirrorBindingReport> {
     let mut cursor = load_cursor(conn, binding)?;
+    let had_completed_backfill = cursor.backfill_done;
     let fingerprint = binding.filter_fingerprint();
     let filter_changed = cursor.filter_fingerprint != fingerprint;
     let starting_full_rewalk = full && !cursor.full_rewalk;
@@ -132,6 +134,7 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
         pruned_items: 0,
         paused_until_ms: None,
         pause_reason: None,
+        completed_full_walk: false,
     };
     if filter_changed {
         report.pruned_items += prune_unmatched(conn, binding)?;
@@ -140,7 +143,11 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
 
     let result = mirror_binding_inner(conn, binding, client, &mut cursor, &mut report).await;
     match result {
-        Ok(()) => Ok(report),
+        Ok(()) => {
+            report.completed_full_walk =
+                cursor.backfill_done && (!had_completed_backfill || starting_full_rewalk);
+            Ok(report)
+        },
         Err(error) if pause(&error).is_some() => {
             let (resume_at_ms, reason) = pause(&error).expect("checked");
             report.paused_until_ms = Some(resume_at_ms);

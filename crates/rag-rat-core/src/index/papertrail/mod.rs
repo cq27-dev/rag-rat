@@ -131,6 +131,7 @@ pub struct PapertrailBindingStatus {
     pub last_successful_mirror_ms: Option<i64>,
     pub last_full_walk_ms: Option<i64>,
     pub retry_not_before_ms: Option<i64>,
+    pub full_walk_in_progress: bool,
     pub error_class: Option<PapertrailErrorClass>,
     pub error_detail: Option<String>,
     pub overdue: bool,

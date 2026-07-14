@@ -101,7 +101,7 @@ fn completed_mirror_operation(
     if report.paused_until_ms.is_some() {
         return None;
     }
-    Some(if full {
+    Some(if full || report.completed_full_walk {
         SuccessfulOperation::FullMirror
     } else {
         SuccessfulOperation::IncrementalMirror
@@ -248,6 +248,7 @@ pub(crate) fn status(
                 last_successful_mirror_ms: health.last_successful_mirror_ms,
                 last_full_walk_ms: health.last_full_walk_ms,
                 retry_not_before_ms: health.retry_not_before_ms,
+                full_walk_in_progress: health.full_walk_in_progress,
                 error_class,
                 error_detail,
                 overdue,
@@ -499,6 +500,7 @@ mod capability_tests {
             pruned_items: 0,
             paused_until_ms: Some(42),
             pause_reason: Some("rate_limited".to_string()),
+            completed_full_walk: false,
         };
         assert_eq!(completed_mirror_operation(&report, false), None);
         assert_eq!(completed_mirror_operation(&report, true), None);
@@ -510,6 +512,24 @@ mod capability_tests {
         );
         assert_eq!(
             completed_mirror_operation(&completed, true),
+            Some(SuccessfulOperation::FullMirror)
+        );
+    }
+
+    #[test]
+    fn completed_initial_backfill_is_a_full_walk() {
+        let report = MirrorBindingReport {
+            tracker: Tracker::Github,
+            project: "o/r".to_string(),
+            stored_items: 1,
+            stored_comments: 0,
+            pruned_items: 0,
+            paused_until_ms: None,
+            pause_reason: None,
+            completed_full_walk: true,
+        };
+        assert_eq!(
+            completed_mirror_operation(&report, false),
             Some(SuccessfulOperation::FullMirror)
         );
     }
@@ -550,6 +570,8 @@ mod capability_tests {
         assert_eq!(report.bindings.len(), 2);
         assert_eq!(report.bindings[0].project, "a/one");
         assert_eq!(report.bindings[1].project, "b/two");
+        assert!(report.bindings.iter().all(|binding| binding.completed_full_walk));
+        assert!(report.status.bindings.iter().all(|binding| binding.last_full_walk_ms.is_some()));
         assert_eq!(report.status.issues, 2);
         assert_eq!(first_handle.join().unwrap().len(), 7);
         assert_eq!(second_handle.join().unwrap().len(), 7);

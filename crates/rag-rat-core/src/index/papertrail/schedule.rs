@@ -19,6 +19,7 @@ pub(crate) struct BindingScheduleState {
     pub last_successful_mirror_ms: Option<i64>,
     pub last_full_walk_ms: Option<i64>,
     pub retry_not_before_ms: Option<i64>,
+    pub full_walk_in_progress: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -71,6 +72,9 @@ pub(crate) fn decide_schedule(
     }
     if !elapsed(state.last_attempt_ms, config.sync_min_interval_secs) {
         return ScheduleDecision::Skip;
+    }
+    if state.full_walk_in_progress {
+        return ScheduleDecision::Full;
     }
     if elapsed(state.last_full_walk_ms, config.full_sync_interval_secs) {
         return ScheduleDecision::Full;
@@ -133,7 +137,14 @@ pub(crate) fn record_pause(
     resume_at_ms: i64,
 ) -> anyhow::Result<()> {
     ensure_health_row(conn, binding)?;
-    update_health(conn, binding, "retry_not_before_ms=?4", resume_at_ms)
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    conn.execute(
+        "UPDATE papertrail_sync_cursor
+         SET retry_not_before_ms=?4, error_class='rate_limited', error_detail=NULL
+         WHERE repo_id=?1 AND tracker=?2 AND project=?3",
+        params![repo_id, binding.provider.as_db_str(), binding.project, resume_at_ms],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn record_failure(
@@ -201,12 +212,12 @@ pub(crate) fn load_persisted_health(
     Ok(conn
         .query_row(
             "SELECT last_attempt_ms, last_successful_probe_ms, last_successful_mirror_ms,
-                    last_full_sync_ms, retry_not_before_ms, error_class, error_detail
+                    last_full_sync_ms, retry_not_before_ms, full_rewalk, error_class, error_detail
              FROM papertrail_sync_cursor
              WHERE repo_id=?1 AND tracker=?2 AND project=?3",
             params![repo_id, tracker.as_db_str(), project],
             |row| {
-                let error: Option<String> = row.get(5)?;
+                let error: Option<String> = row.get(6)?;
                 Ok((
                     BindingScheduleState {
                         last_attempt_ms: row.get(0)?,
@@ -214,9 +225,10 @@ pub(crate) fn load_persisted_health(
                         last_successful_mirror_ms: row.get(2)?,
                         last_full_walk_ms: row.get(3)?,
                         retry_not_before_ms: row.get(4)?,
+                        full_walk_in_progress: row.get(5)?,
                     },
                     error.as_deref().and_then(PapertrailErrorClass::from_db_str),
-                    row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -314,8 +326,42 @@ mod tests {
         let binding = binding();
         record_pause(&conn, &binding, 20_000).unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
-        let (state, _, _) = load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
+        let (state, error, detail) =
+            load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
         assert_eq!(state.retry_not_before_ms, Some(20_000));
+        assert_eq!(error, Some(PapertrailErrorClass::RateLimited));
+        assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn provider_pause_replaces_a_stale_failure() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        let binding = binding();
+        record_failure(
+            &conn,
+            &binding,
+            PapertrailErrorClass::Authentication,
+            Some("old auth failure"),
+        )
+        .unwrap();
+        record_pause(&conn, &binding, 20_000).unwrap();
+        let repo_id = schema::active_repo_id(&conn).unwrap();
+        let (_, error, detail) =
+            load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
+        assert_eq!(error, Some(PapertrailErrorClass::RateLimited));
+        assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn interrupted_full_walk_resumes_after_retry_gates_open() {
+        let state = BindingScheduleState {
+            last_attempt_ms: Some(0),
+            last_full_walk_ms: Some(899_999),
+            full_walk_in_progress: true,
+            ..Default::default()
+        };
+        assert_eq!(decide_schedule(900_000, &config(), state, false), ScheduleDecision::Full);
     }
 
     #[test]

@@ -672,6 +672,21 @@ fn migration_064_is_the_tip_and_persists_binding_health() {
     ] {
         assert!(columns.contains(&name.to_string()), "missing {name}");
     }
+    conn.execute(
+        "INSERT INTO papertrail_sync_cursor(tracker, project, last_probe_ms, repo_id)
+         VALUES ('github', 'o/r', 1234, '__unassigned__')",
+        [],
+    )
+    .unwrap();
+    schema::apply_papertrail_binding_health(&conn).unwrap();
+    let probe: Option<i64> = conn
+        .query_row(
+            "SELECT last_successful_probe_ms FROM papertrail_sync_cursor WHERE project='o/r'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(probe, Some(1234));
 }
 
 #[test]
