@@ -222,6 +222,37 @@ pub fn maintenance_pending_path(database: &Path, repo_id: &str) -> PathBuf {
     lock_dir(database).join(format!("rag-rat-maintenance-{}.pending", lock_discriminator(repo_id)))
 }
 
+/// Per-DB, PER-REPO papertrail auto-sync flight lock (#592), held for one whole coalesced
+/// papertrail run so at most ONE mirror flight per repository is in the air across every trigger
+/// source — watcher timer ticks, git-hook maintenance, other processes. Separate from
+/// [`maintenance_lock_path`]: a mirror flight waits on the NETWORK (pages, rate-governor sleeps)
+/// and must neither hold up nor be held up by ordinary index maintenance. The flight never holds
+/// the repo [`write_lock_path`] — its commits are short synchronous transactions serialized by
+/// SQLite itself.
+pub fn papertrail_lock_path(database: &Path, repo_id: &str) -> PathBuf {
+    lock_dir(database).join(format!("rag-rat-papertrail-{}.lock", lock_discriminator(repo_id)))
+}
+
+/// Marker a coalesced papertrail trigger sets to ask the in-flight runner for one follow-up
+/// evaluation, pairing with [`papertrail_lock_path`] exactly as the maintenance marker pairs with
+/// its lock (#267 pattern). The file CONTENT is the strongest coalesced request token
+/// (`evaluate` / `incremental` / `full`), merged max-wins so a queued full walk is never weakened
+/// by a later incremental trigger. Every read-modify-write of the marker runs under
+/// [`papertrail_marker_lock_path`].
+pub fn papertrail_pending_path(database: &Path, repo_id: &str) -> PathBuf {
+    lock_dir(database).join(format!("rag-rat-papertrail-{}.pending", lock_discriminator(repo_id)))
+}
+
+/// Serializes every read-modify-write of the pending marker: without it two coalescing
+/// contenders can interleave their max-merge and a weaker request overwrites a queued full walk.
+/// Distinct from [`papertrail_lock_path`] — the RUNNER holds that one for the whole
+/// network-bound flight, while this lock is held only for the microseconds of one marker update
+/// (runner and contenders alike), so contenders never wait on the flight.
+pub fn papertrail_marker_lock_path(database: &Path, repo_id: &str) -> PathBuf {
+    lock_dir(database)
+        .join(format!("rag-rat-papertrail-{}.pending.lock", lock_discriminator(repo_id)))
+}
+
 /// Order two repo ids by the CANONICAL LOCK ORDER (see the module doc): lexicographic on the
 /// sanitized discriminator, i.e. the order of the lock FILE NAMES themselves. Multi-lock
 /// acquirers sort with this before acquiring. Ties (same discriminator — same repo) are the

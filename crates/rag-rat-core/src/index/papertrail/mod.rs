@@ -1,4 +1,5 @@
 mod api;
+pub mod autosync;
 mod evidence;
 mod github;
 mod mirror;
@@ -20,6 +21,7 @@ pub(crate) use mirror::{MirrorContinuation, load_mirror_continuation, mirror_bin
 pub(crate) use parse::*;
 pub use parse::{TrackerParsedRef, parse_tracker_refs};
 use rusqlite::{Connection, OptionalExtension, params};
+pub use schedule::AutosyncRequest;
 pub(crate) use schedule::*;
 use serde::{Deserialize, Serialize};
 pub(crate) use store::*;
