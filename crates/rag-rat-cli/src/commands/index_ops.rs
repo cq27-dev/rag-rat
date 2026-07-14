@@ -315,6 +315,11 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     let branch_checkout = args.branch_checkout.clone();
     let old_head = args.old_head.clone();
     let new_head = args.new_head.clone();
+    // Papertrail auto-sync rides GIT-HOOK triggers only. A manual / foreground `maintenance`
+    // run must stay bounded by its index budget — a mirror flight can start a full backfill or
+    // wait on provider rate limits, far past `--max-seconds`. Explicit mirroring is
+    // `rag-rat papertrail sync`.
+    let hook_trigger = crate::MANAGED_HOOKS.contains(&trigger.as_str());
 
     if trigger == "post-checkout" && branch_checkout.as_deref() == Some("0") {
         print_output(&serde_json::json!({
@@ -339,7 +344,8 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     {
         // The git action is still a tracker-change signal even when the index pass is the
         // watcher's job: run the papertrail trigger before deferring (it coalesces with the
-        // watcher's own worker through the flight lock).
+        // watcher's own worker through the flight lock). This path is only reachable for
+        // hook triggers (post-checkout / post-merge).
         let papertrail = papertrail_hook_trigger(config);
         print_output(&serde_json::json!({
             "trigger": trigger,
@@ -390,7 +396,15 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         // network-bound mirror flight must not make concurrent git triggers coalesce-skip their
         // ordinary index passes.
     }
-    let papertrail = papertrail_hook_trigger(config);
+    let papertrail = if hook_trigger {
+        papertrail_hook_trigger(config)
+    } else {
+        serde_json::json!({
+            "status": "skipped",
+            "reason": "papertrail auto-sync rides git-hook triggers only; run `rag-rat \
+                       papertrail sync` for an explicit mirror pass",
+        })
+    };
     if let Some(report) = report.as_object_mut() {
         report.insert("papertrail".to_string(), papertrail);
     }
@@ -1288,6 +1302,42 @@ mod papertrail_hook_tests {
         assert!(
             !rag_rat_core::locks::papertrail_pending_path(&config.database, &lock_repo).exists()
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Papertrail auto-sync rides GIT-HOOK triggers only: a manual / foreground `maintenance`
+    /// run must stay bounded by its index budget and never start a network mirror flight.
+    #[test]
+    fn manual_maintenance_never_triggers_papertrail() {
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-papertrail-manual-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let config = config_with_unreachable_tracker(&root);
+        IndexDatabase::rebuild(&config).unwrap();
+
+        for trigger in [None, Some("manual".to_string()), Some("cron".to_string())] {
+            let args = super::MaintenanceArgs {
+                trigger,
+                max_seconds: Some(0),
+                branch_checkout: None,
+                old_head: None,
+                new_head: None,
+            };
+            super::maintenance(&config, &args).unwrap();
+        }
+
+        // The flight never ran: no binding health row was ever created.
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        let cursor_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM papertrail_sync_cursor", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cursor_rows, 0, "a non-hook trigger must not start a mirror flight");
 
         let _ = std::fs::remove_dir_all(&root);
     }

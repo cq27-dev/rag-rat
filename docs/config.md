@@ -638,10 +638,12 @@ full_sync_interval_secs = 86400 # default: daily healing walk
 Synchronization is **automatic** once an index exists — no cron entry and no manual sync command
 needed:
 
-- **Git hooks.** Every `rag-rat maintenance` trigger (post-commit, post-merge, …) finishes its
-  ordinary index pass, releases its coordination lock, then runs an incremental papertrail
-  evaluation. A broken or unreachable mirror never fails the hook; the outcome rides the
-  maintenance report's `papertrail` field.
+- **Git hooks.** Every git-hook `rag-rat maintenance` trigger (post-commit, post-merge,
+  post-rewrite, post-checkout) finishes its ordinary index pass, releases its coordination lock,
+  then runs an incremental papertrail evaluation. Manual or scripted `maintenance` runs (no
+  `--trigger`, or a non-hook value) never start mirror work — they stay bounded by their index
+  budget. A broken or unreachable mirror never fails the hook; the outcome rides the maintenance
+  report's `papertrail` field.
 - **The watcher.** A live watcher (the MCP server) evaluates the schedule at the tightest
   configured cadence above — every 15 minutes by default — even when the filesystem is idle, and
   the daily full-walk backstop rides the same deadline. An in-flight index pass never postpones
