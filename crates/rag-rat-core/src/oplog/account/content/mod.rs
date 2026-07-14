@@ -1,6 +1,7 @@
 //! Owner-bound `/3` content entries (sync phase C2).
 
 mod acceptance;
+mod candidate;
 mod envelope;
 mod storage;
 
