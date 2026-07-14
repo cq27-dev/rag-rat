@@ -220,6 +220,7 @@ pub struct EmptyIndexRefused {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::config::{Config, ResolvedTarget, TargetKind};
@@ -228,12 +229,20 @@ mod tests {
     // `schema_bootstrap_tests::source_config` / `unique_temp_root` are private to that module and
     // not reachable from here (a sibling of `index`, not a descendant of `schema_bootstrap_tests`)
     // — build the fixtures inline instead of widening their visibility just for this test.
+    /// A temp root unique across BOTH test runners. pid + millisecond is not: `cargo test` (what
+    /// the coverage job runs) executes tests as THREADS IN ONE PROCESS, so two tests entering
+    /// within the same millisecond derive the SAME path — and one test's `remove_dir_all` then
+    /// races the other's `git init`, which fails with a bare "git [\"init\"] failed". nextest
+    /// hides the race by giving each test its own process (its own pid). The atomic counter
+    /// makes the name unique regardless of runner.
     fn unique_temp_root() -> PathBuf {
+        static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
         let mut root = std::env::temp_dir();
         root.push(format!(
-            "rag-rat-adoption-hints-test-{}-{}",
+            "rag-rat-adoption-hints-test-{}-{}-{}",
             std::process::id(),
-            crate::index::now_ms()
+            crate::index::now_ms(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed),
         ));
         root
     }
