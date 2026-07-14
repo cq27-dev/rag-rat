@@ -64,11 +64,12 @@ pub(crate) async fn sync_mirror(
                 },
             },
             Err(error) => {
+                let persisted_detail = authentication_failure_detail(binding, &error);
                 record_failure(
                     conn,
                     binding,
                     PapertrailErrorClass::Authentication,
-                    Some(&error.to_string()),
+                    persisted_detail.as_deref(),
                 )?;
                 errors.push(PapertrailSyncError {
                     tracker: binding.provider,
@@ -92,6 +93,17 @@ pub(crate) async fn sync_mirror(
         errors,
         status: status(conn, ctx)?,
     })
+}
+
+fn authentication_failure_detail(
+    binding: &ResolvedTracker,
+    error: &anyhow::Error,
+) -> Option<String> {
+    match binding.auth {
+        Some(crate::config::TrackerAuth::TokenCommand(_)) =>
+            Some("configured token command failed".to_string()),
+        _ => Some(error.to_string()),
+    }
 }
 
 fn completed_mirror_operation(
@@ -596,6 +608,18 @@ mod capability_tests {
         let refs: i64 =
             conn.query_row("SELECT COUNT(*) FROM papertrail_refs", [], |row| row.get(0)).unwrap();
         assert_eq!(refs, 0);
+    }
+
+    #[test]
+    fn token_command_failure_detail_is_redacted_before_persistence() {
+        let mut binding = github(None);
+        binding.auth =
+            Some(crate::config::TrackerAuth::TokenCommand("secret-bearing command".to_string()));
+        let error = anyhow::anyhow!("token_command `secret-bearing command` failed: secret stderr");
+        assert_eq!(
+            authentication_failure_detail(&binding, &error).as_deref(),
+            Some("configured token command failed")
+        );
     }
 
     #[test]

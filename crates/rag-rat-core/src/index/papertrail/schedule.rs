@@ -161,7 +161,8 @@ pub(crate) fn record_failure(
     let detail = detail.map(sanitize_error_detail);
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     conn.execute(
-        "UPDATE papertrail_sync_cursor SET error_class=?4, error_detail=?5
+        "UPDATE papertrail_sync_cursor
+         SET retry_not_before_ms=NULL, error_class=?4, error_detail=?5
          WHERE repo_id=?1 AND tracker=?2 AND project=?3",
         params![repo_id, binding.provider.as_db_str(), binding.project, class.as_db_str(), detail,],
     )?;
@@ -363,6 +364,27 @@ mod tests {
             load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
         assert_eq!(error, Some(PapertrailErrorClass::RateLimited));
         assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn non_rate_failure_clears_a_stale_provider_pause() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        let binding = binding();
+        record_pause(&conn, &binding, 20_000).unwrap();
+        record_failure(
+            &conn,
+            &binding,
+            PapertrailErrorClass::Authentication,
+            Some("new auth failure"),
+        )
+        .unwrap();
+        let repo_id = schema::active_repo_id(&conn).unwrap();
+        let (state, error, detail, _) =
+            load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
+        assert_eq!(state.retry_not_before_ms, None);
+        assert_eq!(error, Some(PapertrailErrorClass::Authentication));
+        assert_eq!(detail.as_deref(), Some("new auth failure"));
     }
 
     #[test]
