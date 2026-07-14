@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.17.0...rag-rat-core-v0.18.0) - 2026-07-14
+
+### Added
+
+- *(account)* add /3 candidate ancestry and branch selection ([#647](https://github.com/cq27-dev/rag-rat/pull/647))
+- *(lang)* add Swift baseline support ([#639](https://github.com/cq27-dev/rag-rat/pull/639))
+- *(account)* add pure content acceptance evaluator; split auth_len freshness out of the authority seam ([#645](https://github.com/cq27-dev/rag-rat/pull/645))
+- *(papertrail)* add automatic sync scheduling core ([#640](https://github.com/cq27-dev/rag-rat/pull/640))
+- *(account)* add signed content entry envelope ([#643](https://github.com/cq27-dev/rag-rat/pull/643))
+- *(account)* finish C1 authority projection and query seams ([#604](https://github.com/cq27-dev/rag-rat/pull/604)) ([#641](https://github.com/cq27-dev/rag-rat/pull/641))
+- *(papertrail)* add native GitHub project mirror ([#638](https://github.com/cq27-dev/rag-rat/pull/638))
+- *(papertrail)* add shared provider transport ([#633](https://github.com/cq27-dev/rag-rat/pull/633))
+- *(papertrail)* add tracker config and provider ref grammar ([#631](https://github.com/cq27-dev/rag-rat/pull/631))
+- *(papertrail)* add provider-neutral schema ([#632](https://github.com/cq27-dev/rag-rat/pull/632))
+- *(account)* C1 candidate-DAG storage — ingest, refold + branch selection (V059) ([#627](https://github.com/cq27-dev/rag-rat/pull/627))
+
+### Fixed
+
+- *(account)* preserve bounded historical authority ([#642](https://github.com/cq27-dev/rag-rat/pull/642))
+- *(account)* bound candidate ingest work ([#634](https://github.com/cq27-dev/rag-rat/pull/634))
+
+### Other
+
+- add content candidate DAG storage ([#644](https://github.com/cq27-dev/rag-rat/pull/644))
+- tiered god-module sweep (watch, config, mcp, embed_loop) ([#630](https://github.com/cq27-dev/rag-rat/pull/630))
+- explain Codex MCP approval for reviews ([#628](https://github.com/cq27-dev/rag-rat/pull/628))
+
 ## [0.17.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.16.0...rag-rat-core-v0.17.0) - 2026-07-11
 
 ### Added
