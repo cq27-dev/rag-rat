@@ -52,8 +52,8 @@ pub fn run(config: &Config, request: AutosyncRequest) -> anyhow::Result<Autosync
     Ok(match drain(config, &lock_repo, &pending, flight, Some(request))? {
         Drained::NotIndexed => AutosyncOutcome::NotIndexed,
         Drained::Ran(Some(report)) => AutosyncOutcome::Ran(report),
-        // Only reachable defensively (the initial pass always runs before any guard can stop
-        // the drain); a later trigger re-evaluates.
+        // A stale-keyed runner stepped aside before its first pass (identity re-key guard in
+        // `run_flight`); a later trigger under the fresh identity covers the request.
         Drained::Ran(None) => AutosyncOutcome::Coalesced,
     })
 }
@@ -133,7 +133,6 @@ fn drain(
 ) -> anyhow::Result<Drained> {
     let mut flight = Some(flight);
     let mut next = initial;
-    let mut first_pass = next.is_some();
     let mut last_report = None;
     loop {
         {
@@ -150,19 +149,8 @@ fn drain(
                 },
             }
         }
-        // Identity re-key guard for marker-driven follow-ups: the flight lock was keyed from
-        // the identity resolved at entry, and a long pass can outlive an identity transition
-        // (a shallow clone upgrading to its portable id). Triggers arriving under the NEW
-        // identity key their own flight lock, so continuing under the stale key would run two
-        // concurrent flights over one cursor — step aside instead; the scheduling policy
-        // re-derives any lost urgency from persisted cursor state on the next tick.
-        if !first_pass && locks::write_lock_repo_id(config) != lock_repo {
-            drop(flight.take());
-            return Ok(Drained::Ran(last_report));
-        }
-        first_pass = false;
         let request = next.take().expect("the loop is only entered with a request");
-        match run_flight(config, request) {
+        match run_flight(config, lock_repo, request) {
             Ok(FlightPass::Report(report)) => last_report = Some(report),
             Ok(FlightPass::NotIndexed) => {
                 // Nothing can run until the first index pass, and any queued follow-up is
@@ -172,6 +160,19 @@ fn drain(
                 let _ = guard.take()?;
                 drop(flight.take());
                 return Ok(Drained::NotIndexed);
+            },
+            Ok(FlightPass::Rekeyed) => {
+                // The identity this open resolved no longer matches the held lock's key (a
+                // shallow clone upgrading to its portable id mid-flight). Triggers arriving
+                // under the NEW identity key their own flight lock, so mirroring under the
+                // stale key would run two concurrent flights over one cursor — step aside.
+                // The old-key marker is unreachable for new-key triggers: consume it rather
+                // than strand the file; the scheduling policy re-derives any lost urgency from
+                // persisted cursor state on the next tick.
+                let guard = pending.lock()?;
+                let _ = guard.take()?;
+                drop(flight.take());
+                return Ok(Drained::Ran(last_report));
             },
             Err(error) => {
                 // Best-effort retry signal: a failing marker write must not shadow the flight
@@ -188,10 +189,23 @@ fn drain(
 enum FlightPass {
     Report(Box<PapertrailSyncReport>),
     NotIndexed,
+    Rekeyed,
 }
 
-fn run_flight(config: &Config, request: AutosyncRequest) -> anyhow::Result<FlightPass> {
+fn run_flight(
+    config: &Config,
+    lock_repo: &str,
+    request: AutosyncRequest,
+) -> anyhow::Result<FlightPass> {
     let db = IndexDatabase::open_config(config)?;
+    // Identity re-key guard, on EVERY pass (the first included) at the latest pre-walk moment:
+    // the flight lock was keyed from the identity resolved at entry, and both the wait for this
+    // slot and `open_config`'s own git reads take real time. A fresh resolution here is exactly
+    // what a future trigger would key its lock from, so a mismatch means a concurrent
+    // fresh-keyed flight is possible and this runner must not start the walk.
+    if locks::write_lock_repo_id(config) != lock_repo {
+        return Ok(FlightPass::Rekeyed);
+    }
     // Automatic sync serves already-INDEXED repos only. `open_config` registers read-only (it
     // never creates an index), so on a shared database this repo can be registered yet never
     // indexed; the #427 "an index pass ran here" signal (a recorded root, or the source_root
@@ -626,6 +640,52 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// A runner whose flight lock was keyed from a since-upgraded identity must step aside
+    /// BEFORE any mirror work — on the first pass too, not only marker-driven follow-ups — so
+    /// it can never overlap a fresh-keyed flight over the same cursor.
+    #[test]
+    fn stale_keyed_runner_steps_aside_before_any_mirror_work() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.trackers = vec![crate::config::TrackerConfig {
+            provider: crate::config::Tracker::Github,
+            project: Some("o/r".to_string()),
+            remote: "origin".to_string(),
+            base_url: Some("http://127.0.0.1:9".to_string()),
+            auth: None,
+            tags: Vec::new(),
+        }];
+        config.allow_empty = true;
+        IndexDatabase::rebuild(&config).unwrap();
+
+        // Simulate the post-transition world: the runner still holds a flight lock keyed from
+        // the OLD identity, while the config now resolves to a different id.
+        let stale_repo = "stale-pre-upgrade-id";
+        assert_ne!(locks::write_lock_repo_id(&config), stale_repo);
+        let stale_lock_path = locks::papertrail_lock_path(&config.database, stale_repo);
+        let flight = FileLock::try_acquire(&stale_lock_path).unwrap().unwrap();
+        let pending = PendingMarker::new(&config.database, stale_repo);
+        pending.lock().unwrap().merge(AutosyncRequest::Full).unwrap();
+
+        let drained =
+            drain(&config, stale_repo, &pending, flight, Some(AutosyncRequest::Incremental))
+                .unwrap();
+        assert!(matches!(drained, Drained::Ran(None)), "no pass may run under the stale key");
+        // No mirror work happened, the stranded old-key marker was consumed, and the stale
+        // flight lock was released.
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        let cursor_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM papertrail_sync_cursor WHERE project='o/r'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_rows, 0);
+        assert!(!locks::papertrail_pending_path(&config.database, stale_repo).exists());
+        assert!(FileLock::try_acquire(&stale_lock_path).unwrap().is_some());
     }
 
     fn temp_git_repo(tag: &str) -> std::path::PathBuf {
