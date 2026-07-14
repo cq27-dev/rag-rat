@@ -295,12 +295,189 @@ pub(crate) fn roster_ref_effective(
     };
     let authority = fold::RosterAuthority {
         device_fingerprint: DeviceFingerprint::from_bytes(fixed(&device)?),
-        role: DeviceRole::from_db_str(&role)?,
+        current_role: DeviceRole::from_db_str(&role)?,
     };
     if authority.device_fingerprint != device_fingerprint {
         return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
     }
     validated_open_fact(authority, effective_at, closed_at)
+}
+
+pub(crate) fn roster_content_authority(
+    conn: &Connection,
+    account_id: AccountId,
+    roster_ref: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+    stream_id: StreamId,
+    auth_len: u64,
+) -> anyhow::Result<fold::AuthorityQuery<fold::RosterContentAuthority>> {
+    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let conn: &Connection = &read_tx;
+    if let Some(reason) = auth_len_preflight(conn, account_id, auth_len)? {
+        return Ok(fold::AuthorityQuery::Parked(reason));
+    }
+    let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT device_fingerprint, role, effective_at, closed_at
+             FROM account_roster_history WHERE account_id = ?1 AND roster_ref = ?2",
+            params![account_id.to_bytes().as_slice(), roster_ref.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((device, role, effective_at, closed_at)) = row else {
+        return missing_reference(conn, account_id, &roster_ref);
+    };
+    let roster = fold::RosterAuthority {
+        device_fingerprint: DeviceFingerprint::from_bytes(fixed(&device)?),
+        current_role: DeviceRole::from_db_str(&role)?,
+    };
+    if roster.device_fingerprint != device_fingerprint {
+        return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
+    }
+    let _ = (u64::try_from(effective_at)?, closed_at.map(u64::try_from).transpose()?);
+    let cut: Option<(Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT seq, entry_hash FROM account_roster_content_boundaries
+             WHERE account_id = ?1 AND roster_ref = ?2 AND stream_id = ?3",
+            params![
+                account_id.to_bytes().as_slice(),
+                roster_ref.as_slice(),
+                stream_id.to_bytes().as_slice(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let boundary = match cut {
+        Some((seq, hash)) => fold::AuthorityBoundary::Cut {
+            seq: u64::from_be_bytes(fixed(&seq)?),
+            hash: fixed(&hash)?,
+        },
+        None if closed_at.is_none() => fold::AuthorityBoundary::Open,
+        None => fold::AuthorityBoundary::Closed,
+    };
+    Ok(fold::AuthorityQuery::Effective(fold::RosterContentAuthority {
+        device_fingerprint: roster.device_fingerprint,
+        boundary,
+    }))
+}
+
+pub(crate) fn owner_control_authority(
+    conn: &Connection,
+    account_id: AccountId,
+    owner_id: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+    auth_len: u64,
+) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
+    owner_chain_authority(conn, account_id, owner_id, device_fingerprint, auth_len, "control")
+}
+
+pub(crate) fn owner_secrets_authority(
+    conn: &Connection,
+    account_id: AccountId,
+    owner_id: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+    auth_len: u64,
+) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
+    owner_chain_authority(conn, account_id, owner_id, device_fingerprint, auth_len, "secrets")
+}
+
+fn owner_chain_authority(
+    conn: &Connection,
+    account_id: AccountId,
+    owner_id: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+    auth_len: u64,
+    chain: &str,
+) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
+    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let conn: &Connection = &read_tx;
+    if let Some(reason) = auth_len_preflight(conn, account_id, auth_len)? {
+        return Ok(fold::AuthorityQuery::Parked(reason));
+    }
+    let sql = format!(
+        "SELECT o.device_fingerprint, o.effective_at, o.closed_at,
+                o.{chain}_boundary, o.{chain}_seq, o.{chain}_hash,
+                r.effective_at, r.closed_at, r.{chain}_boundary, r.{chain}_seq, r.{chain}_hash
+         FROM account_owner_incarnations o
+         LEFT JOIN account_roster_history r
+           ON r.account_id = o.account_id AND r.device_fingerprint = o.device_fingerprint
+         WHERE o.account_id = ?1 AND o.owner_id = ?2"
+    );
+    type BoundaryRow = (
+        Vec<u8>,
+        i64,
+        Option<i64>,
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
+    let row: Option<BoundaryRow> = conn
+        .query_row(&sql, params![account_id.to_bytes().as_slice(), owner_id.as_slice()], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+            ))
+        })
+        .optional()?;
+    let Some((
+        device,
+        owner_effective,
+        owner_closed,
+        owner_kind,
+        owner_seq,
+        owner_hash,
+        device_effective,
+        device_closed,
+        device_kind,
+        device_seq,
+        device_hash,
+    )) = row
+    else {
+        return missing_reference(conn, account_id, &owner_id);
+    };
+    let owner =
+        fold::OwnerAuthority { device_fingerprint: DeviceFingerprint::from_bytes(fixed(&device)?) };
+    if owner.device_fingerprint != device_fingerprint {
+        return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
+    }
+    let _ = (
+        u64::try_from(owner_effective)?,
+        owner_closed.map(u64::try_from).transpose()?,
+        device_effective.map(u64::try_from).transpose()?,
+        device_closed.map(u64::try_from).transpose()?,
+    );
+    let device_boundary = match device_kind {
+        Some(kind) =>
+            decode_stored_boundary(&kind, device_seq, device_hash, device_closed, false, true)?,
+        None => fold::AuthorityBoundary::Closed,
+    };
+    let incarnation_boundary = decode_stored_boundary(
+        &owner_kind,
+        owner_seq,
+        owner_hash,
+        owner_closed,
+        device_boundary != fold::AuthorityBoundary::Open,
+        false,
+    )?;
+    Ok(fold::AuthorityQuery::Effective(fold::OwnerChainAuthority {
+        owner,
+        device_boundary,
+        incarnation_boundary,
+    }))
 }
 
 pub(crate) fn owner_incarnation_effective(
@@ -586,6 +763,45 @@ fn validated_open_fact<T>(
     })
 }
 
+fn stored_boundary(
+    boundary: fold::AuthorityBoundary,
+) -> (&'static str, Option<[u8; 8]>, Option<[u8; 32]>) {
+    match boundary {
+        fold::AuthorityBoundary::Open => ("open", None, None),
+        fold::AuthorityBoundary::Closed => ("closed", None, None),
+        fold::AuthorityBoundary::Cut { seq, hash } => ("cut", Some(seq.to_be_bytes()), Some(hash)),
+    }
+}
+
+fn decode_stored_boundary(
+    kind: &str,
+    seq: Option<Vec<u8>>,
+    hash: Option<Vec<u8>>,
+    closed_at: Option<i64>,
+    allow_closed_open: bool,
+    allow_open_bounded: bool,
+) -> anyhow::Result<fold::AuthorityBoundary> {
+    let boundary = match (kind, seq, hash) {
+        ("open", None, None) => fold::AuthorityBoundary::Open,
+        ("closed", None, None) => fold::AuthorityBoundary::Closed,
+        ("cut", Some(seq), Some(hash)) => fold::AuthorityBoundary::Cut {
+            seq: u64::from_be_bytes(fixed(&seq)?),
+            hash: fixed(&hash)?,
+        },
+        _ => anyhow::bail!("malformed persisted authority boundary"),
+    };
+    match (closed_at.is_some(), boundary) {
+        (false, fold::AuthorityBoundary::Open)
+        | (true, fold::AuthorityBoundary::Cut { .. } | fold::AuthorityBoundary::Closed) =>
+            Ok(boundary),
+        (true, fold::AuthorityBoundary::Open) if allow_closed_open => Ok(boundary),
+        (false, fold::AuthorityBoundary::Cut { .. } | fold::AuthorityBoundary::Closed)
+            if allow_open_bounded =>
+            Ok(boundary),
+        _ => anyhow::bail!("authority closure and boundary disagree"),
+    }
+}
+
 /// The refold body (caller owns the txn). Returns each entry_hash → its projected status.
 fn refold_in_tx(
     tx: &Transaction<'_>,
@@ -642,6 +858,7 @@ fn rewrite_authority_projection(
 ) -> anyhow::Result<()> {
     let account = account_id.to_bytes();
     for table in [
+        "account_roster_content_boundaries",
         "account_roster_history",
         "account_owner_incarnations",
         "account_stream_ownership",
@@ -678,31 +895,68 @@ fn rewrite_authority_projection(
     )?;
 
     for (roster_ref, fact) in history.roster_facts() {
+        let (control_kind, control_seq, control_hash) = stored_boundary(fact.control_boundary);
+        let (secrets_kind, secrets_seq, secrets_hash) = stored_boundary(fact.secrets_boundary);
         tx.execute(
             "INSERT INTO account_roster_history(
-                 roster_ref, account_id, device_fingerprint, role, effective_at, closed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 roster_ref, account_id, device_fingerprint, role, effective_at, closed_at,
+                 control_boundary, control_seq, control_hash,
+                 secrets_boundary, secrets_seq, secrets_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 roster_ref.as_slice(),
                 account.as_slice(),
                 fact.authority.device_fingerprint.to_bytes().as_slice(),
-                fact.authority.role.as_db_str(),
+                fact.authority.current_role.as_db_str(),
                 i64::try_from(fact.effective_at)?,
                 fact.closed_at.map(i64::try_from).transpose()?,
+                control_kind,
+                control_seq.as_ref().map(<[u8; 8]>::as_slice),
+                control_hash.as_ref().map(<[u8; 32]>::as_slice),
+                secrets_kind,
+                secrets_seq.as_ref().map(<[u8; 8]>::as_slice),
+                secrets_hash.as_ref().map(<[u8; 32]>::as_slice),
             ],
         )?;
+        for (stream_id, boundary) in &fact.content_boundaries {
+            let fold::AuthorityBoundary::Cut { seq, hash } = boundary else {
+                continue;
+            };
+            tx.execute(
+                "INSERT INTO account_roster_content_boundaries(
+                     roster_ref, account_id, stream_id, seq, entry_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    roster_ref.as_slice(),
+                    account.as_slice(),
+                    stream_id.to_bytes().as_slice(),
+                    seq.to_be_bytes().as_slice(),
+                    hash.as_slice(),
+                ],
+            )?;
+        }
     }
     for (owner_id, fact) in history.owner_incarnation_facts() {
+        let (control_kind, control_seq, control_hash) = stored_boundary(fact.control_boundary);
+        let (secrets_kind, secrets_seq, secrets_hash) = stored_boundary(fact.secrets_boundary);
         tx.execute(
             "INSERT INTO account_owner_incarnations(
-                 owner_id, account_id, device_fingerprint, effective_at, closed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                 owner_id, account_id, device_fingerprint, effective_at, closed_at,
+                 control_boundary, control_seq, control_hash,
+                 secrets_boundary, secrets_seq, secrets_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 owner_id.as_slice(),
                 account.as_slice(),
                 fact.authority.device_fingerprint.to_bytes().as_slice(),
                 i64::try_from(fact.effective_at)?,
                 fact.closed_at.map(i64::try_from).transpose()?,
+                control_kind,
+                control_seq.as_ref().map(<[u8; 8]>::as_slice),
+                control_hash.as_ref().map(<[u8; 32]>::as_slice),
+                secrets_kind,
+                secrets_seq.as_ref().map(<[u8; 8]>::as_slice),
+                secrets_hash.as_ref().map(<[u8; 32]>::as_slice),
             ],
         )?;
     }
@@ -1279,7 +1533,7 @@ mod tests {
     use super::*;
     use crate::index::schema;
     use crate::oplog::account::envelope::sign_account_entry;
-    use crate::oplog::account::ops::{DeviceCut, DeviceRole, GrantRole};
+    use crate::oplog::account::ops::{ContentCut, DeviceCut, DeviceRole, GrantRole};
     use crate::oplog::device::{DeviceSecret, DeviceX25519Secret};
     use crate::oplog::stream::{self, StreamSpec, StreamSpecV2};
 
@@ -1651,7 +1905,10 @@ mod tests {
         );
         assert!(matches!(
             roster_ref_effective(&conn, account_id, genesis_hash, founder.fp, 1).unwrap(),
-            fold::AuthorityQuery::Effective(fold::RosterAuthority { role: DeviceRole::Owner, .. })
+            fold::AuthorityQuery::Effective(fold::RosterAuthority {
+                current_role: DeviceRole::Owner,
+                ..
+            })
         ));
         assert!(matches!(
             owner_incarnation_effective(&conn, account_id, genesis_hash, founder.fp, 1).unwrap(),
@@ -1854,9 +2111,12 @@ mod tests {
         );
         assert!(matches!(
             roster_ref_effective(&conn, account_id, genesis_hash, founder.fp, 2).unwrap(),
-            fold::AuthorityQuery::Effective(fold::RosterAuthority { role: DeviceRole::Owner, .. })
+            fold::AuthorityQuery::Effective(fold::RosterAuthority {
+                current_role: DeviceRole::Owner,
+                ..
+            })
         ));
-        assert_eq!(schema::status(&conn).unwrap().current_version, 64);
+        assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     }
 
     #[test]
@@ -2831,6 +3091,37 @@ mod tests {
             roster_ref_effective(&conn, account_id, b2, g.fp, 7).unwrap(),
             fold::AuthorityQuery::Effective(_)
         ));
+        assert_eq!(
+            owner_control_authority(&conn, account_id, add_owner, owner.fp, 7).unwrap(),
+            fold::AuthorityQuery::Effective(fold::OwnerChainAuthority {
+                owner: fold::OwnerAuthority { device_fingerprint: owner.fp },
+                device_boundary: fold::AuthorityBoundary::Cut { seq: 2, hash: b2 },
+                incarnation_boundary: fold::AuthorityBoundary::Open,
+            }),
+            "the query exposes the final joined device register and the independent incarnation",
+        );
+
+        // Simulate an already-populated V064 projection upgrading: additive columns begin at
+        // their legacy-safe Open default, then V065's same-transaction refold must replace them
+        // before its ledger stamp commits.
+        conn.execute("DELETE FROM schema_version WHERE id = '065_account_authority_boundaries'", [
+        ])
+        .unwrap();
+        conn.execute(
+            "UPDATE account_roster_history
+             SET control_boundary = 'open', control_seq = NULL, control_hash = NULL
+             WHERE roster_ref = ?1",
+            [add_owner.as_slice()],
+        )
+        .unwrap();
+        schema::migrate_forward(&conn).unwrap();
+        assert!(matches!(
+            owner_control_authority(&conn, account_id, add_owner, owner.fp, 7).unwrap(),
+            fold::AuthorityQuery::Effective(fold::OwnerChainAuthority {
+                device_boundary: fold::AuthorityBoundary::Cut { seq: 2, hash },
+                ..
+            }) if hash == b2
+        ));
     }
 
     #[test]
@@ -2895,6 +3186,110 @@ mod tests {
             )
             .unwrap();
         assert_eq!(owner_count, 3, "only state-before owner incarnations are projected");
+    }
+
+    #[test]
+    fn owner_query_preserves_and_extends_both_registers_independently() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let owner = Dev::new(2);
+        let (account, genesis_bytes, genesis) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (add_bytes, owner_id) = op(
+            account,
+            &founder,
+            1,
+            Some(genesis),
+            Some(genesis),
+            &device_add(&owner, DeviceRole::Owner),
+        );
+        account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
+        let mut prev = None;
+        let mut heads = Vec::new();
+        for (seq, seed) in [(0, 10), (1, 11), (2, 12)] {
+            let member = Dev::new(seed);
+            let (bytes, hash) = op(
+                account,
+                &owner,
+                seq,
+                prev,
+                Some(owner_id),
+                &device_add(&member, DeviceRole::Member),
+            );
+            account_ingest(&conn, &bytes, NOW + 2 + i64::try_from(seq).unwrap()).unwrap();
+            prev = Some(hash);
+            heads.push(hash);
+        }
+        let demote = AccountOp::OwnerDemote {
+            device_fingerprint: owner.fp,
+            owner_id,
+            control_cut: super::super::cut::Cut::At { seq: 0, hash: heads[0] },
+            secrets_cut: super::super::cut::Cut::Empty,
+            reason: "demote".to_string(),
+        };
+        let (demote_bytes, demote_hash) =
+            op(account, &founder, 2, Some(owner_id), Some(genesis), &demote);
+        account_ingest(&conn, &demote_bytes, NOW + 5).unwrap();
+        let (remove_bytes, remove_hash) = op(
+            account,
+            &founder,
+            3,
+            Some(demote_hash),
+            Some(genesis),
+            &device_remove(&owner, super::super::cut::Cut::At { seq: 1, hash: heads[1] }),
+        );
+        account_ingest(&conn, &remove_bytes, NOW + 6).unwrap();
+        let expected = |device_boundary, incarnation_boundary| {
+            fold::AuthorityQuery::Effective(fold::OwnerChainAuthority {
+                owner: fold::OwnerAuthority { device_fingerprint: owner.fp },
+                device_boundary,
+                incarnation_boundary,
+            })
+        };
+        assert_eq!(
+            owner_control_authority(&conn, account, owner_id, owner.fp, 0).unwrap(),
+            expected(
+                fold::AuthorityBoundary::Cut { seq: 1, hash: heads[1] },
+                fold::AuthorityBoundary::Cut { seq: 0, hash: heads[0] },
+            ),
+        );
+        let extend_incarnation = AccountOp::CutExtend {
+            chain_kind: super::super::ops::ChainKind::Ctrl,
+            stream_id: None,
+            incarnation_id: Some(owner_id),
+            subject_account_id: account,
+            device_fingerprint: owner.fp,
+            new_seq: 2,
+            new_entry_hash: heads[2],
+        };
+        let (bytes, extend_hash) =
+            op(account, &founder, 4, Some(remove_hash), Some(genesis), &extend_incarnation);
+        account_ingest(&conn, &bytes, NOW + 7).unwrap();
+        assert_eq!(
+            owner_control_authority(&conn, account, owner_id, owner.fp, 0).unwrap(),
+            expected(
+                fold::AuthorityBoundary::Cut { seq: 1, hash: heads[1] },
+                fold::AuthorityBoundary::Cut { seq: 2, hash: heads[2] },
+            ),
+            "extending the incarnation register leaves the device register unchanged",
+        );
+        let (bytes, _) = op(
+            account,
+            &founder,
+            5,
+            Some(extend_hash),
+            Some(genesis),
+            &cut_extend_ctrl(account, &owner, 2, heads[2]),
+        );
+        account_ingest(&conn, &bytes, NOW + 8).unwrap();
+        assert_eq!(
+            owner_control_authority(&conn, account, owner_id, owner.fp, 0).unwrap(),
+            expected(
+                fold::AuthorityBoundary::Cut { seq: 2, hash: heads[2] },
+                fold::AuthorityBoundary::Cut { seq: 2, hash: heads[2] },
+            ),
+            "extending the device register leaves the incarnation register unchanged",
+        );
     }
 
     #[test]
@@ -3018,7 +3413,7 @@ mod tests {
             roster_ref_effective(&conn, account_id, add, member.fp, 3).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterAuthority {
                 device_fingerprint: member.fp,
-                role: DeviceRole::Owner,
+                current_role: DeviceRole::Owner,
             }),
         );
 
@@ -3035,7 +3430,7 @@ mod tests {
             roster_ref_effective(&conn, account_id, add, member.fp, 4).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterAuthority {
                 device_fingerprint: member.fp,
-                role: DeviceRole::Member,
+                current_role: DeviceRole::Member,
             }),
         );
         assert_eq!(
@@ -3480,5 +3875,95 @@ mod tests {
             )
             .unwrap();
         assert_eq!(accepted, 2, "repeated clear-and-set refolds keep the same accepted chain");
+    }
+
+    #[test]
+    fn removed_roster_citation_keeps_only_its_per_stream_prefix() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let member = Dev::new(2);
+        let (account, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (add_bytes, roster_ref) = op(
+            account,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&member, DeviceRole::Member),
+        );
+        account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
+        let listed = StreamId::from_bytes([0x41; 32]);
+        let unlisted = StreamId::from_bytes([0x42; 32]);
+        let remove = AccountOp::DeviceRemove {
+            device_fingerprint: member.fp,
+            control_cut: super::super::cut::Cut::Empty,
+            secrets_cut: super::super::cut::Cut::Empty,
+            content_cuts: vec![ContentCut { stream_id: listed, seq: u64::MAX, hash: [0xa5; 32] }],
+            reason: "revoked".to_string(),
+        };
+        let (remove_bytes, _) =
+            op(account, &founder, 2, Some(roster_ref), Some(genesis_hash), &remove);
+        account_ingest(&conn, &remove_bytes, NOW + 2).unwrap();
+
+        assert_eq!(
+            roster_content_authority(&conn, account, roster_ref, member.fp, listed, 3).unwrap(),
+            fold::AuthorityQuery::Effective(fold::RosterContentAuthority {
+                device_fingerprint: member.fp,
+                boundary: fold::AuthorityBoundary::Cut { seq: u64::MAX, hash: [0xa5; 32] },
+            }),
+        );
+        assert_eq!(
+            roster_content_authority(&conn, account, roster_ref, member.fp, unlisted, 3).unwrap(),
+            fold::AuthorityQuery::Effective(fold::RosterContentAuthority {
+                device_fingerprint: member.fp,
+                boundary: fold::AuthorityBoundary::Closed,
+            }),
+            "an omitted content chain is the empty cut, never open",
+        );
+    }
+
+    #[test]
+    fn malformed_persisted_owner_boundary_fails_closed() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account, genesis_bytes, owner_id) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        conn.execute(
+            "UPDATE account_owner_incarnations
+             SET control_boundary = 'cut', control_seq = NULL, control_hash = NULL
+             WHERE owner_id = ?1",
+            [owner_id.as_slice()],
+        )
+        .unwrap();
+        assert!(
+            owner_control_authority(&conn, account, owner_id, founder.fp, 1).is_err(),
+            "a partial cut tuple must never become open authority",
+        );
+        conn.execute(
+            "UPDATE account_owner_incarnations
+             SET control_boundary = 'open', effective_at = -1
+             WHERE owner_id = ?1",
+            [owner_id.as_slice()],
+        )
+        .unwrap();
+        assert!(
+            owner_control_authority(&conn, account, owner_id, founder.fp, 1).is_err(),
+            "negative fact epochs fail closed",
+        );
+        conn.execute(
+            "UPDATE account_owner_incarnations SET effective_at = 0, closed_at = 2
+             WHERE owner_id = ?1",
+            [owner_id.as_slice()],
+        )
+        .unwrap();
+        conn.execute("UPDATE account_roster_history SET closed_at = 2 WHERE roster_ref = ?1", [
+            owner_id.as_slice(),
+        ])
+        .unwrap();
+        assert!(
+            owner_control_authority(&conn, account, owner_id, founder.fp, 1).is_err(),
+            "a closed roster and owner cannot jointly retain Open/Open authority",
+        );
     }
 }

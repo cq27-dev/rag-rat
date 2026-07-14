@@ -47,11 +47,12 @@ mod stream;
 // cross the phase boundary.
 #[expect(unused_imports, reason = "C2 authority seam is frozen before its caller lands")]
 pub(crate) use account::{
-    AccountId, AuthorityInvalidReason, AuthorityParkReason, AuthorityQuery, CapacityScope,
-    DeviceCut, DeviceRole, GrantAuthority, GrantDeviceAuthority, GrantDeviceBoundary, GrantRole,
-    IngestOutcome, OwnerAuthority, RosterAuthority, account_ingest, backfill_authority_projection,
-    grant_effective_for_device, owner_incarnation_effective, roster_ref_effective,
-    stream_owner_effective,
+    AccountId, AuthorityBoundary, AuthorityInvalidReason, AuthorityParkReason, AuthorityQuery,
+    CapacityScope, DeviceCut, DeviceRole, GrantAuthority, GrantDeviceAuthority,
+    GrantDeviceBoundary, GrantRole, IngestOutcome, OwnerAuthority, OwnerChainAuthority,
+    RosterContentAuthority, account_ingest, backfill_authority_projection,
+    grant_effective_for_device, owner_control_authority, owner_secrets_authority,
+    roster_content_authority, stream_owner_effective,
 };
 // The op-log's first crate-internal API surface (#524): the MINTING primitives + the op
 // vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is

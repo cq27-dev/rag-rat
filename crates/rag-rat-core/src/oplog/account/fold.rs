@@ -216,12 +216,38 @@ pub(crate) enum AuthorityInvalidReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RosterAuthority {
     pub(crate) device_fingerprint: DeviceFingerprint,
-    pub(crate) role: DeviceRole,
+    /// Current roster metadata, not authority for an owner-required operation. Owner authority is
+    /// established only by citing a fresh `owner_id` and applying both revocation registers.
+    pub(crate) current_role: DeviceRole,
+}
+
+/// The valid prefix of a cited device chain. `Closed` is the empty cut: no entry on that chain is
+/// admissible. Callers must still verify ancestry for `Cut`; the hash prevents an equal/older
+/// off-branch entry from laundering through a sequence-only check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorityBoundary {
+    Open,
+    Cut { seq: u64, hash: [u8; 32] },
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RosterContentAuthority {
+    pub(crate) device_fingerprint: DeviceFingerprint,
+    pub(crate) boundary: AuthorityBoundary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OwnerAuthority {
     pub(crate) device_fingerprint: DeviceFingerprint,
+}
+
+/// Owner-required entries are admitted by the conjunction of these two independent registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnerChainAuthority {
+    pub(crate) owner: OwnerAuthority,
+    pub(crate) device_boundary: AuthorityBoundary,
+    pub(crate) incarnation_boundary: AuthorityBoundary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,11 +272,14 @@ pub(crate) enum GrantDeviceBoundary {
     Closed,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct RosterFact {
     pub(super) authority: RosterAuthority,
     pub(super) effective_at: u64,
     pub(super) closed_at: Option<u64>,
+    pub(super) control_boundary: AuthorityBoundary,
+    pub(super) secrets_boundary: AuthorityBoundary,
+    pub(super) content_boundaries: HashMap<StreamId, AuthorityBoundary>,
 }
 
 #[derive(Clone, Copy)]
@@ -258,6 +287,8 @@ pub(super) struct OwnerIncarnationFact {
     pub(super) authority: OwnerAuthority,
     pub(super) effective_at: u64,
     pub(super) closed_at: Option<u64>,
+    pub(super) control_boundary: AuthorityBoundary,
+    pub(super) secrets_boundary: AuthorityBoundary,
 }
 
 #[derive(Clone, Copy)]
@@ -334,6 +365,39 @@ impl AccountAuthHistory {
         )
     }
 
+    pub(super) fn roster_content_authority(
+        &self,
+        roster_ref: [u8; 32],
+        device_fingerprint: DeviceFingerprint,
+        stream_id: StreamId,
+        auth_len: u64,
+    ) -> AuthorityQuery<RosterContentAuthority> {
+        if auth_len > self.effective_count {
+            return AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead);
+        }
+        let Some(fact) = self.roster_refs.get(&roster_ref) else {
+            return if self.outcomes.contains_key(&roster_ref) {
+                AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
+            } else {
+                AuthorityQuery::Parked(AuthorityParkReason::UnknownReference)
+            };
+        };
+        if fact.authority.device_fingerprint != device_fingerprint {
+            return AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject);
+        }
+        let boundary = fact.content_boundaries.get(&stream_id).copied().unwrap_or_else(|| {
+            if fact.closed_at.is_none() {
+                AuthorityBoundary::Open
+            } else {
+                AuthorityBoundary::Closed
+            }
+        });
+        AuthorityQuery::Effective(RosterContentAuthority {
+            device_fingerprint: fact.authority.device_fingerprint,
+            boundary,
+        })
+    }
+
     pub(super) fn owner_incarnation_effective(
         &self,
         owner_id: [u8; 32],
@@ -350,6 +414,69 @@ impl AccountAuthHistory {
             device_fingerprint,
             self.outcomes.contains_key(&owner_id),
         )
+    }
+
+    pub(super) fn owner_control_authority(
+        &self,
+        owner_id: [u8; 32],
+        device_fingerprint: DeviceFingerprint,
+        auth_len: u64,
+    ) -> AuthorityQuery<OwnerChainAuthority> {
+        self.owner_chain_authority(
+            owner_id,
+            device_fingerprint,
+            auth_len,
+            |fact| fact.control_boundary,
+            |fact| fact.control_boundary,
+        )
+    }
+
+    pub(super) fn owner_secrets_authority(
+        &self,
+        owner_id: [u8; 32],
+        device_fingerprint: DeviceFingerprint,
+        auth_len: u64,
+    ) -> AuthorityQuery<OwnerChainAuthority> {
+        self.owner_chain_authority(
+            owner_id,
+            device_fingerprint,
+            auth_len,
+            |fact| fact.secrets_boundary,
+            |fact| fact.secrets_boundary,
+        )
+    }
+
+    fn owner_chain_authority(
+        &self,
+        owner_id: [u8; 32],
+        device_fingerprint: DeviceFingerprint,
+        auth_len: u64,
+        device_boundary: impl Fn(&RosterFact) -> AuthorityBoundary,
+        incarnation_boundary: impl Fn(&OwnerIncarnationFact) -> AuthorityBoundary,
+    ) -> AuthorityQuery<OwnerChainAuthority> {
+        if auth_len > self.effective_count {
+            return AuthorityQuery::Parked(AuthorityParkReason::AuthLenAhead);
+        }
+        let Some(owner) = self.owner_incarnations.get(&owner_id) else {
+            return if self.outcomes.contains_key(&owner_id) {
+                AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
+            } else {
+                AuthorityQuery::Parked(AuthorityParkReason::UnknownReference)
+            };
+        };
+        if owner.authority.device_fingerprint != device_fingerprint {
+            return AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject);
+        }
+        let device = self
+            .roster_refs
+            .values()
+            .find(|fact| fact.authority.device_fingerprint == device_fingerprint)
+            .map_or(AuthorityBoundary::Closed, device_boundary);
+        AuthorityQuery::Effective(OwnerChainAuthority {
+            owner: owner.authority,
+            device_boundary: device,
+            incarnation_boundary: incarnation_boundary(owner),
+        })
     }
 
     pub(super) fn grant_effective(
@@ -1306,7 +1433,7 @@ fn fold_account_pass(
             discovered.insert(candidate.hash(), Outcome::Parked(ParkReason::AuthLenAhead));
         }
     }
-    let facts = derive_authority_facts(&candidates, &outcomes);
+    let facts = derive_authority_facts(&candidates, &outcomes, &registers);
     (
         AccountAuthHistory {
             outcomes,
@@ -1477,6 +1604,7 @@ struct AuthorityFacts {
 fn derive_authority_facts(
     candidates: &[Candidate],
     outcomes: &HashMap<[u8; 32], Outcome>,
+    registers: &HashMap<RegisterKey, Cut>,
 ) -> AuthorityFacts {
     let mut effective: Vec<(&Candidate, u64)> = candidates
         .iter()
@@ -1498,15 +1626,20 @@ fn derive_authority_facts(
                 facts.roster_refs.insert(hash, RosterFact {
                     authority: RosterAuthority {
                         device_fingerprint: device,
-                        role: DeviceRole::Owner,
+                        current_role: DeviceRole::Owner,
                     },
                     effective_at: epoch,
                     closed_at: None,
+                    control_boundary: AuthorityBoundary::Open,
+                    secrets_boundary: AuthorityBoundary::Open,
+                    content_boundaries: HashMap::new(),
                 });
                 facts.owner_incarnations.insert(hash, OwnerIncarnationFact {
                     authority: OwnerAuthority { device_fingerprint: device },
                     effective_at: epoch,
                     closed_at: None,
+                    control_boundary: AuthorityBoundary::Open,
+                    secrets_boundary: AuthorityBoundary::Open,
                 });
                 roster.insert(device, hash);
                 owners.insert(device, hash);
@@ -1516,10 +1649,13 @@ fn derive_authority_facts(
                 facts.roster_refs.insert(hash, RosterFact {
                     authority: RosterAuthority {
                         device_fingerprint: *device_fingerprint,
-                        role: *role,
+                        current_role: *role,
                     },
                     effective_at: epoch,
                     closed_at: None,
+                    control_boundary: AuthorityBoundary::Open,
+                    secrets_boundary: AuthorityBoundary::Open,
+                    content_boundaries: HashMap::new(),
                 });
                 roster.insert(*device_fingerprint, hash);
                 if *role == DeviceRole::Owner {
@@ -1527,6 +1663,8 @@ fn derive_authority_facts(
                         authority: OwnerAuthority { device_fingerprint: *device_fingerprint },
                         effective_at: epoch,
                         closed_at: None,
+                        control_boundary: AuthorityBoundary::Open,
+                        secrets_boundary: AuthorityBoundary::Open,
                     });
                     owners.insert(*device_fingerprint, hash);
                 }
@@ -1536,19 +1674,39 @@ fn derive_authority_facts(
                 let roster_ref = roster
                     .get(device_fingerprint)
                     .expect("promoted device has an active roster fact");
-                facts.roster_refs.get_mut(roster_ref).expect("active roster fact").authority.role =
-                    DeviceRole::Owner;
+                facts
+                    .roster_refs
+                    .get_mut(roster_ref)
+                    .expect("active roster fact")
+                    .authority
+                    .current_role = DeviceRole::Owner;
                 facts.owner_incarnations.insert(hash, OwnerIncarnationFact {
                     authority: OwnerAuthority { device_fingerprint: *device_fingerprint },
                     effective_at: epoch,
                     closed_at: None,
+                    control_boundary: AuthorityBoundary::Open,
+                    secrets_boundary: AuthorityBoundary::Open,
                 });
                 owners.insert(*device_fingerprint, hash);
             },
-            AccountOp::DeviceRemove { device_fingerprint, .. } => {
+            AccountOp::DeviceRemove { device_fingerprint, secrets_cut, content_cuts, .. } => {
                 if let Some(roster_ref) = roster.remove(device_fingerprint) {
-                    facts.roster_refs.get_mut(&roster_ref).expect("active roster fact").closed_at =
-                        Some(epoch);
+                    let fact = facts.roster_refs.get_mut(&roster_ref).expect("active roster fact");
+                    fact.closed_at = Some(epoch);
+                    fact.control_boundary = registers
+                        .get(&RegisterKey::Device {
+                            account: candidate.header().account_id,
+                            log: 0,
+                            device: *device_fingerprint,
+                        })
+                        .map_or(AuthorityBoundary::Closed, boundary_from_cut);
+                    fact.secrets_boundary = boundary_from_cut(secrets_cut);
+                    fact.content_boundaries = content_cuts
+                        .iter()
+                        .map(|cut| {
+                            (cut.stream_id, AuthorityBoundary::Cut { seq: cut.seq, hash: cut.hash })
+                        })
+                        .collect();
                 }
                 if let Some(owner_id) = owners.remove(device_fingerprint) {
                     facts
@@ -1558,7 +1716,7 @@ fn derive_authority_facts(
                         .closed_at = Some(epoch);
                 }
             },
-            AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } => {
+            AccountOp::OwnerDemote { device_fingerprint, owner_id, secrets_cut, .. } => {
                 if owners.get(device_fingerprint) == Some(owner_id) {
                     owners.remove(device_fingerprint);
                     let roster_ref = roster
@@ -1569,12 +1727,19 @@ fn derive_authority_facts(
                         .get_mut(roster_ref)
                         .expect("active roster fact")
                         .authority
-                        .role = DeviceRole::Member;
-                    facts
-                        .owner_incarnations
-                        .get_mut(owner_id)
-                        .expect("active owner fact")
-                        .closed_at = Some(epoch);
+                        .current_role = DeviceRole::Member;
+                    let fact =
+                        facts.owner_incarnations.get_mut(owner_id).expect("active owner fact");
+                    fact.closed_at = Some(epoch);
+                    fact.control_boundary = registers
+                        .get(&RegisterKey::OwnerIncarnation {
+                            account: candidate.header().account_id,
+                            log: 0,
+                            device: *device_fingerprint,
+                            owner_id: *owner_id,
+                        })
+                        .map_or(AuthorityBoundary::Closed, boundary_from_cut);
+                    fact.secrets_boundary = boundary_from_cut(secrets_cut);
                 }
             },
             AccountOp::StreamOwn { stream_id, .. } => {
@@ -1603,7 +1768,28 @@ fn derive_authority_facts(
             AccountOp::CutExtend { .. } | AccountOp::AccountReRoot { .. } => {},
         }
     }
+    // Register creators can be retained even when their state mutation is ineffective (notably a
+    // remove that arrived before enrollment). Project the fold's FINAL device register onto every
+    // roster incarnation for that device; deriving only from effective close ops would otherwise
+    // expose Open while the fold condemns that chain.
+    for fact in facts.roster_refs.values_mut() {
+        if let Some(cut) = registers.iter().find_map(|(key, cut)| match key {
+            RegisterKey::Device { log: 0, device, .. }
+                if *device == fact.authority.device_fingerprint =>
+                Some(cut),
+            _ => None,
+        }) {
+            fact.control_boundary = boundary_from_cut(cut);
+        }
+    }
     facts
+}
+
+fn boundary_from_cut(cut: &Cut) -> AuthorityBoundary {
+    match cut {
+        Cut::Empty => AuthorityBoundary::Closed,
+        Cut::At { seq, hash } => AuthorityBoundary::Cut { seq: *seq, hash: *hash },
+    }
 }
 
 /// The genesis candidate: an `AccountGenesis` whose payload hashes to the shared `account_id` (§4)
@@ -2296,7 +2482,7 @@ mod tests {
             h.roster_ref_effective(valid, device.fp, h.effective_count()),
             AuthorityQuery::Effective(RosterAuthority {
                 device_fingerprint: device.fp,
-                role: DeviceRole::Owner,
+                current_role: DeviceRole::Owner,
             }),
         );
         assert_eq!(
@@ -3100,7 +3286,7 @@ mod tests {
             h.roster_ref_effective(add, member.fp, 2),
             AuthorityQuery::Effective(RosterAuthority {
                 device_fingerprint: member.fp,
-                role: DeviceRole::Owner,
+                current_role: DeviceRole::Owner,
             }),
         );
         assert_eq!(
@@ -3123,7 +3309,7 @@ mod tests {
             h.roster_ref_effective(add, member.fp, 4),
             AuthorityQuery::Effective(RosterAuthority {
                 device_fingerprint: member.fp,
-                role: DeviceRole::Member,
+                current_role: DeviceRole::Member,
             }),
         );
         assert_eq!(
@@ -3454,6 +3640,8 @@ mod tests {
             "removing a never-enrolled device is ineffective",
         );
         assert!(h.is_effective(&add), "the device is not pre-tombstoned, so it can still be added");
+        let fact = h.roster_refs.get(&add).expect("later enrollment has a roster fact");
+        assert_eq!(fact.control_boundary, AuthorityBoundary::Closed);
     }
 
     #[test]

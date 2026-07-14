@@ -26,13 +26,14 @@ mod registers;
 mod storage;
 
 pub(crate) use fold::{
-    AuthorityInvalidReason, AuthorityParkReason, AuthorityQuery, GrantAuthority,
-    GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, RosterAuthority,
+    AuthorityBoundary, AuthorityInvalidReason, AuthorityParkReason, AuthorityQuery, GrantAuthority,
+    GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,
+    RosterContentAuthority,
 };
 pub(crate) use id::AccountId;
 pub(crate) use ops::{DeviceCut, DeviceRole, GrantRole};
 pub(crate) use storage::{
     CapacityScope, IngestOutcome, account_ingest, backfill_authority_projection,
-    grant_effective_for_device, owner_incarnation_effective, roster_ref_effective,
-    stream_owner_effective,
+    grant_effective_for_device, owner_control_authority, owner_secrets_authority,
+    roster_content_authority, stream_owner_effective,
 };

@@ -1865,8 +1865,7 @@ fn migration_059_creates_the_account_candidate_dag() {
 }
 
 #[test]
-fn migration_064_is_the_tip_and_creates_account_authority_shadow_tables() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 64, "move this pin with the next schema migration");
+fn migration_064_creates_account_authority_shadow_tables() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
     for table in [
@@ -1914,8 +1913,32 @@ fn migration_064_is_the_tip_and_creates_account_authority_shadow_tables() {
     )
     .unwrap();
     schema::migrate_forward(&conn).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 64);
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     assert!(conn_table_exists(&conn, "account_auth_state"));
+}
+
+#[test]
+fn migration_065_is_the_tip_and_adds_historical_authority_boundaries() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 65, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    assert!(conn_table_exists(&conn, "account_roster_content_boundaries"));
+    for table in ["account_roster_history", "account_owner_incarnations"] {
+        for column in [
+            "control_boundary",
+            "control_seq",
+            "control_hash",
+            "secrets_boundary",
+            "secrets_seq",
+            "secrets_hash",
+        ] {
+            assert!(
+                conn_table_columns(&conn, table).contains(&column.to_string()),
+                "V065 adds {table}.{column}"
+            );
+        }
+    }
+    schema::apply_account_authority_boundaries(&conn).expect("V065 replay is idempotent");
 }
 
 #[test]

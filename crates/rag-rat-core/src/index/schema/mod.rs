@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 64;
+pub const LATEST_SCHEMA_VERSION: u32 = 65;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -453,6 +453,10 @@ const MIGRATION_064_DESCRIPTION: &str =
      stream ownership, exact grant incarnations, and revoke device cuts. refold_account rewrites \
      these shadow tables in the same IMMEDIATE transaction as accepted/status, so /3 authority \
      checks never rescan the bounded candidate DAG";
+const MIGRATION_065_ID: &str = "065_account_authority_boundaries";
+const MIGRATION_065_CHECKSUM: &str = "sha256:rag-rat-account-authority-boundaries-v65a";
+const MIGRATION_065_DESCRIPTION: &str =
+    "Persist closed roster and owner chain boundaries for bounded historical citations";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -608,7 +612,7 @@ struct Migration {
 /// share one IMMEDIATE transaction so older writers cannot land an unprojected candidate in a
 /// migration race.
 fn apply_and_record_migration(conn: &Connection, step: &Migration) -> rusqlite::Result<()> {
-    if step.id != MIGRATION_064_ID {
+    if !matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID) {
         (step.apply)(conn)?;
         return record_migration(conn, step.id, step.checksum, step.description);
     }
@@ -998,6 +1002,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_064_CHECKSUM,
         description: MIGRATION_064_DESCRIPTION,
         apply: apply_account_authority_projection,
+    },
+    Migration {
+        id: MIGRATION_065_ID,
+        checksum: MIGRATION_065_CHECKSUM,
+        description: MIGRATION_065_DESCRIPTION,
+        apply: apply_account_authority_boundaries,
     },
 ];
 

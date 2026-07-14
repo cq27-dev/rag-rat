@@ -1259,6 +1259,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_062_ID => Some(62),
             MIGRATION_063_ID => Some(63),
             MIGRATION_064_ID => Some(64),
+            MIGRATION_065_ID => Some(65),
             _ => None,
         })
         .max()
@@ -1332,6 +1333,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_062_ID
             | MIGRATION_063_ID
             | MIGRATION_064_ID
+            | MIGRATION_065_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1402,6 +1404,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_062_ID => migration.checksum != MIGRATION_062_CHECKSUM,
         MIGRATION_063_ID => migration.checksum != MIGRATION_063_CHECKSUM,
         MIGRATION_064_ID => migration.checksum != MIGRATION_064_CHECKSUM,
+        MIGRATION_065_ID => migration.checksum != MIGRATION_065_CHECKSUM,
         _ => false,
     }
 }
@@ -4430,6 +4433,43 @@ pub(crate) fn apply_account_authority_projection(conn: &Connection) -> rusqlite:
          ) STRICT;
          CREATE INDEX IF NOT EXISTS account_stream_grant_cuts_owner
              ON account_stream_grant_cuts(owner_account_id, grant_id);",
+    )?;
+    // V064's transactional backfill immediately calls the current projection writer. Provision
+    // the additive boundary shape here too, so a database upgrading from V063 can be backfilled by
+    // this binary; V065 repeats it idempotently for databases that already recorded old V064.
+    apply_account_authority_boundaries(conn)
+}
+
+/// V065: retain the exact chain boundaries of closed roster and owner citations. The V064 rows
+/// remain historical facts; these columns make their valid prefix explicit instead of forcing a
+/// caller to choose between accepting a revoked citation and rejecting valid late delivery.
+pub(crate) fn apply_account_authority_boundaries(conn: &Connection) -> rusqlite::Result<()> {
+    for (table, prefix) in [
+        ("account_roster_history", "control"),
+        ("account_roster_history", "secrets"),
+        ("account_owner_incarnations", "control"),
+        ("account_owner_incarnations", "secrets"),
+    ] {
+        add_column_if_missing(
+            conn,
+            table,
+            &format!("{prefix}_boundary"),
+            "TEXT NOT NULL DEFAULT 'open'",
+        )?;
+        add_column_if_missing(conn, table, &format!("{prefix}_seq"), "BLOB")?;
+        add_column_if_missing(conn, table, &format!("{prefix}_hash"), "BLOB")?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_roster_content_boundaries(
+             roster_ref BLOB NOT NULL,
+             account_id BLOB NOT NULL,
+             stream_id  BLOB NOT NULL,
+             seq        BLOB NOT NULL CHECK(length(seq) = 8),
+             entry_hash BLOB NOT NULL CHECK(length(entry_hash) = 32),
+             PRIMARY KEY(roster_ref, stream_id)
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS account_roster_content_boundaries_account
+             ON account_roster_content_boundaries(account_id, roster_ref);",
     )
 }
 
