@@ -634,3 +634,28 @@ probe_interval_secs = 900       # default: 15 minutes
 sync_min_interval_secs = 900    # default: 15 minutes between attempts
 full_sync_interval_secs = 86400 # default: daily healing walk
 ```
+
+Synchronization is **automatic** once an index exists — no cron entry and no manual sync command
+needed:
+
+- **Git hooks.** Every `rag-rat maintenance` trigger (post-commit, post-merge, …) finishes its
+  ordinary index pass, releases its coordination lock, then runs an incremental papertrail
+  evaluation. A broken or unreachable mirror never fails the hook; the outcome rides the
+  maintenance report's `papertrail` field.
+- **The watcher.** A live watcher (the MCP server) evaluates the schedule at the tightest
+  configured cadence above — every 15 minutes by default — even when the filesystem is idle, and
+  the daily full-walk backstop rides the same deadline. An in-flight index pass never postpones
+  the evaluation.
+- **One flight per repository.** All triggers — watcher ticks, hooks, concurrent processes —
+  coalesce on a per-repo flight lock: at most one mirror run is in the air, triggers arriving
+  mid-run queue at most one follow-up, and a queued full walk is never weakened by a later
+  incremental trigger.
+- **Failures stay per binding.** Due bindings sync concurrently under one shared quota governor;
+  a failed or rate-paused binding never cancels its siblings, its failure class is persisted on
+  the binding's health row (see `papertrail_sync_status`), and the cadence above retries it.
+  Auto-sync never holds the repository write lock, so mirror traffic cannot stall ordinary index
+  maintenance.
+
+Manual `rag-rat papertrail sync` remains the unconditional pass: it dispatches every binding
+regardless of cadence, reports provider-client-pending bindings explicitly, and also refreshes
+reference discovery (commit / file / branch refs), which the automatic path deliberately skips.
