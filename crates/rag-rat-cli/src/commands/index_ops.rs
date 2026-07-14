@@ -373,15 +373,21 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     {
         let Some(_maint) = rag_rat_core::locks::FileLock::try_acquire(&lock_path)? else {
             let _ = fs::File::create(&pending);
-            // No papertrail trigger here: the in-flight runner fires one after its own passes,
-            // covering this trigger's change signal.
-            return print_output(&serde_json::json!({
+            let mut skip_report = serde_json::json!({
                 "trigger": trigger,
                 "status": "skipped",
                 "reason": "another maintenance pass is in flight (coalesced, #267)",
                 "old_head": old_head,
                 "new_head": new_head,
-            }));
+            });
+            // A HOOK trigger still fires its own papertrail request: the in-flight maintenance
+            // holder may be a manual/cron run that never triggers papertrail, so relying on it
+            // would drop this trigger's change signal. The flight lock and pending marker dedup
+            // this against any flight the holder (or the watcher) does run.
+            if hook_trigger {
+                skip_report["papertrail"] = papertrail_hook_trigger(config);
+            }
+            return print_output(&skip_report);
         };
         loop {
             // This pass covers the current state, so clear any prior rerun request first; a
@@ -423,6 +429,10 @@ fn papertrail_hook_trigger(config: &Config) -> serde_json::Value {
         Ok(autosync::AutosyncOutcome::Disabled) => {
             serde_json::json!({"status": "disabled", "reason": "no tracker bindings"})
         },
+        Ok(autosync::AutosyncOutcome::NotIndexed) => serde_json::json!({
+            "status": "deferred",
+            "reason": "repo is not indexed yet; automatic sync starts after the first index pass",
+        }),
         Ok(autosync::AutosyncOutcome::Coalesced) => serde_json::json!({
             "status": "coalesced",
             "reason": "another papertrail flight is in the air; request queued",
@@ -1302,6 +1312,58 @@ mod papertrail_hook_tests {
         assert!(
             !rag_rat_core::locks::papertrail_pending_path(&config.database, &lock_repo).exists()
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A hook trigger that coalesces behind an in-flight maintenance run still fires its own
+    /// papertrail request: the holder may be a manual/cron run that never triggers papertrail,
+    /// so deferring to it would drop the change signal. A coalesced NON-hook trigger stays
+    /// mirror-free.
+    #[test]
+    fn coalesced_hook_trigger_still_fires_papertrail() {
+        use rag_rat_core::locks::{FileLock, maintenance_lock_path, write_lock_repo_id};
+
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-papertrail-coalesced-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let config = config_with_unreachable_tracker(&root);
+        IndexDatabase::rebuild(&config).unwrap();
+
+        let lock_repo = write_lock_repo_id(&config);
+        let held = FileLock::try_acquire(&maintenance_lock_path(&config.database, &lock_repo))
+            .unwrap()
+            .unwrap();
+        let args = |trigger: &str| super::MaintenanceArgs {
+            trigger: Some(trigger.to_string()),
+            max_seconds: Some(0),
+            branch_checkout: None,
+            old_head: None,
+            new_head: None,
+        };
+        let mirror_attempts = || -> i64 {
+            rusqlite::Connection::open(&config.database)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM papertrail_sync_cursor WHERE project='o/r'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        // A coalesced non-hook trigger must not start mirror work...
+        super::maintenance(&config, &args("manual")).unwrap();
+        assert_eq!(mirror_attempts(), 0);
+        // ...while a coalesced HOOK trigger fires the papertrail flight inline.
+        super::maintenance(&config, &args("post-commit")).unwrap();
+        assert_eq!(mirror_attempts(), 1, "the hook's change signal must not be dropped");
+        drop(held);
 
         let _ = std::fs::remove_dir_all(&root);
     }

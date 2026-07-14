@@ -4,16 +4,25 @@
 use std::fs;
 
 use rag_rat_core::Config;
+use rag_rat_core::index::papertrail::autosync;
 
 use crate::cli::{HookAction, HooksArgs, PapertrailArgs, PapertrailCommand};
 use crate::render::print_output;
-use crate::{MANAGED_HOOKS, git_paths, install_hook, is_rag_rat_hook, open_index};
+use crate::{MANAGED_HOOKS, git_paths, install_hook, is_rag_rat_hook};
 
 pub(crate) fn papertrail(config: &Config, args: &PapertrailArgs) -> anyhow::Result<()> {
     match &args.command {
         PapertrailCommand::Sync { full } => {
-            let db = open_index(config)?;
-            let report = db.papertrail_sync(*full)?;
+            // Manual sync shares the per-repo flight lock with automatic sync: two mirror runs
+            // over one binding would interleave their cursor load/save cycles and clobber each
+            // other's walk state. A running automatic flight is waited out (observably), never
+            // substituted for the unconditional manual pass.
+            let report = autosync::run_manual(config, *full, || {
+                eprintln!(
+                    "papertrail: an automatic sync flight is running; waiting for it to finish \
+                     (Ctrl-C to abort)…"
+                );
+            })?;
             print_output(&report)
         },
     }

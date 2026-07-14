@@ -22,6 +22,10 @@ use crate::locks::{self, FileLock};
 pub enum AutosyncOutcome {
     /// The repo resolves no tracker bindings; there is nothing to sync.
     Disabled,
+    /// The repo has never been indexed. Automatic sync serves already-indexed repos only — a
+    /// deferred first-time-empty hook, or a shared database where this repo was only ever
+    /// registered read-only, must not start mirroring. The first index pass unlocks it.
+    NotIndexed,
     /// Another flight holds this repository's lock. The request was merged into the pending
     /// marker; the holder's follow-up pass (or the next periodic deadline) covers it.
     Coalesced,
@@ -42,30 +46,133 @@ pub fn run(config: &Config, request: AutosyncRequest) -> anyhow::Result<Autosync
     let lock_repo = locks::write_lock_repo_id(config);
     let lock_path = locks::papertrail_lock_path(&config.database, &lock_repo);
     let pending = PendingMarker::new(&config.database, &lock_repo);
-    // Acquire-or-coalesce atomically under the marker lock: pairing the failed flight
-    // try-acquire with the marker write in one critical section is one half of the exit
-    // handoff below — a request only ever lands in the marker while some runner is still
-    // obligated to check it.
-    let flight = {
-        let guard = pending.lock()?;
-        match FileLock::try_acquire(&lock_path)? {
-            Some(flight) => flight,
-            None => {
-                guard.merge(request)?;
-                return Ok(AutosyncOutcome::Coalesced);
-            },
-        }
+    let Some(flight) = acquire_or_coalesce(&lock_path, &pending, request)? else {
+        return Ok(AutosyncOutcome::Coalesced);
     };
+    Ok(match drain(config, &lock_repo, &pending, flight, Some(request))? {
+        Drained::NotIndexed => AutosyncOutcome::NotIndexed,
+        Drained::Ran(Some(report)) => AutosyncOutcome::Ran(report),
+        // Only reachable defensively (the initial pass always runs before any guard can stop
+        // the drain); a later trigger re-evaluates.
+        Drained::Ran(None) => AutosyncOutcome::Coalesced,
+    })
+}
+
+/// The explicit `papertrail sync` command: unconditional manual semantics (every binding
+/// dispatched, reference discovery refreshed, `full` honored), SHARING the per-repo flight lock
+/// with automatic sync — two mirror runs over one binding would interleave their cursor
+/// load/save cycles and clobber each other's walk state. Unlike automatic triggers, a manual
+/// invocation never degrades into a policy-gated follow-up: when an automatic flight is in the
+/// air it WAITS for the lock (announcing the wait through `on_wait`, interruptible like any
+/// foreground command) and then runs the full manual pass itself.
+pub fn run_manual(
+    config: &Config,
+    full: bool,
+    on_wait: impl FnOnce(),
+) -> anyhow::Result<PapertrailSyncReport> {
+    let lock_repo = locks::write_lock_repo_id(config);
+    let lock_path = locks::papertrail_lock_path(&config.database, &lock_repo);
+    let pending = PendingMarker::new(&config.database, &lock_repo);
+    // No marker lock is held while blocking here (a contender holding the marker lock must
+    // never block on the flight lock — see [`MarkerGuard`]); the runner's exit handoff releases
+    // the flight lock only with an empty marker, so this wait ends at a clean boundary.
+    let flight = match FileLock::try_acquire(&lock_path)? {
+        Some(flight) => flight,
+        None => {
+            on_wait();
+            FileLock::acquire_blocking(&lock_path)?
+        },
+    };
+    let manual_report = {
+        let db = IndexDatabase::open_config(config)?;
+        db.papertrail_sync(full)?
+    };
+    // Triggers that coalesced behind the manual pass still get their follow-up (and the exit
+    // handoff) before the flight lock releases.
+    drain(config, &lock_repo, &pending, flight, None)?;
+    Ok(manual_report)
+}
+
+/// Take the flight lock, or coalesce `request` into the pending marker — atomically under the
+/// marker lock, so a request only ever lands in the marker while some runner is still obligated
+/// to check it (one half of the exit handoff in [`drain`]).
+fn acquire_or_coalesce(
+    lock_path: &Path,
+    pending: &PendingMarker,
+    request: AutosyncRequest,
+) -> anyhow::Result<Option<FileLock>> {
+    let guard = pending.lock()?;
+    match FileLock::try_acquire(lock_path)? {
+        Some(flight) => Ok(Some(flight)),
+        None => {
+            guard.merge(request)?;
+            Ok(None)
+        },
+    }
+}
+
+enum Drained {
+    Ran(Option<Box<PapertrailSyncReport>>),
+    NotIndexed,
+}
+
+/// Drive scheduled passes while holding the flight lock: `initial` first (when given), then any
+/// follow-ups coalesced into the marker mid-pass, until the EXIT HANDOFF — absorbing the marker
+/// and releasing the flight lock under ONE marker-lock hold — finds nothing queued. A
+/// contender's merge-and-try-acquire section ([`acquire_or_coalesce`]) is serialized either
+/// before that hold (its request is seen here and earns the follow-up) or after the flight lock
+/// is already free (its own try-acquire wins and IT becomes the runner); checking without the
+/// lock, or releasing the flight lock outside it, reopens the window where a coalesced request
+/// is written into the void and never runs.
+fn drain(
+    config: &Config,
+    lock_repo: &str,
+    pending: &PendingMarker,
+    flight: FileLock,
+    initial: Option<AutosyncRequest>,
+) -> anyhow::Result<Drained> {
     let mut flight = Some(flight);
-    let mut request = request;
-    let last_report = loop {
-        // This run covers everything requested so far: absorb (and clear) the marker BEFORE
-        // running, so only triggers arriving mid-flight earn the follow-up evaluation below.
-        if let Some(coalesced) = pending.lock()?.take()? {
-            request = request.max(coalesced);
+    let mut next = initial;
+    let mut first_pass = next.is_some();
+    let mut last_report = None;
+    loop {
+        {
+            let guard = pending.lock()?;
+            match (guard.take()?, next.take()) {
+                (Some(queued), current) =>
+                    next = Some(current.map_or(queued, |request| request.max(queued))),
+                (None, Some(current)) => next = Some(current),
+                (None, None) => {
+                    // The exit handoff: release under the same hold that observed the empty
+                    // marker.
+                    drop(flight.take());
+                    return Ok(Drained::Ran(last_report));
+                },
+            }
         }
-        let report = match run_flight(config, request) {
-            Ok(report) => report,
+        // Identity re-key guard for marker-driven follow-ups: the flight lock was keyed from
+        // the identity resolved at entry, and a long pass can outlive an identity transition
+        // (a shallow clone upgrading to its portable id). Triggers arriving under the NEW
+        // identity key their own flight lock, so continuing under the stale key would run two
+        // concurrent flights over one cursor — step aside instead; the scheduling policy
+        // re-derives any lost urgency from persisted cursor state on the next tick.
+        if !first_pass && locks::write_lock_repo_id(config) != lock_repo {
+            drop(flight.take());
+            return Ok(Drained::Ran(last_report));
+        }
+        first_pass = false;
+        let request = next.take().expect("the loop is only entered with a request");
+        match run_flight(config, request) {
+            Ok(FlightPass::Report(report)) => last_report = Some(report),
+            Ok(FlightPass::NotIndexed) => {
+                // Nothing can run until the first index pass, and any queued follow-up is
+                // equally unservable: consume it under the exit hold and stop. Post-index
+                // triggers start synchronization.
+                let guard = pending.lock()?;
+                let _ = guard.take()?;
+                drop(flight.take());
+                return Ok(Drained::NotIndexed);
+            },
             Err(error) => {
                 // Best-effort retry signal: a failing marker write must not shadow the flight
                 // error the caller is about to log.
@@ -74,28 +181,25 @@ pub fn run(config: &Config, request: AutosyncRequest) -> anyhow::Result<Autosync
                 }
                 return Err(error);
             },
-        };
-        // The exit handoff: the final marker check and the flight-lock release happen under ONE
-        // marker-lock hold. A contender's merge-and-try-acquire section is serialized either
-        // before this check (its marker is seen here and earns the follow-up) or after the
-        // flight lock is already free (its try-acquire wins and IT becomes the runner).
-        // Checking without the lock — or releasing the flight lock outside it — reopens the
-        // window where a coalesced request is written into the void and never runs.
-        let guard = pending.lock()?;
-        if !guard.is_set() {
-            drop(flight.take());
-            break report;
         }
-        drop(guard);
-        // The follow-up's strength comes from the marker itself, absorbed at the loop top.
-        request = AutosyncRequest::Evaluate;
-    };
-    Ok(AutosyncOutcome::Ran(Box::new(last_report)))
+    }
 }
 
-fn run_flight(config: &Config, request: AutosyncRequest) -> anyhow::Result<PapertrailSyncReport> {
+enum FlightPass {
+    Report(Box<PapertrailSyncReport>),
+    NotIndexed,
+}
+
+fn run_flight(config: &Config, request: AutosyncRequest) -> anyhow::Result<FlightPass> {
     let db = IndexDatabase::open_config(config)?;
-    db.papertrail_sync_scheduled(request)
+    // Automatic sync serves already-INDEXED repos only. `open_config` registers read-only (it
+    // never creates an index), so on a shared database this repo can be registered yet never
+    // indexed; the #427 "an index pass ran here" signal (a recorded root, or the source_root
+    // meta an identity-less root gets) is what separates the two.
+    if !crate::index::is_root_already_indexed_conn(db.storage.connection(), config)? {
+        return Ok(FlightPass::NotIndexed);
+    }
+    Ok(FlightPass::Report(Box::new(db.papertrail_sync_scheduled(request)?)))
 }
 
 /// The pending-marker pair: the marker file carrying the strongest coalesced request, and the
@@ -152,6 +256,9 @@ impl MarkerGuard<'_> {
         Ok(Some(AutosyncRequest::from_marker_str(&content)))
     }
 
+    /// Test-only visibility into the marker's presence; production paths decide through
+    /// [`Self::take`] so the decision and the consumption share one hold.
+    #[cfg(test)]
     fn is_set(&self) -> bool {
         self.marker.path.exists()
     }
@@ -269,6 +376,7 @@ mod tests {
                     AutosyncOutcome::Ran(_) => ran += 1,
                     AutosyncOutcome::Coalesced => coalesced += 1,
                     AutosyncOutcome::Disabled => panic!("bindings are configured"),
+                    AutosyncOutcome::NotIndexed => panic!("the index was built above"),
                 }
             }
         });
@@ -375,6 +483,173 @@ mod tests {
         assert!(full_walk_ms.is_some());
         let lock_repo = locks::write_lock_repo_id(&config);
         assert!(!locks::papertrail_pending_path(&config.database, &lock_repo).exists());
+    }
+
+    /// A shared database can hold a repo that was REGISTERED (read-only opens do that) but
+    /// never indexed; automatic sync must defer until the first index pass instead of starting
+    /// a mirror for it.
+    #[test]
+    fn flight_defers_until_the_repo_is_indexed() {
+        let indexed_tmp = tempfile::TempDir::new().unwrap();
+        let mut indexed_config = test_config(indexed_tmp.path());
+        indexed_config.allow_empty = true;
+        IndexDatabase::rebuild(&indexed_config).unwrap();
+
+        // A second repo (a real git repo, so it resolves its OWN identity instead of falling
+        // back to the sole registered one) sharing the same database, with a binding but no
+        // index pass ever run.
+        let unindexed_root = temp_git_repo("autosync-unindexed");
+        let mut config = test_config(&unindexed_root);
+        config.database = indexed_config.database.clone();
+        config.trackers = vec![crate::config::TrackerConfig {
+            provider: crate::config::Tracker::Github,
+            project: Some("o/r".to_string()),
+            remote: "origin".to_string(),
+            base_url: Some("http://127.0.0.1:9".to_string()),
+            auth: None,
+            tags: Vec::new(),
+        }];
+
+        let outcome = run(&config, AutosyncRequest::Full).unwrap();
+        assert!(matches!(outcome, AutosyncOutcome::NotIndexed), "{outcome:?}");
+        // No mirror work happened and no follow-up signal is owed. (Counts are scoped to the
+        // binding under test — the schema bootstrap seeds a poison-sibling row into every
+        // repo-scoped table.)
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        let cursor_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM papertrail_sync_cursor WHERE project='o/r'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_rows, 0);
+        let lock_repo = locks::write_lock_repo_id(&config);
+        assert!(!locks::papertrail_pending_path(&config.database, &lock_repo).exists());
+
+        // The first index pass unlocks automatic sync (the flight then runs and persists the
+        // unreachable binding's failure as health).
+        config.allow_empty = true;
+        IndexDatabase::rebuild(&config).unwrap();
+        let outcome = run(&config, AutosyncRequest::Incremental).unwrap();
+        assert!(matches!(outcome, AutosyncOutcome::Ran(_)), "{outcome:?}");
+        let cursor_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM papertrail_sync_cursor WHERE project='o/r'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_rows, 1);
+    }
+
+    /// An explicit sync never degrades into a policy-gated follow-up: it announces the wait,
+    /// blocks until the running flight releases the lock, then runs the full manual pass.
+    #[test]
+    fn manual_sync_waits_out_a_running_flight_instead_of_degrading() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.allow_empty = true;
+        IndexDatabase::rebuild(&config).unwrap();
+        let lock_repo = locks::write_lock_repo_id(&config);
+        let lock_path = locks::papertrail_lock_path(&config.database, &lock_repo);
+        let held = FileLock::try_acquire(&lock_path).unwrap().unwrap();
+
+        let waited = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                drop(held);
+            });
+            // No bindings: the manual pass itself is a cheap local report — the point is the
+            // lock choreography, not the mirror.
+            let report = run_manual(&config, false, || {
+                waited.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .unwrap();
+            assert!(report.bindings.is_empty());
+            holder.join().unwrap();
+        });
+        assert!(waited.load(std::sync::atomic::Ordering::Relaxed), "the wait is announced");
+        // No degraded follow-up was queued anywhere.
+        assert!(!locks::papertrail_pending_path(&config.database, &lock_repo).exists());
+    }
+
+    /// Manual sync holds the shared flight lock for its whole pass, then drains any follow-up
+    /// requests that coalesced behind it before releasing.
+    #[test]
+    fn manual_sync_runs_under_the_flight_lock_and_drains_queued_followups() {
+        use super::super::transport::stub::{StubResponse, spawn_script_stub};
+        let script = vec![
+            StubResponse::ok(
+                r#"{"incomplete_results":false,"items":[{"number":1,"html_url":"https://example.test/o/r/issues/1","state":"open","title":"one","body":"","updated_at":"2026-01-01T00:00:00Z","labels":[]}]}"#,
+            ),
+            StubResponse::ok("[]"),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok(r#"{"incomplete_results":false,"items":[]}"#),
+            StubResponse::ok("[]"),
+            StubResponse::ok("[]"),
+        ];
+        let (url, _stub) = spawn_script_stub(script);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.trackers = vec![crate::config::TrackerConfig {
+            provider: crate::config::Tracker::Github,
+            project: Some("o/r".to_string()),
+            remote: "origin".to_string(),
+            base_url: Some(url),
+            auth: None,
+            tags: Vec::new(),
+        }];
+        config.allow_empty = true;
+        IndexDatabase::rebuild(&config).unwrap();
+
+        // A request queued before the manual pass rides its drain: the manual walk covers it
+        // (the follow-up evaluation lands inside the attempt interval and settles to a skip).
+        let lock_repo = locks::write_lock_repo_id(&config);
+        PendingMarker::new(&config.database, &lock_repo)
+            .lock()
+            .unwrap()
+            .merge(AutosyncRequest::Incremental)
+            .unwrap();
+
+        let report = run_manual(&config, false, || panic!("the lock is free; no wait")).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.bindings.len(), 1);
+        assert!(report.bindings[0].completed_full_walk);
+
+        // Everything queued was drained and the flight lock released.
+        assert!(!locks::papertrail_pending_path(&config.database, &lock_repo).exists());
+        assert!(
+            FileLock::try_acquire(&locks::papertrail_lock_path(&config.database, &lock_repo))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn temp_git_repo(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("ragrat-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "root",
+        ]);
+        root
     }
 
     fn test_config(root: &Path) -> Config {

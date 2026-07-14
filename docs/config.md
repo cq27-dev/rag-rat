@@ -657,7 +657,14 @@ needed:
   the binding's health row (see `papertrail_sync_status`), and the cadence above retries it.
   Auto-sync never holds the repository write lock, so mirror traffic cannot stall ordinary index
   maintenance.
+- **Indexed repos only.** Automatic sync starts after the repo's first index pass — a repo that
+  is merely registered in a shared database (read-only opens do that) is never mirrored
+  automatically.
 
 Manual `rag-rat papertrail sync` remains the unconditional pass: it dispatches every binding
 regardless of cadence, reports provider-client-pending bindings explicitly, and also refreshes
 reference discovery (commit / file / branch refs), which the automatic path deliberately skips.
+It shares the per-repo flight lock with automatic sync — two mirror runs over one binding would
+clobber each other's cursor — so a request issued while an automatic flight is running waits for
+that flight to finish (the wait is announced on stderr and can be interrupted) and then runs the
+full manual pass; it is never downgraded to a policy-gated follow-up.
