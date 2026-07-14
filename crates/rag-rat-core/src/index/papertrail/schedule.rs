@@ -20,6 +20,7 @@ pub(crate) struct BindingScheduleState {
     pub last_full_walk_ms: Option<i64>,
     pub retry_not_before_ms: Option<i64>,
     pub full_walk_in_progress: bool,
+    pub mirror_work_in_progress: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -75,6 +76,9 @@ pub(crate) fn decide_schedule(
     }
     if state.full_walk_in_progress {
         return ScheduleDecision::Full;
+    }
+    if state.mirror_work_in_progress {
+        return ScheduleDecision::Incremental;
     }
     if elapsed(state.last_full_walk_ms, config.full_sync_interval_secs) {
         return ScheduleDecision::Full;
@@ -201,7 +205,7 @@ fn sanitize_error_detail(detail: &str) -> String {
 }
 
 pub(crate) type PersistedHealth =
-    (BindingScheduleState, Option<PapertrailErrorClass>, Option<String>);
+    (BindingScheduleState, Option<PapertrailErrorClass>, Option<String>, String);
 
 pub(crate) fn load_persisted_health(
     conn: &Connection,
@@ -212,12 +216,18 @@ pub(crate) fn load_persisted_health(
     Ok(conn
         .query_row(
             "SELECT last_attempt_ms, last_successful_probe_ms, last_successful_mirror_ms,
-                    last_full_sync_ms, retry_not_before_ms, full_rewalk, error_class, error_detail
+                    last_full_sync_ms, retry_not_before_ms, full_rewalk,
+                    backfill_done = 0 OR item_delta_in_progress = 1
+                        OR item_delta_page_token IS NOT NULL
+                        OR backfill_page_cursor IS NOT NULL
+                        OR item_thread_cursor IS NOT NULL
+                        OR comment_page_token IS NOT NULL,
+                    error_class, error_detail, filter_fingerprint
              FROM papertrail_sync_cursor
              WHERE repo_id=?1 AND tracker=?2 AND project=?3",
             params![repo_id, tracker.as_db_str(), project],
             |row| {
-                let error: Option<String> = row.get(6)?;
+                let error: Option<String> = row.get(7)?;
                 Ok((
                     BindingScheduleState {
                         last_attempt_ms: row.get(0)?,
@@ -226,9 +236,11 @@ pub(crate) fn load_persisted_health(
                         last_full_walk_ms: row.get(3)?,
                         retry_not_before_ms: row.get(4)?,
                         full_walk_in_progress: row.get(5)?,
+                        mirror_work_in_progress: row.get(6)?,
                     },
                     error.as_deref().and_then(PapertrailErrorClass::from_db_str),
-                    row.get(7)?,
+                    row.get(8)?,
+                    row.get::<_, Option<String>>(9)?.unwrap_or_default(),
                 ))
             },
         )
@@ -311,7 +323,7 @@ mod tests {
         record_pause(&conn, &binding, 20_000).unwrap();
         record_success(&conn, &binding, SuccessfulOperation::IncrementalMirror, 10_000).unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
-        let (state, error, _) =
+        let (state, error, _, _) =
             load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
         assert_eq!(state.last_successful_probe_ms, Some(10_000));
         assert_eq!(state.last_successful_mirror_ms, Some(10_000));
@@ -326,7 +338,7 @@ mod tests {
         let binding = binding();
         record_pause(&conn, &binding, 20_000).unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
-        let (state, error, detail) =
+        let (state, error, detail, _) =
             load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
         assert_eq!(state.retry_not_before_ms, Some(20_000));
         assert_eq!(error, Some(PapertrailErrorClass::RateLimited));
@@ -347,7 +359,7 @@ mod tests {
         .unwrap();
         record_pause(&conn, &binding, 20_000).unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
-        let (_, error, detail) =
+        let (_, error, detail, _) =
             load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
         assert_eq!(error, Some(PapertrailErrorClass::RateLimited));
         assert_eq!(detail, None);
@@ -362,6 +374,40 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(decide_schedule(900_000, &config(), state, false), ScheduleDecision::Full);
+    }
+
+    #[test]
+    fn interrupted_incremental_work_resumes_before_a_fresh_probe() {
+        let state = BindingScheduleState {
+            last_attempt_ms: Some(0),
+            last_successful_probe_ms: Some(899_999),
+            last_full_walk_ms: Some(899_999),
+            mirror_work_in_progress: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_schedule(900_000, &config(), state, false),
+            ScheduleDecision::Incremental
+        );
+    }
+
+    #[test]
+    fn persisted_cursor_work_and_filter_fingerprint_are_loaded_for_scheduling() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        let binding = binding();
+        record_attempt(&conn, &binding, 1).unwrap();
+        conn.execute(
+            "UPDATE papertrail_sync_cursor
+             SET backfill_done=1, item_delta_in_progress=1, filter_fingerprint='old'",
+            [],
+        )
+        .unwrap();
+        let repo_id = schema::active_repo_id(&conn).unwrap();
+        let (state, _, _, fingerprint) =
+            load_persisted_health(&conn, &repo_id, Tracker::Github, "o/r").unwrap();
+        assert!(state.mirror_work_in_progress);
+        assert_eq!(fingerprint, "old");
     }
 
     #[test]

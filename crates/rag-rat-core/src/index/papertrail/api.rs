@@ -236,10 +236,11 @@ pub(crate) fn status(
         .trackers
         .iter()
         .map(|binding| {
-            let (health, error_class, error_detail) =
+            let (health, error_class, error_detail, stored_filter_fingerprint) =
                 load_persisted_health(conn, &repo_id, binding.provider, &binding.project)?;
-            let overdue =
-                decide_schedule(now, &ctx.schedule, health, false) != ScheduleDecision::Skip;
+            let filter_changed = stored_filter_fingerprint != binding.filter_fingerprint();
+            let overdue = decide_schedule(now, &ctx.schedule, health, filter_changed)
+                != ScheduleDecision::Skip;
             Ok(PapertrailBindingStatus {
                 tracker: binding.provider,
                 project: binding.project.clone(),

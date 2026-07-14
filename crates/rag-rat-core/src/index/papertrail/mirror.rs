@@ -144,8 +144,8 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
     let result = mirror_binding_inner(conn, binding, client, &mut cursor, &mut report).await;
     match result {
         Ok(()) => {
-            report.completed_full_walk =
-                cursor.backfill_done && (!had_completed_backfill || starting_full_rewalk);
+            report.completed_full_walk = cursor.backfill_done
+                && (!had_completed_backfill || starting_full_rewalk || filter_changed);
             Ok(report)
         },
         Err(error) if pause(&error).is_some() => {
@@ -1886,6 +1886,7 @@ mod tests {
         ]);
         let report = block_on(mirror_binding(&conn, &docs, &changed, false)).unwrap();
         assert_eq!(report.pruned_items, 1);
+        assert!(report.completed_full_walk);
         assert_eq!(keys(&conn), vec!["2"]);
     }
 

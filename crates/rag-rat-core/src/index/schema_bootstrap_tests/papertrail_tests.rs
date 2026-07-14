@@ -657,8 +657,8 @@ fn migration_063_persists_mirror_resume_state() {
 }
 
 #[test]
-fn migration_064_is_the_tip_and_persists_binding_health() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 64, "move this pin with the next schema migration");
+fn migration_065_is_the_tip_and_persists_binding_health() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 65, "move this pin with the next schema migration");
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
     let columns = conn_table_columns(&conn, "papertrail_sync_cursor");
