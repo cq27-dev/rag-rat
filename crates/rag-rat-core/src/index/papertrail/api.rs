@@ -245,8 +245,9 @@ pub(crate) fn status(
             let (health, error_class, error_detail, stored_filter_fingerprint) =
                 load_persisted_health(conn, &repo_id, binding)?;
             let filter_changed = stored_filter_fingerprint != binding.filter_fingerprint();
-            let overdue = decide_schedule(now, &ctx.schedule, health, filter_changed)
-                != ScheduleDecision::Skip;
+            let synchronization = tracker_synchronization(binding);
+            let decision = decide_schedule(now, &ctx.schedule, health, filter_changed);
+            let (overdue, failed) = binding_status_flags(synchronization, decision, error_class);
             Ok(PapertrailBindingStatus {
                 tracker: binding.provider,
                 project: binding.project.clone(),
@@ -259,7 +260,7 @@ pub(crate) fn status(
                 error_class,
                 error_detail,
                 overdue,
-                failed: error_class.is_some(),
+                failed,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -317,6 +318,20 @@ fn tracker_synchronization(binding: &ResolvedTracker) -> TrackerSynchronization 
         Tracker::Github => TrackerSynchronization::Native,
         _ => TrackerSynchronization::ProviderClientPending,
     }
+}
+
+fn binding_status_flags(
+    synchronization: TrackerSynchronization,
+    decision: ScheduleDecision,
+    error_class: Option<PapertrailErrorClass>,
+) -> (bool, bool) {
+    if synchronization == TrackerSynchronization::ProviderClientPending {
+        return (false, false);
+    }
+    (
+        decision != ScheduleDecision::Skip,
+        error_class.is_some_and(|class| class != PapertrailErrorClass::RateLimited),
+    )
 }
 pub(crate) fn issue_search(
     conn: &Connection,
@@ -498,6 +513,49 @@ mod capability_tests {
     }
 
     #[test]
+    fn public_binding_status_distinguishes_capability_pause_and_failure() {
+        assert_eq!(
+            binding_status_flags(
+                TrackerSynchronization::ProviderClientPending,
+                ScheduleDecision::Full,
+                Some(PapertrailErrorClass::Provider),
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            binding_status_flags(
+                TrackerSynchronization::Native,
+                ScheduleDecision::Skip,
+                Some(PapertrailErrorClass::RateLimited),
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            binding_status_flags(
+                TrackerSynchronization::Native,
+                ScheduleDecision::Incremental,
+                Some(PapertrailErrorClass::Authentication),
+            ),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn persisted_rate_limit_pause_is_not_reported_as_a_failure() {
+        let binding = github(None);
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        record_pause(&conn, &binding, i64::MAX).unwrap();
+
+        let binding_status = status(&conn, &ctx).unwrap().bindings.remove(0);
+        assert_eq!(binding_status.error_class, Some(PapertrailErrorClass::RateLimited));
+        assert!(!binding_status.overdue);
+        assert!(!binding_status.failed);
+    }
+
+    #[test]
     fn paused_mirror_is_not_a_successful_operation() {
         let report = MirrorBindingReport {
             tracker: Tracker::Github,
@@ -650,6 +708,7 @@ mod capability_tests {
         let pending =
             report.status.bindings.iter().find(|binding| binding.project == "group/repo").unwrap();
         assert!(!pending.failed);
+        assert!(!pending.overdue);
         assert_eq!(pending.error_class, None);
     }
 }
