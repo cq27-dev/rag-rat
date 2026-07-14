@@ -42,15 +42,26 @@ pub fn run(config: &Config, request: AutosyncRequest) -> anyhow::Result<Autosync
     let lock_repo = locks::write_lock_repo_id(config);
     let lock_path = locks::papertrail_lock_path(&config.database, &lock_repo);
     let pending = PendingMarker::new(&config.database, &lock_repo);
-    let Some(_flight) = FileLock::try_acquire(&lock_path)? else {
-        pending.merge(request)?;
-        return Ok(AutosyncOutcome::Coalesced);
+    // Acquire-or-coalesce atomically under the marker lock: pairing the failed flight
+    // try-acquire with the marker write in one critical section is one half of the exit
+    // handoff below — a request only ever lands in the marker while some runner is still
+    // obligated to check it.
+    let flight = {
+        let guard = pending.lock()?;
+        match FileLock::try_acquire(&lock_path)? {
+            Some(flight) => flight,
+            None => {
+                guard.merge(request)?;
+                return Ok(AutosyncOutcome::Coalesced);
+            },
+        }
     };
+    let mut flight = Some(flight);
     let mut request = request;
     let last_report = loop {
         // This run covers everything requested so far: absorb (and clear) the marker BEFORE
         // running, so only triggers arriving mid-flight earn the follow-up evaluation below.
-        if let Some(coalesced) = pending.take()? {
+        if let Some(coalesced) = pending.lock()?.take()? {
             request = request.max(coalesced);
         }
         let report = match run_flight(config, request) {
@@ -58,13 +69,24 @@ pub fn run(config: &Config, request: AutosyncRequest) -> anyhow::Result<Autosync
             Err(error) => {
                 // Best-effort retry signal: a failing marker write must not shadow the flight
                 // error the caller is about to log.
-                let _ = pending.merge(request);
+                if let Ok(guard) = pending.lock() {
+                    let _ = guard.merge(request);
+                }
                 return Err(error);
             },
         };
-        if !pending.is_set() {
+        // The exit handoff: the final marker check and the flight-lock release happen under ONE
+        // marker-lock hold. A contender's merge-and-try-acquire section is serialized either
+        // before this check (its marker is seen here and earns the follow-up) or after the
+        // flight lock is already free (its try-acquire wins and IT becomes the runner).
+        // Checking without the lock — or releasing the flight lock outside it — reopens the
+        // window where a coalesced request is written into the void and never runs.
+        let guard = pending.lock()?;
+        if !guard.is_set() {
+            drop(flight.take());
             break report;
         }
+        drop(guard);
         // The follow-up's strength comes from the marker itself, absorbed at the loop top.
         request = AutosyncRequest::Evaluate;
     };
@@ -77,11 +99,12 @@ fn run_flight(config: &Config, request: AutosyncRequest) -> anyhow::Result<Paper
 }
 
 /// The pending-marker pair: the marker file carrying the strongest coalesced request, and the
-/// short-lived lock serializing every read-modify-write of it. Without the lock two coalescing
-/// contenders can interleave their max-merge — one reads the old marker, another writes `full`,
-/// the first overwrites it with `incremental` — silently postponing an explicitly queued full
-/// walk. Distinct from the flight lock, which the runner holds for the whole network-bound run;
-/// this one is held for microseconds per update, so contenders never wait on a flight.
+/// lock serializing every access to it. All reads and writes flow through a held [`MarkerGuard`]
+/// so no path can touch the file outside the lock — without it, two coalescing contenders can
+/// interleave their max-merge (a weaker request overwrites a queued `full`), and a runner's exit
+/// check can miss a marker written just before its flight lock releases. Distinct from the
+/// flight lock, which the runner holds for the whole network-bound run; this one is held for
+/// microseconds per section, so contenders never wait on a flight.
 struct PendingMarker {
     path: PathBuf,
     update_lock: PathBuf,
@@ -95,31 +118,42 @@ impl PendingMarker {
         }
     }
 
+    fn lock(&self) -> anyhow::Result<MarkerGuard<'_>> {
+        Ok(MarkerGuard { marker: self, _update: FileLock::acquire_blocking(&self.update_lock)? })
+    }
+}
+
+/// One held marker-lock section. Lock ordering: a runner holding the FLIGHT lock may block on
+/// this lock; a contender holding this lock only ever TRY-acquires the flight lock — the
+/// non-blocking edge is what makes the pair deadlock-free.
+struct MarkerGuard<'a> {
+    marker: &'a PendingMarker,
+    _update: FileLock,
+}
+
+impl MarkerGuard<'_> {
     /// Record `request` into the marker, max-merged with whatever is already queued there.
     fn merge(&self, request: AutosyncRequest) -> anyhow::Result<()> {
-        let _update = FileLock::acquire_blocking(&self.update_lock)?;
-        let merged = match fs::read_to_string(&self.path) {
+        let merged = match fs::read_to_string(&self.marker.path) {
             Ok(existing) => request.max(AutosyncRequest::from_marker_str(&existing)),
             Err(_) => request,
         };
-        fs::write(&self.path, merged.as_marker_str())?;
+        fs::write(&self.marker.path, merged.as_marker_str())?;
         Ok(())
     }
 
-    /// Consume the marker. Runs under the same update lock as [`Self::merge`], so a request
-    /// merged concurrently is either absorbed into the returned value or lands after the removal
-    /// and survives for the next check.
+    /// Consume the marker. A request merged concurrently is either absorbed into the returned
+    /// value or lands after the removal and survives for the next check.
     fn take(&self) -> anyhow::Result<Option<AutosyncRequest>> {
-        let _update = FileLock::acquire_blocking(&self.update_lock)?;
-        let Ok(content) = fs::read_to_string(&self.path) else {
+        let Ok(content) = fs::read_to_string(&self.marker.path) else {
             return Ok(None);
         };
-        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.marker.path);
         Ok(Some(AutosyncRequest::from_marker_str(&content)))
     }
 
     fn is_set(&self) -> bool {
-        self.path.exists()
+        self.marker.path.exists()
     }
 }
 
@@ -150,19 +184,19 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let marker = PendingMarker::new(&tmp.path().join("locks/index.sqlite"), "repo");
 
-        marker.merge(AutosyncRequest::Full).unwrap();
+        marker.lock().unwrap().merge(AutosyncRequest::Full).unwrap();
         // A later, weaker trigger must not weaken the queued full walk.
-        marker.merge(AutosyncRequest::Incremental).unwrap();
+        marker.lock().unwrap().merge(AutosyncRequest::Incremental).unwrap();
         assert_eq!(fs::read_to_string(&marker.path).unwrap(), "full");
 
-        assert_eq!(marker.take().unwrap(), Some(AutosyncRequest::Full));
-        assert!(!marker.is_set());
-        assert_eq!(marker.take().unwrap(), None);
+        assert_eq!(marker.lock().unwrap().take().unwrap(), Some(AutosyncRequest::Full));
+        assert!(!marker.lock().unwrap().is_set());
+        assert_eq!(marker.lock().unwrap().take().unwrap(), None);
 
         // And the upgrade direction: a stronger trigger replaces a weaker queued one.
-        marker.merge(AutosyncRequest::Evaluate).unwrap();
-        marker.merge(AutosyncRequest::Incremental).unwrap();
-        assert_eq!(marker.take().unwrap(), Some(AutosyncRequest::Incremental));
+        marker.lock().unwrap().merge(AutosyncRequest::Evaluate).unwrap();
+        marker.lock().unwrap().merge(AutosyncRequest::Incremental).unwrap();
+        assert_eq!(marker.lock().unwrap().take().unwrap(), Some(AutosyncRequest::Incremental));
     }
 
     #[test]
@@ -184,13 +218,67 @@ mod tests {
                         AutosyncRequest::Incremental
                     };
                     for _ in 0..50 {
-                        marker.merge(request).unwrap();
+                        marker.lock().unwrap().merge(request).unwrap();
                     }
                 });
             }
         });
         let marker = PendingMarker::new(&database, "repo");
-        assert_eq!(marker.take().unwrap(), Some(AutosyncRequest::Full));
+        assert_eq!(marker.lock().unwrap().take().unwrap(), Some(AutosyncRequest::Full));
+    }
+
+    /// The exit handoff under contention: any trigger accepted as `Coalesced` must eventually be
+    /// covered by a runner — after every concurrent `run` returns, no request may be left
+    /// orphaned in the marker. Races many triggers against fast flights (the binding's endpoint
+    /// is unreachable, so each flight fails fast and persists health; after the first attempt
+    /// the minimum interval makes evaluations near-instant).
+    #[test]
+    fn racing_triggers_never_orphan_a_coalesced_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.trackers = vec![crate::config::TrackerConfig {
+            provider: crate::config::Tracker::Github,
+            project: Some("o/r".to_string()),
+            remote: "origin".to_string(),
+            // The discard port: connection refused, so flights fail fast without network.
+            base_url: Some("http://127.0.0.1:9".to_string()),
+            auth: None,
+            tags: Vec::new(),
+        }];
+        config.allow_empty = true;
+        IndexDatabase::rebuild(&config).unwrap();
+
+        let mut ran = 0;
+        let mut coalesced = 0;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|contender| {
+                    let config = &config;
+                    scope.spawn(move || {
+                        let request = if contender % 2 == 0 {
+                            AutosyncRequest::Incremental
+                        } else {
+                            AutosyncRequest::Full
+                        };
+                        run(config, request).unwrap()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                match handle.join().unwrap() {
+                    AutosyncOutcome::Ran(_) => ran += 1,
+                    AutosyncOutcome::Coalesced => coalesced += 1,
+                    AutosyncOutcome::Disabled => panic!("bindings are configured"),
+                }
+            }
+        });
+        assert!(ran >= 1, "at least one trigger must have run the flight");
+        let lock_repo = locks::write_lock_repo_id(&config);
+        let pending = locks::papertrail_pending_path(&config.database, &lock_repo);
+        assert!(
+            !pending.exists(),
+            "an accepted trigger was orphaned in the marker ({ran} ran, {coalesced} coalesced)"
+        );
     }
 
     #[test]
