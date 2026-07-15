@@ -9,8 +9,6 @@
 //! pay a full FTS rebuild forever after a sibling synced (stale-dirty loop). Do NOT route these
 //! back through `self.repo_meta` / `self.set_repo_meta`.
 
-use anyhow::Context as _;
-
 use super::*;
 
 impl IndexDatabase {
@@ -18,12 +16,19 @@ impl IndexDatabase {
     /// store and rebuild the external-content `commit_fts`, then record freshness. The hot
     /// full-rebuild path uses [`finalize_full_rebuild_fts`] instead (chunk_fts is written inline).
     pub fn rebuild_fts(&self) -> anyhow::Result<()> {
-        self.rebuild_chunk_fts()?;
-        schema::rebuild_commit_fts(self.storage.connection())?;
-        self.record_content_revision()?;
-        self.record_fts_current()?;
-        self.set_meta("fts_dirty", "false")?;
-        Ok(())
+        // ONE transaction when standalone (#610): 'delete-all' + per-row reinserts + the
+        // freshness stamps are a multi-statement sequence — interrupted mid-way it leaves an
+        // EMPTY mirror silently missing from BM25 until the next refresh fires, and a
+        // concurrent reader sees the torn intermediate. Inside a caller's fence (the corruption
+        // heals) it runs bare; SQLite rejects nested BEGINs.
+        fenced_when_autocommit(self.storage.connection(), || {
+            self.rebuild_chunk_fts()?;
+            schema::rebuild_commit_fts(self.storage.connection())?;
+            self.record_content_revision()?;
+            self.record_fts_current()?;
+            self.set_meta("fts_dirty", "false")?;
+            Ok(())
+        })
     }
 
     /// Full-rebuild FTS finalize: `chunk_fts` was written inline during chunk
@@ -178,7 +183,7 @@ impl IndexDatabase {
     /// bare "database disk image is malformed" a corrupt read returns does not name the table
     /// (the #582 incident burned three wrong theories on exactly that); every mirror rebuilds
     /// losslessly (`chunk_fts`/`commit_fts` from the chunk/commit stores, `repo_memory_fts` from
-    /// `repo_memories`, `github_fts` from the papertrail tables), so over-healing costs one
+    /// `repo_memories`, `papertrail_fts` from the papertrail tables), so over-healing costs one
     /// re-tokenize, not data. Healing through the querying connection is what makes the fix
     /// visible to a long-lived server: an out-of-band repair leaves the connection's cached
     /// corrupt pages serving `SQLITE_CORRUPT` indefinitely.
@@ -241,8 +246,8 @@ impl IndexDatabase {
         let chunk_corrupt = probe_corrupt("chunk_fts")?;
         let commit_corrupt = probe_corrupt("commit_fts")?;
         let memory_corrupt = probe_corrupt("repo_memory_fts")?;
-        let github_corrupt = probe_corrupt("github_fts")?;
-        if !(chunk_corrupt || commit_corrupt || memory_corrupt || github_corrupt) {
+        let papertrail_corrupt = probe_corrupt("papertrail_fts")?;
+        if !(chunk_corrupt || commit_corrupt || memory_corrupt || papertrail_corrupt) {
             return Ok(healed);
         }
         // Same database-wide fence as `heal_corrupt_fts`: the rebuilds are global and
@@ -264,13 +269,33 @@ impl IndexDatabase {
             crate::query::memory::heal_repo_memory_fts(conn)?;
             healed.push("repo_memory_fts".to_string());
         }
-        if github_corrupt {
+        if papertrail_corrupt {
             crate::index::papertrail::rebuild_fts(conn)?;
-            healed.push("github_fts".to_string());
+            healed.push("papertrail_fts".to_string());
         }
         fence.commit()?;
         Ok(healed)
     }
+}
+
+/// Run `op` inside its own IMMEDIATE transaction when the connection is in autocommit, bare when
+/// a caller already holds one (SQLite rejects nested BEGINs). The atomicity seam for every
+/// multi-statement FTS mirror maintenance sequence (#610): standalone callers get all-or-nothing
+/// plus write serialization against sibling repos on a consolidated database (per-repo flocks
+/// cannot serialize a GLOBAL mirror; the database write lock can), and fenced callers (the
+/// corruption heals) keep their outer fence as the single atomic unit.
+pub(crate) fn fenced_when_autocommit(
+    conn: &rusqlite::Connection,
+    op: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !conn.is_autocommit() {
+        return op();
+    }
+    let fence =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    op()?;
+    fence.commit()?;
+    Ok(())
 }
 
 /// #582: whether `err`'s chain contains SQLITE_CORRUPT — the FTS5 shadow-table variant surfaces
@@ -362,5 +387,55 @@ mod corruption_tests {
         );
         assert!(error_is_fts_corruption(&result.unwrap_err()));
         assert_eq!(calls, 2, "exactly one retry, no loop");
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    fn conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t(x INTEGER)").unwrap();
+        conn
+    }
+
+    #[test]
+    fn standalone_callers_get_all_or_nothing() {
+        let conn = conn();
+        let error = fenced_when_autocommit(&conn, || {
+            conn.execute("INSERT INTO t(x) VALUES (1)", [])?;
+            anyhow::bail!("interrupted mid-sequence")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("interrupted"), "{error:#}");
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 0, "the partial write must roll back — no torn mirror");
+        assert!(conn.is_autocommit(), "the failed fence must not leave a transaction open");
+
+        fenced_when_autocommit(&conn, || {
+            conn.execute("INSERT INTO t(x) VALUES (2)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn fenced_callers_run_bare_inside_their_own_transaction() {
+        let conn = conn();
+        let outer =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        fenced_when_autocommit(&conn, || {
+            conn.execute("INSERT INTO t(x) VALUES (1)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        // The outer fence is still the single atomic unit: rolling it back drops the write.
+        outer.rollback().unwrap();
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 0, "no nested commit may escape the caller's fence");
     }
 }

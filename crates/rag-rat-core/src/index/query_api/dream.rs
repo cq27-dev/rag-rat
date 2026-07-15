@@ -52,7 +52,7 @@ impl IndexDatabase {
             || {
                 crate::dream::model_work_pending(
                     self.storage.connection(),
-                    opts.clone(),
+                    opts,
                     budget,
                     verify,
                     compact,

@@ -186,6 +186,24 @@ pub(crate) fn store_comment(
 /// Every repo's rows are re-derived (each stamped its base row's `repo_id`), and `classification`
 /// is recomputed by [`insert_fts`].
 pub(crate) fn rebuild_fts(conn: &Connection) -> rusqlite::Result<()> {
+    // Whole-table delete + per-row reinserts must be one atomic unit when standalone (#610);
+    // the full-rewalk caller already runs inside its own transaction and SQLite rejects nested
+    // BEGINs, so the fence only wraps autocommit callers (the corruption heals hold their own).
+    if conn.is_autocommit() {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = rebuild_fts_inner(conn);
+        match &result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+            },
+        }
+        return result;
+    }
+    rebuild_fts_inner(conn)
+}
+
+fn rebuild_fts_inner(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM papertrail_fts", [])?;
     {
         let mut stmt = conn.prepare(
