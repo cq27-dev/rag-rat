@@ -8,11 +8,13 @@ use rag_rat_core::index::papertrail::autosync;
 
 use crate::cli::{HookAction, HooksArgs, PapertrailArgs, PapertrailCommand};
 use crate::render::print_output;
-use crate::{MANAGED_HOOKS, git_paths, install_hook, is_rag_rat_hook};
+use crate::{MANAGED_HOOKS, ensure_index_exists, git_paths, install_hook, is_rag_rat_hook};
 
 pub(crate) fn papertrail(config: &Config, args: &PapertrailArgs) -> anyhow::Result<()> {
     match &args.command {
         PapertrailCommand::Sync { full } => {
+            // The friendly missing-index hint, before any lock or open work.
+            ensure_index_exists(config)?;
             // Manual sync shares the per-repo flight lock with automatic sync: two mirror runs
             // over one binding would interleave their cursor load/save cycles and clobber each
             // other's walk state. A running automatic flight is waited out (observably), never

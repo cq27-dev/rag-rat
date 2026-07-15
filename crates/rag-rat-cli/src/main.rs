@@ -473,13 +473,20 @@ fn is_git_hook_trigger(trigger: Option<&str>) -> bool {
 /// Open the index for a read command, mapping a not-yet-built index to a friendly hint instead
 /// of an empty auto-created SQLite file. Commands that build the index (`index`, `maintenance`)
 /// or tolerate a missing schema (`doctor`, `migrate`) deliberately do not go through this.
-pub(crate) fn open_index(config: &Config) -> anyhow::Result<IndexDatabase> {
+/// The friendly missing-index guard, shared by [`open_index`] and the commands that reach the
+/// database through their own open path (manual papertrail sync goes through the flight lock).
+pub(crate) fn ensure_index_exists(config: &Config) -> anyhow::Result<()> {
     if !config.database.exists() {
         anyhow::bail!(
             "No index found at {}.\nRun `rag-rat index` to build it first.",
             config.database.display()
         );
     }
+    Ok(())
+}
+
+pub(crate) fn open_index(config: &Config) -> anyhow::Result<IndexDatabase> {
+    ensure_index_exists(config)?;
     IndexDatabase::open_config(config)
 }
 

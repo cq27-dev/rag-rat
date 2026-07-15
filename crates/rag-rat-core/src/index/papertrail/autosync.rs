@@ -43,6 +43,13 @@ pub fn run(config: &Config, request: AutosyncRequest) -> anyhow::Result<Autosync
     if PapertrailContext::resolve(config).trackers.is_empty() {
         return Ok(AutosyncOutcome::Disabled);
     }
+    // The non-creating half of the indexed-only gate, BEFORE any lock or open: opening a
+    // missing database creates the (empty) file first and only then refuses on the missing
+    // schema, and that artifact defeats every later `database.exists()` "build the index first"
+    // hint. A repo with no store at all is trivially not indexed.
+    if !config.database.exists() {
+        return Ok(AutosyncOutcome::NotIndexed);
+    }
     // Identity re-key retry: when a pass discovers its flight lock was keyed from a
     // since-upgraded identity, the stranded request (max-merged with anything consumed from the
     // old-key marker) is carried to fresh keys and re-run — an `Incremental` change signal is
@@ -98,6 +105,13 @@ pub fn run_manual(
     full: bool,
     mut on_wait: impl FnMut(),
 ) -> anyhow::Result<PapertrailSyncReport> {
+    // Refuse BEFORE any lock or open: opening a missing database creates the (empty) file
+    // first and only then refuses on the missing schema, and that artifact defeats every later
+    // `database.exists()` "build the index first" hint.
+    anyhow::ensure!(
+        config.database.exists(),
+        "no index at this path yet; build one with `rag-rat index` or `rag-rat index --full`"
+    );
     // The same identity re-key guard as `run_flight`, with manual semantics: the identity can
     // move between resolving the lock key and the post-open re-check (the wait for the flight
     // slot and `open_config`'s own git reads take real time, and the open can itself upgrade
@@ -123,7 +137,13 @@ pub fn run_manual(
         if locks::write_lock_repo_id(config) != lock_repo {
             // Never mirror under a stale-keyed flight lock: a trigger resolving the upgraded
             // identity keys a DIFFERENT lock and could run concurrently over the same cursor.
+            // A follow-up that coalesced into the OLD-key marker while this runner held the
+            // stale lock is unreachable for fresh-keyed triggers — carry it forward (the
+            // automatic path's `Rekeyed` carry, manual flavor) before releasing.
             drop(db);
+            if let Some(stranded) = pending.lock()?.take()? {
+                preserve_for_fresh_key(config, stranded);
+            }
             drop(flight);
             continue;
         }
@@ -481,6 +501,10 @@ mod tests {
             auth: None,
             tags: Vec::new(),
         }];
+        // The store must exist: the non-creating indexed gate defers before the coalesce path
+        // otherwise (and no real flight can hold the lock without one).
+        config.allow_empty = true;
+        IndexDatabase::rebuild(&config).unwrap();
 
         let lock_repo = locks::write_lock_repo_id(&config);
         let held =
@@ -552,6 +576,33 @@ mod tests {
         assert!(full_walk_ms.is_some());
         let lock_repo = locks::write_lock_repo_id(&config);
         assert!(!locks::papertrail_pending_path(&config.database, &lock_repo).exists());
+    }
+
+    /// The non-creating gate: a trigger firing before `rag-rat index` ever created the store
+    /// must defer WITHOUT leaving an empty database file behind — opening a missing database
+    /// creates the file before the schema check refuses, and that artifact defeats every later
+    /// `database.exists()` "build the index first" hint. The manual command refuses the same
+    /// way.
+    #[test]
+    fn triggers_before_any_store_exists_defer_without_creating_the_database() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.trackers = vec![crate::config::TrackerConfig {
+            provider: crate::config::Tracker::Github,
+            project: Some("o/r".to_string()),
+            remote: "origin".to_string(),
+            base_url: Some("http://127.0.0.1:9".to_string()),
+            auth: None,
+            tags: Vec::new(),
+        }];
+
+        let outcome = run(&config, AutosyncRequest::Incremental).unwrap();
+        assert!(matches!(outcome, AutosyncOutcome::NotIndexed), "{outcome:?}");
+        assert!(!config.database.exists(), "a deferred trigger must not create the database");
+
+        let error = run_manual(&config, true, || {}).unwrap_err().to_string();
+        assert!(error.contains("no index at this path yet"), "{error}");
+        assert!(!config.database.exists(), "a refused manual sync must not create the database");
     }
 
     /// A shared database can hold a repo that was REGISTERED (read-only opens do that) but
