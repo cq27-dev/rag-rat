@@ -446,11 +446,19 @@ impl IndexDatabase {
         )?;
         if include_memories {
             let conn = self.storage.connection();
-            chunk.memories = crate::query::memory::memories_for_chunk(conn, chunk_id, 20)?;
             // Drive-by chunk attachments honor `[memory] surface`: under `Summary` each memory's
             // body is deferred to `memory show`, leaving the summary + verdict marker
-            // (title-only fallback).
-            crate::query::memory::apply_memory_surface(conn, &mut chunk.memories, surface)?;
+            // (title-only fallback). #582: the Summary hydration runs a RANKED chunk_fts query —
+            // heal-and-retry.
+            chunk.memories = crate::index::retry_once_on_fts_corruption(
+                || {
+                    let mut memories =
+                        crate::query::memory::memories_for_chunk(conn, chunk_id, 20)?;
+                    crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                    Ok(memories)
+                },
+                || self.heal_corrupt_fts(),
+            )?;
         }
         Ok(Some(chunk))
     }
