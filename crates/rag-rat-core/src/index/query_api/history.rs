@@ -80,7 +80,19 @@ impl IndexDatabase {
         limit: u32,
     ) -> anyhow::Result<Vec<QueryCommitHit>> {
         let current_hits = self.search(query, limit, true)?;
-        git_history::commits_touching_query(self.storage.connection(), query, limit, &current_hits)
+        // #582: an INDEPENDENT ranked commit_fts path — it calls git_history::commit_search
+        // internally, not the wrapped commit_search above, so it needs its own heal-and-retry.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                git_history::commits_touching_query(
+                    self.storage.connection(),
+                    query,
+                    limit,
+                    &current_hits,
+                )
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn git_blame_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<ChunkBlameSummary>> {

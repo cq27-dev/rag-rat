@@ -257,13 +257,11 @@ impl IndexDatabase {
         // Same staged-rows refusal as `heal_corrupt_fts` — the memory/papertrail heals below are
         // unaffected (their sources are always complete).
         if (chunk_corrupt || commit_corrupt) && !self.staged_files_generation_exists()? {
+            // The shared rebuild repopulates BOTH mirrors regardless of which probe failed —
+            // report both, so the heal report states what was actually rebuilt.
             self.rebuild_fts()?;
-            if chunk_corrupt {
-                healed.push("chunk_fts".to_string());
-            }
-            if commit_corrupt {
-                healed.push("commit_fts".to_string());
-            }
+            healed.push("chunk_fts".to_string());
+            healed.push("commit_fts".to_string());
         }
         if memory_corrupt {
             crate::query::memory::heal_repo_memory_fts(conn)?;
