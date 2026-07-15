@@ -52,8 +52,25 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # --no-default-features = hash-only build: no ONNX/model downloads, fast and network-free.
-      # The full feature set is compile-checked by the build-full job below.
+      # This lints the cfg(not(feature = ...)) branches; the feature-gated code is linted by the
+      # clippy-all-features job below.
       - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+
+  clippy-all-features:
+    name: clippy (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The all-features graph compiles ort/fastembed, which downloads the ONNX runtime; force
+      # ort-sys to re-emit its link metadata for the current cache location (matches build-full).
+      - run: cargo clean -p ort-sys
+      # Lints fastembed, model2vec, and eval — the feature-gated code the --no-default-features
+      # clippy job never compiles.
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     name: test
