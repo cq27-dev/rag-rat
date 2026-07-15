@@ -2,7 +2,7 @@
 //! selection, and GitHub payload mapping live here; mirror policy stays in `mirror`.
 
 use reqwest::Url;
-use reqwest::header::{ETAG, IF_NONE_MATCH, LINK};
+use reqwest::header::{ETAG, IF_NONE_MATCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -490,14 +490,6 @@ impl PapertrailClient for GitHubClient {
     }
 }
 
-fn validate_positive_id(value: &Value, field: &str, resource: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        value[field].as_u64().is_some_and(|id| id > 0),
-        "{resource} has no valid {field}"
-    );
-    Ok(())
-}
-
 fn github_headers() -> Vec<(&'static str, &'static str)> {
     vec![("accept", ACCEPT), ("x-github-api-version", API_VERSION)]
 }
@@ -525,11 +517,7 @@ fn with_per_page(url: String) -> String {
 }
 
 fn ensure_success(status: u16, body: &str) -> anyhow::Result<()> {
-    if status == 404 {
-        return Err(PapertrailClientError::ItemNotFound.into());
-    }
-    anyhow::ensure!((200..300).contains(&status), "GitHub HTTP {status}: {body}");
-    Ok(())
+    ensure_provider_success("GitHub", status, body)
 }
 
 fn search_items(value: &Value) -> anyhow::Result<&[Value]> {
@@ -563,15 +551,6 @@ fn safe_search_boundary(left: Option<String>, right: Option<String>) -> Option<S
         (Some(left), Some(right)) => Some(left.max(right)),
         (left, right) => left.or(right),
     }
-}
-
-fn next_link(headers: &reqwest::header::HeaderMap) -> anyhow::Result<Option<String>> {
-    let Some(link) = headers.get(LINK) else { return Ok(None) };
-    let link = link.to_str()?;
-    Ok(link.split(',').find_map(|part| {
-        let (url, rel) = part.trim().split_once(';')?;
-        rel.trim().eq(r#"rel="next""#).then(|| url.trim().trim_matches(['<', '>']).to_string())
-    }))
 }
 
 #[cfg(test)]

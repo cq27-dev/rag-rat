@@ -17,7 +17,9 @@ pub(crate) async fn sync_mirror(
     let mut jobs = Vec::new();
     for binding in &ctx.trackers {
         record_attempt(conn, binding, now_ms())?;
-        if binding.provider != Tracker::Github {
+        // One source of truth for native providers: the same capability the status surface and
+        // the scheduled filter report.
+        if tracker_synchronization(binding) != TrackerSynchronization::Native {
             errors.push(binding_error(
                 binding,
                 "provider_client_pending",
@@ -114,8 +116,118 @@ fn scheduled_walk_depth(decision: ScheduleDecision, request: AutosyncRequest) ->
 /// walk depth decided. Skipped and provider-client-pending bindings never become jobs.
 struct BindingJob<'a> {
     binding: &'a ResolvedTracker,
-    client: GitHubClient,
+    client: ProviderClient,
     full: bool,
+}
+
+/// The native client for one binding, dispatched by provider. An enum rather than a trait object
+/// because [`PapertrailClient`]'s `async fn` methods are not dyn-compatible; each arm delegates.
+enum ProviderClient {
+    Github(GitHubClient),
+    Gitlab(GitLabClient),
+}
+
+impl ProviderClient {
+    fn new(
+        binding: &ResolvedTracker,
+        registry: &transport::GovernorRegistry,
+        options: transport::TransportOptions,
+    ) -> anyhow::Result<Self> {
+        match binding.provider {
+            Tracker::Github => GitHubClient::new(binding, registry, options).map(Self::Github),
+            Tracker::Gitlab => GitLabClient::new(binding, registry, options).map(Self::Gitlab),
+            other => anyhow::bail!("no native papertrail client for {} yet", other.as_db_str()),
+        }
+    }
+}
+
+impl PapertrailClient for ProviderClient {
+    async fn item(
+        &self,
+        project: &str,
+        kind: ItemKind,
+        key: &str,
+    ) -> anyhow::Result<PapertrailItem> {
+        match self {
+            Self::Github(client) => client.item(project, kind, key).await,
+            Self::Gitlab(client) => client.item(project, kind, key).await,
+        }
+    }
+
+    async fn item_comments(
+        &self,
+        project: &str,
+        kind: ItemKind,
+        key: &str,
+    ) -> anyhow::Result<Vec<PapertrailComment>> {
+        match self {
+            Self::Github(client) => client.item_comments(project, kind, key).await,
+            Self::Gitlab(client) => client.item_comments(project, kind, key).await,
+        }
+    }
+
+    fn item_comment_streams(&self, kind: ItemKind) -> &'static [&'static str] {
+        match self {
+            Self::Github(client) => client.item_comment_streams(kind),
+            Self::Gitlab(client) => client.item_comment_streams(kind),
+        }
+    }
+
+    async fn item_comments_page(
+        &self,
+        project: &str,
+        kind: ItemKind,
+        key: &str,
+        cursor: &PageCursor,
+    ) -> anyhow::Result<CommentsPage> {
+        match self {
+            Self::Github(client) => client.item_comments_page(project, kind, key, cursor).await,
+            Self::Gitlab(client) => client.item_comments_page(project, kind, key, cursor).await,
+        }
+    }
+
+    async fn enrich_item(&self, item: &mut PapertrailItem) -> anyhow::Result<()> {
+        match self {
+            Self::Github(client) => client.enrich_item(item).await,
+            Self::Gitlab(client) => client.enrich_item(item).await,
+        }
+    }
+
+    async fn items_page(&self, project: &str, cursor: &PageCursor) -> anyhow::Result<ItemsPage> {
+        match self {
+            Self::Github(client) => client.items_page(project, cursor).await,
+            Self::Gitlab(client) => client.items_page(project, cursor).await,
+        }
+    }
+
+    fn comment_streams(&self) -> &'static [&'static str] {
+        match self {
+            Self::Github(client) => client.comment_streams(),
+            Self::Gitlab(client) => client.comment_streams(),
+        }
+    }
+
+    async fn comments_page(
+        &self,
+        project: &str,
+        cursor: &PageCursor,
+    ) -> anyhow::Result<CommentsPage> {
+        match self {
+            Self::Github(client) => client.comments_page(project, cursor).await,
+            Self::Gitlab(client) => client.comments_page(project, cursor).await,
+        }
+    }
+
+    async fn freshness_probe(
+        &self,
+        project: &str,
+        probe: &FreshnessProbe,
+    ) -> anyhow::Result<FreshnessResult> {
+        match self {
+            Self::Github(client) => client.freshness_probe(project, probe).await,
+            Self::Gitlab(client) => client.freshness_probe(project, probe).await,
+        }
+    }
 }
 
 /// What one dispatched binding produced: a resumable report, or the error entry to surface.
@@ -135,7 +247,7 @@ fn prepare_binding_job<'a>(
     full: bool,
     errors: &mut Vec<PapertrailSyncError>,
 ) -> anyhow::Result<Option<BindingJob<'a>>> {
-    match GitHubClient::new(binding, registry, options.clone()) {
+    match ProviderClient::new(binding, registry, options.clone()) {
         Ok(client) => Ok(Some(BindingJob { binding, client, full })),
         Err(error) => {
             let persisted_detail = authentication_failure_detail(binding, &error);
@@ -485,7 +597,7 @@ fn discovered_ref_uses_legacy_github_client(
 
 fn tracker_synchronization(binding: &ResolvedTracker) -> TrackerSynchronization {
     match binding.provider {
-        Tracker::Github => TrackerSynchronization::Native,
+        Tracker::Github | Tracker::Gitlab => TrackerSynchronization::Native,
         _ => TrackerSynchronization::ProviderClientPending,
     }
 }
@@ -916,7 +1028,7 @@ mod capability_tests {
         };
         let ctx = PapertrailContext {
             trackers: vec![
-                tracker(Tracker::Gitlab, "group/repo", Some("https://gitlab.com".to_string())),
+                tracker(Tracker::Bitbucket, "workspace/repo", None),
                 tracker(Tracker::Github, "bad/origin", Some("not an absolute URL".to_string())),
                 tracker(Tracker::Github, "fails/http", Some(failed_url)),
             ],
@@ -933,8 +1045,12 @@ mod capability_tests {
             vec!["provider_client_pending", "authentication_or_transport", "failed"]
         );
         assert_eq!(failed_handle.join().unwrap().len(), 1);
-        let pending =
-            report.status.bindings.iter().find(|binding| binding.project == "group/repo").unwrap();
+        let pending = report
+            .status
+            .bindings
+            .iter()
+            .find(|binding| binding.project == "workspace/repo")
+            .unwrap();
         assert!(!pending.failed);
         assert!(!pending.overdue);
         assert_eq!(pending.error_class, None);
@@ -1149,9 +1265,9 @@ mod scheduled_tests {
     fn provider_client_pending_bindings_are_silently_filtered_from_scheduled_runs() {
         let conn = open_schema();
         let binding = ResolvedTracker {
-            provider: Tracker::Gitlab,
-            project: "group/repo".to_string(),
-            base_url: Some("https://gitlab.com".to_string()),
+            provider: Tracker::Bitbucket,
+            project: "workspace/repo".to_string(),
+            base_url: None,
             auth: None,
             authentication: TrackerAuthentication::AuthMissing,
             tags: Vec::new(),

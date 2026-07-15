@@ -209,10 +209,7 @@ fn production_discovery_persists_refs_for_every_configured_tracker() {
         status.capabilities[0].authentication,
         papertrail::TrackerAuthentication::AuthConfigured
     );
-    assert_eq!(
-        status.capabilities[0].synchronization,
-        papertrail::TrackerSynchronization::ProviderClientPending
-    );
+    assert_eq!(status.capabilities[0].synchronization, papertrail::TrackerSynchronization::Native);
     assert_eq!(
         status.capabilities[1].authentication,
         papertrail::TrackerAuthentication::AuthMissing
