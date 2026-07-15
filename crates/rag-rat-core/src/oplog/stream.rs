@@ -108,15 +108,23 @@ pub(crate) struct StreamSpec {
     pub(crate) node_overrides: Vec<NodeOverride>,
 }
 
-/// The default full-visibility stream a repo's own authored log lives on: one repo, no kind or
-/// relation filtering, no overrides. The only stream shape mintable this increment.
-pub(crate) fn owner_stream(repo_id: &str) -> anyhow::Result<StreamId> {
-    derive(&StreamSpec {
+/// The full-visibility policy a repo's own authored log lives on: one repo, no kind or relation
+/// filtering, no overrides. The `/1` [`owner_stream`] and the `/2` [`owner_stream_v2`] derivations
+/// share this ONE literal so the two owner-stream identities can never drift in their visibility
+/// rule — they differ only in the domain tag (and the owner prefix `/2` adds).
+fn owner_stream_spec(repo_id: &str) -> StreamSpec {
+    StreamSpec {
         repo_set: vec![repo_id.to_string()],
         kind_allow_list: None,
         relation_policy: None,
         node_overrides: Vec::new(),
-    })
+    }
+}
+
+/// The default full-visibility stream a repo's own authored log lives on: one repo, no kind or
+/// relation filtering, no overrides. The only stream shape mintable this increment.
+pub(crate) fn owner_stream(repo_id: &str) -> anyhow::Result<StreamId> {
+    derive(&owner_stream_spec(repo_id))
 }
 
 /// Derive the immutable `stream_id` for a visibility policy. Canonicalizes the spec (sort + dedup)
@@ -196,6 +204,15 @@ pub(crate) struct StreamSpecV2 {
     /// The visibility policy (repos, kind/relation filters, per-node overrides), same shape as
     /// `/1`.
     pub(crate) policy: StreamSpec,
+}
+
+/// The owner-bound (`/2`) counterpart of [`owner_stream`]: the same full-visibility policy, wrapped
+/// with the owning `account_id` so the identity self-certifies its owner (§14). Reusing
+/// [`owner_stream_spec`] with the `/1` path keeps the two owner-stream identities byte-identical in
+/// their visibility rule. C3.4 authors a `StreamOwn` over the returned spec to publish ownership;
+/// nothing switches the live authoring path here.
+pub(crate) fn owner_stream_v2(repo_id: &str, account_id: AccountId) -> StreamSpecV2 {
+    StreamSpecV2 { owner_account_id: account_id, policy: owner_stream_spec(repo_id) }
 }
 
 /// Derive the owner-bound `stream_id` (`/2`, §14): `sha256(cbor(["rag-rat/stream/2",
@@ -498,6 +515,26 @@ mod tests {
             hex(&id.to_bytes()),
             "d998110a767b415646b18c09745d6586b2ae6afdeb3144fe5f0907d2761557e3",
             "stream/2 golden",
+        );
+    }
+
+    #[test]
+    fn owner_stream_v2_golden_pins_the_default_owned_stream() {
+        // The `/2` owner stream `ensure_owned_stream_v2_in_tx` authors a `StreamOwn` over is a
+        // frozen primitive (its id lands in signed `/3` bodies): a canonical-rule drift must break
+        // this and force a deliberate `rag-rat/stream/2` bump. Also proves the constructor reuses
+        // the full-visibility policy — same bytes as the `/1` owner stream plus the owner prefix.
+        let spec = owner_stream_v2("repo-a", AccountId::from_bytes([0x11; 32]));
+        assert_eq!(
+            spec.policy,
+            owner_stream_spec("repo-a"),
+            "owner_stream_v2 wraps the shared /1 owner policy verbatim",
+        );
+        let id = derive_v2(&spec).unwrap();
+        assert_eq!(
+            hex(&id.to_bytes()),
+            "d1fee7eec725d5004c7f3827788cada29545315484ccf073663536a3172f5223",
+            "owner_stream_v2 golden",
         );
     }
 

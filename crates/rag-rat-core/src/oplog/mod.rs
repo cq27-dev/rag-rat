@@ -57,6 +57,14 @@ mod stream;
     reason = "C3.4b-i content-author seam is frozen before its caller lands"
 )]
 pub(crate) use account::author_content_batch_in_tx;
+// C3.4b-ii's in-tx `/2`-ownership ensure seam (#676): the idempotent
+// ensure-the-repo's-`/2`-stream-is-owned primitive #664 calls before authoring owner-bound
+// `/3` content. Frozen until that caller lands.
+#[expect(
+    unused_imports,
+    reason = "C3.4b-ii /2-ownership ensure seam is frozen before its caller lands"
+)]
+pub(crate) use account::ensure_owned_stream_v2_in_tx;
 #[expect(
     unused_imports,
     reason = "C3.4a local account mint is frozen before its caller lands"

@@ -15,6 +15,7 @@
 //! - [`id`]: [`AccountId`] + the §4 genesis commitment.
 //! - [`limits`]: §18a protocol-validity constants + the account-layer domain strings.
 //! - [`envelope`]: the 13-part signed account-entry envelope (§6).
+mod authoring;
 mod bootstrap;
 mod candidate;
 mod content;
@@ -27,6 +28,14 @@ mod ops;
 mod registers;
 mod storage;
 
+// The in-tx `/2`-ownership ensure seam (C3.4b-ii, #676) — the idempotent
+// ensure-the-repo's-owner-stream-is-owned primitive #664 calls before authoring `/3` content.
+// Frozen until that caller lands.
+#[allow(
+    unused_imports,
+    reason = "C3.4b-ii /2-ownership ensure seam is frozen before its caller lands"
+)]
+pub(crate) use authoring::ensure_owned_stream_v2_in_tx;
 pub(crate) use bootstrap::local_account;
 // The in-tx `/3` content-author seam (C3.4b-i, #663) — frozen until #664 retargets the live
 // path.
