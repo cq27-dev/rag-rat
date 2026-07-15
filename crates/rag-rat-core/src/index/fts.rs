@@ -365,19 +365,27 @@ fn docsize_shadow_is_corrupt(
     table: &str,
     index_rows_sql: Option<&str>,
 ) -> anyhow::Result<bool> {
+    // ANY read in this scan can itself land on a corrupt _docsize page (count, prepare, step,
+    // column get) — that IS a positive probe, not a probe failure: mapping it to an error would
+    // make the heal fail instead of rebuilding the mirror.
+    match docsize_shadow_scan(conn, table, index_rows_sql) {
+        Err(err) if error_is_fts_corruption(&err) => Ok(true),
+        other => other,
+    }
+}
+
+fn docsize_shadow_scan(
+    conn: &rusqlite::Connection,
+    table: &str,
+    index_rows_sql: Option<&str>,
+) -> anyhow::Result<bool> {
     let columns: usize =
         conn.query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}')"), [], |row| {
             row.get::<_, i64>(0).map(|n| n as usize)
         })?;
     let count_sql =
         index_rows_sql.map_or_else(|| format!("SELECT count(*) FROM {table}"), String::from);
-    let index_rows: i64 = match conn.query_row(&count_sql, [], |row| row.get(0)) {
-        Ok(rows) => rows,
-        Err(err) => {
-            let err: anyhow::Error = err.into();
-            return if error_is_fts_corruption(&err) { Ok(true) } else { Err(err) };
-        },
-    };
+    let index_rows: i64 = conn.query_row(&count_sql, [], |row| row.get(0))?;
     let shadow_rows: i64 =
         conn.query_row(&format!("SELECT count(*) FROM {table}_docsize"), [], |row| row.get(0))?;
     if index_rows != shadow_rows {
