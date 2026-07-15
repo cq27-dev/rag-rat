@@ -513,11 +513,25 @@ impl PapertrailClient for GitLabClient {
             }
             ensure_success(response.status, &response.body)?;
             let value: Value = serde_json::from_str(&response.body)?;
-            let leg_latest = value
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(|item| item["updated_at"].as_str())
-                .map(str::to_string);
+            // Malformed 2xx payloads must FAIL, not read as quiet: `not_modified` derives from
+            // `latest`, so a silently-None probe would skip the delta scan indefinitely.
+            let items = value.as_array().ok_or_else(|| {
+                anyhow::anyhow!("GitLab {} probe response is not an array", leg.path_segment())
+            })?;
+            let leg_latest = match items.first() {
+                None => None,
+                Some(item) => Some(
+                    item["updated_at"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "GitLab {} probe item has no valid updated_at",
+                                leg.path_segment()
+                            )
+                        })?
+                        .to_string(),
+                ),
+            };
             latest = max_timestamp(latest.take(), leg_latest);
         }
         if unavailable == 2 {
@@ -1247,6 +1261,26 @@ mod tests {
         let heads = handle.join().unwrap();
         assert!(heads[0].contains("per_page=1"), "{}", heads[0]);
         assert!(heads[0].contains("sort=desc"), "{}", heads[0]);
+    }
+
+    /// A malformed 2xx probe payload must surface as an error: `not_modified` derives from
+    /// `latest`, so silence here would skip the delta scan on every poll indefinitely.
+    #[test]
+    fn a_malformed_probe_payload_fails_instead_of_reading_as_quiet() {
+        let (base, _handle) = spawn_script_stub(vec![StubResponse::ok("{}")]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+        let error =
+            block_on(client.freshness_probe("g/s/r", &FreshnessProbe::default())).unwrap_err();
+        assert!(error.to_string().contains("probe response is not an array"), "{error:#}");
+
+        let (base, _handle) =
+            spawn_script_stub(vec![StubResponse::ok(r#"[{"iid":1,"state":"opened"}]"#)]);
+        let registry = GovernorRegistry::default();
+        let stampless = self::tests::client(base, &registry);
+        let error =
+            block_on(stampless.freshness_probe("g/s/r", &FreshnessProbe::default())).unwrap_err();
+        assert!(error.to_string().contains("no valid updated_at"), "{error:#}");
     }
 
     #[test]
