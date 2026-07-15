@@ -1072,11 +1072,23 @@ fn store_repo_comments(
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let tx = conn.unchecked_transaction()?;
     for comment in comments {
+        // Resolve the parent item, PREFERRING the kind the provider put on the comment: under
+        // namespaced numbering (GitLab) issue #N and change request !N coexist on one key, and
+        // a key-only lookup would hitch the comment to whichever twin the scan returns first —
+        // then rewrite the correctly-kinded row through the kind-less comment conflict key. The
+        // fallback to the other kind serves providers whose feed cannot name the kind (GitHub's
+        // issue-comment stream spans issues and pull requests), where the key alone IS unique.
         let kind = tx
             .query_row(
                 "SELECT item_kind FROM papertrail_items WHERE repo_id=?1 AND tracker=?2 AND \
-                 project=?3 AND item_key=?4 LIMIT 1",
-                params![repo_id, binding.provider.as_db_str(), binding.project, comment.item_key],
+                 project=?3 AND item_key=?4 ORDER BY (item_kind = ?5) DESC LIMIT 1",
+                params![
+                    repo_id,
+                    binding.provider.as_db_str(),
+                    binding.project,
+                    comment.item_key,
+                    comment.item_kind.as_db_str()
+                ],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -1401,6 +1413,99 @@ mod tests {
         let mut stmt =
             conn.prepare("SELECT item_key FROM papertrail_items ORDER BY item_key").unwrap();
         stmt.query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect()
+    }
+
+    /// Namespaced numbering (GitLab): issue #N and change request !N share a key. The repo
+    /// comment lane must resolve the parent by the comment's OWN kind first — a key-only lookup
+    /// hitches the comment to whichever twin the scan returns first and then rewrites the
+    /// correctly-kinded row through the kind-less comment conflict key.
+    #[test]
+    fn repo_comments_resolve_namespaced_twins_by_their_own_kind() {
+        let conn = db();
+        let mut binding = binding(&[]);
+        binding.provider = Tracker::Gitlab;
+        binding.project = "g/r".to_string();
+        let mut issue = item("1", "2026-01-02T00:00:00Z", "issue one", &[]);
+        issue.project = "g/r".to_string();
+        let mut change = item("1", "2026-01-03T00:00:00Z", "mr one", &[]);
+        change.project = "g/r".to_string();
+        change.item_kind = ItemKind::ChangeRequest;
+        store_item(&conn, binding.provider, &issue).unwrap();
+        store_item(&conn, binding.provider, &change).unwrap();
+
+        let mut report = MirrorBindingReport {
+            tracker: binding.provider,
+            project: binding.project.clone(),
+            stored_items: 0,
+            stored_comments: 0,
+            pruned_items: 0,
+            paused_until_ms: None,
+            pause_reason: None,
+            completed_full_walk: false,
+            probe_not_modified: false,
+        };
+        let mut issue_note = comment("1", "note:1", "2026-01-04T00:00:00Z");
+        issue_note.project = "g/r".to_string();
+        let mut change_note = comment("1", "note:2", "2026-01-04T00:00:00Z");
+        change_note.project = "g/r".to_string();
+        change_note.item_kind = ItemKind::ChangeRequest;
+        store_repo_comments(&conn, &binding, &[issue_note, change_note], &mut report).unwrap();
+
+        let kinds: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT comment_id, item_kind FROM papertrail_comments ORDER BY comment_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(kinds, vec![
+            ("note:1".to_string(), "issue".to_string()),
+            ("note:2".to_string(), "change_request".to_string()),
+        ]);
+    }
+
+    /// The fallback half of the twin resolution: a provider whose feed cannot name the kind
+    /// (GitHub's issue-comment stream spans issues and pull requests) still resolves through the
+    /// key alone when no item of the claimed kind exists.
+    #[test]
+    fn repo_comments_fall_back_to_the_key_when_the_claimed_kind_has_no_item() {
+        let conn = db();
+        let binding = binding(&[]);
+        let mut pull = item("7", "2026-01-02T00:00:00Z", "pull seven", &[]);
+        pull.item_kind = ItemKind::ChangeRequest;
+        store_item(&conn, binding.provider, &pull).unwrap();
+
+        let mut report = MirrorBindingReport {
+            tracker: binding.provider,
+            project: binding.project.clone(),
+            stored_items: 0,
+            stored_comments: 0,
+            pruned_items: 0,
+            paused_until_ms: None,
+            pause_reason: None,
+            completed_full_walk: false,
+            probe_not_modified: false,
+        };
+        // The GitHub feed guesses Issue; only the pull exists.
+        store_repo_comments(
+            &conn,
+            &binding,
+            &[comment("7", "c1", "2026-01-04T00:00:00Z")],
+            &mut report,
+        )
+        .unwrap();
+        let kind: String = conn
+            .query_row(
+                "SELECT item_kind FROM papertrail_comments WHERE comment_id='c1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "change_request");
     }
 
     #[test]
