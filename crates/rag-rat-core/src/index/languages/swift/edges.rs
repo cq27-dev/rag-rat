@@ -818,6 +818,14 @@ fn swift_operator_stripped_path(target: Node<'_>) -> Option<Vec<Node<'_>>> {
         // `base + foo().bar` bottoms out here with a dynamic operand — not a qualifiable path.
         return swift_callable_is_static_path(operand).then(|| syntax::identifier_nodes(operand));
     }
+    // A force-unwrap is a transparent receiver wrapper. tree-sitter left-associates the operator
+    // into it — `base + obj!.method()` parses as `navigation(postfix(additive(base + obj), !),
+    // method)` — so descend into the unwrapped target to reach the operator. Matches the
+    // `swift_callable_is_static_path` handling so the operator and plain forms agree.
+    if swift_postfix_is_force_unwrap(target) {
+        let inner = target.child_by_field_name("target")?;
+        return crate::index::grow_stack(|| swift_operator_stripped_path(inner));
+    }
     if target.kind() == "navigation_expression" {
         let mut cursor = target.walk();
         let children = target.named_children(&mut cursor).collect::<Vec<_>>();
@@ -882,6 +890,15 @@ fn swift_normalize_call_path(
     Some((identifiers, callee_range))
 }
 
+/// A force-unwrap postfix (`obj!`) — as opposed to a custom postfix operator (`obj++`). Only the
+/// force-unwrap `!` is a NAMED `bang` node under `operation`; custom postfix tokens are anonymous.
+/// Keying on `bang` is what lets force-unwrap be treated as a transparent receiver wrapper without
+/// swallowing a genuine postfix-operator value expression.
+fn swift_postfix_is_force_unwrap(node: Node<'_>) -> bool {
+    node.kind() == "postfix_expression"
+        && node.child_by_field_name("operation").is_some_and(|op| op.kind() == "bang")
+}
+
 fn swift_callable_is_static_path(root: Node<'_>) -> bool {
     let mut stack = vec![root];
     let mut children = Vec::new();
@@ -890,6 +907,19 @@ fn swift_callable_is_static_path(root: Node<'_>) -> bool {
             "identifier" | "simple_identifier" | "type_identifier" | "type_arguments"
             | "self_expression" | "super_expression" => continue,
             "user_type" | "navigation_expression" | "navigation_suffix" => {},
+            // A force-unwrap is a transparent receiver wrapper: `obj!.method` names the same path
+            // as `obj.method`, so descend into the unwrapped target ONLY (its `bang`
+            // child is not a path segment). Optional chaining (`obj?.method`) needs
+            // nothing here — the `?` is an anonymous token directly under
+            // `navigation_expression`, already handled. A NON force-unwrap postfix
+            // (`obj++`) is a value expression, not a nameable path, so the
+            // whitelist rejects it as before.
+            "postfix_expression" if swift_postfix_is_force_unwrap(node) => {
+                if let Some(target) = node.child_by_field_name("target") {
+                    stack.push(target);
+                }
+                continue;
+            },
             _ => return false,
         }
         let mut cursor = node.walk();
@@ -1877,6 +1907,50 @@ super.finish()
         assert!(
             !has(&control, EdgeKind::CallsName, "render"),
             "control: the baseline also drops the outer dynamic-receiver call: {control:#?}"
+        );
+    }
+    /// A force-unwrapped RECEIVER (`obj!.method()`) is recovered like an optional-chained one
+    /// (`obj?.method()`) — Swift's `X!` names the same receiver path as `X`, so the two must agree.
+    /// Force-unwrap used to be dropped everywhere (its `postfix_expression` failed the static-path
+    /// check) while optional-chain resolved — an asymmetry this closes (#655). A CUSTOM postfix
+    /// (`obj++`) stays dropped: it is a value expression, not a nameable path.
+    #[test]
+    fn force_unwrapped_receiver_calls_are_recovered_like_optional_chained() {
+        let force = edges("func f() { obj!.method() }");
+        assert!(has(&force, EdgeKind::CallsName, "method"), "force-unwrap receiver: {force:#?}");
+        // Plain force-unwrap and optional-chain now AGREE — same callee, same receiver hint.
+        let optional = edges("func f() { obj?.method() }");
+        let hint = |es: &[EdgeCandidate]| {
+            es.iter()
+                .find(|e| e.edge_kind == EdgeKind::CallsName && e.to_name == "method")
+                .and_then(|e| e.receiver_hint.clone())
+        };
+        assert_eq!(hint(&force), Some("obj".to_string()), "force-unwrap receiver hint: {force:#?}");
+        assert_eq!(hint(&force), hint(&optional), "force-unwrap must match optional-chain");
+
+        // A custom postfix operator is a value expression, not a receiver path — still dropped.
+        let custom = edges("func f() { obj++.method() }");
+        assert!(
+            !has(&custom, EdgeKind::CallsName, "method"),
+            "a custom postfix receiver is not a nameable path: {custom:#?}"
+        );
+
+        // Force-unwrap `!` must NOT be emitted as an operator call (the existing suppression
+        // holds).
+        assert!(
+            !has(&force, EdgeKind::UsesOperator, "!") && !has(&force, EdgeKind::CallsName, "!"),
+            "force-unwrap `!` is not a callable operator: {force:#?}"
+        );
+
+        // Multi-segment and chained force-unwraps, and force-unwrap on an operator RHS.
+        let qualified = edges("func f() { self.cache!.render() }");
+        assert!(has(&qualified, EdgeKind::CallsName, "render"), "qualified: {qualified:#?}");
+        let chained = edges("func f() { a!.b!.c() }");
+        assert!(has(&chained, EdgeKind::CallsName, "c"), "chained force-unwraps: {chained:#?}");
+        let on_operator = edges("func f() -> Int { return total + obj!.value() }");
+        assert!(
+            has(&on_operator, EdgeKind::CallsName, "value"),
+            "force-unwrap on operator RHS: {on_operator:#?}"
         );
     }
 }
