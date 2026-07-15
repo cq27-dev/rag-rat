@@ -284,7 +284,7 @@ impl PapertrailClient for GitLabClient {
             page_token: Some(page_token),
             ..PageCursor::default()
         });
-        Ok(CommentsPage { comments, next })
+        Ok(CommentsPage { comments, next, frontier: None })
     }
 
     async fn items_page(&self, project: &str, cursor: &PageCursor) -> anyhow::Result<ItemsPage> {
@@ -413,6 +413,14 @@ impl PapertrailClient for GitLabClient {
         let events = value
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("GitLab events response is not an array"))?;
+        // The page watermark covers EVERY event on the page — including ones that map to no
+        // comment (commit/snippet notes) — so a page of only-skipped events still advances the
+        // stream instead of pinning it to the old date forever.
+        let frontier = events
+            .iter()
+            .filter_map(|event| event["created_at"].as_str())
+            .max()
+            .map(str::to_string);
         let mut comments = Vec::new();
         for event in events {
             // The feed is creation events for notes; each embeds the note's CURRENT state. The
@@ -457,7 +465,7 @@ impl PapertrailClient for GitLabClient {
             page_token: Some(page_token),
             ..PageCursor::default()
         });
-        Ok(CommentsPage { comments, next })
+        Ok(CommentsPage { comments, next, frontier })
     }
 
     async fn freshness_probe(
@@ -1166,6 +1174,26 @@ mod tests {
             ),
             "the day BEFORE the cursor's date keeps same-day events in scope: {}",
             heads[0]
+        );
+    }
+
+    /// Commit/snippet notes map to no comment; a page of only those must still carry the
+    /// events frontier so the mirror can advance instead of replaying the page forever.
+    #[test]
+    fn a_page_of_untracked_note_events_still_reports_its_frontier() {
+        let events = r#"[
+            {"target_type":"Note","created_at":"2026-01-14T00:00:00Z","note":{"id":50,"body":"commit words","system":false,"noteable_type":"Commit","author":{"username":"c"},"created_at":"2026-01-14T00:00:00Z"}},
+            {"target_type":"Note","created_at":"2026-01-15T00:00:00Z","note":{"id":51,"body":"snippet words","system":false,"noteable_type":"Snippet","author":{"username":"s"},"created_at":"2026-01-15T00:00:00Z"}}
+        ]"#;
+        let (base, _handle) = spawn_script_stub(vec![StubResponse::ok(events)]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+        let page = block_on(client.comments_page("g/s/r", &PageCursor::default())).unwrap();
+        assert!(page.comments.is_empty());
+        assert_eq!(
+            page.frontier.as_deref(),
+            Some("2026-01-15T00:00:00Z"),
+            "the frontier covers skipped events so the stream never pins"
         );
     }
 

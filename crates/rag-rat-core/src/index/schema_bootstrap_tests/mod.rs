@@ -657,7 +657,11 @@ impl papertrail::PapertrailClient for MockGitHubClient {
         project: &str,
         _cursor: &papertrail::PageCursor,
     ) -> anyhow::Result<papertrail::CommentsPage> {
-        Ok(papertrail::CommentsPage { comments: Self::mock_comments(project, "42"), next: None })
+        Ok(papertrail::CommentsPage {
+            comments: Self::mock_comments(project, "42"),
+            next: None,
+            frontier: None,
+        })
     }
 
     async fn freshness_probe(

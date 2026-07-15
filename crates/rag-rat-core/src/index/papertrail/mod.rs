@@ -258,6 +258,14 @@ pub struct CurrentSourceEvidence {
     pub symbol: Option<String>,
 }
 
+/// Whether a provider's item keys are unique across kinds. GitHub's shared issue/PR numbering
+/// is the exception (a key names at most one item, and its repo comment feed cannot always name
+/// the kind); namespaced providers (GitLab iids, Bitbucket, Jira) always name the kind on their
+/// comments, so a comment there must NEVER attach across namespaces.
+pub(crate) fn shared_item_numbering(tracker: Tracker) -> bool {
+    matches!(tracker, Tracker::Github)
+}
+
 /// Provider-neutral item kind. GitHub's shared issue/PR numbering is the exception, not the
 /// rule — GitLab issues and merge requests live in separate iid namespaces and Jira has no
 /// change requests at all — so the kind is part of an item's identity, never inferred.
@@ -382,6 +390,11 @@ pub struct ItemsPage {
 pub struct CommentsPage {
     pub comments: Vec<PapertrailComment>,
     pub next: Option<PageCursor>,
+    /// Provider-confirmed watermark for THIS page beyond the returned comments — set when the
+    /// provider's feed can contain entries that map to no comment (GitLab events on commit or
+    /// snippet notes). Without it, a first page of only-skipped entries returns no timestamps,
+    /// the stream's frontier cannot advance, and every scheduled sync replays the same pages.
+    pub frontier: Option<String>,
 }
 
 /// Provider outcomes that affect mirror control flow rather than representing a retryable
@@ -481,7 +494,11 @@ pub trait PapertrailClient {
         cursor: &PageCursor,
     ) -> anyhow::Result<CommentsPage> {
         anyhow::ensure!(cursor.page_token.is_none(), "legacy item comments cannot resume a page");
-        Ok(CommentsPage { comments: self.item_comments(project, kind, key).await?, next: None })
+        Ok(CommentsPage {
+            comments: self.item_comments(project, kind, key).await?,
+            next: None,
+            frontier: None,
+        })
     }
     /// Complete provider-specific item fields before the mirror starts the item's durable thread.
     /// The mirror invokes this one item at a time and checkpoints each completed item, so a

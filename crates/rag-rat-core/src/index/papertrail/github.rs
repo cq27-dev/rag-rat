@@ -235,7 +235,7 @@ impl PapertrailClient for GitHubClient {
             page_token: Some(page_token),
             ..PageCursor::default()
         });
-        Ok(CommentsPage { comments, next })
+        Ok(CommentsPage { comments, next, frontier: None })
     }
 
     async fn enrich_item(&self, item: &mut PapertrailItem) -> anyhow::Result<()> {
@@ -446,7 +446,7 @@ impl PapertrailClient for GitHubClient {
             page_token: Some(page_token),
             provider_state: None,
         });
-        Ok(CommentsPage { comments, next })
+        Ok(CommentsPage { comments, next, frontier: None })
     }
 
     async fn freshness_probe(
