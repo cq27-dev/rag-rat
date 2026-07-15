@@ -5,7 +5,7 @@
 //! re-clones of the same repo share one identity.
 //!
 //! A repo whose full history is present derives a `Portable` id (the same on every machine — the
-//! identity family sync can trust). A shallow clone whose history was CUT cannot reach its root, so
+//! identity peer sync can trust). A shallow clone whose history was CUT cannot reach its root, so
 //! it derives a deterministic-but-depth-dependent `LocalOnly` id from the shallow boundary instead
 //! of failing: indexing must not be blocked by a shallow checkout (CI fixtures, `--depth 1`
 //! clones). The portability class travels with the identity so the future sync layer can refuse to
@@ -22,13 +22,13 @@ use crate::index::schema::LEGACY_REPO_ID;
 /// `local:`-prefixed `[index] repo_id` is therefore refused — it would collide with that detection.
 pub const LOCAL_ONLY_ID_PREFIX: &str = "local:";
 
-/// Whether a repo's identity is portable across machines (safe for family sync) or only stable on
+/// Whether a repo's identity is portable across machines (safe for peer sync) or only stable on
 /// THIS machine's clone. Open-time resolution NEVER hard-rejects a shallow clone — it downgrades
 /// the class instead — so the hard "portable required" gate lives in the sync layer, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoIdentityClass {
     /// Machine-stable: derived from the repo's root commit, or an explicit `[index] repo_id` pin.
-    /// The same repo resolves to the same id on every machine, so family sync can replicate it.
+    /// The same repo resolves to the same id on every machine, so peer sync can replicate it.
     Portable,
     /// Deterministic on THIS clone but depth-dependent: a shallow clone whose history was cut, so
     /// the root commit is unreachable and the id is derived from the shallow BOUNDARY commits
@@ -47,7 +47,7 @@ pub struct RepoIdentity {
     pub repo_id: String,
     /// The working-tree directory name — cosmetic only, never an identity input.
     pub display_name: String,
-    /// Whether [`repo_id`](Self::repo_id) is portable across machines (family sync eligible) or
+    /// Whether [`repo_id`](Self::repo_id) is portable across machines (peer sync eligible) or
     /// only stable on this clone (a cut shallow clone). Never an identity input; a
     /// scoping-neutral tag.
     pub class: RepoIdentityClass,
@@ -151,13 +151,13 @@ pub fn resolve_repo_identity(
     let (repo_id, class, shallow_boundary) = derive_repo_id(root)?;
     if class == RepoIdentityClass::LocalOnly {
         // ONE warning per resolution, naming the future constraint and both remedies. The id is
-        // usable NOW (single-repo indexing on this machine); the warning is about family sync,
+        // usable NOW (single-repo indexing on this machine); the warning is about peer sync,
         // which will refuse a non-portable id.
         tracing::warn!(
             repo_id = %repo_id,
             root = %root.display(),
             "shallow clone: derived a machine-local repo identity because the root commit is \
-             unreachable (history is cut). Indexing proceeds, but family sync requires a portable \
+             unreachable (history is cut). Indexing proceeds, but peer sync requires a portable \
              identity — run `git fetch --unshallow` to derive the stable root-commit id, or pin \
              `[index] repo_id` in rag-rat.toml."
         );
