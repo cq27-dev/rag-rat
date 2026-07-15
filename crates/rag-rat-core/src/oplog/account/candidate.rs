@@ -87,10 +87,11 @@ pub(super) fn ancestry(target: &[u8; 32], cut: &Cut, view: &dyn HeaderView) -> A
             return Ancestry::OffBranch; // reached the chain origin without hitting the target
         };
         // If the predecessor is held, it must be the EXACTLY-preceding slot (`seq - 1`) — a chain
-        // is contiguous, so a link that skips slots (e.g. 5 → 3) is forged, not a real
-        // parent.
+        // is contiguous, so a link that skips slots (e.g. 5 → 3) is forged, not a real parent.
+        // `seq` is peer-supplied, so guard the `+ 1` against a `u64::MAX` header rather than panic
+        // on a checked build (the content-side walk uses the same `checked_add`).
         if let Some(prev_header) = view.header(&prev)
-            && prev_header.seq + 1 != header.seq
+            && prev_header.seq.checked_add(1) != Some(header.seq)
         {
             return Ancestry::OffBranch;
         }
@@ -282,6 +283,18 @@ mod tests {
         insert_chain_entry(&mut v3, [0x03; 32], 3, None);
         let skip = Cut::At { seq: 5, hash: [0x05; 32] };
         assert_eq!(ancestry(&[0x03; 32], &skip, &v3), Ancestry::OffBranch);
+    }
+
+    #[test]
+    fn a_peer_supplied_seq_at_the_u64_ceiling_cannot_panic_the_walk() {
+        // `seq` is peer-supplied, so a candidate can sit at `u64::MAX`. A watermark whose prev
+        // points at that entry is a non-contiguous (forged) link — it must be rejected as
+        // off-branch, not overflow `seq + 1` and panic the fold on a checked build.
+        let mut view = HashMap::new();
+        insert_chain_entry(&mut view, [0xff; 32], u64::MAX, None);
+        insert_chain_entry(&mut view, [0xf0; 32], 0, Some([0xff; 32]));
+        let cut = Cut::At { seq: 0, hash: [0xf0; 32] };
+        assert_eq!(ancestry(&[0xff; 32], &cut, &view), Ancestry::OffBranch);
     }
 
     #[test]
