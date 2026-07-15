@@ -191,12 +191,11 @@ pub(crate) fn rebuild_fts(conn: &Connection) -> rusqlite::Result<()> {
     // BEGINs, so the fence only wraps autocommit callers (the corruption heals hold their own).
     if conn.is_autocommit() {
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = rebuild_fts_inner(conn);
-        match &result {
-            Ok(()) => conn.execute_batch("COMMIT")?,
-            Err(_) => {
-                let _ = conn.execute_batch("ROLLBACK");
-            },
+        let result = rebuild_fts_inner(conn).and_then(|()| conn.execute_batch("COMMIT"));
+        // A failed COMMIT does not always auto-rollback (e.g. SQLITE_BUSY keeps the transaction
+        // open) — never leave this long-lived connection stuck inside one.
+        if result.is_err() && !conn.is_autocommit() {
+            let _ = conn.execute_batch("ROLLBACK");
         }
         return result;
     }
