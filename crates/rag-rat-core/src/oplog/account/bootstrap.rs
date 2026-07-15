@@ -158,6 +158,27 @@ fn mint_local_account_in_tx(tx: &Transaction<'_>, now_ms: i64) -> anyhow::Result
     }
 }
 
+/// This store's local account resolved from the pointer: its `account_id` and the `genesis_hash`
+/// that names its self-authorizing genesis (the roster_ref an owner-authored `/3` entry cites).
+pub(super) struct LocalAccountRef {
+    pub(super) account_id: AccountId,
+    pub(super) genesis_hash: [u8; 32],
+}
+
+/// Resolve the already-minted local account from the pointer WITHOUT minting — the in-tx content
+/// author seam needs both the `account_id` (the `/3` `author_account_id`) and the genesis entry
+/// hash (its `roster_ref`), reading whatever snapshot `conn` is already in. `None` when no account
+/// has been minted yet: [`local_account`] (which self-transacts and cannot nest) is the mint path,
+/// so a caller authoring `/3` content inside its own IMMEDIATE txn must have minted the account
+/// first.
+pub(super) fn local_account_ref(conn: &Connection) -> anyhow::Result<Option<LocalAccountRef>> {
+    let Some(genesis_hash) = read_pointer_hash(conn)? else {
+        return Ok(None);
+    };
+    let account_id = resolve_account_for_genesis(conn, &genesis_hash)?;
+    Ok(Some(LocalAccountRef { account_id, genesis_hash }))
+}
+
 /// Resolve this store's local account from the pointer, or `None` if none is minted yet. The
 /// pointer is a content address; the account_id is recovered by looking the genesis up in the
 /// candidate DAG (§4 commits the account_id inside the genesis payload, so this is the one true
@@ -166,6 +187,16 @@ fn read_local_account(conn: &Connection) -> anyhow::Result<Option<AccountId>> {
     let Some(genesis_hash) = read_pointer_hash(conn)? else {
         return Ok(None);
     };
+    Ok(Some(resolve_account_for_genesis(conn, &genesis_hash)?))
+}
+
+/// Recover the account_id the pointer names by looking its genesis up in the candidate DAG (§4
+/// commits the account_id inside the genesis payload, so this is the one true id). A pointer naming
+/// a genesis absent from `account_entries` is a corrupted pointer and errors.
+fn resolve_account_for_genesis(
+    conn: &Connection,
+    genesis_hash: &[u8; 32],
+) -> anyhow::Result<AccountId> {
     let account_bytes: Vec<u8> = conn
         .query_row(
             "SELECT account_id FROM account_entries WHERE entry_hash = ?1",
@@ -181,7 +212,7 @@ fn read_local_account(conn: &Connection) -> anyhow::Result<Option<AccountId>> {
         .as_slice()
         .try_into()
         .map_err(|_| anyhow::anyhow!("stored account_id is not exactly 32 bytes"))?;
-    Ok(Some(AccountId::from_bytes(account_id)))
+    Ok(AccountId::from_bytes(account_id))
 }
 
 /// Read the single-row pointer's genesis hash, or `None` when no account has been minted.

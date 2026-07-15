@@ -34,6 +34,7 @@
 
 mod account;
 mod cbor;
+mod content_projection;
 mod device;
 mod entry;
 mod identity;
@@ -48,6 +49,14 @@ mod stream;
 // C3.4a's local-account mint (#662): the store-global principal later C3.4 slices author
 // owner-bound /3 content under. Unused until that caller lands, so the re-export is `expect`'d
 // like the seam above.
+// C3.4b-i's in-tx `/3` content-author seam (#663): the local writer that authors owner-bound
+// `/3` content on a `/2` stream, verify-accepted in the caller's txn. Frozen until #664
+// retargets the live memory path onto it.
+#[expect(
+    unused_imports,
+    reason = "C3.4b-i content-author seam is frozen before its caller lands"
+)]
+pub(crate) use account::author_content_batch_in_tx;
 #[expect(
     unused_imports,
     reason = "C3.4a local account mint is frozen before its caller lands"

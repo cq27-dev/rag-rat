@@ -410,7 +410,13 @@ fn candidate_capacity(
     Ok(None)
 }
 
-fn insert_candidate(
+/// Insert one verified `/3` entry into the candidate DAG under the caller's txn (`accepted = 0`;
+/// authority acceptance is the refold's job). `pub(super)` so the in-tx content-author seam
+/// [`super::author`] can store its freshly-signed owner-authored entries through the same seam the
+/// ingest path uses — it MUST NOT go through the self-transacting [`content_ingest`] (it authors
+/// inside the caller's IMMEDIATE txn) and it deliberately skips [`candidate_capacity`] (the §18b
+/// remote-abuse budget, not a local-authoring bound).
+pub(super) fn insert_candidate(
     tx: &Transaction<'_>,
     entry: &VerifiedContentEntry,
     signed_bytes: &[u8],
@@ -594,7 +600,14 @@ fn content_entries_exists(tx: &Transaction<'_>) -> rusqlite::Result<bool> {
     .map(|row| row.is_some())
 }
 
-fn refold_content_stream(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::Result<()> {
+/// Re-derive `/3` acceptance for one stream from the current fold (the only writer of
+/// `accepted = 1`). `pub(super)` so the in-tx content-author seam [`super::author`] can fold the
+/// batch of owner-authored entries it just inserted — ONE refold per batch, then it verifies each
+/// entry came back `accepted` inside the same txn or rolls the whole batch back.
+pub(super) fn refold_content_stream(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+) -> anyhow::Result<()> {
     // The owner is inside the stream identity (`stream_id = sha256(cbor([.., owner, ..]))`, §14)
     // but not invertible, so it is resolved through the owner's `StreamOwn` fact. No fact ⇒
     // authority cannot be evaluated: the entries revert to their structural state. This is a

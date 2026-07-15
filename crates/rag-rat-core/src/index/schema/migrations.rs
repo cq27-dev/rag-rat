@@ -1267,6 +1267,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_067_ID => Some(67),
             MIGRATION_068_ID => Some(68),
             MIGRATION_069_ID => Some(69),
+            MIGRATION_070_ID => Some(70),
             _ => None,
         })
         .max()
@@ -1345,6 +1346,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_067_ID
             | MIGRATION_068_ID
             | MIGRATION_069_ID
+            | MIGRATION_070_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1420,6 +1422,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_067_ID => migration.checksum != MIGRATION_067_CHECKSUM,
         MIGRATION_068_ID => migration.checksum != MIGRATION_068_CHECKSUM,
         MIGRATION_069_ID => migration.checksum != MIGRATION_069_CHECKSUM,
+        MIGRATION_070_ID => migration.checksum != MIGRATION_070_CHECKSUM,
         _ => false,
     }
 }
@@ -4485,6 +4488,39 @@ pub(crate) fn apply_oplog_local_account(conn: &Connection) -> rusqlite::Result<(
              id                 INTEGER PRIMARY KEY CHECK (id = 0),
              genesis_entry_hash BLOB NOT NULL CHECK (length(genesis_entry_hash) = 32),
              created_at_ms      INTEGER NOT NULL
+         ) STRICT;",
+    )
+}
+
+/// V070 (sync phase C3.4b-i): the accepted-`/3` → memory projection tables.
+/// `content_projected_nodes` / `content_projected_edges` mirror the `/1` shadow tables
+/// `oplog_projected_nodes` / `oplog_projected_edges` (stream-keyed since V053) but materialize the
+/// acceptance-gated `/3` DAG: [`crate::oplog::reproject_accepted_content_stream`] decodes each
+/// `content_entries` row where `accepted = 1`, folds via the shared memory projector, and rewrites
+/// the keyed rows for one `/2` stream. Kept SEPARATE from the `/1` tables on purpose (decision 7):
+/// the `/1` projector sweep (`store::reproject_all_streams`) `DELETE`s the `oplog_projected_*`
+/// tables wholesale and rebuilds only streams present in `oplog_entries`, so sharing them would let
+/// a projector-version bump wipe the `/3` projection and never rebuild it — mass duplicate
+/// re-authoring into the immutable `/3` log. These tables are owned by the memory layer and updated
+/// only when acceptance changes (the content refold), never by the `/1` sweep. Purely additive;
+/// `CREATE ... IF NOT EXISTS`, so a torn replay reconverges without a wrapping transaction; nothing
+/// pre-existing to backfill.
+pub(crate) fn apply_content_projected_tables(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS content_projected_nodes(
+             stream_id    BLOB NOT NULL,
+             node_id      TEXT NOT NULL,
+             content_json TEXT NOT NULL,
+             status       TEXT NOT NULL,
+             PRIMARY KEY(stream_id, node_id)
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS content_projected_edges(
+             stream_id     BLOB NOT NULL,
+             edge_key      TEXT NOT NULL,
+             spec_json     TEXT NOT NULL,
+             resolved_json TEXT,
+             PRIMARY KEY(stream_id, edge_key)
          ) STRICT;",
     )
 }

@@ -792,6 +792,27 @@ pub(crate) fn auth_len_freshness(
     })
 }
 
+/// This account's current effective control-fold length — the raw `effective_count`
+/// [`auth_len_freshness`] compares against, read from whatever snapshot `conn` is already in. The
+/// in-tx content-author seam stamps it as the `owner_auth_len`/`author_auth_len` it cites so its
+/// own entries never park `auth_len_ahead` against its own fold; it MUST be read in the SAME
+/// snapshot as the authoring txn, or a concurrent control-fold advance would let the citation
+/// straddle two folds. Zero for an account we hold nothing for (its facts resolve `Unknown` long
+/// before freshness).
+pub(crate) fn account_effective_count(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<u64> {
+    let effective_count: Option<i64> = conn
+        .query_row(
+            "SELECT effective_count FROM account_auth_state WHERE account_id = ?1",
+            [account_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(effective_count.map(u64::try_from).transpose()?.unwrap_or_default())
+}
+
 fn missing_reference<T>(
     conn: &Connection,
     account_id: AccountId,

@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 69;
+pub const LATEST_SCHEMA_VERSION: u32 = 70;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -479,6 +479,14 @@ const MIGRATION_069_DESCRIPTION: &str =
      the genesis_entry_hash of this store's one local account, minted once by local_account and \
      reused so later C3.4 slices author owner-bound /3 content under a stable identity. \
      Store-global, not repo-scoped; purely additive, nothing pre-existing to backfill";
+const MIGRATION_070_ID: &str = "070_content_projected_tables";
+const MIGRATION_070_CHECKSUM: &str = "sha256:rag-rat-content-projected-tables-v70";
+const MIGRATION_070_DESCRIPTION: &str =
+    "Add content_projected_nodes/content_projected_edges (sync phase C3.4b-i): the stream-keyed \
+     memory projection of the accepted /3 content DAG, mirroring the /1 oplog_projected_* shadow \
+     tables but updated only when acceptance changes (the content refold), never by the /1 \
+     projector sweep — kept separate so a projector-version bump cannot wipe the /3 projection. \
+     Purely additive, nothing pre-existing to backfill";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1054,6 +1062,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_069_CHECKSUM,
         description: MIGRATION_069_DESCRIPTION,
         apply: apply_oplog_local_account,
+    },
+    Migration {
+        id: MIGRATION_070_ID,
+        checksum: MIGRATION_070_CHECKSUM,
+        description: MIGRATION_070_DESCRIPTION,
+        apply: apply_content_projected_tables,
     },
 ];
 

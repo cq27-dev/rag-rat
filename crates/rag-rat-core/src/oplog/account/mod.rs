@@ -28,6 +28,13 @@ mod registers;
 mod storage;
 
 pub(crate) use bootstrap::local_account;
+// The in-tx `/3` content-author seam (C3.4b-i, #663) — frozen until #664 retargets the live
+// path.
+#[allow(
+    unused_imports,
+    reason = "C3.4b-i content-author seam is frozen before its caller lands"
+)]
+pub(crate) use content::author_content_batch_in_tx;
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub(in crate::oplog) use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, SignedContentEntry,

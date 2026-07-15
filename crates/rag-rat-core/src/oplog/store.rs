@@ -735,9 +735,12 @@ fn hash_from_vec(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
 
 // The shadow-table serialization DTOs. serde lives HERE, never on the frozen op-wire types (whose
 // wire is minicbor via `op::encode`); these tables are local, derived, and rebuilt wholesale.
+// `pub(super)` (= `pub(in crate::oplog)`): the `/3` accepted-content projection
+// ([`super::content_projection`]) writes `content_projected_nodes`/`_edges` with the SAME JSON
+// shape, so it reuses these DTOs rather than duplicating the row schema.
 
 #[derive(Serialize, Deserialize)]
-struct NodeContentRow {
+pub(super) struct NodeContentRow {
     kind: String,
     title: String,
     body: String,
@@ -776,7 +779,7 @@ impl From<NodeContentRow> for NodeContent {
 }
 
 #[derive(Serialize, Deserialize)]
-struct EdgeSpecRow {
+pub(super) struct EdgeSpecRow {
     source_node_id: String,
     relation: String,
     target_repo_id: String,
@@ -814,7 +817,7 @@ impl TryFrom<EdgeSpecRow> for EdgeSpec {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ResolvedAnchorRow {
+pub(super) struct ResolvedAnchorRow {
     target_repo_id: String,
     target_node_id: Option<String>,
     anchor_status: String,

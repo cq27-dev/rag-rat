@@ -2076,10 +2076,16 @@ fn migration_068_hides_suppressed_edge_candidates() {
 }
 
 #[test]
-fn migration_069_is_the_tip_and_adds_the_local_account_pointer() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 69, "move this pin with the next schema migration");
+fn migration_069_adds_the_local_account_pointer() {
+    // The absolute-tip pin moved to `migration_070_*` (V070 is the tip now); this drops to the
+    // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply",
+    );
 
     // The single-row pointer table exists with its full column set.
     for column in ["id", "genesis_entry_hash", "created_at_ms"] {
@@ -2156,6 +2162,84 @@ fn migration_069_is_the_tip_and_adds_the_local_account_pointer() {
         )
         .unwrap();
     assert_eq!(v69_recorded, 1, "the forward migration records V069");
+}
+
+#[test]
+fn migration_070_is_the_tip_and_adds_the_content_projected_tables() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 70, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    // Both /3 projection tables exist with their full column set, mirroring the stream-keyed /1
+    // shadow tables (V053).
+    for column in ["stream_id", "node_id", "content_json", "status"] {
+        assert!(
+            conn_table_columns(&conn, "content_projected_nodes").contains(&column.to_string()),
+            "V070 gives content_projected_nodes its {column} column",
+        );
+    }
+    for column in ["stream_id", "edge_key", "spec_json", "resolved_json"] {
+        assert!(
+            conn_table_columns(&conn, "content_projected_edges").contains(&column.to_string()),
+            "V070 gives content_projected_edges its {column} column",
+        );
+    }
+
+    // The primary key is the composite (stream_id, node_id) / (stream_id, edge_key): the SAME
+    // (node_id / edge_key) may recur under a DIFFERENT stream, but a duplicate under one stream is
+    // refused — the stream-keying that keeps two /2 streams' projections from colliding.
+    conn.execute(
+        "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
+         VALUES (zeroblob(32), 'n1', '{}', 'active')",
+        [],
+    )
+    .expect("first node row inserts");
+    conn.execute(
+        "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
+         VALUES (randomblob(32), 'n1', '{}', 'active')",
+        [],
+    )
+    .expect("the same node_id under a different stream is a distinct row");
+    assert!(
+        conn.execute(
+            "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
+             VALUES (zeroblob(32), 'n1', '{}', 'active')",
+            [],
+        )
+        .is_err(),
+        "the (stream_id, node_id) primary key rejects a duplicate within one stream",
+    );
+
+    // Deferred-absence in ISOLATION: a bare DB lacks the tables until the V070 applier runs, and a
+    // replay is an idempotent no-op (CREATE ... IF NOT EXISTS).
+    let isolated = rusqlite::Connection::open_in_memory().unwrap();
+    assert!(
+        !conn_table_exists(&isolated, "content_projected_nodes"),
+        "bare DB lacks content_projected_nodes before the isolated apply",
+    );
+    schema::apply_content_projected_tables(&isolated).unwrap();
+    schema::apply_content_projected_tables(&isolated).expect("replay is a no-op");
+    assert!(
+        conn_table_columns(&isolated, "content_projected_edges").contains(&"spec_json".to_string()),
+        "the isolated applier recreates the tables",
+    );
+
+    // A forward migrate over a ledger truncated below V070 replays the step and records V070.
+    truncate_schema_to(&conn, 69);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip",
+    );
+    let v70_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '070_content_projected_tables'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v70_recorded, 1, "the forward migration records V070");
 }
 
 #[test]
