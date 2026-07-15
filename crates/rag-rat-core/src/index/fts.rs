@@ -187,7 +187,9 @@ impl IndexDatabase {
     /// re-tokenize, not data. Healing through the querying connection is what makes the fix
     /// visible to a long-lived server: an out-of-band repair leaves the connection's cached
     /// corrupt pages serving `SQLITE_CORRUPT` indefinitely.
-    pub(crate) fn heal_corrupt_fts(&self) -> anyhow::Result<()> {
+    /// Returns the mirrors whose repair was DEFERRED (today: only `chunk_fts`, behind a staged
+    /// rebuild); every other mirror is rebuilt unconditionally.
+    pub(crate) fn heal_corrupt_fts(&self) -> anyhow::Result<Vec<String>> {
         let conn = self.storage.connection();
         // ONE `BEGIN IMMEDIATE` transaction fences the whole heal. The mirrors are GLOBAL on a
         // consolidated DB while write flocks are per-repo, so a flock cannot serialize sibling
@@ -200,18 +202,21 @@ impl IndexDatabase {
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         // Between a staged rebuild's committed waves, chunk_fts rows exist whose text is not in
         // the durable store yet — 'delete-all' + re-derive would drop them permanently and stamp
-        // the loss clean (the same A6 guard `ensure_fts_fresh` applies). Refuse; the original
-        // error surfaces and the heal retries once the rebuild's text store is complete.
-        anyhow::ensure!(
-            !self.staged_files_generation_exists()?,
-            "FTS corruption heal deferred: a staged rebuild's chunk_fts rows are not yet \
-             re-derivable from the text store"
-        );
-        self.rebuild_fts()?;
+        // the loss clean (the same A6 guard `ensure_fts_fresh` applies). Defer ONLY that mirror:
+        // commit_fts (git_commits), repo_memory_fts (repo_memories), and papertrail_fts (the
+        // papertrail tables) rebuild from always-durable sources, so a staged window must not
+        // leave their ranked surfaces broken too.
+        let deferred = if self.staged_files_generation_exists()? {
+            schema::rebuild_commit_fts(conn)?;
+            vec!["chunk_fts".to_string()]
+        } else {
+            self.rebuild_fts()?;
+            Vec::new()
+        };
         crate::query::memory::heal_repo_memory_fts(conn)?;
         crate::index::papertrail::rebuild_fts(conn)?;
         fence.commit()?;
-        Ok(())
+        Ok(deferred)
     }
 }
 
@@ -258,15 +263,17 @@ impl IndexDatabase {
         // unaffected (their sources are always complete).
         if chunk_corrupt || commit_corrupt {
             if self.staged_files_generation_exists()? {
-                // A silent skip here would let the report read healthy while ranked queries
-                // still fail — surface the deferral so the caller reruns after the staged
-                // rebuild completes.
-                for (corrupt, table) in
-                    [(chunk_corrupt, "chunk_fts"), (commit_corrupt, "commit_fts")]
-                {
-                    if corrupt {
-                        outcome.deferred.push(table.to_string());
-                    }
+                // The staged-window hazard is CHUNK-only (chunk_fts re-derives from chunk_text,
+                // which lags the staged waves); commit_fts rebuilds from durable git_commits and
+                // must not stay broken behind unrelated staging. A silent skip of the deferred
+                // mirror would let the report read healthy while ranked queries still fail —
+                // surface it so the caller reruns after the staged rebuild completes.
+                if commit_corrupt {
+                    schema::rebuild_commit_fts(conn)?;
+                    outcome.healed.push("commit_fts".to_string());
+                }
+                if chunk_corrupt {
+                    outcome.deferred.push("chunk_fts".to_string());
                 }
             } else {
                 // The shared rebuild repopulates BOTH mirrors regardless of which probe failed
@@ -317,9 +324,13 @@ pub struct FtsHealOutcome {
     pub deferred: Vec<String>,
 }
 
-/// #582: whether `err`'s chain contains SQLITE_CORRUPT — the FTS5 shadow-table variant surfaces
-/// as extended `SQLITE_CORRUPT_VTAB` (267), whose primary code rusqlite maps to
-/// `DatabaseCorrupt`, rendered as the bare "database disk image is malformed".
+/// #582: whether `err`'s chain contains SQLITE_CORRUPT — matched on the PRIMARY code
+/// (`DatabaseCorrupt`), deliberately not the extended `SQLITE_CORRUPT_VTAB` (267): the incident
+/// class itself reports extended code 11 (measured by truncating `chunk_fts_docsize` and reading
+/// `sqlite3_extended_errcode` through the ranked probe), so requiring 267 would miss exactly the
+/// corruption this exists to catch. The cost of the broad match is bounded: a non-FTS corruption
+/// triggers one lossless mirror rebuild before the ORIGINAL error surfaces from the failed
+/// retry.
 pub fn error_is_fts_corruption(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         matches!(
@@ -335,18 +346,31 @@ pub fn error_is_fts_corruption(err: &anyhow::Error) -> bool {
 /// deliberately no loop (#582).
 pub(crate) fn retry_once_on_fts_corruption<T>(
     mut op: impl FnMut() -> anyhow::Result<T>,
-    heal: impl FnOnce() -> anyhow::Result<()>,
+    heal: impl FnOnce() -> anyhow::Result<Vec<String>>,
 ) -> anyhow::Result<T> {
     match op() {
         Ok(value) => Ok(value),
         Err(err) if error_is_fts_corruption(&err) => {
-            if let Err(heal_err) = heal() {
-                // Keep the ORIGINAL corruption error as the chain root (callers and tests match
-                // on it); the heal's own failure — e.g. the staged-rebuild deferral — rides
-                // along as context.
-                return Err(err.context(format!("FTS self-heal did not complete: {heal_err:#}")));
+            let deferred = match heal() {
+                Ok(deferred) => deferred,
+                Err(heal_err) => {
+                    // Keep the ORIGINAL corruption error as the chain root (callers and tests
+                    // match on it); the heal's own failure rides along as context.
+                    return Err(
+                        err.context(format!("FTS self-heal did not complete: {heal_err:#}"))
+                    );
+                },
+            };
+            match op() {
+                Ok(value) => Ok(value),
+                // The retry failing right after a heal that DEFERRED a mirror is the deferral
+                // biting: say so, instead of a bare "malformed" that reads like a fresh mystery.
+                Err(retry_err) if !deferred.is_empty() => Err(retry_err.context(format!(
+                    "FTS self-heal deferred {deferred:?} behind an in-flight staged rebuild; \
+                     rerun once it completes"
+                ))),
+                other => other,
             }
-            op()
         },
         Err(err) => Err(err),
     }
@@ -378,7 +402,7 @@ mod corruption_tests {
             },
             || {
                 healed = true;
-                Ok(())
+                Ok(Vec::new())
             },
         );
         assert_eq!(result.unwrap(), 42);
@@ -402,7 +426,7 @@ mod corruption_tests {
                 calls += 1;
                 Err(corrupt_error())
             },
-            || Ok(()),
+            || Ok(Vec::new()),
         );
         assert!(error_is_fts_corruption(&result.unwrap_err()));
         assert_eq!(calls, 2, "exactly one retry, no loop");

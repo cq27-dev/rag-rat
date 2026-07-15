@@ -614,7 +614,9 @@ impl IndexDatabase {
         } else {
             self.ensure_fts_fresh()?;
         }
-        report.fts_fresh = !self.fts_dirty()?;
+        // A deferred corrupt mirror is NOT fresh, whatever the dirty flag says — operators key
+        // health off this field.
+        report.fts_fresh = !self.fts_dirty()? && report.fts_deferred.is_empty();
         Ok(report)
     }
 

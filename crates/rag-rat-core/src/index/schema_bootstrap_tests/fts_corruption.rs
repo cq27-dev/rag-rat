@@ -241,5 +241,68 @@ fn heal_refuses_while_staged_chunk_fts_rows_are_not_rederivable() {
     assert!(outcome.healed.is_empty(), "{:?}", outcome.healed);
     assert_eq!(outcome.deferred, vec!["chunk_fts".to_string()]);
 
+    // And the health flag must not read fresh while a known-corrupt mirror waits: operators key
+    // off fts_fresh.
+    let report = db.heal_index(None).unwrap();
+    assert_eq!(report.fts_deferred, vec!["chunk_fts".to_string()]);
+    assert!(!report.fts_fresh, "a deferred corrupt mirror is not fresh");
+
+    // The plain dream worklist ranks nothing and must stay write-free and error-free under the
+    // exact same window (byte-identical contract): no probe, no heal, corruption untouched.
+    let worklist_opts =
+        crate::dream::DreamOptions { now_ms: 1, limit: 10, verify: false, include_reviewed: false };
+    db.dream_run_with_passes(worklist_opts, None, None)
+        .expect("the deterministic worklist never touches ranked FTS");
+    let docsize_rows: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT count(*) FROM chunk_fts_docsize", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(docsize_rows, 0, "no heal may run for the pass-less worklist");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The staged-window hazard is CHUNK-only: commit_fts rebuilds from durable git_commits and must
+/// heal even while a staged generation exists — deferring it would leave commit_search broken
+/// behind unrelated staging.
+#[test]
+fn commit_fts_heals_even_while_chunk_staging_exists() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn staged_commit_witness() {}\n").unwrap();
+    // commit_fts indexes git history — the corruption probe needs a non-empty mirror.
+    let git = |args: &[&str]| {
+        let out =
+            std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=t@example.invalid",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "-m",
+        "commit witness message",
+    ]);
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    db.storage
+        .connection()
+        .execute("UPDATE main.files SET generation = generation + 1 WHERE path = 'src/lib.rs'", [])
+        .unwrap();
+    corrupt_fts_docsize(&db, "chunk_fts");
+    corrupt_fts_docsize(&db, "commit_fts");
+
+    let outcome = db.heal_fts_if_corrupt().unwrap();
+    assert_eq!(outcome.healed, vec!["commit_fts".to_string()]);
+    assert_eq!(outcome.deferred, vec!["chunk_fts".to_string()]);
+
     let _ = fs::remove_dir_all(&root);
 }
