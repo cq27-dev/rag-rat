@@ -338,7 +338,28 @@ pub(crate) fn roster_content_authority(
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterContentAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    let conn: &Connection = &read_tx;
+    roster_content_authority_in_snapshot(
+        &read_tx,
+        account_id,
+        roster_ref,
+        device_fingerprint,
+        stream_id,
+    )
+}
+
+/// The body of [`roster_content_authority`], reading whatever snapshot `conn` is already in.
+///
+/// The `/3` refold resolves EVERY authority fact for an entry — ownership, roster, grant, both
+/// freshness verdicts — and must see one consistent snapshot across all of them, or a refold
+/// committing mid-evaluation could pair an old grant with a new cut. It therefore reads inside its
+/// own transaction and cannot call the wrapper above, which would try to `BEGIN` a second one.
+pub(crate) fn roster_content_authority_in_snapshot(
+    conn: &Connection,
+    account_id: AccountId,
+    roster_ref: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+    stream_id: StreamId,
+) -> anyhow::Result<fold::AuthorityQuery<fold::RosterContentAuthority>> {
     let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
         .query_row(
             "SELECT device_fingerprint, role, effective_at, closed_at
@@ -579,7 +600,9 @@ pub(crate) fn grant_effective_for_device(
     )
 }
 
-fn grant_effective_for_device_in_snapshot(
+/// The body of [`grant_effective_for_device`], reading whatever snapshot `conn` is already in — see
+/// [`roster_content_authority_in_snapshot`] for why the `/3` refold needs this shape.
+pub(crate) fn grant_effective_for_device_in_snapshot(
     conn: &Connection,
     owner_account_id: AccountId,
     grant_id: EntryHash,
@@ -625,7 +648,16 @@ pub(crate) fn stream_owner_effective(
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<EntryHash>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    let conn: &Connection = &read_tx;
+    stream_owner_effective_in_snapshot(&read_tx, account_id, stream_id)
+}
+
+/// The body of [`stream_owner_effective`], reading whatever snapshot `conn` is already in — see
+/// [`roster_content_authority_in_snapshot`] for why the `/3` refold needs this shape.
+pub(crate) fn stream_owner_effective_in_snapshot(
+    conn: &Connection,
+    account_id: AccountId,
+    stream_id: StreamId,
+) -> anyhow::Result<fold::AuthorityQuery<EntryHash>> {
     let row: Option<(Vec<u8>, i64)> = conn
         .query_row(
             "SELECT own_id, effective_at FROM account_stream_ownership
@@ -691,6 +723,44 @@ fn load_grant_device_cut(
         })
     })
     .transpose()
+}
+
+/// The account that owns `stream_id`, per the current fold.
+///
+/// A `/3` header never names its owner: `stream_id` is `sha256(cbor([..., owner_account_id,
+/// ...]))`, so ownership is INSIDE the identity and two accounts claiming one stream is
+/// cryptographically impossible (§14). The preimage is not invertible, though, so the owner is
+/// resolved through the `StreamOwn` fact the owner published. No fact ⇒ we do not know who owns
+/// this stream yet, and nothing on it can be authorized — that is recoverable, never a rejection.
+pub(crate) fn stream_owner_account(
+    conn: &Connection,
+    stream_id: StreamId,
+) -> anyhow::Result<Option<AccountId>> {
+    let owner: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT account_id FROM account_stream_ownership WHERE stream_id = ?1",
+            [stream_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    owner.map(|bytes| Ok(AccountId::from_bytes(fixed(&bytes)?))).transpose()
+}
+
+/// Whether an account has folded to `contested` — a genuine owner-key-compromise / equivocation
+/// event (§12), which HALTS authority mutation. Content authorized by a contested account is
+/// fail-closed: parked (quota-bounded), never accepted, and reclassified if the account recovers.
+pub(crate) fn account_is_contested(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<bool> {
+    let classification: Option<String> = conn
+        .query_row(
+            "SELECT classification FROM account_auth_state WHERE account_id = ?1",
+            [account_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(classification.is_some_and(|state| state == "contested"))
 }
 
 /// Measure an asserted control-fold length against our own folded view (§7) — the ONE seam that
@@ -809,6 +879,11 @@ fn refold_in_tx(
     let rows = load_candidates(tx, account_id)?;
     let projection = derive_account_projection(&rows);
 
+    // Streams this account owns BEFORE the projection rewrite: a fold that drops a `StreamOwn` fact
+    // must still refold that stream so its content is declassified, but the ownership row is gone
+    // after the rewrite — so capture it now and hand it to the content trigger below.
+    let previously_owned = owned_streams(tx, account_id)?;
+
     // Rewrite atomically so the partial unique index never observes two accepted rows at a slot.
     tx.execute("UPDATE account_entries SET accepted = 0 WHERE account_id = ?1", params![
         account_id.to_bytes().as_slice()
@@ -845,7 +920,23 @@ fn refold_in_tx(
         statuses.insert(row.entry_hash, status);
     }
     rewrite_authority_projection(tx, account_id, &projection.history)?;
+    // Authority just changed, so content acceptance can change with it: re-evaluate every stream
+    // this account's authority reaches (§13). Same txn as the projection rewrite ⇒ a revocation
+    // retro-condemns accepted content atomically, and content that arrived before its owner's
+    // `StreamOwn` is classified the moment that fact folds.
+    super::content::refold_streams_for_account(tx, account_id, &previously_owned)?;
     Ok(statuses)
+}
+
+/// The streams this account currently owns, per the projection — captured before a refold rewrites
+/// it so a dropped `StreamOwn` still triggers its stream's content declassification.
+fn owned_streams(tx: &Transaction<'_>, account_id: AccountId) -> anyhow::Result<Vec<[u8; 32]>> {
+    let mut stmt =
+        tx.prepare("SELECT stream_id FROM account_stream_ownership WHERE account_id = ?1")?;
+    let rows = stmt
+        .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.iter().map(|bytes| fixed(bytes)).collect()
 }
 
 /// Replace every query-ready authority fact for this account. The caller's IMMEDIATE refold txn

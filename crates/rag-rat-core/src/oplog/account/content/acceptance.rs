@@ -176,6 +176,42 @@ pub(crate) fn evaluate_content_acceptance<F>(
 where
     F: Fn(EntryHash, EntryHash) -> AncestryRelation,
 {
+    if let Some(verdict) = authority_verdict(input)? {
+        return Ok(verdict);
+    }
+    if !input.dense_predecessor_reachable {
+        return Ok(ContentAcceptance::Parked(ContentParkReason::MissingPredecessor));
+    }
+    if !input.branch_selected {
+        return Ok(ContentAcceptance::Forked);
+    }
+    // Freshness last (§13): an author citing control ops we have not folded parks for refetch, but
+    // only once every verdict the current fold CAN decide — condemnation, fork — has been ruled
+    // out.
+    if input.owner_freshness.state == AuthorityFreshness::Ahead {
+        return Ok(ContentAcceptance::Parked(ContentParkReason::OwnerAuthLenAhead));
+    }
+    if input.author_freshness.state == AuthorityFreshness::Ahead {
+        return Ok(ContentAcceptance::Parked(ContentParkReason::AuthorAuthLenAhead));
+    }
+    Ok(ContentAcceptance::Accepted)
+}
+
+/// Everything §13 decides BEFORE the content DAG has a say: the structural grant coupling, the
+/// authority citations, every applicable revocation register, and the subject holds. `None` means
+/// the entry is authorized — it is then eligible to contest a slot in branch selection, and the
+/// caller finishes the verdict with [`evaluate_content_acceptance`].
+///
+/// This is the phase split the refold needs: an entry that is condemned or rejected must NOT
+/// compete for its dense seq slot (a small-hash entry mined beyond a cut would otherwise fork an
+/// honest sibling off the accepted branch), so eligibility has to be decided before selection runs
+/// — and selection's output is itself an input to the full predicate.
+pub(crate) fn authority_verdict<F>(
+    input: &ContentAcceptanceInput<'_, F>,
+) -> Result<Option<ContentAcceptance>, ContentAcceptanceInputError>
+where
+    F: Fn(EntryHash, EntryHash) -> AncestryRelation,
+{
     // Provenance first: a freshness verdict computed for another account, or for a shorter
     // assertion than the header makes, decides nothing about THIS entry.
     if input.owner_freshness.account_id != input.owner_account_id
@@ -190,27 +226,29 @@ where
 
     let is_owner = input.header.author_account_id == input.owner_account_id;
     if is_owner && (input.header.grant_id.is_some() || input.grant.is_some()) {
-        return Ok(ContentAcceptance::Rejected(ContentRejectReason::UnexpectedGrant));
+        return Ok(Some(ContentAcceptance::Rejected(ContentRejectReason::UnexpectedGrant)));
     }
     if !is_owner && input.header.grant_id.is_none() {
-        return Ok(ContentAcceptance::Rejected(ContentRejectReason::GrantRequired));
+        return Ok(Some(ContentAcceptance::Rejected(ContentRejectReason::GrantRequired)));
     }
+    let rejected = |reason| Ok(Some(ContentAcceptance::Rejected(reason)));
+    let parked = |reason| Ok(Some(ContentAcceptance::Parked(reason)));
+
     match input.ownership {
         AuthorityQuery::Effective(fact)
             if fact.owner_account_id == input.owner_account_id
                 && fact.stream_id == input.header.stream_id => {},
-        AuthorityQuery::Unknown =>
-            return Ok(ContentAcceptance::Parked(ContentParkReason::UnknownOwner)),
+        AuthorityQuery::Unknown => return parked(ContentParkReason::UnknownOwner),
         // Ownership is minted in the OWNER's log, so the owner's freshness gates its rejection.
         AuthorityQuery::Invalid(reason) =>
-            return Ok(invalid_citation(
+            return Ok(Some(invalid_citation(
                 reason,
                 owner_freshness,
                 ContentRejectReason::OwnerReferenceInvalid,
                 ContentParkReason::OwnerAuthLenAhead,
-            )),
+            ))),
         AuthorityQuery::Effective(_) =>
-            return Ok(ContentAcceptance::Rejected(ContentRejectReason::OwnerReferenceInvalid)),
+            return rejected(ContentRejectReason::OwnerReferenceInvalid),
     }
     let roster = match input.roster {
         AuthorityQuery::Effective(fact)
@@ -219,18 +257,17 @@ where
                 && fact.stream_id == input.header.stream_id
                 && fact.authority.device_fingerprint == input.header.device_fingerprint =>
             fact,
-        AuthorityQuery::Unknown =>
-            return Ok(ContentAcceptance::Parked(ContentParkReason::UnknownRosterRef)),
+        AuthorityQuery::Unknown => return parked(ContentParkReason::UnknownRosterRef),
         // The roster enrollment lives in the AUTHOR's log — the author's freshness gates it.
         AuthorityQuery::Invalid(reason) =>
-            return Ok(invalid_citation(
+            return Ok(Some(invalid_citation(
                 reason,
                 author_freshness,
                 ContentRejectReason::RosterReferenceInvalid,
                 ContentParkReason::AuthorAuthLenAhead,
-            )),
+            ))),
         AuthorityQuery::Effective(_) =>
-            return Ok(ContentAcceptance::Rejected(ContentRejectReason::RosterReferenceInvalid)),
+            return rejected(ContentRejectReason::RosterReferenceInvalid),
     };
     let mut boundaries = vec![roster.authority.boundary];
 
@@ -243,21 +280,20 @@ where
                     && fact.authority.grant.grantee_account_id
                         == input.header.author_account_id =>
                 fact,
-            Some(AuthorityQuery::Unknown) | None =>
-                return Ok(ContentAcceptance::Parked(ContentParkReason::UnknownGrant)),
+            Some(AuthorityQuery::Unknown) | None => return parked(ContentParkReason::UnknownGrant),
             // The grant is minted in the OWNER's log — the owner's freshness gates it.
             Some(AuthorityQuery::Invalid(reason)) =>
-                return Ok(invalid_citation(
+                return Ok(Some(invalid_citation(
                     *reason,
                     owner_freshness,
                     ContentRejectReason::GrantReferenceInvalid,
                     ContentParkReason::OwnerAuthLenAhead,
-                )),
+                ))),
             Some(AuthorityQuery::Effective(_)) =>
-                return Ok(ContentAcceptance::Rejected(ContentRejectReason::GrantReferenceInvalid)),
+                return rejected(ContentRejectReason::GrantReferenceInvalid),
         };
         if grant.authority.grant.role != GrantRole::Writer {
-            return Ok(ContentAcceptance::Rejected(ContentRejectReason::GrantDoesNotPermitWrite));
+            return rejected(ContentRejectReason::GrantDoesNotPermitWrite);
         }
         boundaries.push(match &grant.authority.boundary {
             GrantDeviceBoundary::Open => AuthorityBoundary::Open,
@@ -265,7 +301,7 @@ where
                 if cut.device_fingerprint == input.header.device_fingerprint =>
                 AuthorityBoundary::Cut { seq: cut.seq, hash: cut.hash },
             GrantDeviceBoundary::Cut(_) =>
-                return Ok(ContentAcceptance::Rejected(ContentRejectReason::GrantReferenceInvalid)),
+                return rejected(ContentRejectReason::GrantReferenceInvalid),
             GrantDeviceBoundary::Closed => AuthorityBoundary::Closed,
         });
     }
@@ -273,34 +309,17 @@ where
     let boundary_decision =
         combine_boundaries(&boundaries, input.header.seq, input.entry_hash, &input.ancestry);
     if matches!(boundary_decision, Some(ContentAcceptance::Condemned(_))) {
-        return Ok(boundary_decision.expect("matched Some"));
+        return Ok(boundary_decision);
     }
     match input.subject_hold {
         SubjectAuthorityHold::UnknownCutTarget =>
-            return Ok(ContentAcceptance::Parked(ContentParkReason::UnknownCutTarget)),
-        SubjectAuthorityHold::Contested =>
-            return Ok(ContentAcceptance::Parked(ContentParkReason::ContestedSubject)),
+            return parked(ContentParkReason::UnknownCutTarget),
+        SubjectAuthorityHold::Contested => return parked(ContentParkReason::ContestedSubject),
         SubjectAuthorityHold::Clear => {},
     }
-    if let Some(decision) = boundary_decision {
-        return Ok(decision);
-    }
-    if !input.dense_predecessor_reachable {
-        return Ok(ContentAcceptance::Parked(ContentParkReason::MissingPredecessor));
-    }
-    if !input.branch_selected {
-        return Ok(ContentAcceptance::Forked);
-    }
-    // Freshness last (§13): an author citing control ops we have not folded parks for refetch, but
-    // only once every verdict the current fold CAN decide — condemnation, fork — has been ruled
-    // out.
-    if owner_freshness == AuthorityFreshness::Ahead {
-        return Ok(ContentAcceptance::Parked(ContentParkReason::OwnerAuthLenAhead));
-    }
-    if author_freshness == AuthorityFreshness::Ahead {
-        return Ok(ContentAcceptance::Parked(ContentParkReason::AuthorAuthLenAhead));
-    }
-    Ok(ContentAcceptance::Accepted)
+    // A boundary that could not be decided (a withheld watermark, an incomplete walk) parks here,
+    // after the holds — it is the weakest verdict the registers can produce.
+    Ok(boundary_decision)
 }
 
 /// Lower an `Invalid` citation into a verdict. `WrongSubject` is decided by bytes we already hold,
