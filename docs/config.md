@@ -588,8 +588,10 @@ Per-key notes:
   (the project key, e.g. `PROJ`): Jira is not a code host, so it is never auto-detected and has
   no remote to derive from.
 - `base_url` — self-hosted / enterprise instances (`https://gitlab.example.com`). Must be an
-  http(s) URL without inline credentials. Self-hosted GitHub Enterprise and Bitbucket instances
-  are configured this way — only the three cloud hosts auto-detect.
+  origin URL without inline credentials, and must use **https**: the transport never sends the
+  binding's token over plaintext, so `http` origins are accepted for loopback hosts only (local
+  testing). Self-hosted GitHub Enterprise and Bitbucket instances are configured this way —
+  only the three cloud hosts auto-detect.
 - `auth` — exactly one of `env` (the NAME of an env var holding the token — never the token
   itself) or `token_command` (a command printing the token to stdout). Omitted = anonymous /
   provider-native fallback.

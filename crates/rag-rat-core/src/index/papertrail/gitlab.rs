@@ -80,39 +80,12 @@ impl GitLabClient {
         options: TransportOptions,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(binding.provider == Tracker::Gitlab, "not a GitLab binding");
-        let parsed = match binding.base_url.as_deref() {
-            None => Url::parse("https://gitlab.com/api/v4")?,
-            Some(base) => {
-                let mut base = Url::parse(base)?;
-                anyhow::ensure!(
-                    matches!(base.scheme(), "http" | "https"),
-                    "GitLab base URL must use http(s)"
-                );
-                anyhow::ensure!(
-                    base.username().is_empty() && base.password().is_none(),
-                    "GitLab base URL must not contain credentials"
-                );
-                anyhow::ensure!(
-                    matches!(base.path(), "" | "/")
-                        && base.query().is_none()
-                        && base.fragment().is_none(),
-                    "GitLab base URL must be an origin without a path, query, or fragment"
-                );
-                base.set_path("/api/v4");
-                base
-            },
-        };
-        let host =
-            parsed.host_str().ok_or_else(|| anyhow::anyhow!("GitLab API origin has no host"))?;
-        let authority_host = if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]")
-        } else {
-            host.to_string()
-        };
-        let authority = parsed
-            .port()
-            .map_or_else(|| authority_host.clone(), |port| format!("{authority_host}:{port}"));
-        let api_origin = parsed.as_str().trim_end_matches('/').to_string();
+        let (api_origin, authority) = resolve_api_origin(
+            "GitLab",
+            binding.base_url.as_deref(),
+            "https://gitlab.com/api/v4",
+            "/api/v4",
+        )?;
         let token = transport::resolve_token(binding.auth.as_ref())?;
         // One lane: GitLab reports a single `RateLimit-*` quota bucket (the governor already
         // parses the IETF-draft header form), unlike GitHub's core/search split.
@@ -189,10 +162,8 @@ impl GitLabClient {
     /// previously mirrored item.
     async fn leg_page(&self, project: &str, url: &str, leg: ListLeg) -> anyhow::Result<LegOutcome> {
         let response = self.core.get(url, &gitlab_headers()).await?;
-        match response.status {
-            403 => return Ok(LegOutcome::Unavailable { missing: false }),
-            404 => return Ok(LegOutcome::Unavailable { missing: true }),
-            _ => {},
+        if matches!(response.status, 403 | 404) {
+            return Ok(LegOutcome::Unavailable);
         }
         ensure_success(response.status, &response.body)?;
         let next_url = next_link(&response.headers)?;
@@ -209,10 +180,12 @@ impl GitLabClient {
 }
 
 /// What one leg fetch produced: a page, or a 403/404 whose meaning the caller decides by walk
-/// phase (fresh open: disabled feature or missing project; mid-walk: an error).
+/// phase (fresh open: disabled feature or missing project; mid-walk: an error). Disabled
+/// features answer 403, HIDDEN features answer 404 — indistinguishable from a gone project at
+/// the leg level, which is why the project readability probe is the discriminator.
 enum LegOutcome {
     Page(Vec<PapertrailItem>, Option<String>),
-    Unavailable { missing: bool },
+    Unavailable,
 }
 
 impl PapertrailClient for GitLabClient {
@@ -330,7 +303,6 @@ impl PapertrailClient for GitLabClient {
             ),
         };
         let mut items = Vec::new();
-        let mut issues_missing = false;
         let mut issues_advanced = false;
         if let Some(url) = state.issues_next.take() {
             match self.leg_page(project, &url, ListLeg::Issues).await? {
@@ -340,8 +312,8 @@ impl PapertrailClient for GitLabClient {
                     issues_advanced = true;
                 },
                 // Only a FRESH open may map unavailability to an empty leg (see leg_page).
-                LegOutcome::Unavailable { missing } if fresh_open => issues_missing = missing,
-                LegOutcome::Unavailable { .. } => {
+                LegOutcome::Unavailable if fresh_open => {},
+                LegOutcome::Unavailable => {
                     anyhow::bail!("GitLab issues became unavailable mid-walk for {project}")
                 },
             }
@@ -352,21 +324,18 @@ impl PapertrailClient for GitLabClient {
                     items.extend(page);
                     state.merge_requests_next = next;
                 },
-                Ok(LegOutcome::Unavailable { missing }) if fresh_open => {
-                    // EVERY namespace unavailable on a fresh open: all-404 means the project is
-                    // missing — surface the typed not-found. Otherwise (403s involved) the
-                    // project must PROVE it is readable before the walk may treat the trackers
-                    // as disabled features and mirror quietly as empty — a token that lost
-                    // access also answers 403 on both lists, and completing that walk "empty"
-                    // would prune everything.
+                Ok(LegOutcome::Unavailable) if fresh_open => {
+                    // EVERY namespace unavailable on a fresh open: the project must PROVE it is
+                    // readable before the walk may treat the trackers as disabled/hidden
+                    // features and mirror quietly as empty. A token that lost access answers
+                    // 403 on both lists, a gone project answers 404 — and completing either
+                    // walk "empty" would prune everything. The readability probe maps its own
+                    // 404 to the typed not-found, so a gone project still surfaces as such.
                     if !issues_advanced {
-                        if missing && issues_missing {
-                            return Err(PapertrailClientError::ItemNotFound.into());
-                        }
                         self.project_is_readable(project).await?;
                     }
                 },
-                Ok(LegOutcome::Unavailable { .. }) => {
+                Ok(LegOutcome::Unavailable) => {
                     anyhow::bail!("GitLab merge requests became unavailable mid-walk for {project}")
                 },
                 // A rate/budget pause AFTER the issues leg already consumed a CONTINUATION page
@@ -527,7 +496,6 @@ impl PapertrailClient for GitLabClient {
         // the project's newest movement. No ETag: two responses cannot share one validator, and
         // `probe_advance` on timestamps suffices.
         let mut latest: Option<String> = None;
-        let mut missing = 0usize;
         let mut unavailable = 0usize;
         for leg in [ListLeg::Issues, ListLeg::MergeRequests] {
             let mut url = Url::parse(&self.project_path(project, leg.path_segment())?)?;
@@ -536,20 +504,12 @@ impl PapertrailClient for GitLabClient {
                 .append_pair("sort", "desc")
                 .append_pair("per_page", "1");
             let response = self.core.get(url.as_str(), &gitlab_headers()).await?;
-            // A disabled namespace is quiet, not fatal — the sibling still answers the probe.
-            // Both answering 404 = the project is gone; a 403 anywhere is a feature setting,
-            // and a project with BOTH features disabled probes as a quiet empty project.
-            match response.status {
-                403 => {
-                    unavailable += 1;
-                    continue;
-                },
-                404 => {
-                    missing += 1;
-                    unavailable += 1;
-                    continue;
-                },
-                _ => {},
+            // A disabled/hidden namespace (403/404) is quiet, not fatal — the sibling still
+            // answers the probe. Both unavailable = only the project readability probe can
+            // tell a docs-only project from a gone one.
+            if matches!(response.status, 403 | 404) {
+                unavailable += 1;
+                continue;
             }
             ensure_success(response.status, &response.body)?;
             let value: Value = serde_json::from_str(&response.body)?;
@@ -560,12 +520,10 @@ impl PapertrailClient for GitLabClient {
                 .map(str::to_string);
             latest = max_timestamp(latest.take(), leg_latest);
         }
-        if missing == 2 {
-            return Err(PapertrailClientError::ItemNotFound.into());
-        }
         if unavailable == 2 {
-            // Both lists unavailable with a 403 involved: disabled features and lost access
-            // look identical here — only a readable project may probe as quietly empty.
+            // Disabled/hidden features and lost access/deletion look identical at the list
+            // level — only a readable project may probe as quietly empty; the readability
+            // probe's own 404 surfaces a gone project as the typed not-found.
             self.project_is_readable(project).await?;
         }
         // GitLab has no probe validator (no shared ETag across the two namespace calls), so the
@@ -762,6 +720,9 @@ mod tests {
             ("https://user:pw@gitlab.example.com", "credentials"),
             ("ftp://gitlab.example.com", "http(s)"),
             ("https://gitlab.example.com?x=1", "without a path"),
+            // The transport refuses plaintext to non-loopback hosts per request; accepting it
+            // here would mint a "native" binding whose every sync fails.
+            ("http://gitlab.example.com:8080", "loopback-only"),
         ] {
             let error = GitLabClient::new(
                 &binding(base.to_string()),
@@ -1135,6 +1096,27 @@ mod tests {
         );
     }
 
+    /// HIDDEN features answer 404 like a gone project; a readable project with both trackers
+    /// hidden mirrors quietly as empty instead of failing as not-found on every sync.
+    #[test]
+    fn hidden_features_on_a_readable_project_mirror_as_quietly_empty() {
+        let (base, _handle) = spawn_script_stub(vec![
+            StubResponse::status("404 Not Found", "{}"),
+            StubResponse::status("404 Not Found", "{}"),
+            StubResponse::ok(r#"{"id":1,"path_with_namespace":"g/s/r"}"#),
+        ]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+        let page = block_on(client.items_page("g/s/r", &PageCursor {
+            updated_before: Some("2026-02-01T00:00:00Z".to_string()),
+            ..PageCursor::default()
+        }))
+        .unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next.is_none());
+        assert!(page.backfill_boundary.is_none(), "the mirror's done shape");
+    }
+
     /// A token that lost access answers 403 on both lists too — the readability probe fails
     /// and the walk ERRORS instead of completing empty (which would prune everything).
     #[test]
@@ -1183,6 +1165,7 @@ mod tests {
         let (base, _handle) = spawn_script_stub(vec![
             StubResponse::status("404 Not Found", "{}"),
             StubResponse::status("404 Not Found", "{}"),
+            StubResponse::status("404 Not Found", "{}"),
         ]);
         let registry = GovernorRegistry::default();
         let client = client(base, &registry);
@@ -1205,6 +1188,7 @@ mod tests {
         let (base, _handle) = spawn_script_stub(vec![
             StubResponse::status("403 Forbidden", "{}"),
             StubResponse::ok(&format!("[{}]", merge_request(2, "2026-01-07T00:00:00Z"))),
+            StubResponse::status("404 Not Found", "{}"),
             StubResponse::status("404 Not Found", "{}"),
             StubResponse::status("404 Not Found", "{}"),
         ]);

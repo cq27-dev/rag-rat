@@ -368,7 +368,7 @@ fn parse_bound_authority(authority: &str) -> anyhow::Result<(String, Option<u16>
 }
 
 /// Loopback spellings a binding/test can use; these allow plain http and arbitrary ports.
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 

@@ -56,39 +56,12 @@ impl GitHubClient {
         options: TransportOptions,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(binding.provider == Tracker::Github, "not a GitHub binding");
-        let parsed = match binding.base_url.as_deref() {
-            None => Url::parse("https://api.github.com")?,
-            Some(base) => {
-                let mut base = Url::parse(base)?;
-                anyhow::ensure!(
-                    matches!(base.scheme(), "http" | "https"),
-                    "GitHub base URL must use http(s)"
-                );
-                anyhow::ensure!(
-                    base.username().is_empty() && base.password().is_none(),
-                    "GitHub base URL must not contain credentials"
-                );
-                anyhow::ensure!(
-                    matches!(base.path(), "" | "/")
-                        && base.query().is_none()
-                        && base.fragment().is_none(),
-                    "GitHub base URL must be an origin without a path, query, or fragment"
-                );
-                base.set_path("/api/v3");
-                base
-            },
-        };
-        let host =
-            parsed.host_str().ok_or_else(|| anyhow::anyhow!("GitHub API origin has no host"))?;
-        let authority_host = if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]")
-        } else {
-            host.to_string()
-        };
-        let authority = parsed
-            .port()
-            .map_or_else(|| authority_host.clone(), |port| format!("{authority_host}:{port}"));
-        let api_origin = parsed.as_str().trim_end_matches('/').to_string();
+        let (api_origin, authority) = resolve_api_origin(
+            "GitHub",
+            binding.base_url.as_deref(),
+            "https://api.github.com",
+            "/api/v3",
+        )?;
         let token = transport::resolve_token(binding.auth.as_ref())?;
         let transport = |lane| {
             Transport::new_with_token(
