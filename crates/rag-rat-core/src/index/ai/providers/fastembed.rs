@@ -43,8 +43,9 @@ impl FastEmbedEmbedder {
             .with_show_download_progress(true);
         // `ort_threads` caps the ONNX Runtime intra-op thread pool. Microsoft's prebuilt ORT
         // binaries (what fastembed downloads) are OpenMP-based, where this has no effect and
-        // OMP_NUM_THREADS (set from `omp_threads`) is the lever instead — see docs/config/embedding.md.
-        // We still apply it so non-OpenMP builds honor the configured cap.
+        // OMP_NUM_THREADS (set from `omp_threads`) is the lever instead — see
+        // docs/config/embedding.md. We still apply it so non-OpenMP builds honor the
+        // configured cap.
         if let Some(threads) = intra_threads.filter(|threads| *threads > 0) {
             options = options.with_intra_threads(threads);
         }
