@@ -231,10 +231,15 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         let mut outcome = FtsHealOutcome::default();
         // chunk_fts and commit_fts share one recovery (`rebuild_fts` repopulates both).
-        let chunk_corrupt = ranked_probe_is_corrupt(conn, "chunk_fts")?;
-        let commit_corrupt = ranked_probe_is_corrupt(conn, "commit_fts")?;
-        let memory_corrupt = ranked_probe_is_corrupt(conn, "repo_memory_fts")?;
-        let papertrail_corrupt = ranked_probe_is_corrupt(conn, "papertrail_fts")?;
+        // chunk_fts is CONTENTLESS: its own count(*) enumerates THROUGH docsize (measured), so
+        // row parity must come from the durable source the rebuild derives from. The other
+        // mirrors carry (or reference) their own content, where count(*) is docsize-independent.
+        let chunk_rows = "SELECT count(*) FROM main.chunks JOIN main.chunk_text ON \
+                          chunk_text.chunk_id = main.chunks.id";
+        let chunk_corrupt = ranked_probe_is_corrupt(conn, "chunk_fts", Some(chunk_rows))?;
+        let commit_corrupt = ranked_probe_is_corrupt(conn, "commit_fts", None)?;
+        let memory_corrupt = ranked_probe_is_corrupt(conn, "repo_memory_fts", None)?;
+        let papertrail_corrupt = ranked_probe_is_corrupt(conn, "papertrail_fts", None)?;
         if !(chunk_corrupt || commit_corrupt || memory_corrupt || papertrail_corrupt) {
             return Ok(outcome);
         }
@@ -299,14 +304,26 @@ pub(crate) fn fenced_when_autocommit(
     Ok(())
 }
 
-/// Probe one FTS mirror for the docsize corruption class with a query that EXECUTES rank — only
-/// rank/bm25 decodes docsize, which both `PRAGMA integrity_check` and FTS5's own
-/// `'integrity-check'` miss. The probe term is a REAL term pulled from the mirror's own
-/// `fts5vocab`, so the ranked read matches at least one indexed row regardless of the corpus
-/// alphabet (an ASCII-prefix disjunction goes blind on a corpus of non-ASCII-leading tokens —
-/// review finding on #675). An empty mirror has no terms and probes clean, which is right
-/// (nothing ranks it); a vocab read that itself hits corruption counts as corrupt.
-fn ranked_probe_is_corrupt(conn: &rusqlite::Connection, table: &str) -> anyhow::Result<bool> {
+/// Probe one FTS mirror for the docsize corruption class. Two complementary reads, both cheap
+/// relative to the explicit-heal/preflight contexts this runs in (never per-query):
+///
+/// 1. A query that EXECUTES rank on a REAL term sampled from the mirror's own `fts5vocab` — only
+///    rank/bm25 decodes docsize AND the shared averages record, and both `PRAGMA integrity_check`
+///    and FTS5's own `'integrity-check'` miss that class. A real term matches at least one indexed
+///    row regardless of the corpus alphabet (an ASCII-prefix disjunction goes blind on
+///    non-ASCII-leading tokens).
+/// 2. A full scan of the `<table>_docsize` shadow itself — docsize is PER ROW, so the sampled rank
+///    read proves only its matched row; the scan checks row-count parity with the index and varint
+///    well-formedness of every blob, catching corruption on rows the sample never ranks.
+///
+/// An empty mirror has no terms and probes clean, which is right (nothing ranks it); any probe
+/// read that itself hits corruption counts as corrupt. A false positive only costs one lossless
+/// rebuild.
+fn ranked_probe_is_corrupt(
+    conn: &rusqlite::Connection,
+    table: &str,
+    index_rows_sql: Option<&str>,
+) -> anyhow::Result<bool> {
     let vocab = format!("probe_vocab_{table}");
     let map_corrupt = |err: rusqlite::Error| -> anyhow::Result<bool> {
         let err: anyhow::Error = err.into();
@@ -332,9 +349,67 @@ fn ranked_probe_is_corrupt(conn: &rusqlite::Connection, table: &str) -> anyhow::
     let phrase = format!("\"{}\"", term.replace('"', "\"\""));
     let sql = format!("SELECT rowid FROM {table} WHERE {table} MATCH ?1 ORDER BY rank LIMIT 1");
     match conn.query_row(&sql, [phrase.as_str()], |_| Ok(())) {
-        Ok(()) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-        Err(err) => map_corrupt(err),
+        Ok(()) | Err(rusqlite::Error::QueryReturnedNoRows) => {},
+        Err(err) => return map_corrupt(err),
     }
+    docsize_shadow_is_corrupt(conn, table, index_rows_sql)
+}
+
+/// The per-row half of the probe: every `<table>_docsize` row must exist (count parity against
+/// `index_rows_sql` — the durable source for a CONTENTLESS mirror, whose own count(*) enumerates
+/// THROUGH docsize and would compare the shadow to itself; the mirror's own content-derived
+/// count otherwise) and hold exactly one well-formed varint per indexed column. bm25 decodes
+/// exactly this on demand, so a row failing here is a ranked query waiting to fail.
+fn docsize_shadow_is_corrupt(
+    conn: &rusqlite::Connection,
+    table: &str,
+    index_rows_sql: Option<&str>,
+) -> anyhow::Result<bool> {
+    let columns: usize =
+        conn.query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}')"), [], |row| {
+            row.get::<_, i64>(0).map(|n| n as usize)
+        })?;
+    let count_sql =
+        index_rows_sql.map_or_else(|| format!("SELECT count(*) FROM {table}"), String::from);
+    let index_rows: i64 = match conn.query_row(&count_sql, [], |row| row.get(0)) {
+        Ok(rows) => rows,
+        Err(err) => {
+            let err: anyhow::Error = err.into();
+            return if error_is_fts_corruption(&err) { Ok(true) } else { Err(err) };
+        },
+    };
+    let shadow_rows: i64 =
+        conn.query_row(&format!("SELECT count(*) FROM {table}_docsize"), [], |row| row.get(0))?;
+    if index_rows != shadow_rows {
+        return Ok(true);
+    }
+    let mut stmt = conn.prepare(&format!("SELECT sz FROM {table}_docsize"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let blob: Vec<u8> = row.get(0)?;
+        if !blob_is_exactly_n_varints(&blob, columns) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `blob` is exactly `n` SQLite varints, no more, no less — the docsize row format (one
+/// per indexed column).
+fn blob_is_exactly_n_varints(blob: &[u8], n: usize) -> bool {
+    let mut offset = 0usize;
+    for _ in 0..n {
+        let mut len = 0usize;
+        loop {
+            let Some(byte) = blob.get(offset + len) else { return false };
+            len += 1;
+            if byte & 0x80 == 0 || len == 9 {
+                break;
+            }
+        }
+        offset += len;
+    }
+    offset == blob.len()
 }
 
 /// What one FTS corruption sweep did: the mirrors rebuilt, and the corrupt mirrors whose
@@ -467,20 +542,78 @@ mod probe_tests {
              \u{691c}\u{67fb}');",
         )
         .unwrap();
-        assert!(!ranked_probe_is_corrupt(&conn, "probe_t").unwrap(), "intact mirror probes clean");
+        assert!(
+            !ranked_probe_is_corrupt(&conn, "probe_t", None).unwrap(),
+            "intact mirror probes clean"
+        );
         conn.execute_batch("DELETE FROM probe_t_docsize").unwrap();
         assert!(
-            ranked_probe_is_corrupt(&conn, "probe_t").unwrap(),
+            ranked_probe_is_corrupt(&conn, "probe_t", None).unwrap(),
             "a real vocab term ranks the corpus regardless of alphabet — an ASCII-prefix probe \
              reports this corrupt mirror healthy"
         );
+    }
+
+    /// docsize is PER ROW: corrupting a row the sampled term never matches must still be
+    /// caught — this is the class the LIMIT-1 rank read alone cannot see.
+    #[test]
+    fn per_row_corruption_outside_the_sampled_row_is_still_detected() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE probe_t USING fts5(body, content='', contentless_delete=1);
+             INSERT INTO probe_t(rowid, body) VALUES (1, 'aardvark aardvark aardvark');
+             INSERT INTO probe_t(rowid, body) VALUES (2, 'zebra');",
+        )
+        .unwrap();
+        assert!(!ranked_probe_is_corrupt(&conn, "probe_t", None).unwrap());
+        // Malform row 2's blob only: the vocab sample ('aardvark' sorts first) ranks row 1 and
+        // passes; the shadow scan must flag the truncated varint on row 2.
+        conn.execute("UPDATE probe_t_docsize SET sz = x'FF' WHERE id = 2", []).unwrap();
+        assert!(
+            ranked_probe_is_corrupt(&conn, "probe_t", None).unwrap(),
+            "a malformed blob on an unranked row is a ranked query waiting to fail"
+        );
+    }
+
+    /// Count parity needs a docsize-INDEPENDENT row source: a contentless mirror's own count(*)
+    /// enumerates through docsize (comparing the shadow to itself), so the caller supplies the
+    /// durable source; content-carrying mirrors use their own count.
+    #[test]
+    fn a_missing_single_docsize_row_is_detected_by_count_parity() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE src(id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO src VALUES (1, 'alpha'), (2, 'beta');
+             CREATE VIRTUAL TABLE probe_t USING fts5(body, content='', contentless_delete=1);
+             INSERT INTO probe_t(rowid, body) SELECT id, body FROM src;",
+        )
+        .unwrap();
+        let rows = Some("SELECT count(*) FROM src");
+        assert!(!ranked_probe_is_corrupt(&conn, "probe_t", rows).unwrap());
+        conn.execute("DELETE FROM probe_t_docsize WHERE id = 2", []).unwrap();
+        assert!(
+            ranked_probe_is_corrupt(&conn, "probe_t", rows).unwrap(),
+            "a vanished docsize row (invisible to the mirror's own scans) fails parity against \
+             the durable source"
+        );
+    }
+
+    #[test]
+    fn varint_shape_validation_is_exact() {
+        assert!(blob_is_exactly_n_varints(&[0x05], 1), "one small varint");
+        assert!(blob_is_exactly_n_varints(&[0x81, 0x05], 1), "two-byte varint");
+        assert!(blob_is_exactly_n_varints(&[0x05, 0x07], 2), "two columns");
+        assert!(!blob_is_exactly_n_varints(&[0xFF], 1), "truncated continuation");
+        assert!(!blob_is_exactly_n_varints(&[0x05, 0x07], 1), "trailing bytes");
+        assert!(!blob_is_exactly_n_varints(&[], 1), "missing varint");
+        assert!(blob_is_exactly_n_varints(&[], 0), "zero columns, empty blob");
     }
 
     #[test]
     fn an_empty_mirror_probes_clean() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE VIRTUAL TABLE probe_t USING fts5(body, content='')").unwrap();
-        assert!(!ranked_probe_is_corrupt(&conn, "probe_t").unwrap());
+        assert!(!ranked_probe_is_corrupt(&conn, "probe_t", None).unwrap());
     }
 }
 
