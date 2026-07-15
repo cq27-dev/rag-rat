@@ -378,7 +378,7 @@ By default every repo's index and memories live in **one consolidated database p
 (`$XDG_DATA_HOME/rag-rat/rag-rat.sqlite`; override with `RAG_RAT_DATA_DIR`), so a deleted checkout or
 `git clean -fdx` no longer loses your authored memories. Set an explicit `[index] database` to keep a
 repo on its own file (deprecated), and run `rag-rat consolidate` to import a pre-existing
-`.rag-rat/index.sqlite` into the global store — see [docs/config.md](docs/config.md#database-location-index-database).
+`.rag-rat/index.sqlite` into the global store — see [docs/config/database.md](docs/config/database.md).
 
 ## <a id="output"></a>Output format
 
