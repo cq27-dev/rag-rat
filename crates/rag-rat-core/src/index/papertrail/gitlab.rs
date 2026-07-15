@@ -23,22 +23,28 @@ use super::*;
 const LIST_BACKFILL_STREAM: &str = "list_backfill";
 const LIST_DELTA_STREAM: &str = "list_delta";
 
-/// Continuation across the two chained list legs of one items request. Persisted opaquely inside
+/// Continuation across the two PARALLEL list legs of one items stream. Persisted opaquely inside
 /// [`PageCursor::provider_state`]; the mirror never interprets it.
+///
+/// Both legs advance together — every page fetch pulls one page from EACH still-pending leg and
+/// emits the merged items — so the mirror's first-page frontier (`max updated_at` of the scan's
+/// first page) covers BOTH iid namespaces. Chaining the legs sequentially instead would leave
+/// the merge-request maximum out of the persisted high watermark and replay the same merge
+/// requests on every delta scan.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ListContinuation {
-    #[serde(default)]
-    leg: ListLeg,
+    /// Next-page URL per leg; `None` = drained. (A continuation only exists after the first
+    /// fetch, so `None` never means "not started".)
+    issues_next: Option<String>,
+    merge_requests_next: Option<String>,
     /// Oldest `updated_at` consumed across BOTH legs of this backfill cycle — the provider-
     /// confirmed strict boundary reported when the cycle completes. Descending below the global
     /// minimum (not the last page's) keeps the next cycle from re-walking the older leg's tail.
     oldest: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListLeg {
-    #[default]
     Issues,
     MergeRequests,
 }
@@ -161,24 +167,22 @@ impl GitLabClient {
         Ok(url.into())
     }
 
-    /// The follow-up cursor entering `leg` of the same logical request, first page.
-    fn leg_entry_cursor(
+    /// One page from one leg: the mapped items plus the leg's next-page URL, if any.
+    async fn leg_page(
         &self,
         project: &str,
+        url: &str,
         leg: ListLeg,
-        cursor: &PageCursor,
-        state: &ListContinuation,
-    ) -> anyhow::Result<PageCursor> {
-        Ok(PageCursor {
-            stream: cursor.stream.clone(),
-            updated_since: cursor.updated_since.clone(),
-            updated_before: cursor.updated_before.clone(),
-            page_token: Some(self.list_url(project, leg, cursor)?),
-            provider_state: Some(serde_json::to_string(&ListContinuation {
-                leg,
-                oldest: state.oldest.clone(),
-            })?),
-        })
+    ) -> anyhow::Result<(Vec<PapertrailItem>, Option<String>)> {
+        let (value, next_url) = self.get_json(url).await?;
+        let values = value.as_array().ok_or_else(|| {
+            anyhow::anyhow!("GitLab {} response is not an array", leg.path_segment())
+        })?;
+        let mut items = Vec::with_capacity(values.len());
+        for value in values {
+            items.push(item_from_gitlab_value(project, leg.item_kind(), value)?);
+        }
+        Ok((items, next_url))
     }
 }
 
@@ -280,23 +284,36 @@ impl PapertrailClient for GitLabClient {
             anyhow::bail!("an item page cannot be both delta and backfill");
         }
         let backfill = cursor.updated_before.is_some();
+        // Resume from the persisted continuation, or open BOTH legs' first pages.
         let mut state = match cursor.provider_state.as_deref() {
             Some(state) => serde_json::from_str::<ListContinuation>(state)?,
-            None => ListContinuation::default(),
+            None => ListContinuation {
+                issues_next: Some(self.list_url(project, ListLeg::Issues, cursor)?),
+                merge_requests_next: Some(self.list_url(
+                    project,
+                    ListLeg::MergeRequests,
+                    cursor,
+                )?),
+                oldest: None,
+            },
         };
-        let url = match cursor.page_token.clone() {
-            Some(next) => next,
-            None => self.list_url(project, state.leg, cursor)?,
-        };
-        let (value, next_url) = self.get_json(&url).await?;
-        let values = value.as_array().ok_or_else(|| {
-            anyhow::anyhow!("GitLab {} response is not an array", state.leg.path_segment())
-        })?;
-        let kind = state.leg.item_kind();
-        let mut items = Vec::with_capacity(values.len());
-        for value in values {
-            items.push(item_from_gitlab_value(project, kind, value)?);
+        let mut items = Vec::new();
+        if let Some(url) = state.issues_next.take() {
+            let (page, next) = self.leg_page(project, &url, ListLeg::Issues).await?;
+            items.extend(page);
+            state.issues_next = next;
         }
+        if let Some(url) = state.merge_requests_next.take() {
+            let (page, next) = self.leg_page(project, &url, ListLeg::MergeRequests).await?;
+            items.extend(page);
+            state.merge_requests_next = next;
+        }
+        // Keep the emitted page ordered like its legs (mirror correctness is order-agnostic;
+        // ordering keeps pages legible in logs and tests).
+        items.sort_by(|left, right| {
+            let ordering = left.updated_at.cmp(&right.updated_at);
+            if backfill { ordering.reverse() } else { ordering }
+        });
         if backfill
             && let Some(oldest) = items.iter().filter_map(|item| item.updated_at.clone()).min()
         {
@@ -306,25 +323,19 @@ impl PapertrailClient for GitLabClient {
             };
         }
         let stream = if backfill { LIST_BACKFILL_STREAM } else { LIST_DELTA_STREAM };
-        let next = if let Some(page_token) = next_url {
-            // More pages in the current leg.
-            Some(PageCursor {
+        let pending = [state.issues_next.as_deref(), state.merge_requests_next.as_deref()];
+        let next = match pending.iter().flatten().next() {
+            Some(token) => Some(PageCursor {
                 stream: Some(stream.to_string()),
                 updated_since: cursor.updated_since.clone(),
                 updated_before: cursor.updated_before.clone(),
-                page_token: Some(page_token),
+                // A non-empty token marks every continuation page as NOT the scan's first page
+                // (the mirror's conservative-frontier logic keys off that); the authoritative
+                // state is the full per-leg continuation.
+                page_token: Some((*token).to_string()),
                 provider_state: Some(serde_json::to_string(&state)?),
-            })
-        } else if state.leg == ListLeg::Issues {
-            // Issues leg drained below the cutoff — chain into the merge-request leg of the SAME
-            // logical request. The consumed issues continuation dies here (a chained leg must
-            // never outlive its consumption).
-            let mut entry =
-                self.leg_entry_cursor(project, ListLeg::MergeRequests, cursor, &state)?;
-            entry.stream = Some(stream.to_string());
-            Some(entry)
-        } else {
-            None
+            }),
+            None => None,
         };
         // The cycle's provider-confirmed strict boundary: both legs drained fully below the
         // cutoff, so the global oldest consumed timestamp bounds everything this cycle stored.
@@ -419,11 +430,12 @@ impl PapertrailClient for GitLabClient {
                 (current, new) => current.or(new),
             };
         }
-        Ok(FreshnessResult {
-            latest: probe_advance(latest, probe.updated_since.as_deref()),
-            etag: probe.etag.clone(),
-            not_modified: false,
-        })
+        // GitLab has no probe validator (no shared ETag across the two namespace calls), so the
+        // timestamp comparison IS the quiet signal: the mirror keys the delta-scan decision off
+        // `not_modified`, and reporting quiet here is what keeps an idle project's poll at two
+        // 1-item requests instead of two full delta legs.
+        let latest = probe_advance(latest, probe.updated_since.as_deref());
+        Ok(FreshnessResult { not_modified: latest.is_none(), latest, etag: probe.etag.clone() })
     }
 }
 
@@ -705,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn backfill_chains_issue_and_merge_request_legs_and_reports_the_global_boundary() {
+    fn backfill_fetches_both_legs_in_parallel_and_reports_the_global_boundary() {
         let issues_page_one = format!(
             "[{},{}]",
             issue(20, "2026-01-10T00:00:00Z"),
@@ -718,8 +730,8 @@ mod tests {
                 StubResponse::ok(&issues_page_one),
                 "/api/v4/projects/g%2Fs%2Fr/issues?page=2",
             ),
-            StubResponse::ok(&issues_page_two),
             StubResponse::ok(&change_page),
+            StubResponse::ok(&issues_page_two),
         ]);
         let registry = GovernorRegistry::default();
         let client = client(base, &registry);
@@ -729,46 +741,46 @@ mod tests {
             ..PageCursor::default()
         };
         let first = block_on(client.items_page("g/s/r", &cursor)).unwrap();
-        assert_eq!(first.items.len(), 2);
-        assert!(first.items.iter().all(|item| item.item_kind == ItemKind::Issue));
+        // BOTH legs' first pages arrive in the scan's first page, merged newest-first, so the
+        // mirror's initial high mark covers both iid namespaces.
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| (item.item_kind, item.item_key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(ItemKind::Issue, "20"), (ItemKind::ChangeRequest, "7"), (ItemKind::Issue, "19"),]
+        );
         assert_eq!(first.backfill_boundary, None, "mid-cycle pages report no boundary");
-        cursor = first.next.expect("issues page two pending");
-        assert!(cursor.page_token.as_deref().unwrap().contains("/issues?page=2"));
+        cursor = first.next.expect("the issues leg still has a page");
+        assert!(cursor.page_token.is_some(), "continuations must not look like first pages");
 
         let second = block_on(client.items_page("g/s/r", &cursor)).unwrap();
         assert_eq!(second.items.len(), 1);
-        assert_eq!(second.backfill_boundary, None, "the merge-request leg has not run yet");
-        cursor = second.next.expect("the merge-request leg must chain");
-        let entry = cursor.page_token.as_deref().unwrap();
-        assert!(entry.contains("/merge_requests?"), "{entry}");
-        assert!(
-            entry.contains("sort=desc") && entry.contains("updated_before=2026-02-01"),
-            "{entry}"
-        );
-
-        let third = block_on(client.items_page("g/s/r", &cursor)).unwrap();
-        assert_eq!(third.items.len(), 1);
-        assert_eq!(third.items[0].item_kind, ItemKind::ChangeRequest);
-        assert!(third.next.is_none(), "both legs drained");
+        assert_eq!(second.items[0].item_key, "18");
+        assert!(second.next.is_none(), "both legs drained");
         assert_eq!(
-            third.backfill_boundary.as_deref(),
+            second.backfill_boundary.as_deref(),
             Some("2026-01-03T00:00:00Z"),
             "the boundary is the GLOBAL oldest across both legs, not the last page's"
         );
 
         let heads = handle.join().unwrap();
+        assert_eq!(heads.len(), 3);
         assert!(
             heads[0].contains("/issues?order_by=updated_at&per_page=100&sort=desc"),
             "{}",
             heads[0]
         );
         assert!(heads[0].contains("updated_before=2026-02-01"), "{}", heads[0]);
-        assert!(heads[2].contains("/merge_requests?"), "{}", heads[2]);
+        assert!(heads[1].contains("/merge_requests?"), "{}", heads[1]);
+        assert!(heads[1].contains("updated_before=2026-02-01"), "{}", heads[1]);
+        assert!(heads[2].contains("/issues?page=2"), "{}", heads[2]);
     }
 
     #[test]
     fn an_empty_project_backfill_terminates_with_the_done_shape() {
-        let (base, _handle) =
+        let (base, handle) =
             spawn_script_stub(vec![StubResponse::ok("[]"), StubResponse::ok("[]")]);
         let registry = GovernorRegistry::default();
         let client = client(base, &registry);
@@ -777,18 +789,18 @@ mod tests {
             updated_before: Some("2026-02-01T00:00:00Z".to_string()),
             ..PageCursor::default()
         };
-        let first = block_on(client.items_page("g/s/r", &cursor)).unwrap();
-        assert!(first.items.is_empty());
-        let chained = first.next.expect("the empty issues leg still chains to merge requests");
-
-        let second = block_on(client.items_page("g/s/r", &chained)).unwrap();
-        assert!(second.items.is_empty());
-        assert!(second.next.is_none());
-        assert!(second.backfill_boundary.is_none(), "nothing consumed = the mirror's done shape");
+        let page = block_on(client.items_page("g/s/r", &cursor)).unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next.is_none());
+        assert!(page.backfill_boundary.is_none(), "nothing consumed = the mirror's done shape");
+        assert_eq!(handle.join().unwrap().len(), 2, "one page per leg, no extra cycles");
     }
 
+    /// The high-watermark half of the parallel-leg contract: the delta scan's FIRST page must
+    /// contain both namespaces, or the persisted frontier misses whichever namespace is newer
+    /// and replays it on every scan.
     #[test]
-    fn delta_ascends_with_updated_after_and_chains_both_legs() {
+    fn delta_merges_both_namespaces_into_the_scan_first_page() {
         let issues = format!("[{}]", issue(21, "2026-01-11T00:00:00Z"));
         let changes = format!("[{}]", merge_request(8, "2026-01-12T00:00:00Z"));
         let (base, handle) =
@@ -800,15 +812,19 @@ mod tests {
             updated_since: Some("2026-01-09T00:00:00Z".to_string()),
             ..PageCursor::default()
         };
-        let first = block_on(client.items_page("g/s/r", &cursor)).unwrap();
-        assert_eq!(first.items[0].item_kind, ItemKind::Issue);
-        let chained = first.next.expect("delta chains into merge requests too");
-        assert_eq!(chained.updated_since.as_deref(), Some("2026-01-09T00:00:00Z"));
-
-        let second = block_on(client.items_page("g/s/r", &chained)).unwrap();
-        assert_eq!(second.items[0].item_kind, ItemKind::ChangeRequest);
-        assert!(second.next.is_none());
-        assert!(second.backfill_boundary.is_none(), "delta never reports a backfill boundary");
+        let page = block_on(client.items_page("g/s/r", &cursor)).unwrap();
+        assert_eq!(
+            page.items.iter().map(|item| item.item_kind).collect::<Vec<_>>(),
+            vec![ItemKind::Issue, ItemKind::ChangeRequest],
+            "ascending merge, both namespaces present"
+        );
+        assert_eq!(
+            page.items.iter().filter_map(|item| item.updated_at.as_deref()).max(),
+            Some("2026-01-12T00:00:00Z"),
+            "the first-page maximum covers the newer namespace"
+        );
+        assert!(page.next.is_none());
+        assert!(page.backfill_boundary.is_none(), "delta never reports a backfill boundary");
 
         let heads = handle.join().unwrap();
         for head in &heads {
@@ -842,6 +858,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(quiet.latest, None, "at-or-before the cursor must stay quiet");
+        assert!(
+            quiet.not_modified,
+            "quiet must be reported in the flag the mirror keys the delta decision off, or an \
+             idle project pays two full delta legs every poll"
+        );
 
         let heads = handle.join().unwrap();
         assert!(heads[0].contains("per_page=1"), "{}", heads[0]);
@@ -882,16 +903,14 @@ mod tests {
 
     #[test]
     fn cross_origin_pagination_is_rejected_before_following_it() {
-        let (base, handle) = spawn_script_stub(vec![with_next_link(
-            StubResponse::ok(&format!("[{}]", issue(1, "2026-01-05T00:00:00Z"))),
-            "",
-        )]);
-        // Rewrite the next link to a foreign origin AFTER stub substitution.
+        let (base, handle) = spawn_script_stub(Vec::new());
         let registry = GovernorRegistry::default();
         let client = client(base, &registry);
+        let foreign = "https://gitlab.com/api/v4/projects/g%2Fs%2Fr/issues?page=2";
         let cursor = PageCursor {
             updated_before: Some("2026-02-01T00:00:00Z".to_string()),
-            page_token: Some("https://gitlab.com/api/v4/projects/g%2Fs%2Fr/issues".to_string()),
+            page_token: Some(foreign.to_string()),
+            provider_state: Some(format!(r#"{{"issues_next":"{foreign}"}}"#)),
             ..PageCursor::default()
         };
         let error = block_on(client.items_page("g/s/r", &cursor)).unwrap_err();
