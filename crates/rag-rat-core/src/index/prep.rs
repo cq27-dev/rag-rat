@@ -149,6 +149,220 @@ pub(crate) fn collect_changed_index_files(
     Ok(files)
 }
 
+/// Build the `(files, changes)` for an EXPLICIT candidate path list — the `index --paths` entry
+/// point (#659). Unlike [`collect_changed_index_files`] + a raw [`GitChangedPaths`], the explicit
+/// list can name CLEAN / already-committed files (a caller — a git hook, an agent edit hook — knows
+/// what it touched, so this "also sees committed changes" the git-status walk misses). So it does
+/// NOT put every supplied file in `changed`: it builds an `IndexFile` for every supplied indexable
+/// path, but `changed` holds ONLY the DIRTY subset (cross-referenced against the actual git
+/// status), because [`IndexDatabase::assign_file_scopes`] reads `changed` as "working-tree dirt" —
+/// a clean file left OUT of `changed` is correctly scoped to the COMMITTED scope, not shadowed by
+/// an overlay row. Each supplied path (absolute, or already `config.root`-relative) is:
+///  1. normalized to a `config.root`-relative path — dropped if NOT under `config.root` (a
+///     linked-worktree edit is routed to the overlay path by the caller, not fed here) or if it
+///     escapes the tree once symlinks and `..` are resolved (see [`resolves_within_root`] — a
+///     lexical check alone accepts both `<root>/src/../../outside.rs` and a path through an in-repo
+///     symlink pointing outside);
+///  2. dropped if ignored by the repo's `.gitignore` rules + floor, or not a configured target;
+///  3. an existing target FILE becomes an `IndexFile` (content hash decides staleness downstream,
+///     so an unchanged path is a no-op), added to `changed` ONLY if git status reports it dirty; a
+///     path that no longer exists goes to `deleted` (tombstoned, keyed by path+scope — a no-op if
+///     it was never indexed).
+pub(crate) fn explicit_index_files_and_changes(
+    db: &IndexDatabase,
+    config: &Config,
+    paths: &[PathBuf],
+) -> anyhow::Result<(Vec<IndexFile>, GitChangedPaths, bool)> {
+    let has_base_commit = !db.active_commit_sha.is_empty();
+    let target_dirs = config.target_directories();
+    let ignore = crate::index::ignore_rules::IgnoreMatcher::compile(&config.root, &target_dirs);
+    // The actual working-tree-dirty set: a supplied path is overlay-scoped ONLY if it is genuinely
+    // dirt here; a supplied CLEAN/committed path is left out of `changed` → committed-scoped.
+    //
+    // Whether a git-status FAILURE is fatal depends on whether a base commit exists. WITH a base
+    // commit, `assign_file_scopes` uses this set to split dirty vs committed, so an empty set from
+    // a swallowed error would misclassify a DIRTY supplied file as clean and write its
+    // uncommitted bytes into the committed scope — corruption; PROPAGATE (`?`). WITHOUT a base
+    // commit (a non-git or unborn checkout, where `git_changed_paths` errors on discovery),
+    // `assign_file_scopes` scopes EVERY file as working-tree dirt regardless of this set, so
+    // the classification is moot — tolerate the error.
+    let dirty = if has_base_commit {
+        crate::index::git_changed_paths(&config.root)?
+    } else {
+        crate::index::git_changed_paths(&config.root).unwrap_or_default()
+    };
+    let canonical_root = config.root.canonicalize().unwrap_or_else(|_| config.root.clone());
+    let mut files = Vec::new();
+    let mut changes = GitChangedPaths::default();
+    // Whether a supplied path is a `Cargo.toml` (present, or a real deletion) — the package-map
+    // refresh signal. A manifest is not itself a target file, so it never reaches `files`; the
+    // signal must be carried out separately (crate names / path-deps must refresh even for a
+    // CLEAN/committed manifest named on the command line — #659 review).
+    let mut manifest_in_change_set = false;
+    for path in paths {
+        let raw_relative = if path.is_absolute() {
+            match path.strip_prefix(&config.root) {
+                Ok(relative) => relative.to_path_buf(),
+                // A LEXICAL strip fails when the caller spells the path (or the checkout root)
+                // through a DIFFERENT symlink than `config.root` (macOS `/tmp` vs `/private/tmp`,
+                // a symlinked editor `$PWD`), even for a file genuinely inside the checkout. Retry
+                // against the CANONICAL root before giving up, so the valid edit is not silently
+                // dropped; a strip that still fails is a real outside / linked-worktree path the
+                // caller routes elsewhere (#659 review).
+                Err(_) => {
+                    let Some(relative) =
+                        canonicalize_nearest_ancestor(path).and_then(|canonical| {
+                            canonical.strip_prefix(&canonical_root).ok().map(Path::to_path_buf)
+                        })
+                    else {
+                        continue;
+                    };
+                    relative
+                },
+            }
+        } else {
+            path.clone()
+        };
+        // NORMALIZE the relative path (resolve `.` / `..` lexically) BEFORE it is used for target
+        // matching, dirty-status lookup, and the persisted `files.path` key — the raw spelling
+        // would otherwise let `src/../outside.rs` match the `src` target while resolving
+        // elsewhere, or `src/../src/a.rs` miss its `dirty.changed` entry and write under a
+        // duplicate key. `None` means the path escaped the root via `..`; skip it.
+        let Some(relative) = lexically_normalized_within_root(&raw_relative) else {
+            continue;
+        };
+        let full_path = config.root.join(&relative);
+        // Containment: the path must stay under the root after resolving SYMLINKS (lexical
+        // normalization can't see them) — a path through an in-repo symlink pointing outside
+        // (`src/link/foo.rs`, `link` → /outside) resolves outside and would make `prepare_files`
+        // read an external file. Like the symlink/ignore skips below, an out-of-root path must NOT
+        // be INDEXED, but must NOT short-circuit the deletion branch either: a regular file
+        // REPLACED by an outside-pointing symlink must still TOMBSTONE its stale row (a
+        // discover pass would drop it). So fold containment into `is_present` rather than
+        // `continue`ing; a never-indexed outside path stays a no-op (#659 review).
+        let within_root = resolves_within_root(&full_path, &canonical_root);
+        // Match the walker (`walker::walk_dir`), which SKIPS a symlink ENTRY and never descends
+        // into it: a supplied path that crosses a symlink at ANY component — the leaf
+        // (`src/link.rs`) OR an ancestor directory (`src/link/a.rs`, `src/link` → another
+        // in-repo dir) — is likewise not indexable, or `index --paths` writes an index row
+        // under a symlink spelling a full/discover pass never produces (a duplicate of the
+        // real file's row). `symlink_metadata` per ancestor does NOT follow, so it catches
+        // a symlinked component; a missing leaf simply isn't a symlink. `relative` is
+        // lexically normalized (Normal components only), so walking it from the root
+        // reconstructs the real ancestor chain (#659 review).
+        let mut probe = config.root.clone();
+        let crosses_symlink = relative.components().any(|component| {
+            probe.push(component);
+            probe.symlink_metadata().is_ok_and(|meta| meta.file_type().is_symlink())
+        });
+        // A path that ESCAPES the root, CROSSES a symlink, or is not a regular file is NOT
+        // indexable; an existing indexed row for one (a regular file since replaced by a
+        // symlink, in- or out-of-repo) still falls through to the deletion branch below and
+        // is TOMBSTONED, while an unindexed such path stays a no-op. `within_root`
+        // short-circuits before `is_file` (which follows symlinks), so an escaping
+        // symlink's external target is never even stat'd.
+        let is_present = within_root && !crosses_symlink && full_path.is_file();
+        // Gate ignore on PRESENCE (dir-ness `false` is sound for the floor's component-name check
+        // and for file globs — matches the watcher's classifier). An IGNORED path is never INDEXED
+        // (the walker skips it), but a MISSING, previously-indexed path must still fall through to
+        // the deletion branch below and be TOMBSTONED even if its path now matches an ignore rule:
+        // the file is gone, so a discover pass would remove the stale row, and the ignore rule does
+        // not resurrect it (`index --paths src/gen/a.rs` after deleting an indexed file under a
+        // now-ignored dir). A PRESENT file that just became ignored is a SEMANTIC deletion Paths
+        // defers to discovery — a `.gitignore` edit fires a discover pass — matching Changed's
+        // fs-deletion-only posture (#659 review).
+        if is_present && ignore.is_ignored(&full_path, false) {
+            continue;
+        }
+        // A supplied `Cargo.toml` signals a package-map refresh whether it is present
+        // (added/edited) or MISSING (deleted) — it is not a source target, so it flows no
+        // further than this signal. NOT gated on a git-confirmed deletion: an UNTRACKED or
+        // NON-GIT manifest that was scanned into `packages` and then deleted is reported by
+        // neither git status nor a `files` row, yet the caller explicitly NAMED it, so its
+        // stale package/import rows must still be re-scanned (#659 review). Harmless for a
+        // typo'd nonexistent path — `refresh_packages` just re-scans and writes back the
+        // same rows; this is the one-shot `index --paths` CLI path (never the
+        // idle watcher), so an occasional redundant refresh is fine.
+        if relative.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+            manifest_in_change_set = true;
+        }
+        if is_present {
+            let Some((language, kind)) = target_for_path(config, &relative) else {
+                continue; // wrong extension / outside a configured target directory
+            };
+            if dirty.changed.contains(&relative) {
+                changes.changed.insert(relative.clone());
+            }
+            files.push(IndexFile {
+                full_path,
+                relative_path: relative,
+                language,
+                kind,
+                commit_sha: String::new(),
+                worktree_id: String::new(),
+            });
+        } else if dirty.deleted.contains(&relative) || db.path_has_indexed_row(&relative)? {
+            // Tombstone a vanished path ONLY when it was really indexed (git-confirmed deletion, or
+            // an existing indexed row). A never-indexed typo / out-of-target temp file must not get
+            // a spurious `kind='deleted'` overlay row, which would shadow a real
+            // committed file that later appears at that path (#659 review).
+            changes.deleted.insert(relative);
+        }
+    }
+    Ok((files, changes, manifest_in_change_set))
+}
+
+/// Lexically resolve `.` / `..` in a `config.root`-relative path, returning `None` if it escapes
+/// the root (a leading/interior `..` that pops above the root) or is not relative. This is
+/// symlink-blind (a symlink escape is caught separately by [`resolves_within_root`]); its job is to
+/// produce the CANONICAL RELATIVE SPELLING used for target/dirty/persistence so `src/../src/a.rs`
+/// collapses to `src/a.rs` and `src/../outside.rs` to `outside.rs` (then dropped by the target
+/// filter).
+fn lexically_normalized_within_root(relative: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => out.push(name),
+            std::path::Component::CurDir => {},
+            std::path::Component::ParentDir =>
+                if !out.pop() {
+                    return None; // escaped above the root
+                },
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Whether `full_path` stays under `canonical_root` after resolving `..` and symlinks. Rejects both
+/// `..`-escapes and in-repo-symlink escapes; the lexical prefix check alone would accept both.
+/// Rejects a path where nothing on the chain resolves (containment unverifiable).
+fn resolves_within_root(full_path: &Path, canonical_root: &Path) -> bool {
+    canonicalize_nearest_ancestor(full_path)
+        .is_some_and(|canonical| canonical.starts_with(canonical_root))
+}
+
+/// Canonicalize `path` by canonicalizing its nearest EXISTING ancestor (the file — or even its
+/// parent dir — may be gone in a deletion, or not yet created) and re-appending the missing suffix,
+/// so the result is SYMLINK-RESOLVED even for a path that doesn't exist. `None` when nothing on the
+/// ancestor chain canonicalizes (effectively unreachable for a real absolute path — the filesystem
+/// root always resolves). Shared by containment ([`resolves_within_root`]), the absolute-path
+/// rebase in [`explicit_index_files_and_changes`] (a symlinked checkout-root spelling must compare
+/// canonically or a valid in-repo edit is dropped), and the worktree routing in `watch::overlay`.
+pub(crate) fn canonicalize_nearest_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    loop {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            let suffix = path.strip_prefix(ancestor).unwrap_or_else(|_| Path::new(""));
+            return Some(canonical.join(suffix));
+        }
+        match ancestor.parent() {
+            Some(parent) if parent != ancestor => ancestor = parent,
+            _ => return None,
+        }
+    }
+}
+
 pub(crate) fn spawn_git_history_prepare(
     root: &Path,
 ) -> JoinHandle<anyhow::Result<git_history::PreparedGitHistory>> {

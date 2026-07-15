@@ -34,7 +34,31 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        Self::index_incremental_with_progress(config, IndexMode::Changed, &mut progress)
+        Self::index_incremental_with_progress(config, IndexMode::Changed, None, &mut progress)
+            .map(|(db, _)| db)
+    }
+
+    /// Reconcile exactly the supplied candidate `paths` (#659) — the edit-driven-reindex substrate.
+    /// Like [`Self::index_changed`], but the change set is the explicit list rather than a
+    /// git-status walk (so it also sees committed changes), filtered through the same
+    /// ignore/target rules and content-hash staleness; ignored / out-of-target / unchanged
+    /// paths are no-ops, and a supplied path that no longer exists is tombstoned. Same per-repo
+    /// `WriteLock` and #427 first-time-empty deferral as the other modes. Paths must be under
+    /// `config.root`; a linked-worktree edit is routed to the overlay path by the caller (see
+    /// the CLI `index --paths`).
+    pub fn index_paths(config: &Config, paths: &[PathBuf]) -> anyhow::Result<Self> {
+        Self::index_paths_with_progress(config, paths, |_| {})
+    }
+
+    pub fn index_paths_with_progress<F>(
+        config: &Config,
+        paths: &[PathBuf],
+        mut progress: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnMut(IndexProgress),
+    {
+        Self::index_incremental_with_progress(config, IndexMode::Paths, Some(paths), &mut progress)
             .map(|(db, _)| db)
     }
 
@@ -46,7 +70,7 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        Self::index_incremental_with_progress(config, IndexMode::Discover, &mut progress)
+        Self::index_incremental_with_progress(config, IndexMode::Discover, None, &mut progress)
             .map(|(db, _)| db)
     }
 
@@ -54,21 +78,33 @@ impl IndexDatabase {
     /// (a file was added / edited / removed). The watch loop uses this to skip the
     /// reconcile / memory-validate tail on an idle no-change sweep (issue #63).
     pub fn index_discover_reporting(config: &Config) -> anyhow::Result<(Self, bool)> {
-        Self::index_incremental_with_progress(config, IndexMode::Discover, &mut |_| {})
+        Self::index_incremental_with_progress(config, IndexMode::Discover, None, &mut |_| {})
     }
 
     fn index_incremental_with_progress<F>(
         config: &Config,
         mode: IndexMode,
+        explicit_paths: Option<&[PathBuf]>,
         progress: &mut F,
     ) -> anyhow::Result<(Self, bool)>
     where
         F: FnMut(IndexProgress),
     {
-        if !config.database.exists() {
-            return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
-        }
-        if Self::migration_check(&config.database)?.state == schema::SchemaState::Missing {
+        // An absent / schemaless DB is bootstrapped by a FULL rebuild for the sweep-style modes
+        // (Changed / Discover) — but NOT for Paths (#659). `Paths` is a scoped reconcile whose
+        // whole contract is "touch exactly the supplied paths"; a full rebuild would index
+        // the entire repository instead, so a scoped pass on a not-yet-initialized index
+        // DEFERS (its caller — the CLI / an edit hook — surfaces `EmptyIndexRefused` as
+        // "run `rag-rat index` first"), exactly like the #427 first-time-empty deferral.
+        let uninitialized = !config.database.exists()
+            || Self::migration_check(&config.database)?.state == schema::SchemaState::Missing;
+        if uninitialized {
+            if mode == IndexMode::Paths {
+                return Err(crate::index::EmptyIndexRefused {
+                    root: config.root.display().to_string(),
+                }
+                .into());
+            }
             return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
 
@@ -162,6 +198,19 @@ impl IndexDatabase {
         let repo_generation_file_count =
             db.repo_generation_file_count(!active_base_scope_discovered)?;
         if repo_generation_file_count == 0 && !active_base_scope_discovered {
+            // A repo registered in a SHARED/global DB but not yet indexed reaches here with zero
+            // rows: another repo created the DB file (so the missing-DB/schema guard above passed)
+            // and this repo has files on disk (so the #427 first-time-empty check let it through).
+            // For the sweep modes that means "bootstrap it" — a full rebuild. But `Paths` must
+            // NEVER rebuild the WHOLE repository for a command like `index --paths
+            // src/a.rs`; it DEFERS exactly like the missing-DB case above, so the
+            // caller surfaces "run `rag-rat index` first" (#659 review).
+            if mode == IndexMode::Paths {
+                return Err(crate::index::EmptyIndexRefused {
+                    root: config.root.display().to_string(),
+                }
+                .into());
+            }
             return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
         // A commit advances HEAD before committed-scope rows have been stamped for it. Likewise, a
@@ -170,11 +219,21 @@ impl IndexDatabase {
         // and restamp the generation for the active HEAD/target fingerprint (#459 review).
         let active_scope_incomplete =
             !active_base_scope_discovered || scoped_file_count < repo_generation_file_count;
-        let effective_mode = if active_scope_incomplete && mode == IndexMode::Changed {
-            IndexMode::Discover
-        } else {
-            mode
-        };
+        // Both the git-status `Changed` mode AND the explicit-path `Paths` mode (#659) index only a
+        // subset; when the active base scope is INCOMPLETE — a commit advanced HEAD but the
+        // existing committed rows are still keyed to the old sha, or a target-set change
+        // staled the marker — that subset alone would leave every UNCHANGED file absent
+        // from the new scope, so queries would suddenly lose most of the repository.
+        // Promote to `Discover` (which restamps/carries the committed rows onto the current
+        // HEAD/target fingerprint, #459) to complete the scope; the named paths are a
+        // subset discovery already covers. On a COMPLETE scope, `Paths` keeps its scoped
+        // behavior.
+        let effective_mode =
+            if active_scope_incomplete && matches!(mode, IndexMode::Changed | IndexMode::Paths) {
+                IndexMode::Discover
+            } else {
+                mode
+            };
         progress(IndexProgress::Started {
             database: config.database.clone(),
             mode: effective_mode,
@@ -198,19 +257,21 @@ impl IndexDatabase {
         // is the work the audit found holding the writer lock for time proportional to repo
         // size (unbounded in Discover mode); hoisting it is the entire point of the patch.
         let prepare_started = std::time::Instant::now();
-        let prepared = match db.prepare_incremental_pass(config, effective_mode, progress) {
-            Ok(prepared) => prepared,
-            Err(err) => {
-                // Prepare failed off the lock (e.g. an unreadable changed file). JOIN the pending
-                // git-history worker before bailing, so its (possibly full `git log`) scan does not
-                // detach and keep burning CPU/IO after the failed pass — matching the pre-hoist
-                // error path, which joined the handle before returning.
-                if let Some(handle) = git_history_handle {
-                    let _ = join_git_history_prepare(handle);
-                }
-                return Err(err);
-            },
-        };
+        let prepared =
+            match db.prepare_incremental_pass(config, effective_mode, explicit_paths, progress) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    // Prepare failed off the lock (e.g. an unreadable changed file). JOIN the
+                    // pending git-history worker before bailing, so its
+                    // (possibly full `git log`) scan does not detach and keep
+                    // burning CPU/IO after the failed pass — matching the pre-hoist
+                    // error path, which joined the handle before returning.
+                    if let Some(handle) = git_history_handle {
+                        let _ = join_git_history_prepare(handle);
+                    }
+                    return Err(err);
+                },
+            };
         // Join the git-history prepare thread OUTSIDE the write lock too — a thread `join()` must
         // not sit inside `BEGIN IMMEDIATE`. The apply below still revalidates the append plan under
         // the lock, preserving the git-history freshness invariant.
@@ -572,6 +633,7 @@ impl IndexDatabase {
         &self,
         config: &Config,
         mode: IndexMode,
+        explicit_paths: Option<&[PathBuf]>,
         progress: &mut F,
     ) -> anyhow::Result<PreparedIncrementalPass>
     where
@@ -580,23 +642,36 @@ impl IndexDatabase {
         progress(IndexProgress::Discovering);
         match mode {
             // Changed mode never carries: it only sees working-tree dirt, and a stale base-scope
-            // marker promotes a HEAD move to Discover (#459), where the carry lives.
+            // marker promotes a HEAD move to Discover (#459), where the carry lives. Its change set
+            // is the git-status walk; `Paths` mode reuses the SAME preparation over an explicit
+            // caller-supplied list instead (#659), and likewise never carries.
             IndexMode::Changed => {
                 let changes = git_changed_paths(&config.root)?;
+                // `changes.changed` IS the full dirty set (git status), so a dirty `Cargo.toml` is
+                // already in it; `files` ⊆ `changes.changed`, so this is complete for Changed.
                 let manifest_in_change_set =
                     paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
                         || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path));
                 let files = collect_changed_index_files(config, &changes)?;
-                let files = self.assign_file_scopes(files, &changes);
-                let deleted = changes.deleted.clone();
-                progress(IndexProgress::Discovered { files: files.len() });
-                let prepared_files = prepare_files_with_progress(&files, progress, 0, files.len())?;
-                Ok(PreparedIncrementalPass {
+                self.prepare_from_files_and_changes(
+                    files,
+                    changes,
                     manifest_in_change_set,
-                    carried_ids: Vec::new(),
-                    prepared_files,
-                    deleted,
-                })
+                    progress,
+                )
+            },
+            IndexMode::Paths => {
+                // The builder reports whether a supplied path is a `Cargo.toml` — a non-target file
+                // dropped from `files`, but still a package-map refresh signal even when CLEAN /
+                // committed (this mode reconciles committed changes) (#659 review).
+                let (files, changes, manifest_in_change_set) =
+                    explicit_index_files_and_changes(self, config, explicit_paths.unwrap_or(&[]))?;
+                self.prepare_from_files_and_changes(
+                    files,
+                    changes,
+                    manifest_in_change_set,
+                    progress,
+                )
             },
             // The manifest flag also consults the discovery plan's file list, so a NEW (untracked,
             // not-yet-committed) `Cargo.toml` is caught even though git status would not list it as
@@ -629,6 +704,35 @@ impl IndexDatabase {
             },
             IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
         }
+    }
+
+    /// Prepare a no-carry incremental pass from an already-collected `files` list and its
+    /// dirty/deleted `changes` — shared by `Changed` (git-status walk → collect) and `Paths`
+    /// (explicit list) (#659). `changes.changed` classifies which of `files` are working-tree DIRT
+    /// for [`Self::assign_file_scopes`]; a file present in `files` but ABSENT from
+    /// `changes.changed` is committed-scoped (how `Paths` keeps a clean/committed supplied file
+    /// out of an overlay row). Content-hash staleness is decided later (an unchanged file
+    /// prepares but writes nothing); `deleted` paths are tombstoned at apply time.
+    fn prepare_from_files_and_changes<F>(
+        &self,
+        files: Vec<IndexFile>,
+        changes: GitChangedPaths,
+        manifest_in_change_set: bool,
+        progress: &mut F,
+    ) -> anyhow::Result<PreparedIncrementalPass>
+    where
+        F: FnMut(IndexProgress),
+    {
+        let files = self.assign_file_scopes(files, &changes);
+        let deleted = changes.deleted.clone();
+        progress(IndexProgress::Discovered { files: files.len() });
+        let prepared_files = prepare_files_with_progress(&files, progress, 0, files.len())?;
+        Ok(PreparedIncrementalPass {
+            manifest_in_change_set,
+            carried_ids: Vec::new(),
+            prepared_files,
+            deleted,
+        })
     }
 
     /// APPLY phase (#560): the WRITE half of an incremental/discover pass, run inside the caller's
@@ -837,28 +941,31 @@ impl IndexDatabase {
         // and skip both guards below. The mtime guard (changed-file overwrites) applies in
         // either hoisted mode.
         let guard_concurrent_writes = mode_guard.is_some();
-        // The fs-deletion restore recheck applies ONLY in Changed mode. There, `deleted` is purely
-        // git file-deletions and the target/ignore set is stable within the pass, so "exists on
-        // disk" means "restored AND still in scope". Discover's `deleted` also carries
-        // SEMANTIC deletions (a path that left the target set or became gitignored but
-        // still exists on disk) which MUST be tombstoned regardless of disk existence — and
-        // a genuine fs-restore in Discover self-heals on the next discover pass anyway.
-        let revalidate_fs_deletions = mode_guard == Some(IndexMode::Changed);
+        // The fs-deletion restore recheck applies only to the fs-deletion modes (Changed and
+        // Paths). There, `deleted` is purely file-deletions and the target/ignore set is
+        // stable within the pass, so "exists on disk" means "restored AND still in scope".
+        // Discover's `deleted` also carries SEMANTIC deletions (a path that left the target
+        // set or became gitignored but still exists on disk) which MUST be tombstoned
+        // regardless of disk existence — and a genuine fs-restore in Discover self-heals on
+        // the next discover pass anyway.
+        let revalidate_fs_deletions = mode_guard.is_some_and(IndexMode::revalidates_fs_deletions);
         let mut deleted_count = 0usize;
         for path in deleted {
             // A git-deleted path may have been RESTORED on disk during the off-lock window (#561).
             // Tombstoning it would HIDE it — and a file restored to HEAD-clean content is in no
             // later CHANGED set and the stale-overlay heal skips `kind='deleted'` rows,
             // so it would not self-heal until a discover pass. Skip the tombstone only when the
-            // path is a regular FILE on disk again: a directory (or other non-file)
-            // recreated at that path is not a restored source file and would never be
-            // re-indexed, so it must still tombstone.
+            // path is a regular FILE on disk again — via `symlink_metadata` (does NOT follow), so a
+            // SYMLINK or a directory recreated at that path is NOT treated as a restored source
+            // file (the walker skips both and would never re-index them), and its stale
+            // row still tombstones (#659 review).
             if revalidate_fs_deletions
                 && self
                     .storage
                     .source_root()
                     .map(|root| root.join(path))
-                    .is_some_and(|full| full.is_file())
+                    .and_then(|full| full.symlink_metadata().ok())
+                    .is_some_and(|meta| meta.is_file())
             {
                 continue;
             }
@@ -895,6 +1002,32 @@ impl IndexDatabase {
                     &prepared_file.file.worktree_id,
                 )?
                 && row_modified_at_ms > content.modified_at_ms
+            {
+                continue;
+            }
+            // True no-op skip for the explicit-path flow ONLY (#659 review): `index --paths`
+            // prepares EVERY supplied file — including clean/reverted ones — to scope
+            // them, so without this an unchanged file would be needlessly
+            // removed+reinserted, churning its id and cascade-dropping its chunk
+            // embeddings. Compares the FULL `(sha256, language, kind)` identity, not sha alone: a
+            // TARGET-identity drift with unchanged bytes (an extension-precedence change
+            // re-languages the path) must still reindex, exactly as discovery's
+            // staleness does — a sha-only skip would strand the old parse. Gated to
+            // `Paths`: the heal / worktree-overlay callers (`mode_guard = None`)
+            // deliberately re-index UNCHANGED content to upgrade a stale anchor/schema
+            // format the sha doesn't capture, and Changed/Discover never prepare an
+            // unchanged file — so neither wants this skip.
+            if mode_guard == Some(IndexMode::Paths)
+                && let Ok(content) = &prepared_file.prepared
+                && self.scope_row_identity(
+                    &prepared_file.file.relative_path,
+                    &prepared_file.file.commit_sha,
+                    &prepared_file.file.worktree_id,
+                )? == Some((
+                    content.sha256.clone(),
+                    prepared_file.file.language.as_str().to_string(),
+                    prepared_file.file.kind.as_str().to_string(),
+                ))
             {
                 continue;
             }

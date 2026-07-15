@@ -114,6 +114,26 @@ impl IndexDatabase {
         self.set_repo_meta_if_changed(BASE_SCOPE_DISCOVERED_META, &marker)
     }
 
+    /// Whether `branch_targets` (a linked overlay's config targets) MAY differ from the config the
+    /// base scope was indexed with — the cheap gate for the per-file target-identity drift scan
+    /// ([`Self::base_scope_target_drift`]). The base scope's discovery marker embeds its target
+    /// fingerprint; when it equals the branch's, no file can re-language, so the O(base-files) scan
+    /// is skipped — the common no-divergent-branch-config case that would otherwise re-scan every
+    /// base file on every overlay refresh × worktree, undoing the #577 event-scoping win.
+    /// Conservatively returns `true` when the marker is absent (a match can't be proven).
+    pub(super) fn overlay_targets_may_drift(
+        &self,
+        branch_targets: &[ResolvedTarget],
+    ) -> anyhow::Result<bool> {
+        let Some(marker) = self.repo_meta(BASE_SCOPE_DISCOVERED_META)? else {
+            return Ok(true);
+        };
+        // Marker layout: `generation=…;<scope>;targets=<hex fingerprint>` — the fingerprint is the
+        // trailing segment (a hex sha256, so it holds no `;targets=`).
+        let base_fingerprint = marker.rsplit_once(";targets=").map(|(_, fingerprint)| fingerprint);
+        Ok(base_fingerprint != Some(target_scope_fingerprint(branch_targets).as_str()))
+    }
+
     fn base_scope_discovery_marker(&self, targets: &[ResolvedTarget]) -> Option<String> {
         let scope = if self.active_commit_sha.is_empty() {
             if self.active_worktree_id.is_empty() {

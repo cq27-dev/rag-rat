@@ -30,6 +30,15 @@ pub(crate) struct WorktreeOverlayDelta {
     /// prune — pruning against a partial `shadowing_paths` would delete valid overlay rows (#219
     /// review). The committed-diff portion is always complete (it errors hard).
     pub(crate) status_complete: bool,
+    /// Whether a `Cargo.toml` appeared in the linked WORKING-TREE STATUS (a dirty manifest edit).
+    /// A manifest is not a target file, so it never lands in `readable`/`tombstones` and
+    /// produces no source-row change — but the branch's package/import scope must still
+    /// refresh for it, so the overlay's finalize refreshes packages on this signal alone (#659
+    /// review). Derived from STATUS (not the committed base↔branch diff) so it SELF-CLEARS on
+    /// commit, matching the base flow's git-status manifest signal and keeping idle overlay
+    /// passes write-free — a committed branch manifest persists in the tree-diff and would
+    /// otherwise rewrite `packages` every pass.
+    pub(crate) manifest_changed: bool,
 }
 
 impl WorktreeOverlayDelta {
@@ -84,6 +93,27 @@ fn linked_config_subdir_and_root(
         .unwrap_or_default();
     let linked_config_root = linked_workdir.join(&config_subdir);
     (config_subdir, linked_config_root)
+}
+
+/// Resolve the `(base_sha, worktree_id, source_root)` for a linked-worktree overlay, or `None` when
+/// `linked_path` is not a valid linked sibling of `config.root`'s repo (its scope fell back to
+/// base). Shared by [`IndexDatabase::index_worktree_overlay`] and
+/// [`IndexDatabase::refresh_worktree_overlay_packages`] so both derive the SAME scope + source
+/// root.
+fn resolve_overlay_scope(
+    config: &Config,
+    linked_path: &Path,
+) -> anyhow::Result<Option<(String, String, PathBuf)>> {
+    let (base_sha, worktree_id) =
+        git_context::resolve_worktree_scope(&config.root, Some(linked_path));
+    if worktree_id == git_context::worktree_id_of(&config.root) {
+        return Ok(None);
+    }
+    let base_repo = git_context::discover_repo(&config.root)?;
+    let linked_repo = git_context::discover_repo(linked_path)?;
+    let (_, source_root) =
+        linked_config_subdir_and_root(config, &base_repo, &linked_repo, linked_path);
+    Ok(Some((base_sha, worktree_id, source_root)))
 }
 
 /// Compute the overlay delta of `linked_path` (a linked worktree of `config.root`'s repo) against
@@ -144,12 +174,21 @@ pub(crate) fn compute_linked_worktree_delta(
     // untracked / working-tree-deleted paths), and the caller must skip the prune on a partial
     // delta or it would delete valid overlay rows (#219 review).
     let mut status_complete = false;
+    // A `Cargo.toml` among the STATUS entries (a DIRTY manifest edit) must refresh the package/
+    // import scope even though a manifest is not a target file (so it never reaches the delta's
+    // readable set). Detect it DURING the fold — status is a one-shot iterator. `Cell` because
+    // `fold_status_candidates` takes an `Fn` locator, not `FnMut`.
+    let manifest_in_status = std::cell::Cell::new(false);
     if let Ok(platform) = linked_repo.status(gix::progress::Discard)
         && let Ok(items) =
             platform.untracked_files(UntrackedFiles::Files).into_iter(None::<gix::bstr::BString>)
     {
         status_complete = fold_status_candidates(&mut candidates, items, |item| {
-            PathBuf::from(item.location().to_str_lossy().as_ref())
+            let path = PathBuf::from(item.location().to_str_lossy().as_ref());
+            if path_is_manifest_under_subdir(&path, &config_subdir) {
+                manifest_in_status.set(true);
+            }
+            path
         });
     }
 
@@ -183,7 +222,11 @@ pub(crate) fn compute_linked_worktree_delta(
         config,
     );
 
-    let mut delta = WorktreeOverlayDelta { status_complete, ..Default::default() };
+    let mut delta = WorktreeOverlayDelta {
+        status_complete,
+        manifest_changed: manifest_in_status.get(),
+        ..Default::default()
+    };
     for repo_rel in candidates {
         // Candidates are repo-relative; the overlay keys rows config-root-relative (matching the
         // base rows + `target_for_path`). A candidate OUTSIDE the config subdir has no base row to
@@ -312,6 +355,16 @@ fn fold_status_candidates<T, E>(
     true
 }
 
+/// Whether `repo_rel` (a repo-relative status path) is a `Cargo.toml` under `config_subdir` — i.e.
+/// a manifest whose change should refresh THIS config's package map. A manifest outside the config
+/// subdir belongs to a different part of the repo (when `config.root` is a subdir) and is not this
+/// overlay's concern; `refresh_packages` scans manifests under the config's source root only.
+fn path_is_manifest_under_subdir(repo_rel: &Path, config_subdir: &Path) -> bool {
+    repo_rel
+        .strip_prefix(config_subdir)
+        .is_ok_and(|rel| rel.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")))
+}
+
 fn change_location_path(change: &gix::object::tree::diff::Change<'_, '_, '_>) -> PathBuf {
     use gix::object::tree::diff::Change;
     let location = match change {
@@ -413,25 +466,38 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        let (base_sha, worktree_id) =
-            git_context::resolve_worktree_scope(&config.root, Some(linked_path));
-        // Fell back to base → not a valid linked sibling; nothing to overlay.
-        if worktree_id == git_context::worktree_id_of(&config.root) {
+        // `source_root` is the LINKED checkout's equivalent of `config.root` — bytes are read from
+        // there, not the raw `linked_path` (which may be a subdir of the checkout, e.g. `--worktree
+        // .` from `/wt/src`, or the git dir from a hook) (#219 review).
+        let Some((base_sha, worktree_id, source_root)) =
+            resolve_overlay_scope(config, linked_path)?
+        else {
+            // Fell back to base → not a valid linked sibling; nothing to overlay.
             return Ok(WorktreeOverlayReport::default());
-        }
+        };
         // Scope the connection to the overlay (base commit + linked worktree id) so context-
         // dependent steps (tombstones, FTS, edge resolution) operate in the linked scope.
         self.set_context(&base_sha, &worktree_id)?;
 
-        let delta = compute_linked_worktree_delta(config, linked_path)?;
-        // `delta.readable` is config-root-relative, so the bytes are read from the LINKED
-        // checkout's equivalent of `config.root` — not the raw `linked_path` (which may be
-        // a subdir of the checkout, e.g. `--worktree .` from `/wt/src`, or the git dir from
-        // a hook) (#219 review).
-        let base_repo = git_context::discover_repo(&config.root)?;
-        let linked_repo = git_context::discover_repo(linked_path)?;
-        let (_, source_root) =
-            linked_config_subdir_and_root(config, &base_repo, &linked_repo, linked_path);
+        let mut delta = compute_linked_worktree_delta(config, linked_path)?;
+        // Fold in TARGET-IDENTITY drift: a branch config change that re-languages or drops a
+        // byte-identical file is invisible to the content delta, but the overlay's (language, kind)
+        // must still track the branch config, like discovery's staleness (#659 review). This also
+        // covers the `index --paths <linked>/foo.rs` case for a clean re-languaged file without
+        // threading the supplied paths — the scan sees every base-scope file. GATED on the branch
+        // config's targets differing from the base's (fingerprint match → no file can re-language),
+        // so the common no-divergent-config worktree does NOT pay an O(base-files) scan on every
+        // overlay refresh (#577 event-scoping).
+        if self.overlay_targets_may_drift(&config.targets)? {
+            let (drift_readable, drift_tombstones) = self.overlay_target_config_reconcile(
+                &base_sha,
+                config,
+                &source_root,
+                &delta.shadowing_paths(),
+            )?;
+            delta.readable.extend(drift_readable);
+            delta.tombstones.extend(drift_tombstones);
+        }
         let scope = FileScope::worktree(worktree_id.clone());
         // ONE transaction around the whole overlay update — incremental file replacement, tombstone
         // writes, the prune, AND the global logical-symbol/package/edge/FTS refresh — mirroring the
@@ -484,7 +550,14 @@ impl IndexDatabase {
             } else {
                 0
             };
-            self.finalize_overlay_refresh(&source_root, &worktree_id, indexed, tombstoned, pruned)?;
+            self.finalize_overlay_refresh(
+                &source_root,
+                &worktree_id,
+                indexed,
+                tombstoned,
+                pruned,
+                delta.manifest_changed,
+            )?;
             Ok((indexed, tombstoned, pruned))
         })();
         let (indexed, tombstoned, pruned) = match result {
@@ -505,6 +578,44 @@ impl IndexDatabase {
             pruned,
             status_complete: delta.status_complete,
         })
+    }
+
+    /// Refresh JUST the linked overlay's package/import scope (and re-resolve its edges against the
+    /// new map) — the `index --paths <linked>/Cargo.toml` entry point when the supplied manifest is
+    /// CLEAN/committed. `index_worktree_overlay` derives its manifest signal from the WORKING-TREE
+    /// STATUS (dirty-only, for idle-safety), so a supplied but clean manifest produces no indexed
+    /// rows and would leave the package map stale — this honors the base `Paths` flow's
+    /// supplied-manifest signal for the linked route (#659 review). Its own `BEGIN IMMEDIATE` (the
+    /// caller is not mid-transaction) and idempotent, so re-running it after a dirty-status refresh
+    /// is harmless. No-op when `linked_path` is not a valid linked sibling. Leaves the connection
+    /// scoped to the overlay.
+    pub fn refresh_worktree_overlay_packages(
+        &mut self,
+        config: &Config,
+        linked_path: &Path,
+    ) -> anyhow::Result<()> {
+        let Some((base_sha, worktree_id, source_root)) =
+            resolve_overlay_scope(config, linked_path)?
+        else {
+            return Ok(());
+        };
+        self.set_context(&base_sha, &worktree_id)?;
+        self.storage.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> anyhow::Result<()> {
+            self.refresh_packages(&source_root)?;
+            self.resolve_overlay_edges(&worktree_id)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.storage.execute_batch("COMMIT")?;
+                Ok(())
+            },
+            Err(err) => {
+                let _ = self.storage.execute_batch("ROLLBACK");
+                Err(err)
+            },
+        }
     }
 
     /// The post-write finalize tail of `index_worktree_overlay`, run INSIDE its transaction — ONLY
@@ -529,6 +640,10 @@ impl IndexDatabase {
     ///   must not be rewritten or base `find_callers`/impact would corrupt until a base pass
     ///   resolved it back, flipping by whichever worktree refreshed last (#219 P1).
     /// - sync_fts: so semantic_search (BM25) sees the overlay's chunks.
+    ///
+    /// A manifest-only change (`manifest_changed`, no source rows) refreshes JUST the package scope
+    /// — the logical-symbol/edge/FTS steps depend on source-row changes, so they stay gated on the
+    /// counts (#659 review).
     fn finalize_overlay_refresh(
         &self,
         source_root: &Path,
@@ -536,6 +651,7 @@ impl IndexDatabase {
         indexed: usize,
         tombstoned: usize,
         pruned: usize,
+        manifest_changed: bool,
     ) -> anyhow::Result<()> {
         if indexed > 0 || tombstoned > 0 || pruned > 0 {
             // Defer: an overlay refresh re-parsed only the worktree's own files, so it must not
@@ -545,6 +661,18 @@ impl IndexDatabase {
             self.refresh_packages(source_root)?;
             self.resolve_overlay_edges(worktree_id)?;
             self.sync_fts()?;
+        } else if manifest_changed {
+            // A dirty `Cargo.toml` with no source-row change: the base flow's manifest signal
+            // refreshes the package map even with zero indexed files, and the overlay must match so
+            // the branch resolves imports against its own manifest. `manifest_changed` is
+            // status-derived (self-clears on commit), so this does not rewrite `packages` on every
+            // idle overlay pass (#659 review).
+            self.refresh_packages(source_root)?;
+            // Overlay EDGES resolve THROUGH the package/import scope, so a package-map change must
+            // re-resolve them too — otherwise callers/callees keep returning targets resolved
+            // against the OLD manifest until an unrelated source change triggers a resolve (#659
+            // review).
+            self.resolve_overlay_edges(worktree_id)?;
         }
         Ok(())
     }
@@ -567,23 +695,32 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        // Existing rows in this scope (path → sha) so an UNCHANGED file is skipped: re-running the
-        // overlay on a static worktree then writes nothing, so the watcher can refresh overlays
+        // Existing rows in this scope (path → identity) so an UNCHANGED file is skipped: re-running
+        // the overlay on a static worktree then writes nothing, so the watcher can refresh overlays
         // every maintenance pass without churn — preserving the idle backstop (#63) and not
-        // tripping the self-sustaining re-index loop.
-        let existing = self.scope_file_shas(&scope.commit_sha, &scope.worktree_id)?;
+        // tripping the self-sustaining re-index loop. The identity is `(sha256, language, kind)`,
+        // not sha alone: a branch config change that RE-LANGUAGES a byte-identical file
+        // must still rewrite the overlay row, mirroring discovery / the base `Paths` flow's
+        // staleness (#659).
+        let existing = self.scope_file_identities(&scope.commit_sha, &scope.worktree_id)?;
         let mut files = Vec::new();
         for rel in paths {
             let full_path = source_root.join(rel);
             let Ok(bytes) = std::fs::read(&full_path) else {
                 continue; // not a readable regular file
             };
-            if existing.get(path_string(rel).as_str()) == Some(&hex_sha256(&bytes)) {
-                continue; // unchanged since the last overlay index
-            }
             let Some((language, kind)) = target_for_path(config, rel) else {
                 continue;
             };
+            if existing.get(path_string(rel).as_str())
+                == Some(&(
+                    hex_sha256(&bytes),
+                    language.as_str().to_string(),
+                    kind.as_str().to_string(),
+                ))
+            {
+                continue; // unchanged since the last overlay index (content AND target identity)
+            }
             files.push(IndexFile {
                 full_path,
                 relative_path: rel.clone(),
@@ -596,26 +733,105 @@ impl IndexDatabase {
         self.apply_incremental_file_plan(files, BTreeSet::new(), progress)
     }
 
-    /// Existing file rows in a scope as `path → sha256` — for the idle-safe skip above. A direct
-    /// `main.files` probe (bypasses the repo-scoped view), so it carries the `repo_id` predicate
-    /// explicitly (A3): today's sole caller passes a non-empty (path-derived, globally unique)
-    /// `worktree_id`, but this is the documented reusable primitive — a base-scope caller
-    /// (`commit_sha`, `''`) would otherwise skip files on the strength of a fork sibling's sha.
-    fn scope_file_shas(
+    /// Existing file rows in a scope as `path → (sha256, language, kind)` — for the identity-aware
+    /// idle-safe skip above. A direct `main.files` probe (bypasses the repo-scoped view), so it
+    /// carries the `repo_id` predicate explicitly (A3): today's sole caller passes a non-empty
+    /// (path-derived, globally unique) `worktree_id`, but this is the documented reusable primitive
+    /// — a base-scope caller (`commit_sha`, `''`) would otherwise skip files on the strength of a
+    /// fork sibling's sha.
+    fn scope_file_identities(
         &self,
         commit_sha: &str,
         worktree_id: &str,
-    ) -> anyhow::Result<HashMap<String, String>> {
+    ) -> anyhow::Result<HashMap<String, (String, String, String)>> {
         let conn = self.storage.connection();
         let mut stmt = conn.prepare(
-            "SELECT path, sha256 FROM main.files
+            "SELECT path, sha256, language, kind FROM main.files
              WHERE repo_id = ?1 AND commit_sha = ?2 AND worktree_id = ?3",
         )?;
-        let rows = stmt
-            .query_map(params![self.active_repo_id, commit_sha, worktree_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        let rows =
+            stmt.query_map(params![self.active_repo_id, commit_sha, worktree_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?),
+                ))
             })?;
         rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
+    }
+
+    /// Config-aware overlay reconcile: extra `(readable, tombstone)` candidates for files whose
+    /// overlay state under `config` (the BRANCH overlay config) differs from the base index for a
+    /// reason the content-based delta (`compute_linked_worktree_delta`, tree-diff + status) cannot
+    /// see — a branch config change that RE-LANGUAGES, newly TARGETS, or DROPS a byte-identical
+    /// file. Mirrors discovery's `(language, kind)` staleness for the overlay (#659 review). Two
+    /// directions, both EXCLUDING `covered` (paths the content delta already reconciles):
+    ///  - walk the branch checkout's target files (the branch config over `source_root`): a file
+    ///    the base index LACKS (newly-targetable) or whose stored base identity DIFFERS
+    ///    (re-languaged) → readable, so the overlay row carries the branch identity; a file whose
+    ///    base identity already matches shows through the base row and needs no overlay;
+    ///  - base rows the branch config NO LONGER targets → tombstone, so the stale base row is
+    ///    shadowed instead of showing through.
+    ///
+    /// Read-only unless there is REAL divergence; on a later pass the row already exists in the
+    /// overlay scope, so the identity-aware skip in `index_explicit_paths_from_root` makes it
+    /// write-free. The caller GATES this on the branch target fingerprint differing from the base's
+    /// ([`IndexDatabase::overlay_targets_may_drift`]), so a no-divergent-config worktree never runs
+    /// the walk (#577 event-scoping).
+    fn overlay_target_config_reconcile(
+        &self,
+        base_sha: &str,
+        config: &Config,
+        source_root: &Path,
+        covered: &BTreeSet<PathBuf>,
+    ) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        // Base-scope identity: path → (language, kind).
+        let base_identity: HashMap<PathBuf, (String, String)> = {
+            let conn = self.storage.connection();
+            let mut stmt = conn.prepare(
+                "SELECT path, language, kind FROM main.files
+                 WHERE repo_id = ?1 AND commit_sha = ?2 AND worktree_id = '' AND generation = ?3
+                   AND kind != 'deleted'",
+            )?;
+            stmt.query_map(params![self.active_repo_id, base_sha, self.active_generation], |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+                ))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        let mut readable = Vec::new();
+        let mut visited = BTreeSet::new();
+        // Direction 1 — every file the BRANCH config targets in the checkout. `collect_index_files`
+        // walks the branch config's targets over `source_root` (the linked checkout), honoring its
+        // `.gitignore`, exactly like the base walker.
+        let walk_config = Config { root: source_root.to_path_buf(), ..config.clone() };
+        for file in collect_index_files(&walk_config)? {
+            let rel = file.relative_path;
+            if covered.contains(&rel) {
+                continue;
+            }
+            visited.insert(rel.clone());
+            let branch_identity =
+                (file.language.as_str().to_string(), file.kind.as_str().to_string());
+            if base_identity.get(&rel) == Some(&branch_identity) {
+                continue; // the base row already carries the branch identity → it shows through
+            }
+            readable.push(rel); // newly-targetable OR re-languaged → shadow with the branch parse
+        }
+        // Direction 2 — base rows the branch config NO LONGER targets (the walk never reached them,
+        // and the branch config doesn't claim them) → shadow the stale base row. A base row still
+        // targeted but absent in the checkout is a content deletion the delta covers.
+        let mut tombstones = Vec::new();
+        for rel in base_identity.keys() {
+            if covered.contains(rel) || visited.contains(rel) {
+                continue;
+            }
+            if target_for_path(config, rel).is_none() {
+                tombstones.push(rel.clone());
+            }
+        }
+        Ok((readable, tombstones))
     }
 
     /// Remove overlay rows of `worktree_id` whose path is no longer in the delta (the file matches

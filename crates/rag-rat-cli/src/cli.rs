@@ -153,6 +153,19 @@ pub(crate) struct IndexArgs {
     /// only the delta vs the base; does not rebuild the base.
     #[arg(long, value_name = "PATH")]
     pub worktree: Option<std::path::PathBuf>,
+    /// Reconcile exactly these paths (the edit-driven-reindex substrate): index the supplied files
+    /// (content-hash decides staleness), tombstone any that no longer exist, and leave everything
+    /// else untouched. Ignored / out-of-target / unchanged paths are no-ops; an edit under a
+    /// linked worktree is routed to that worktree's overlay. Unlike the default changed-file
+    /// mode this also sees committed changes, since the caller — not git status — names the
+    /// paths.
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 1..,
+        conflicts_with_all = ["full", "discover", "changed", "worktree", "watch"]
+    )]
+    pub paths: Vec<std::path::PathBuf>,
     /// Run the background file watcher in the foreground until interrupted.
     #[arg(long)]
     pub watch: bool,

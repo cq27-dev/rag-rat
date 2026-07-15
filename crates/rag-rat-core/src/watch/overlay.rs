@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::index::IndexDatabase;
 use crate::index::ai::ReconcileOptions;
+use crate::index::{IndexDatabase, IndexProgress};
 
 /// The canonical worktree id string [`crate::index::live_worktree_contexts`] reports. When `root`
 /// is a repo SUBDIR (`<repo>/crate`), the enclosing worktree root is `<repo>` — which is the
@@ -272,6 +272,134 @@ impl ReconcileBudget {
     }
 }
 
+/// The `index --paths` orchestration (#659) — the edit-driven-reindex substrate. Reconciles exactly
+/// the supplied candidate `paths`, ROUTING each to the index that owns it:
+/// - a path under `config.root`'s own checkout goes through a scoped base
+///   [`IndexDatabase::index_paths_with_progress`] pass, which reconciles EXACTLY those paths
+///   (content-hash decides staleness; ignored / out-of-target / unchanged paths are no-ops; a
+///   vanished path is tombstoned);
+/// - a path under a LINKED worktree goes through that checkout's OVERLAY instead. This is
+///   load-bearing: `find_config` re-anchors `config.root` to the MAIN checkout, so a linked edit is
+///   not in the base tree — a base pass would `strip_prefix` it away and silently drop it. NOTE the
+///   overlay pass is per-CHECKOUT, not per-path: [`IndexDatabase::index_worktree_overlay`]
+///   reindexes the worktree's whole base↔branch delta (there is no path-scoped overlay primitive
+///   today — see #679), so a linked `index --paths` also refreshes any OTHER pending change in that
+///   checkout. A failure PROPAGATES (unlike the best-effort watcher/maintenance sweep), so an edit
+///   hook can retry instead of exiting 0 on a drop.
+///
+/// The per-repo `WriteLock` is held across BOTH halves (the base pass re-acquires it reentrantly),
+/// mirroring the maintenance path. Returns the base db so the caller can read base-scoped status.
+/// #427 first-time-empty deferral is inherited from the base pass — an unregistered base surfaces
+/// `EmptyIndexRefused` for the caller to defer on (a linked overlay is a delta vs the base, so the
+/// base must exist first).
+pub fn reindex_paths<F>(
+    config: &Config,
+    paths: &[PathBuf],
+    mut progress: F,
+) -> anyhow::Result<IndexDatabase>
+where
+    F: FnMut(IndexProgress),
+{
+    let lock_repo = crate::locks::write_lock_repo_id(config);
+    let _lock = crate::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+
+    let WorktreePartition { base_paths, linked_roots, manifest_roots } =
+        partition_paths_by_worktree(config, paths);
+    // Always run the base pass: it opens the db (returned for status + the overlay refresh) and
+    // enforces #427. With no base paths it is a no-op scoped pass over an empty change set.
+    let mut db = IndexDatabase::index_paths_with_progress(config, &base_paths, &mut progress)?;
+    for checkout in &linked_roots {
+        // Index each touched checkout's overlay with the LINKED branch's OWN targets (a branch that
+        // adds/narrows targets must be indexed by its own config). `?` PROPAGATES a failure — the
+        // caller (an edit hook) must be able to tell the reindex did not land and retry.
+        let overlay_config = config.for_linked_worktree_overlay(checkout);
+        let report = db.index_worktree_overlay(&overlay_config, checkout, &mut progress)?;
+        // A PARTIAL status read (`status_complete = false`) may have missed the supplied
+        // uncommitted edit, yet returns Ok — so, like the watcher, CLEAR this worktree's overlay
+        // basis so a later scoped pass re-refreshes it instead of skipping on a still-matching
+        // basis. Otherwise `index --paths` would report success while leaving the branch stale
+        // (#659 review).
+        if !report.status_complete && !report.worktree_id.is_empty() {
+            let _ = db.clear_worktree_overlay_basis(&report.worktree_id);
+        }
+        // A SUPPLIED `Cargo.toml` must refresh the overlay's package map even when it is CLEAN/
+        // committed (so it produced no source rows and the overlay's status-derived signal missed
+        // it) — the base flow refreshes on a named manifest regardless of dirtiness, and the linked
+        // route must honor the same "also sees committed changes" contract (#659 review).
+        if manifest_roots.contains(checkout) {
+            db.refresh_worktree_overlay_packages(&overlay_config, checkout)?;
+        }
+    }
+    // `index_worktree_overlay` / the manifest refresh leave the connection scoped to the LAST
+    // overlay; restore the base scope so the returned db reads base-scoped status.
+    if !linked_roots.is_empty() {
+        let (base_sha, base_id) = crate::index::resolve_git_context(&config.root);
+        db.set_context(&base_sha, &base_id)?;
+    }
+    Ok(db)
+}
+
+/// Candidate paths split by which checkout owns them (see [`partition_paths_by_worktree`]).
+pub(crate) struct WorktreePartition {
+    /// Paths under the base checkout (and non-git trees) — the scoped base pass reconciles these.
+    pub(crate) base_paths: Vec<PathBuf>,
+    /// Live linked-worktree checkout roots any supplied path lives under — each gets an overlay
+    /// pass.
+    pub(crate) linked_roots: BTreeSet<PathBuf>,
+    /// Linked checkout roots that had a supplied `Cargo.toml`. Their overlay package map must be
+    /// refreshed even for a CLEAN/committed manifest — the overlay's own signal is status-derived
+    /// (dirty-only), so this carries the base flow's supplied-manifest signal to the linked route.
+    pub(crate) manifest_roots: BTreeSet<PathBuf>,
+}
+
+/// Split absolute candidate paths by owning checkout. A path is a linked-worktree path when its
+/// (canonicalized) location lives under a live linked checkout root; everything else — including
+/// non-git trees and paths already under the base checkout — is a base path. The linked roots are
+/// the [`crate::index::live_worktree_contexts`] spellings (canonicalized, base excluded), so the
+/// base pass and the overlay refresh key on the exact same identities the rest of the engine uses.
+pub(crate) fn partition_paths_by_worktree(config: &Config, paths: &[PathBuf]) -> WorktreePartition {
+    let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
+    let base = enclosing_worktree_id(&config.root);
+    let linked: Vec<PathBuf> =
+        worktrees.into_iter().filter(|w| *w != base).map(PathBuf::from).collect();
+    let mut partition = WorktreePartition {
+        base_paths: Vec::new(),
+        linked_roots: BTreeSet::new(),
+        manifest_roots: BTreeSet::new(),
+    };
+    for path in paths {
+        match enclosing_linked_root(path, &linked) {
+            Some(root) => {
+                if path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+                    partition.manifest_roots.insert(root.clone());
+                }
+                partition.linked_roots.insert(root);
+            },
+            None => partition.base_paths.push(path.clone()),
+        }
+    }
+    partition
+}
+
+/// The live linked checkout root `path` lives under, or `None` if it is under the base checkout (or
+/// no linked worktree). Compares against the canonicalized `linked` roots after canonicalizing
+/// `path` itself — via the shared [`crate::index::canonicalize_nearest_ancestor`], which walks up
+/// to the nearest EXISTING ancestor (a deletion may have removed the file AND its parent dir, e.g.
+/// `rm -rf wt/src`) so a symlinked checkout dir (`/tmp` → `/private/tmp`) is never misrouted to the
+/// base. Falls back to the lexical path only when nothing on the chain resolves. Picks the MOST
+/// SPECIFIC (longest) matching root, not the first: a worktree NESTED under another worktree's dir
+/// makes `path` a prefix-match of BOTH, and the nested checkout is the real owner — a first-match
+/// would refresh the outer overlay and leave the nested one stale.
+fn enclosing_linked_root(path: &Path, linked: &[PathBuf]) -> Option<PathBuf> {
+    let canonical =
+        crate::index::canonicalize_nearest_ancestor(path).unwrap_or_else(|| path.to_path_buf());
+    linked
+        .iter()
+        .filter(|root| canonical.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -288,6 +416,33 @@ mod tests {
         assert!(OverlayScope::All.lists(&id));
         assert!(linked.lists(&id));
         assert!(!linked.lists("some-other-worktree"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn enclosing_linked_root_picks_the_most_specific_nested_worktree() {
+        // A worktree NESTED under another worktree's dir makes a path a prefix-match of BOTH roots;
+        // the nested checkout is the real owner. Longest match must win regardless of the order
+        // `live_worktree_contexts` returns the roots in (#659 review). (Non-existent paths → the
+        // canonicalize fallback is the lexical path, so this white-boxes the selection.)
+        let outer = PathBuf::from("/wt/outer");
+        let inner = PathBuf::from("/wt/outer/inner");
+        let path = PathBuf::from("/wt/outer/inner/src/x.rs");
+        assert_eq!(
+            enclosing_linked_root(&path, &[outer.clone(), inner.clone()]),
+            Some(inner.clone()),
+            "outer-first: the nested root still wins",
+        );
+        assert_eq!(
+            enclosing_linked_root(&path, &[inner.clone(), outer.clone()]),
+            Some(inner.clone()),
+            "inner-first: the nested root still wins",
+        );
+        // A path under only the outer root routes to the outer.
+        assert_eq!(
+            enclosing_linked_root(Path::new("/wt/outer/top.rs"), &[outer.clone(), inner]),
+            Some(outer),
+        );
     }
 
     #[test]

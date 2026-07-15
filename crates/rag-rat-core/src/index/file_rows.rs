@@ -239,6 +239,64 @@ impl IndexDatabase {
             .map_err(Into::into)
     }
 
+    /// The `(sha256, language, kind)` identity of the row for this exact scope key (`None` when no
+    /// such row exists) — the no-op-skip signal for the explicit-path flow: an `index --paths` over
+    /// a CLEAN/reverted file prepares a row whose identity matches the existing one, and
+    /// `write_prepared_incremental_files` skips the remove+insert so the row id and its chunk
+    /// embeddings are not needlessly churned (#659 review). Includes `language`/`kind` so a TARGET
+    /// identity change with UNCHANGED bytes (an extension-precedence upgrade re-languages a path
+    /// without touching its content) is NOT skipped — mirroring discovery's `(sha256, language,
+    /// kind)` staleness ([`super::discovery::target_for_path`] drift). Sibling of
+    /// [`Self::scope_row_modified_at_ms`].
+    pub(super) fn scope_row_identity(
+        &self,
+        path: &Path,
+        commit_sha: &str,
+        worktree_id: &str,
+    ) -> anyhow::Result<Option<(String, String, String)>> {
+        self.storage
+            .connection()
+            .query_row(
+                "SELECT sha256, language, kind FROM main.files
+                 WHERE repo_id = ?1 AND path = ?2 AND commit_sha = ?3 AND worktree_id = ?4
+                   AND generation = ?5",
+                params![
+                    self.active_repo_id,
+                    path_string(path),
+                    commit_sha,
+                    worktree_id,
+                    self.active_generation
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Whether the ACTIVE scope (any commit/worktree at the live generation) has a row for `path` —
+    /// used by the explicit-path flow to tombstone a vanished supplied path ONLY when it was really
+    /// indexed, never a never-indexed typo / out-of-target file (a spurious `kind='deleted'`
+    /// overlay row would shadow any real committed file later appearing at that path) (#659
+    /// review).
+    pub(super) fn path_has_indexed_row(&self, path: &Path) -> anyhow::Result<bool> {
+        self.storage
+            .connection()
+            .query_row(
+                "SELECT 1 FROM files WHERE path = ?1 LIMIT 1",
+                params![path_string(path)],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(Into::into)
+    }
+
     pub(super) fn file_row(&self, path: &Path) -> anyhow::Result<FileRow> {
         self.storage
             .connection()

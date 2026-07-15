@@ -203,6 +203,14 @@ pub enum IndexProgress {
 #[serde(rename_all = "snake_case")]
 pub enum IndexMode {
     Changed,
+    /// Reconcile exactly an explicitly-supplied set of candidate paths (#659) — the substrate for
+    /// edit-driven reindex. Like `Changed` (working-tree-scoped, content-hash decides staleness, no
+    /// carry), but the change set comes from the caller's path list rather than a git-status walk,
+    /// so it also sees committed changes the status walk would not. The path list is threaded
+    /// alongside the mode (`explicit_paths`) rather than carried in the variant, so `IndexMode`
+    /// stays `Copy` (it is copied at several hot sites in the pass). Unlike `Changed`, it never
+    /// promotes to `Discover` on an incomplete base scope — it is deliberately scoped.
+    Paths,
     Discover,
     Full,
 }
@@ -211,9 +219,21 @@ impl IndexMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Changed => "changed files",
+            Self::Paths => "explicit paths",
             Self::Discover => "discovery",
             Self::Full => "full rebuild",
         }
+    }
+
+    /// Whether a tombstone in this mode's `deleted` set is a pure FILESYSTEM deletion (the path
+    /// left the tree) rather than a SEMANTIC one (the path left the target set / became ignored
+    /// but still exists). Only fs-deletion modes get the #561 restore recheck at apply time —
+    /// see `write_prepared_incremental_files`. `Changed` and `Paths` both derive `deleted`
+    /// purely from "the file is not on disk", so both revalidate; `Discover`'s plan also
+    /// tombstones semantic deletions that must land regardless of disk existence, so it does
+    /// not.
+    pub(crate) fn revalidates_fs_deletions(self) -> bool {
+        matches!(self, Self::Changed | Self::Paths)
     }
 }
 

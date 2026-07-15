@@ -61,6 +61,31 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    // `--paths`: reconcile exactly the supplied paths (#659), routing linked-worktree edits to
+    // their overlay. A distinct scoped mode — handle before the full/discover/changed branches.
+    // #427: like the hook-driven maintenance pass, a scoped pass on a not-yet-registered repo
+    // DEFERS (there is nothing to reconcile into yet) rather than erroring, since this is the
+    // edit-hook substrate.
+    if !args.paths.is_empty() {
+        surface_adoption_warnings(config)?;
+        let cwd = std::env::current_dir()?;
+        let paths: Vec<std::path::PathBuf> = args
+            .paths
+            .iter()
+            .map(|path| if path.is_absolute() { path.clone() } else { cwd.join(path) })
+            .collect();
+        match rag_rat_core::watch::reindex_paths(config, &paths, render_index_progress) {
+            Ok(db) => return report_indexed(&db, config),
+            Err(err) if err.downcast_ref::<rag_rat_core::index::EmptyIndexRefused>().is_some() => {
+                eprintln!(
+                    "index --paths: deferred — no index yet; nothing to reconcile until content \
+                     is indexed (run 'rag-rat index' first)"
+                );
+                return Ok(());
+            },
+            Err(err) => return Err(err),
+        }
+    }
     surface_adoption_warnings(config)?;
     let db = if args.full {
         IndexDatabase::rebuild_with_progress(config, render_index_progress)?
@@ -69,9 +94,13 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     } else {
         IndexDatabase::index_changed_with_progress(config, render_index_progress)?
     };
-    // Re-anchor repo memories against the freshly indexed symbols/chunks so a moved or renamed
-    // binding relocates (or is flagged) instead of silently pointing at a stale row. Memory rows
-    // themselves are never deleted by indexing.
+    report_indexed(&db, config)
+}
+
+/// Shared `index` tail: re-anchor repo memories against the freshly indexed symbols/chunks (so a
+/// moved/renamed binding relocates or is flagged instead of pointing at a stale row — memory rows
+/// are never deleted by indexing), warn about anchors still needing attention, then print status.
+fn report_indexed(db: &IndexDatabase, config: &Config) -> anyhow::Result<()> {
     if let Err(err) = db.memory_validate() {
         eprintln!("warning: repo-memory re-validation failed: {err}");
     }
