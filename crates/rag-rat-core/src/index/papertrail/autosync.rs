@@ -24,7 +24,8 @@ pub enum AutosyncOutcome {
     Disabled,
     /// The repo has never been indexed. Automatic sync serves already-indexed repos only — a
     /// deferred first-time-empty hook, or a shared database where this repo was only ever
-    /// registered read-only, must not start mirroring. The first index pass unlocks it.
+    /// registered read-only, must not start mirroring. The request is queued in the pending
+    /// marker so the first post-index trigger runs with it.
     NotIndexed,
     /// Another flight holds this repository's lock. The request was merged into the pending
     /// marker; the holder's follow-up pass (or the next periodic deadline) covers it.
@@ -43,11 +44,14 @@ pub fn run(config: &Config, request: AutosyncRequest) -> anyhow::Result<Autosync
     if PapertrailContext::resolve(config).trackers.is_empty() {
         return Ok(AutosyncOutcome::Disabled);
     }
-    // The non-creating half of the indexed-only gate, BEFORE any lock or open: opening a
-    // missing database creates the (empty) file first and only then refuses on the missing
-    // schema, and that artifact defeats every later `database.exists()` "build the index first"
-    // hint. A repo with no store at all is trivially not indexed.
+    // The non-creating half of the indexed-only gate, BEFORE any open: opening a missing
+    // database creates the (empty) file first and only then refuses on the missing schema, and
+    // that artifact defeats every later `database.exists()` "build the index first" hint. A
+    // repo with no store at all is trivially not indexed — but the accepted signal is queued
+    // (see the NotIndexed drain arm) so a first index pass racing this trigger cannot lose it.
     if !config.database.exists() {
+        let lock_repo = locks::write_lock_repo_id(config);
+        PendingMarker::new(&config.database, &lock_repo).lock()?.merge(request)?;
         return Ok(AutosyncOutcome::NotIndexed);
     }
     // Identity re-key retry: when a pass discovers its flight lock was keyed from a
@@ -227,11 +231,14 @@ fn drain(
         match run_flight(config, lock_repo, request) {
             Ok(FlightPass::Report(report)) => last_report = Some(report),
             Ok(FlightPass::NotIndexed) => {
-                // Nothing can run until the first index pass, and any queued follow-up is
-                // equally unservable: consume it under the exit hold and stop. Post-index
-                // triggers start synchronization.
+                // Nothing can run until the first index pass — but the accepted signal must
+                // not drop: a hook can lose the maintenance lock to a manual run that is
+                // CREATING the first index and will never fire papertrail itself. Queue the
+                // request instead. This is the one deliberate "marker without an obligated
+                // runner" exception to the exit-handoff rule: the first post-index trigger
+                // absorbs it, and on a never-indexed repo it is an inert one-word file.
                 let guard = pending.lock()?;
-                let _ = guard.take()?;
+                guard.merge(request)?;
                 drop(flight.take());
                 return Ok(Drained::NotIndexed);
             },
@@ -599,6 +606,11 @@ mod tests {
         let outcome = run(&config, AutosyncRequest::Incremental).unwrap();
         assert!(matches!(outcome, AutosyncOutcome::NotIndexed), "{outcome:?}");
         assert!(!config.database.exists(), "a deferred trigger must not create the database");
+        // The signal is queued even though no store exists yet: a first index pass racing
+        // this trigger must not lose it.
+        let lock_repo = locks::write_lock_repo_id(&config);
+        let pending = locks::papertrail_pending_path(&config.database, &lock_repo);
+        assert_eq!(fs::read_to_string(&pending).unwrap(), "incremental");
 
         let error = run_manual(&config, true, || {}).unwrap_err().to_string();
         assert!(error.contains("no index at this path yet"), "{error}");
@@ -644,15 +656,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor_rows, 0);
+        // The accepted signal is queued for the first post-index trigger, at full strength.
         let lock_repo = locks::write_lock_repo_id(&config);
-        assert!(!locks::papertrail_pending_path(&config.database, &lock_repo).exists());
+        let pending = locks::papertrail_pending_path(&config.database, &lock_repo);
+        assert_eq!(fs::read_to_string(&pending).unwrap(), "full");
 
-        // The first index pass unlocks automatic sync (the flight then runs and persists the
-        // unreachable binding's failure as health).
+        // The first index pass unlocks automatic sync (the flight then runs, absorbing the
+        // queued signal, and persists the unreachable binding's failure as health).
         config.allow_empty = true;
         IndexDatabase::rebuild(&config).unwrap();
         let outcome = run(&config, AutosyncRequest::Incremental).unwrap();
         assert!(matches!(outcome, AutosyncOutcome::Ran(_)), "{outcome:?}");
+        assert!(!pending.exists(), "the queued signal was absorbed");
         let cursor_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM papertrail_sync_cursor WHERE project='o/r'",
