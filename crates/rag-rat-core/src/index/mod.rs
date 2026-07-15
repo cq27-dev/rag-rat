@@ -23,6 +23,7 @@ mod file_index;
 mod file_rows;
 mod fts;
 pub(crate) use fts::retry_once_on_fts_corruption;
+pub use fts::{FtsHealOutcome, error_is_fts_corruption};
 mod git_context;
 mod git_meta;
 mod graph_index;

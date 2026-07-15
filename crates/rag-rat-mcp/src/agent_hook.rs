@@ -192,7 +192,10 @@ mod listener {
                         memory_surface,
                     )
                 })
-                .await??;
+                .await?;
+                let composed = super::degrade_when_fts_corrupt(composed, || {
+                    super::spawn_background_fts_heal(config.clone())
+                })?;
                 match composed {
                     Some(out) => {
                         // compose's returned IDs are exactly the items rendered, so the
@@ -377,8 +380,78 @@ mod listener_tests {
     }
 }
 
+/// A read-only hook connection cannot heal FTS corruption, and the hook is latency-critical —
+/// degrade to the hook's designed null-context reply and let `on_corrupt` kick recovery. Every
+/// other error propagates unchanged.
+fn degrade_when_fts_corrupt<T>(
+    result: anyhow::Result<Option<T>>,
+    on_corrupt: impl FnOnce(),
+) -> anyhow::Result<Option<T>> {
+    match result {
+        Err(error) if rag_rat_core::index::error_is_fts_corruption(&error) => {
+            on_corrupt();
+            Ok(None)
+        },
+        other => other,
+    }
+}
+
+/// One background FTS heal at a time, off the hook's hot path, on its own WRITABLE open — the
+/// listener's read-only connection cannot rebuild. Without this, a grep-hook-only session
+/// (no MCP queries to trigger the query-layer self-heal) would serve null context indefinitely
+/// after a torn write, even though the repair is one lossless rebuild away.
+fn spawn_background_fts_heal(config: rag_rat_core::Config) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HEAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if HEAL_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        let outcome = rag_rat_core::IndexDatabase::open_config(&config)
+            .and_then(|db| db.heal_fts_if_corrupt());
+        match outcome {
+            Ok(outcome) if !outcome.healed.is_empty() || !outcome.deferred.is_empty() => {
+                eprintln!(
+                    "agent-hook: FTS corruption heal — rebuilt {:?}, deferred {:?}",
+                    outcome.healed, outcome.deferred
+                );
+            },
+            Ok(_) => {},
+            Err(error) => eprintln!("agent-hook: FTS corruption heal failed: {error:#}"),
+        }
+        HEAL_IN_FLIGHT.store(false, Ordering::SeqCst);
+    });
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fts_corruption_degrades_to_null_context_and_kicks_recovery() {
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseCorrupt,
+                extended_code: 267, // SQLITE_CORRUPT_VTAB — the FTS5 shadow variant
+            },
+            Some("database disk image is malformed".to_string()),
+        );
+        let mut kicked = false;
+        let degraded = super::degrade_when_fts_corrupt::<()>(Err(corrupt.into()), || kicked = true)
+            .expect("corruption must not surface as a hook error");
+        assert!(degraded.is_none(), "the hook's designed degrade is a null context");
+        assert!(kicked, "recovery must be kicked exactly when corruption is seen");
+
+        let mut kicked = false;
+        let other = super::degrade_when_fts_corrupt::<()>(
+            Err(anyhow::anyhow!("unrelated failure")),
+            || kicked = true,
+        );
+        assert!(other.is_err(), "non-corruption errors propagate unchanged");
+        assert!(!kicked);
+
+        let value = super::degrade_when_fts_corrupt(Ok(Some(7)), || unreachable!()).unwrap();
+        assert_eq!(value, Some(7));
+    }
+
     use super::*;
 
     #[test]

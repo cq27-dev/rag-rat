@@ -222,7 +222,7 @@ impl IndexDatabase {
     /// optimized away) — and rebuild the mirrors whose probe returns SQLITE_CORRUPT. Returns the
     /// rebuilt table names. The broad prefix disjunction matches essentially any text corpus; an
     /// empty mirror matches nothing and probes clean, which is right (nothing ranks it).
-    pub(crate) fn heal_fts_if_corrupt(&self) -> anyhow::Result<FtsHealOutcome> {
+    pub fn heal_fts_if_corrupt(&self) -> anyhow::Result<FtsHealOutcome> {
         // Every a-z/0-9 prefix: any token leading with an ASCII alphanumeric matches, so the
         // ranked probe reads docsize for essentially every row a real query could rank. (A corpus
         // of exclusively non-ASCII-leading tokens would evade it; the query-layer retry still
@@ -312,15 +312,15 @@ pub(crate) fn fenced_when_autocommit(
 /// What one FTS corruption sweep did: the mirrors rebuilt, and the corrupt mirrors whose
 /// repair had to wait for an in-flight generation-staged rebuild (#582).
 #[derive(Debug, Default)]
-pub(crate) struct FtsHealOutcome {
-    pub(crate) healed: Vec<String>,
-    pub(crate) deferred: Vec<String>,
+pub struct FtsHealOutcome {
+    pub healed: Vec<String>,
+    pub deferred: Vec<String>,
 }
 
 /// #582: whether `err`'s chain contains SQLITE_CORRUPT — the FTS5 shadow-table variant surfaces
 /// as extended `SQLITE_CORRUPT_VTAB` (267), whose primary code rusqlite maps to
 /// `DatabaseCorrupt`, rendered as the bare "database disk image is malformed".
-pub(crate) fn error_is_fts_corruption(err: &anyhow::Error) -> bool {
+pub fn error_is_fts_corruption(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<rusqlite::Error>(),
