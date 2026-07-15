@@ -167,14 +167,23 @@ impl GitLabClient {
         Ok(url.into())
     }
 
-    /// One page from one leg: the mapped items plus the leg's next-page URL, if any.
+    /// One page from one leg: the mapped items plus the leg's next-page URL, if any. `None` =
+    /// the namespace is unavailable (GitLab projects can disable issues or merge requests as a
+    /// feature, surfacing 403/404 on that list) — the caller treats it as an empty, drained leg
+    /// so one disabled tracker never aborts the sibling namespace's mirror.
     async fn leg_page(
         &self,
         project: &str,
         url: &str,
         leg: ListLeg,
-    ) -> anyhow::Result<(Vec<PapertrailItem>, Option<String>)> {
-        let (value, next_url) = self.get_json(url).await?;
+    ) -> anyhow::Result<Option<(Vec<PapertrailItem>, Option<String>)>> {
+        let response = self.core.get(url, &gitlab_headers()).await?;
+        if matches!(response.status, 403 | 404) {
+            return Ok(None);
+        }
+        ensure_success(response.status, &response.body)?;
+        let next_url = next_link(&response.headers)?;
+        let value: Value = serde_json::from_str(&response.body)?;
         let values = value.as_array().ok_or_else(|| {
             anyhow::anyhow!("GitLab {} response is not an array", leg.path_segment())
         })?;
@@ -182,7 +191,7 @@ impl GitLabClient {
         for value in values {
             items.push(item_from_gitlab_value(project, leg.item_kind(), value)?);
         }
-        Ok((items, next_url))
+        Ok(Some((items, next_url)))
     }
 }
 
@@ -284,29 +293,58 @@ impl PapertrailClient for GitLabClient {
             anyhow::bail!("an item page cannot be both delta and backfill");
         }
         let backfill = cursor.updated_before.is_some();
-        // Resume from the persisted continuation, or open BOTH legs' first pages.
-        let mut state = match cursor.provider_state.as_deref() {
-            Some(state) => serde_json::from_str::<ListContinuation>(state)?,
-            None => ListContinuation {
-                issues_next: Some(self.list_url(project, ListLeg::Issues, cursor)?),
-                merge_requests_next: Some(self.list_url(
-                    project,
-                    ListLeg::MergeRequests,
-                    cursor,
-                )?),
-                oldest: None,
-            },
+        // Resume from the persisted continuation, or open BOTH legs' first pages. The delta
+        // checkpoint persists only `page_token` and rebuilds its resume request WITHOUT
+        // provider_state (mirror sync_item_delta), so the continuation JSON must live in the
+        // page token itself — a resume that reopened both first pages would let a pause before
+        // the second logical page spend every run's budget replaying page one.
+        let continuation = cursor
+            .provider_state
+            .as_deref()
+            .or_else(|| cursor.page_token.as_deref().filter(|token| token.starts_with('{')));
+        let (mut state, fresh_open) = match continuation {
+            Some(state) => (serde_json::from_str::<ListContinuation>(state)?, false),
+            None => (
+                ListContinuation {
+                    issues_next: Some(self.list_url(project, ListLeg::Issues, cursor)?),
+                    merge_requests_next: Some(self.list_url(
+                        project,
+                        ListLeg::MergeRequests,
+                        cursor,
+                    )?),
+                    oldest: None,
+                },
+                true,
+            ),
         };
         let mut items = Vec::new();
+        let mut unavailable = 0usize;
+        let mut fetched = 0usize;
         if let Some(url) = state.issues_next.take() {
-            let (page, next) = self.leg_page(project, &url, ListLeg::Issues).await?;
-            items.extend(page);
-            state.issues_next = next;
+            fetched += 1;
+            match self.leg_page(project, &url, ListLeg::Issues).await? {
+                Some((page, next)) => {
+                    items.extend(page);
+                    state.issues_next = next;
+                },
+                None => unavailable += 1,
+            }
         }
         if let Some(url) = state.merge_requests_next.take() {
-            let (page, next) = self.leg_page(project, &url, ListLeg::MergeRequests).await?;
-            items.extend(page);
-            state.merge_requests_next = next;
+            fetched += 1;
+            match self.leg_page(project, &url, ListLeg::MergeRequests).await? {
+                Some((page, next)) => {
+                    items.extend(page);
+                    state.merge_requests_next = next;
+                },
+                None => unavailable += 1,
+            }
+        }
+        // One unavailable namespace is a disabled feature; EVERY namespace unavailable on a
+        // fresh open means the project itself is missing or inaccessible — that must surface,
+        // not mirror as an empty project.
+        if fresh_open && unavailable == fetched {
+            return Err(PapertrailClientError::ItemNotFound.into());
         }
         // Keep the emitted page ordered like its legs (mirror correctness is order-agnostic;
         // ordering keeps pages legible in logs and tests).
@@ -323,19 +361,21 @@ impl PapertrailClient for GitLabClient {
             };
         }
         let stream = if backfill { LIST_BACKFILL_STREAM } else { LIST_DELTA_STREAM };
-        let pending = [state.issues_next.as_deref(), state.merge_requests_next.as_deref()];
-        let next = match pending.iter().flatten().next() {
-            Some(token) => Some(PageCursor {
+        let pending = state.issues_next.is_some() || state.merge_requests_next.is_some();
+        let next = if pending {
+            let token = serde_json::to_string(&state)?;
+            Some(PageCursor {
                 stream: Some(stream.to_string()),
                 updated_since: cursor.updated_since.clone(),
                 updated_before: cursor.updated_before.clone(),
-                // A non-empty token marks every continuation page as NOT the scan's first page
-                // (the mirror's conservative-frontier logic keys off that); the authoritative
-                // state is the full per-leg continuation.
-                page_token: Some((*token).to_string()),
-                provider_state: Some(serde_json::to_string(&state)?),
-            }),
-            None => None,
+                // The full continuation IS the page token (see resume note above); its
+                // non-emptiness also marks every continuation page as NOT the scan's first page
+                // for the mirror's conservative-frontier logic.
+                page_token: Some(token.clone()),
+                provider_state: Some(token),
+            })
+        } else {
+            None
         };
         // The cycle's provider-confirmed strict boundary: both legs drained fully below the
         // cutoff, so the global oldest consumed timestamp bounds everything this cycle stored.
@@ -375,12 +415,15 @@ impl PapertrailClient for GitLabClient {
             .ok_or_else(|| anyhow::anyhow!("GitLab events response is not an array"))?;
         let mut comments = Vec::new();
         for event in events {
-            // The feed is creation events for notes; each embeds the note's CURRENT state. Notes
-            // on untracked noteables (commits, snippets) carry no iid and are skipped.
-            if event["target_type"].as_str() != Some("Note") {
+            // The feed is creation events for notes; each embeds the note's CURRENT state. The
+            // target_type varies by note subclass (`Note`, `DiscussionNote` for threaded MR
+            // discussions, `DiffNote` for positioned comments — verified live), so the gate is
+            // "carries a note on a tracked noteable", never a target_type list. Notes on
+            // untracked noteables (commits, snippets) carry no iid and are skipped.
+            let note = &event["note"];
+            if note.is_null() {
                 continue;
             }
-            let note = &event["note"];
             let kind = match note["noteable_type"].as_str() {
                 Some("Issue") => ItemKind::Issue,
                 Some("MergeRequest") => ItemKind::ChangeRequest,
@@ -390,7 +433,21 @@ impl PapertrailClient for GitLabClient {
                 continue;
             };
             validate_positive_id(note, "id", "GitLab note event")?;
-            if let Some(comment) = comment_from_note_value(project, kind, &iid.to_string(), note) {
+            if let Some(mut comment) =
+                comment_from_note_value(project, kind, &iid.to_string(), note)
+            {
+                // The mirror advances this stream's frontier from comment.updated_at, and the
+                // frontier must ride the feed's OWN ordering key — the event's created_at. An
+                // edited old note embeds a much newer note.updated_at in its old creation
+                // event; letting that inflate the first-page frontier shrinks the next scan's
+                // replay window and can strand events missed to offset shifts. The stored stamp
+                // therefore reflects event time until the next full walk's thread refetch
+                // repairs it — cursor correctness over a cosmetic timestamp.
+                comment.updated_at = event["created_at"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| comment.updated_at.take())
+                    .or_else(|| comment.created_at.clone());
                 comments.push(comment);
             }
         }
@@ -413,13 +470,22 @@ impl PapertrailClient for GitLabClient {
         // the project's newest movement. No ETag: two responses cannot share one validator, and
         // `probe_advance` on timestamps suffices.
         let mut latest: Option<String> = None;
+        let mut unavailable = 0usize;
         for leg in [ListLeg::Issues, ListLeg::MergeRequests] {
             let mut url = Url::parse(&self.project_path(project, leg.path_segment())?)?;
             url.query_pairs_mut()
                 .append_pair("order_by", "updated_at")
                 .append_pair("sort", "desc")
                 .append_pair("per_page", "1");
-            let (value, _) = self.get_json(url.as_str()).await?;
+            let response = self.core.get(url.as_str(), &gitlab_headers()).await?;
+            // A disabled namespace (403/404 on its list) is quiet, not fatal — the sibling
+            // namespace still answers the probe. Both unavailable = the project is gone.
+            if matches!(response.status, 403 | 404) {
+                unavailable += 1;
+                continue;
+            }
+            ensure_success(response.status, &response.body)?;
+            let value: Value = serde_json::from_str(&response.body)?;
             let leg_latest = value
                 .as_array()
                 .and_then(|items| items.first())
@@ -429,6 +495,9 @@ impl PapertrailClient for GitLabClient {
                 (Some(current), Some(new)) => Some(current.max(new)),
                 (current, new) => current.or(new),
             };
+        }
+        if unavailable == 2 {
+            return Err(PapertrailClientError::ItemNotFound.into());
         }
         // GitLab has no probe validator (no shared ETag across the two namespace calls), so the
         // timestamp comparison IS the quiet signal: the mirror keys the delta-scan decision off
@@ -833,6 +902,144 @@ mod tests {
         }
     }
 
+    /// The mirror's delta checkpoint persists ONLY `page_token` and rebuilds its resume
+    /// request without provider_state — a pause between logical pages must resume the saved
+    /// legs, not reopen both first pages (which would spend every run's budget on page one).
+    #[test]
+    fn delta_resumes_from_the_page_token_alone_like_the_mirror_checkpoint() {
+        let issues_page_one = format!("[{}]", issue(21, "2026-01-11T00:00:00Z"));
+        let issues_page_two = format!("[{}]", issue(22, "2026-01-13T00:00:00Z"));
+        let changes = format!("[{}]", merge_request(8, "2026-01-12T00:00:00Z"));
+        let (base, handle) = spawn_script_stub(vec![
+            with_next_link(
+                StubResponse::ok(&issues_page_one),
+                "/api/v4/projects/g%2Fs%2Fr/issues?page=2",
+            ),
+            StubResponse::ok(&changes),
+            StubResponse::ok(&issues_page_two),
+        ]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+
+        let first = block_on(client.items_page("g/s/r", &PageCursor {
+            updated_since: Some("2026-01-09T00:00:00Z".to_string()),
+            ..PageCursor::default()
+        }))
+        .unwrap();
+        let next = first.next.expect("issues leg still pending");
+
+        // Rebuild the resume request the way sync_item_delta does: page_token ONLY.
+        let resumed = block_on(client.items_page("g/s/r", &PageCursor {
+            updated_since: Some("2026-01-09T00:00:00Z".to_string()),
+            page_token: next.page_token.clone(),
+            ..PageCursor::default()
+        }))
+        .unwrap();
+        assert_eq!(resumed.items.len(), 1);
+        assert_eq!(resumed.items[0].item_key, "22");
+        assert!(resumed.next.is_none());
+        let heads = handle.join().unwrap();
+        assert_eq!(heads.len(), 3, "the resume fetched ONE page, not two reopened legs");
+        assert!(heads[2].contains("/issues?page=2"), "{}", heads[2]);
+    }
+
+    /// Threaded MR discussions arrive as `target_type: "DiscussionNote"` events (verified
+    /// live); a `target_type == "Note"` gate silently drops them and quiet discussion comments
+    /// would never mirror incrementally. The frontier falls back to the event's created_at when
+    /// a payload omits the note's updated_at — a None frontier replays the feed every sync.
+    #[test]
+    fn comment_events_accept_discussion_notes_and_fall_back_to_event_timestamps() {
+        let events = r#"[
+            {"target_type":"DiscussionNote","created_at":"2026-01-13T00:00:00Z","note":{"id":40,"body":"threaded words","system":false,"type":"DiscussionNote","noteable_type":"MergeRequest","noteable_iid":6,"author":{"username":"t"},"created_at":"2026-01-12T23:59:00Z"}}
+        ]"#;
+        let (base, _handle) = spawn_script_stub(vec![StubResponse::ok(events)]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+        let page = block_on(client.comments_page("g/s/r", &PageCursor::default())).unwrap();
+        assert_eq!(page.comments.len(), 1);
+        assert_eq!(page.comments[0].item_kind, ItemKind::ChangeRequest);
+        assert_eq!(page.comments[0].item_key, "6");
+        assert_eq!(
+            page.comments[0].updated_at.as_deref(),
+            Some("2026-01-13T00:00:00Z"),
+            "missing note updated_at falls back to the event's created_at"
+        );
+    }
+
+    /// GitLab projects can disable issues or merge requests as a feature; the unavailable leg
+    /// mirrors as empty instead of aborting the sibling namespace. EVERY leg unavailable on a
+    /// fresh open is a missing project and must surface as the typed not-found outcome.
+    #[test]
+    fn a_disabled_namespace_never_aborts_the_sibling_leg() {
+        let changes = format!("[{}]", merge_request(9, "2026-01-05T00:00:00Z"));
+        let (base, _handle) = spawn_script_stub(vec![
+            StubResponse::status("403 Forbidden", "{}"),
+            StubResponse::ok(&changes),
+        ]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+        let page = block_on(client.items_page("g/s/r", &PageCursor {
+            updated_before: Some("2026-02-01T00:00:00Z".to_string()),
+            ..PageCursor::default()
+        }))
+        .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].item_kind, ItemKind::ChangeRequest);
+        assert!(page.next.is_none());
+        assert_eq!(page.backfill_boundary.as_deref(), Some("2026-01-05T00:00:00Z"));
+    }
+
+    #[test]
+    fn a_fully_unavailable_project_surfaces_as_the_typed_not_found_outcome() {
+        let (base, _handle) = spawn_script_stub(vec![
+            StubResponse::status("404 Not Found", "{}"),
+            StubResponse::status("404 Not Found", "{}"),
+        ]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+        let error = block_on(client.items_page("g/s/r", &PageCursor {
+            updated_before: Some("2026-02-01T00:00:00Z".to_string()),
+            ..PageCursor::default()
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<PapertrailClientError>(),
+                Some(PapertrailClientError::ItemNotFound)
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn the_probe_tolerates_one_disabled_namespace_and_fails_on_two() {
+        let (base, _handle) = spawn_script_stub(vec![
+            StubResponse::status("403 Forbidden", "{}"),
+            StubResponse::ok(&format!("[{}]", merge_request(2, "2026-01-07T00:00:00Z"))),
+            StubResponse::status("404 Not Found", "{}"),
+            StubResponse::status("404 Not Found", "{}"),
+        ]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+
+        let probe = block_on(client.freshness_probe("g/s/r", &FreshnessProbe {
+            updated_since: Some("2026-01-06T00:00:00Z".to_string()),
+            etag: None,
+        }))
+        .unwrap();
+        assert_eq!(probe.latest.as_deref(), Some("2026-01-07T00:00:00Z"));
+
+        let error =
+            block_on(client.freshness_probe("g/s/r", &FreshnessProbe::default())).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<PapertrailClientError>(),
+                Some(PapertrailClientError::ItemNotFound)
+            ),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn freshness_probe_takes_the_max_of_both_namespaces_and_stays_quiet_at_the_cursor() {
         let (base, handle) = spawn_script_stub(vec![
@@ -921,9 +1128,9 @@ mod tests {
     #[test]
     fn comment_events_map_embedded_notes_and_skip_untracked_noteables() {
         let events = r#"[
-            {"target_type":"Note","note":{"id":30,"body":"issue words","system":false,"noteable_type":"Issue","noteable_iid":4,"author":{"username":"a"},"created_at":"2026-01-10T00:00:00Z","updated_at":"2026-01-12T00:00:00Z"}},
-            {"target_type":"Note","note":{"id":31,"body":"mr words","system":false,"noteable_type":"MergeRequest","noteable_iid":4,"author":{"username":"b"},"created_at":"2026-01-11T00:00:00Z","updated_at":"2026-01-11T00:00:00Z"}},
-            {"target_type":"Note","note":{"id":32,"body":"commit words","system":false,"noteable_type":"Commit","author":{"username":"c"},"created_at":"2026-01-11T00:00:00Z","updated_at":"2026-01-11T00:00:00Z"}},
+            {"target_type":"Note","created_at":"2026-01-10T00:00:30Z","note":{"id":30,"body":"issue words","system":false,"noteable_type":"Issue","noteable_iid":4,"author":{"username":"a"},"created_at":"2026-01-10T00:00:00Z","updated_at":"2026-01-12T00:00:00Z"}},
+            {"target_type":"Note","created_at":"2026-01-11T00:00:30Z","note":{"id":31,"body":"mr words","system":false,"noteable_type":"MergeRequest","noteable_iid":4,"author":{"username":"b"},"created_at":"2026-01-11T00:00:00Z","updated_at":"2026-01-11T00:00:00Z"}},
+            {"target_type":"Note","created_at":"2026-01-11T00:01:00Z","note":{"id":32,"body":"commit words","system":false,"noteable_type":"Commit","author":{"username":"c"},"created_at":"2026-01-11T00:00:00Z","updated_at":"2026-01-11T00:00:00Z"}},
             {"target_type":"Issue","target_iid":9}
         ]"#;
         let (base, handle) = spawn_script_stub(vec![StubResponse::ok(events)]);
@@ -940,10 +1147,12 @@ mod tests {
         assert_eq!(page.comments[0].item_kind, ItemKind::Issue);
         assert_eq!(page.comments[0].item_key, "4");
         assert_eq!(page.comments[0].comment_id, "note:30");
+        assert_eq!(page.comments[0].body, "issue words", "the embedded note body is current");
         assert_eq!(
             page.comments[0].updated_at.as_deref(),
-            Some("2026-01-12T00:00:00Z"),
-            "the embedded note carries its CURRENT state, edits included"
+            Some("2026-01-10T00:00:30Z"),
+            "the frontier stamp is the EVENT's created_at — an edited old note must not inflate \
+             the first-page frontier past the feed's ordering key"
         );
         assert_eq!(page.comments[1].item_kind, ItemKind::ChangeRequest);
         assert_eq!(page.comments[1].item_key, "4");
