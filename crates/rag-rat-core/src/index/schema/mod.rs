@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 68;
+pub const LATEST_SCHEMA_VERSION: u32 = 69;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -472,6 +472,13 @@ const MIGRATION_068_CHECKSUM: &str = "sha256:rag-rat-suppressed-edge-candidates-
 const MIGRATION_068_DESCRIPTION: &str = "Hide suppressed unresolved edge candidates from the \
                                          compatibility view while retaining them for later \
                                          incremental re-resolution";
+const MIGRATION_069_ID: &str = "069_oplog_local_account";
+const MIGRATION_069_CHECKSUM: &str = "sha256:rag-rat-oplog-local-account-v69";
+const MIGRATION_069_DESCRIPTION: &str =
+    "Add oplog_local_account (sync phase C3.4a): the single-row (id = 0) STRICT pointer naming \
+     the genesis_entry_hash of this store's one local account, minted once by local_account and \
+     reused so later C3.4 slices author owner-bound /3 content under a stable identity. \
+     Store-global, not repo-scoped; purely additive, nothing pre-existing to backfill";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1041,6 +1048,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_068_CHECKSUM,
         description: MIGRATION_068_DESCRIPTION,
         apply: apply_edges_view_refresh,
+    },
+    Migration {
+        id: MIGRATION_069_ID,
+        checksum: MIGRATION_069_CHECKSUM,
+        description: MIGRATION_069_DESCRIPTION,
+        apply: apply_oplog_local_account,
     },
 ];
 

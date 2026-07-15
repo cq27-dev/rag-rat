@@ -1266,6 +1266,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_066_ID => Some(66),
             MIGRATION_067_ID => Some(67),
             MIGRATION_068_ID => Some(68),
+            MIGRATION_069_ID => Some(69),
             _ => None,
         })
         .max()
@@ -1343,6 +1344,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_066_ID
             | MIGRATION_067_ID
             | MIGRATION_068_ID
+            | MIGRATION_069_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1417,6 +1419,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_066_ID => migration.checksum != MIGRATION_066_CHECKSUM,
         MIGRATION_067_ID => migration.checksum != MIGRATION_067_CHECKSUM,
         MIGRATION_068_ID => migration.checksum != MIGRATION_068_CHECKSUM,
+        MIGRATION_069_ID => migration.checksum != MIGRATION_069_CHECKSUM,
         _ => false,
     }
 }
@@ -4463,6 +4466,26 @@ pub(crate) fn apply_content_candidate_dag(conn: &Connection) -> rusqlite::Result
          ) STRICT;
          CREATE INDEX IF NOT EXISTS content_pre_verify_author
              ON content_pre_verify(claimed_author_account_id, roster_ref);",
+    )
+}
+
+/// V069 (sync phase C3.4a): the store-global local-account pointer. `oplog_local_account` is a
+/// single-row (`CHECK (id = 0)`) STRICT table naming the `genesis_entry_hash` of THIS store's one
+/// local account — the seq-0, self-authorizing `AccountGenesis` minted once by
+/// [`crate::oplog::local_account`] and reused thereafter, so later C3.4 slices author owner-bound
+/// `/3` content under a stable account identity. The pointer is a 32-byte content address into
+/// `account_entries`, not the account_id itself: the id is resolved by looking the genesis up in
+/// the candidate DAG, so the pointer + genesis stay a single source of truth (one committed
+/// atomically with the other by the minting transaction). Store-global like
+/// `oplog_device_identity`, not repo-scoped. Purely additive; `CREATE ... IF NOT EXISTS`, so a torn
+/// replay reconverges without a wrapping transaction.
+pub(crate) fn apply_oplog_local_account(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS oplog_local_account(
+             id                 INTEGER PRIMARY KEY CHECK (id = 0),
+             genesis_entry_hash BLOB NOT NULL CHECK (length(genesis_entry_hash) = 32),
+             created_at_ms      INTEGER NOT NULL
+         ) STRICT;",
     )
 }
 

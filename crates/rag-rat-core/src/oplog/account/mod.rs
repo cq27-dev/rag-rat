@@ -15,6 +15,7 @@
 //! - [`id`]: [`AccountId`] + the §4 genesis commitment.
 //! - [`limits`]: §18a protocol-validity constants + the account-layer domain strings.
 //! - [`envelope`]: the 13-part signed account-entry envelope (§6).
+mod bootstrap;
 mod candidate;
 mod content;
 mod cut;
@@ -26,6 +27,7 @@ mod ops;
 mod registers;
 mod storage;
 
+pub(crate) use bootstrap::local_account;
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub(in crate::oplog) use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, SignedContentEntry,

@@ -45,8 +45,11 @@ struct AccountProjection {
     forked: HashSet<EntryHash>,
 }
 
+/// The outcome of an `INSERT OR IGNORE` into the candidate DAG. `pub(super)` so the account
+/// [`super::bootstrap`] seam can reuse [`insert_candidate`] directly when minting the local-account
+/// genesis (it MUST NOT go through the self-transacting [`account_ingest`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CandidateInsert {
+pub(super) enum CandidateInsert {
     Inserted,
     AlreadyPresent,
     AtCapacity(CapacityScope),
@@ -872,7 +875,9 @@ fn decode_stored_boundary(
 }
 
 /// The refold body (caller owns the txn). Returns each entry_hash → its projected status.
-fn refold_in_tx(
+/// `pub(super)` so [`super::bootstrap`] can fold its freshly-inserted local-account genesis inside
+/// the same mint transaction, rather than nesting the self-transacting [`refold_account`].
+pub(super) fn refold_in_tx(
     tx: &Transaction<'_>,
     account_id: AccountId,
 ) -> anyhow::Result<HashMap<[u8; 32], String>> {
@@ -1246,7 +1251,10 @@ fn load_candidates(conn: &Connection, account_id: AccountId) -> anyhow::Result<V
     Ok(out)
 }
 
-fn insert_candidate(
+/// Insert one verified entry into the candidate DAG under the caller's txn, enforcing the
+/// operational admission budgets. `pub(super)` so [`super::bootstrap`] can store its local-account
+/// genesis through the same seam the ingest path uses.
+pub(super) fn insert_candidate(
     tx: &Transaction<'_>,
     verified: &VerifiedAccountEntry,
     signed_bytes: &[u8],

@@ -2015,10 +2015,16 @@ fn migration_066_adds_the_content_candidate_dag() {
 }
 
 #[test]
-fn migration_068_is_the_tip_and_hides_suppressed_edge_candidates() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 68, "move this pin with the next schema migration");
+fn migration_068_hides_suppressed_edge_candidates() {
+    // The absolute-tip pin moved to `migration_069_*` (V069 is the tip now); this drops to the
+    // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply",
+    );
     conn.execute(
         "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
          commit_sha, worktree_id) VALUES ('App.swift', 'swift', 'source', 'sha', 0, 0, 'head', '')",
@@ -2067,6 +2073,89 @@ fn migration_068_is_the_tip_and_hides_suppressed_edge_candidates() {
         )
         .unwrap();
     assert_eq!(v68_recorded, 1, "the forward migration records V068");
+}
+
+#[test]
+fn migration_069_is_the_tip_and_adds_the_local_account_pointer() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 69, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    // The single-row pointer table exists with its full column set.
+    for column in ["id", "genesis_entry_hash", "created_at_ms"] {
+        assert!(
+            conn_table_columns(&conn, "oplog_local_account").contains(&column.to_string()),
+            "V069 gives oplog_local_account its {column} column",
+        );
+    }
+
+    // `CHECK (id = 0)` + the primary key make it a strict single-row table: id 0 inserts once; a
+    // non-zero id is refused by the CHECK; a second id-0 insert is refused by the PK. The
+    // `length(genesis_entry_hash) = 32` CHECK rejects a wrong-width pointer.
+    conn.execute(
+        "INSERT INTO oplog_local_account(id, genesis_entry_hash, created_at_ms)
+         VALUES (0, zeroblob(32), 0)",
+        [],
+    )
+    .expect("the sole id=0 pointer row inserts");
+    assert!(
+        conn.execute(
+            "INSERT INTO oplog_local_account(id, genesis_entry_hash, created_at_ms)
+             VALUES (1, zeroblob(32), 0)",
+            [],
+        )
+        .is_err(),
+        "CHECK (id = 0) rejects a second, non-zero pointer",
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO oplog_local_account(id, genesis_entry_hash, created_at_ms)
+             VALUES (0, zeroblob(32), 1)",
+            [],
+        )
+        .is_err(),
+        "the id=0 primary key rejects a second pointer",
+    );
+    assert!(
+        conn.execute(
+            "UPDATE oplog_local_account SET genesis_entry_hash = zeroblob(31) WHERE id = 0",
+            [],
+        )
+        .is_err(),
+        "the length(genesis_entry_hash) = 32 CHECK rejects a wrong-width hash",
+    );
+
+    // Deferred-absence in ISOLATION: a bare DB lacks the table until the V069 applier runs, and a
+    // replay is an idempotent no-op (CREATE ... IF NOT EXISTS).
+    let isolated = rusqlite::Connection::open_in_memory().unwrap();
+    assert!(
+        !conn_table_exists(&isolated, "oplog_local_account"),
+        "bare DB lacks oplog_local_account before the isolated apply",
+    );
+    schema::apply_oplog_local_account(&isolated).unwrap();
+    schema::apply_oplog_local_account(&isolated).expect("replay is a no-op");
+    assert!(
+        conn_table_columns(&isolated, "oplog_local_account")
+            .contains(&"genesis_entry_hash".to_string()),
+        "the isolated applier recreates the table",
+    );
+
+    // A forward migrate over a ledger truncated below V069 replays the step and records V069.
+    truncate_schema_to(&conn, 68);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip",
+    );
+    let v69_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '069_oplog_local_account'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v69_recorded, 1, "the forward migration records V069");
 }
 
 #[test]

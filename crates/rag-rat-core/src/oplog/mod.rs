@@ -45,6 +45,14 @@ mod stream;
 // C1's curated authority seam for the C2 `/3` content envelope and candidate DAG. The account
 // implementation stays private; only typed ingest results and snapshot-consistent point queries
 // cross the phase boundary.
+// C3.4a's local-account mint (#662): the store-global principal later C3.4 slices author
+// owner-bound /3 content under. Unused until that caller lands, so the re-export is `expect`'d
+// like the seam above.
+#[expect(
+    unused_imports,
+    reason = "C3.4a local account mint is frozen before its caller lands"
+)]
+pub(crate) use account::local_account;
 #[expect(unused_imports, reason = "C2 authority seam is frozen before its caller lands")]
 pub(crate) use account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
