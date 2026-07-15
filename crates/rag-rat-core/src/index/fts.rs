@@ -107,29 +107,23 @@ impl IndexDatabase {
         if !self.fts_dirty()? && fts_source_revision.as_deref() == Some(content_revision.as_str()) {
             return Ok(());
         }
-        // NEVER rebuild while any SEARCHABLE chunk lacks its durable text row (A6, P2 review): a
+        // NEVER rebuild while any chunk lacks its durable text row (A6, P2 review): a
         // generation-staged full rebuild commits its waves BEFORE `build_chunk_text_store` runs,
-        // so on a FIRST index (no `chunk_text_dict` yet) the staged chunks carry inline
-        // `chunk_fts` rows whose text exists only in the REBUILDING connection's temp table.
-        // `rebuild_chunk_fts`'s 'delete-all' + re-derive from `chunk_text` would silently drop
-        // those rows from BM25 and the freshness stamp below would mark the loss clean —
-        // permanent missing rows in the published generation. Degrade instead: serve the current
-        // (possibly stale) FTS and leave the dirty/stale state in place, so the refresh re-fires
-        // once the text store is complete (the rebuild's own finalize records freshness for the
-        // fast path). The probe is deliberately "HAS an fts row we cannot re-derive" — not a bare
-        // "lacks text" — so a chunk with NEITHER row (never searchable; the re-derive would
-        // exclude it regardless) can never wedge freshness healing permanently. Runs only on the
-        // dirty/stale path, never steady-state.
-        let irreplaceable_fts_rows: bool = self.storage.connection().query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM main.chunks
-                 WHERE id IN (SELECT rowid FROM chunk_fts)
-                   AND id NOT IN (SELECT chunk_id FROM main.chunk_text)
-             )",
-            [],
-            |row| row.get(0),
-        )?;
-        if irreplaceable_fts_rows {
+        // so mid-rebuild the staged chunks carry inline `chunk_fts` rows whose text exists only
+        // in the REBUILDING connection's temp table. `rebuild_chunk_fts`'s 'delete-all' +
+        // re-derive from `chunk_text` would silently drop those rows from BM25 and the freshness
+        // stamp below would mark the loss clean — permanent missing rows in the published
+        // generation. Degrade instead: serve the current (possibly stale) FTS and leave the
+        // dirty/stale state in place, so the refresh re-fires once the text store is complete.
+        //
+        // The probe reads the GENERATION LEDGER, never chunk/FTS shapes (#582 review): the A6
+        // guard used to check "HAS an fts row we cannot re-derive", but a docsize-corrupted
+        // mirror SCANS AS EMPTY, blinding that shape exactly when a stale stamp coincides with
+        // corruption — the rebuild then destroyed the staged rows the guard exists to protect.
+        // Staging-above-live is corruption-independent, true precisely during rebuild windows
+        // (an abandoned staging is swept by gc under the flock), so it cannot wedge freshness
+        // healing permanently.
+        if self.staged_files_generation_exists()? {
             return Ok(());
         }
         self.rebuild_fts()?;
@@ -142,6 +136,35 @@ impl IndexDatabase {
             );
         }
         Ok(())
+    }
+
+    /// The staging probe shared by `ensure_fts_fresh` and the corruption heals (#582 review): a
+    /// generation-staged rebuild is in flight (or abandoned, pending gc's flock-guarded sweep)
+    /// iff any repo carries `files` rows ABOVE its live generation pointer — the same ledger
+    /// signal the #492 torn-window guard reads. Deliberately consults the generation ledger and
+    /// never chunk/FTS shapes: a docsize-corrupted `chunk_fts` SCANS AS EMPTY (blinding any
+    /// FTS-membership probe exactly when it matters), and "chunk without durable text"
+    /// over-fires on never-searchable chunks that legitimately carry neither row. `chunk_fts` is
+    /// GLOBAL, so ANY repo's staging defers the rebuild.
+    fn staged_files_generation_exists(&self) -> anyhow::Result<bool> {
+        let conn = self.storage.connection();
+        let repos: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT DISTINCT repo_id FROM main.files")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for repo_id in repos {
+            let live = crate::index::schema::live_files_generation(conn, &repo_id)?;
+            let staged: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND generation > ?2)",
+                rusqlite::params![repo_id, live],
+                |row| row.get(0),
+            )?;
+            if staged {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(super) fn fts_dirty(&self) -> anyhow::Result<bool> {
@@ -170,6 +193,15 @@ impl IndexDatabase {
         // ORIGINAL corruption error; the next query (or explicit `heal_index`) retries.
         let fence =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        // Between a staged rebuild's committed waves, chunk_fts rows exist whose text is not in
+        // the durable store yet — 'delete-all' + re-derive would drop them permanently and stamp
+        // the loss clean (the same A6 guard `ensure_fts_fresh` applies). Refuse; the original
+        // error surfaces and the heal retries once the rebuild's text store is complete.
+        anyhow::ensure!(
+            !self.staged_files_generation_exists()?,
+            "FTS corruption heal deferred: a staged rebuild's chunk_fts rows are not yet \
+             re-derivable from the text store"
+        );
         self.rebuild_fts()?;
         crate::query::memory::heal_repo_memory_fts(conn)?;
         crate::index::papertrail::rebuild_fts(conn)?;
@@ -217,7 +249,9 @@ impl IndexDatabase {
         // multi-statement, and per-repo flocks cannot serialize a consolidated DB's siblings.
         let fence =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        if chunk_corrupt || commit_corrupt {
+        // Same staged-rows refusal as `heal_corrupt_fts` — the memory/papertrail heals below are
+        // unaffected (their sources are always complete).
+        if (chunk_corrupt || commit_corrupt) && !self.staged_files_generation_exists()? {
             self.rebuild_fts()?;
             if chunk_corrupt {
                 healed.push("chunk_fts".to_string());
@@ -262,7 +296,12 @@ pub(crate) fn retry_once_on_fts_corruption<T>(
     match op() {
         Ok(value) => Ok(value),
         Err(err) if error_is_fts_corruption(&err) => {
-            heal().context("healing corrupt FTS indexes (#582)")?;
+            if let Err(heal_err) = heal() {
+                // Keep the ORIGINAL corruption error as the chain root (callers and tests match
+                // on it); the heal's own failure — e.g. the staged-rebuild deferral — rides
+                // along as context.
+                return Err(err.context(format!("FTS self-heal did not complete: {heal_err:#}")));
+            }
             op()
         },
         Err(err) => Err(err),

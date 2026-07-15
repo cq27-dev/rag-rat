@@ -21,6 +21,11 @@ impl IndexDatabase {
         verdict_pass: Option<VerdictPass<'_>>,
         compact_pass: Option<CompactPass<'_>>,
     ) -> anyhow::Result<DreamReport> {
+        // #582 review: the verify/compact passes rank chunk_fts (evidence-pack probes) MID-RUN,
+        // after model side effects — a blanket retry would replay them. PRE-FLIGHT the
+        // probe-and-heal instead so the run starts on healthy mirrors; on a clean index the
+        // probe is four ranked LIMIT-1 reads.
+        self.heal_fts_if_corrupt()?;
         crate::dream::dream_run_with_passes(
             self.storage.connection(),
             opts,
@@ -41,13 +46,20 @@ impl IndexDatabase {
         compact: bool,
         model_id: &str,
     ) -> anyhow::Result<bool> {
-        crate::dream::model_work_pending(
-            self.storage.connection(),
-            opts,
-            budget,
-            verify,
-            compact,
-            model_id,
+        // #582 review: the zero-work guard ranks chunk_fts (`dream::verify::text_probe`) —
+        // read-only, so heal-and-retry is safe.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                crate::dream::model_work_pending(
+                    self.storage.connection(),
+                    opts.clone(),
+                    budget,
+                    verify,
+                    compact,
+                    model_id,
+                )
+            },
+            || self.heal_corrupt_fts(),
         )
     }
 

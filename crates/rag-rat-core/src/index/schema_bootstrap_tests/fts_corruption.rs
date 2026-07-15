@@ -191,3 +191,49 @@ fn commit_search_self_heals_commit_fts_corruption() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn heal_refuses_while_staged_chunk_fts_rows_are_not_rederivable() {
+    // #582 review: between a staged rebuild's committed waves, chunk_fts rows exist whose text
+    // is not in the durable store yet. A corruption heal firing in that window must REFUSE (the
+    // original error surfaces; the next query retries) rather than 'delete-all' + re-derive,
+    // which would silently drop the staged rows and stamp the loss clean.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn staged_witness_fn() {}\n").unwrap();
+    fs::write(root.join("src/other.rs"), "pub fn ranked_witness_fn() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Simulate the mid-rebuild window through the GENERATION LEDGER (the staging signal the
+    // guard reads — corruption-independent by design): one file's rows sit ABOVE the repo's live
+    // generation, exactly as a rebuild's committed-but-unpublished wave does.
+    db.storage
+        .connection()
+        .execute("UPDATE main.files SET generation = generation + 1 WHERE path = 'src/lib.rs'", [])
+        .unwrap();
+    corrupt_fts_docsize(&db, "chunk_fts");
+
+    let fts_rows_before: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT count(*) FROM chunk_fts", [], |row| row.get(0))
+        .unwrap();
+    let result = db.search("ranked_witness_fn", 10, false);
+    assert!(
+        result.is_err_and(|e| {
+            let chain = format!("{e:#}");
+            chain.contains("malformed") && chain.contains("heal")
+        }),
+        "the heal refuses: the ORIGINAL corruption error surfaces with the deferral as context"
+    );
+    let fts_rows_after: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT count(*) FROM chunk_fts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(fts_rows_before, fts_rows_after, "the staged fts rows were NOT deleted");
+
+    let _ = fs::remove_dir_all(&root);
+}
