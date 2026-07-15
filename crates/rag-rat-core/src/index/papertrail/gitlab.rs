@@ -10,14 +10,20 @@
 //! - **No "notes updated since" feed**: there is no project-level notes endpoint, and note activity
 //!   does NOT bump the noteable's `updated_at` (verified live against GitLab CE). New comments
 //!   therefore arrive through the project EVENTS feed (`action=commented`, one event per note
-//!   CREATION, each embedding the note's CURRENT body); edits to old notes produce no event and no
-//!   timestamp movement anywhere, so edited bodies converge at the daily full re-walk.
+//!   CREATION, each embedding the note's CURRENT body); edits to old notes and approvals produce no
+//!   commented event and no timestamp movement anywhere, so both converge at the daily full
+//!   re-walk. The feed is offset-paginated: deleting a note/item mid-scan can shift an unread event
+//!   into an already-read offset, and the per-page frontier then advances past it — a bounded
+//!   staleness window (also healed by the daily full re-walk) accepted in exchange for not
+//!   replaying busy multi-page days on every poll forever.
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::transport::{GovernorRegistry, Transport, TransportOptions, TransportParams};
+use super::transport::{
+    GovernorRegistry, Transport, TransportError, TransportOptions, TransportParams,
+};
 use super::*;
 
 const LIST_BACKFILL_STREAM: &str = "list_backfill";
@@ -51,10 +57,7 @@ enum ListLeg {
 
 impl ListLeg {
     fn path_segment(self) -> &'static str {
-        match self {
-            Self::Issues => "issues",
-            Self::MergeRequests => "merge_requests",
-        }
+        resource_segment(self.item_kind())
     }
 
     fn item_kind(self) -> ItemKind {
@@ -167,19 +170,29 @@ impl GitLabClient {
         Ok(url.into())
     }
 
-    /// One page from one leg: the mapped items plus the leg's next-page URL, if any. `None` =
-    /// the namespace is unavailable (GitLab projects can disable issues or merge requests as a
-    /// feature, surfacing 403/404 on that list) — the caller treats it as an empty, drained leg
-    /// so one disabled tracker never aborts the sibling namespace's mirror.
-    async fn leg_page(
-        &self,
-        project: &str,
-        url: &str,
-        leg: ListLeg,
-    ) -> anyhow::Result<Option<(Vec<PapertrailItem>, Option<String>)>> {
+    /// Confirm the project itself is readable — the discriminator between "both tracker
+    /// features are disabled" (lists 403/404 but the project answers 200) and "the token lost
+    /// access / the project is gone" (the project answers 403/404 too). Trusting bare list
+    /// 403s as disabled features would let an auth loss complete a full re-walk "empty" and
+    /// prune every previously mirrored item.
+    async fn project_is_readable(&self, project: &str) -> anyhow::Result<()> {
+        let url = self.endpoint(&format!("projects/{}", project.replace('/', "%2F")));
+        let response = self.core.get(&url, &gitlab_headers()).await?;
+        ensure_success(response.status, &response.body)
+    }
+
+    /// One page from one leg. GitLab projects can disable issues or merge requests as a
+    /// feature: the list then answers 403 (or 404 when the feature is hidden), which is a
+    /// durable project setting, not a failure — but only a FRESH open may treat it that way.
+    /// Mid-walk unavailability (a deleted project, a token losing read_api) must stay an error:
+    /// mapping it to an empty leg would let a full re-walk complete "empty" and prune every
+    /// previously mirrored item.
+    async fn leg_page(&self, project: &str, url: &str, leg: ListLeg) -> anyhow::Result<LegOutcome> {
         let response = self.core.get(url, &gitlab_headers()).await?;
-        if matches!(response.status, 403 | 404) {
-            return Ok(None);
+        match response.status {
+            403 => return Ok(LegOutcome::Unavailable { missing: false }),
+            404 => return Ok(LegOutcome::Unavailable { missing: true }),
+            _ => {},
         }
         ensure_success(response.status, &response.body)?;
         let next_url = next_link(&response.headers)?;
@@ -191,8 +204,15 @@ impl GitLabClient {
         for value in values {
             items.push(item_from_gitlab_value(project, leg.item_kind(), value)?);
         }
-        Ok(Some((items, next_url)))
+        Ok(LegOutcome::Page(items, next_url))
     }
+}
+
+/// What one leg fetch produced: a page, or a 403/404 whose meaning the caller decides by walk
+/// phase (fresh open: disabled feature or missing project; mid-walk: an error).
+enum LegOutcome {
+    Page(Vec<PapertrailItem>, Option<String>),
+    Unavailable { missing: bool },
 }
 
 impl PapertrailClient for GitLabClient {
@@ -211,11 +231,7 @@ impl PapertrailClient for GitLabClient {
     ) -> anyhow::Result<PapertrailItem> {
         // Kind is BINDING: issues and merge requests live in separate iid namespaces.
         let iid = validate_iid(key)?;
-        let resource = match kind {
-            ItemKind::Issue => "issues",
-            ItemKind::ChangeRequest => "merge_requests",
-        };
-        let url = self.project_path(project, &format!("{resource}/{iid}"))?;
+        let url = self.project_path(project, &format!("{}/{iid}", resource_segment(kind)))?;
         let (value, _) = self.get_json(&url).await?;
         item_from_gitlab_value(project, kind, &value)
     }
@@ -252,15 +268,14 @@ impl PapertrailClient for GitLabClient {
         let iid = validate_iid(key)?;
         let stream = cursor.stream.as_deref().unwrap_or(NOTES_STREAM);
         anyhow::ensure!(stream == NOTES_STREAM, "unknown GitLab item-comment stream `{stream}`");
-        let resource = match kind {
-            ItemKind::Issue => "issues",
-            ItemKind::ChangeRequest => "merge_requests",
-        };
         let url = match cursor.page_token.clone() {
             Some(next) => next,
             None => {
                 let mut url =
-                    Url::parse(&self.project_path(project, &format!("{resource}/{iid}/notes"))?)?;
+                    Url::parse(&self.project_path(
+                        project,
+                        &format!("{}/{iid}/notes", resource_segment(kind)),
+                    )?)?;
                 url.query_pairs_mut()
                     .append_pair("order_by", "updated_at")
                     .append_pair("sort", "asc")
@@ -293,17 +308,14 @@ impl PapertrailClient for GitLabClient {
             anyhow::bail!("an item page cannot be both delta and backfill");
         }
         let backfill = cursor.updated_before.is_some();
-        // Resume from the persisted continuation, or open BOTH legs' first pages. The delta
-        // checkpoint persists only `page_token` and rebuilds its resume request WITHOUT
-        // provider_state (mirror sync_item_delta), so the continuation JSON must live in the
-        // page token itself — a resume that reopened both first pages would let a pause before
-        // the second logical page spend every run's budget replaying page one.
-        let continuation = cursor
-            .provider_state
-            .as_deref()
-            .or_else(|| cursor.page_token.as_deref().filter(|token| token.starts_with('{')));
-        let (mut state, fresh_open) = match continuation {
-            Some(state) => (serde_json::from_str::<ListContinuation>(state)?, false),
+        // Resume from the persisted continuation, or open BOTH legs' first pages. The
+        // continuation lives IN the page token (parsed unconditionally — a corrupt token fails
+        // loudly at serde): the mirror's delta checkpoint persists only page_token and rebuilds
+        // its resume request without provider_state, and a resume that reopened both first
+        // pages would let a pause before the second logical page spend every run's budget
+        // replaying page one.
+        let (mut state, fresh_open) = match cursor.page_token.as_deref() {
+            Some(token) => (serde_json::from_str::<ListContinuation>(token)?, false),
             None => (
                 ListContinuation {
                     issues_next: Some(self.list_url(project, ListLeg::Issues, cursor)?),
@@ -318,33 +330,66 @@ impl PapertrailClient for GitLabClient {
             ),
         };
         let mut items = Vec::new();
-        let mut unavailable = 0usize;
-        let mut fetched = 0usize;
+        let mut issues_missing = false;
+        let mut issues_advanced = false;
         if let Some(url) = state.issues_next.take() {
-            fetched += 1;
             match self.leg_page(project, &url, ListLeg::Issues).await? {
-                Some((page, next)) => {
+                LegOutcome::Page(page, next) => {
                     items.extend(page);
                     state.issues_next = next;
+                    issues_advanced = true;
                 },
-                None => unavailable += 1,
+                // Only a FRESH open may map unavailability to an empty leg (see leg_page).
+                LegOutcome::Unavailable { missing } if fresh_open => issues_missing = missing,
+                LegOutcome::Unavailable { .. } => {
+                    anyhow::bail!("GitLab issues became unavailable mid-walk for {project}")
+                },
             }
         }
         if let Some(url) = state.merge_requests_next.take() {
-            fetched += 1;
-            match self.leg_page(project, &url, ListLeg::MergeRequests).await? {
-                Some((page, next)) => {
+            match self.leg_page(project, &url, ListLeg::MergeRequests).await {
+                Ok(LegOutcome::Page(page, next)) => {
                     items.extend(page);
                     state.merge_requests_next = next;
                 },
-                None => unavailable += 1,
+                Ok(LegOutcome::Unavailable { missing }) if fresh_open => {
+                    // EVERY namespace unavailable on a fresh open: all-404 means the project is
+                    // missing — surface the typed not-found. Otherwise (403s involved) the
+                    // project must PROVE it is readable before the walk may treat the trackers
+                    // as disabled features and mirror quietly as empty — a token that lost
+                    // access also answers 403 on both lists, and completing that walk "empty"
+                    // would prune everything.
+                    if !issues_advanced {
+                        if missing && issues_missing {
+                            return Err(PapertrailClientError::ItemNotFound.into());
+                        }
+                        self.project_is_readable(project).await?;
+                    }
+                },
+                Ok(LegOutcome::Unavailable { .. }) => {
+                    anyhow::bail!("GitLab merge requests became unavailable mid-walk for {project}")
+                },
+                // A rate/budget pause AFTER the issues leg already consumed a CONTINUATION page
+                // must not discard that progress: return the partial page with the
+                // merge-request leg still pending at ITS CURRENT url (transport pauses never
+                // consume pagination cursors). On a FRESH open the pause propagates instead —
+                // the scan's first page must cover both namespaces (the mirror seeds its
+                // durable watermarks from it), and re-fetching one leg page on resume is
+                // cheaper than a watermark that misses a namespace.
+                Err(error)
+                    if !fresh_open
+                        && issues_advanced
+                        && error.chain().any(|cause| {
+                            matches!(
+                                cause.downcast_ref::<TransportError>(),
+                                Some(TransportError::Paused { .. })
+                            )
+                        }) =>
+                {
+                    state.merge_requests_next = Some(url);
+                },
+                Err(error) => return Err(error),
             }
-        }
-        // One unavailable namespace is a disabled feature; EVERY namespace unavailable on a
-        // fresh open means the project itself is missing or inaccessible — that must surface,
-        // not mirror as an empty project.
-        if fresh_open && unavailable == fetched {
-            return Err(PapertrailClientError::ItemNotFound.into());
         }
         // Keep the emitted page ordered like its legs (mirror correctness is order-agnostic;
         // ordering keeps pages legible in logs and tests).
@@ -363,16 +408,15 @@ impl PapertrailClient for GitLabClient {
         let stream = if backfill { LIST_BACKFILL_STREAM } else { LIST_DELTA_STREAM };
         let pending = state.issues_next.is_some() || state.merge_requests_next.is_some();
         let next = if pending {
-            let token = serde_json::to_string(&state)?;
             Some(PageCursor {
                 stream: Some(stream.to_string()),
                 updated_since: cursor.updated_since.clone(),
                 updated_before: cursor.updated_before.clone(),
-                // The full continuation IS the page token (see resume note above); its
+                // The continuation IS the page token (see the resume note above); its
                 // non-emptiness also marks every continuation page as NOT the scan's first page
                 // for the mirror's conservative-frontier logic.
-                page_token: Some(token.clone()),
-                provider_state: Some(token),
+                page_token: Some(serde_json::to_string(&state)?),
+                provider_state: None,
             })
         } else {
             None
@@ -440,7 +484,12 @@ impl PapertrailClient for GitLabClient {
             let Some(iid) = note["noteable_iid"].as_u64().filter(|iid| *iid > 0) else {
                 continue;
             };
-            validate_positive_id(note, "id", "GitLab note event")?;
+            // A malformed embedded note (permissions-redacted id, future payload shape) is
+            // SKIPPED like every sibling malformation: erroring here would pin the stream on
+            // this page forever — the page's frontier could never persist.
+            if note["id"].as_u64().is_none_or(|id| id == 0) {
+                continue;
+            }
             if let Some(mut comment) =
                 comment_from_note_value(project, kind, &iid.to_string(), note)
             {
@@ -478,6 +527,7 @@ impl PapertrailClient for GitLabClient {
         // the project's newest movement. No ETag: two responses cannot share one validator, and
         // `probe_advance` on timestamps suffices.
         let mut latest: Option<String> = None;
+        let mut missing = 0usize;
         let mut unavailable = 0usize;
         for leg in [ListLeg::Issues, ListLeg::MergeRequests] {
             let mut url = Url::parse(&self.project_path(project, leg.path_segment())?)?;
@@ -486,11 +536,20 @@ impl PapertrailClient for GitLabClient {
                 .append_pair("sort", "desc")
                 .append_pair("per_page", "1");
             let response = self.core.get(url.as_str(), &gitlab_headers()).await?;
-            // A disabled namespace (403/404 on its list) is quiet, not fatal — the sibling
-            // namespace still answers the probe. Both unavailable = the project is gone.
-            if matches!(response.status, 403 | 404) {
-                unavailable += 1;
-                continue;
+            // A disabled namespace is quiet, not fatal — the sibling still answers the probe.
+            // Both answering 404 = the project is gone; a 403 anywhere is a feature setting,
+            // and a project with BOTH features disabled probes as a quiet empty project.
+            match response.status {
+                403 => {
+                    unavailable += 1;
+                    continue;
+                },
+                404 => {
+                    missing += 1;
+                    unavailable += 1;
+                    continue;
+                },
+                _ => {},
             }
             ensure_success(response.status, &response.body)?;
             let value: Value = serde_json::from_str(&response.body)?;
@@ -499,13 +558,15 @@ impl PapertrailClient for GitLabClient {
                 .and_then(|items| items.first())
                 .and_then(|item| item["updated_at"].as_str())
                 .map(str::to_string);
-            latest = match (latest.take(), leg_latest) {
-                (Some(current), Some(new)) => Some(current.max(new)),
-                (current, new) => current.or(new),
-            };
+            latest = max_timestamp(latest.take(), leg_latest);
+        }
+        if missing == 2 {
+            return Err(PapertrailClientError::ItemNotFound.into());
         }
         if unavailable == 2 {
-            return Err(PapertrailClientError::ItemNotFound.into());
+            // Both lists unavailable with a 403 involved: disabled features and lost access
+            // look identical here — only a readable project may probe as quietly empty.
+            self.project_is_readable(project).await?;
         }
         // GitLab has no probe validator (no shared ETag across the two namespace calls), so the
         // timestamp comparison IS the quiet signal: the mirror keys the delta-scan decision off
@@ -519,33 +580,29 @@ impl PapertrailClient for GitLabClient {
 const NOTES_STREAM: &str = "notes";
 const EVENTS_STREAM: &str = "events";
 
-/// The civil date one day before `timestamp`'s date part (`YYYY-MM-DD…` → `YYYY-MM-DD`), via
-/// days-from-civil round-tripping (Howard Hinnant's algorithm) — no calendar dependency.
+/// The civil date one day before `timestamp`'s date part (`YYYY-MM-DD…` → `YYYY-MM-DD`),
+/// on the shared calendar helpers.
 fn day_before(timestamp: &str) -> anyhow::Result<String> {
     let date = timestamp.get(..10).unwrap_or_default();
-    let mut parts = date.split('-').map(|part| part.parse::<i64>());
-    let (year, month, day) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(Ok(year)), Some(Ok(month)), Some(Ok(day)))
-            if (1..=12).contains(&month) && (1..=31).contains(&day) =>
-            (year, month, day),
-        _ => anyhow::bail!("timestamp `{timestamp}` has no leading YYYY-MM-DD date"),
+    let (year, month, day) = parse_date(date)
+        .filter(|(_, month, day)| (1..=12).contains(month) && (1..=31).contains(day))
+        .ok_or_else(|| anyhow::anyhow!("timestamp `{timestamp}` has no leading YYYY-MM-DD date"))?;
+    let (year, month, day) = if day > 1 {
+        (year, month, day - 1)
+    } else if month > 1 {
+        (year, month - 1, days_in_month(year, month - 1))
+    } else {
+        (year - 1, 12, 31)
     };
-    let shifted_year = if month <= 2 { year - 1 } else { year };
-    let era = shifted_year.div_euclid(400);
-    let year_of_era = shifted_year - era * 400;
-    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468 - 1; // one day earlier
-    let era = (days + 719_468).div_euclid(146_097);
-    let day_of_era = days + 719_468 - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
     Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+/// The API resource segment for one iid namespace.
+fn resource_segment(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Issue => "issues",
+        ItemKind::ChangeRequest => "merge_requests",
+    }
 }
 
 fn gitlab_headers() -> Vec<(&'static str, &'static str)> {
@@ -974,9 +1031,133 @@ mod tests {
         );
     }
 
-    /// GitLab projects can disable issues or merge requests as a feature; the unavailable leg
-    /// mirrors as empty instead of aborting the sibling namespace. EVERY leg unavailable on a
-    /// fresh open is a missing project and must surface as the typed not-found outcome.
+    /// A rate/budget pause between the two leg fetches of a CONTINUATION page must not discard
+    /// the first leg's progress: the partial page returns with the paused leg still pending at
+    /// its CURRENT url, so a one-request budget window advances one leg page per attempt
+    /// instead of replaying the first leg forever.
+    #[test]
+    fn a_pause_between_continuation_legs_checkpoints_the_first_legs_progress() {
+        let issues = format!("[{}]", issue(30, "2026-01-06T00:00:00Z"));
+        // Quota headers on the issues response leave the governor below its reserve, pausing
+        // the very next request (the merge-request leg).
+        let (base, _handle) =
+            spawn_script_stub(vec![StubResponse::ok_with_quota(&issues, 100, 5, 4_000_000_000)]);
+        let registry = GovernorRegistry::default();
+        let client = client(base.clone(), &registry);
+
+        let continuation = PageCursor {
+            updated_before: Some("2026-02-01T00:00:00Z".to_string()),
+            page_token: Some(format!(
+                r#"{{"issues_next":"{base}/api/v4/projects/g%2Fs%2Fr/issues?page=2","merge_requests_next":"{base}/api/v4/projects/g%2Fs%2Fr/merge_requests?page=2","oldest":null}}"#
+            )),
+            ..PageCursor::default()
+        };
+        let partial = block_on(client.items_page("g/s/r", &continuation)).unwrap();
+        assert_eq!(partial.items.len(), 1, "the fetched issues page must not be discarded");
+        assert_eq!(partial.items[0].item_key, "30");
+        let next = partial.next.expect("the merge-request leg is still pending");
+        let token = next.page_token.as_deref().unwrap();
+        assert!(token.contains("merge_requests"), "{token}");
+
+        // The immediate next fetch surfaces the pause, with the progress safely persisted
+        // behind it by the mirror.
+        let error = block_on(client.items_page("g/s/r", &next)).unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<TransportError>(), Some(TransportError::Paused { .. })),
+            "{error:#}"
+        );
+    }
+
+    /// On a FRESH open the pause propagates instead: the scan's first page must cover both
+    /// namespaces (the mirror seeds its durable watermarks from it), and re-fetching one leg
+    /// page on resume is cheaper than a watermark that misses a namespace.
+    #[test]
+    fn a_pause_on_a_fresh_open_propagates_rather_than_emitting_a_one_namespace_first_page() {
+        let issues = format!("[{}]", issue(31, "2026-01-06T00:00:00Z"));
+        let (base, _handle) =
+            spawn_script_stub(vec![StubResponse::ok_with_quota(&issues, 100, 5, 4_000_000_000)]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+        let error = block_on(client.items_page("g/s/r", &PageCursor {
+            updated_since: Some("2026-01-01T00:00:00Z".to_string()),
+            ..PageCursor::default()
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<TransportError>(), Some(TransportError::Paused { .. })),
+            "{error:#}"
+        );
+    }
+
+    /// Namespace unavailability MID-WALK is an error, never an empty leg: mapping it to empty
+    /// would let a full re-walk complete "empty" and prune every previously mirrored item when
+    /// a project is deleted or a token loses read_api mid-continuation.
+    #[test]
+    fn mid_walk_unavailability_is_an_error_not_an_empty_walk() {
+        let (base, _handle) = spawn_script_stub(vec![StubResponse::status("403 Forbidden", "{}")]);
+        let registry = GovernorRegistry::default();
+        let client = client(base.clone(), &registry);
+        let continuation = PageCursor {
+            updated_before: Some("2026-02-01T00:00:00Z".to_string()),
+            page_token: Some(format!(
+                r#"{{"issues_next":"{base}/api/v4/projects/g%2Fs%2Fr/issues?page=2","merge_requests_next":null,"oldest":"2026-01-03T00:00:00Z"}}"#
+            )),
+            ..PageCursor::default()
+        };
+        let error = block_on(client.items_page("g/s/r", &continuation)).unwrap_err();
+        assert!(error.to_string().contains("unavailable mid-walk"), "{error:#}");
+    }
+
+    /// BOTH features disabled (403s) is a legitimate docs-only project: once the project
+    /// itself proves readable, it mirrors quietly as empty — only all-404 means it is gone.
+    #[test]
+    fn a_project_with_both_features_disabled_mirrors_as_quietly_empty() {
+        let (base, handle) = spawn_script_stub(vec![
+            StubResponse::status("403 Forbidden", "{}"),
+            StubResponse::status("403 Forbidden", "{}"),
+            StubResponse::ok(r#"{"id":1,"path_with_namespace":"g/s/r"}"#),
+        ]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+        let page = block_on(client.items_page("g/s/r", &PageCursor {
+            updated_before: Some("2026-02-01T00:00:00Z".to_string()),
+            ..PageCursor::default()
+        }))
+        .unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next.is_none());
+        assert!(page.backfill_boundary.is_none(), "the mirror's done shape");
+        let heads = handle.join().unwrap();
+        assert!(
+            heads[2].starts_with("GET /api/v4/projects/g%2Fs%2Fr "),
+            "the disabled-features mapping requires proof the project is readable: {}",
+            heads[2]
+        );
+    }
+
+    /// A token that lost access answers 403 on both lists too — the readability probe fails
+    /// and the walk ERRORS instead of completing empty (which would prune everything).
+    #[test]
+    fn lost_access_never_masquerades_as_a_disabled_feature_project() {
+        let (base, _handle) = spawn_script_stub(vec![
+            StubResponse::status("403 Forbidden", "{}"),
+            StubResponse::status("403 Forbidden", "{}"),
+            StubResponse::status("403 Forbidden", "{}"),
+        ]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+        let error = block_on(client.items_page("g/s/r", &PageCursor {
+            updated_before: Some("2026-02-01T00:00:00Z".to_string()),
+            ..PageCursor::default()
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("HTTP 403"), "{error:#}");
+    }
+
+    /// GitLab projects can disable issues or merge requests as a feature;    /// GitLab projects
+    /// can disable issues or merge requests as a feature; the unavailable leg mirrors as empty
+    /// instead of aborting the sibling namespace. EVERY leg unavailable on a fresh open is a
+    /// missing project and must surface as the typed not-found outcome.
     #[test]
     fn a_disabled_namespace_never_aborts_the_sibling_leg() {
         let changes = format!("[{}]", merge_request(9, "2026-01-05T00:00:00Z"));
@@ -1124,8 +1305,7 @@ mod tests {
         let foreign = "https://gitlab.com/api/v4/projects/g%2Fs%2Fr/issues?page=2";
         let cursor = PageCursor {
             updated_before: Some("2026-02-01T00:00:00Z".to_string()),
-            page_token: Some(foreign.to_string()),
-            provider_state: Some(format!(r#"{{"issues_next":"{foreign}"}}"#)),
+            page_token: Some(format!(r#"{{"issues_next":"{foreign}"}}"#)),
             ..PageCursor::default()
         };
         let error = block_on(client.items_page("g/s/r", &cursor)).unwrap_err();
@@ -1175,6 +1355,23 @@ mod tests {
             "the day BEFORE the cursor's date keeps same-day events in scope: {}",
             heads[0]
         );
+    }
+
+    /// One malformed embedded note (redacted/zero id) is skipped like every sibling
+    /// malformation — erroring would pin the stream on this page forever.
+    #[test]
+    fn a_malformed_note_event_is_skipped_not_fatal() {
+        let events = r#"[
+            {"target_type":"Note","created_at":"2026-01-16T00:00:00Z","note":{"id":0,"body":"redacted","system":false,"noteable_type":"Issue","noteable_iid":4,"author":{"username":"x"},"created_at":"2026-01-16T00:00:00Z"}},
+            {"target_type":"Note","created_at":"2026-01-17T00:00:00Z","note":{"id":60,"body":"fine","system":false,"noteable_type":"Issue","noteable_iid":4,"author":{"username":"y"},"created_at":"2026-01-17T00:00:00Z"}}
+        ]"#;
+        let (base, _handle) = spawn_script_stub(vec![StubResponse::ok(events)]);
+        let registry = GovernorRegistry::default();
+        let client = client(base, &registry);
+        let page = block_on(client.comments_page("g/s/r", &PageCursor::default())).unwrap();
+        assert_eq!(page.comments.len(), 1);
+        assert_eq!(page.comments[0].comment_id, "note:60");
+        assert_eq!(page.frontier.as_deref(), Some("2026-01-17T00:00:00Z"));
     }
 
     /// Commit/snippet notes map to no comment; a page of only those must still carry the

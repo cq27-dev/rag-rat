@@ -618,7 +618,10 @@ supported; issues `#N` and merge requests `!N` are separate numbering namespaces
 feed (GitLab has no "notes updated since" endpoint, and commenting does not touch the parent's
 `updated_at`); an EDIT to an old comment produces no event, so edited bodies converge at the
 daily full re-walk unless the comment's creation event is still inside the incremental replay
-window. Merge-request approvals mirror as review comments (`review_state`). The shared runner keeps every result, cursor, auth source, and quota governor scoped to its
+window. Merge-request approvals mirror as review comments (`review_state`) — approving emits no
+`commented` event either, so approvals also converge at the daily full re-walk. A comment whose
+parent item is excluded by the `tags` filter is skipped; if that item later gains a tracked tag,
+its earlier comments appear at the next full re-walk. The shared runner keeps every result, cursor, auth source, and quota governor scoped to its
 binding. A repository may have at most one resolved binding for a given `(provider, project)`:
 the mirror rejects duplicates before dispatch because API origin and tag filters are not part of
 the persisted item/cache cursor identity. Use one binding and one combined tag set for that

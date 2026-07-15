@@ -428,10 +428,7 @@ async fn sync_comment_delta<C: PapertrailClient>(
         loop {
             let page = client.comments_page(&binding.project, &request).await?;
             let first_page_high = request.page_token.is_none().then(|| {
-                max_timestamp(
-                    page.comments.iter().filter_map(|comment| comment.updated_at.clone()).max(),
-                    page.frontier.clone(),
-                )
+                page.comments.iter().filter_map(|comment| comment.updated_at.clone()).max()
             });
             let next = if let Some(mut next) = page.next {
                 anyhow::ensure!(
@@ -452,6 +449,14 @@ async fn sync_comment_delta<C: PapertrailClient>(
                 // ascending page. Replaying its inclusive upper boundary prevents offset shifts
                 // from stranding an unseen or stale comment below the durable watermark.
                 state.scan_high_mark_at = first_page_high;
+            }
+            // The provider-confirmed frontier is trusted on EVERY page — providers only set it
+            // for immutable append-only feeds (see CommentsPage::frontier). Folding each page's
+            // frontier carries a drained multi-page window past its LAST page, where the
+            // first-page comment maximum alone would pin a busy window forever.
+            if page.frontier.is_some() {
+                state.scan_high_mark_at =
+                    max_timestamp(state.scan_high_mark_at.take(), page.frontier.clone());
             }
             state.page_token = next.as_ref().and_then(|next| next.page_token.clone());
             state.scan_since = next.as_ref().map(|_| scan_since.clone());
@@ -1079,6 +1084,7 @@ fn store_repo_comments(
     report: &mut MirrorBindingReport,
 ) -> anyhow::Result<()> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let fallback = item_numbering_is_shared(binding.provider);
     let tx = conn.unchecked_transaction()?;
     for comment in comments {
         // Resolve the parent item, PREFERRING the kind the provider put on the comment: under
@@ -1090,12 +1096,13 @@ fn store_repo_comments(
         // IS unique. A namespaced provider names the kind authoritatively, so a missing
         // exact-kind parent (e.g. a merge request pruned by the tag filter while issue #N is
         // cached) means SKIP, never contaminate the twin namespace's evidence.
-        let fallback = if shared_item_numbering(binding.provider) { "1" } else { "0" };
         let kind = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT item_kind FROM papertrail_items WHERE repo_id=?1 AND tracker=?2 AND \
                  project=?3 AND item_key=?4 AND (item_kind = ?5 OR ?6) ORDER BY (item_kind = ?5) \
                  DESC LIMIT 1",
+            )?
+            .query_row(
                 params![
                     repo_id,
                     binding.provider.as_db_str(),
@@ -1108,9 +1115,13 @@ fn store_repo_comments(
             )
             .optional()?;
         let Some(kind) = kind else { continue };
-        let mut comment = comment.clone();
-        comment.item_kind = ItemKind::from_db_str(&kind)?;
-        store_comment(&tx, binding.provider, &comment)?;
+        if kind == comment.item_kind.as_db_str() {
+            store_comment(&tx, binding.provider, comment)?;
+        } else {
+            let mut comment = comment.clone();
+            comment.item_kind = ItemKind::from_db_str(&kind)?;
+            store_comment(&tx, binding.provider, &comment)?;
+        }
         report.stored_comments += 1;
     }
     tx.commit()?;
@@ -1125,7 +1136,7 @@ fn max_item_updated_at(items: &[PapertrailItem]) -> Option<String> {
     items.iter().filter_map(|item| item.updated_at.clone()).max()
 }
 
-fn max_timestamp(left: Option<String>, right: Option<String>) -> Option<String> {
+pub(crate) fn max_timestamp(left: Option<String>, right: Option<String>) -> Option<String> {
     left.into_iter().chain(right).max()
 }
 
@@ -1175,7 +1186,7 @@ fn overlap_timestamp(timestamp: &str) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-fn parse_date(value: &str) -> Option<(i32, u32, u32)> {
+pub(crate) fn parse_date(value: &str) -> Option<(i32, u32, u32)> {
     let mut parts = value.split('-');
     let parsed =
         (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
@@ -1184,12 +1195,20 @@ fn parse_date(value: &str) -> Option<(i32, u32, u32)> {
 
 fn parse_time(value: &str) -> Option<(u32, u32, u32)> {
     let mut parts = value.split(':');
-    let parsed =
-        (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+    // Fractional seconds (GitLab emits millisecond stamps) truncate: the rewound overlap
+    // timestamp compares lexicographically BELOW any fractional variant of the same second, so
+    // truncation only widens the replay window. Refusing to parse them instead silently
+    // returned the input unchanged — a ZERO overlap — and with a strict updated_after filter
+    // the boundary row became unreachable, so the replay convergence check could never pass.
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.split('.').next()?.parse().ok()?,
+    );
     parts.next().is_none().then_some(parsed)
 }
 
-fn days_in_month(year: i32, month: u32) -> u32 {
+pub(crate) fn days_in_month(year: i32, month: u32) -> u32 {
     match month {
         4 | 6 | 9 | 11 => 30,
         2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
@@ -1424,6 +1443,20 @@ mod tests {
         }
     }
 
+    fn empty_report(binding: &ResolvedTracker) -> MirrorBindingReport {
+        MirrorBindingReport {
+            tracker: binding.provider,
+            project: binding.project.clone(),
+            stored_items: 0,
+            stored_comments: 0,
+            pruned_items: 0,
+            paused_until_ms: None,
+            pause_reason: None,
+            completed_full_walk: false,
+            probe_not_modified: false,
+        }
+    }
+
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn).unwrap();
@@ -1440,6 +1473,18 @@ mod tests {
     /// comment lane must resolve the parent by the comment's OWN kind first — a key-only lookup
     /// hitches the comment to whichever twin the scan returns first and then rewrites the
     /// correctly-kinded row through the kind-less comment conflict key.
+    /// GitLab emits millisecond timestamps; the overlap rewind must handle the fraction —
+    /// refusing to parse it silently returned the input unchanged (ZERO overlap), and with a
+    /// strict updated_after filter the boundary row became unreachable, so replay convergence
+    /// could never complete.
+    #[test]
+    fn overlap_timestamp_rewinds_fractional_second_stamps() {
+        assert_eq!(overlap_timestamp("2026-07-15T13:15:56.837Z"), "2026-07-15T13:15:55Z");
+        assert_eq!(overlap_timestamp("2026-01-01T00:00:00.001Z"), "2025-12-31T23:59:59Z");
+        // Non-fractional stamps keep their existing behavior.
+        assert_eq!(overlap_timestamp("2026-07-15T13:15:56Z"), "2026-07-15T13:15:55Z");
+    }
+
     /// A quiet probe must not starve an OWED boundary replay: providers without a probe
     /// validator (GitLab) report a timestamp tie as not_modified, and the conservative frontier
     /// left by an interrupted delta would otherwise wait for the daily full walk.
@@ -1511,6 +1556,51 @@ mod tests {
         );
     }
 
+    /// A drained multi-page comment window must advance past its LAST page's frontier: with a
+    /// date-granular provider filter (GitLab events `after`), a first-page-only frontier keeps
+    /// re-opening the same busy day and replays every later page on every poll, forever.
+    #[test]
+    fn a_drained_multi_page_window_advances_past_its_last_frontier() {
+        let conn = db();
+        let binding = binding(&[]);
+        let first_walk = ScriptClient::new(vec![
+            Ok(ItemsPage {
+                items: vec![item("1", "2026-01-02T00:00:00Z", "one", &[])],
+                next: None,
+                backfill_boundary: None,
+            }),
+            Ok(ItemsPage { items: Vec::new(), next: None, backfill_boundary: None }),
+        ])
+        .with_repo_comments(Vec::new());
+        block_on(mirror_binding(&conn, &binding, &first_walk, false)).unwrap();
+
+        let quiet = ScriptClient::new(vec![])
+            .with_probe(FreshnessResult { latest: None, etag: None, not_modified: true })
+            .with_repo_comment_pages(vec![
+                Ok(CommentsPage {
+                    comments: vec![comment("1", "early", "2026-02-01T08:00:00Z")],
+                    next: Some(PageCursor {
+                        page_token: Some("events-page-2".to_string()),
+                        ..PageCursor::default()
+                    }),
+                    frontier: Some("2026-02-01T08:00:00Z".to_string()),
+                }),
+                Ok(CommentsPage {
+                    comments: Vec::new(),
+                    next: None,
+                    frontier: Some("2026-02-01T20:00:00Z".to_string()),
+                }),
+            ]);
+        block_on(mirror_binding(&conn, &binding, &quiet, false)).unwrap();
+
+        let cursor = load_cursor(&conn, &binding).unwrap();
+        assert_eq!(
+            cursor.comment_stream_cursors.get("default").and_then(|s| s.high_mark_at.as_deref()),
+            Some("2026-02-01T20:00:00Z"),
+            "the stream must clear the drained window, not pin to the first page's maximum"
+        );
+    }
+
     /// Namespaced providers name the comment's kind authoritatively: a missing exact-kind
     /// parent (a merge request pruned by the tag filter while issue #N is cached) means SKIP —
     /// never attach the comment across namespaces.
@@ -1524,17 +1614,7 @@ mod tests {
         issue.project = "g/r".to_string();
         store_item(&conn, binding.provider, &issue).unwrap();
 
-        let mut report = MirrorBindingReport {
-            tracker: binding.provider,
-            project: binding.project.clone(),
-            stored_items: 0,
-            stored_comments: 0,
-            pruned_items: 0,
-            paused_until_ms: None,
-            pause_reason: None,
-            completed_full_walk: false,
-            probe_not_modified: false,
-        };
+        let mut report = empty_report(&binding);
         let mut change_note = comment("7", "note:9", "2026-01-04T00:00:00Z");
         change_note.project = "g/r".to_string();
         change_note.item_kind = ItemKind::ChangeRequest;
@@ -1575,17 +1655,7 @@ mod tests {
         store_item(&conn, binding.provider, &issue).unwrap();
         store_item(&conn, binding.provider, &change).unwrap();
 
-        let mut report = MirrorBindingReport {
-            tracker: binding.provider,
-            project: binding.project.clone(),
-            stored_items: 0,
-            stored_comments: 0,
-            pruned_items: 0,
-            paused_until_ms: None,
-            pause_reason: None,
-            completed_full_walk: false,
-            probe_not_modified: false,
-        };
+        let mut report = empty_report(&binding);
         let mut issue_note = comment("1", "note:1", "2026-01-04T00:00:00Z");
         issue_note.project = "g/r".to_string();
         let mut change_note = comment("1", "note:2", "2026-01-04T00:00:00Z");
@@ -1621,17 +1691,7 @@ mod tests {
         pull.item_kind = ItemKind::ChangeRequest;
         store_item(&conn, binding.provider, &pull).unwrap();
 
-        let mut report = MirrorBindingReport {
-            tracker: binding.provider,
-            project: binding.project.clone(),
-            stored_items: 0,
-            stored_comments: 0,
-            pruned_items: 0,
-            paused_until_ms: None,
-            pause_reason: None,
-            completed_full_walk: false,
-            probe_not_modified: false,
-        };
+        let mut report = empty_report(&binding);
         // The GitHub feed guesses Issue; only the pull exists.
         store_repo_comments(
             &conn,

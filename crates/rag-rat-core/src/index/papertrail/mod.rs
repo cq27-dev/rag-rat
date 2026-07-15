@@ -3,6 +3,7 @@ pub mod autosync;
 mod evidence;
 mod github;
 mod gitlab;
+mod http;
 mod mirror;
 mod parse;
 mod schedule;
@@ -18,8 +19,12 @@ pub(crate) use api::*;
 pub(crate) use evidence::*;
 pub(crate) use github::*;
 pub(crate) use gitlab::*;
+pub(crate) use http::*;
 pub use mirror::MirrorBindingReport;
-pub(crate) use mirror::{MirrorContinuation, load_mirror_continuation, mirror_binding};
+pub(crate) use mirror::{
+    MirrorContinuation, days_in_month, load_mirror_continuation, max_timestamp, mirror_binding,
+    parse_date,
+};
 pub(crate) use parse::*;
 pub use parse::{TrackerParsedRef, parse_tracker_refs};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -262,7 +267,7 @@ pub struct CurrentSourceEvidence {
 /// is the exception (a key names at most one item, and its repo comment feed cannot always name
 /// the kind); namespaced providers (GitLab iids, Bitbucket, Jira) always name the kind on their
 /// comments, so a comment there must NEVER attach across namespaces.
-pub(crate) fn shared_item_numbering(tracker: Tracker) -> bool {
+pub(crate) fn item_numbering_is_shared(tracker: Tracker) -> bool {
     matches!(tracker, Tracker::Github)
 }
 
@@ -390,10 +395,13 @@ pub struct ItemsPage {
 pub struct CommentsPage {
     pub comments: Vec<PapertrailComment>,
     pub next: Option<PageCursor>,
-    /// Provider-confirmed watermark for THIS page beyond the returned comments — set when the
-    /// provider's feed can contain entries that map to no comment (GitLab events on commit or
-    /// snippet notes). Without it, a first page of only-skipped entries returns no timestamps,
-    /// the stream's frontier cannot advance, and every scheduled sync replays the same pages.
+    /// Provider-confirmed consumed watermark for THIS page: everything in the stream at or
+    /// before it has been returned or deliberately skipped. The mirror trusts it on EVERY page
+    /// (unlike the returned comments, whose maximum is trusted only on the scan's first page),
+    /// so only feeds with immutable append-only ordering may set it — GitLab's events feed,
+    /// ordered by creation. It carries a drained multi-page window past its LAST page (a
+    /// first-page-only frontier pins a busy day forever) and advances past entries that map to
+    /// no comment (commit/snippet notes). Mutable updated-order pages (GitHub) leave it None.
     pub frontier: Option<String>,
 }
 
@@ -403,44 +411,6 @@ pub struct CommentsPage {
 pub(crate) enum PapertrailClientError {
     #[error("tracker item not found")]
     ItemNotFound,
-}
-
-/// Reject a non-2xx provider response, mapping 404 to the typed not-found outcome the mirror
-/// understands. `provider` labels the error ("GitHub", "GitLab").
-pub(crate) fn ensure_provider_success(
-    provider: &str,
-    status: u16,
-    body: &str,
-) -> anyhow::Result<()> {
-    if status == 404 {
-        return Err(PapertrailClientError::ItemNotFound.into());
-    }
-    anyhow::ensure!((200..300).contains(&status), "{provider} HTTP {status}: {body}");
-    Ok(())
-}
-
-/// The `rel="next"` target from an RFC-8288 `Link` header — the pagination continuation both
-/// GitHub and GitLab emit.
-pub(crate) fn next_link(headers: &reqwest::header::HeaderMap) -> anyhow::Result<Option<String>> {
-    let Some(link) = headers.get(reqwest::header::LINK) else { return Ok(None) };
-    let link = link.to_str()?;
-    Ok(link.split(',').find_map(|part| {
-        let (url, rel) = part.trim().split_once(';')?;
-        rel.trim().eq(r#"rel="next""#).then(|| url.trim().trim_matches(['<', '>']).to_string())
-    }))
-}
-
-/// Provider payload rows must carry a positive numeric identity before they are trusted.
-pub(crate) fn validate_positive_id(
-    value: &serde_json::Value,
-    field: &str,
-    resource: &str,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        value[field].as_u64().is_some_and(|id| id > 0),
-        "{resource} has no valid {field}"
-    );
-    Ok(())
 }
 
 /// Advance decision for a freshness probe: the newest `updated_at` the provider reported vs the
