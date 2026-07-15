@@ -1,9 +1,14 @@
 //! Index key-value meta (the `index_meta` table) and the content-revision digest.
 
 use super::*;
-use crate::config::ResolvedTarget;
+use crate::config::{Config, ResolvedTarget};
+use crate::storage::IndexConnection;
 
 const WATCH_SHUTDOWN_RECONCILE_PENDING_META: &str = "watch_shutdown_reconcile_pending";
+/// Watch-placement failure HIGH-WATER MARK the resident watcher has seen (see `watch::placement`).
+/// Persisted per pass, never lowered, so `index_status` can surface silent inotify degradation
+/// without one watcher process masking another's (see `record_watch_placement_failures`).
+const WATCH_PLACEMENT_FAILURES_META: &str = "watch_placement_failures";
 const BASE_SCOPE_DISCOVERED_META: &str = "files_base_scope_discovered";
 
 impl IndexDatabase {
@@ -56,6 +61,37 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         delete_repo_meta(conn, &self.active_repo_id, WATCH_SHUTDOWN_RECONCILE_PENDING_META)?;
         Ok(true)
+    }
+
+    /// Record the resident watcher's watch-placement failures as a HIGH-WATER MARK — raised only
+    /// when it exceeds the stored value, never lowered. Returns whether the stored value rose.
+    ///
+    /// Never lowered because several watcher processes can share this database (a checkout of one
+    /// repo can have more than one live watcher). A healthy or freshly-restarted watcher (whose
+    /// process-local source count is 0 or low) must not erase a degraded watcher's recorded
+    /// failures, so [`bump_repo_meta_high_water`] takes the max ATOMICALLY in one upsert — no
+    /// read-then-write to race. Once any watcher has degraded, `index_status` never falsely reports
+    /// zero. Trade-off: distinct processes dropping watches at once report the max, not the sum —
+    /// an acceptable under-count for a "watching is degraded" signal that never over- or
+    /// zero-reports.
+    pub(crate) fn record_watch_placement_failures(&self, failures: u64) -> anyhow::Result<bool> {
+        // Atomic max-upsert (a single statement) — never a read-then-write, so a concurrent
+        // same-repo writer cannot interleave and regress the high-water mark.
+        Ok(bump_repo_meta_high_water(
+            self.storage.connection(),
+            &self.active_repo_id,
+            WATCH_PLACEMENT_FAILURES_META,
+            failures,
+        )?)
+    }
+
+    /// The persisted watch-placement failure high-water mark (0 if never written — e.g. a repo
+    /// whose watcher has never dropped a watch, or a checkout with no resident watcher).
+    pub(crate) fn watch_placement_failures(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .repo_meta(WATCH_PLACEMENT_FAILURES_META)?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0))
     }
 
     pub(super) fn active_base_scope_discovered(
@@ -180,6 +216,84 @@ pub(crate) fn repo_meta(
         |row| row.get(0),
     )
     .optional()
+}
+
+/// Atomically raise a per-repo INTEGER meta value to `value`, never lowering it — the max is
+/// computed IN the upsert (one statement), so two watcher processes recording failures for the same
+/// repo at once cannot interleave a read-then-write and regress the high-water mark. Returns
+/// whether the stored value rose (a fresh insert, or an increase). A same-or-lower `value` is a
+/// no-op.
+pub(crate) fn bump_repo_meta_high_water(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    key: &str,
+    value: u64,
+) -> rusqlite::Result<bool> {
+    conn.execute(
+        "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, ?3)
+         ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value
+             WHERE CAST(excluded.value AS INTEGER) > CAST(repo_meta.value AS INTEGER)",
+        params![repo_id, key, value.to_string()],
+    )?;
+    Ok(conn.changes() > 0)
+}
+
+/// Persist a watch-placement failure high-water mark for the watcher's out-of-band flush paths —
+/// the non-blocking post-resync flush on the event loop and the shutdown flush (#658 review). It is
+/// deliberately CHEAP, NON-BLOCKING, and SIDE-EFFECT-FREE:
+/// - **No index creation.** Returns early (no write) when the DB file does not exist, and opens
+///   NON-creating ([`IndexConnection::open_read_write_no_create_nowait`]) — a first-time-empty
+///   checkout that never built an index must not gain a schemaless `.rag-rat/index.sqlite` here.
+/// - **No blocking.** The no-wait open + `busy_timeout = 0` mean a concurrent writer (another repo
+///   in a consolidated DB, a checkpoint) yields `SQLITE_BUSY`, treated as SKIP — the event loop
+///   must never stall on classification/fleet triggers, and the count rides the next pass.
+/// - **No on-open heals.** Unlike `open_config` (schema migration, graph-index / model-manifest /
+///   generated-flags heals), so a degraded watcher exiting after a binary/schema-version change
+///   can't spend an unbounded heal here.
+///
+/// Config-SCOPED via [`schema::resolve_config_repo_id`] so it targets the SAME repo the pass's
+/// persist did, even in a consolidated multi-repo DB (a bare sole-repo pick could hit a sibling).
+/// Also skips when the repo isn't registered yet (nothing to surface into) or the schema isn't
+/// Compatible (the next full pass migrates + persists). The caller owns the per-repo write lock.
+///
+/// Returns whether the flush is SETTLED — `Ok(true)` means the count is now in the DB, or there is
+/// definitively nothing to persist into (no index file yet, repo not registered, schema not
+/// Compatible) so retrying is pointless; `Ok(false)` means a TRANSIENT `SQLITE_BUSY` skip, so the
+/// caller should retry (the event-loop drain re-attempts next tick). A non-busy error propagates.
+pub(crate) fn record_watch_placement_failures_scoped(
+    config: &Config,
+    failures: u64,
+) -> anyhow::Result<bool> {
+    // A first-time-empty checkout has no index yet: skip WITHOUT opening, so the flush never
+    // creates a schemaless DB file (which would break the friendly no-index read path). Settled — a
+    // later pass registers the repo and persists once real content appears.
+    if !config.database.try_exists().unwrap_or(false) {
+        return Ok(true);
+    }
+    match write_watch_placement_high_water(config, failures) {
+        Ok(()) => Ok(true),
+        // No-wait open/write: a busy DB (concurrent writer / checkpoint) is a TRANSIENT skip — the
+        // caller retries (the count rides the next tick, pass, sweep, or shutdown flush). A file
+        // that vanished in the race between the check above and the open surfaces as a non-busy
+        // open error, propagated for the caller to log (best-effort).
+        Err(err) if crate::storage::is_busy(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn write_watch_placement_high_water(config: &Config, failures: u64) -> anyhow::Result<()> {
+    let storage = IndexConnection::open_read_write_no_create_nowait(&config.database)?;
+    let conn = storage.connection();
+    if schema::status(conn)?.state != schema::SchemaState::Compatible {
+        return Ok(());
+    }
+    let Some(repo_id) =
+        schema::resolve_config_repo_id(conn, &config.root, config.repo_id_override.as_deref())?
+    else {
+        return Ok(());
+    };
+    bump_repo_meta_high_water(conn, &repo_id, WATCH_PLACEMENT_FAILURES_META, failures)?;
+    Ok(())
 }
 
 /// Upsert a per-repo meta value into `repo_meta` (keyed by `(repo_id, key)`). The repo-scoped twin

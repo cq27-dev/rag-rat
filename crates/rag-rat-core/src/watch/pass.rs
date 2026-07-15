@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use notify::Event;
 
 use super::overlay::{OverlayScope, ReconcileBudget, refresh_worktree_overlays};
+use super::placement::WatchPlacementCounters;
 use crate::config::Config;
 use crate::index::IndexDatabase;
 use crate::index::ai::ReconcileOptions;
@@ -207,39 +208,48 @@ pub(crate) fn spawn_pass_worker(
 }
 
 /// Run one maintenance pass, blocking on the per-DB write lock (watcher-to-watcher serializes).
+/// The hook/CLI entry point — it has no resident watcher, so there are no watch-placement counters
+/// to persist (`None`); a running watcher records its own via [`maintenance_pass_scoped`].
 pub fn maintenance_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
-    maintenance_pass_scoped(config, run_gc, &OverlayScope::All)
+    maintenance_pass_scoped(config, run_gc, &OverlayScope::All, None)
 }
 
 /// [`maintenance_pass`] with an explicit overlay scope — the watcher's event-driven passes name
-/// the checkouts events came from instead of sweeping the whole worktree fleet (#577).
+/// the checkouts events came from instead of sweeping the whole worktree fleet (#577). The resident
+/// watcher passes `Some(counters)` so this pass persists its watch-placement failure high-water
+/// mark; the hook/CLI wrapper above passes `None`.
 pub(crate) fn maintenance_pass_scoped(
     config: &Config,
     run_gc: bool,
     overlay_scope: &OverlayScope,
+    watch_counters: Option<&WatchPlacementCounters>,
 ) -> anyhow::Result<()> {
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
-    run_pass(config, run_gc, false, overlay_scope)
+    run_pass(config, run_gc, false, overlay_scope, watch_counters)
 }
 
 /// Run one maintenance pass only if the write lock is free within `SKIP_TIMEOUT`; returns whether
-/// it ran. Used by interactive / hook / shutdown callers so a held lock can't hang them.
+/// it ran. Used by interactive / hook / shutdown callers so a held lock can't hang them — none of
+/// which own a watcher, so no watch-placement counters (`None`).
 pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result<bool> {
     let lock_repo = locks::write_lock_repo_id(config);
     match locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SKIP_TIMEOUT)? {
         Some(_lock) => {
-            run_pass(config, run_gc, false, &OverlayScope::All)?;
+            run_pass(config, run_gc, false, &OverlayScope::All, None)?;
             Ok(true)
         },
         None => Ok(false),
     }
 }
 
-pub(crate) fn startup_catchup_pass(config: &Config) -> anyhow::Result<()> {
+pub(crate) fn startup_catchup_pass(
+    config: &Config,
+    watch_counters: Option<&WatchPlacementCounters>,
+) -> anyhow::Result<()> {
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
-    run_pass(config, STARTUP_CATCHUP_RUN_GC, true, &OverlayScope::All)
+    run_pass(config, STARTUP_CATCHUP_RUN_GC, true, &OverlayScope::All, watch_counters)
 }
 
 fn run_pass(
@@ -247,6 +257,7 @@ fn run_pass(
     run_gc: bool,
     retry_base_embedding_backlog: bool,
     overlay_scope: &OverlayScope,
+    watch_counters: Option<&WatchPlacementCounters>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut timings = PassTimings::new(started);
@@ -263,6 +274,16 @@ fn run_pass(
         },
         Err(err) => return Err(err),
     };
+    // Persist the resident watcher's watch-placement failure count (as a high-water mark) so
+    // `index_status` can surface silently-dropped watches — a directory whose watch failed (ENOSPC
+    // on Linux) falls back to this very sweep, but without this the degradation is invisible. This
+    // is the persist using the pass's already-open connection; the WARN (and a between-pass
+    // backstop persist) is owned by the event-loop drain, which runs even when no pass does
+    // (#658 review).
+    if let Some(counters) = watch_counters {
+        let (_watch_attempts, watch_failures) = counters.counts();
+        db.record_watch_placement_failures(watch_failures)?;
+    }
     let shutdown_reconcile_pending = db.watch_shutdown_reconcile_pending()?;
     let runtime = &config.llm.embedding.runtime;
     let options = ReconcileOptions {

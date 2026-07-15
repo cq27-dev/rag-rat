@@ -15,9 +15,9 @@ use super::pass::{
     maintenance_pass_scoped, spawn_pass_worker, startup_catchup_pass,
 };
 use super::placement::{
-    LinkedWorktreeWatches, event_requests_maintenance, event_targets_binary, is_gitignore_path,
-    kind_is_mutation, place_initial_watch_state, recompile_ignore_and_place_watches,
-    sync_linked_worktrees_after_pass,
+    LinkedWorktreeWatches, WatchPlacementCounters, event_requests_maintenance,
+    event_targets_binary, is_gitignore_path, kind_is_mutation, place_initial_watch_state,
+    recompile_ignore_and_place_watches, sync_linked_worktrees_after_pass,
 };
 use crate::config::Config;
 use crate::fleet;
@@ -156,8 +156,15 @@ fn watcher_main(
     // checkout's own gitignore rules, so overlay refreshes do not subscribe to ignored build trees.
     // The worktree registry is still watched non-recursively so `git worktree add/remove` fires a
     // pass. `linked_worktrees` is reconciled after each pass to pick up newly-added worktrees.
+    //
+    // Watch-placement counters are OWNED by this watcher (not a process-global), so one repo
+    // config's dropped watches are never attributed to another (#658 review). The event-loop thread
+    // records placements into them; the pass worker reads them to persist the failure high-water
+    // mark — hence the `Arc`, shared across the two threads.
+    let watch_counters = Arc::new(WatchPlacementCounters::default());
     let (mut linked_worktrees, worktree_registry) = place_initial_watch_state(
         &mut notify_watcher,
+        &watch_counters,
         &config,
         &target_dirs,
         &ignore,
@@ -194,11 +201,19 @@ fn watcher_main(
     let (pass_tx, pass_rx) = std::sync::mpsc::channel();
     let Some(pass_worker) = spawn_pass_worker(pass_rx, tx, {
         let config = config.clone();
+        // This watcher's counters, shared with the event-loop thread that records into them; the
+        // pass reads them to persist the placement-failure high-water mark for `index_status`.
+        let watch_counters = Arc::clone(&watch_counters);
         move |request| {
             let _ = match request {
-                PassRequest::StartupCatchup => startup_catchup_pass(&config),
-                PassRequest::Maintenance { run_gc, overlay_scope } =>
-                    maintenance_pass_scoped(&config, *run_gc, overlay_scope),
+                PassRequest::StartupCatchup =>
+                    startup_catchup_pass(&config, Some(watch_counters.as_ref())),
+                PassRequest::Maintenance { run_gc, overlay_scope } => maintenance_pass_scoped(
+                    &config,
+                    *run_gc,
+                    overlay_scope,
+                    Some(watch_counters.as_ref()),
+                ),
             };
         }
     }) else {
@@ -220,6 +235,7 @@ fn watcher_main(
         target_dirs: &target_dirs,
         fleet_bin: fleet_bin.as_deref(),
         notify_watcher: &mut notify_watcher,
+        counters: &watch_counters,
         ignore: &mut ignore,
         linked_worktrees: &mut linked_worktrees,
         worktree_registry: worktree_registry.as_deref(),
@@ -247,6 +263,59 @@ fn watcher_main(
     if final_refresh_owed {
         let _ = shutdown_discover(&config);
     }
+
+    // Flush the watch-placement failure high-water mark on the way out, in case the event loop's
+    // between-pass drain didn't catch the last resync-introduced drop before `stop`. Runs AFTER the
+    // shutdown discover on purpose: a watcher that started with NO index has a drain that treated
+    // the missing DB as settled, so if the discover above just CREATED and registered the index for
+    // content that arrived in the last debounce window, this is the only chance to write the count
+    // into it (#658 review). Best-effort and bounded; a no-op (no DB open at all) when there is
+    // still no index or nothing ever failed, so a healthy watcher's shutdown pays nothing.
+    let _ = flush_watch_placement_failures(&config, &watch_counters, SKIP_TIMEOUT);
+}
+
+/// Persist this watcher's watch-placement failure high-water mark out of band — from the event-loop
+/// drain between passes (the post-pass linked-worktree resync places watches AFTER the pass worker
+/// already persisted the counter) and at shutdown — so a drop introduced there is not lost on a
+/// periodic-sweep-disabled watcher with no further events (#658 review). Takes the write lock with
+/// `lock_timeout` (`Duration::ZERO` for a non-blocking try on the event loop — it must not stall
+/// event classification; [`SKIP_TIMEOUT`] at shutdown). The persist goes through the LIGHTWEIGHT,
+/// NON-CREATING, NON-BLOCKING config-scoped path
+/// ([`crate::index::record_watch_placement_failures_scoped`]).
+///
+/// Returns whether the flush SETTLED: `true` = persisted, or nothing to persist (no failures, no
+/// index yet, repo not registered) — the caller may advance its low-water mark; `false` = a
+/// TRANSIENT skip (write lock held, or the DB busy) — the caller should retry on a later tick.
+pub(crate) fn flush_watch_placement_failures(
+    config: &Config,
+    counters: &WatchPlacementCounters,
+    lock_timeout: Duration,
+) -> bool {
+    let (_, failures) = counters.counts();
+    if failures == 0 {
+        return true;
+    }
+    let lock_repo = locks::write_lock_repo_id(config);
+    let Ok(Some(_lock)) =
+        locks::WriteLock::acquire_timeout(&config.database, &lock_repo, lock_timeout)
+    else {
+        // The flock is held (a pass mid-write, another process) — transient; retry next tick.
+        return false;
+    };
+    match crate::index::record_watch_placement_failures_scoped(config, failures) {
+        Ok(settled) => settled,
+        Err(error) => {
+            // A non-busy error (schema corruption, a vanished file) can't be fixed by retrying —
+            // treat as settled so the drain doesn't spin/log every tick; the next full pass
+            // persists via its own connection.
+            tracing::debug!(
+                target: "rag_rat_core::watch",
+                error = %error,
+                "watch-placement-failure flush failed; the count rides the next pass"
+            );
+            true
+        },
+    }
 }
 
 /// The watcher event loop, separated from [`watcher_main`] so tests can drive it with a recording
@@ -258,6 +327,10 @@ pub(crate) struct EventLoop<'a, W: notify::Watcher> {
     pub(crate) target_dirs: &'a [PathBuf],
     pub(crate) fleet_bin: Option<&'a Path>,
     pub(crate) notify_watcher: &'a mut W,
+    /// This watcher's watch-placement counters (not a process-global), recorded on every placement
+    /// the loop performs and read by the pass worker to persist the failure high-water mark
+    /// (#658).
+    pub(crate) counters: &'a WatchPlacementCounters,
     pub(crate) ignore: &'a mut IgnoreMatcher,
     pub(crate) linked_worktrees: &'a mut LinkedWorktreeWatches,
     pub(crate) worktree_registry: Option<&'a Path>,
@@ -297,6 +370,12 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
         // dispatch, like the debounce itself — mid-pass events keep accumulating for the
         // coalesced follow-up.
         let mut pending_overlay_scope: Option<OverlayScope> = None;
+        // The watch-placement failure count this loop has already flushed to `repo_meta`. The
+        // between-pass drain at the loop tail compares the live counter against this and persists +
+        // warns on any rise, so a drop the post-pass resync introduced (after the pass worker
+        // persisted) still surfaces — in `index_status` AND the log — on a periodic-sweep-disabled
+        // watcher with no further events (#658 review).
+        let mut last_flushed_placement_failures = 0u64;
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 break;
@@ -346,6 +425,7 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                     // nested `.gitignore` (#332).
                     if let Some(scope) = event_requests_maintenance(
                         self.notify_watcher,
+                        self.counters,
                         &event,
                         self.config,
                         self.target_dirs,
@@ -374,6 +454,7 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                             // bookkeeping is deferred.)
                             recompile_ignore_and_place_watches(
                                 self.notify_watcher,
+                                self.counters,
                                 self.config,
                                 self.target_dirs,
                                 self.ignore,
@@ -397,9 +478,13 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                     // state remains active.
                     sync_linked_worktrees_after_pass(
                         self.notify_watcher,
+                        self.counters,
                         self.config,
                         self.linked_worktrees,
                     );
+                    // A resync-introduced watch-placement drop is picked up by the between-pass
+                    // drain at the tail of this loop (it runs every iteration), not here — see
+                    // there.
                 },
                 Ok(LoopMsg::PapertrailDone) => {
                     if let Some(request_tx) = self.papertrail_tx
@@ -462,6 +547,44 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                 // binary.
                 (self.fleet_trigger)(bin);
                 fleet_debounce.reset();
+            }
+            // Between-pass watch-placement-failure drain (#658 review). Runs every loop iteration —
+            // the loop wakes at least every `IDLE_WAIT`, so even a periodic-sweep-disabled watcher
+            // with no further filesystem events reaches here within one idle tick. Gated on a RISE
+            // in the counter (two atomic loads on the healthy path — negligible), so it opens the
+            // DB only when a placement newly failed. The pass worker persists at pass
+            // start, but the post-pass linked-worktree resync places watches AFTER
+            // that; this is what surfaces such a drop while the watcher keeps running.
+            // The `warn!` is emitted here (once per new batch via the coalesced
+            // counter) so the log signal fires even when the flush is deferred, and the
+            // flush is NON-blocking: a busy DB / held write lock leaves `last_flushed` unadvanced
+            // so the next tick retries. It never dispatches a pass, so it cannot re-drive the
+            // resync and loop.
+            let (_, current_placement_failures) = self.counters.counts();
+            if current_placement_failures > last_flushed_placement_failures {
+                if let Some(total) = self.counters.newly_warnable_failures() {
+                    // The recovery path differs by config: with the periodic sweep ON, the
+                    // unwatched subtree is re-scanned each interval; with it DISABLED
+                    // (`periodic_sweep_secs = 0`) there is no backstop, so edits beneath the
+                    // dropped watch can go unindexed until an event-driven pass happens to touch it
+                    // or the operator reindexes — don't promise a sweep that won't run.
+                    let recovery = if self.config.watch.periodic_sweep_secs > 0 {
+                        "falling back to the periodic sweep"
+                    } else {
+                        "and the periodic sweep is DISABLED, so edits beneath an unwatched \
+                         directory may go unindexed until the next event-driven pass or a reindex"
+                    };
+                    tracing::warn!(
+                        target: "rag_rat_core::watch",
+                        watch_placement_failures = total,
+                        periodic_sweep_secs = self.config.watch.periodic_sweep_secs,
+                        "watch placement failed for one or more directories ({recovery}); on Linux \
+                         this is usually fs.inotify.max_user_watches exhaustion"
+                    );
+                }
+                if flush_watch_placement_failures(self.config, self.counters, Duration::ZERO) {
+                    last_flushed_placement_failures = current_placement_failures;
+                }
             }
         }
         debounce.fire_at().is_some()

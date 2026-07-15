@@ -94,6 +94,31 @@ impl IndexConnection {
         Ok(Self { conn, database_path: path.to_path_buf(), source_root: None })
     }
 
+    /// Read-WRITE open that neither CREATES the database nor WAITS on a busy lock — for the
+    /// watcher's non-blocking, side-effect-free out-of-band flush (#658 review). Two departures
+    /// from [`open`](Self::open), both load-bearing for that caller:
+    /// - `SQLITE_OPEN_READ_WRITE` WITHOUT `_CREATE` (and no `create_dir_all`), so a
+    ///   first-time-empty checkout with no index yet ERRORS (`SQLITE_CANTOPEN`) instead of leaving
+    ///   a schemaless `.rag-rat/index.sqlite` behind that would poison the friendly no-index read
+    ///   path.
+    /// - `busy_timeout = 0` and NO `setup()`, so a single write FAILS FAST with `SQLITE_BUSY` under
+    ///   a concurrent writer (another repo in a consolidated DB, a checkpoint) instead of stalling
+    ///   the caller — the watcher event loop, which must never block on classification/fleet
+    ///   triggers — for up to the 5s `setup()` timeout. The WAL journal mode is persistent on an
+    ///   already initialized DB, so skipping `setup()`'s `journal_mode = WAL` retry is safe here.
+    ///
+    /// The caller treats BOTH the open error and a busy write as "skip; the count rides the next
+    /// pass" (see [`is_busy`]). NOT for general use — a normal writer wants [`open`](Self::open).
+    pub fn open_read_write_no_create_nowait(path: &Path) -> anyhow::Result<Self> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        Ok(Self { conn, database_path: path.to_path_buf(), source_root: None })
+    }
+
     pub fn database_path(&self) -> &Path {
         &self.database_path
     }

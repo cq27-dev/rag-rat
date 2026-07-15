@@ -58,7 +58,9 @@ pub(crate) use git_context::*;
 pub(crate) use lifecycle::install_scope_view;
 pub use lifecycle::{GlobalStoreOverview, install_worktree_scope_view, resolve_scope_repo_id};
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
-pub(crate) use meta::{delete_repo_meta, repo_meta, set_repo_meta};
+pub(crate) use meta::{
+    delete_repo_meta, record_watch_placement_failures_scoped, repo_meta, set_repo_meta,
+};
 pub use parser_failures::ParserFailure;
 pub(crate) use prep::*;
 pub use query_api::{
@@ -229,6 +231,18 @@ pub struct IndexStatus {
     pub file_count_by_language: BTreeMap<String, u64>,
     pub parser_failures: u64,
     pub parser_failure_paths: Vec<ParserFailure>,
+    /// HIGH-WATER MARK of watch-placement failures — the MOST any single watcher lifetime has
+    /// recorded for this repo (a per-lifetime MAXIMUM, not a running sum across lifetimes: two
+    /// watcher runs that dropped 3 and 2 watches report 3, not 5). A degradation SIGNAL, not a
+    /// live "currently degraded" gauge. Nonzero means at least one directory has, at some
+    /// point, fallen back to the periodic sweep because its watch could not be placed (on
+    /// Linux, usually `fs.inotify.max_user_watches` exhaustion); it is worth investigating,
+    /// not proof that watches are dropped right now. Deliberately NEVER lowered — a healthy or
+    /// freshly-restarted watcher sharing the DB must not be able to erase a concurrently
+    /// degraded watcher's record — so it does NOT clear when the condition is fixed and
+    /// watches are re-placed cleanly; treat it as "has this index ever dropped a watch", not
+    /// "is it dropping them now". 0 only when no watcher has ever recorded a failed placement.
+    pub watch_placement_failures: u64,
     pub git_history: GitHistoryIndexStatus,
     pub papertrail: PapertrailStatus,
     pub llm: LlmStatus,

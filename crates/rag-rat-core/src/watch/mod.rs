@@ -26,7 +26,7 @@ mod placement;
 
 pub use event_loop::Watcher;
 #[cfg(test)]
-pub(crate) use event_loop::{EventLoop, shutdown_discover};
+pub(crate) use event_loop::{EventLoop, flush_watch_placement_failures, shutdown_discover};
 #[cfg(test)]
 pub(crate) use overlay::{OverlayBasisAction, overlay_basis_action, overlay_needs_embed};
 pub use overlay::{OverlayScope, ReconcileBudget, refresh_worktree_overlays};
@@ -41,8 +41,8 @@ pub(crate) use pass::{
 };
 #[cfg(test)]
 pub(crate) use placement::{
-    CreatedDirPlacement, LinkedWorktreeWatches, WorktreeEventHint, created_dir_placement,
-    event_is_relevant, event_requests_maintenance, event_touches_worktree,
+    CreatedDirPlacement, LinkedWorktreeWatches, WatchPlacementCounters, WorktreeEventHint,
+    created_dir_placement, event_is_relevant, event_requests_maintenance, event_touches_worktree,
     gitignore_rule_watch_dirs, gitignore_watch_dirs, is_gitignore_path, kind_is_mutation,
     missing_config_root_bootstrap_dirs, place_initial_watch_state,
     recompile_ignore_and_place_watches, sync_linked_worktrees_after_pass, watch_created_dirs,

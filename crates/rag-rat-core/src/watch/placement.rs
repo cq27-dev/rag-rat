@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
 use notify::{Event, RecursiveMode};
@@ -8,6 +9,89 @@ use super::overlay::{OverlayScope, enclosing_worktree_id};
 use crate::config::Config;
 use crate::index::ignore_rules::{IgnoreMatcher, target_ancestor_dirs};
 use crate::index::target_for_path;
+
+/// Per-watcher counters for watch PLACEMENT outcomes, OWNED by the watcher that created them (not a
+/// process-global). `watcher_main` builds one and shares it — via `Arc` — between the event-loop
+/// thread (which records a placement on every `.watch()`) and the pass worker (which reads it to
+/// persist the failure high-water mark into `repo_meta`). Scoping to the watcher INSTANCE is what
+/// keeps one repo config's placement outcomes from ever being attributed to another's — even if a
+/// single process ran more than one `Watcher` (the public `spawn` API does not forbid it) — and the
+/// counts do not outlive the watcher's own shutdown the way a static would.
+///
+/// A failure means `notify::Watcher::watch` returned `Err` — on Linux, `ENOSPC` once
+/// `fs.inotify.max_user_watches` is exhausted; on any OS, a transient failure. The directory (and,
+/// in [`watch_tree_pruned`], its whole unwalked subtree) then silently falls back to the periodic
+/// sweep. These counters make that fallback *observable*. Interior atomics so the shared `&self`
+/// can be read on the pass thread while the event-loop thread records placements concurrently.
+#[derive(Debug, Default)]
+pub(crate) struct WatchPlacementCounters {
+    attempts: AtomicU64,
+    failures: AtomicU64,
+    /// The failure count this watcher last emitted a warning for. Warning coalescing keys on THIS
+    /// (instance-local), NOT on the persisted high-water mark — a restarted watcher whose fresh
+    /// count is below a prior high-water still has real new failures to log.
+    last_warned: AtomicU64,
+}
+
+impl WatchPlacementCounters {
+    fn record_attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(attempts, failures)` watch placements this watcher has seen — read by the watcher's pass
+    /// to persist into `repo_meta` (`watch_placement_failures`), surfaced by `index_status`.
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        (self.attempts.load(Ordering::Relaxed), self.failures.load(Ordering::Relaxed))
+    }
+
+    /// This watcher's total watch-placement failures, but only if they have RISEN since the last
+    /// call — so the pass warns once per new batch of drops and never per directory. Returns `None`
+    /// when nothing new (or none ever) failed.
+    pub(crate) fn newly_warnable_failures(&self) -> Option<u64> {
+        let current = self.failures.load(Ordering::Relaxed);
+        if current == 0 {
+            return None;
+        }
+        // fetch_max stores the max and returns the PRIOR value atomically, so the pass thread can't
+        // double-warn for the same increment even against a concurrent placement.
+        let prior = self.last_warned.fetch_max(current, Ordering::Relaxed);
+        (current > prior).then_some(current)
+    }
+}
+
+/// Place one non-recursive watch, counting the outcome into `counters`; returns `true` on success.
+/// EVERY `.watch()` in this module goes through here so a swallowed failure is still counted.
+/// Behavior is unchanged — a failed watch still falls back to the sweep exactly as before; only its
+/// visibility changes.
+fn place_watch(
+    watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
+    path: &Path,
+    mode: RecursiveMode,
+) -> bool {
+    counters.record_attempt();
+    match watcher.watch(path, mode) {
+        Ok(()) => true,
+        Err(_) => {
+            // Only a watch that failed on a directory that EXISTS is a silently-dropped watch (the
+            // ENOSPC / inotify-exhaustion case this signal is for). A watch that failed because the
+            // path is absent is an EXPECTED miss — a not-yet-created configured target, a
+            // branch-specific subdir, or a worktree registry that appears later — all of which the
+            // ancestor / bootstrap / created-dir watches already cover. Counting those would peg
+            // the never-lowered high-water mark forever on a config with an optional
+            // target dir and emit a spurious ENOSPC warning. `try_exists` errors (e.g.
+            // a permission wall) count, so a genuine drop is never under-reported.
+            if path.try_exists().unwrap_or(true) {
+                counters.record_failure();
+            }
+            false
+        },
+    }
+}
 
 /// Whether an event KIND should ever fire a pass. Only content mutations do — `Create`, `Remove`,
 /// any `Modify` (data/metadata/rename), and a write-close. Reads must NOT: notify's inotify mask
@@ -126,32 +210,35 @@ impl LinkedWorktreeWatch {
         Self { checkout_root, config, target_dirs, ignore }
     }
 
-    fn place_watches(&self, watcher: &mut impl notify::Watcher) {
-        watch_configured_trees(watcher, &self.config, &self.target_dirs, &self.ignore);
-        watch_gitignore_rule_dirs(watcher, &self.config.root, &self.target_dirs);
+    fn place_watches(&self, watcher: &mut impl notify::Watcher, counters: &WatchPlacementCounters) {
+        watch_configured_trees(watcher, counters, &self.config, &self.target_dirs, &self.ignore);
+        watch_gitignore_rule_dirs(watcher, counters, &self.config.root, &self.target_dirs);
         for root in missing_config_root_bootstrap_dirs(&self.config.root, &self.checkout_root) {
             // The linked checkout may not have this subdir on the current branch yet. Keep narrow
             // bootstraps on the existing ancestor chain so the next recreated config-root component
             // is observed without returning to a recursive whole-checkout watch.
-            let _ = watcher.watch(&root, RecursiveMode::NonRecursive);
+            place_watch(watcher, counters, &root, RecursiveMode::NonRecursive);
         }
     }
 
     pub(crate) fn recompile_ignore_and_place_watches(
         &mut self,
         watcher: &mut impl notify::Watcher,
+        counters: &WatchPlacementCounters,
     ) {
         self.ignore = IgnoreMatcher::compile(&self.config.root, &self.target_dirs);
-        self.place_watches(watcher);
+        self.place_watches(watcher, counters);
     }
 
     pub(crate) fn watch_created_dirs(
         &mut self,
         watcher: &mut impl notify::Watcher,
+        counters: &WatchPlacementCounters,
         event: &Event,
     ) -> bool {
         watch_created_dirs(
             watcher,
+            counters,
             event,
             &self.config,
             &self.target_dirs,
@@ -189,13 +276,14 @@ impl LinkedWorktreeWatches {
     pub(crate) fn sync(
         &mut self,
         watcher: &mut impl notify::Watcher,
+        counters: &WatchPlacementCounters,
         base_config: &Config,
         checkout_roots: Vec<PathBuf>,
     ) {
         let mut states = Vec::with_capacity(checkout_roots.len());
         for root in checkout_roots {
             let state = LinkedWorktreeWatch::new(base_config, root);
-            state.place_watches(watcher);
+            state.place_watches(watcher, counters);
             states.push(state);
         }
         self.states = states;
@@ -207,11 +295,12 @@ impl LinkedWorktreeWatches {
     pub(crate) fn watch_created_dirs(
         &mut self,
         watcher: &mut impl notify::Watcher,
+        counters: &WatchPlacementCounters,
         event: &Event,
     ) -> BTreeSet<PathBuf> {
         let mut placed = BTreeSet::new();
         for state in &mut self.states {
-            if state.watch_created_dirs(watcher, event) {
+            if state.watch_created_dirs(watcher, counters, event) {
                 placed.insert(state.checkout_root.clone());
             }
         }
@@ -221,9 +310,10 @@ impl LinkedWorktreeWatches {
     pub(crate) fn recompile_ignore_and_place_watches(
         &mut self,
         watcher: &mut impl notify::Watcher,
+        counters: &WatchPlacementCounters,
     ) {
         for state in &mut self.states {
-            state.recompile_ignore_and_place_watches(watcher);
+            state.recompile_ignore_and_place_watches(watcher, counters);
         }
     }
 
@@ -342,12 +432,13 @@ pub(crate) fn missing_config_root_bootstrap_dirs(
 
 pub(crate) fn watch_tree_pruned(
     watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
     dir: &Path,
     ignore: &IgnoreMatcher,
 ) {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        if watcher.watch(&d, RecursiveMode::NonRecursive).is_err() {
+        if !place_watch(watcher, counters, &d, RecursiveMode::NonRecursive) {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&d) else {
@@ -430,6 +521,7 @@ pub(crate) fn created_dir_placement(
 ///    here picks the nested rules up so `watch_tree_pruned` prunes against them, not stale rules.
 pub(crate) fn watch_created_dirs(
     watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
     event: &Event,
     config: &Config,
     target_dirs: &[PathBuf],
@@ -462,10 +554,10 @@ pub(crate) fn watch_created_dirs(
                 // A nested target's leading directory can appear after startup. Watch the ancestor
                 // non-recursively so the eventual target dir creation is delivered, and re-place
                 // target watches too in case a fast `mkdir -p target/path` already created it.
-                let _ = watcher.watch(path, RecursiveMode::NonRecursive);
-                watch_gitignore_rule_dirs(watcher, &config.root, target_dirs);
+                place_watch(watcher, counters, path, RecursiveMode::NonRecursive);
+                watch_gitignore_rule_dirs(watcher, counters, &config.root, target_dirs);
                 *ignore = IgnoreMatcher::compile(&config.root, target_dirs);
-                watch_configured_trees(watcher, config, target_dirs, ignore);
+                watch_configured_trees(watcher, counters, config, target_dirs, ignore);
                 placed_target_watch = true;
             },
             CreatedDirPlacement::TargetSubtree => {
@@ -479,7 +571,7 @@ pub(crate) fn watch_created_dirs(
                 if ignore.is_ignored(path, true) {
                     continue;
                 }
-                watch_tree_pruned(watcher, path, ignore);
+                watch_tree_pruned(watcher, counters, path, ignore);
                 placed_target_watch = true;
             },
         }
@@ -489,22 +581,23 @@ pub(crate) fn watch_created_dirs(
 
 pub(crate) fn place_initial_watch_state(
     watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
     config: &Config,
     target_dirs: &[PathBuf],
     ignore: &IgnoreMatcher,
     fleet_bin: Option<&Path>,
 ) -> (LinkedWorktreeWatches, Option<PathBuf>) {
-    watch_configured_trees(watcher, config, target_dirs, ignore);
-    watch_gitignore_rule_dirs(watcher, &config.root, target_dirs);
+    watch_configured_trees(watcher, counters, config, target_dirs, ignore);
+    watch_gitignore_rule_dirs(watcher, counters, &config.root, target_dirs);
 
     if let Some(dir) = fleet_bin.and_then(Path::parent) {
-        let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+        place_watch(watcher, counters, dir, RecursiveMode::NonRecursive);
     }
 
     let (linked_worktree_roots, worktree_registry) = worktree_watch_targets(config);
-    let linked_worktrees = watch_linked_worktrees(watcher, config, linked_worktree_roots);
+    let linked_worktrees = watch_linked_worktrees(watcher, counters, config, linked_worktree_roots);
     if let Some(registry) = &worktree_registry {
-        let _ = watcher.watch(registry, RecursiveMode::NonRecursive);
+        place_watch(watcher, counters, registry, RecursiveMode::NonRecursive);
     }
     (linked_worktrees, worktree_registry)
 }
@@ -514,8 +607,14 @@ pub(crate) fn place_initial_watch_state(
 /// pass's discover covers the base scope regardless), `None` to ignore. Every sub-check still
 /// RUNS unconditionally (no short-circuit): watch placement is a side effect both the base and
 /// every linked state need regardless of what else already fired.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the per-watcher placement counters thread alongside the watcher through every \
+              placement entry point (#658); this one was already at the limit"
+)]
 pub(crate) fn event_requests_maintenance(
     watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
     event: &Event,
     config: &Config,
     target_dirs: &[PathBuf],
@@ -524,8 +623,8 @@ pub(crate) fn event_requests_maintenance(
     worktree_registry: Option<&Path>,
 ) -> Option<OverlayScope> {
     let created_dir_watch_placed =
-        watch_created_dirs(watcher, event, config, target_dirs, ignore, None);
-    let linked_created_dir_roots = linked_worktrees.watch_created_dirs(watcher, event);
+        watch_created_dirs(watcher, counters, event, config, target_dirs, ignore, None);
+    let linked_created_dir_roots = linked_worktrees.watch_created_dirs(watcher, counters, event);
     let base_relevant = event_is_relevant(config, ignore, event);
     let worktree_hint = event_touches_worktree(event, linked_worktrees, worktree_registry);
     let fires = created_dir_watch_placed
@@ -550,23 +649,25 @@ pub(crate) fn event_requests_maintenance(
 
 pub(crate) fn recompile_ignore_and_place_watches(
     watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
     config: &Config,
     target_dirs: &[PathBuf],
     ignore: &mut IgnoreMatcher,
     linked_worktrees: &mut LinkedWorktreeWatches,
 ) {
     *ignore = IgnoreMatcher::compile(&config.root, target_dirs);
-    watch_configured_trees(watcher, config, target_dirs, ignore);
-    linked_worktrees.recompile_ignore_and_place_watches(watcher);
+    watch_configured_trees(watcher, counters, config, target_dirs, ignore);
+    linked_worktrees.recompile_ignore_and_place_watches(watcher, counters);
 }
 
 pub(crate) fn sync_linked_worktrees_after_pass(
     watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
     config: &Config,
     linked_worktrees: &mut LinkedWorktreeWatches,
 ) {
     let (current, _) = worktree_watch_targets(config);
-    linked_worktrees.sync(watcher, config, current);
+    linked_worktrees.sync(watcher, counters, config, current);
 }
 
 /// Live linked-worktree checkout roots (excluding the base `config.root`) plus the worktree
@@ -589,12 +690,13 @@ pub(crate) fn worktree_watch_targets(config: &Config) -> (Vec<PathBuf>, Option<P
 
 pub(crate) fn watch_configured_trees(
     watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
     config: &Config,
     target_dirs: &[PathBuf],
     ignore: &IgnoreMatcher,
 ) {
     for dir in target_dirs {
-        watch_tree_pruned(watcher, &config.root.join(dir), ignore);
+        watch_tree_pruned(watcher, counters, &config.root.join(dir), ignore);
     }
 }
 
@@ -616,21 +718,23 @@ pub(crate) fn gitignore_rule_watch_dirs(root: &Path, target_dirs: &[PathBuf]) ->
 
 pub(crate) fn watch_gitignore_rule_dirs(
     watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
     root: &Path,
     target_dirs: &[PathBuf],
 ) {
     for dir in gitignore_rule_watch_dirs(root, target_dirs) {
-        let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+        place_watch(watcher, counters, &dir, RecursiveMode::NonRecursive);
     }
 }
 
 pub(crate) fn watch_linked_worktrees(
     watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
     base_config: &Config,
     checkout_roots: Vec<PathBuf>,
 ) -> LinkedWorktreeWatches {
     let mut worktrees = LinkedWorktreeWatches::default();
-    worktrees.sync(watcher, base_config, checkout_roots);
+    worktrees.sync(watcher, counters, base_config, checkout_roots);
     worktrees
 }
 

@@ -23,6 +23,13 @@ fn mutation_event(path: PathBuf) -> Event {
     Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path)
 }
 
+/// Fresh throwaway placement counters for tests that assert on WHICH directories get watched, not
+/// on the failure count (the live watcher owns one long-lived instance per the #658 hardening).
+/// Keeps those call sites terse; the counting test uses its own named instances.
+fn placement_counters() -> WatchPlacementCounters {
+    WatchPlacementCounters::default()
+}
+
 /// A single-Rust-target `Config` rooted at `root` watching `target_dirs` — the inline builder
 /// the real-watcher placement tests share so they can call `watch_created_dirs` (which needs a
 /// `&Config` for the target-relation gate, #332).
@@ -147,6 +154,359 @@ impl notify::Watcher for RecordingWatcher {
     {
         notify::WatcherKind::NullWatcher
     }
+}
+
+/// A watcher whose every `watch()` fails — stands in for `ENOSPC` (inotify `max_user_watches`
+/// exhausted) so the placement-failure counting is testable without exhausting the real kernel
+/// limit.
+#[derive(Debug, Default)]
+struct FailingWatcher;
+
+impl notify::Watcher for FailingWatcher {
+    fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+        Ok(Self)
+    }
+    fn watch(&mut self, _: &Path, _: RecursiveMode) -> notify::Result<()> {
+        Err(notify::Error::generic("forced test failure"))
+    }
+    fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+        Ok(())
+    }
+    fn kind() -> notify::WatcherKind {
+        notify::WatcherKind::NullWatcher
+    }
+}
+
+/// A failed watch placement is COUNTED (so `index_status` can surface silent degradation), and the
+/// existing subtree-skip behavior is unchanged: when the top dir's watch fails, `watch_tree_pruned`
+/// does not descend, so exactly one failure is recorded for a whole failed subtree — while a
+/// succeeding watcher walks every directory. The counters are OWNED per watcher, so each half of
+/// this test reads its own instance — no dependence on other tests' placements (the point of the
+/// #658 hardening).
+#[test]
+fn watch_placement_failures_are_counted_and_the_subtree_is_still_skipped() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("child/grandchild")).unwrap();
+    let ignore = crate::index::ignore_rules::IgnoreMatcher::compile(root, &[root.to_path_buf()]);
+
+    // A succeeding watcher places a watch on every directory and records no failure.
+    let ok_counters = WatchPlacementCounters::default();
+    let mut ok = RecordingWatcher::default();
+    super::placement::watch_tree_pruned(&mut ok, &ok_counters, root, &ignore);
+    let (ok_attempts, ok_failures) = ok_counters.counts();
+    assert_eq!(ok_failures, 0, "no failures for a succeeding watcher");
+    assert!(ok_attempts >= 3, "succeeding watcher attempts every directory: {ok_attempts}");
+    assert!(ok.watched.len() >= 3, "succeeding watcher descends: {:?}", ok.watched);
+    assert!(ok_counters.newly_warnable_failures().is_none(), "no failures → never warnable");
+
+    // A failing watcher fails on the top dir; the subtree is not walked, so exactly ONE failure is
+    // counted for the whole subtree (the pre-existing coverage gap this observability surfaces).
+    let fail_counters = WatchPlacementCounters::default();
+    let mut failing = FailingWatcher;
+    super::placement::watch_tree_pruned(&mut failing, &fail_counters, root, &ignore);
+    let (_, fail_failures) = fail_counters.counts();
+    assert_eq!(
+        fail_failures, 1,
+        "one failure recorded for the top dir; descent stops, so the subtree is not re-attempted"
+    );
+
+    // Warning coalescing: a fresh failure is warnable once, then not (the pass would emit exactly
+    // one log line for this batch, never one per directory).
+    assert_eq!(fail_counters.newly_warnable_failures(), Some(1), "new failures warn once");
+    assert!(
+        fail_counters.newly_warnable_failures().is_none(),
+        "already-warned failures do not re-warn without new ones"
+    );
+}
+
+/// A watch that fails because the directory does NOT exist is an expected miss (a not-yet-created
+/// configured target, a branch-specific subdir, a worktree registry that appears later) — the
+/// ancestor/bootstrap/created-dir watches cover it — so it must NOT be counted as a
+/// silently-dropped watch. Otherwise, because the persisted value is a never-lowered high-water
+/// mark, an optional target dir would peg `index_status` at "degraded" forever and emit a spurious
+/// ENOSPC warning (#658 review).
+#[test]
+fn a_watch_failure_on_an_absent_directory_is_not_counted() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    let ignore = IgnoreMatcher::compile(root, &[root.to_path_buf()]);
+    let counters = WatchPlacementCounters::default();
+
+    // A failing watcher pointed at a directory that does not exist: the watch errors, but the path
+    // is absent, so nothing is counted.
+    let mut failing = FailingWatcher;
+    let absent = root.join("not-created-yet");
+    watch_tree_pruned(&mut failing, &counters, &absent, &ignore);
+    assert_eq!(counters.counts().1, 0, "an absent target dir is an expected miss, not a drop");
+
+    // The SAME failing watcher on a directory that DOES exist is a genuine dropped watch — counted.
+    std::fs::create_dir_all(root.join("present")).unwrap();
+    watch_tree_pruned(&mut failing, &counters, &root.join("present"), &ignore);
+    assert_eq!(counters.counts().1, 1, "a failed watch on an existing dir is a real drop");
+}
+
+/// The post-pass linked-worktree sync places watches AFTER the pass persisted the counter, so the
+/// watcher flushes the failure high-water mark at shutdown — otherwise a drop introduced by that
+/// sync, on a periodic-sweep-disabled watcher with no further events, would never reach
+/// `index_status` (#658 review). Covers the flush persistence directly (the shutdown wiring in
+/// `watcher_main` uses the real notify watcher and isn't unit-drivable).
+#[test]
+fn shutdown_flush_persists_watch_placement_failures() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let config = whole_root_config(root, &[PathBuf::from("src")]);
+    IndexDatabase::rebuild(&config).unwrap();
+
+    // A fresh index has recorded nothing; a flush with zero failures stays a no-op.
+    let empty = WatchPlacementCounters::default();
+    flush_watch_placement_failures(&config, &empty, Duration::from_secs(3));
+    let db = IndexDatabase::open_config(&config).unwrap();
+    assert_eq!(db.status(&config.database).unwrap().watch_placement_failures, 0);
+    drop(db);
+
+    // Record genuine failures (failing watcher on an existing target), then flush at shutdown.
+    let counters = WatchPlacementCounters::default();
+    let ignore = IgnoreMatcher::compile(&config.root, &config.target_directories());
+    let mut failing = FailingWatcher;
+    watch_tree_pruned(&mut failing, &counters, &root.join("src"), &ignore);
+    let (_, failures) = counters.counts();
+    assert!(failures > 0, "a failing watcher on an existing dir records a failure");
+
+    flush_watch_placement_failures(&config, &counters, Duration::from_secs(3));
+    let db = IndexDatabase::open_config(&config).unwrap();
+    assert_eq!(
+        db.status(&config.database).unwrap().watch_placement_failures,
+        failures,
+        "the shutdown flush persists the count so index_status surfaces it"
+    );
+}
+
+/// The post-resync flush on the event loop uses a NON-blocking (`Duration::ZERO`) lock acquire so
+/// it never stalls event classification (#658 review). Prove that path still persists when the lock
+/// is free — i.e. `Duration::ZERO` is a real "try once and take it if free", not "never acquire" —
+/// and that it routes through the lightweight config-scoped persist (no `open_config` heals).
+#[test]
+fn a_nonblocking_flush_persists_the_count_when_the_write_lock_is_free() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let config = whole_root_config(root, &[PathBuf::from("src")]);
+    IndexDatabase::rebuild(&config).unwrap();
+
+    let counters = WatchPlacementCounters::default();
+    let ignore = IgnoreMatcher::compile(&config.root, &config.target_directories());
+    let mut failing = FailingWatcher;
+    watch_tree_pruned(&mut failing, &counters, &root.join("src"), &ignore);
+    let (_, failures) = counters.counts();
+    assert!(failures > 0);
+
+    flush_watch_placement_failures(&config, &counters, Duration::ZERO);
+    let db = IndexDatabase::open_config(&config).unwrap();
+    assert_eq!(
+        db.status(&config.database).unwrap().watch_placement_failures,
+        failures,
+        "a non-blocking flush persists when the lock is free"
+    );
+}
+
+/// The flush must stay SIDE-EFFECT-FREE on a first-time-empty checkout: a watcher that placed a
+/// watch which failed but never built an index (nothing to discover yet) must NOT leave a
+/// schemaless `.rag-rat/index.sqlite` behind — that would poison the friendly no-index read path
+/// (#658 review).
+#[test]
+fn a_flush_on_a_checkout_without_an_index_creates_no_db_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    // A source file exists (so the later rebuild has something to index), but no index has been
+    // built yet — a source file on disk does not create the `.rag-rat/index.sqlite`.
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let config = whole_root_config(root, &[PathBuf::from("src")]);
+    assert!(!config.database.exists(), "precondition: no index file yet");
+
+    // Record real placement failures, then flush — as the shutdown path would.
+    let counters = WatchPlacementCounters::default();
+    let ignore = IgnoreMatcher::compile(&config.root, &config.target_directories());
+    let mut failing = FailingWatcher;
+    watch_tree_pruned(&mut failing, &counters, &root.join("src"), &ignore);
+    assert!(counters.counts().1 > 0);
+
+    flush_watch_placement_failures(&config, &counters, Duration::from_secs(3));
+    assert!(
+        !config.database.exists(),
+        "flushing on a checkout with no index must not create a schemaless DB file"
+    );
+
+    // ...but once the index IS created (as the shutdown discover does when content arrives in the
+    // last debounce window), a subsequent flush persists the count — which is why the shutdown
+    // flush runs AFTER `shutdown_discover`, not before (#658 review).
+    IndexDatabase::rebuild(&config).unwrap();
+    flush_watch_placement_failures(&config, &counters, Duration::from_secs(3));
+    assert_eq!(
+        IndexDatabase::open_config(&config)
+            .unwrap()
+            .status(&config.database)
+            .unwrap()
+            .watch_placement_failures,
+        counters.counts().1,
+        "a flush after the index is created writes the count into the freshly-created index"
+    );
+}
+
+/// The non-blocking flush must SKIP (not block, not error) when another SQLite writer holds the
+/// database — the event loop must never stall on classification/fleet triggers (#658 review). A
+/// second connection holding a write transaction stands in for another repo's writer in a
+/// consolidated DB; `busy_timeout = 0` turns the contended write into an immediate SKIP.
+#[test]
+fn a_nonblocking_flush_skips_a_busy_database_instead_of_blocking() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let config = whole_root_config(root, &[PathBuf::from("src")]);
+    IndexDatabase::rebuild(&config).unwrap();
+
+    // Persist an initial count (lock free) so we can prove a later busy flush does NOT overwrite
+    // it.
+    let counters = WatchPlacementCounters::default();
+    let ignore = IgnoreMatcher::compile(&config.root, &config.target_directories());
+    let mut failing = FailingWatcher;
+    watch_tree_pruned(&mut failing, &counters, &root.join("src"), &ignore);
+    let first = counters.counts().1;
+    assert!(first > 0);
+    flush_watch_placement_failures(&config, &counters, Duration::from_secs(3));
+    assert_eq!(
+        IndexDatabase::open_config(&config)
+            .unwrap()
+            .status(&config.database)
+            .unwrap()
+            .watch_placement_failures,
+        first
+    );
+
+    // Grow the in-memory count, then hold the SQLite write lock from a second connection and
+    // attempt a non-blocking flush of the higher count. `BEGIN IMMEDIATE` reserves the WAL
+    // writer; the flush's `busy_timeout = 0` write must fail fast and SKIP, leaving the stored
+    // value untouched.
+    watch_tree_pruned(&mut failing, &counters, &root.join("src"), &ignore);
+    let grown = counters.counts().1;
+    assert!(grown > first, "the second placement raised the in-memory count");
+    let blocker = rusqlite::Connection::open(&config.database).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    flush_watch_placement_failures(&config, &counters, Duration::ZERO);
+    blocker.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        IndexDatabase::open_config(&config)
+            .unwrap()
+            .status(&config.database)
+            .unwrap()
+            .watch_placement_failures,
+        first,
+        "a flush against a busy DB skips rather than blocking or overwriting"
+    );
+
+    // With the writer gone, the same flush persists the grown count — proving it was a skip, not a
+    // loss.
+    flush_watch_placement_failures(&config, &counters, Duration::ZERO);
+    assert_eq!(
+        IndexDatabase::open_config(&config)
+            .unwrap()
+            .status(&config.database)
+            .unwrap()
+            .watch_placement_failures,
+        grown,
+        "once the DB is free the flush persists the higher count"
+    );
+}
+
+/// End-to-end: the event loop's between-pass DRAIN surfaces a placement failure in `index_status`
+/// WHILE the watcher runs, with the periodic sweep disabled and no pass dispatched — the exact case
+/// the post-resync flush exists for (#658 review). Records a failure into the loop's counters (as a
+/// resync would, after the pass persisted), wakes the loop, and asserts the drain persisted it.
+#[test]
+fn the_event_loop_drain_persists_a_placement_failure_while_running() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    config.watch.periodic_sweep_secs = 0; // the exact case the drain must cover.
+    IndexDatabase::rebuild(&config).unwrap();
+
+    // A failure recorded into the loop's OWN counters — as the post-pass resync would, after the
+    // pass worker already persisted. Nothing is in `repo_meta` yet (no pass wrote it).
+    let counters = WatchPlacementCounters::default();
+    let ignore_m = IgnoreMatcher::compile(&config.root, &config.target_directories());
+    let mut failing = FailingWatcher;
+    watch_tree_pruned(&mut failing, &counters, &root.join("src"), &ignore_m);
+    let failures = counters.counts().1;
+    assert!(failures > 0);
+    assert_eq!(
+        IndexDatabase::open_config(&config)
+            .unwrap()
+            .status(&config.database)
+            .unwrap()
+            .watch_placement_failures,
+        0,
+        "precondition: no pass has persisted the count yet"
+    );
+
+    let target_dirs = config.target_directories();
+    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+    let mut linked_worktrees = LinkedWorktreeWatches::default();
+    let mut notify_watcher =
+        <RecordingWatcher as notify::Watcher>::new(|_| {}, notify::Config::default()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (pass_tx, pass_rx) = std::sync::mpsc::channel::<PassRequest>();
+    let pass_tx_for_loop = pass_tx.clone();
+    let mut scheduler = PassScheduler::new();
+    let stop = AtomicBool::new(false);
+    let mut fleet_trigger = |_: &Path| {};
+
+    let event_loop = EventLoop {
+        config: &config,
+        target_dirs: &target_dirs,
+        fleet_bin: None,
+        notify_watcher: &mut notify_watcher,
+        counters: &counters,
+        ignore: &mut ignore,
+        linked_worktrees: &mut linked_worktrees,
+        worktree_registry: None,
+        rx,
+        pass_tx: &pass_tx_for_loop,
+        scheduler: &mut scheduler,
+        papertrail_tx: None,
+        papertrail_interval: None,
+        stop: &stop,
+        fleet_trigger: &mut fleet_trigger,
+    };
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(move || event_loop.run());
+        // Wake the loop so an iteration runs the tail drain, give it a moment, then stop.
+        tx.send(LoopMsg::Wake).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        stop.store(true, Ordering::Relaxed);
+        tx.send(LoopMsg::Wake).unwrap();
+        drop(tx);
+        drop(pass_tx);
+        let _ = pass_rx;
+        handle.join().unwrap();
+    });
+
+    assert_eq!(
+        IndexDatabase::open_config(&config)
+            .unwrap()
+            .status(&config.database)
+            .unwrap()
+            .watch_placement_failures,
+        failures,
+        "the between-pass drain surfaces the drop in index_status while running (sweep disabled, \
+         no pass)"
+    );
 }
 
 #[test]
@@ -384,7 +744,7 @@ fn startup_catchup_retries_existing_base_embedding_backlog() {
     );
     drop(db);
 
-    startup_catchup_pass(&config).unwrap();
+    startup_catchup_pass(&config, None).unwrap();
     let db = IndexDatabase::open_config(&config).unwrap();
     assert_eq!(
         db.pending_embedding_jobs().unwrap(),
@@ -436,7 +796,7 @@ fn startup_catchup_skips_ephemeral_backlog_scan_without_query_endpoint() {
     drop(db);
 
     crate::index::ai::reset_estimated_reconcile_job_calls();
-    startup_catchup_pass(&config).unwrap();
+    startup_catchup_pass(&config, None).unwrap();
     assert_eq!(
         crate::index::ai::estimated_reconcile_job_calls(),
         0,
@@ -614,6 +974,7 @@ fn initial_watch_state_places_base_gitignore_and_fleet_surfaces() {
     let mut watcher = RecordingWatcher::default();
     let (linked_worktrees, registry) = place_initial_watch_state(
         &mut watcher,
+        &placement_counters(),
         &config,
         &target_dirs,
         &ignore,
@@ -668,6 +1029,7 @@ fn event_maintenance_helpers_place_dirs_recompile_and_refresh_linked_state() {
     assert_eq!(
         event_requests_maintenance(
             &mut watcher,
+            &placement_counters(),
             &create,
             &config,
             &target_dirs,
@@ -690,6 +1052,7 @@ fn event_maintenance_helpers_place_dirs_recompile_and_refresh_linked_state() {
     let before_recompile = watcher.watched.len();
     recompile_ignore_and_place_watches(
         &mut watcher,
+        &placement_counters(),
         &config,
         &target_dirs,
         &mut ignore,
@@ -700,7 +1063,12 @@ fn event_maintenance_helpers_place_dirs_recompile_and_refresh_linked_state() {
         "gitignore recompiles also re-place base target watches",
     );
 
-    sync_linked_worktrees_after_pass(&mut watcher, &config, &mut linked_worktrees);
+    sync_linked_worktrees_after_pass(
+        &mut watcher,
+        &placement_counters(),
+        &config,
+        &mut linked_worktrees,
+    );
     assert!(linked_worktrees.states.is_empty());
 
     std::fs::remove_dir_all(&root).ok();
@@ -728,6 +1096,7 @@ fn event_maintenance_helper_requests_pass_for_relevant_and_registry_events() {
     assert_eq!(
         event_requests_maintenance(
             &mut watcher,
+            &placement_counters(),
             &relevant_file,
             &config,
             &target_dirs,
@@ -744,6 +1113,7 @@ fn event_maintenance_helper_requests_pass_for_relevant_and_registry_events() {
     assert_eq!(
         event_requests_maintenance(
             &mut watcher,
+            &placement_counters(),
             &registry_event,
             &config,
             &target_dirs,
@@ -789,8 +1159,14 @@ fn initial_watch_state_places_worktree_registry() {
     let target_dirs = config.target_directories();
     let ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
     let mut watcher = RecordingWatcher::default();
-    let (linked_worktrees, registry) =
-        place_initial_watch_state(&mut watcher, &config, &target_dirs, &ignore, None);
+    let (linked_worktrees, registry) = place_initial_watch_state(
+        &mut watcher,
+        &placement_counters(),
+        &config,
+        &target_dirs,
+        &ignore,
+        None,
+    );
     let registry = registry.expect("git worktree repo exposes a registry directory");
 
     assert!(
@@ -819,7 +1195,15 @@ fn watch_created_dirs_ignores_non_appearance_events() {
     let mut watcher = RecordingWatcher::default();
     let access = Event::new(EventKind::Access(AccessKind::Any)).add_path(root.join("src/fresh"));
 
-    assert!(!watch_created_dirs(&mut watcher, &access, &config, &target_dirs, &mut ignore, None));
+    assert!(!watch_created_dirs(
+        &mut watcher,
+        &placement_counters(),
+        &access,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        None
+    ));
     assert!(watcher.watched.is_empty());
 }
 
@@ -939,7 +1323,9 @@ fn event_touches_worktree_matches_checkout_targets_and_registry() {
     let worktree = PathBuf::from("/wt/feat");
     let registry = PathBuf::from("/main/.git/worktrees");
     let mut watcher = RecordingWatcher::default();
-    let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
+    let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        worktree.clone(),
+    ]);
 
     // A target file in a linked worktree fires (its overlay needs refreshing).
     assert!(
@@ -1020,7 +1406,10 @@ fn event_touches_worktree_attributes_the_touched_checkout_roots() {
     let wt_b = PathBuf::from("/wt/b");
     let registry = PathBuf::from("/main/.git/worktrees");
     let mut watcher = RecordingWatcher::default();
-    let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![wt_a.clone(), wt_b.clone()]);
+    let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        wt_a.clone(),
+        wt_b.clone(),
+    ]);
 
     assert_eq!(
         event_touches_worktree(&mutation_event(wt_a.join("src/a.rs")), &worktrees, None),
@@ -1088,7 +1477,9 @@ fn linked_worktree_events_honor_its_ignore_rules() {
 
     let config = whole_root_config(&worktree, &[PathBuf::from(".")]);
     let mut watcher = RecordingWatcher::default();
-    let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
+    let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        worktree.clone(),
+    ]);
 
     assert!(
         event_touches_worktree(&mutation_event(worktree.join("src/lib.rs")), &worktrees, None)
@@ -1141,7 +1532,9 @@ fn linked_worktree_watch_placement_uses_configured_pruned_targets() {
 
     let config = whole_root_config(&worktree, &[PathBuf::from("src")]);
     let mut watcher = RecordingWatcher::default();
-    let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
+    let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        worktree.clone(),
+    ]);
     let state = &worktrees.states[0];
 
     assert_eq!(state.config.root, worktree);
@@ -1187,10 +1580,10 @@ fn linked_worktree_watch_set_sync_rebuilds_existing_root_state() {
     let extra_config = whole_root_config(&worktree, &[PathBuf::from("extra")]);
     let mut watcher = RecordingWatcher::default();
     let mut worktrees = LinkedWorktreeWatches::default();
-    worktrees.sync(&mut watcher, &src_config, vec![worktree.clone()]);
+    worktrees.sync(&mut watcher, &placement_counters(), &src_config, vec![worktree.clone()]);
     assert_eq!(worktrees.states[0].target_dirs, vec![PathBuf::from("src")]);
 
-    worktrees.sync(&mut watcher, &extra_config, vec![worktree.clone()]);
+    worktrees.sync(&mut watcher, &placement_counters(), &extra_config, vec![worktree.clone()]);
     assert_eq!(worktrees.states.len(), 1);
     assert_eq!(worktrees.states[0].target_dirs, vec![PathBuf::from("extra")]);
     assert!(
@@ -1213,13 +1606,15 @@ fn linked_worktree_watch_set_handles_created_dirs_and_recompile() {
 
     let config = whole_root_config(&worktree, &[PathBuf::from("src")]);
     let mut watcher = RecordingWatcher::default();
-    let mut worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
+    let mut worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        worktree.clone(),
+    ]);
 
     let fresh = worktree.join("src/fresh");
     std::fs::create_dir_all(&fresh).unwrap();
     let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(fresh.clone());
     assert_eq!(
-        worktrees.watch_created_dirs(&mut watcher, &create),
+        worktrees.watch_created_dirs(&mut watcher, &placement_counters(), &create),
         BTreeSet::from([worktree.clone()]),
         "created target dirs should request a maintenance pass scoped to their checkout",
     );
@@ -1229,7 +1624,7 @@ fn linked_worktree_watch_set_handles_created_dirs_and_recompile() {
     );
 
     std::fs::write(worktree.join(".gitignore"), "src/fresh/\n").unwrap();
-    worktrees.recompile_ignore_and_place_watches(&mut watcher);
+    worktrees.recompile_ignore_and_place_watches(&mut watcher, &placement_counters());
     assert!(
         worktrees.states[0].ignore.is_ignored(&fresh, true),
         "recompile refreshes the state's matcher",
@@ -1252,14 +1647,16 @@ fn linked_worktree_watch_set_handles_created_target_ancestors() {
     let target_dirs = vec![PathBuf::from("src/generated")];
     let config = whole_root_config(&worktree, &target_dirs);
     let mut watcher = RecordingWatcher::default();
-    let mut worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
+    let mut worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        worktree.clone(),
+    ]);
 
     watcher.watched.clear();
     let ancestor = worktree.join("src");
     std::fs::create_dir_all(&ancestor).unwrap();
     let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(ancestor.clone());
     assert_eq!(
-        worktrees.watch_created_dirs(&mut watcher, &create),
+        worktrees.watch_created_dirs(&mut watcher, &placement_counters(), &create),
         BTreeSet::from([worktree.clone()]),
         "created target ancestors should request a maintenance pass after placing watches",
     );
@@ -1300,7 +1697,9 @@ fn linked_worktree_target_ancestor_gitignore_is_compiled() {
     let target_dirs = vec![PathBuf::from("src/generated")];
     let config = whole_root_config(&worktree, &target_dirs);
     let mut watcher = RecordingWatcher::default();
-    let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
+    let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        worktree.clone(),
+    ]);
     let ignore = &worktrees.states[0].ignore;
 
     assert!(
@@ -1346,7 +1745,9 @@ fn linked_subdir_root_watch_placement_keeps_checkout_root_when_config_root_missi
     let config = whole_root_config(&config_root, &target_dirs);
 
     let mut watcher = RecordingWatcher::default();
-    let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![checkout.clone()]);
+    let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        checkout.clone(),
+    ]);
     let linked_root = checkout.join("packages/crate");
 
     assert_eq!(worktrees.states[0].config.root, linked_root);
@@ -1390,7 +1791,15 @@ fn watch_created_dirs_reinstalls_watches_for_recreated_config_root() {
     let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(root.clone());
 
     assert!(
-        watch_created_dirs(&mut watcher, &create, &config, &target_dirs, &mut ignore, None),
+        watch_created_dirs(
+            &mut watcher,
+            &placement_counters(),
+            &create,
+            &config,
+            &target_dirs,
+            &mut ignore,
+            None
+        ),
         "recreated config roots should re-place target watches and request maintenance",
     );
     assert!(
@@ -1433,6 +1842,7 @@ fn watch_created_dirs_bootstraps_missing_linked_subdir_root_ancestors() {
     assert!(
         watch_created_dirs(
             &mut watcher,
+            &placement_counters(),
             &create_packages,
             &config,
             &target_dirs,
@@ -1459,6 +1869,7 @@ fn watch_created_dirs_bootstraps_missing_linked_subdir_root_ancestors() {
     assert!(
         !watch_created_dirs(
             &mut watcher,
+            &placement_counters(),
             &create_vendor,
             &config,
             &target_dirs,
@@ -1486,7 +1897,9 @@ fn linked_created_target_dir_requests_maintenance_when_directory_event_is_not_re
     let target_dirs = vec![PathBuf::from("src")];
     let config = whole_root_config(&worktree, &target_dirs);
     let mut watcher = RecordingWatcher::default();
-    let mut worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
+    let mut worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        worktree.clone(),
+    ]);
 
     watcher.watched.clear();
     let pkg = worktree.join("src/pkg");
@@ -1499,7 +1912,7 @@ fn linked_created_target_dir_requests_maintenance_when_directory_event_is_not_re
         "extensionless directory events are not target-file events",
     );
     assert_eq!(
-        worktrees.watch_created_dirs(&mut watcher, &create),
+        worktrees.watch_created_dirs(&mut watcher, &placement_counters(), &create),
         BTreeSet::from([worktree.clone()]),
         "placing a linked target-dir watch must request a maintenance pass",
     );
@@ -1530,8 +1943,10 @@ fn linked_created_dir_watch_signal_does_not_short_circuit_state_updates() {
     let target_dirs = vec![PathBuf::from("src")];
     let config = whole_root_config(&first, &target_dirs);
     let mut watcher = RecordingWatcher::default();
-    let mut worktrees =
-        watch_linked_worktrees(&mut watcher, &config, vec![first.clone(), second.clone()]);
+    let mut worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        first.clone(),
+        second.clone(),
+    ]);
 
     watcher.watched.clear();
     let first_pkg = first.join("src/pkg");
@@ -1543,7 +1958,7 @@ fn linked_created_dir_watch_signal_does_not_short_circuit_state_updates() {
         .add_path(second_pkg.clone());
 
     assert_eq!(
-        worktrees.watch_created_dirs(&mut watcher, &create),
+        worktrees.watch_created_dirs(&mut watcher, &placement_counters(), &create),
         BTreeSet::from([first.clone(), second.clone()]),
         "BOTH linked states place their watch and are reported (no short-circuit)",
     );
@@ -1580,7 +1995,15 @@ fn watch_created_dirs_skips_dirs_ignored_before_or_after_recompile() {
     let already = root.join("src/already_ignored");
     let create_already =
         Event::new(EventKind::Create(CreateKind::Folder)).add_path(already.clone());
-    watch_created_dirs(&mut watcher, &create_already, &config, &target_dirs, &mut ignore, None);
+    watch_created_dirs(
+        &mut watcher,
+        &placement_counters(),
+        &create_already,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        None,
+    );
     assert!(
         watcher.watched.iter().all(|(path, _)| path != &already),
         "a dir ignored before recompile should not be watched",
@@ -1589,7 +2012,15 @@ fn watch_created_dirs_skips_dirs_ignored_before_or_after_recompile() {
     std::fs::write(root.join(".gitignore"), "src/already_ignored/\nsrc/newly_ignored/\n").unwrap();
     let newly = root.join("src/newly_ignored");
     let create_newly = Event::new(EventKind::Create(CreateKind::Folder)).add_path(newly.clone());
-    watch_created_dirs(&mut watcher, &create_newly, &config, &target_dirs, &mut ignore, None);
+    watch_created_dirs(
+        &mut watcher,
+        &placement_counters(),
+        &create_newly,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        None,
+    );
     assert!(
         watcher.watched.iter().all(|(path, _)| path != &newly),
         "a dir ignored only after recompile should not be watched",
@@ -1652,7 +2083,9 @@ fn event_touches_worktree_rebases_subdir_rooted_config() {
     let checkout =
         std::env::temp_dir().join(format!("ragrat-wt-subdir-co-{}-{id}", std::process::id()));
     let mut watcher = RecordingWatcher::default();
-    let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![checkout.clone()]);
+    let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
+        checkout.clone(),
+    ]);
     assert!(
         event_touches_worktree(&mutation_event(checkout.join("crate/src/a.rs")), &worktrees, None,)
             .fires(),
@@ -2058,11 +2491,13 @@ fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
         let _ = fleet_tx.send(bin.to_path_buf());
     };
 
+    let counters = placement_counters();
     let event_loop = EventLoop {
         config: &config,
         target_dirs: &target_dirs,
         fleet_bin: Some(&fleet_bin),
         notify_watcher: &mut notify_watcher,
+        counters: &counters,
         ignore: &mut ignore,
         linked_worktrees: &mut linked_worktrees,
         worktree_registry: None,
@@ -2290,7 +2725,7 @@ fn root_gitignore_edit_is_delivered_to_a_real_watcher() {
     // + the ancestor gitignore chain. The root `.gitignore` edit is delivered by the chain
     // watch, not the target subtree, so the pruned placement doesn't weaken this assertion.
     let ignore = IgnoreMatcher::compile(&sub, &[PathBuf::from(".")]);
-    watch_tree_pruned(&mut w, &sub, &ignore);
+    watch_tree_pruned(&mut w, &placement_counters(), &sub, &ignore);
     for dir in gitignore_watch_dirs(&sub) {
         let _ = w.watch(&dir, RecursiveMode::NonRecursive);
     }
@@ -2438,7 +2873,7 @@ fn gitignored_subdir_under_a_target_is_not_watched() {
     };
     // Place watches exactly as watcher_main does: the gitignore-pruned target subtree.
     let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from(".")]);
-    watch_tree_pruned(&mut w, &root, &ignore);
+    watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
     drain_until_quiet(&rx, 100, 1000);
 
     // A write inside the gitignored subtree must NOT be delivered (the dir was never watched).
@@ -2481,14 +2916,22 @@ fn newly_created_non_ignored_dir_gets_watched() {
     let target_dirs = vec![PathBuf::from(".")];
     let config = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
-    watch_tree_pruned(&mut w, &root, &ignore);
+    watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
 
     // Create a NEW non-ignored directory after the initial placement.
     let fresh = root.join("fresh_dir");
     std::fs::create_dir_all(&fresh).unwrap();
     // Feed the create event through the same handler watcher_main runs, which places the watch.
     let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(fresh.clone());
-    watch_created_dirs(&mut w, &create, &config, &target_dirs, &mut ignore, None);
+    watch_created_dirs(
+        &mut w,
+        &placement_counters(),
+        &create,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        None,
+    );
 
     // A write inside the freshly-watched dir must now be delivered.
     std::fs::write(fresh.join("c.rs"), "// c\n").unwrap();
@@ -2581,14 +3024,22 @@ fn a_directory_moved_into_a_target_is_watched() {
     let target_dirs = vec![PathBuf::from(".")];
     let config = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
-    watch_tree_pruned(&mut w, &root, &ignore);
+    watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
     // Simulate `mv` landing a directory into the target: create it, then feed a rename-To
     // event.
     let moved = root.join("moved_pkg");
     std::fs::create_dir_all(&moved).unwrap();
     let rename =
         Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(moved.clone());
-    watch_created_dirs(&mut w, &rename, &config, &target_dirs, &mut ignore, None);
+    watch_created_dirs(
+        &mut w,
+        &placement_counters(),
+        &rename,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        None,
+    );
     std::fs::write(moved.join("d.rs"), "// d\n").unwrap();
     let seen = drain_until_path_under(&rx, &moved, 3);
     drop(w);
@@ -2619,12 +3070,12 @@ fn relaxing_an_ignore_rule_re_places_watches_on_the_unignored_subtree() {
     };
     // Startup placement against the original rules: the dir is ignored → NOT watched.
     let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from(".")]);
-    watch_tree_pruned(&mut w, &root, &ignore);
+    watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
     // Relax the rule, then recompile + RE-PLACE (what the loop now does on a `.gitignore`
     // edit).
     std::fs::write(root.join(".gitignore"), "").unwrap();
     let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from(".")]);
-    watch_tree_pruned(&mut w, &root, &ignore);
+    watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
     // An edit in the formerly-ignored (now eligible) subtree must now be delivered.
     std::fs::write(root.join("formerly_ignored/e.rs"), "// e edited\n").unwrap();
     let seen = drain_until_path_under(&rx, &root.join("formerly_ignored"), 3);
@@ -2669,13 +3120,21 @@ fn a_symlink_to_a_directory_is_not_followed_into_watches() {
     let target_dirs = vec![PathBuf::from(".")];
     let config = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
-    watch_tree_pruned(&mut w, &root, &ignore);
+    watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
 
     // Symlink the outside dir UNDER the target, then feed its create event.
     let link = root.join("linked");
     std::os::unix::fs::symlink(&outside, &link).unwrap();
     let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(link.clone());
-    watch_created_dirs(&mut w, &create, &config, &target_dirs, &mut ignore, None);
+    watch_created_dirs(
+        &mut w,
+        &placement_counters(),
+        &create,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        None,
+    );
 
     // An edit to the file INSIDE the link target must NOT be delivered (the link wasn't
     // watched, and the outside dir is not under config.root at all).
@@ -2715,7 +3174,7 @@ fn a_non_target_top_level_dir_is_not_watched() {
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
     // Watch the target subtree + (mirroring watcher_main) config.root itself non-recursively,
     // so a top-level create is delivered here exactly as it would be in production.
-    watch_tree_pruned(&mut w, &root.join("src"), &ignore);
+    watch_tree_pruned(&mut w, &placement_counters(), &root.join("src"), &ignore);
     let _ = w.watch(&root, RecursiveMode::NonRecursive);
 
     // A NON-target top-level dir: created + its event fed → must NOT be watched. Probe a file
@@ -2727,7 +3186,15 @@ fn a_non_target_top_level_dir_is_not_watched() {
     let vendor_sub = vendor.join("sub");
     std::fs::create_dir_all(&vendor_sub).unwrap();
     let vendor_ev = Event::new(EventKind::Create(CreateKind::Folder)).add_path(vendor.clone());
-    watch_created_dirs(&mut w, &vendor_ev, &config, &target_dirs, &mut ignore, None);
+    watch_created_dirs(
+        &mut w,
+        &placement_counters(),
+        &vendor_ev,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        None,
+    );
     std::fs::write(vendor_sub.join("v.rs"), "// v\n").unwrap();
     let vendor_seen = drain_until_path_under(&rx, &vendor_sub, 2);
 
@@ -2735,7 +3202,15 @@ fn a_non_target_top_level_dir_is_not_watched() {
     let pkg = root.join("src/pkg");
     std::fs::create_dir_all(&pkg).unwrap();
     let pkg_ev = Event::new(EventKind::Create(CreateKind::Folder)).add_path(pkg.clone());
-    watch_created_dirs(&mut w, &pkg_ev, &config, &target_dirs, &mut ignore, None);
+    watch_created_dirs(
+        &mut w,
+        &placement_counters(),
+        &pkg_ev,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        None,
+    );
     std::fs::write(pkg.join("p.rs"), "// p\n").unwrap();
     let pkg_seen = drain_until_path_under(&rx, &pkg, 3);
 
@@ -2776,7 +3251,7 @@ fn a_moved_in_dir_with_a_nested_gitignore_prunes_against_it() {
     let target_dirs = vec![PathBuf::from(".")];
     let config = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
-    watch_tree_pruned(&mut w, &root, &ignore);
+    watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
     drain_until_quiet(&rx, 100, 1000);
 
     // Build the moved-in dir with a NESTED `.gitignore` ignoring `ignored_sub/`, plus a kept
@@ -2789,7 +3264,15 @@ fn a_moved_in_dir_with_a_nested_gitignore_prunes_against_it() {
     std::fs::write(pkg.join("kept_sub/deep/y.rs"), "// y\n").unwrap();
     let rename =
         Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(pkg.clone());
-    watch_created_dirs(&mut w, &rename, &config, &target_dirs, &mut ignore, None);
+    watch_created_dirs(
+        &mut w,
+        &placement_counters(),
+        &rename,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        None,
+    );
     drain_until_quiet(&rx, 100, 1000);
 
     // The nested-ignored subdir must NOT be watched; the kept sibling MUST be.
@@ -2850,11 +3333,13 @@ fn event_loop_ignores_fs_errors_and_exits_on_disconnect() {
     let stop = AtomicBool::new(false);
     let mut fleet_trigger = |_: &Path| {};
 
+    let counters = placement_counters();
     let event_loop = EventLoop {
         config: &config,
         target_dirs: &target_dirs,
         fleet_bin: None,
         notify_watcher: &mut notify_watcher,
+        counters: &counters,
         ignore: &mut ignore,
         linked_worktrees: &mut linked_worktrees,
         worktree_registry: None,
@@ -2901,11 +3386,13 @@ fn periodic_sweep_dispatches_all_overlay_scope() {
     let stop = AtomicBool::new(false);
     let mut fleet_trigger = |_: &Path| {};
 
+    let counters = placement_counters();
     let event_loop = EventLoop {
         config: &config,
         target_dirs: &target_dirs,
         fleet_bin: None,
         notify_watcher: &mut notify_watcher,
+        counters: &counters,
         ignore: &mut ignore,
         linked_worktrees: &mut linked_worktrees,
         worktree_registry: None,
@@ -3051,11 +3538,13 @@ fn idle_watcher_enqueues_papertrail_evaluation_without_filesystem_activity() {
     let stop = AtomicBool::new(false);
     let mut fleet_trigger = |_: &Path| {};
 
+    let counters = placement_counters();
     let event_loop = EventLoop {
         config: &config,
         target_dirs: &target_dirs,
         fleet_bin: None,
         notify_watcher: &mut notify_watcher,
+        counters: &counters,
         ignore: &mut ignore,
         linked_worktrees: &mut linked_worktrees,
         worktree_registry: None,
@@ -3104,11 +3593,13 @@ fn papertrail_deadline_fires_during_an_in_flight_pass_and_ticks_coalesce() {
     let stop = AtomicBool::new(false);
     let mut fleet_trigger = |_: &Path| {};
 
+    let counters = placement_counters();
     let event_loop = EventLoop {
         config: &config,
         target_dirs: &target_dirs,
         fleet_bin: None,
         notify_watcher: &mut notify_watcher,
+        counters: &counters,
         ignore: &mut ignore,
         linked_worktrees: &mut linked_worktrees,
         worktree_registry: None,
