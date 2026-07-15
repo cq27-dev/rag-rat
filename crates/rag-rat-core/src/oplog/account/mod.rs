@@ -28,28 +28,23 @@ mod ops;
 mod registers;
 mod storage;
 
-// The in-tx `/2`-ownership ensure seam (C3.4b-ii, #676) — the idempotent
-// ensure-the-repo's-owner-stream-is-owned primitive #664 calls before authoring `/3` content.
-// Frozen until that caller lands.
-#[allow(
-    unused_imports,
-    reason = "C3.4b-ii /2-ownership ensure seam is frozen before its caller lands"
-)]
-pub(crate) use authoring::ensure_owned_stream_v2_in_tx;
+// The in-tx `/2`-ownership ensure seam + the two read-only `/2`-stream resolvers (C3.4b-ii, #676):
+// `owned_stream_v2_id` (pure derivation — the live seam's stream resolver) and
+// `established_owned_stream_v2` (derivation + effective-ownership fact — the reconcile's fast-path
+// probe). #664 wires all three into `query::memory`, so they are plain re-exports.
+pub(crate) use authoring::{
+    ensure_owned_stream_v2_in_tx, established_owned_stream_v2, owned_stream_v2_id,
+};
 pub(crate) use bootstrap::local_account;
-// The in-tx `/3` content-author seam (C3.4b-i, #663) — frozen until #664 retargets the live
-// path.
-#[allow(
-    unused_imports,
-    reason = "C3.4b-i content-author seam is frozen before its caller lands"
-)]
-pub(crate) use content::author_content_batch_in_tx;
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub(in crate::oplog) use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, SignedContentEntry,
     VerifiedContentEntry, content_ingest, decode_content_signed, sign_content_entry,
     verify_content_signed,
 };
+// The in-tx `/3` content-author seam + its genesis-detection reader (C3.4b-i, #663): #664
+// retargets the live memory path onto them, so they are plain re-exports.
+pub(crate) use content::{author_content_batch_in_tx, content_stream_is_empty};
 pub(crate) use fold::{
     AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, GrantAuthority,
     GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,

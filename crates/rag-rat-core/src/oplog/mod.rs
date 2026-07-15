@@ -46,30 +46,17 @@ mod stream;
 // C1's curated authority seam for the C2 `/3` content envelope and candidate DAG. The account
 // implementation stays private; only typed ingest results and snapshot-consistent point queries
 // cross the phase boundary.
-// C3.4a's local-account mint (#662): the store-global principal later C3.4 slices author
-// owner-bound /3 content under. Unused until that caller lands, so the re-export is `expect`'d
-// like the seam above.
-// C3.4b-i's in-tx `/3` content-author seam (#663): the local writer that authors owner-bound
-// `/3` content on a `/2` stream, verify-accepted in the caller's txn. Frozen until #664
-// retargets the live memory path onto it.
-#[expect(
-    unused_imports,
-    reason = "C3.4b-i content-author seam is frozen before its caller lands"
-)]
-pub(crate) use account::author_content_batch_in_tx;
-// C3.4b-ii's in-tx `/2`-ownership ensure seam (#676): the idempotent
-// ensure-the-repo's-`/2`-stream-is-owned primitive #664 calls before authoring owner-bound
-// `/3` content. Frozen until that caller lands.
-#[expect(
-    unused_imports,
-    reason = "C3.4b-ii /2-ownership ensure seam is frozen before its caller lands"
-)]
-pub(crate) use account::ensure_owned_stream_v2_in_tx;
-#[expect(
-    unused_imports,
-    reason = "C3.4a local account mint is frozen before its caller lands"
-)]
-pub(crate) use account::local_account;
+//
+// The C3.4 local-authoring surface `query::memory` reaches for once #664 retargets the live memory
+// path onto the owner-bound `/2`//3 substrate:
+// - `local_account` (C3.4a, #662): the store-global principal owner-bound `/3` content authors
+//   under.
+// - `ensure_owned_stream_v2_in_tx` (C3.4b-ii, #676): publish + resolve a repo's owned `/2` stream.
+// - `owned_stream_v2_id` / `established_owned_stream_v2` (C3.4b-ii, #676): the pure stream resolver
+//   and the effective-ownership fast-path probe.
+// - `author_content_batch_in_tx` (C3.4b-i, #663): author a batch of ops as owner-authored `/3`
+//   content, verify-accepted in the caller's txn.
+// - `content_stream_is_empty` (C3.4b-i, #663): the `/3` genesis-detection reader.
 #[expect(unused_imports, reason = "C2 authority seam is frozen before its caller lands")]
 pub(crate) use account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
@@ -79,27 +66,26 @@ pub(crate) use account::{
     grant_effective_for_device, owner_control_authority, owner_secrets_authority,
     roster_content_authority, stream_owner_effective,
 };
+pub(crate) use account::{
+    author_content_batch_in_tx, content_stream_is_empty, ensure_owned_stream_v2_in_tx,
+    established_owned_stream_v2, local_account, owned_stream_v2_id,
+};
 // The op-log's first crate-internal API surface (#524): the MINTING primitives + the op
 // vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
 // — and the only direction of the dependency (`oplog` never depends back on `query::memory`).
 pub(crate) use identity::local_device;
 pub(crate) use op::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
-// The reconcile's tests read the materialized shadow projection as a `ProjectedState` via
-// `load_projection` (below) — test-only today (the live path folds in-txn), so `allow`'d.
+// The `/1` shadow-projection read seams (`ProjectedState` / `load_projection`) and the
+// standalone (own-txn) `/1` authoring wrappers (`author_batch` / `author_op`) — test-only
+// scaffolding for the retained `/1` store. The live memory path now authors owner-bound `/3`
+// content (#664), so these `/1` seams have no non-test caller; the re-exports stay `allow`'d
+// rather than removed because the `/1` store itself is retained (its history is not migrated,
+// per J1).
 #[allow(unused_imports)]
 pub(crate) use project::ProjectedState;
-// `author_batch_in_tx` is the gate-free batch-author primitive (#541) the reconcile authors
-// its ghost batch through (`query::memory::authoring::sync_owner_stream`).
-pub(crate) use store::author_batch_in_tx;
-// `load_projection` materializes a `ProjectedState` from the shadow tables — the
-// reconcile-test read seam above; only test-used for now, so `allow`'d.
 #[allow(unused_imports)]
 pub(crate) use store::load_projection;
-// `author_batch` / `author_op` are the standalone (own-txn) wrappers — `author_batch` is only
-// test-used and `author_op` is only reached from a test helper, so their re-export stays
-// `allow(unused_imports)`. The live write path uses the in-txn primitives.
 #[allow(unused_imports)]
 pub(crate) use store::{author_batch, author_op};
-pub(crate) use store::{author_in_tx, chain_tail};
-pub(crate) use stream::{StreamId, owner_stream};
+pub(crate) use stream::StreamId;

@@ -22,7 +22,7 @@
 //! ([`crate::oplog::store::NodeContentRow`] et al.), so the two projections serialize identically.
 
 use anyhow::Context;
-use rusqlite::{Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::account::decode_content_signed;
 use super::op::{self, DecodedOp, Entry, OpMeta};
@@ -30,6 +30,17 @@ use super::project;
 use super::project::ProjectedState;
 use super::store::{EdgeSpecRow, NodeContentRow, ResolvedAnchorRow};
 use super::stream::StreamId;
+
+/// Bump when the accepted-`/3` → memory fold's projectable set or LWW semantics change (a new op
+/// kind becomes `Known`, a register is added). A `/3` projection stamped with an older version is
+/// rebuilt on the next content refold, never trusted incrementally; a NEWER stamp blocks this
+/// binary from reprojecting at all (see [`assert_content_projector_not_newer`]).
+const CONTENT_PROJECTOR_VERSION: i64 = 1;
+
+/// The `oplog_meta` key holding the `/3` projector version the content projection was last folded
+/// by. DISTINCT from the `/1` `projector_version` (they evolve independently and share one meta
+/// table): a `/1` projector bump must not silently invalidate the `/3` projection, or vice versa.
+const CONTENT_PROJECTOR_VERSION_KEY: &str = "content_projector_version";
 
 /// Re-derive the accepted-`/3` → memory projection for one `/2` stream from the CURRENT accepted
 /// set and rewrite its rows in both `/3` projection tables — another stream's rows are never
@@ -39,9 +50,54 @@ pub(in crate::oplog) fn reproject_accepted_content_stream(
     tx: &Transaction<'_>,
     stream_id: StreamId,
 ) -> anyhow::Result<()> {
+    // Refuse to reproject if a NEWER binary already owns this store's `/3` projection: the
+    // wholesale DELETE + rebuild below would drop ops the newer binary decodes as `Known` (this
+    // binary reads them as `Unknown` and skips them), leaving those nodes ABSENT from
+    // `content_projected_nodes`. The memory reconcile's anti-join would then read them as
+    // unauthored and mass-duplicate them into the immutable `/3` log. Guard BEFORE any write.
+    assert_content_projector_not_newer(tx)?;
     let entries = load_accepted_entries(tx, stream_id)?;
     let state = project::project(&entries);
-    write_projection(tx, stream_id, &state)
+    write_projection(tx, stream_id, &state)?;
+    stamp_content_projector_version(tx)?;
+    Ok(())
+}
+
+/// Error if a NEWER `/3` projector already folded this store's content projection — an older binary
+/// must not reproject (it would drop ops the newer binary knows) or stamp the version down. Mirrors
+/// the `/1` guard in [`crate::oplog::store`], at the `/3` projection layer (a projector bump need
+/// not carry a schema bump, so the schema guard does not cover it). Store-global, not per stream:
+/// one binary folds every stream it holds.
+fn assert_content_projector_not_newer(conn: &Connection) -> anyhow::Result<()> {
+    if let Some(stored) = stored_content_projector_version(conn)?
+        && stored > CONTENT_PROJECTOR_VERSION
+    {
+        anyhow::bail!(
+            "the /3 content projection was folded by a newer rag-rat (content projector v{stored} \
+             > v{CONTENT_PROJECTOR_VERSION}); upgrade to write this store"
+        );
+    }
+    Ok(())
+}
+
+fn stamp_content_projector_version(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO oplog_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![CONTENT_PROJECTOR_VERSION_KEY, CONTENT_PROJECTOR_VERSION.to_string()],
+    )?;
+    Ok(())
+}
+
+fn stored_content_projector_version(conn: &Connection) -> anyhow::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT value FROM oplog_meta WHERE key = ?1",
+        params![CONTENT_PROJECTOR_VERSION_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|value| value.parse::<i64>().context("oplog content_projector_version is not an integer"))
+    .transpose()
 }
 
 /// Rewrite one stream's rows in `content_projected_nodes` / `content_projected_edges` — clear the

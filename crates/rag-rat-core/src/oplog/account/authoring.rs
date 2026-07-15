@@ -17,7 +17,7 @@
 //! gate serializes racers, so a duplicate `StreamOwn` is never authored at all.
 
 use anyhow::Context;
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::AuthorityQuery;
 use super::bootstrap::{self, LocalAccountRef};
@@ -85,6 +85,44 @@ pub(crate) fn ensure_owned_stream_v2_in_tx(
             "StreamOwn authored but the /2 stream did not fold owned (fact {other:?}); refusing \
              to report a stream that is not owned by the local account",
         ),
+    }
+}
+
+/// Derive the repo's owner-bound `/2` stream id under the store's local account, or `None` when no
+/// local account is minted yet. PURE derivation — resolves the account pointer and hashes the spec,
+/// opening NO nested transaction, so it is safe both in autocommit and inside an open IMMEDIATE txn
+/// (pass a `&Transaction`, which derefs to `&Connection`). The live authoring seam's stream
+/// resolver: a `None` means "no principal to author under yet", so the caller SKIPS authoring
+/// rather than forcing a mint — the exact analog of an unstable scope.
+pub(crate) fn owned_stream_v2_id(
+    conn: &Connection,
+    repo_id: &str,
+) -> anyhow::Result<Option<StreamId>> {
+    let Some(LocalAccountRef { account_id, .. }) = bootstrap::local_account_ref(conn)? else {
+        return Ok(None);
+    };
+    Ok(Some(stream::derive_v2(&stream::owner_stream_v2(repo_id, account_id))?))
+}
+
+/// The repo's `/2` owner stream, but ONLY once it is fully ESTABLISHED: the local account is minted
+/// AND its `StreamOwn` has folded `Effective` (the ownership fact is live), so an owner-authored
+/// `/3` batch on it would accept. `None` when no account is minted OR ownership has not folded
+/// effective yet — so a fresh repo whose anti-join is empty only because it has never published
+/// ownership resolves `None` here and is NOT mistaken for "nothing to do" (the caller establishes
+/// ownership rather than early-returning). AUTOCOMMIT-ONLY: [`storage::stream_owner_effective`]
+/// opens its OWN Deferred transaction, so this MUST NOT be called inside an open transaction (use
+/// [`owned_stream_v2_id`] there). The reconcile's fast-path probe.
+pub(crate) fn established_owned_stream_v2(
+    conn: &Connection,
+    repo_id: &str,
+) -> anyhow::Result<Option<StreamId>> {
+    let Some(LocalAccountRef { account_id, .. }) = bootstrap::local_account_ref(conn)? else {
+        return Ok(None);
+    };
+    let stream_id = stream::derive_v2(&stream::owner_stream_v2(repo_id, account_id))?;
+    match storage::stream_owner_effective(conn, account_id, stream_id)? {
+        AuthorityQuery::Effective(_) => Ok(Some(stream_id)),
+        AuthorityQuery::Unknown | AuthorityQuery::Invalid(_) => Ok(None),
     }
 }
 

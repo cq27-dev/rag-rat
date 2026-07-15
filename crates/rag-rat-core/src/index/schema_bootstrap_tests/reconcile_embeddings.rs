@@ -1456,9 +1456,12 @@ fn reconcile_heals_an_op_log_ghost_in_an_idle_repo() {
     )
     .unwrap();
 
+    // The memory reconcile now authors owner-bound `/3` content (#664), so the healed ghost lands
+    // in the accepted-`/3` projection `content_projected_nodes`, not the retained `/1` shadow
+    // table.
     let ghost_in_projection = |conn: &rusqlite::Connection| -> i64 {
         conn.query_row(
-            "SELECT COUNT(*) FROM oplog_projected_nodes WHERE node_id = 'mem_ghost_583'",
+            "SELECT COUNT(*) FROM content_projected_nodes WHERE node_id = 'mem_ghost_583'",
             [],
             |row| row.get(0),
         )

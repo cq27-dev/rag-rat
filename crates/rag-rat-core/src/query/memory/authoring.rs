@@ -1,21 +1,33 @@
 //! Translating persisted memories into signed op-log entries, and the per-node/edge reconcile that
-//! keeps the log a COMPLETE signed mirror of `repo_memories` / `repo_node_edges` (#524, #541).
+//! keeps the log a COMPLETE signed mirror of `repo_memories` / `repo_node_edges` (#524, #541,
+//! #664).
 //!
 //! This bridges `repo_memories` / `repo_node_edges` (owned by this module) and the op-log MINTING
 //! primitives ([`crate::oplog`]) — a ONE-WAY dependency, so `oplog` never depends back on the
 //! memory subsystem (a reverse call would cycle the build).
 //!
+//! OWNER-BOUND `/2`//3 substrate (#664). The live path authors owner-bound `/3` content on the
+//! repo's owner-bound `/2` stream, under the store's single local account (minted once, store-
+//! global). Each reconcile/mutation ensures the repo's `/2` stream is owned (publishing a
+//! `StreamOwn` account op) and authors its ops as owner-authored `/3` content
+//! ([`crate::oplog::author_content_batch_in_tx`]), which verify-accepts and reprojects into
+//! `content_projected_nodes` / `content_projected_edges`. The completeness predicate is an
+//! anti-join against that accepted-`/3` projection; the pre-existing `/1` history is retained but
+//! no longer written by the live path (existing `/1` rows are adopted into `/3` by the reconcile).
+//!
 //! WIRED into the live write path (#532): the memory mutations call [`backfill_memory_oplog`] once
 //! (before the first live entry) and the `author_*` seams below INSIDE their own transaction, so
 //! the op-append and the table write commit — or roll back — together (strict-atomic). Authoring is
-//! a NO-OP under an unstable scope ([`stable_owner_stream`]), leaving scope-less callers untouched.
+//! a NO-OP under an unstable scope ([`stable_owner_stream`]) or before the local account is minted,
+//! leaving scope-less callers untouched.
 //!
 //! [`backfill_memory_oplog`] is a per-node/edge RECONCILE (#541), not a per-chain gate: it authors
-//! every table row MISSING from the materialized shadow projection, so a row that entered the
-//! tables outside the wired path (a pre-#532 binary, a raw writer, a consolidation import) is
-//! signed on the next mutation and no later lifecycle op on it is ever inert. Genesis is just the
-//! empty-chain case where every row is missing.
+//! every table row MISSING from the accepted-`/3` projection, so a row that entered the tables
+//! outside the wired path (a pre-#532 binary, a raw writer, a consolidation import, or pre-existing
+//! `/1` history) is signed on the next mutation and no later lifecycle op on it is ever inert.
+//! Genesis is just the empty-`/3`-chain case where every row is missing.
 
+use anyhow::Context;
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 use super::hydrate::tags_for_memory;
@@ -55,10 +67,7 @@ impl Drop for AuthoredDurability<'_> {
     }
 }
 use super::{EdgeRelation, NodeEdge, RepoMemory, memory_repo_scope};
-use crate::oplog::{
-    EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, StreamId, author_batch_in_tx,
-    author_in_tx, chain_tail, local_device, owner_stream,
-};
+use crate::oplog::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, StreamId};
 
 /// One memory's projectable content — the columns the op model carries (NOT the identity / anchor /
 /// dedup bookkeeping). Read in bulk so the backfill makes one pass over `repo_memories`.
@@ -193,13 +202,15 @@ fn build_reconcile_ops(
     Ok(ops)
 }
 
-/// Reconcile the owner stream against the repo's tables: author every `repo_memories` /
-/// `repo_node_edges` row MISSING from the shadow projection. Genesis (empty chain) authors the full
-/// history; a populated chain authors only the ghosts. Idempotent and scope-gated (LEGACY /
-/// `local:` ids never root an immutable stream). Scope-EXPLICIT — `repo_id` is passed, and the
-/// readers + re-resolution are scope-independent, so the consolidation importer's unscoped
-/// connection can call it. Concurrency: two racing callers serialize on the IMMEDIATE lock; the
-/// loser re-reads under the lock and authors only what the winner left missing.
+/// Reconcile the repo's owner-bound `/2` stream against its tables: establish ownership (mint the
+/// local account + publish a `StreamOwn` if needed) and author every `repo_memories` /
+/// `repo_node_edges` row MISSING from the accepted-`/3` projection as owner-authored `/3` content.
+/// Genesis (empty `/3` chain) authors the full history; a populated chain authors only the ghosts.
+/// Idempotent and scope-gated (LEGACY / `local:` ids never root an immutable stream).
+/// Scope-EXPLICIT — `repo_id` is passed, and the readers + re-resolution are scope-independent, so
+/// the consolidation importer's unscoped connection can call it. Concurrency: two racing callers
+/// serialize on the IMMEDIATE lock; the loser re-reads under the lock and authors only what the
+/// winner left missing.
 fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::Result<()> {
     // Only a STABLE id may root an IMMUTABLE owner stream. Two ids get re-pointed later, which
     // would strand a stream signed under the old id: the legacy `__unassigned__` placeholder
@@ -211,29 +222,62 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     {
         return Ok(());
     }
-    let stream = owner_stream(repo_id)?;
-    // Cheap autocommit probe: return WITHOUT a write lock when nothing is missing (steady state).
-    if read_unauthored_memory_rows(conn, repo_id, stream)?.is_empty()
+    // Cheap autocommit fast-path: return WITHOUT the write lock only when the `/3` log is fully
+    // ESTABLISHED (the local account is minted AND its `StreamOwn` folded effective) AND nothing is
+    // missing. `established_owned_stream_v2` returns `None` for a fresh repo that has never
+    // published ownership — even one with an empty anti-join — so such a repo FALLS THROUGH to
+    // the slow path to mint + publish ownership rather than early-returning on an empty set it
+    // could not yet author into. `established_owned_stream_v2` is autocommit-only (it opens its
+    // own read txn), so it runs here, not under the write lock.
+    if let Some(stream) = crate::oplog::established_owned_stream_v2(conn, repo_id)?
+        && read_unauthored_memory_rows(conn, repo_id, stream)?.is_empty()
         && crate::query::memory::edges::unauthored_edges(conn, repo_id, stream)?.is_empty()
     {
         return Ok(());
     }
-    let device = local_device(conn, now_ms)?;
+
+    // Slow path. Mint the store's local account BEFORE the durability guard: the mint
+    // self-transacts and holds its OWN durability guard that restores `synchronous = NORMAL` on
+    // drop — beginning our guard first would let the mint's drop downgrade our authored commit
+    // below NORMAL, silently losing the #560 durability. The mint is store-global and
+    // idempotent (a re-mint returns the same account).
+    crate::oplog::local_account(conn, now_ms)?;
     // Authored, irreplaceable data → durable (#560). FULL for this txn only, restored on drop; set
     // OUTSIDE the txn (SQLite applies a `synchronous` change to SUBSEQUENT transactions only).
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Publish ownership of the repo's `/2` stream and resolve its id. Idempotent +
+    // check-fact-first: a re-ensure (or a racer serialized on this IMMEDIATE lock) authors no
+    // second `StreamOwn`.
+    let stream = crate::oplog::ensure_owned_stream_v2_in_tx(&tx, repo_id, now_ms)?;
     // Authoritative re-read UNDER the write lock (TOCTOU): a concurrent author may have healed or
     // added rows between the probe and the lock, so re-read the missing set and re-derive `genesis`
-    // here. `genesis` decides the status-elision: an empty LOCAL chain ⇒ no stale registers ⇒ elide
-    // `active` (byte-identical to the pre-#541 genesis). This equivalence holds ONLY under the
-    // single-local-writer owner stream (see the module header); phase D (foreign devices can
-    // populate the stream) must revisit whether local-chain-empty still implies register-clean.
-    let genesis = chain_tail(&tx, stream, device.fingerprint())?.is_none();
+    // here. `genesis` decides the status-elision: an empty `/3` content chain ⇒ no stale registers
+    // ⇒ elide `active` (byte-identical to the pre-#541 genesis). This equivalence holds ONLY
+    // under the single-local-writer owner stream (see the module header); phase D (foreign
+    // devices can populate the stream) must revisit whether local-chain-empty still implies
+    // register-clean.
+    let genesis = crate::oplog::content_stream_is_empty(&tx, stream)?;
     let missing_nodes = read_unauthored_memory_rows(&tx, repo_id, stream)?;
     let missing_edges = crate::query::memory::edges::unauthored_edges(&tx, repo_id, stream)?;
     let ops = build_reconcile_ops(&missing_nodes, &missing_edges, repo_id, genesis)?;
-    author_batch_in_tx(&tx, stream, &device, &ops, now_ms)?;
+    // Skip the author when there is nothing to author: a fresh repo whose anti-join was empty only
+    // needed ownership established (done above), and authoring an empty batch would still refold +
+    // reproject for no change.
+    if !ops.is_empty() {
+        // Fail-loud on an oversized envelope (a raw/adversarial memory body over the §18a 256 KiB
+        // cap): the `/3` author `bail!`s rather than dropping irreplaceable data, and we surface
+        // the failure with the repo it belongs to instead of wedging the store silently. A
+        // normal rag-rat memory (body ≤ 8 KiB) can never hit this; it is an
+        // adversarial/raw-writer backstop.
+        crate::oplog::author_content_batch_in_tx(&tx, stream, &ops, now_ms).with_context(|| {
+            format!(
+                "reconciling the /3 owner log for repo `{repo_id}` failed while authoring {} \
+                 pre-existing memory op(s)",
+                ops.len()
+            )
+        })?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -263,11 +307,13 @@ pub(crate) fn reconcile_owner_stream_for_repo(
     sync_owner_stream(conn, repo_id, now_ms)
 }
 
-/// The active repo's owner stream, but ONLY when the scope is a STABLE identity to root an
-/// IMMUTABLE stream on — the SAME gate the backfill uses: `Some`, not the `__unassigned__`
-/// placeholder, not a `local:` shallow-clone id (both get re-pointed later). `None` otherwise, and
-/// the `author_*` seams SKIP authoring on `None`, so a scope-less mutation (most tests) never
-/// touches the log.
+/// The active repo's owner-bound `/2` stream, but ONLY when the scope is a STABLE identity to root
+/// an IMMUTABLE stream on — the SAME gate the backfill uses: `Some`, not the `__unassigned__`
+/// placeholder, not a `local:` shallow-clone id (both get re-pointed later) — AND the store's local
+/// account is minted (the `/2` id is derived under it). `None` otherwise, and the `author_*` seams
+/// SKIP authoring on `None`, so a scope-less mutation (most tests) or a store whose account is not
+/// yet minted never touches the log. Derivation-only (no fact check), so it is safe inside the
+/// caller's open txn — unlike the reconcile's autocommit `established_owned_stream_v2` probe.
 fn stable_owner_stream(conn: &Connection) -> anyhow::Result<Option<StreamId>> {
     let Some(repo_id) = memory_repo_scope(conn)? else {
         return Ok(None);
@@ -277,14 +323,17 @@ fn stable_owner_stream(conn: &Connection) -> anyhow::Result<Option<StreamId>> {
     {
         return Ok(None);
     }
-    Ok(Some(owner_stream(&repo_id)?))
+    crate::oplog::owned_stream_v2_id(conn, &repo_id)
 }
 
-/// Author `ops` onto the active repo's owner stream WITHIN the caller's mutation txn — the strict-
-/// atomic live seam. Each op is minted + inserted + folded by `author_in_tx` (no open/commit), so
-/// an authoring error propagates via `?` and the caller's txn rolls the table write back with it. A
-/// NO-OP under an unstable scope. The caller MUST have run [`backfill_memory_oplog`] first (so the
-/// pre-existing history precedes this live entry).
+/// Author `ops` as owner-authored `/3` content on the active repo's owner-bound `/2` stream WITHIN
+/// the caller's mutation txn — the strict-atomic live seam.
+/// [`crate::oplog::author_content_batch_in_tx`] mints, inserts, refolds, and verify-accepts the
+/// batch (no open/commit), so an authoring error propagates via `?` and the caller's txn rolls the
+/// table write back with it. A NO-OP under an unstable scope or before the local account is minted.
+/// The caller MUST have run `backfill_memory_oplog` first, so the store's account plus `StreamOwn`
+/// are established (else the batch's verify-accepted rolls back) and the pre-existing history
+/// precedes this live entry.
 fn author_in_owner_stream(
     tx: &Transaction<'_>,
     ops: &[MemoryOp],
@@ -293,10 +342,13 @@ fn author_in_owner_stream(
     let Some(stream) = stable_owner_stream(tx)? else {
         return Ok(());
     };
-    let device = local_device(tx, now_ms)?;
-    for op in ops {
-        author_in_tx(tx, stream, &device, op, now_ms)?;
+    // Skip a no-op mutation: an empty batch would still refold + reproject the whole stream for no
+    // change. (The four live seams only reach here with non-empty ops today, but the guard keeps a
+    // change-free `author_update` from doing O(chain) work.)
+    if ops.is_empty() {
+        return Ok(());
     }
+    crate::oplog::author_content_batch_in_tx(tx, stream, ops, now_ms)?;
     Ok(())
 }
 
@@ -397,11 +449,11 @@ fn content_of(memory: &RepoMemory) -> NodeContent {
     )
 }
 
-/// The repo's memories with NO projected node on `stream` — the rows the signed log is MISSING —
-/// in deterministic `(created_at_ms, id)` order, tags attached. On an EMPTY projection this is
-/// every memory (genesis); on a populated one, the ghosts a raw writer or an old binary left
-/// behind (#541). Reuses the memory subsystem's own tag reader (the op encoder sorts + dedupes
-/// anyway).
+/// The repo's memories with NO projected node on `stream` in the accepted-`/3` projection — the
+/// rows the signed log is MISSING — in deterministic `(created_at_ms, id)` order, tags attached. On
+/// an EMPTY projection this is every memory (genesis); on a populated one, the ghosts a raw writer,
+/// an old binary, or pre-existing `/1` history left behind (#541, #664). Reuses the memory
+/// subsystem's own tag reader (the op encoder sorts + dedupes anyway).
 fn read_unauthored_memory_rows(
     conn: &Connection,
     repo_id: &str,
@@ -412,7 +464,7 @@ fn read_unauthored_memory_rows(
          FROM repo_memories m
          WHERE m.repo_id = ?1
            AND NOT EXISTS (
-                 SELECT 1 FROM oplog_projected_nodes p
+                 SELECT 1 FROM content_projected_nodes p
                  WHERE p.stream_id = ?2 AND p.node_id = m.id)
          ORDER BY m.created_at_ms, m.id",
     )?;
@@ -478,10 +530,44 @@ mod tests {
         .unwrap();
     }
 
-    /// Read the materialized shadow projection for `stream` — the completeness mirror the reconcile
-    /// heals into.
-    fn projected_state(conn: &Connection, stream: StreamId) -> crate::oplog::ProjectedState {
-        crate::oplog::load_projection(conn, stream).unwrap()
+    /// Insert an active memory with a CUSTOM body — used to plant an adversarial oversized body
+    /// that a normal rag-rat memory (body ≤ 8 KiB) could never carry.
+    fn insert_memory_with_body(conn: &Connection, id: &str, body: &str) {
+        conn.execute(
+            "INSERT INTO repo_memories(
+                 id, kind, title, body, confidence, status, created_by, created_at_ms,
+                 updated_at_ms, source, input_hash, memory_version, repo_id)
+             VALUES (?1, 'Invariant', ?1, ?2, 'high', 'active', 'agent', 100, 100, 'agent', 'h',
+                 'v1', ?3)",
+            params![id, body, REPO],
+        )
+        .unwrap();
+    }
+
+    /// Point a freshly-opened connection at `repo` via the per-connection TEMP `connection_context`
+    /// (temp tables are connection-local, so each thread of the race test scopes its own).
+    fn set_scope(conn: &Connection, repo: &str) {
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', ?1)",
+            [repo],
+        )
+        .unwrap();
+    }
+
+    /// The projected `/3` status of `node_id` on the store's owner stream — the completeness mirror
+    /// the reconcile heals into. A test DB holds one repo/stream, so no stream filter is needed;
+    /// panics if the node is not projected (callers assert presence).
+    fn projected_node_status(conn: &Connection, node_id: &str) -> String {
+        conn.query_row(
+            "SELECT status FROM content_projected_nodes WHERE node_id = ?1",
+            [node_id],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     /// Insert a node-edge by RAW SQL, bypassing the wired `add_edge` author — a "ghost edge" that
@@ -498,28 +584,46 @@ mod tests {
         .unwrap();
     }
 
-    /// Author a BARE `NodeStatus` for a node with NO `NodeCreate` — simulates the INERT op a
-    /// pre-fix (#532) binary authored when it `mark_obsolete`'d a still-ghost memory. Leaves a
-    /// stale status register with no projected node.
+    /// Author a BARE `/3` NodeStatus for a node with NO `NodeCreate` — the `/3` analog of the INERT
+    /// op a pre-fix (#532) binary authored when it `mark_obsolete`'d a still-ghost memory. The
+    /// shared projector emits no node without content, so this leaves a stale status register
+    /// with no projected node. Requires the store's account + owner stream already established
+    /// (via a prior live create); it authors through the real `/3` seam so the register truly
+    /// lands.
     fn author_inert_status_op(conn: &Connection, node_id: &str, status: NodeStatus) {
-        let device = crate::oplog::local_device(conn, 0).unwrap();
-        let stream = crate::oplog::owner_stream(REPO).unwrap();
-        crate::oplog::author_op(
-            conn,
+        let stream = crate::oplog::owned_stream_v2_id(conn, REPO)
+            .unwrap()
+            .expect("account minted by a prior live create");
+        let tx = conn.unchecked_transaction().unwrap();
+        crate::oplog::author_content_batch_in_tx(
+            &tx,
             stream,
-            &device,
-            &MemoryOp::NodeStatus { node_id: NodeId::from(node_id), status },
+            &[MemoryOp::NodeStatus { node_id: NodeId::from(node_id), status }],
             100,
         )
         .unwrap();
+        tx.commit().unwrap();
     }
 
+    /// The `/3` content chain length — one entry per authored op, the retarget's signed op-log
+    /// (account genesis + `StreamOwn` live in `account_entries`, not counted here).
     fn entry_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM oplog_entries", [], |r| r.get(0)).unwrap()
+        conn.query_row("SELECT COUNT(*) FROM content_entries", [], |r| r.get(0)).unwrap()
     }
 
     fn projected_node_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM oplog_projected_nodes", [], |r| r.get(0)).unwrap()
+        conn.query_row("SELECT COUNT(*) FROM content_projected_nodes", [], |r| r.get(0)).unwrap()
+    }
+
+    /// The number of local accounts minted (the single-row pointer table): 0 before any established
+    /// reconcile, 1 after — proves a no-op / scope-gated path mints NO account.
+    fn local_account_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM oplog_local_account", [], |r| r.get(0)).unwrap()
+    }
+
+    /// The number of folded `StreamOwn` ownership facts — one per owned `/2` stream.
+    fn owned_stream_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM account_stream_ownership", [], |r| r.get(0)).unwrap()
     }
 
     /// #560 durability split: an authored write commits under `synchronous = FULL`, and the guard
@@ -635,16 +739,18 @@ mod tests {
         assert!(err.to_string().contains("unknown status"), "an unknown status fails authoring");
     }
 
-    /// #541: the reconcile's memory reader anti-joins `repo_memories` against
-    /// `oplog_projected_nodes` — only a row with no projected node (never signed) comes back.
+    /// #541/#664: the reconcile's memory reader anti-joins `repo_memories` against the accepted-`/3`
+    /// projection `content_projected_nodes` — only a row with no projected node (never signed)
+    /// comes back. `stream` is an opaque `StreamId` here (the anti-join only needs seed/query
+    /// agreement).
     #[test]
     fn read_unauthored_memory_rows_returns_only_rows_absent_from_the_projection() {
         let conn = scoped_conn();
         insert_memory(&conn, "mem_live", "active", 100);
         insert_memory(&conn, "mem_ghost", "active", 200);
-        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        let stream = StreamId::from_bytes([0x11; 32]);
         conn.execute(
-            "INSERT INTO oplog_projected_nodes(stream_id, node_id, content_json, status)
+            "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
              VALUES (?1, 'mem_live', '{}', 'active')",
             params![stream.to_bytes().as_slice()],
         )
@@ -661,13 +767,11 @@ mod tests {
         create_concept(&conn, "seed").unwrap(); // roots the chain via genesis
         insert_memory(&conn, "mem_ghost", "obsolete", 500); // raw, un-authored ghost
         backfill_memory_oplog(&conn, 9_000).unwrap();
-        let stream = crate::oplog::owner_stream(REPO).unwrap();
-        let g = projected_state(&conn, stream)
-            .nodes
-            .get(&NodeId::from("mem_ghost"))
-            .cloned()
-            .expect("ghost is now authored");
-        assert_eq!(g.status, NodeStatus::Obsolete, "create-time status carried");
+        assert_eq!(
+            projected_node_status(&conn, "mem_ghost"),
+            NodeStatus::Obsolete.as_db_str(),
+            "the ghost is now authored with its create-time status",
+        );
     }
 
     #[test]
@@ -675,24 +779,18 @@ mod tests {
         // The decision-6 divergence: an inert NodeStatus{obsolete} exists, the row is now active,
         // the heal must author an explicit NodeStatus{active} so the projection matches the table.
         let conn = scoped_conn();
-        let id = create_concept(&conn, "seed").unwrap().memory.memory_id;
-        // Author an inert NodeStatus for a NOT-yet-created ghost by hand (simulate the old binary):
+        create_concept(&conn, "seed").unwrap(); // establishes the account + owner stream
+        // Author an inert `/3` NodeStatus for a NOT-yet-created ghost (the /3 analog of the old
+        // binary's inert op): a bare status register with no projected node.
         let ghost = "mem_ghost";
         author_inert_status_op(&conn, ghost, NodeStatus::Obsolete);
         insert_memory(&conn, ghost, "active", 500); // the table says active
         backfill_memory_oplog(&conn, 9_000).unwrap();
-        let stream = crate::oplog::owner_stream(REPO).unwrap();
-        let node = projected_state(&conn, stream)
-            .nodes
-            .get(&NodeId::from(ghost))
-            .cloned()
-            .expect("ghost healed");
         assert_eq!(
-            node.status,
-            NodeStatus::Active,
-            "explicit NodeStatus{{active}} overrode the stale register"
+            projected_node_status(&conn, ghost),
+            NodeStatus::Active.as_db_str(),
+            "explicit NodeStatus{{active}} overrode the stale register",
         );
-        let _ = id;
     }
 
     #[test]
@@ -702,23 +800,16 @@ mod tests {
         let b = create_concept(&conn, "b").unwrap().memory.memory_id;
         insert_raw_node_edge(&conn, &a, "relates_to", &b); // writes repo_node_edges directly
         backfill_memory_oplog(&conn, 9_000).unwrap();
-        let stream = crate::oplog::owner_stream(REPO).unwrap();
-        assert_eq!(projected_state(&conn, stream).edges.len(), 1, "ghost edge now signed");
+        assert_eq!(projected_edge_count(&conn), 1, "ghost edge now signed");
     }
 
     #[test]
     fn reconcile_is_idempotent_and_a_clean_repo_authors_nothing() {
         let conn = scoped_conn();
         create_concept(&conn, "seed").unwrap();
-        let stream = crate::oplog::owner_stream(REPO).unwrap();
-        let fp = crate::oplog::local_device(&conn, 0).unwrap().fingerprint();
-        let before = crate::oplog::chain_tail(&conn, stream, fp).unwrap();
+        let before = entry_count(&conn);
         backfill_memory_oplog(&conn, 9_000).unwrap();
-        assert_eq!(
-            crate::oplog::chain_tail(&conn, stream, fp).unwrap(),
-            before,
-            "no ghost → no new op"
-        );
+        assert_eq!(entry_count(&conn), before, "no ghost → no new /3 entry");
     }
 
     #[test]
@@ -755,20 +846,14 @@ mod tests {
             .unwrap();
 
         backfill_memory_oplog(&conn, 1_000).unwrap();
-        // 3 NodeCreate + 1 NodeStatus (mem_b obsolete) + 1 EdgeAdd (from obsolete mem_b) = 5
-        // entries; 3 projected nodes.
+        // 3 NodeCreate + 1 NodeStatus (mem_b obsolete) + 1 EdgeAdd (from obsolete mem_b) = 5 `/3`
+        // content entries; 3 projected nodes.
         assert_eq!(entry_count(&conn), 5);
         assert_eq!(projected_node_count(&conn), 3);
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM oplog_projected_nodes WHERE node_id = 'mem_b'",
-                [],
-                |r| r.get(0),
-            )
+        assert_eq!(projected_node_status(&conn, "mem_b"), "obsolete");
+        let edges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM content_projected_edges", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(status, "obsolete");
-        let edges: i64 =
-            conn.query_row("SELECT COUNT(*) FROM oplog_projected_edges", [], |r| r.get(0)).unwrap();
         assert_eq!(edges, 1);
 
         // A second backfill is a no-op — the atomic batch already completed (chain non-empty).
@@ -804,6 +889,11 @@ mod tests {
 
         backfill_memory_oplog(&conn, 1_000).unwrap();
         assert_eq!(entry_count(&conn), 0, "the placeholder repo is not backfilled");
+        assert_eq!(
+            local_account_count(&conn),
+            0,
+            "the scope gate no-ops BEFORE the mint — a placeholder repo mints no account",
+        );
     }
 
     #[test]
@@ -834,6 +924,7 @@ mod tests {
 
         backfill_memory_oplog(&conn, 1_000).unwrap();
         assert_eq!(entry_count(&conn), 0, "a local: repo is not backfilled");
+        assert_eq!(local_account_count(&conn), 0, "a local: repo mints no account");
     }
 
     #[test]
@@ -843,19 +934,27 @@ mod tests {
         crate::index::schema::apply(&conn).unwrap();
         backfill_memory_oplog(&conn, 1_000).unwrap();
         assert_eq!(entry_count(&conn), 0);
+        assert_eq!(local_account_count(&conn), 0, "an unscoped DB mints no account");
     }
 
     #[test]
-    fn backfill_of_an_empty_repo_leaves_the_chain_empty() {
+    fn backfill_of_an_empty_scoped_repo_establishes_ownership_but_authors_no_content() {
+        // A fresh scoped repo with no memories: the reconcile falls through the fast-path probe
+        // (ownership not yet established), mints the account, and publishes the `/2` StreamOwn —
+        // but authors NO `/3` content (nothing is missing). So the content chain stays
+        // empty while ownership is now live (the first live op will chain off an empty
+        // content chain = genesis).
         let conn = scoped_conn();
         backfill_memory_oplog(&conn, 1_000).unwrap();
-        assert_eq!(entry_count(&conn), 0, "no memories ⇒ no entries; the first live op is genesis");
+        assert_eq!(entry_count(&conn), 0, "no memories ⇒ no /3 content entries");
+        assert_eq!(local_account_count(&conn), 1, "a scoped repo mints the store's local account");
+        assert_eq!(owned_stream_count(&conn), 1, "and publishes exactly one /2 StreamOwn");
     }
 
     // --- live write-path wiring (#532) ---
 
     fn projected_edge_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM oplog_projected_edges", [], |r| r.get(0)).unwrap()
+        conn.query_row("SELECT COUNT(*) FROM content_projected_edges", [], |r| r.get(0)).unwrap()
     }
 
     /// Create an unanchored `Concept` (needs no code binding) through the LIVE `create_memory`.
@@ -882,12 +981,12 @@ mod tests {
         let r = create_concept(&conn, "t1").unwrap();
         let n: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM oplog_projected_nodes WHERE node_id = ?1",
+                "SELECT COUNT(*) FROM content_projected_nodes WHERE node_id = ?1",
                 [&r.memory.memory_id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(n, 1, "the created memory is a projected node");
+        assert_eq!(n, 1, "the created memory is a projected /3 node");
         assert_eq!(projected_node_count(&conn), 1);
     }
 
@@ -898,6 +997,7 @@ mod tests {
         crate::index::schema::apply(&conn).unwrap();
         create_concept(&conn, "t1").unwrap();
         assert_eq!(entry_count(&conn), 0, "a scope-less create never touches the log");
+        assert_eq!(local_account_count(&conn), 0, "a scope-less create mints no account");
     }
 
     #[test]
@@ -917,7 +1017,7 @@ mod tests {
         .unwrap();
         let (content_json, status): (String, String) = conn
             .query_row(
-                "SELECT content_json, status FROM oplog_projected_nodes WHERE node_id = ?1",
+                "SELECT content_json, status FROM content_projected_nodes WHERE node_id = ?1",
                 [&id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -933,12 +1033,7 @@ mod tests {
         // The NodeCreate is the sole entry so far.
         assert_eq!(entry_count(&conn), 1);
         crate::query::memory::mark_obsolete(&conn, &id).unwrap();
-        let status: String = conn
-            .query_row("SELECT status FROM oplog_projected_nodes WHERE node_id = ?1", [&id], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(status, "obsolete");
+        assert_eq!(projected_node_status(&conn, &id), "obsolete");
         // A status-only change authors EXACTLY ONE op (a NodeStatus) — NOT a NodeUpdate, which in a
         // synced stream could revert a concurrent content edit (content/status are independent
         // LWW).
@@ -993,13 +1088,11 @@ mod tests {
         // mark_obsolete reconciles first (heals NodeCreate + NodeStatus{active}), THEN authors the
         // obsolete NodeStatus — so it is NOT inert and the node projects obsolete.
         crate::query::memory::mark_obsolete(&conn, "mem_ghost").unwrap();
-        let stream = crate::oplog::owner_stream(REPO).unwrap();
-        let node = projected_state(&conn, stream)
-            .nodes
-            .get(&NodeId::from("mem_ghost"))
-            .cloned()
-            .expect("ghost healed then obsoleted");
-        assert_eq!(node.status, NodeStatus::Obsolete);
+        assert_eq!(
+            projected_node_status(&conn, "mem_ghost"),
+            NodeStatus::Obsolete.as_db_str(),
+            "ghost healed then obsoleted",
+        );
     }
 
     #[test]
@@ -1028,25 +1121,27 @@ mod tests {
             before + 2,
             "the heal's EdgeAdd + remove_edge's own EdgeRemove — not a bare, inert tombstone"
         );
-        let stream = crate::oplog::owner_stream(REPO).unwrap();
-        assert!(
-            projected_state(&conn, stream).edges.is_empty(),
-            "healed then tombstoned → edge absent"
-        );
+        assert_eq!(projected_edge_count(&conn), 0, "healed then tombstoned → edge absent");
     }
 
     #[test]
     fn a_failed_author_rolls_back_the_memory_write() {
         let conn = scoped_conn();
-        // One good create so the owner chain is non-empty (the second create's backfill fast-paths,
-        // isolating the failure to the live author).
+        // One good create so the account + owner stream are established and the first create
+        // stamped the `/3` content projector version (the second create's backfill
+        // fast-paths, isolating the failure to the live author's reproject).
         create_concept(&conn, "first").unwrap();
         let before: i64 =
             conn.query_row("SELECT COUNT(*) FROM repo_memories", [], |r| r.get(0)).unwrap();
-        // Poison: pretend a NEWER projector owns the store — `author_in_tx`'s
-        // `assert_projector_not_newer` now errors, so the second create's op-append fails.
-        conn.execute("UPDATE oplog_meta SET value = '999' WHERE key = 'projector_version'", [])
-            .unwrap();
+        // Poison the `/3` projector guard: pretend a NEWER binary already folded this store's `/3`
+        // projection, so `reproject_accepted_content_stream`'s `assert_content_projector_not_newer`
+        // errors and the second create's `/3` author fails (this doubles as the #664 `/3`
+        // projector-stamp poison test).
+        conn.execute(
+            "UPDATE oplog_meta SET value = '999' WHERE key = 'content_projector_version'",
+            [],
+        )
+        .unwrap();
         assert!(create_concept(&conn, "second").is_err(), "the authoring failure fails the create");
         let after: i64 =
             conn.query_row("SELECT COUNT(*) FROM repo_memories", [], |r| r.get(0)).unwrap();
@@ -1067,7 +1162,7 @@ mod tests {
         );
         let old_present: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM oplog_projected_nodes WHERE node_id = 'old'",
+                "SELECT COUNT(*) FROM content_projected_nodes WHERE node_id = 'old'",
                 [],
                 |r| r.get(0),
             )
@@ -1152,5 +1247,165 @@ mod tests {
             "an idempotent edge re-add authors no duplicate EdgeAdd"
         );
         assert_eq!(projected_edge_count(&conn), 1);
+    }
+
+    // --- owner-bound /2//3 retarget (#664) ---
+
+    #[test]
+    fn a_fresh_repo_first_create_mints_the_account_publishes_ownership_and_projects_the_node() {
+        let conn = scoped_conn();
+        let id = create_concept(&conn, "first").unwrap().memory.memory_id;
+        // The first create on a fresh scoped repo mints exactly one local account and folds exactly
+        // one `/2` StreamOwn effective — the ownership the owner-authored `/3` content accepts
+        // under.
+        assert_eq!(local_account_count(&conn), 1, "the first create mints one local account");
+        assert_eq!(owned_stream_count(&conn), 1, "exactly one /2 StreamOwn folds effective");
+        // And the memory is an accepted, projected `/3` node.
+        assert_eq!(projected_node_count(&conn), 1, "the created memory is a projected /3 node");
+        assert_eq!(projected_node_status(&conn, &id), "active", "a fresh create projects active");
+    }
+
+    #[test]
+    fn a_second_repo_first_create_establishes_its_own_ownership_despite_the_shared_account() {
+        // Multi-repo store, the distinguishing case for the fast-path probe: repo A's create mints
+        // the STORE-GLOBAL account and establishes A's ownership. Repo B is then fresh with ZERO
+        // memories. B's first create must STILL publish B's own `/2` StreamOwn — the account
+        // already being minted is NOT enough. This is why the probe checks
+        // `established_owned_stream_v2` (StreamOwn folded EFFECTIVE) and not merely
+        // "account minted": with the weaker check, B's empty anti-join would early-return,
+        // B would author `/3` content under an unowned stream, and verify-accepted would
+        // roll the create back (Risk trap #1). A single-repo test cannot catch this — there
+        // the account is unminted, so both checks agree.
+        let conn = scoped_conn(); // repo-a: registered + scoped
+        create_concept(&conn, "a1").unwrap();
+        assert_eq!(local_account_count(&conn), 1, "repo-a's create mints the store account");
+        assert_eq!(owned_stream_count(&conn), 1, "repo-a owns its /2 stream");
+
+        // Register a SECOND repo in the same store and scope the connection to it.
+        const REPO_B: &str = "repo-b";
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
+            [REPO_B],
+        )
+        .unwrap();
+        set_scope(&conn, REPO_B);
+
+        // B's first create: the account is already minted, B has no StreamOwn and no memories.
+        let id_b = create_concept(&conn, "b1").unwrap().memory.memory_id;
+        assert_eq!(
+            local_account_count(&conn),
+            1,
+            "the account is store-global — still exactly one"
+        );
+        assert_eq!(
+            owned_stream_count(&conn),
+            2,
+            "repo-b established its OWN /2 StreamOwn rather than riding repo-a's",
+        );
+        assert_eq!(
+            projected_node_status(&conn, &id_b),
+            "active",
+            "b1 accepted under repo-b's freshly-published ownership",
+        );
+    }
+
+    #[test]
+    fn pre_existing_memories_are_adopted_into_v3_and_the_v1_tables_are_left_untouched() {
+        let conn = scoped_conn();
+        // Pre-existing history a pre-#664 binary / raw writer left in the tables (never signed).
+        insert_memory(&conn, "old_a", "active", 100);
+        insert_memory(&conn, "old_b", "obsolete", 200);
+        insert_memory(&conn, "old_c", "active", 300);
+        // One live mutation triggers the reconcile: the three pre-existing rows are authored into
+        // `/3` as the genesis batch, then the new memory is authored live.
+        create_concept(&conn, "trigger").unwrap();
+        for id in ["old_a", "old_b", "old_c"] {
+            let projected: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM content_projected_nodes WHERE node_id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(projected, 1, "pre-existing memory {id} was adopted into /3");
+        }
+        assert_eq!(projected_node_status(&conn, "old_b"), "obsolete", "the adopted status carried");
+        // The retained `/1` tables are UNTOUCHED — the live path no longer writes them (issue J1).
+        let v1_entries: i64 =
+            conn.query_row("SELECT COUNT(*) FROM oplog_entries", [], |r| r.get(0)).unwrap();
+        let v1_nodes: i64 =
+            conn.query_row("SELECT COUNT(*) FROM oplog_projected_nodes", [], |r| r.get(0)).unwrap();
+        assert_eq!(v1_entries, 0, "the /1 entry log is not written by the retargeted live path");
+        assert_eq!(v1_nodes, 0, "the /1 shadow projection is not written by the retarget");
+    }
+
+    #[test]
+    fn racing_backfills_converge_on_one_stream_own_and_no_duplicate_content() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.db");
+        // Setup once: schema, the registered repo, and one pre-existing memory so there is content
+        // for the reconcile to author (the racers must converge on authoring it exactly once).
+        let setup = Connection::open(&path).unwrap();
+        setup.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        crate::index::schema::apply(&setup).unwrap();
+        setup
+            .execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
+                [REPO],
+            )
+            .unwrap();
+        set_scope(&setup, REPO);
+        insert_memory(&setup, "old", "active", 100);
+        drop(setup);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = || {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let conn = Connection::open(path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                set_scope(&conn, REPO);
+                barrier.wait();
+                backfill_memory_oplog(&conn, 9_000).unwrap();
+            })
+        };
+        let a = spawn();
+        let b = spawn();
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(local_account_count(&conn), 1, "the racers converge on one local account");
+        assert_eq!(owned_stream_count(&conn), 1, "exactly one /2 StreamOwn survives the race");
+        assert_eq!(entry_count(&conn), 1, "the pre-existing memory is authored exactly once");
+        let old_nodes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM content_projected_nodes WHERE node_id = 'old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_nodes, 1, "the adopted memory projects exactly once, no duplicate");
+    }
+
+    #[test]
+    fn an_oversized_memory_body_fails_the_reconcile_loudly_and_surfaces_the_repo() {
+        // Fail-loud posture (#664): a raw/adversarial memory body over the §18a 256 KiB envelope
+        // cap makes the `/3` author bail rather than drop irreplaceable data, and the
+        // reconcile surfaces the failure (naming the repo) instead of silently skipping it.
+        // A normal rag-rat memory (body ≤ 8 KiB) can never reach this; it is an
+        // adversarial/raw-writer backstop.
+        let conn = scoped_conn();
+        let oversized = "x".repeat(300 * 1024); // > 256 KiB ⇒ the signed envelope exceeds the cap
+        insert_memory_with_body(&conn, "mem_big", &oversized);
+        let err = backfill_memory_oplog(&conn, 1_000).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(REPO),
+            "the fail-loud error surfaces the reconcile failure for the repo, not a silent skip",
+        );
+        assert_eq!(entry_count(&conn), 0, "the oversized batch rolled back — no /3 content stored");
     }
 }

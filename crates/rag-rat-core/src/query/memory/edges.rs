@@ -307,12 +307,12 @@ pub(crate) fn edge_by_key(conn: &Connection, edge_key: &str) -> anyhow::Result<O
         .map_err(Into::into)
 }
 
-/// The repo's node-edges with NO projected edge on `stream` — the `EdgeAdd`s the signed log is
-/// MISSING — in `edge_key` order. Run through [`reresolve_on_read`] so a node target's
-/// `target_repo_id` is repaired to CURRENT before the reconcile signs it (the stored column is
-/// only an add-time snapshot; a signed op cannot be corrected later — see decision 5 of #541).
-/// Scope-INDEPENDENT: filters on the explicit `repo_id`, and re-resolution is a global by-node-id
-/// lookup, so consolidation's unscoped connection may call it directly. The reconcile
+/// The repo's node-edges with NO projected edge on `stream` in the accepted-`/3` projection — the
+/// `EdgeAdd`s the signed log is MISSING — in `edge_key` order. Run through [`reresolve_on_read`] so
+/// a node target's `target_repo_id` is repaired to CURRENT before the reconcile signs it (the
+/// stored column is only an add-time snapshot; a signed op cannot be corrected later — see decision
+/// 5 of #541). Scope-INDEPENDENT: filters on the explicit `repo_id`, and re-resolution is a global
+/// by-node-id lookup, so consolidation's unscoped connection may call it directly. The reconcile
 /// (`authoring::sync_owner_stream`) authors what this returns.
 pub(crate) fn unauthored_edges(
     conn: &Connection,
@@ -323,7 +323,7 @@ pub(crate) fn unauthored_edges(
         "{EDGE_SELECT} e
          WHERE e.repo_id = ?1
            AND NOT EXISTS (
-                 SELECT 1 FROM oplog_projected_edges p
+                 SELECT 1 FROM content_projected_edges p
                  WHERE p.stream_id = ?2 AND p.edge_key = e.edge_key)
          ORDER BY e.edge_key"
     ))?;
@@ -531,12 +531,12 @@ mod tests {
         assert!(EdgeRelation::from_db_str("bogus").is_err(), "an unknown token must not resolve");
     }
 
-    /// #541: the reconcile's edge reader anti-joins `repo_node_edges` against
-    /// `oplog_projected_edges` and re-resolves what it returns. Proves BOTH halves of the
-    /// correctness crux: (a) only the edge absent from the projection comes back, and (b) its
-    /// `target_repo_id` — deliberately stale on the stored row, simulating an add-time snapshot
-    /// left behind by a repo-id re-point — is repaired to the CURRENT owner before it would be
-    /// signed.
+    /// #541/#664: the reconcile's edge reader anti-joins `repo_node_edges` against the accepted-`/3`
+    /// projection `content_projected_edges` and re-resolves what it returns. Proves BOTH halves of
+    /// the correctness crux: (a) only the edge absent from the projection comes back, and (b)
+    /// its `target_repo_id` — deliberately stale on the stored row, simulating an add-time
+    /// snapshot left behind by a repo-id re-point — is repaired to the CURRENT owner before it
+    /// would be signed.
     #[test]
     fn unauthored_edges_returns_only_edges_absent_from_the_projection_reresolved() {
         let conn = scoped_conn();
@@ -546,10 +546,12 @@ mod tests {
         let authored_key = insert_raw_node_edge(&conn, "mem_a", "relates_to", "mem_b");
         let ghost_key = insert_raw_node_edge(&conn, "mem_a", "depends_on", "mem_c");
 
-        let stream = crate::oplog::owner_stream(REPO).unwrap();
-        // Seed the projection with the `relates_to` edge only — it is already authored.
+        // `stream` is an opaque `StreamId` here — the anti-join only needs seed/query agreement.
+        let stream = StreamId::from_bytes([0x11; 32]);
+        // Seed the accepted-`/3` projection with the `relates_to` edge only — it is already
+        // authored.
         conn.execute(
-            "INSERT INTO oplog_projected_edges(stream_id, edge_key, spec_json, resolved_json)
+            "INSERT INTO content_projected_edges(stream_id, edge_key, spec_json, resolved_json)
              VALUES (?1, ?2, '{}', NULL)",
             params![stream.to_bytes().as_slice(), authored_key],
         )

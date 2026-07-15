@@ -2139,38 +2139,48 @@ mod tests {
     }
 
     /// Before #541 Task 5, consolidation's import never touched the op-log: the imported rows
-    /// landed in `repo_memories`/`repo_node_edges` but the per-CHAIN backfill gate saw the target's
-    /// owner stream was already non-empty (this test's seed rooted it) and skipped authoring them
-    /// entirely — a later `mark_obsolete` on such a row would author an inert `NodeStatus` with no
-    /// `NodeCreate` behind it. This test proves the reconcile call `run` now makes closes that gap:
-    /// an imported memory is present in the target's projection, and a follow-up `mark_obsolete` is
-    /// NOT inert.
+    /// landed in `repo_memories`/`repo_node_edges` but were skipped by the reconcile — a later
+    /// `mark_obsolete` on such a row would author an inert `NodeStatus` with no `NodeCreate` behind
+    /// it. This test proves the reconcile call `run` now makes closes that gap on the owner-bound
+    /// `/2`//3 substrate (#664): an imported memory is present in the target's accepted-`/3`
+    /// projection, and a follow-up `mark_obsolete` is NOT inert.
     #[test]
     fn consolidation_authors_imported_memories_into_target_owner_stream() {
         let source = seeded_source();
         let target = seeded_target_with_rooted_chain();
 
-        // PREMISE SELF-CHECK: the seed must have rooted a non-empty local chain for `global-repo`,
-        // or this test silently degrades to the (already-covered) genesis path and stops exercising
-        // the per-chain-gate bypass #541 fixes.
-        let device = crate::oplog::local_device(&target, 0).unwrap();
-        let stream = crate::oplog::owner_stream("global-repo").unwrap();
+        // The count of a projected node in the accepted-`/3` projection (a test target holds one
+        // repo/stream, so no stream filter is needed).
+        let projected_m1 = |target: &rusqlite::Connection| -> i64 {
+            target
+                .query_row(
+                    "SELECT COUNT(*) FROM content_projected_nodes WHERE node_id = 'm1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        // PREMISE SELF-CHECK: the seed's real `create_memory` must have rooted a non-empty `/3`
+        // content chain for `global-repo`, or this test silently degrades to the (already-covered)
+        // genesis path and stops exercising the per-node reconcile bypass #541 fixes.
+        let content_entries: i64 =
+            target.query_row("SELECT COUNT(*) FROM content_entries", [], |r| r.get(0)).unwrap();
         assert!(
-            crate::oplog::chain_tail(&target, stream, device.fingerprint()).unwrap().is_some(),
-            "the seed must root a non-empty owner chain, or this test degrades to the genesis path"
+            content_entries > 0,
+            "the seed must root a non-empty /3 content chain, or this test degrades to genesis"
         );
 
         // The import itself does NOT touch the op-log (it predates #541's reconcile call) — only
         // `repo_memories`/`repo_node_edges` gain the imported rows.
         let counts = import_from_source(&source, &target, "global-repo").unwrap();
         assert_eq!(counts.memories, 3, "sanity: the import still carries all 3 source memories");
-        assert!(
-            !crate::oplog::load_projection(&target, stream)
-                .unwrap()
-                .nodes
-                .contains_key(&crate::oplog::NodeId::from("m1")),
-            "pre-reconcile: the imported memory m1 must NOT yet be projected (the per-chain gate \
-             skipped it, the bug #541 fixes) — only the seed memory should be projected here"
+        assert_eq!(
+            projected_m1(&target),
+            0,
+            "pre-reconcile: the imported memory m1 must NOT yet be projected (the per-node \
+             anti-join skipped it, the bug #541 fixes) — only the seed memory should be projected \
+             here"
         );
 
         // The call this task wires into `run`, immediately after `import_from_source` and before
@@ -2182,25 +2192,21 @@ mod tests {
         )
         .unwrap();
 
-        // An imported memory is now present in the target owner stream's projection.
-        let projected = crate::oplog::load_projection(&target, stream).unwrap();
-        assert!(
-            projected.nodes.contains_key(&crate::oplog::NodeId::from("m1")),
-            "the imported memory m1 must be present in the target owner stream's projection"
+        // An imported memory is now present in the target owner stream's accepted-`/3` projection.
+        assert_eq!(
+            projected_m1(&target),
+            1,
+            "the imported memory m1 must be present in the target owner stream's /3 projection"
         );
 
         // A follow-up `mark_obsolete` on the imported memory is NOT inert: it flips the projected
         // status (which requires the `NodeCreate` the reconcile just authored).
         crate::query::memory::mark_obsolete(&target, "m1").unwrap();
-        let projected = crate::oplog::load_projection(&target, stream).unwrap();
-        let node = projected
-            .nodes
-            .get(&crate::oplog::NodeId::from("m1"))
+        let status: String = target
+            .query_row("SELECT status FROM content_projected_nodes WHERE node_id = 'm1'", [], |r| {
+                r.get(0)
+            })
             .expect("m1 must still be projected after mark_obsolete");
-        assert_eq!(
-            node.status,
-            crate::oplog::NodeStatus::Obsolete,
-            "mark_obsolete on an imported memory must not be inert"
-        );
+        assert_eq!(status, "obsolete", "mark_obsolete on an imported memory must not be inert");
     }
 }

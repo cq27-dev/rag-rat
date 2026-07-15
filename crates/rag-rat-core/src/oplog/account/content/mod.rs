@@ -15,11 +15,9 @@ pub(crate) use acceptance::{
     ContentParkReason, ContentRejectReason, SubjectAuthorityHold, UnknownAncestry,
     evaluate_content_acceptance,
 };
-#[allow(
-    unused_imports,
-    reason = "C3.4b-i content-author seam is frozen before its caller lands"
-)]
-pub(crate) use author::author_content_batch_in_tx;
+// The in-tx `/3` local-authoring seam + its genesis-detection reader (C3.4b-i, #663): live
+// callers in `query::memory` land with #664, so these are plain (un-frozen) re-exports.
+pub(crate) use author::{author_content_batch_in_tx, content_stream_is_empty};
 pub(in crate::oplog) use envelope::{
     ContentEntryHeader, SignedContentEntry, VerifiedContentEntry, decode_content_signed,
     sign_content_entry, verify_content_signed,

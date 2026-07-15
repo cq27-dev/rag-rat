@@ -28,7 +28,7 @@
 //! minting from the plain candidate tail (below) is the accepted tail.
 
 use anyhow::Context;
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::super::bootstrap::{self, LocalAccountRef};
 use super::super::{AccountId, storage as account_storage};
@@ -138,6 +138,24 @@ pub(crate) fn author_content_batch_in_tx(
     content_projection::reproject_accepted_content_stream(tx, stream_id)?;
 
     Ok(authored)
+}
+
+/// Whether the `/2` stream's `/3` content chain is EMPTY — no `content_entries` row on it at all.
+/// Under the single local writer the store's own account+device are the only chain on the stream,
+/// so "no rows for this stream" is the whole chain: the genesis case where the memory reconcile
+/// elides a create-time `active` status (a fresh chain holds no stale status register to override).
+/// A pure read opening no transaction, so it is safe inside the caller's IMMEDIATE txn (a
+/// `&Transaction` derefs to `&Connection`).
+pub(crate) fn content_stream_is_empty(
+    conn: &Connection,
+    stream_id: StreamId,
+) -> anyhow::Result<bool> {
+    let has_row: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM content_entries WHERE stream_id = ?1)",
+        params![stream_id.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    Ok(!has_row)
 }
 
 /// The `(stream, author, device)` chain's highest-`seq` `/3` candidate, or `None` for an empty
