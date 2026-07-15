@@ -222,7 +222,7 @@ impl IndexDatabase {
     /// optimized away) — and rebuild the mirrors whose probe returns SQLITE_CORRUPT. Returns the
     /// rebuilt table names. The broad prefix disjunction matches essentially any text corpus; an
     /// empty mirror matches nothing and probes clean, which is right (nothing ranks it).
-    pub(crate) fn heal_fts_if_corrupt(&self) -> anyhow::Result<Vec<String>> {
+    pub(crate) fn heal_fts_if_corrupt(&self) -> anyhow::Result<FtsHealOutcome> {
         // Every a-z/0-9 prefix: any token leading with an ASCII alphanumeric matches, so the
         // ranked probe reads docsize for essentially every row a real query could rank. (A corpus
         // of exclusively non-ASCII-leading tokens would evade it; the query-layer retry still
@@ -241,14 +241,14 @@ impl IndexDatabase {
                 },
             }
         };
-        let mut healed = Vec::new();
+        let mut outcome = FtsHealOutcome::default();
         // chunk_fts and commit_fts share one recovery (`rebuild_fts` repopulates both).
         let chunk_corrupt = probe_corrupt("chunk_fts")?;
         let commit_corrupt = probe_corrupt("commit_fts")?;
         let memory_corrupt = probe_corrupt("repo_memory_fts")?;
         let papertrail_corrupt = probe_corrupt("papertrail_fts")?;
         if !(chunk_corrupt || commit_corrupt || memory_corrupt || papertrail_corrupt) {
-            return Ok(healed);
+            return Ok(outcome);
         }
         // Same database-wide fence as `heal_corrupt_fts`: the rebuilds are global and
         // multi-statement, and per-repo flocks cannot serialize a consolidated DB's siblings.
@@ -256,23 +256,36 @@ impl IndexDatabase {
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         // Same staged-rows refusal as `heal_corrupt_fts` — the memory/papertrail heals below are
         // unaffected (their sources are always complete).
-        if (chunk_corrupt || commit_corrupt) && !self.staged_files_generation_exists()? {
-            // The shared rebuild repopulates BOTH mirrors regardless of which probe failed —
-            // report both, so the heal report states what was actually rebuilt.
-            self.rebuild_fts()?;
-            healed.push("chunk_fts".to_string());
-            healed.push("commit_fts".to_string());
+        if chunk_corrupt || commit_corrupt {
+            if self.staged_files_generation_exists()? {
+                // A silent skip here would let the report read healthy while ranked queries
+                // still fail — surface the deferral so the caller reruns after the staged
+                // rebuild completes.
+                for (corrupt, table) in
+                    [(chunk_corrupt, "chunk_fts"), (commit_corrupt, "commit_fts")]
+                {
+                    if corrupt {
+                        outcome.deferred.push(table.to_string());
+                    }
+                }
+            } else {
+                // The shared rebuild repopulates BOTH mirrors regardless of which probe failed
+                // — report both, so the heal report states what was actually rebuilt.
+                self.rebuild_fts()?;
+                outcome.healed.push("chunk_fts".to_string());
+                outcome.healed.push("commit_fts".to_string());
+            }
         }
         if memory_corrupt {
             crate::query::memory::heal_repo_memory_fts(conn)?;
-            healed.push("repo_memory_fts".to_string());
+            outcome.healed.push("repo_memory_fts".to_string());
         }
         if papertrail_corrupt {
             crate::index::papertrail::rebuild_fts(conn)?;
-            healed.push("papertrail_fts".to_string());
+            outcome.healed.push("papertrail_fts".to_string());
         }
         fence.commit()?;
-        Ok(healed)
+        Ok(outcome)
     }
 }
 
@@ -294,6 +307,14 @@ pub(crate) fn fenced_when_autocommit(
     op()?;
     fence.commit()?;
     Ok(())
+}
+
+/// What one FTS corruption sweep did: the mirrors rebuilt, and the corrupt mirrors whose
+/// repair had to wait for an in-flight generation-staged rebuild (#582).
+#[derive(Debug, Default)]
+pub(crate) struct FtsHealOutcome {
+    pub(crate) healed: Vec<String>,
+    pub(crate) deferred: Vec<String>,
 }
 
 /// #582: whether `err`'s chain contains SQLITE_CORRUPT — the FTS5 shadow-table variant surfaces

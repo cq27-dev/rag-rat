@@ -24,8 +24,15 @@ impl IndexDatabase {
         // #582 review: the verify/compact passes rank chunk_fts (evidence-pack probes) MID-RUN,
         // after model side effects — a blanket retry would replay them. PRE-FLIGHT the
         // probe-and-heal instead so the run starts on healthy mirrors; on a clean index the
-        // probe is four ranked LIMIT-1 reads.
-        self.heal_fts_if_corrupt()?;
+        // probe is four ranked LIMIT-1 reads. A DEFERRED repair (staged rebuild in flight) must
+        // postpone the run: proceeding would pay the model/provisioning side effects only to
+        // hit the same corruption mid-pass — the exact failure this preflight exists to prevent.
+        let preflight = self.heal_fts_if_corrupt()?;
+        anyhow::ensure!(
+            preflight.deferred.is_empty(),
+            "dream postponed: FTS mirrors {:?} are corrupt and their repair is deferred behind              an in-flight staged rebuild; rerun once it completes (or after gc sweeps an              abandoned staging)",
+            preflight.deferred
+        );
         crate::dream::dream_run_with_passes(
             self.storage.connection(),
             opts,

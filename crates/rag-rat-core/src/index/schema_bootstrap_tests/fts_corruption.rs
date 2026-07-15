@@ -235,5 +235,11 @@ fn heal_refuses_while_staged_chunk_fts_rows_are_not_rederivable() {
         .unwrap();
     assert_eq!(fts_rows_before, fts_rows_after, "the staged fts rows were NOT deleted");
 
+    // The explicit heal surfaces the SAME window as a deferral, never as health: a silent skip
+    // would let heal_index report a clean index while ranked queries still fail.
+    let outcome = db.heal_fts_if_corrupt().unwrap();
+    assert!(outcome.healed.is_empty(), "{:?}", outcome.healed);
+    assert_eq!(outcome.deferred, vec!["chunk_fts".to_string()]);
+
     let _ = fs::remove_dir_all(&root);
 }

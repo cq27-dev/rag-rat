@@ -437,7 +437,11 @@ row names its `tracker` (`github`), `project` (`owner/repo`), `item_kind` (`issu
 and each binding's authentication and native synchronization capability.
 `papertrail_sync_status` returns that cache section directly. `heal_index` repairs or removes
 already-indexed files whose current source no longer matches the stored SQLite index, then refreshes
-SQLite FTS. It does not discover brand-new files; run `rag-rat index` for discovery.
+SQLite FTS. It also probes every FTS mirror with a ranked query — the only read that decodes the
+docsize shadow, whose corruption every ordinary integrity check misses — and rebuilds corrupt
+mirrors from their durable sources, reporting them in `fts_healed` (or `fts_deferred` when a
+staged rebuild in flight makes the repair unsafe — rerun once it completes). It does not discover
+brand-new files; run `rag-rat index` for discovery.
 
 Embedding artifacts are explicit and current-only. `llm_status` reports embedding model state,
 artifact counts, FastEmbed build/cache/model details, and the last reconcile throughput summary when

@@ -257,6 +257,11 @@ pub struct HealIndexReport {
     /// Ranked because only rank/bm25 decodes docsize — the corruption class both
     /// `PRAGMA integrity_check` and FTS5's own `'integrity-check'` miss.
     pub fts_healed: Vec<String>,
+    /// Mirrors whose probe hit corruption but whose repair was DEFERRED: a generation-staged
+    /// rebuild is in flight, and 'delete-all' + re-derive would drop its not-yet-durable rows.
+    /// Non-empty means ranked queries on these mirrors still fail — rerun `heal_index` once the
+    /// rebuild completes (or after gc sweeps an abandoned staging).
+    pub fts_deferred: Vec<String>,
     pub message: Option<String>,
 }
 
