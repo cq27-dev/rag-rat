@@ -1269,15 +1269,15 @@ mod tests {
     fn a_malformed_probe_payload_fails_instead_of_reading_as_quiet() {
         let (base, _handle) = spawn_script_stub(vec![StubResponse::ok("{}")]);
         let registry = GovernorRegistry::default();
-        let client = client(base, &registry);
+        let non_array = client(base, &registry);
         let error =
-            block_on(client.freshness_probe("g/s/r", &FreshnessProbe::default())).unwrap_err();
+            block_on(non_array.freshness_probe("g/s/r", &FreshnessProbe::default())).unwrap_err();
         assert!(error.to_string().contains("probe response is not an array"), "{error:#}");
 
         let (base, _handle) =
             spawn_script_stub(vec![StubResponse::ok(r#"[{"iid":1,"state":"opened"}]"#)]);
         let registry = GovernorRegistry::default();
-        let stampless = self::tests::client(base, &registry);
+        let stampless = client(base, &registry);
         let error =
             block_on(stampless.freshness_probe("g/s/r", &FreshnessProbe::default())).unwrap_err();
         assert!(error.to_string().contains("no valid updated_at"), "{error:#}");
