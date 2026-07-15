@@ -228,30 +228,13 @@ impl IndexDatabase {
     /// rebuilt table names. The broad prefix disjunction matches essentially any text corpus; an
     /// empty mirror matches nothing and probes clean, which is right (nothing ranks it).
     pub fn heal_fts_if_corrupt(&self) -> anyhow::Result<FtsHealOutcome> {
-        // Every a-z/0-9 prefix: any token leading with an ASCII alphanumeric matches, so the
-        // ranked probe reads docsize for essentially every row a real query could rank. (A corpus
-        // of exclusively non-ASCII-leading tokens would evade it; the query-layer retry still
-        // covers those.)
-        let probe_query =
-            ('a'..='z').chain('0'..='9').map(|c| format!("{c}*")).collect::<Vec<_>>().join(" OR ");
         let conn = self.storage.connection();
-        let probe_corrupt = |table: &str| -> anyhow::Result<bool> {
-            let sql =
-                format!("SELECT rowid FROM {table} WHERE {table} MATCH ?1 ORDER BY rank LIMIT 1");
-            match conn.query_row(&sql, [probe_query.as_str()], |_| Ok(())) {
-                Ok(()) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-                Err(err) => {
-                    let err: anyhow::Error = err.into();
-                    if error_is_fts_corruption(&err) { Ok(true) } else { Err(err) }
-                },
-            }
-        };
         let mut outcome = FtsHealOutcome::default();
         // chunk_fts and commit_fts share one recovery (`rebuild_fts` repopulates both).
-        let chunk_corrupt = probe_corrupt("chunk_fts")?;
-        let commit_corrupt = probe_corrupt("commit_fts")?;
-        let memory_corrupt = probe_corrupt("repo_memory_fts")?;
-        let papertrail_corrupt = probe_corrupt("papertrail_fts")?;
+        let chunk_corrupt = ranked_probe_is_corrupt(conn, "chunk_fts")?;
+        let commit_corrupt = ranked_probe_is_corrupt(conn, "commit_fts")?;
+        let memory_corrupt = ranked_probe_is_corrupt(conn, "repo_memory_fts")?;
+        let papertrail_corrupt = ranked_probe_is_corrupt(conn, "papertrail_fts")?;
         if !(chunk_corrupt || commit_corrupt || memory_corrupt || papertrail_corrupt) {
             return Ok(outcome);
         }
@@ -314,6 +297,44 @@ pub(crate) fn fenced_when_autocommit(
     op()?;
     fence.commit()?;
     Ok(())
+}
+
+/// Probe one FTS mirror for the docsize corruption class with a query that EXECUTES rank — only
+/// rank/bm25 decodes docsize, which both `PRAGMA integrity_check` and FTS5's own
+/// `'integrity-check'` miss. The probe term is a REAL term pulled from the mirror's own
+/// `fts5vocab`, so the ranked read matches at least one indexed row regardless of the corpus
+/// alphabet (an ASCII-prefix disjunction goes blind on a corpus of non-ASCII-leading tokens —
+/// review finding on #675). An empty mirror has no terms and probes clean, which is right
+/// (nothing ranks it); a vocab read that itself hits corruption counts as corrupt.
+fn ranked_probe_is_corrupt(conn: &rusqlite::Connection, table: &str) -> anyhow::Result<bool> {
+    let vocab = format!("probe_vocab_{table}");
+    let map_corrupt = |err: rusqlite::Error| -> anyhow::Result<bool> {
+        let err: anyhow::Error = err.into();
+        if error_is_fts_corruption(&err) { Ok(true) } else { Err(err) }
+    };
+    if let Err(err) = conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.{vocab} USING fts5vocab(main, '{table}', 'row')"
+    )) {
+        return map_corrupt(err);
+    }
+    let term = conn
+        .query_row(&format!("SELECT term FROM temp.{vocab} LIMIT 1"), [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional();
+    let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS temp.{vocab}"));
+    let term = match term {
+        Ok(Some(term)) => term,
+        Ok(None) => return Ok(false),
+        Err(err) => return map_corrupt(err),
+    };
+    // Exact-phrase match on the sampled term; internal quotes double per FTS5 phrase syntax.
+    let phrase = format!("\"{}\"", term.replace('"', "\"\""));
+    let sql = format!("SELECT rowid FROM {table} WHERE {table} MATCH ?1 ORDER BY rank LIMIT 1");
+    match conn.query_row(&sql, [phrase.as_str()], |_| Ok(())) {
+        Ok(()) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(err) => map_corrupt(err),
+    }
 }
 
 /// What one FTS corruption sweep did: the mirrors rebuilt, and the corrupt mirrors whose
@@ -430,6 +451,36 @@ mod corruption_tests {
         );
         assert!(error_is_fts_corruption(&result.unwrap_err()));
         assert_eq!(calls, 2, "exactly one retry, no loop");
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn the_ranked_probe_sees_docsize_corruption_on_a_non_ascii_corpus() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE probe_t USING fts5(body, content='', contentless_delete=1);
+             INSERT INTO probe_t(rowid, body) VALUES (1, '\u{7d22}\u{5f15} \u{640d}\u{58ca} \
+             \u{691c}\u{67fb}');",
+        )
+        .unwrap();
+        assert!(!ranked_probe_is_corrupt(&conn, "probe_t").unwrap(), "intact mirror probes clean");
+        conn.execute_batch("DELETE FROM probe_t_docsize").unwrap();
+        assert!(
+            ranked_probe_is_corrupt(&conn, "probe_t").unwrap(),
+            "a real vocab term ranks the corpus regardless of alphabet — an ASCII-prefix probe \
+             reports this corrupt mirror healthy"
+        );
+    }
+
+    #[test]
+    fn an_empty_mirror_probes_clean() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE probe_t USING fts5(body, content='')").unwrap();
+        assert!(!ranked_probe_is_corrupt(&conn, "probe_t").unwrap());
     }
 }
 
