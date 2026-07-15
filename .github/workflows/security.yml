@@ -1,0 +1,72 @@
+name: Supply chain
+
+# Two complementary supply-chain gates:
+#   cargo-deny  — advisories + licenses + bans + sources, config in deny.toml
+#   cargo-audit — the canonical RustSec vulnerability scan over Cargo.lock
+# They overlap on advisories by design (belt and suspenders); cargo-deny additionally enforces the
+# license allow-list and source/registry policy, while cargo-audit is the reference RustSec tool.
+#
+# On PR/push these only need to run when the dependency set or policy changes, so they are
+# path-filtered. The scheduled run has no such filter: it catches advisories newly published against
+# dependencies that did not otherwise change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      # All files cargo-deny loads as policy: deny.toml plus the optional exception files it also
+      # reads (deny.exceptions.toml, .deny.exceptions.toml, .cargo/deny.exceptions.toml). We do not
+      # ship exception files today, but if one is added it must trip this gate on the PR that adds it.
+      - 'deny.toml'
+      - 'deny.exceptions.toml'
+      - '.deny.exceptions.toml'
+      - '.cargo/deny.exceptions.toml'
+      - '.github/workflows/security.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      # All files cargo-deny loads as policy: deny.toml plus the optional exception files it also
+      # reads (deny.exceptions.toml, .deny.exceptions.toml, .cargo/deny.exceptions.toml). We do not
+      # ship exception files today, but if one is added it must trip this gate on the PR that adds it.
+      - 'deny.toml'
+      - 'deny.exceptions.toml'
+      - '.deny.exceptions.toml'
+      - '.cargo/deny.exceptions.toml'
+      - '.github/workflows/security.yml'
+  schedule:
+    # Daily at 07:13 UTC — new RustSec advisories land against an unchanged Cargo.lock.
+    - cron: '13 7 * * *'
+  workflow_dispatch:
+
+# Least privilege: these jobs only read the repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@cargo-deny
+      # Runs all four checks (advisories, bans, licenses, sources) per deny.toml.
+      - run: cargo deny check
+
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@cargo-audit
+      # Fails only on vulnerabilities; unmaintained/unsound advisories surface as warnings.
+      - run: cargo audit

@@ -1,0 +1,77 @@
+# cargo-deny configuration — supply-chain gate for the rag-rat workspace.
+#
+# Checks (see `.github/workflows/security.yml`):
+#   advisories — RustSec vulnerabilities / unsound / unmaintained against Cargo.lock
+#   licenses   — every crate in the graph resolves to a license on the allow list below
+#   bans       — no wildcard version requirements; duplicate versions are surfaced (warn)
+#   sources    — crates come only from crates.io (no unknown registries or git deps)
+#
+# Run locally with: cargo deny check
+# Lint levels: deny = error/fail, warn = surfaced but non-fatal, allow = silent.
+
+[graph]
+# Check every target triple (no `targets` filter): a platform-specific dependency can carry a
+# platform-specific advisory, and we would rather see all of them than narrow to one host.
+# `all-features` pulls every optional/feature-gated crate into the graph so cargo-deny sees the same
+# full dependency set `cargo audit` reads from Cargo.lock (e.g. quinn-proto, gated behind a feature).
+all-features = true
+
+[advisories]
+version = 2
+# `unsound` and `unmaintained` are advisory SCOPES (all/workspace/transitive/none), not lint levels.
+# unsound = "all": fail on an unsound advisory anywhere in the graph, transitive included — the
+# default "workspace" scope would let a transitive unsound advisory stay green. Vulnerabilities
+# always fail in the version-2 format; there is no `vulnerability` scope to set.
+unsound = "all"
+# unmaintained = "workspace": fail only on unmaintained crates the workspace depends on DIRECTLY
+# (actionable). Transitive unmaintained crates — which we cannot upgrade away — are surfaced by
+# `cargo audit` on the scheduled run but do not break CI. This deliberately avoids per-advisory
+# `ignore` entries, whose narrow rationale (e.g. "dev-only") silently goes stale if the crate later
+# becomes reachable from a runtime dependency and the global ignore keeps suppressing it.
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+# Confidence required when matching a crate's license text to an SPDX id. 0.8 is the cargo-deny
+# default and tolerates the minor header reformatting some crates ship.
+confidence-threshold = 0.8
+# Check dev- and build-dependencies too, not just the crates that ship in the binary — the gate is
+# meant to cover every crate in the graph, and cargo-deny excludes both of these by default.
+include-dev = true
+include-build = true
+# Every license below is either the sole license of at least one crate in the tree, or the branch a
+# dual-/multi-licensed crate resolves to. All are OSI-permissive or public-domain-equivalent. No
+# strong-copyleft (GPL/AGPL/LGPL) license is accepted — the LGPL-tagged crates in the tree (r-efi)
+# are `MIT OR Apache-2.0 OR LGPL` and resolve to MIT. MPL-2.0 is handled as a scoped exception below.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "BlueOak-1.0.0",
+]
+
+# MPL-2.0 is weak, file-level copyleft. It is accepted for exactly one crate — option-ext (a
+# transitive dep via dirs) — as a scoped exception rather than a workspace-wide allow, so a future
+# MPL-licensed dependency is forced through review instead of satisfying the gate silently.
+[[licenses.exceptions]]
+crate = "option-ext"
+allow = ["MPL-2.0"]
+
+[bans]
+# The tree carries several duplicate major versions (windows-sys, hashbrown, thiserror, tokenizers,
+# ureq, …) that we do not control from here; surface them without failing CI.
+multiple-versions = "warn"
+# A `version = "*"` requirement in one of our own manifests is a supply-chain footgun — deny it.
+wildcards = "deny"
+
+[sources]
+# crates.io only. An unknown registry or a git dependency must be a deliberate, reviewed choice.
+unknown-registry = "deny"
+unknown-git = "deny"
