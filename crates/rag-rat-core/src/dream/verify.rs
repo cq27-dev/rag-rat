@@ -1414,7 +1414,7 @@ mod tests {
         )
         .unwrap();
         let chunk_id = c.last_insert_rowid();
-        crate::index::chunk_text_store::seed_chunk_text(c, chunk_id, text).unwrap();
+        rag_rat_db::chunk_text_store::seed_chunk_text(c, chunk_id, text).unwrap();
         // Mirror production: the chunk is FTS-searchable, so `resolve_identifier`'s verbatim-text
         // tier can narrow to it (`seed_chunk_text` alone populates only `chunk_text`).
         c.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", rusqlite::params![

@@ -999,7 +999,7 @@ mod tests {
         // chunks.text is gone (#77 Phase 2): seed the compressed chunk_text blob (readers INNER
         // JOIN it) and the contentless chunk_fts tokens directly, keeping this seed
         // self-contained.
-        crate::index::chunk_text_store::seed_chunk_text(&conn, chunk_id, text).unwrap();
+        rag_rat_db::chunk_text_store::seed_chunk_text(&conn, chunk_id, text).unwrap();
         conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", params![chunk_id, text])
             .unwrap();
         conn
@@ -1182,7 +1182,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        crate::index::chunk_text_store::seed_chunk_text(conn, chunk_id, text).unwrap();
+        rag_rat_db::chunk_text_store::seed_chunk_text(conn, chunk_id, text).unwrap();
         conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", params![chunk_id, text])
             .unwrap();
         chunk_id
@@ -1649,7 +1649,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        crate::index::chunk_text_store::seed_chunk_text(&conn, chunk_id, text).unwrap();
+        rag_rat_db::chunk_text_store::seed_chunk_text(&conn, chunk_id, text).unwrap();
         conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", params![chunk_id, text])
             .unwrap();
 

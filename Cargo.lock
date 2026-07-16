@@ -3564,6 +3564,7 @@ dependencies = [
  "rag-rat-db",
  "rag-rat-llm",
  "rag-rat-mcp",
+ "rag-rat-oracle",
  "rag-rat-papertrail",
  "ratatui",
  "rusqlite",
@@ -3642,6 +3643,7 @@ dependencies = [
  "rag-rat-clones",
  "rag-rat-db",
  "rag-rat-llm",
+ "rag-rat-oracle",
  "rag-rat-papertrail",
  "rayon",
  "regex",
@@ -3719,6 +3721,7 @@ dependencies = [
  "rag-rat-base",
  "rag-rat-core",
  "rag-rat-db",
+ "rag-rat-oracle",
  "rag-rat-papertrail",
  "rmcp",
  "rusqlite",
@@ -3727,6 +3730,24 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rag-rat-oracle"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "protobuf",
+ "rag-rat-base",
+ "rag-rat-clones",
+ "rag-rat-db",
+ "rusqlite",
+ "scip",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "strum",
+ "toml",
 ]
 
 [[package]]

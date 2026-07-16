@@ -12,7 +12,6 @@ pub(crate) use handlers::*;
 use rag_rat_base::config::{Config, MemorySurface};
 use rag_rat_base::language::Language;
 use rag_rat_core::IndexDatabase;
-use rag_rat_core::index::oracle::LibraryUsageOptions;
 use rag_rat_core::query::clusters::RepoClustersOptions;
 use rag_rat_core::query::graph::{GraphResolutionMode, GraphTraversalOptions};
 use rag_rat_core::query::graph_meta::GraphMetaMode;
@@ -21,6 +20,7 @@ use rag_rat_core::query::memory::{RepoMemoryBindTarget, RepoMemoryCreate, RepoMe
 use rag_rat_core::query::repo_brief::{RepoBriefMode, RepoBriefOptions};
 use rag_rat_core::query::symbol::SymbolSelector;
 use rag_rat_core::search::lexical::SearchOptions;
+use rag_rat_oracle::LibraryUsageOptions;
 pub use requests::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

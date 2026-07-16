@@ -582,14 +582,13 @@ pub(crate) enum OracleToolArg {
 }
 
 impl OracleToolArg {
-    pub(crate) fn core(self) -> rag_rat_core::index::oracle::OracleTool {
+    pub(crate) fn core(self) -> rag_rat_oracle::OracleTool {
         match self {
-            OracleToolArg::RustAnalyzer => rag_rat_core::index::oracle::OracleTool::RustAnalyzer,
-            OracleToolArg::ScipClang => rag_rat_core::index::oracle::OracleTool::ScipClang,
-            OracleToolArg::ScipPython => rag_rat_core::index::oracle::OracleTool::ScipPython,
-            OracleToolArg::ScipTypescript =>
-                rag_rat_core::index::oracle::OracleTool::ScipTypescript,
-            OracleToolArg::ScipJava => rag_rat_core::index::oracle::OracleTool::ScipJava,
+            OracleToolArg::RustAnalyzer => rag_rat_oracle::OracleTool::RustAnalyzer,
+            OracleToolArg::ScipClang => rag_rat_oracle::OracleTool::ScipClang,
+            OracleToolArg::ScipPython => rag_rat_oracle::OracleTool::ScipPython,
+            OracleToolArg::ScipTypescript => rag_rat_oracle::OracleTool::ScipTypescript,
+            OracleToolArg::ScipJava => rag_rat_oracle::OracleTool::ScipJava,
         }
     }
 }

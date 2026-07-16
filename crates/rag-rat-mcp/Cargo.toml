@@ -17,6 +17,7 @@ rag-rat-db.workspace = true
 rag-rat-papertrail.workspace = true
 anyhow.workspace = true
 rag-rat-core = { workspace = true }
+rag-rat-oracle.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true

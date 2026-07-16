@@ -979,7 +979,7 @@ mod tests {
         )
         .unwrap();
         let chunk_id = c.last_insert_rowid();
-        crate::index::chunk_text_store::seed_chunk_text(&c, chunk_id, "fn real_symbol() {}\n")
+        rag_rat_db::chunk_text_store::seed_chunk_text(&c, chunk_id, "fn real_symbol() {}\n")
             .unwrap();
         seed_memory(&c, "m1", "note", "describes `real_symbol` and `ghost_symbol`", "r");
         c.execute(

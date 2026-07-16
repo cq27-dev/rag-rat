@@ -1,0 +1,26 @@
+[package]
+name = "rag-rat-oracle"
+version.workspace = true
+description = "Compiler-grade reference oracle for the rag-rat workspace: SCIP/LSP evidence ingestion, run manifests, and the verdict store."
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+protobuf.workspace = true
+rag-rat-base.workspace = true
+rag-rat-clones.workspace = true
+rag-rat-db.workspace = true
+rusqlite.workspace = true
+scip.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strum.workspace = true
+toml.workspace = true

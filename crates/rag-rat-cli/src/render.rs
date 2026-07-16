@@ -259,7 +259,7 @@ pub(crate) fn render_index_progress(progress: IndexProgress) {
 /// formatting is unit-testable without capturing stdout — the rates and raw counts must stay in the
 /// line so `eval` output is greppable.
 #[cfg(feature = "eval")]
-fn format_oracle_line(oracle: &rag_rat_core::index::oracle::OracleEvalMetrics) -> String {
+fn format_oracle_line(oracle: &rag_rat_oracle::OracleEvalMetrics) -> String {
     format!(
         "eval: oracle precision={:.3} recall={:.3} name_only_recovery={:.3} \
          upgradeable_fraction={:.3} (confirm={} contradict={} upgrade={} external={} \
@@ -279,7 +279,7 @@ fn format_oracle_line(oracle: &rag_rat_core::index::oracle::OracleEvalMetrics) -
 
 #[cfg(all(test, feature = "eval"))]
 mod tests {
-    use rag_rat_core::index::oracle::OracleEvalMetrics;
+    use rag_rat_oracle::OracleEvalMetrics;
 
     use super::format_oracle_line;
 

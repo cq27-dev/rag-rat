@@ -172,7 +172,7 @@ pub(crate) fn names_external_package(scip_symbol: &str) -> bool {
 
 /// The package name component of a SCIP symbol (`scip::symbol::parse_symbol`), e.g. the crate name.
 /// `None` for local symbols or symbols without a package component.
-pub(crate) fn package_of(scip_symbol: &str) -> Option<String> {
+pub fn package_of(scip_symbol: &str) -> Option<String> {
     let parsed = ::scip::symbol::parse_symbol(scip_symbol).ok()?;
     let package = parsed.package.as_ref()?;
     let name = package.name.trim();

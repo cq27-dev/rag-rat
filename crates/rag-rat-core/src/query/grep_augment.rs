@@ -654,7 +654,7 @@ mod tests {
         let chunk_id = conn.last_insert_rowid();
         // chunks.text is gone (#77 Phase 2): seed the compressed chunk_text blob (readers INNER
         // JOIN it) and the contentless chunk_fts tokens.
-        crate::index::chunk_text_store::seed_chunk_text(&conn, chunk_id, chunk_text).unwrap();
+        rag_rat_db::chunk_text_store::seed_chunk_text(&conn, chunk_id, chunk_text).unwrap();
         conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", rusqlite::params![
             chunk_id, chunk_text
         ])

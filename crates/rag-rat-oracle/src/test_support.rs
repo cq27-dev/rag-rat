@@ -1,18 +1,19 @@
-//! End-to-end tests for the SCIP-oracle join. SCIP `Index` objects are built **programmatically**
-//! via the `scip` crate's types (no rust-analyzer, no network) and serialized, then fed through the
-//! real `run_oracle` path against a DB seeded with synthetic files/symbols/edges. This keeps the
-//! join deterministic and exercises the exact code eval uses.
+//! Programmatic SCIP fixture harness for oracle-run tests: a temp checkout + an in-memory DB
+//! seeded with synthetic files/symbols/edges, and `.scip` bytes built via the `scip` crate's types
+//! (no rust-analyzer, no network). Consumed by this crate's own tests AND by the engine's
+//! memory-relocation tests, so it is NOT `#[cfg(test)]` — the gate does not propagate cross-crate.
+//! Not part of the semver-stable API surface.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ::protobuf::{EnumOrUnknown, Message};
-use ::scip::types::{Document, Index, Occurrence, PositionEncoding, SymbolRole};
+use ::scip::types::{Document, Index, Occurrence, PositionEncoding};
 use rag_rat_db::schema;
 use rusqlite::{Connection, params};
 
-use super::store::EdgeOracleRow;
-use super::*;
+use crate::store::{self, EdgeOracleRow};
+use crate::{OracleResolutionKind, OracleTool};
 
 /// A unique temp directory under the system temp root (no external crate; matches the repo's
 /// `std::env::temp_dir` + atomic-counter convention). Cleaned up on `Drop`.
@@ -43,39 +44,47 @@ impl Drop for TempRoot {
     }
 }
 
-const TOOL: OracleTool = OracleTool::RustAnalyzer;
-const VERSION: &str = "test";
+pub const TOOL: OracleTool = OracleTool::RustAnalyzer;
+pub const VERSION: &str = "test";
 // Model a REAL clean git checkout: a non-empty `commit_sha`, empty `worktree_id` (the
 // `FileScope::commit` case — the dominant production shape). The earlier `"" / ""` pair only
 // occurs in a non-git temp dir, where the active-checkout predicate degenerates and silently
 // masked the #82 P0 (the AND-of-both-non-empty predicate matched zero rows on every real repo).
-const COMMIT: &str = "deadbeefcafef00d";
-const WORKTREE: &str = "";
+pub const COMMIT: &str = "deadbeefcafef00d";
+pub const WORKTREE: &str = "";
 
 /// The content-key fields of a live edge, owned so an [`EdgeOracleRow`] borrowing them outlives the
 /// borrow (#248: verdicts are content-keyed, not rowid-keyed).
-struct EdgeContentKey {
-    source_path: String,
-    source_start_byte: i64,
-    source_end_byte: i64,
-    callee_start_byte: i64,
-    callee_end_byte: i64,
-    edge_kind: String,
+pub struct EdgeContentKey {
+    pub source_path: String,
+    pub source_start_byte: i64,
+    pub source_end_byte: i64,
+    pub callee_start_byte: i64,
+    pub callee_end_byte: i64,
+    pub edge_kind: String,
 }
 
 /// A test corpus written to a temp checkout + an index DB seeded to match.
-struct Harness {
-    conn: Connection,
+pub struct Harness {
+    pub conn: Connection,
     root: TempRoot,
 }
 
+impl Default for Harness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Harness {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let conn = Connection::open_in_memory().unwrap();
         // Match production (storage.rs) so FK cascades fire — `edge_oracle.edge_id` cascades off
         // `edges` (V018), and the oracle tests assert that cascade.
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        // Fresh in-memory scratch DB: the documented-sound `MigrationHooks::noop()` case — every
+        // hook-using migration runs over empty tables, so the harness stays engine-free.
+        schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
         let root = TempRoot::new();
         Harness { conn, root }
     }
@@ -84,7 +93,7 @@ impl Harness {
     /// `files.sha256` is the REAL hash of the written bytes (matching production), so the oracle's
     /// content-integrity gate (finding 2) sees no drift — the run hashes the same disk bytes. Tests
     /// that want to model drift override the row's `sha256` afterward (see `set_file_sha`).
-    fn add_file(&self, path: &str, contents: &str) -> i64 {
+    pub fn add_file(&self, path: &str, contents: &str) -> i64 {
         std::fs::write(self.root.path().join(path), contents).unwrap();
         let sha = sha256_hex(contents.as_bytes());
         self.conn
@@ -100,14 +109,14 @@ impl Harness {
     /// Force a file's recorded `sha256` to a value that does NOT match its disk bytes, modelling
     /// content drift between the index build and the `.scip` — the candidate's `file_sha` then
     /// disagrees with the disk-byte hash and the oracle skips it (finding 2).
-    fn set_file_sha(&self, file_id: i64, sha: &str) {
+    pub fn set_file_sha(&self, file_id: i64, sha: &str) {
         self.conn
             .execute("UPDATE files SET sha256 = ?2 WHERE id = ?1", params![file_id, sha])
             .unwrap();
     }
 
     /// Insert a symbol with a byte span, returning its id.
-    fn add_symbol(&self, file_id: i64, name: &str, start_byte: usize, end_byte: usize) -> i64 {
+    pub fn add_symbol(&self, file_id: i64, name: &str, start_byte: usize, end_byte: usize) -> i64 {
         // #224: qualified_name interned into name_strings (here name == qualified_name).
         self.conn
             .execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![name])
@@ -127,7 +136,7 @@ impl Harness {
     /// Insert a symbol with an explicit qualified name + kind (the production shape is
     /// path-qualified), returning its id. The moniker tests need the qualified name to CHANGE on a
     /// file move so the qualified-name relocation arm can't fire.
-    fn add_symbol_qualified(
+    pub fn add_symbol_qualified(
         &self,
         file_id: i64,
         name: &str,
@@ -154,7 +163,7 @@ impl Harness {
     }
 
     /// Insert a logical symbol group (explicit content-derived-style id) with one member.
-    fn add_logical_symbol(
+    pub fn add_logical_symbol(
         &self,
         logical_symbol_id: i64,
         path: &str,
@@ -187,7 +196,7 @@ impl Harness {
 
     /// Insert a chunk for a symbol (the memory bind/validate path reads the symbol's chunk for its
     /// content hash and line span; a symbol row without one is not a shape the indexer produces).
-    fn add_chunk(&self, file_id: i64, symbol_path: &str, text: &str) {
+    pub fn add_chunk(&self, file_id: i64, symbol_path: &str, text: &str) {
         self.conn
             .execute(
                 "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, \
@@ -198,11 +207,11 @@ impl Harness {
         // chunks.text is gone (#77 Phase 2); seed the compressed chunk_text blob readers INNER
         // JOIN.
         let chunk_id = self.conn.last_insert_rowid();
-        crate::index::chunk_text_store::seed_chunk_text(&self.conn, chunk_id, text).unwrap();
+        rag_rat_db::chunk_text_store::seed_chunk_text(&self.conn, chunk_id, text).unwrap();
     }
 
     /// The persisted moniker row for a logical symbol, if any.
-    fn moniker(&self, logical_symbol_id: i64) -> Option<(String, String, String)> {
+    pub fn moniker(&self, logical_symbol_id: i64) -> Option<(String, String, String)> {
         self.conn
             .query_row(
                 "SELECT moniker, tool, tool_version FROM logical_symbol_monikers WHERE \
@@ -221,7 +230,7 @@ impl Harness {
 
     /// Insert a `calls_name` edge carrying a callee identifier byte range, returning its id.
     #[allow(clippy::too_many_arguments)]
-    fn add_edge(
+    pub fn add_edge(
         &self,
         source_file_id: i64,
         to_name: &str,
@@ -245,7 +254,7 @@ impl Harness {
     /// range, returning its id. Non-call kinds still join against SCIP occurrences (they carry a
     /// callee range) but must not count toward the covered side of recall.
     #[allow(clippy::too_many_arguments)]
-    fn add_edge_with_kind(
+    pub fn add_edge_with_kind(
         &self,
         source_file_id: i64,
         to_name: &str,
@@ -277,13 +286,13 @@ impl Harness {
         self.conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
     }
 
-    fn root(&self) -> &Path {
+    pub fn root(&self) -> &Path {
         self.root.path()
     }
 
     /// Insert a `files` row in an explicit `(commit_sha, worktree_id)` scope (no checkout write —
     /// these rows model another checkout sharing the same DB). Returns the file id.
-    fn add_file_in_scope(&self, path: &str, commit: &str, worktree: &str) -> i64 {
+    pub fn add_file_in_scope(&self, path: &str, commit: &str, worktree: &str) -> i64 {
         let sha = format!("sha-{worktree}-{path}");
         self.conn
             .execute(
@@ -300,7 +309,7 @@ impl Harness {
     /// callee spans + edge_kind, the same key the production read join uses. NOTE: unlike the
     /// surfacing reads, this does NOT gate on `files.sha256 = file_sha`, so a test that wrote a
     /// non-matching `file_sha` still sees its row (the persisted-population view).
-    fn verdict(&self, edge_id: i64) -> Option<(String, Option<i64>, String)> {
+    pub fn verdict(&self, edge_id: i64) -> Option<(String, Option<i64>, String)> {
         self.conn
             .query_row(
                 "SELECT eo.kind, eo.resolved_symbol_id, eo.scip_symbol
@@ -326,7 +335,7 @@ impl Harness {
 
     /// The recorded `files.sha256` for a path in the active checkout — the "current content" sha a
     /// verdict must carry to be counted/surfaced (the scope join + current predicate gate on it).
-    fn file_sha(&self, path: &str) -> String {
+    pub fn file_sha(&self, path: &str) -> String {
         self.conn
             .query_row("SELECT sha256 FROM files WHERE path = ?1", params![path], |r| r.get(0))
             .unwrap()
@@ -334,7 +343,7 @@ impl Harness {
 
     /// The recorded `files.sha256` for a path in a specific commit scope — for verdicts written
     /// against a sibling checkout's file (disambiguates the same path across two commits).
-    fn file_sha_for_commit(&self, path: &str, commit: &str) -> String {
+    pub fn file_sha_for_commit(&self, path: &str, commit: &str) -> String {
         self.conn
             .query_row(
                 "SELECT sha256 FROM files WHERE path = ?1 AND commit_sha = ?2",
@@ -347,7 +356,7 @@ impl Harness {
     /// The content-key fields of a live edge (`source_path`, source/callee byte spans,
     /// `edge_kind`), for building an [`EdgeOracleRow`] in tests that reference an edge by id.
     /// Mirrors what the production write path reads from each [`store::EdgeJoinCandidate`].
-    fn edge_content_key(&self, edge_id: i64) -> EdgeContentKey {
+    pub fn edge_content_key(&self, edge_id: i64) -> EdgeContentKey {
         self.conn
             .query_row(
                 "SELECT files.path, edges.source_start_byte, edges.source_end_byte,
@@ -372,7 +381,7 @@ impl Harness {
     /// Write an `edge_oracle` verdict for a live edge, deriving the content key from the edge so
     /// the row matches the production read join by construction. The `EdgeContentKey` outlives
     /// the row.
-    fn write_verdict(
+    pub fn write_verdict(
         &self,
         edge_id: i64,
         file_sha: &str,
@@ -397,7 +406,7 @@ impl Harness {
     }
 
     /// The heuristic resolution on the `edges` row (must never change).
-    fn heuristic_resolution(&self, edge_id: i64) -> (String, Option<i64>) {
+    pub fn heuristic_resolution(&self, edge_id: i64) -> (String, Option<i64>) {
         self.conn
             .query_row(
                 "SELECT resolution, to_symbol_id FROM edges WHERE id = ?1",
@@ -406,10 +415,22 @@ impl Harness {
             )
             .unwrap()
     }
+
+    /// Persisted `edge_oracle` verdict count in the harness's active scope (all kinds) — wraps
+    /// the internal scoped counter so dependent-crate tests don't need `store::` visibility.
+    pub fn verdict_count(&self) -> u64 {
+        store::count_edge_oracle_scoped(&self.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap()
+    }
 }
 
 /// A single-line occurrence: `range = [line, start_char, end_char]` in the document's encoding.
-fn occurrence(line: i32, start_char: i32, end_char: i32, symbol: &str, roles: i32) -> Occurrence {
+pub fn occurrence(
+    line: i32,
+    start_char: i32,
+    end_char: i32,
+    symbol: &str,
+    roles: i32,
+) -> Occurrence {
     Occurrence {
         range: vec![line, start_char, end_char],
         symbol: symbol.to_string(),
@@ -420,7 +441,7 @@ fn occurrence(line: i32, start_char: i32, end_char: i32, symbol: &str, roles: i3
 
 /// Build a single-document SCIP index over `path` with the given occurrences + encoding,
 /// serialized.
-fn scip_bytes(path: &str, encoding: PositionEncoding, occurrences: Vec<Occurrence>) -> Vec<u8> {
+pub fn scip_bytes(path: &str, encoding: PositionEncoding, occurrences: Vec<Occurrence>) -> Vec<u8> {
     let document = Document {
         relative_path: path.to_string(),
         occurrences,
@@ -433,7 +454,7 @@ fn scip_bytes(path: &str, encoding: PositionEncoding, occurrences: Vec<Occurrenc
 
 /// Hex SHA-256 of bytes — the same hash `files.sha256` carries, so a test file's recorded sha
 /// matches the disk-byte hash the oracle's content-integrity gate computes (finding 2).
-fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
@@ -449,11 +470,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 // real shape: two checkouts at the same HEAD is unusual, and under the active-checkout predicate a
 // same-commit worktree overlay would shadow the clean row by path, which is not the
 // cross-checkout-isolation property these tests mean to assert. Commit isolation is.
-const OTHER_COMMIT: &str = "5ad1f1ce5ad1f1ce";
-const OTHER_WORKTREE: &str = "";
+pub const OTHER_COMMIT: &str = "5ad1f1ce5ad1f1ce";
+pub const OTHER_WORKTREE: &str = "";
 
 /// Build a multi-document SCIP index, serialized.
-fn scip_bytes_docs(docs: Vec<(&str, Vec<Occurrence>)>) -> Vec<u8> {
+pub fn scip_bytes_docs(docs: Vec<(&str, Vec<Occurrence>)>) -> Vec<u8> {
     let documents = docs
         .into_iter()
         .map(|(path, occurrences)| Document {
@@ -469,39 +490,12 @@ fn scip_bytes_docs(docs: Vec<(&str, Vec<Occurrence>)>) -> Vec<u8> {
     index.write_to_bytes().unwrap()
 }
 
-const TARGET_MONIKER: &str = "rust-analyzer cargo test_crate 0.1.0 target().";
-
-/// Create a memory bound to the harness symbol, asserting the automatic `scip_moniker` binding.
-fn create_target_memory(h: &Harness, symbol_id: i64) -> String {
-    use crate::query::memory::{RepoMemoryBindTarget, RepoMemoryCreate, create_memory};
-
-    let created = create_memory(&h.conn, RepoMemoryCreate {
-        kind: "Invariant".to_string(),
-        title: "target invariant".to_string(),
-        body: "target must stay reentrant".to_string(),
-        confidence: "high".to_string(),
-        created_by: None,
-        source: None,
-        tags: Vec::new(),
-        payload_json: None,
-        bind: RepoMemoryBindTarget { symbol_id: Some(symbol_id), ..Default::default() },
-    })
-    .unwrap();
-    assert!(!created.duplicate);
-    let moniker_binding =
-        created.memory.bindings.iter().find(|b| b.binding_kind == "scip_moniker").expect(
-            "memory on a symbol with a known moniker gets the moniker binding automatically",
-        );
-    assert_eq!(moniker_binding.binding_id, TARGET_MONIKER);
-    assert_eq!(moniker_binding.moniker_tool.as_deref(), Some(TOOL.as_db_str()));
-    assert_eq!(moniker_binding.moniker_tool_version.as_deref(), Some(VERSION));
-    created.memory.memory_id
-}
+pub const TARGET_MONIKER: &str = "rust-analyzer cargo test_crate 0.1.0 target().";
 
 /// Simulate a file move WITH a content edit: the old file/symbol/logical rows die, the new home
 /// has a different path, qualified name, AND content — so neither the qualified-name arm nor the
 /// name+content-hash arm can relocate, only the moniker can. Returns the new symbol id.
-fn move_target_with_edit(h: &Harness, old_file: i64, new_kind: &str) -> i64 {
+pub fn move_target_with_edit(h: &Harness, old_file: i64, new_kind: &str) -> i64 {
     h.conn.execute("DELETE FROM logical_symbol_members", []).unwrap();
     h.conn.execute("DELETE FROM logical_symbols", []).unwrap();
     h.conn.execute("DELETE FROM symbols", []).unwrap();
@@ -514,22 +508,3 @@ fn move_target_with_edit(h: &Harness, old_file: i64, new_kind: &str) -> i64 {
     h.add_logical_symbol(2002, "moved.rs", "target", "moved.rs::target", sym);
     sym
 }
-
-mod edge_view;
-mod join_tests;
-mod library_usage;
-mod memory_bindings;
-mod monikers;
-mod persisted_enums;
-mod pre_spawn;
-mod production;
-mod reports;
-mod resolution;
-mod run_eval;
-mod schema_tests;
-mod scip_parse;
-mod scope;
-mod status_tests;
-mod store_io;
-mod surfacing;
-mod tool_defaults;

@@ -174,18 +174,18 @@ impl IndexDatabase {
         // keyed by `(commit_sha, worktree_id)` directly — nothing cascades it either — so
         // prune a dead checkout's run rows with the SAME live sets, so a run and the
         // edges it produced are dropped together.
-        oracle::prune_edge_oracle_without_live_edge(conn)?;
+        rag_rat_oracle::prune_edge_oracle_without_live_edge(conn)?;
         // Per-repo (A5): `prune_oracle_runs_outside_scope` now filters `oracle_runs.repo_id` (its
         // own column since V042), so it deletes only THIS repo's run rows that fall outside THIS
         // repo's live sets — a sibling repo's runs are legitimately absent from this repo's live
         // set but are no longer touched. That real `repo_id` predicate SUPERSEDES the old V042-seam
         // `multiple_real_repos` guard, so the prune runs unconditionally again (exactly as it did
         // on a single-repo DB before scoping).
-        oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
+        rag_rat_oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
         // #114: `external_symbols` is checkout-keyed like `oracle_runs` (nothing cascades it), so a
         // dead checkout's dependency contracts need the SAME per-repo, dead-scope prune — otherwise
         // signature/doc payloads for retired branches/worktrees accumulate without bound.
-        oracle::prune_external_symbols_outside_scope(conn, live_commits, live_worktrees)?;
+        rag_rat_oracle::prune_external_symbols_outside_scope(conn, live_commits, live_worktrees)?;
         // #357: `embedding_cache` is content-keyed too (survives reindex, like the oracle above),
         // so it needs the SAME global sweep — drop vectors no live chunk references in ANY
         // context (a sibling worktree / branch may still use one, so this must not be

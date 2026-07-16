@@ -531,7 +531,7 @@ fn full_rebuild_preserves_other_worktree_contexts() {
         .unwrap();
     // chunks.text is gone (#77 Phase 2); seed the chunk_text blob readers INNER JOIN. (The
     // chunk_fts row for this other-context chunk is seeded a few lines below.)
-    crate::index::chunk_text_store::seed_chunk_text(
+    rag_rat_db::chunk_text_store::seed_chunk_text(
         db.storage.connection(),
         other_chunk_id,
         "other context",

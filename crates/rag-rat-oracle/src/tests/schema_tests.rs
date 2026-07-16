@@ -4,7 +4,7 @@ use super::*;
 #[test]
 fn migration_creates_oracle_side_tables() {
     let conn = Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
 
     for table in ["oracle_runs", "edge_oracle"] {
         let count: i64 = conn
@@ -57,7 +57,7 @@ fn migration_creates_oracle_side_tables() {
 #[test]
 fn migration_creates_moniker_table_and_binding_columns() {
     let conn = Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
 
     let sql: String = conn
         .query_row(

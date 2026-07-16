@@ -86,3 +86,32 @@ pub fn build_store(conn: &Connection, source: &str) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Test seeder (not `#[cfg(test)]`: consumed by dependent crates' tests, and the gate does not
+/// propagate cross-crate): chunks now have no `text` column, so tests that insert a chunk row
+/// directly must also seed its compressed `chunk_text` blob (readers INNER JOIN `chunk_text`).
+/// Compresses against the EXISTING latest dict version if one exists (e.g. a prior rebuild trained
+/// version 1) so the blob is decodable; otherwise creates version 1 with the empty-dict (no-dict,
+/// plain zstd) sentinel. Tagging an empty-dict blob with a trained version would make it
+/// undecodable.
+pub fn seed_chunk_text(
+    conn: &rusqlite::Connection,
+    chunk_id: i64,
+    text: &str,
+) -> rusqlite::Result<()> {
+    let (version, dict) = match latest_dict(conn).expect("read latest dict") {
+        Some(existing) => existing,
+        None => {
+            conn.execute("INSERT INTO chunk_text_dict(version, dict) VALUES (1, x'')", [])?;
+            (1, Vec::new())
+        },
+    };
+    let blob = crate::text_compression::ChunkCompressor::new(&dict)
+        .and_then(|mut c| c.compress(text.as_bytes()))
+        .expect("compress is infallible for a valid dict");
+    conn.execute(
+        "INSERT INTO chunk_text(chunk_id, blob, raw_len, dict_version) VALUES (?1, ?2, ?3, ?4)",
+        params![chunk_id, blob, i64::try_from(text.len()).unwrap_or(i64::MAX), version],
+    )
+    .map(|_| ())
+}

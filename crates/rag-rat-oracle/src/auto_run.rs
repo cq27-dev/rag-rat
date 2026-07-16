@@ -8,7 +8,7 @@
 //! index's last change time and the last successful oracle run's start time — so the decision
 //! itself is pure and fully unit-testable without a clock, a database, or rust-analyzer.
 //!
-//! Mirrors the shape of [`crate::version_check::needs_refresh`]: inputs are values, the decision is
+//! Mirrors the shape of `version_check::needs_refresh` (engine): inputs are values, the decision is
 //! a closed enum, the clock lives outside.
 
 /// Plain-value inputs to [`auto_run_decision`] — sourced by the caller (config, index meta, the

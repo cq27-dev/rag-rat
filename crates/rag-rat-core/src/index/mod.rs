@@ -5,7 +5,6 @@ pub mod edges;
 pub mod git_history;
 pub mod ignore_rules;
 pub(crate) mod languages;
-pub mod oracle;
 pub mod papertrail_autosync;
 pub mod parser;
 pub mod symbols;

@@ -1,4 +1,6 @@
 mod api;
+#[cfg(test)]
+mod oracle_relocation_tests;
 // The op-log authoring seam: row→op translation, the one-time full backfill, and the live
 // `author_*` helpers the memory mutations call in-transaction (#532).
 mod authoring;

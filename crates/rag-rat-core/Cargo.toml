@@ -34,13 +34,11 @@ notify = "8.2.0"
 rayon.workspace = true
 regex.workspace = true
 rusqlite.workspace = true
-# Sourcegraph SCIP protobuf types for the SCIP-oracle pass (#61/#68). Normal dependency — the
-# size budget is explicitly waived for SCIP; do NOT feature-gate or hand-copy the proto.
-# `protobuf` is scip's own transitive dep, pulled in directly so we can call `Message::parse_*`
-# on the generated SCIP types; pinned to the version scip 0.8 generates against.
-protobuf = "3.7"
+# scip/protobuf stay direct deps: eval + query_api tests build SCIP fixtures in-process.
+protobuf.workspace = true
+rag-rat-oracle.workspace = true
 reqwest.workspace = true
-scip = "0.8.1"
+scip.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

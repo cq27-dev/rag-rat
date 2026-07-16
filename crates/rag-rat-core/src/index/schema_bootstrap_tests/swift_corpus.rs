@@ -13,8 +13,9 @@
 //! A test that only asserted (1) would let a resolver that CONFIDENTLY GUESSES look like an
 //! improvement. Asserting (2) is what keeps the baseline honest.
 
+use rag_rat_oracle::{LineIndex, LspEncoding};
+
 use super::*;
-use crate::index::oracle::lsp::position::{LineIndex, LspEncoding};
 
 /// Index the corpus. SwiftPM puts first-party code under `Sources/` and its test targets under
 /// `Tests/`; both are bound so the fixture exercises test detection as well as source extraction.

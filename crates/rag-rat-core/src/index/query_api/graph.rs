@@ -23,9 +23,9 @@ impl IndexDatabase {
     /// `NoExternalSymbols` status).
     pub fn check_library_usage(
         &self,
-        opts: &crate::index::oracle::LibraryUsageOptions,
-    ) -> anyhow::Result<crate::index::oracle::LibraryUsageReport> {
-        crate::index::oracle::check_library_usage(
+        opts: &rag_rat_oracle::LibraryUsageOptions,
+    ) -> anyhow::Result<rag_rat_oracle::LibraryUsageReport> {
+        rag_rat_oracle::check_library_usage(
             self.storage.connection(),
             &self.active_commit_sha,
             &self.active_worktree_id,
@@ -87,8 +87,11 @@ impl IndexDatabase {
         // edge belongs to one language, so the per-tool verdict sets are disjoint — merging can't
         // collide.
         let conn = self.storage.connection();
-        let runs =
-            oracle::latest_runs_in_scope(conn, &self.active_commit_sha, &self.active_worktree_id)?;
+        let runs = rag_rat_oracle::latest_runs_in_scope(
+            conn,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )?;
         if runs.is_empty() {
             // No oracle run for this checkout — nothing to surface, all hops stay heuristic.
             return Ok(false);
@@ -96,7 +99,7 @@ impl IndexDatabase {
         let edge_ids = hops.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
         let mut verdicts = std::collections::HashMap::new();
         for (tool, tool_version) in &runs {
-            verdicts.extend(oracle::current_oracle_verdicts_for_edges(
+            verdicts.extend(rag_rat_oracle::current_oracle_verdicts_for_edges(
                 conn,
                 *tool,
                 tool_version,
@@ -114,7 +117,8 @@ impl IndexDatabase {
                 continue;
             };
             match verdict.kind {
-                oracle::OracleResolutionKind::Upgrade | oracle::OracleResolutionKind::Confirm => {
+                rag_rat_oracle::OracleResolutionKind::Upgrade
+                | rag_rat_oracle::OracleResolutionKind::Confirm => {
                     // Hydrate the hop's target from the compiler's `resolved_symbol_id` BEFORE
                     // promoting to `compiler` — for an `Upgrade` on a `NameOnly`/`Ambiguous` edge
                     // the heuristic target is missing or wrong, so promoting confidence without
@@ -133,12 +137,12 @@ impl IndexDatabase {
                     hop.resolution_reason = Some(verdict.resolution_reason());
                     promoted_any = true;
                 },
-                oracle::OracleResolutionKind::ResolvedExternal => {
+                rag_rat_oracle::OracleResolutionKind::ResolvedExternal => {
                     hop.resolved_external = verdict.resolved_external_label();
                     hop.resolution_reason = Some(verdict.resolution_reason());
                 },
                 // The oracle disagrees with the heuristic target — do not promote to `compiler`.
-                oracle::OracleResolutionKind::Contradict => {},
+                rag_rat_oracle::OracleResolutionKind::Contradict => {},
             }
         }
         Ok(promoted_any)
@@ -456,8 +460,11 @@ impl IndexDatabase {
         // a mixed-language repo's contradictions span tools (a C edge under scip-clang, a Python
         // edge under scip-python). Verdict sets are disjoint by edge language, so aggregating is a
         // plain concatenation.
-        let runs =
-            oracle::latest_runs_in_scope(conn, &self.active_commit_sha, &self.active_worktree_id)?;
+        let runs = rag_rat_oracle::latest_runs_in_scope(
+            conn,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )?;
         let mut summary = crate::query::graph::CompareGraphScipSummary::default();
         let mut contradictions = Vec::new();
         if runs.is_empty() {
@@ -479,7 +486,7 @@ impl IndexDatabase {
             });
         }
         for (tool, version) in &runs {
-            let comparisons = oracle::current_oracle_comparisons(
+            let comparisons = rag_rat_oracle::current_oracle_comparisons(
                 conn,
                 *tool,
                 version,
@@ -488,7 +495,7 @@ impl IndexDatabase {
             )?;
             summary.verdicts_examined += u64::try_from(comparisons.len()).unwrap_or(u64::MAX);
             for comparison in comparisons {
-                if comparison.kind != oracle::OracleResolutionKind::Contradict {
+                if comparison.kind != rag_rat_oracle::OracleResolutionKind::Contradict {
                     continue;
                 }
                 contradictions.push(crate::query::graph::GraphScipContradiction {

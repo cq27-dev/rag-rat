@@ -13,7 +13,7 @@
 /// The position encoding an LSP session resolved during `initialize`. LSP's protocol default is
 /// UTF-16; a server may advertise `utf-8` / `utf-32` support and the client picks one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LspEncoding {
+pub enum LspEncoding {
     Utf8,
     Utf16,
     Utf32,
@@ -44,14 +44,14 @@ impl LspEncoding {
 /// A zero-based LSP text position: `line` and `character`, the latter counted in code units of the
 /// session's [`LspEncoding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LspPosition {
-    pub(crate) line: u32,
-    pub(crate) character: u32,
+pub struct LspPosition {
+    pub line: u32,
+    pub character: u32,
 }
 
 /// Precomputes per-line byte starts over a document so `(line, character)` ↔ byte lookups are a
 /// single walk from the line start in the declared encoding.
-pub(crate) struct LineIndex<'a> {
+pub struct LineIndex<'a> {
     source: &'a [u8],
     encoding: LspEncoding,
     /// Byte offset of the first byte of each 0-based line.
@@ -59,7 +59,7 @@ pub(crate) struct LineIndex<'a> {
 }
 
 impl<'a> LineIndex<'a> {
-    pub(crate) fn new(source: &'a [u8], encoding: LspEncoding) -> Self {
+    pub fn new(source: &'a [u8], encoding: LspEncoding) -> Self {
         let mut line_starts = vec![0usize];
         for (idx, byte) in source.iter().enumerate() {
             if *byte == b'\n' {
@@ -71,7 +71,7 @@ impl<'a> LineIndex<'a> {
 
     /// The LSP position of an absolute byte offset: its line, and the code-unit count from that
     /// line's start to the offset. `byte` past EOF clamps to the last line's end.
-    pub(crate) fn position_at_byte(&self, byte: usize) -> LspPosition {
+    pub fn position_at_byte(&self, byte: usize) -> LspPosition {
         let byte = byte.min(self.source.len());
         // The line is the last line start at or before `byte`: `partition_point` gives the count of
         // starts `<= byte`, which is `line + 1` (there is always the line-0 start at 0).
@@ -95,7 +95,7 @@ impl<'a> LineIndex<'a> {
     /// The absolute byte offset of an LSP position, where `character` counts code units in the
     /// session encoding. `None` when the line is out of range; a `character` past the line's end
     /// clamps to the line end (LSP end positions commonly sit at the trailing column).
-    pub(crate) fn byte_at_position(&self, pos: LspPosition) -> Option<usize> {
+    pub fn byte_at_position(&self, pos: LspPosition) -> Option<usize> {
         let line = usize::try_from(pos.line).ok()?;
         let target_units = usize::try_from(pos.character).ok()?;
         let line_start = *self.line_starts.get(line)?;

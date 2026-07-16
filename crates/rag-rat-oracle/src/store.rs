@@ -194,7 +194,7 @@ pub(crate) const CALL_HEAD_EDGE_KINDS_SQL: &str = "('calls_name', 'uses_macro')"
 /// (`oracle_callee_coverage_exists`) so the probe and the fetch express ONE currency discipline —
 /// a probe looser than the fetch would key baseline-identical refinements into the scip cache
 /// namespace (needless oracle-run churn).
-pub(crate) fn callee_moniker_current_clause(
+pub fn callee_moniker_current_clause(
     conn: &Connection,
     commit_slot: &str,
     worktree_slot: &str,
@@ -226,7 +226,7 @@ pub(crate) fn callee_moniker_current_clause(
 ///   would identify two different functions — never returned.
 /// - a span where two rows (different tools / tool versions) disagree on the moniker has no
 ///   trustworthy identity — dropped entirely.
-pub(crate) fn current_callee_monikers(
+pub fn current_callee_monikers(
     conn: &Connection,
     source_path: &str,
     file_sha: &str,
@@ -839,7 +839,7 @@ pub(crate) fn latest_run_tool_version(
 
 /// The `started_at` (Unix-epoch ms) of the LAST-COMPLETED run for `tool` **in the active
 /// checkout**, or `None` when no run exists. The staleness clock the background auto-fresh oracle
-/// compares against the index's `indexed_at_ms` (see [`crate::index::oracle::auto_run_decision`]):
+/// compares against the index's `indexed_at_ms` (see [`crate::auto_run_decision`]):
 /// a run that started after the last index change means its verdicts are current. Scoped to
 /// `(commit_sha, worktree_id)` — the sibling of [`latest_run_tool_version`], ordered the same way
 /// (`id DESC` = completion order, so the start time returned belongs to the run whose verdicts are
@@ -1077,8 +1077,8 @@ pub(crate) fn edge_oracle_live_edge_predicate(commit_slot: &str, worktree_slot: 
 /// `Compiler` tier. `package` is the external dependency name for `resolved-external` verdicts
 /// (`scip_symbol`'s package component), `None` for in-corpus resolutions.
 #[derive(Debug, Clone)]
-pub(crate) struct EdgeOracleVerdict {
-    pub(crate) kind: OracleResolutionKind,
+pub struct EdgeOracleVerdict {
+    pub kind: OracleResolutionKind,
     /// The qualified name of the verdict's in-corpus `resolved_symbol_id` (joined at read time),
     /// `None` when the verdict is external (`resolved_symbol_id IS NULL`) or the resolved symbol
     /// no longer exists. An `Upgrade`'s target is hydrated from THIS name — never the
@@ -1087,7 +1087,7 @@ pub(crate) struct EdgeOracleVerdict {
     /// target we can't name (#82 finding 2). The def-drift gate in
     /// [`edge_oracle_current_predicate`] already filters a deleted/reinserted resolved symbol,
     /// so in practice this is `None` only for externals.
-    pub(crate) resolved_qualified_name: Option<String>,
+    pub resolved_qualified_name: Option<String>,
     pub(crate) scip_symbol: String,
     pub(crate) tool: OracleTool,
     pub(crate) tool_version: String,
@@ -1096,7 +1096,7 @@ pub(crate) struct EdgeOracleVerdict {
 impl EdgeOracleVerdict {
     /// The provenance string surfaced as `resolution_reason` when this verdict upgrades an edge to
     /// the `Compiler` tier: `scip:<tool>@<version>` (the #61 design's reason format).
-    pub(crate) fn resolution_reason(&self) -> String {
+    pub fn resolution_reason(&self) -> String {
         format!("scip:{}@{}", self.tool.as_db_str(), self.tool_version)
     }
 
@@ -1104,7 +1104,7 @@ impl EdgeOracleVerdict {
     /// the corpus, deriving `<package>` from the SCIP symbol's package component; `None` for
     /// in-corpus verdicts. The display string surfaced in query output for
     /// unresolved-but-externally-resolved edges.
-    pub(crate) fn resolved_external_label(&self) -> Option<String> {
+    pub fn resolved_external_label(&self) -> Option<String> {
         if self.kind != OracleResolutionKind::ResolvedExternal {
             return None;
         }
@@ -1199,7 +1199,7 @@ pub(crate) fn current_oracle_verdicts_for_edges(
 /// Fetch ALL current, in-scope oracle verdicts for `(tool, tool_version)` in this checkout, keyed
 /// by `edge_id` → `(kind, resolved_symbol_id)`. The single-scan sibling of
 /// [`current_oracle_verdicts_for_edges`] (which filters to a bounded id list): symbol-importance
-/// ranking ([`crate::query::pagerank`]) walks the WHOLE edge graph, so it needs the verdict set in
+/// ranking (`pagerank`) walks the WHOLE edge graph, so it needs the verdict set in
 /// one pass rather than a query per edge. Routes through the shared [`edge_oracle_scope_join`] +
 /// [`edge_oracle_current_predicate`] so the scope+currency gate can't be re-spelled — the only raw
 /// `FROM edge_oracle` lives here (#81). `resolved_symbol_id` is returned (not just its name)
@@ -1242,13 +1242,13 @@ pub(crate) fn current_oracle_verdicts_all(
 /// disagreement. The compare tool filters to `Contradict` kinds; the total it scans is every
 /// current verdict in scope.
 #[derive(Debug, Clone)]
-pub(crate) struct EdgeOracleComparison {
-    pub(crate) edge_id: i64,
-    pub(crate) kind: OracleResolutionKind,
-    pub(crate) edge_kind: String,
-    pub(crate) heuristic_confidence: String,
-    pub(crate) heuristic_target: Option<String>,
-    pub(crate) callee_name: Option<String>,
+pub struct EdgeOracleComparison {
+    pub edge_id: i64,
+    pub kind: OracleResolutionKind,
+    pub edge_kind: String,
+    pub heuristic_confidence: String,
+    pub heuristic_target: Option<String>,
+    pub callee_name: Option<String>,
     /// Our `symbols.id` when the compiler resolved this callee to an IN-CORPUS symbol (an
     /// in-corpus `Contradict`: the compiler picked a different in-corpus target), `None` when
     /// it placed the callee in a dependency. `compare_graph_to_scip` labels
@@ -1256,10 +1256,10 @@ pub(crate) struct EdgeOracleComparison {
     /// crate/package component even for the LOCAL crate, so deriving `resolved-external` from
     /// `scip_symbol` alone would mislabel an in-corpus contradiction as
     /// `resolved-external(<local-crate>)` (#82 finding 1).
-    pub(crate) resolved_symbol_id: Option<i64>,
-    pub(crate) scip_symbol: String,
-    pub(crate) callsite_path: String,
-    pub(crate) callsite_line: i64,
+    pub resolved_symbol_id: Option<i64>,
+    pub scip_symbol: String,
+    pub callsite_path: String,
+    pub callsite_line: i64,
 }
 
 /// Load every CURRENT, in-scope `edge_oracle` verdict joined to its edge's heuristic resolution —

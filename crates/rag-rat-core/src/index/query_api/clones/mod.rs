@@ -876,7 +876,7 @@ impl IndexDatabase {
                     let disk_sha = rag_rat_base::hash::hex_sha256(content.as_bytes());
                     moniker_cache.insert(
                         row.path.clone(),
-                        crate::index::oracle::current_callee_monikers(
+                        rag_rat_oracle::current_callee_monikers(
                             conn,
                             &row.path,
                             &disk_sha,

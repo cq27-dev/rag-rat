@@ -1297,15 +1297,16 @@ fn deleted_file_occurrences_do_not_inflate_gap() {
 /// through the scoped helper.
 #[test]
 fn raw_edge_oracle_queries_live_only_in_store() {
-    let oracle_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/index/oracle");
+    let oracle_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     for entry in std::fs::read_dir(&oracle_dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
         let name = path.file_name().unwrap().to_str().unwrap().to_string();
-        // store.rs owns the scoped helpers; tests.rs exercises them with direct assertions.
-        if name == "store.rs" || name == "tests.rs" {
+        // store.rs owns the scoped helpers; the test-fixture harness exercises them with
+        // direct assertions (its raw reads are the persisted-population view, not surfacing).
+        if name == "store.rs" || name == "test_support.rs" {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap();

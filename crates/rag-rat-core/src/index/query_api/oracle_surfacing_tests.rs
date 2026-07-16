@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ::protobuf::{EnumOrUnknown, Message};
 use ::scip::types::{Document, Index, Occurrence, PositionEncoding, SymbolRole};
 use rag_rat_base::config::ResolvedTarget;
+use rag_rat_oracle::OracleTool;
 
 use super::*;
-use crate::index::oracle::OracleTool;
 
 static N: AtomicU64 = AtomicU64::new(0);
 
@@ -722,7 +722,7 @@ fn gc_prunes_oracle_runs_for_dead_contexts() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // Record a run for THIS (active) checkout + a run for a dead sibling context.
-    crate::index::oracle::run_oracle(
+    rag_rat_oracle::run_oracle(
         db.storage.connection(),
         OracleTool::RustAnalyzer,
         "v-test",
@@ -849,7 +849,7 @@ fn oracle_run_without_tool_is_blocked_not_error() {
     let config = rust_config(root.clone());
     let db = IndexDatabase::rebuild(&config).unwrap();
     let outcome = db.run_oracle_with_tool(OracleTool::RustAnalyzer, &root.join("o.scip")).unwrap();
-    assert!(matches!(outcome, crate::index::oracle::OracleRunOutcome::Blocked { .. }));
+    assert!(matches!(outcome, rag_rat_oracle::OracleRunOutcome::Blocked { .. }));
     let _ = fs::remove_dir_all(&root);
 }
 

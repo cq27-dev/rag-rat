@@ -62,6 +62,11 @@ version_group = "rag-rat"
 changelog_path = "./CHANGELOG.md"
 
 [[package]]
+name = "rag-rat-oracle"
+version_group = "rag-rat"
+changelog_path = "./CHANGELOG.md"
+
+[[package]]
 name = "rag-rat-clones"
 version_group = "rag-rat"
 changelog_path = "./CHANGELOG.md"

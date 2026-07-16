@@ -786,7 +786,7 @@ fn seed_search_leak_data(fx: &TwoRepoFixture) {
             |r| r.get(0),
         )
         .unwrap();
-    crate::index::chunk_text_store::seed_chunk_text(conn, chunk_id, &text).unwrap();
+    rag_rat_db::chunk_text_store::seed_chunk_text(conn, chunk_id, &text).unwrap();
     conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", rusqlite::params![
         chunk_id, text
     ])
@@ -1053,12 +1053,9 @@ fn oracle_run_prune_is_per_repo() {
     // is scoped to repo A, so repo B's run (equally not-live here) is untouched.
     let live_commits = vec!["a-live".to_string()];
     let live_worktrees = vec!["a-live-wt".to_string()];
-    let deleted = crate::index::oracle::prune_oracle_runs_outside_scope(
-        &conn,
-        &live_commits,
-        &live_worktrees,
-    )
-    .unwrap();
+    let deleted =
+        rag_rat_oracle::prune_oracle_runs_outside_scope(&conn, &live_commits, &live_worktrees)
+            .unwrap();
     assert_eq!(deleted, 1, "only repo A's dead run is pruned");
     assert_eq!(a5_oracle_run_count(&conn, A5_REPO_A), 0, "repo A's dead run is gone");
     assert_eq!(a5_oracle_run_count(&conn, A5_REPO_B), 1, "repo B's run survives repo A's prune");
@@ -1535,7 +1532,7 @@ fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
         )
         .unwrap();
         let chunk_id = conn.last_insert_rowid();
-        crate::index::chunk_text_store::seed_chunk_text(&conn, chunk_id, chunk_text).unwrap();
+        rag_rat_db::chunk_text_store::seed_chunk_text(&conn, chunk_id, chunk_text).unwrap();
         // Make the chunk FTS-searchable too, so `resolve_identifier`'s verbatim-text tier can be
         // driven — and, for the sibling, PROVE that tier is repo-scoped: the sibling's chunk is in
         // the GLOBAL chunk_fts, so only the scoped `files` join keeps its text out of repo A's
@@ -2018,7 +2015,7 @@ fn current_callee_monikers_ignores_a_sibling_repos_rows() {
 
     a5_set_active_repo(&conn, A5_REPO_A);
     let monikers =
-        crate::index::oracle::current_callee_monikers(&conn, "src/x.rs", "sha-x", "commit-x", "")
+        rag_rat_oracle::current_callee_monikers(&conn, "src/x.rs", "sha-x", "commit-x", "")
             .unwrap();
     assert_eq!(
         monikers,

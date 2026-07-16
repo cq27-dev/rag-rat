@@ -4,7 +4,6 @@ use rag_rat_db::schema;
 use rusqlite::OptionalExtension;
 
 use super::*;
-use crate::index::oracle;
 use crate::index::staleness::Heal;
 use crate::query::text_compare::*;
 use crate::search::lexical::SearchOptions;
@@ -667,7 +666,7 @@ fn selector_is_name_based(selector: &crate::query::symbol::SymbolSelector) -> bo
 /// `None` when it has no package component. Shared by `compare_graph_to_scip` to label a
 /// contradiction whose compiler resolution is external.
 fn resolved_external_label(scip_symbol: &str) -> Option<String> {
-    oracle::package_of(scip_symbol).map(|package| format!("resolved-external({package})"))
+    rag_rat_oracle::package_of(scip_symbol).map(|package| format!("resolved-external({package})"))
 }
 
 /// Append a quantitative clause to `summary.completeness_risk` describing how many of the SHOWN

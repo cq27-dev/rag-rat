@@ -29,6 +29,7 @@ mod run;
 mod scip;
 mod status;
 mod store;
+pub mod test_support;
 #[cfg(test)]
 mod tests;
 
@@ -39,11 +40,14 @@ pub use auto_run::{AutoRunDecision, AutoRunInputs, auto_run_decision};
 pub use corpus::{
     HealthViolation, check_corpus_health, corpora_for_tier, corpus_by_id, load_corpora,
 };
-pub(crate) use join::package_of;
+pub use join::package_of;
 pub use library_usage::{
     LibraryUsageCallSite, LibraryUsageEntry, LibraryUsageOptions, LibraryUsageReport,
     LibraryUsageStatus, check_library_usage,
 };
+// LSP position conversion (line/char <-> byte under an encoding) — consumed by the engine's
+// corpus fixtures; the rest of `lsp` stays private.
+pub use lsp::position::{LineIndex, LspEncoding, LspPosition};
 pub use manifest::{ToolAvailability, ToolManifest};
 pub use report::{
     CorpusHealth, CorpusProfile, OracleResolutionReport, REPORT_SCHEMA_VERSION, ResolutionBefore,
@@ -54,7 +58,7 @@ pub use run::{OracleEvalMetrics, RecallCalls};
 use rusqlite::Connection;
 use serde::Serialize;
 pub use status::OracleStatus;
-pub(crate) use store::{
+pub use store::{
     EdgeOracleComparison, EdgeOracleVerdict, callee_moniker_current_clause, current_callee_monikers,
 };
 
@@ -538,7 +542,7 @@ pub fn scip_content_fingerprint(scip_bytes: &[u8]) -> String {
 /// helper (`edge_oracle.file_sha == files.sha256`), so a drifted file's edge never surfaces
 /// `Compiler` (it reverts to heuristic display). `edge_ids` come from the heuristic traversal, so
 /// the result is a subset.
-pub(crate) fn current_oracle_verdicts_for_edges(
+pub fn current_oracle_verdicts_for_edges(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
@@ -560,7 +564,7 @@ pub(crate) fn current_oracle_verdicts_for_edges(
 /// by `edge_id` → `(kind, resolved_symbol_id)`. The whole-graph sibling of
 /// [`current_oracle_verdicts_for_edges`], for symbol-importance ranking which walks every edge (one
 /// scan, not a query per edge). Same scope + currency gate via the store helper.
-pub(crate) fn current_oracle_verdicts_all(
+pub fn current_oracle_verdicts_all(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
@@ -572,7 +576,7 @@ pub(crate) fn current_oracle_verdicts_all(
 
 /// Whether ANY oracle run exists in the active checkout (across all tools) — the cheap existence
 /// probe that short-circuits the per-tool [`latest_run_tool_version`] calls when nothing ever ran.
-pub(crate) fn any_run_in_scope(
+pub fn any_run_in_scope(
     conn: &Connection,
     commit_sha: &str,
     worktree_id: &str,
@@ -660,7 +664,7 @@ pub fn latest_run_started_at(
 /// Load the CURRENT, in-scope `edge_oracle` verdicts joined to their heuristic edge resolution —
 /// the data `compare_graph_to_scip` diffs (it keeps `Contradict` rows). Scoped + current via the
 /// store helper, so drifted/dirty rows never appear as disagreements.
-pub(crate) fn current_oracle_comparisons(
+pub fn current_oracle_comparisons(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,

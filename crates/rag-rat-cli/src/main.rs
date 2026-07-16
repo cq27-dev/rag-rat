@@ -191,7 +191,7 @@ fn spawn_detached_version_refresh(config: &rag_rat_base::config::Config) {
 /// outcome (tool not installed) is a no-op: the loop simply sleeps to the next tick rather than
 /// spinning on it.
 fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
-    use rag_rat_core::index::oracle::{self, AutoRunDecision, AutoRunInputs, OracleTool};
+    use rag_rat_oracle::{AutoRunDecision, AutoRunInputs, OracleTool};
     if !config.oracle.auto_run {
         return;
     }
@@ -248,20 +248,23 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
         for &tool in OracleTool::ALL {
             // Skip a backend whose language this checkout doesn't index — never auto-run it here
             // (the status registry stays broad; only background runs are gated).
-            let manifest = oracle::ToolManifest::for_tool(tool);
+            let manifest = rag_rat_oracle::ToolManifest::for_tool(tool);
             if !manifest.languages.iter().any(|lang| configured_languages.contains(lang)) {
                 continue;
             }
             // Cheap probe before any decision: an uninstalled tool can never run, so don't even
             // read its run history.
-            if matches!(oracle::probe_oracle_tool(tool), oracle::ToolAvailability::Blocked { .. }) {
+            if matches!(
+                rag_rat_oracle::probe_oracle_tool(tool),
+                rag_rat_oracle::ToolAvailability::Blocked { .. }
+            ) {
                 continue;
             }
             let last_run_ms = {
                 let db = open_index(config)?;
                 db.latest_oracle_run_started_at(tool)?
             };
-            let decision = oracle::auto_run_decision(AutoRunInputs {
+            let decision = rag_rat_oracle::auto_run_decision(AutoRunInputs {
                 enabled: true,
                 now_ms,
                 last_index_change_ms,
@@ -296,11 +299,11 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
             .map(Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir)
             .join(format!("rag-rat-oracle-auto-{}.scip", std::process::id()));
-        let production = oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
+        let production = rag_rat_oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
         let _ = fs::remove_file(&scip_output);
         match production? {
-            oracle::ScipProduction::Blocked { .. } => Ok(()),
-            oracle::ScipProduction::Produced { version, bytes, production_sha } => {
+            rag_rat_oracle::ScipProduction::Blocked { .. } => Ok(()),
+            rag_rat_oracle::ScipProduction::Produced { version, bytes, production_sha } => {
                 with_oracle_write_lock(config, |db| {
                     db.run_oracle_at(
                         tool,

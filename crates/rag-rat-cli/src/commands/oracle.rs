@@ -65,7 +65,7 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
         let tool_version = format!(
             "scip-file:{}@{}",
             scip_path.file_name().and_then(|n| n.to_str()).unwrap_or("index.scip"),
-            rag_rat_core::index::oracle::scip_content_fingerprint(&scip_bytes),
+            rag_rat_oracle::scip_content_fingerprint(&scip_bytes),
         );
         let report = with_oracle_write_lock(config, |db| {
             db.run_oracle_from_scip(tool, &tool_version, &scip_bytes)
@@ -86,15 +86,11 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
     // UX before anything touches the index (#88 review): opening the index is not guaranteed
     // side-effect free (a stale graph version triggers an edge reindex), and a Blocked probe
     // must not be preempted by an index-open failure.
-    if let rag_rat_core::index::oracle::ToolAvailability::Blocked { tool, program, hint } =
-        rag_rat_core::index::oracle::probe_oracle_tool(tool)
+    if let rag_rat_oracle::ToolAvailability::Blocked { tool, program, hint } =
+        rag_rat_oracle::probe_oracle_tool(tool)
     {
         eprintln!("oracle: {hint}");
-        return print_output(&rag_rat_core::index::oracle::OracleRunOutcome::Blocked {
-            tool,
-            program,
-            hint,
-        });
+        return print_output(&rag_rat_oracle::OracleRunOutcome::Blocked { tool, program, hint });
     }
 
     // Snapshot the indexed shas BEFORE spawning (#83). The query itself is a cheap read, but
@@ -119,23 +115,14 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir)
         .join(format!("rag-rat-oracle-{}.scip", std::process::id()));
-    let production =
-        rag_rat_core::index::oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
+    let production = rag_rat_oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
     let _ = fs::remove_file(&scip_output);
     match production? {
-        rag_rat_core::index::oracle::ScipProduction::Blocked { tool, program, hint } => {
+        rag_rat_oracle::ScipProduction::Blocked { tool, program, hint } => {
             eprintln!("oracle: {hint}");
-            print_output(&rag_rat_core::index::oracle::OracleRunOutcome::Blocked {
-                tool,
-                program,
-                hint,
-            })
+            print_output(&rag_rat_oracle::OracleRunOutcome::Blocked { tool, program, hint })
         },
-        rag_rat_core::index::oracle::ScipProduction::Produced {
-            version,
-            bytes,
-            production_sha,
-        } => {
+        rag_rat_oracle::ScipProduction::Produced { version, bytes, production_sha } => {
             // The join's content gate revalidates against current disk bytes under the lock;
             // `production_sha` (per-document disk hashes captured the instant the subprocess
             // finished) pins the `.scip` to the content it was built against (#82 TOCTOU); and
@@ -170,9 +157,9 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
 /// ARRAY of per-tool objects: every known tool by default, one element under `--tool` — the shape
 /// stays stable as language backends (#71 TS, #72 Kotlin) join the registry.
 fn oracle_status(db: &IndexDatabase, args: &OracleStatusArgs) -> anyhow::Result<()> {
-    let tools: Vec<rag_rat_core::index::oracle::OracleTool> = match args.tool {
+    let tools: Vec<rag_rat_oracle::OracleTool> = match args.tool {
         Some(tool) => vec![tool.core()],
-        None => rag_rat_core::index::oracle::OracleTool::ALL.to_vec(),
+        None => rag_rat_oracle::OracleTool::ALL.to_vec(),
     };
     let mut entries = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -203,8 +190,6 @@ fn oracle_status(db: &IndexDatabase, args: &OracleStatusArgs) -> anyhow::Result<
 /// UX: this is a measurement runner over a corpus whose tool CI is expected to have installed, so a
 /// silent skip would let a broken environment pass green.
 fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()> {
-    use rag_rat_core::index::oracle;
-
     // Load the corpus profile (defaults to the committed `tools/oracle-corpora.toml`).
     let corpora_path = args
         .corpora
@@ -213,15 +198,15 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
     let toml_str = fs::read_to_string(&corpora_path).map_err(|err| {
         anyhow::anyhow!("failed to read corpora file {}: {err}", corpora_path.display())
     })?;
-    let corpora = oracle::load_corpora(&toml_str)?;
-    let profile = oracle::corpus_by_id(&corpora, &args.corpus)
+    let corpora = rag_rat_oracle::load_corpora(&toml_str)?;
+    let profile = rag_rat_oracle::corpus_by_id(&corpora, &args.corpus)
         .ok_or_else(|| {
             anyhow::anyhow!("no corpus `{}` in {}", args.corpus, corpora_path.display())
         })?
         .clone();
 
     // Map the corpus's declared tool id to an oracle backend.
-    let tool = oracle::OracleTool::from_db_str(&profile.tool).ok_or_else(|| {
+    let tool = rag_rat_oracle::OracleTool::from_db_str(&profile.tool).ok_or_else(|| {
         anyhow::anyhow!(
             "corpus `{}` names unknown oracle tool `{}`",
             profile.corpus_id,
@@ -253,18 +238,20 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
         let tool_version = format!(
             "scip-file:{}@{}",
             scip_path.file_name().and_then(|n| n.to_str()).unwrap_or("index.scip"),
-            oracle::scip_content_fingerprint(&scip_bytes),
+            rag_rat_oracle::scip_content_fingerprint(&scip_bytes),
         );
-        let provenance = oracle::RunProvenance {
+        let provenance = rag_rat_oracle::RunProvenance {
             tool_version,
             rag_rat_commit: rag_rat_commit.clone(),
             // worktree_id filled under the lock (it's the active checkout's, read from the db).
             worktree_id: String::new(),
-            production_sha: oracle::scip_content_fingerprint(&scip_bytes),
+            production_sha: rag_rat_oracle::scip_content_fingerprint(&scip_bytes),
         };
         with_oracle_write_lock(config, |db| {
-            let provenance =
-                oracle::RunProvenance { worktree_id: db.active_worktree_id.clone(), ..provenance };
+            let provenance = rag_rat_oracle::RunProvenance {
+                worktree_id: db.active_worktree_id.clone(),
+                ..provenance
+            };
             // A pre-built `--scip` arms neither content-drift gate and has no spawn moment.
             db.run_oracle_report(
                 &profile,
@@ -279,7 +266,9 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
         // No pre-built index: probe first so a missing tool fails before touching the index, then
         // snapshot the pre-spawn shas (under the lock) and produce the `.scip` outside it
         // (#82/#83).
-        if let oracle::ToolAvailability::Blocked { hint, .. } = oracle::probe_oracle_tool(tool) {
+        if let rag_rat_oracle::ToolAvailability::Blocked { hint, .. } =
+            rag_rat_oracle::probe_oracle_tool(tool)
+        {
             anyhow::bail!("oracle tool for corpus `{}` unavailable: {hint}", profile.corpus_id);
         }
         let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
@@ -291,24 +280,24 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
             .map(Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir)
             .join(format!("rag-rat-oracle-report-{}.scip", std::process::id()));
-        let production = oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
+        let production = rag_rat_oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
         let _ = fs::remove_file(&scip_output);
         match production? {
-            oracle::ScipProduction::Blocked { hint, .. } => {
+            rag_rat_oracle::ScipProduction::Blocked { hint, .. } => {
                 anyhow::bail!("oracle tool for corpus `{}` unavailable: {hint}", profile.corpus_id);
             },
-            oracle::ScipProduction::Produced { version, bytes, production_sha } => {
-                let provenance = oracle::RunProvenance {
+            rag_rat_oracle::ScipProduction::Produced { version, bytes, production_sha } => {
+                let provenance = rag_rat_oracle::RunProvenance {
                     // Fold the pinned-toolchain fingerprint into the probed `--version` so a
                     // lockfile bump that changes the indexer's output breaks Δ
                     // comparability (#185/#197).
                     tool_version: with_oracle_tool_version_suffix(version),
                     rag_rat_commit: rag_rat_commit.clone(),
                     worktree_id: String::new(),
-                    production_sha: oracle::scip_content_fingerprint(&bytes),
+                    production_sha: rag_rat_oracle::scip_content_fingerprint(&bytes),
                 };
                 with_oracle_write_lock(config, |db| {
-                    let provenance = oracle::RunProvenance {
+                    let provenance = rag_rat_oracle::RunProvenance {
                         worktree_id: db.active_worktree_id.clone(),
                         ..provenance
                     };
@@ -362,7 +351,7 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
 ///    ["**/*.<ext>", …]`, `exclude = []`).
 fn ensure_checkout_matches_corpus(
     config: &Config,
-    profile: &rag_rat_core::index::oracle::CorpusProfile,
+    profile: &rag_rat_oracle::CorpusProfile,
 ) -> anyhow::Result<()> {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -514,7 +503,7 @@ mod tests {
     fn checkout_bindings_must_match_corpus() {
         use std::collections::BTreeMap;
 
-        use rag_rat_core::index::oracle::{CorpusHealth, CorpusProfile};
+        use rag_rat_oracle::{CorpusHealth, CorpusProfile};
 
         // A target carrying the SAME default filters the simple `[target_bindings]` form renders
         // (`include = ["**/*.rs"]`, no exclude), so the bindings-match check accepts it.

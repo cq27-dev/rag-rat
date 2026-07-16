@@ -118,7 +118,7 @@ pub fn check_corpus_health(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::oracle::{
+    use crate::{
         OracleEvalMetrics, OracleReport, ResolutionBefore, ResolutionDelta, RunProvenance,
     };
 

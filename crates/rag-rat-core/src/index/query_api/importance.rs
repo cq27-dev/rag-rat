@@ -5,7 +5,6 @@
 use rusqlite::OptionalExtension;
 
 use super::*;
-use crate::index::oracle;
 use crate::query::pagerank::ImportantSymbolsResult;
 
 /// Inputs to [`IndexDatabase::important_symbols`]. The seed (`personalize`) takes names, paths, or
@@ -407,11 +406,12 @@ impl IndexDatabase {
     ) -> anyhow::Result<
         Option<std::collections::HashMap<i64, crate::query::pagerank::EdgeOracleEffect>>,
     > {
-        use crate::index::oracle::OracleResolutionKind as Kind;
+        use rag_rat_oracle::OracleResolutionKind as Kind;
+
         use crate::query::pagerank::EdgeOracleEffect;
         // CPU gate: one scoped existence query, so the dominant "no oracle ever" path skips the
         // per-tool version lookups and the whole-graph verdict scan entirely.
-        if !oracle::any_run_in_scope(
+        if !rag_rat_oracle::any_run_in_scope(
             self.storage.connection(),
             &self.active_commit_sha,
             &self.active_worktree_id,
@@ -419,11 +419,11 @@ impl IndexDatabase {
             return Ok(None);
         }
         let mut effects: Option<std::collections::HashMap<i64, EdgeOracleEffect>> = None;
-        for &tool in oracle::OracleTool::ALL {
+        for &tool in rag_rat_oracle::OracleTool::ALL {
             let Some(version) = self.latest_oracle_run_version(tool)? else {
                 continue;
             };
-            let verdicts = oracle::current_oracle_verdicts_all(
+            let verdicts = rag_rat_oracle::current_oracle_verdicts_all(
                 self.storage.connection(),
                 tool,
                 &version,

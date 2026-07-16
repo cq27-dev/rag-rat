@@ -2,9 +2,7 @@
 //! `resolved-external` call site AND its `external_symbols` contract, then assert the join surfaces
 //! the current signature/docs and the deprecation verdict.
 use super::*;
-use crate::index::oracle::{
-    LibraryUsageOptions, LibraryUsageStatus, OracleResolutionKind, check_library_usage,
-};
+use crate::{LibraryUsageOptions, LibraryUsageStatus, OracleResolutionKind, check_library_usage};
 
 /// Build a `.scip` for a single external call site in `caller.rs` plus the external contracts.
 fn scip_external_call(

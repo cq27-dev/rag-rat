@@ -1,8 +1,8 @@
 //! SCIP moniker anchors for repo memories (#70, SCIP phase 3).
 //!
 //! `oracle run` records each in-corpus SCIP definition's symbol string ("moniker") against the
-//! defining logical symbol in `logical_symbol_monikers` (see `index/oracle/run.rs`). This module
-//! is the memory-side consumer:
+//! defining logical symbol in `logical_symbol_monikers` (see `rag-rat-oracle`'s `run.rs`). This
+//! module is the memory-side consumer:
 //!
 //! - **Auto-binding:** a memory created (or rebound) on a symbol whose logical symbol has a known
 //!   moniker gets an additional `scip_moniker` binding row automatically — binding_id is the

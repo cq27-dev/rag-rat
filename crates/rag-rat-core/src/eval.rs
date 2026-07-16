@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rag_rat_base::config::Config;
+use rag_rat_oracle::{OracleEvalMetrics, OracleTool, RecallCalls};
 use serde::{Deserialize, Serialize};
 
 use crate::IndexDatabase;
-use crate::index::oracle::{OracleEvalMetrics, OracleTool, RecallCalls};
 use crate::index::{OracleShaSnapshots, git_history};
 
 const TOP_K: usize = 10;
@@ -1380,7 +1380,8 @@ mod tests {
     /// through the public `IndexDatabase` API (`run_oracle` + `oracle_eval_metrics`, both scoped to
     /// the rebuilt fixture's active checkout) and attaches `OracleEvalMetrics` to the report. This
     /// exercises `run_oracle_eval` and the `query_api` oracle wrappers — the integration seam the
-    /// unit tests can't reach (they call the `oracle::` functions directly on a synthetic conn).
+    /// unit tests can't reach (they call the `rag_rat_oracle::` functions directly on a synthetic
+    /// conn).
     #[test]
     fn eval_suite_runs_oracle_when_scip_fixture_present() {
         use ::protobuf::Message;

@@ -4,11 +4,11 @@
 use std::path::Path;
 
 use rag_rat_base::time::now_ms;
-
-use super::*;
-use crate::index::oracle::{
+use rag_rat_oracle::{
     self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls,
 };
+
+use super::*;
 
 /// The two indexed-sha snapshots that arm the oracle's content-drift gates (#82/#83): `production`
 /// is the scip-vs-disk pin taken at the tool subprocess's exit; `pre_spawn` is the indexed-sha pin
@@ -61,7 +61,7 @@ impl IndexDatabase {
             );
         };
         let root = root.to_path_buf();
-        oracle::run_oracle_at(
+        rag_rat_oracle::run_oracle_at(
             self.storage.connection(),
             tool,
             tool_version,
@@ -82,7 +82,7 @@ impl IndexDatabase {
     pub fn oracle_pre_spawn_snapshot(
         &self,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        oracle::pre_spawn_snapshot(
+        rag_rat_oracle::pre_spawn_snapshot(
             self.storage.connection(),
             &self.active_commit_sha,
             &self.active_worktree_id,
@@ -99,7 +99,7 @@ impl IndexDatabase {
         tool_version: &str,
         recall_calls: RecallCalls,
     ) -> anyhow::Result<OracleEvalMetrics> {
-        oracle::oracle_eval_metrics(
+        rag_rat_oracle::oracle_eval_metrics(
             self.storage.connection(),
             tool,
             tool_version,
@@ -109,19 +109,20 @@ impl IndexDatabase {
         )
     }
 
-    /// Assemble the typed before/after [`oracle::OracleResolutionReport`] (C2) for a just-completed
-    /// run over this checkout: the heuristic "before" resolution counts + moniker tally are read
-    /// from the index, the eval metrics are diffed from `edge_oracle`, and everything is stamped
-    /// onto the C0 schema with the caller's `profile` + `provenance`. `run` is the just-produced
-    /// [`OracleReport`] (its run-only counts can't be reconstructed from the side tables).
+    /// Assemble the typed before/after [`rag_rat_oracle::OracleResolutionReport`] (C2) for a
+    /// just-completed run over this checkout: the heuristic "before" resolution counts +
+    /// moniker tally are read from the index, the eval metrics are diffed from `edge_oracle`,
+    /// and everything is stamped onto the C0 schema with the caller's `profile` + `provenance`.
+    /// `run` is the just-produced [`OracleReport`] (its run-only counts can't be reconstructed
+    /// from the side tables).
     pub fn resolution_report(
         &self,
-        profile: &oracle::CorpusProfile,
-        provenance: &oracle::RunProvenance,
+        profile: &rag_rat_oracle::CorpusProfile,
+        provenance: &rag_rat_oracle::RunProvenance,
         tool: OracleTool,
         run: &OracleReport,
-    ) -> anyhow::Result<oracle::OracleResolutionReport> {
-        oracle::resolution_report(
+    ) -> anyhow::Result<rag_rat_oracle::OracleResolutionReport> {
+        rag_rat_oracle::resolution_report(
             self.storage.connection(),
             profile,
             provenance,
@@ -140,20 +141,23 @@ impl IndexDatabase {
     /// the content-drift gates exactly as [`Self::run_oracle_at`].
     pub fn run_oracle_report(
         &self,
-        profile: &oracle::CorpusProfile,
-        provenance: &oracle::RunProvenance,
+        profile: &rag_rat_oracle::CorpusProfile,
+        provenance: &rag_rat_oracle::RunProvenance,
         tool: OracleTool,
         scip_bytes: &[u8],
         shas: OracleShaSnapshots<'_>,
         started_at_ms: i64,
-    ) -> anyhow::Result<(oracle::OracleResolutionReport, Vec<oracle::HealthViolation>)> {
+    ) -> anyhow::Result<(
+        rag_rat_oracle::OracleResolutionReport,
+        Vec<rag_rat_oracle::HealthViolation>,
+    )> {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!(
                 "index has no source_root metadata; rebuild required for the oracle pass"
             );
         };
         let root = root.to_path_buf();
-        oracle::run_oracle_report(
+        rag_rat_oracle::run_oracle_report(
             self.storage.connection(),
             profile,
             provenance,
@@ -175,7 +179,7 @@ impl IndexDatabase {
         tool: OracleTool,
         tool_version: &str,
     ) -> anyhow::Result<OracleStatus> {
-        oracle::oracle_status(
+        rag_rat_oracle::oracle_status(
             self.storage.connection(),
             tool,
             tool_version,
@@ -186,21 +190,21 @@ impl IndexDatabase {
 
     /// `rag-rat oracle run [--tool <id>]` without a pre-built `--scip`: invoke the indexer to
     /// produce a `.scip` (to a caller-owned temp path), then run the phase-1 join over it. A
-    /// missing or unrunnable tool returns [`oracle::OracleRunOutcome::Blocked`] with an install
-    /// hint (the CLI prints it and exits 0) — never an error. Records an `oracle_runs` row on
-    /// success.
+    /// missing or unrunnable tool returns [`rag_rat_oracle::OracleRunOutcome::Blocked`] with an
+    /// install hint (the CLI prints it and exits 0) — never an error. Records an `oracle_runs`
+    /// row on success.
     pub fn run_oracle_with_tool(
         &self,
         tool: OracleTool,
         scip_output: &Path,
-    ) -> anyhow::Result<oracle::OracleRunOutcome> {
+    ) -> anyhow::Result<rag_rat_oracle::OracleRunOutcome> {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!(
                 "index has no source_root metadata; rebuild required for the oracle pass"
             );
         };
         let root = root.to_path_buf();
-        oracle::run_oracle_with_tool(
+        rag_rat_oracle::run_oracle_with_tool(
             self.storage.connection(),
             tool,
             &root,
@@ -218,7 +222,7 @@ impl IndexDatabase {
         tool: OracleTool,
         tool_version: &str,
         scip_bytes: &[u8],
-    ) -> anyhow::Result<oracle::OracleReport> {
+    ) -> anyhow::Result<rag_rat_oracle::OracleReport> {
         // A pre-built `--scip` carries no production moment or spawn we control, so neither the
         // scip-vs-disk nor the pre-spawn gate can arm — only the index-vs-disk gate applies.
         self.run_oracle(tool, tool_version, scip_bytes, OracleShaSnapshots::default())
@@ -226,14 +230,14 @@ impl IndexDatabase {
 
     /// Probe whether an oracle tool is installed, for `oracle status`. A `Blocked` probe is
     /// informational (the tool isn't installed), never an error.
-    pub fn probe_oracle_tool(&self, tool: OracleTool) -> oracle::ToolAvailability {
-        oracle::probe_oracle_tool(tool)
+    pub fn probe_oracle_tool(&self, tool: OracleTool) -> rag_rat_oracle::ToolAvailability {
+        rag_rat_oracle::probe_oracle_tool(tool)
     }
 
     /// The `tool_version` of the most recent oracle run for `tool` in this checkout, or `None` when
     /// no run exists. The version `oracle status` reports verdict counts against.
     pub fn latest_oracle_run_version(&self, tool: OracleTool) -> anyhow::Result<Option<String>> {
-        oracle::latest_run_tool_version(
+        rag_rat_oracle::latest_run_tool_version(
             self.storage.connection(),
             tool,
             &self.active_commit_sha,
@@ -245,7 +249,7 @@ impl IndexDatabase {
     /// or `None` when none exists — the staleness clock the background auto-fresh oracle (Phase
     /// 5) compares against the index's `indexed_at_ms` to decide whether verdicts are stale.
     pub fn latest_oracle_run_started_at(&self, tool: OracleTool) -> anyhow::Result<Option<i64>> {
-        oracle::latest_run_started_at(
+        rag_rat_oracle::latest_run_started_at(
             self.storage.connection(),
             tool,
             &self.active_commit_sha,

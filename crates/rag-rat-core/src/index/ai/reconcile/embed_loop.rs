@@ -846,7 +846,7 @@ mod freshness_version_tests {
         )
         .unwrap();
         let chunk_id = conn.last_insert_rowid();
-        crate::index::chunk_text_store::seed_chunk_text(conn, chunk_id, &text).unwrap();
+        rag_rat_db::chunk_text_store::seed_chunk_text(conn, chunk_id, &text).unwrap();
         chunk_id
     }
 

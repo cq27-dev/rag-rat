@@ -193,8 +193,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::index::oracle::lsp::client::test_support::client_with_server;
-    use crate::index::oracle::lsp::position::LspEncoding;
+    use crate::lsp::client::test_support::client_with_server;
+    use crate::lsp::position::LspEncoding;
 
     /// A canned definition the fake server returns: `(target_uri, start (line, char), end)`.
     type FakeDef = (&'static str, (u32, u32), (u32, u32));

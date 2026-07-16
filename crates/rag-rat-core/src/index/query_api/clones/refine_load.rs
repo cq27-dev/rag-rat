@@ -125,11 +125,8 @@ pub(crate) fn oracle_callee_coverage_exists(
         let id_placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
         let commit_slot = format!("?{}", chunk.len() + 1);
         let worktree_slot = format!("?{}", chunk.len() + 2);
-        let current_clause = crate::index::oracle::callee_moniker_current_clause(
-            conn,
-            &commit_slot,
-            &worktree_slot,
-        )?;
+        let current_clause =
+            rag_rat_oracle::callee_moniker_current_clause(conn, &commit_slot, &worktree_slot)?;
         let sql = format!(
             "SELECT EXISTS(
                  SELECT 1

@@ -3,7 +3,7 @@
 use std::sync::mpsc::Sender;
 
 use rag_rat_base::language::Language;
-use rag_rat_core::index::oracle::{OracleTool, ToolAvailability, ToolManifest, probe_oracle_tool};
+use rag_rat_oracle::{OracleTool, ToolAvailability, ToolManifest, probe_oracle_tool};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
