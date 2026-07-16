@@ -43,7 +43,7 @@ mod listener {
     use rag_rat_base::config::Config;
     use rag_rat_base::locks::{self, FileLock};
     use rag_rat_core::query::grep_augment::{self, DedupeFilter};
-    use rag_rat_core::storage::IndexConnection;
+    use rag_rat_db::storage::IndexConnection;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::task::JoinHandle;
@@ -223,8 +223,8 @@ mod listener_tests {
     use std::time::Duration;
 
     use rag_rat_base::config::Config;
-    use rag_rat_core::index::schema;
-    use rag_rat_core::storage::IndexConnection;
+    use rag_rat_db::schema;
+    use rag_rat_db::storage::IndexConnection;
 
     use super::*;
 
@@ -245,7 +245,7 @@ mod listener_tests {
         let config = Config::load(&config_path).unwrap();
 
         let rw = IndexConnection::open(&config.database).unwrap();
-        schema::apply(rw.connection()).unwrap();
+        schema::apply(rw.connection(), &rag_rat_core::index::migration_hooks()).unwrap();
         // Seed at the scope a NON-git index uses (commit_sha '', worktree_id = the root), so the
         // listener's worktree-scoped read (#219) surfaces the file — the listener now installs the
         // scope view (resolve_worktree_scope → an absent request cwd resolves to config.root → base

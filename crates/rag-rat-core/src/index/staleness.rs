@@ -122,7 +122,7 @@ impl IndexDatabase {
         // dict SELECT + dictionary prep is ~20x the decompress itself, so reusing it across the
         // batch keeps the healing-search check cheap (#77 Phase 2 read-path perf).
         let dicts = crate::query::chunk_text_dicts(self.storage.connection())?;
-        let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+        let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
         let mut stale = Vec::new();
         let mut seen = BTreeSet::new();
         for hit in hits {

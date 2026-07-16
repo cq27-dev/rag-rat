@@ -4,7 +4,7 @@ pub(crate) fn parser_failure_count(conn: &Connection) -> anyhow::Result<u64> {
     // `parser_failures` is direct-scoped (V040): count only the ACTIVE repo's failures, matching
     // the scoped `IndexDatabase::parser_failure_count` twin — a sibling repo's parse failures must
     // not depress this repo's graph-coverage confidence in a consolidated DB.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     crate::index::scoped_table_row_count(conn, "parser_failures", &repo_id)
 }
 
@@ -48,7 +48,7 @@ pub(crate) fn git_commits_for_paths(
     // `git_commits` / `git_file_changes` are direct-scoped (V040); join AND filter on `repo_id` so
     // a consolidated DB never attributes a sibling repo's history to this path (a fork shares
     // hashes).
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut added = 0usize;
     let mut stmt = conn.prepare(
         "
@@ -116,7 +116,7 @@ pub(crate) fn papertrail_refs_for_paths(
         return Ok(());
     }
     // `papertrail_refs` is direct-scoped: only surface the ACTIVE repo's refs for this path.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut added = 0usize;
     let mut stmt = conn.prepare(
         "
@@ -174,7 +174,7 @@ pub(crate) fn papertrail_rationale_for_query(
     }
     // `papertrail_fts` is one index over every repo's papertrail; the `repo_id` filter is
     // MANDATORY so a MATCH here never surfaces a sibling repo's issue in a consolidated DB.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT url, title, classification
@@ -259,8 +259,9 @@ pub(crate) fn collect_rows<T>(
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_db::schema;
+
     use super::*;
-    use crate::index::schema;
 
     fn commit(conn: &Connection, hash: &str, path: &str, ts: i64) {
         conn.execute(
@@ -281,7 +282,7 @@ mod tests {
     #[test]
     fn git_commits_budget_is_per_path_not_per_commit_row() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         // `hot.rs` has THREE commits; `cool.rs` has one. All of hot.rs's commits collapse to a
         // single `(hot.rs, "git_commit_touched_file")` item.
         commit(&conn, "c1", "hot.rs", 30);

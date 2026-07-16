@@ -62,7 +62,7 @@ fn configure_jemalloc() {
 fn main() -> anyhow::Result<()> {
     // Record this binary's git-stamped version (#585) so migration provenance and the stranded-
     // binary refusal name a dev build (`0.16.0+g<hash>`) distinctly from a release (`0.16.0`).
-    rag_rat_core::set_binary_version(env!("RAG_RAT_VERSION"));
+    rag_rat_base::version::set_binary_version(env!("RAG_RAT_VERSION"));
     #[cfg(all(not(target_env = "msvc"), not(target_os = "android")))]
     configure_jemalloc();
     let cli = Cli::parse();

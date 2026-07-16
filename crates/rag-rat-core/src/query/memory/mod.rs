@@ -36,12 +36,12 @@ pub(crate) use validate::*;
 /// read/write gates its `repo_id` predicate on this: `Some(repo_id)` scopes to the active repo,
 /// `None` runs the original unscoped SQL. See `schema::periphery_repo_scope` for the deferral.
 pub(crate) fn memory_repo_scope(conn: &Connection) -> anyhow::Result<Option<String>> {
-    Ok(crate::index::schema::periphery_repo_scope(conn, "repo_memories")?)
+    Ok(rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?)
 }
 
 /// The ` AND repo_memories.repo_id = '…'` predicate for a memory read, or `""` when unscoped.
 pub(crate) fn memory_repo_scope_clause(scope: &Option<String>) -> String {
-    crate::index::schema::periphery_repo_scope_clause(scope, "repo_memories")
+    rag_rat_db::schema::periphery_repo_scope_clause(scope, "repo_memories")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -646,7 +646,7 @@ mod tests {
     /// A fresh in-memory index scoped to repo `r` — the fixture for the summary-surfacing tests.
     fn summary_conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&c).unwrap();
+        rag_rat_db::schema::apply(&c, &crate::index::migration_hooks()).unwrap();
         c.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
         )

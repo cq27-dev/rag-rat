@@ -281,7 +281,7 @@ fn watcher_main(
 /// `lock_timeout` (`Duration::ZERO` for a non-blocking try on the event loop — it must not stall
 /// event classification; [`SKIP_TIMEOUT`] at shutdown). The persist goes through the LIGHTWEIGHT,
 /// NON-CREATING, NON-BLOCKING config-scoped path
-/// ([`crate::index::record_watch_placement_failures_scoped`]).
+/// ([`rag_rat_db::meta::record_watch_placement_failures_scoped`]).
 ///
 /// Returns whether the flush SETTLED: `true` = persisted, or nothing to persist (no failures, no
 /// index yet, repo not registered) — the caller may advance its low-water mark; `false` = a
@@ -302,7 +302,7 @@ pub(crate) fn flush_watch_placement_failures(
         // The flock is held (a pass mid-write, another process) — transient; retry next tick.
         return false;
     };
-    match crate::index::record_watch_placement_failures_scoped(config, failures) {
+    match rag_rat_db::meta::record_watch_placement_failures_scoped(config, failures) {
         Ok(settled) => settled,
         Err(error) => {
             // A non-busy error (schema corruption, a vanished file) can't be fixed by retrying —

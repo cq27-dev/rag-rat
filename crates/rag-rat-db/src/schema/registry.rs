@@ -5,20 +5,22 @@ use rag_rat_base::repo_identity::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::hooks::MigrationHooks;
+
 /// The `temp.connection_context` key under which the scope view stashes the active repo id (beside
 /// `commit_sha` / `worktree_id`). [`active_repo_id`] reads it; `install_scope_view` writes it.
-pub(crate) const CONNECTION_CONTEXT_REPO_KEY: &str = "repo_id";
+pub const CONNECTION_CONTEXT_REPO_KEY: &str = "repo_id";
 
 /// The `temp.connection_context` key under which the scope view stashes the active file GENERATION
 /// (A6) — the value the `files` view filters on. `write_scope_view` writes it (the LIVE generation
 /// for a reader/incremental open, the WRITE generation for the connection driving a full rebuild);
 /// [`active_generation`] reads it back for the view-less heal paths.
-pub(crate) const CONNECTION_CONTEXT_GENERATION_KEY: &str = "files_generation";
+pub const CONNECTION_CONTEXT_GENERATION_KEY: &str = "files_generation";
 
 /// The `repo_meta` key holding a repo's LIVE `files.generation` — the pointer a full rebuild flips
 /// once its freshly-staged generation is complete (A6). Absent ⇒ 0 (a fresh index, and every row a
 /// pre-V043 upgrade carries), so an un-restaged index needs no `repo_meta` write to be visible.
-pub(crate) const LIVE_FILES_GENERATION_META_KEY: &str = "live_files_generation";
+pub const LIVE_FILES_GENERATION_META_KEY: &str = "live_files_generation";
 
 /// The direct-scoped tables whose [`LEGACY_REPO_ID`] placeholder rows [`register_repo`] re-points
 /// at the real id when it adopts a legacy DB. V040 (phase A3) added the core tables; V041 (phase
@@ -157,8 +159,9 @@ pub fn register_repo(
     identity: &RepoIdentity,
     root: &Path,
     now_ms: i64,
+    hooks: &MigrationHooks,
 ) -> rusqlite::Result<String> {
-    register_repo_inner(conn, identity, root, now_ms, true)
+    register_repo_inner(conn, identity, root, now_ms, true, hooks)
 }
 
 /// Register/adopt `identity` WITHOUT recording the working-tree `root` in `repo_roots` — the
@@ -174,8 +177,9 @@ pub fn register_repo_read_only(
     identity: &RepoIdentity,
     root: &Path,
     now_ms: i64,
+    hooks: &MigrationHooks,
 ) -> rusqlite::Result<String> {
-    register_repo_inner(conn, identity, root, now_ms, false)
+    register_repo_inner(conn, identity, root, now_ms, false, hooks)
 }
 
 /// The registration impl shared by [`register_repo`] (records the root) and
@@ -187,6 +191,7 @@ fn register_repo_inner(
     root: &Path,
     now_ms: i64,
     record_root: bool,
+    hooks: &MigrationHooks,
 ) -> rusqlite::Result<String> {
     // Defense in depth: the resolver already refuses a pinned placeholder and never derives it, but
     // a caller can hand-build a `RepoIdentity`. Registering the placeholder (or an empty/whitespace
@@ -463,7 +468,7 @@ fn register_repo_inner(
         // `realign_logical_symbol_ids` call below. Guarded like the loop above (a partial-schema
         // bootstrap fixture can lack the table or the V042 column); idempotent.
         if super::column_exists(&tx, "dream_findings", "repo_id")? {
-            crate::dream::rederive_finding_ids(&tx)?;
+            (hooks.rederive_dream_finding_ids)(&tx)?;
         }
         // Move the source id's recorded roots onto the new id BEFORE the source `repos` row is
         // deleted (its FK is `ON DELETE CASCADE`, so the roots would otherwise be dropped). A
@@ -482,7 +487,7 @@ fn register_repo_inner(
         // UPDATE trips the child FK mid-statement. Idempotent with the V040 migration's own
         // realign.
         tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
-        crate::index::graph_index::realign_logical_symbol_ids(&tx)?;
+        (hooks.realign_logical_symbol_ids)(&tx)?;
         tx.execute("DELETE FROM repos WHERE repo_id = ?1", [source_id])?;
     }
     if record_root {
@@ -754,7 +759,7 @@ fn persist_shallow_boundary(conn: &Connection, identity: &RepoIdentity) -> rusql
     if identity.class != RepoIdentityClass::LocalOnly || identity.shallow_boundary.is_empty() {
         return Ok(());
     }
-    crate::index::set_repo_meta(
+    crate::meta::set_repo_meta(
         conn,
         &identity.repo_id,
         SHALLOW_BOUNDARY_META_KEY,
@@ -766,7 +771,7 @@ fn persist_shallow_boundary(conn: &Connection, identity: &RepoIdentity) -> rusql
 /// as a vec. Empty when none was recorded — a pre-gate registration, which the upgrade path treats
 /// as no proof available.
 fn read_shallow_boundary(conn: &Connection, repo_id: &str) -> rusqlite::Result<Vec<String>> {
-    let raw = crate::index::repo_meta(conn, repo_id, SHALLOW_BOUNDARY_META_KEY)?;
+    let raw = crate::meta::repo_meta(conn, repo_id, SHALLOW_BOUNDARY_META_KEY)?;
     Ok(raw
         .map(|value| value.lines().map(str::to_string).filter(|h| !h.is_empty()).collect())
         .unwrap_or_default())
@@ -824,7 +829,7 @@ fn find_upgradeable_local_incumbent(
 /// (both sides store the identical `to_string_lossy` rendering of a `Config::load`-canonicalized
 /// root, so equality is exact). Also the #427 same-identity-join hint's known-checkout test:
 /// telling a repo's own re-index from a NEW physical checkout adopting its scope.
-pub(crate) fn repo_has_recorded_root(
+pub fn repo_has_recorded_root(
     conn: &Connection,
     repo_id: &str,
     root: &str,
@@ -894,7 +899,7 @@ fn mismatched_root_owner_error(owner: &str, incoming: &str, root: &str) -> Strin
 /// with the empty id does not exist. Falling through to `sole_repo_id` on an empty context would
 /// let those readers serve a SIBLING repo while the file view is empty (round-5 finding). So only
 /// the ABSENCE of the context row falls back.
-pub(crate) fn active_repo_id(conn: &Connection) -> rusqlite::Result<String> {
+pub fn active_repo_id(conn: &Connection) -> rusqlite::Result<String> {
     if let Some(repo_id) = context_repo_id(conn) {
         return Ok(repo_id);
     }
@@ -916,7 +921,7 @@ pub(crate) fn active_repo_id(conn: &Connection) -> rusqlite::Result<String> {
 /// `probe_table` is the subsystem's representative table (`repo_memories`,
 /// `clone_graph_generations`, `oracle_runs`, …). V042 adds `repo_id` to every table in a subsystem
 /// in the SAME migration, so one probe per subsystem is authoritative for the set.
-pub(crate) fn periphery_repo_scope(
+pub fn periphery_repo_scope(
     conn: &Connection,
     probe_table: &str,
 ) -> rusqlite::Result<Option<String>> {
@@ -934,7 +939,7 @@ pub(crate) fn periphery_repo_scope(
 /// the id is a registry-validated content-derived value (never user free-text at query time) — the
 /// same posture `oracle::store::sql_quoted_list` takes for the commit/worktree `IN`-lists. Doubling
 /// any single quote keeps it a safe literal regardless.
-pub(crate) fn periphery_repo_scope_clause(scope: &Option<String>, qualifier: &str) -> String {
+pub fn periphery_repo_scope_clause(scope: &Option<String>, qualifier: &str) -> String {
     match scope {
         Some(repo_id) => format!(" AND {qualifier}.repo_id = '{}'", repo_id.replace('\'', "''")),
         None => String::new(),
@@ -946,7 +951,7 @@ pub(crate) fn periphery_repo_scope_clause(scope: &Option<String>, qualifier: &st
 /// back to [`sole_repo_id`], so a caller can distinguish a genuinely scoped connection from the
 /// config-less sole-repo pick (the manifest heal's witness needs exactly that distinction: on a
 /// multi-repo DB the sole pick is an arbitrary first-sorting repo, not an honest attribution).
-pub(crate) fn scope_context_repo_id(conn: &Connection) -> Option<String> {
+pub fn scope_context_repo_id(conn: &Connection) -> Option<String> {
     context_repo_id(conn)
 }
 
@@ -960,7 +965,7 @@ fn context_repo_id(conn: &Connection) -> Option<String> {
 /// Read one key from the per-connection scope context (`temp.connection_context`), tolerating the
 /// table's common absence (a raw connection with no scope view installed) as `None` — the shared
 /// tolerant-read for every context key (`repo_id`, `worktree_id`, `commit_sha`, …).
-pub(crate) fn connection_context_value(conn: &Connection, key: &str) -> Option<String> {
+pub fn connection_context_value(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row("SELECT value FROM temp.connection_context WHERE key = ?1", [key], |row| {
         row.get::<_, String>(0)
     })
@@ -973,8 +978,8 @@ pub(crate) fn connection_context_value(conn: &Connection, key: &str) -> Option<S
 /// `0`, which is the generation `DEFAULT 0` stamps every pre-V043 row and every never-restaged
 /// index carries — so a fresh / upgraded index is visible under generation 0 with no `repo_meta`
 /// write. The full rebuild advances this pointer atomically once its staged generation is complete.
-pub(crate) fn live_files_generation(conn: &Connection, repo_id: &str) -> rusqlite::Result<i64> {
-    let raw = crate::index::repo_meta(conn, repo_id, LIVE_FILES_GENERATION_META_KEY)?;
+pub fn live_files_generation(conn: &Connection, repo_id: &str) -> rusqlite::Result<i64> {
+    let raw = crate::meta::repo_meta(conn, repo_id, LIVE_FILES_GENERATION_META_KEY)?;
     Ok(raw.and_then(|value| value.trim().parse::<i64>().ok()).unwrap_or(0))
 }
 
@@ -988,7 +993,7 @@ pub(crate) fn live_files_generation(conn: &Connection, repo_id: &str) -> rusqlit
 /// the active repo's LIVE generation from `repo_meta` when NO context row is installed — the bare
 /// `open` heal paths (`ensure_graph_index_current` → `resolve_edges` → `all_symbols`) run without a
 /// scope view, exactly as [`active_repo_id`] falls back to [`sole_repo_id`] there.
-pub(crate) fn active_generation(conn: &Connection) -> rusqlite::Result<i64> {
+pub fn active_generation(conn: &Connection) -> rusqlite::Result<i64> {
     if let Some(generation) = context_generation(conn) {
         return Ok(generation);
     }
@@ -1019,7 +1024,7 @@ fn context_generation(conn: &Connection) -> Option<i64> {
 /// unambiguous; multi-repo access always flows through the scope context, never here. Demoted from
 /// the former universal `single_repo_id` resolver — no hard one-row assertion, so a stray call on a
 /// consolidated DB degrades to a deterministic pick rather than a panic.
-pub(crate) fn sole_repo_id(conn: &Connection) -> rusqlite::Result<String> {
+pub fn sole_repo_id(conn: &Connection) -> rusqlite::Result<String> {
     conn.query_row(
         "SELECT repo_id FROM repos ORDER BY (repo_id = ?1), repo_id LIMIT 1",
         [LEGACY_REPO_ID],
@@ -1032,7 +1037,7 @@ pub(crate) fn sole_repo_id(conn: &Connection) -> rusqlite::Result<String> {
 /// predicates) — and, since A7 made multi-repo the default, the bare-open fail-fast: a config-less
 /// `IndexDatabase::open` refuses a DB where this is true rather than silently scoping to the
 /// lexicographically-first repo, and `resolve_config_repo_id` declines its sole-repo fallback.
-pub(crate) fn multiple_real_repos(conn: &Connection) -> rusqlite::Result<bool> {
+pub fn multiple_real_repos(conn: &Connection) -> rusqlite::Result<bool> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM repos WHERE repo_id != ?1",
         [LEGACY_REPO_ID],
@@ -1055,7 +1060,7 @@ pub struct RegisteredRepo {
 /// List every REAL (non-placeholder) repo in the registry with its recorded roots, ordered by
 /// display name then id — read-only, for `doctor`'s global-store overview. Excludes the
 /// [`LEGACY_REPO_ID`] adoption placeholder.
-pub(crate) fn registered_repos(conn: &Connection) -> rusqlite::Result<Vec<RegisteredRepo>> {
+pub fn registered_repos(conn: &Connection) -> rusqlite::Result<Vec<RegisteredRepo>> {
     let mut repos = conn
         .prepare(
             "SELECT repo_id, display_name, registered_at_ms FROM repos WHERE repo_id != ?1 ORDER \
@@ -1107,7 +1112,7 @@ pub(crate) fn registered_repos(conn: &Connection) -> rusqlite::Result<Vec<Regist
 /// A `Rejected` identity (a reserved/`local:` pin, a root-less/corrupt history) short-circuits to
 /// `None`: it must NOT silently resolve — the read-write open surfaces the actionable error
 /// instead.
-pub(crate) fn resolve_config_repo_id(
+pub fn resolve_config_repo_id(
     conn: &Connection,
     root: &Path,
     repo_id_override: Option<&str>,
@@ -1143,7 +1148,7 @@ pub(crate) fn resolve_config_repo_id(
 
 /// Whether `repo_id` is a REGISTERED real repo (present in `repos`, and not the placeholder
 /// marker).
-pub(crate) fn repo_id_is_registered(conn: &Connection, repo_id: &str) -> rusqlite::Result<bool> {
+pub fn repo_id_is_registered(conn: &Connection, repo_id: &str) -> rusqlite::Result<bool> {
     if repo_id == LEGACY_REPO_ID {
         return Ok(false);
     }
@@ -1185,7 +1190,7 @@ fn real_repo_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
 
 /// The earliest-registered recorded root for `repo_id` (a representative "home" checkout to name
 /// in the #427 join hint), or `None` when the repo has no recorded roots. Read-only.
-pub(crate) fn earliest_recorded_root(
+pub fn earliest_recorded_root(
     conn: &Connection,
     repo_id: &str,
 ) -> rusqlite::Result<Option<String>> {

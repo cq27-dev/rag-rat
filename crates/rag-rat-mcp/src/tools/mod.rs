@@ -125,7 +125,7 @@ pub fn call_tool_for_config(
             config.memory.surface,
         ) {
             Ok(result) => return finalize_tool_result(config, name, result),
-            Err(err) if rag_rat_core::storage::is_readonly_violation(&err) => {
+            Err(err) if rag_rat_db::storage::is_readonly_violation(&err) => {
                 // A lazy write hit the read-only connection — fall through to the read-write open.
             },
             Err(err) => return Err(err),
@@ -171,7 +171,7 @@ fn with_busy_retry<T>(mut attempt: impl FnMut() -> anyhow::Result<T>) -> anyhow:
     let mut tries = 0u32;
     loop {
         match attempt() {
-            Err(err) if tries + 1 < MAX_ATTEMPTS && rag_rat_core::storage::is_busy(&err) => {
+            Err(err) if tries + 1 < MAX_ATTEMPTS && rag_rat_db::storage::is_busy(&err) => {
                 tries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(25 * (1 << tries)));
             },

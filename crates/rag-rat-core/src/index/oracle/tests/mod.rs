@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ::protobuf::{EnumOrUnknown, Message};
 use ::scip::types::{Document, Index, Occurrence, PositionEncoding, SymbolRole};
+use rag_rat_db::schema;
 use rusqlite::{Connection, params};
 
 use super::store::EdgeOracleRow;
 use super::*;
-use crate::index::schema;
 
 /// A unique temp directory under the system temp root (no external crate; matches the repo's
 /// `std::env::temp_dir` + atomic-counter convention). Cleaned up on `Drop`.
@@ -75,7 +75,7 @@ impl Harness {
         // Match production (storage.rs) so FK cascades fire — `edge_oracle.edge_id` cascades off
         // `edges` (V018), and the oracle tests assert that cascade.
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         let root = TempRoot::new();
         Harness { conn, root }
     }

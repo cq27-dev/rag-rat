@@ -235,17 +235,17 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use rag_rat_db::schema;
     use rusqlite::{Connection, TransactionBehavior};
 
     use super::*;
-    use crate::index::schema;
     use crate::oplog::op::{MemoryOp, NodeContent, NodeId};
 
     const NOW: i64 = 1_700_000_000_000;
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn
     }
 
@@ -378,7 +378,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ensure-race.db");
         let setup = Connection::open(&path).unwrap();
-        schema::apply(&setup).unwrap();
+        schema::apply(&setup, &crate::index::migration_hooks()).unwrap();
         // Pre-mint the account (the mint self-transacts and cannot nest inside the ensure txn),
         // then race two ensures from separate connections.
         bootstrap::local_account(&setup, NOW).expect("pre-mint the local account");

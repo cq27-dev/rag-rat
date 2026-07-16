@@ -3561,6 +3561,7 @@ dependencies = [
  "path-slash",
  "rag-rat-base",
  "rag-rat-core",
+ "rag-rat-db",
  "rag-rat-mcp",
  "ratatui",
  "rusqlite",
@@ -3619,6 +3620,7 @@ dependencies = [
  "path-slash",
  "protobuf",
  "rag-rat-base",
+ "rag-rat-db",
  "rayon",
  "regex",
  "reqwest",
@@ -3653,6 +3655,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rag-rat-db"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "rag-rat-base",
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "rag-rat-mcp"
 version = "0.19.0"
 dependencies = [
@@ -3660,6 +3675,7 @@ dependencies = [
  "libc",
  "rag-rat-base",
  "rag-rat-core",
+ "rag-rat-db",
  "rmcp",
  "rusqlite",
  "schemars",

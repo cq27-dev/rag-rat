@@ -609,7 +609,7 @@ fn a_path_alive_only_in_another_scope_validates_pending_not_gone() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let live_generation =
-        crate::index::schema::live_files_generation(db.storage.connection(), &db.active_repo_id)
+        rag_rat_db::schema::live_files_generation(db.storage.connection(), &db.active_repo_id)
             .unwrap();
     let insert_row = |generation: i64, sha: &str| {
         db.storage
@@ -3629,7 +3629,7 @@ fn a_staged_generation_freezes_the_downgrade_rule() {
         .unwrap();
     // A staged (higher-than-live) generation row: the mid-flight rebuild window.
     let live_generation =
-        crate::index::schema::live_files_generation(db.storage.connection(), &db.active_repo_id)
+        rag_rat_db::schema::live_files_generation(db.storage.connection(), &db.active_repo_id)
             .unwrap();
     db.storage
         .connection()
@@ -6607,7 +6607,7 @@ fn a_rebuild_carrying_a_committed_leftover_defers_the_stamp() {
     assert!(stamp(&db).is_some(), "the clean rebuild stamps");
     let repo_id = db.active_repo_id.clone();
     let live =
-        crate::index::schema::live_files_generation(db.storage.connection(), &repo_id).unwrap();
+        rag_rat_db::schema::live_files_generation(db.storage.connection(), &repo_id).unwrap();
     // Seed an other-commit committed leftover (worktree_id = '') at the live generation — the
     // #502 HEAD-move retention shape. Not a worktree overlay, so carried_overlay_worktrees skips
     // it, but carry_forward_live_overlays carries it (its commit differs from the active HEAD and

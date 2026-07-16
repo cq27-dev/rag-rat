@@ -19,13 +19,13 @@
 //! Like every dream pass it NEVER writes a `repo_memories` column — `memory_summaries` holds
 //! derived, regenerable data.
 
+use rag_rat_db::schema;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::failure::{
     self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, RecordFailure,
 };
 use super::model::VerdictModel;
-use crate::index::schema;
 
 /// The compaction prompt version, stamped into `memory_summaries.prompt_version`. Bump on any
 /// change to [`COMPACT_PROMPT_HEAD`] so a stale-prompt summary is distinguishable (and can be
@@ -327,10 +327,9 @@ pub(super) mod guards {
     use std::collections::BTreeSet;
     use std::sync::LazyLock;
 
+    use rag_rat_db::schema;
     use regex::Regex;
     use rusqlite::{Connection, OptionalExtension};
-
-    use crate::index::schema;
 
     /// Word-count ceiling — headroom over the prompt's "at most 90 words" so a slightly-long but
     /// otherwise faithful summary is not thrown away.

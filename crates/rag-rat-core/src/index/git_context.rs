@@ -1,6 +1,7 @@
 //! Git context for the active checkout: changed paths, worktree contexts, pathspec/path mapping,
 //! and raw git invocation.
 
+use rag_rat_base::paths::path_string;
 use rag_rat_base::repo_discover::discover_repo;
 
 use super::*;

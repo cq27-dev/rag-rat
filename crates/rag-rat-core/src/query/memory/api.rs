@@ -666,7 +666,7 @@ pub(crate) fn list_memories(
     // The outer WHERE on m.status restricts to non-obsolete memories, matching
     // the memory_search / memories_for_* convention.
     let scope = memory_repo_scope(conn)?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
     let rows: Vec<MemorySummary> = if let Some(binding_kind) = kind {
         let mut stmt = conn.prepare(&format!(
             "
@@ -749,7 +749,7 @@ pub struct MemoryDoctorEntry {
 /// excluded (self-heal on the next oracle run, never rebind-actionable).
 pub(crate) fn doctor_attention_count(conn: &Connection) -> anyhow::Result<u64> {
     let scope = memory_repo_scope(conn)?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
     let count: i64 = conn.query_row(
         &format!(
             "
@@ -773,8 +773,8 @@ pub(crate) fn doctor_attention_count(conn: &Connection) -> anyhow::Result<u64> {
 /// bindings excluded (self-heal on the next oracle run, never rebind-actionable). Returns
 /// `rusqlite::Result` so a `rusqlite::Result` caller (dream) threads it with `?` directly.
 pub(crate) fn memory_ids_with_broken_anchors(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
     conn.prepare(&format!(
         "SELECT DISTINCT b.memory_id
          FROM repo_memory_bindings AS b
@@ -792,7 +792,7 @@ pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDocto
     // Query bindings whose anchor_status is non-current, restricted to active memories.
     // Mirrors the column list used by validate_memories / binding_row.
     let scope = memory_repo_scope(conn)?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
     let mut stmt = conn.prepare(&format!(
         "
         SELECT b.memory_id, b.binding_kind, b.binding_id, b.path,
@@ -967,7 +967,7 @@ pub(crate) fn anchor_health_counts(
     // Scoped to the active repo (V042): these counts drive per-repo doctor warnings, so a sibling
     // repo's bindings must not inflate them on a consolidated DB.
     let scope = memory_repo_scope(conn)?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
     let mut stmt = conn.prepare(&format!(
         "
         SELECT b.anchor_status, COUNT(*) AS cnt
@@ -1012,7 +1012,7 @@ pub(crate) fn validate_memories(
     // read scopes the mutation.
     let scope = memory_repo_scope(conn)?;
     let repo_clause =
-        crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memory_bindings");
+        rag_rat_db::schema::periphery_repo_scope_clause(&scope, "repo_memory_bindings");
     // The downgrade-hysteresis torn-window guard (#492): while a STAGED (higher-than-live)
     // generation exists for this repo — a rebuild is mid-flight, or an abandoned staging awaits
     // gc — a `gone` observation may be reading a half-published world, so it must neither ARM
@@ -1150,7 +1150,7 @@ fn staged_generation_exists(conn: &Connection, scope: &Option<String>) -> anyhow
     let Some(repo_id) = scope.as_deref() else {
         return Ok(false);
     };
-    let live = crate::index::schema::live_files_generation(conn, repo_id)?;
+    let live = rag_rat_db::schema::live_files_generation(conn, repo_id)?;
     let staged: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND generation > ?2)",
         params![repo_id, live],

@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use rag_rat_base::language::Language;
+use rag_rat_db::text_compression;
+use rag_rat_db::text_compression::ChunkTextRow;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use crate::index::text_compression::ChunkTextRow;
-use crate::index::{ai, text_compression};
+use crate::index::ai;
 use crate::query::graph_meta::GraphEvidence;
 
 const BM25_WEIGHT: f64 = 0.45;
@@ -213,7 +214,7 @@ fn search_with_query_embedding(
     // DB a sibling repo's chunks are dropped by the INNER JOIN before ranking. `active_repo_id`
     // is resolved ONCE here and threaded into the git/papertrail boost queries (which read the
     // direct-scoped `git_file_changes` / `papertrail_refs` by path, bypassing the view).
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     // RECALL BOUND: `chunk_fts` / `chunk_embeddings` MATCH globally, then the repo (+ commit +
     // worktree) filter is applied by the scope-view JOIN. Because SQLite applies `LIMIT` AFTER the
     // join filter, the candidate window is a PER-REPO window — the active repo is never starved by
@@ -970,14 +971,14 @@ fn collect_rows<T>(
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_db::schema;
     use rusqlite::Connection;
 
     use super::*;
-    use crate::index::schema;
 
     fn seeded_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
              VALUES ('src/watch.rs', 'rust', 'source', 'abc', 0, 0)",
@@ -1627,7 +1628,7 @@ mod tests {
     #[test]
     fn graded_history_on_applies_generated_and_test_demotion() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         // A generated file with the precomputed test-code flag set.
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,

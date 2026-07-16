@@ -788,7 +788,7 @@ mod tests {
             GitHubClient::new(&binding, &GovernorRegistry::default(), TransportOptions::default())
                 .unwrap();
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         let error = block_on(mirror_binding(&conn, &binding, &client, false)).unwrap_err();
         assert!(error.to_string().contains("GitHub HTTP 403"));

@@ -83,7 +83,7 @@ fn load_package_roots_into_scope(
     // placeholder-defaulted `packages` rows) and to empty commit/worktree — the same scope
     // `add_package`/`refresh_packages` write under for non-git fixtures, so the test path stays
     // consistent.
-    let active_repo_id = crate::index::schema::active_repo_id(conn)?;
+    let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let active_commit_sha = scope_context_value(conn, "commit_sha");
     let active_worktree_id = scope_context_value(conn, "worktree_id");
 

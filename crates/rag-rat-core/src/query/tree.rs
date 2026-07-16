@@ -231,8 +231,8 @@ fn file_counts_by_dir(conn: &Connection) -> anyhow::Result<HashMap<String, u32>>
 fn dir_memory_titles(conn: &Connection) -> anyhow::Result<HashMap<String, String>> {
     // Scoped to the active repo (V042): a sibling repo's `dir` memory must not annotate this repo's
     // tree. `{repo_clause}` empty pre-A5 — see `schema::periphery_repo_scope`.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
     let mut stmt = conn.prepare(&format!(
         // Only active dir memories; binding_id is the normalized dir path (or "" for repo root).
         "SELECT b.binding_id, m.title

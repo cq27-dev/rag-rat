@@ -576,7 +576,7 @@ fn parser_failures_report_paths() {
 #[test]
 fn v060_creates_the_papertrail_tables_on_fresh_apply() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -614,19 +614,19 @@ fn v060_creates_the_papertrail_tables_on_fresh_apply() {
     let cursor_columns = conn_table_columns(&conn, "papertrail_sync_cursor");
     assert!(cursor_columns.contains(&"comment_high_mark_at".to_string()));
     assert!(cursor_columns.contains(&"comment_page_token".to_string()));
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert!(conn_table_exists(&conn, "papertrail_items"), "survives re-apply");
 
     // A V059 ledger advances through both papertrail steps and reaches the current tip.
     truncate_schema_to(&conn, 59);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 }
 
 #[test]
 fn migration_063_persists_mirror_resume_state() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     let columns = conn_table_columns(&conn, "papertrail_sync_cursor");
     assert!(columns.contains(&"comment_high_mark_at".to_string()));
     assert!(columns.contains(&"comment_page_token".to_string()));
@@ -656,7 +656,7 @@ fn migration_063_persists_mirror_resume_state() {
 #[test]
 fn migration_067_persists_binding_health() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     let columns = conn_table_columns(&conn, "papertrail_sync_cursor");
     for name in [
         "last_attempt_ms",
@@ -701,7 +701,7 @@ fn migration_067_persists_binding_health() {
 #[test]
 fn migration_063_checksum_replays_the_pre_replay_flag_shape() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn.execute("ALTER TABLE papertrail_sync_cursor DROP COLUMN item_delta_replay_required", [])
         .unwrap();
     conn.execute(
@@ -712,7 +712,7 @@ fn migration_063_checksum_replays_the_pre_replay_flag_shape() {
     )
     .unwrap();
 
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     assert!(
         conn_table_columns(&conn, "papertrail_sync_cursor")
@@ -729,7 +729,7 @@ fn migration_063_checksum_replays_the_pre_replay_flag_shape() {
 #[test]
 fn v060_keys_let_two_repos_cache_the_same_item_and_fold_item_kind() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     let insert_item = |repo_id: &str, kind: &str| {
         conn.execute(
             "INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, \
@@ -896,7 +896,7 @@ fn migration_045_duplicates_children_per_owning_repo_and_keeps_orphans() {
 #[test]
 fn both_repos_keep_a_shared_items_comments_across_syncs() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
     )
@@ -1266,7 +1266,8 @@ fn seeded_pre_v060_legacy_db() -> rusqlite::Connection {
 fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
     let conn = seeded_pre_v060_legacy_db();
 
-    schema::apply_papertrail_provider_neutral_schema(&conn).unwrap();
+    schema::apply_papertrail_provider_neutral_schema(&conn, &crate::index::migration_hooks())
+        .unwrap();
 
     // Items: issue #1 (both repos, verbatim repo_id) + ONE change_request #2 (shadow deduped,
     // pulls copy wins so merged_at survives).
@@ -1503,7 +1504,8 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
     assert_eq!(refs[0].item_key, "1");
 
     // Replay converges: a second apply is a clean no-op (nothing legacy left to backfill).
-    schema::apply_papertrail_provider_neutral_schema(&conn).unwrap();
+    schema::apply_papertrail_provider_neutral_schema(&conn, &crate::index::migration_hooks())
+        .unwrap();
     let items_after: i64 =
         conn.query_row("SELECT COUNT(*) FROM papertrail_items", [], |r| r.get(0)).unwrap();
     assert_eq!(items_after, 3, "re-apply neither duplicates nor drops migrated rows");

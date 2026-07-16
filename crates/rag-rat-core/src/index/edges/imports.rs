@@ -27,8 +27,8 @@ use super::{ImportScopeRange, MOD_FILE_ROOT};
 /// absent (a non-Cargo corpus, a pre-V021 index, or a raw conn without the registry), which makes
 /// [`ImportScope`] suppress nothing.
 pub(crate) fn load_local_roots(conn: &Connection) -> HashSet<String> {
-    crate::index::schema::active_repo_id(conn)
-        .and_then(|repo_id| crate::index::repo_meta(conn, &repo_id, "local_crate_roots"))
+    rag_rat_db::schema::active_repo_id(conn)
+        .and_then(|repo_id| rag_rat_db::meta::repo_meta(conn, &repo_id, "local_crate_roots"))
         .ok()
         .flatten()
         .map(|value| value.lines().filter(|line| !line.is_empty()).map(str::to_string).collect())

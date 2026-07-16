@@ -283,13 +283,14 @@ fn read_x25519(
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_db::schema;
+
     use super::*;
-    use crate::index::schema;
 
     /// A fully-migrated in-memory DB carrying the identity table with its V058 X25519 columns.
     fn conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory db");
-        schema::apply(&conn).expect("apply schema");
+        schema::apply(&conn, &crate::index::migration_hooks()).expect("apply schema");
         conn
     }
 

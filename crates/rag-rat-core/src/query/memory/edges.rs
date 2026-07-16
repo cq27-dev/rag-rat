@@ -365,7 +365,7 @@ fn edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeEdge> {
 /// The edge is owned by / authored on its source node's repo, so reads/deletes scope by `repo_id`
 /// exactly like the other periphery tables.
 fn periphery_edge_scope_clause(scope: &Option<String>) -> String {
-    crate::index::schema::periphery_repo_scope_clause(scope, "repo_node_edges")
+    rag_rat_db::schema::periphery_repo_scope_clause(scope, "repo_node_edges")
 }
 
 /// Whether `repo_id` is a repo REGISTERED (indexed) in this DB — a row in `repos`. An explicit
@@ -462,7 +462,7 @@ mod tests {
     fn scoped_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
             [REPO],

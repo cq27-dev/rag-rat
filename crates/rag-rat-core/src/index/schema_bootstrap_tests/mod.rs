@@ -833,7 +833,7 @@ fn cascading_fks_to_volatile_parents(conn: &rusqlite::Connection) -> Vec<(String
             .collect();
         for (parent, on_delete) in fks {
             let is_volatile_parent =
-                crate::index::schema::REINDEX_VOLATILE_PARENTS.contains(&parent.as_str());
+                rag_rat_db::schema::REINDEX_VOLATILE_PARENTS.contains(&parent.as_str());
             let is_cascading = matches!(on_delete.to_uppercase().as_str(), "CASCADE" | "RESTRICT");
             if is_volatile_parent && is_cascading {
                 found.push((table.clone(), parent, on_delete));

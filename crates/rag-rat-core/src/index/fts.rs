@@ -9,6 +9,8 @@
 //! pay a full FTS rebuild forever after a sibling synced (stale-dirty loop). Do NOT route these
 //! back through `self.repo_meta` / `self.set_repo_meta`.
 
+use rag_rat_db::schema;
+
 use super::*;
 
 impl IndexDatabase {
@@ -59,16 +61,16 @@ impl IndexDatabase {
         // unsupported; on an external-content table it also corrupts a desynced index — #51).
         conn.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('delete-all')", [])?;
         let dicts = crate::query::chunk_text_dicts(conn)?;
-        let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+        let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
         // Collect (rowid, ChunkTextRow) first: decompress's anyhow::Result can't cross the rusqlite
         // closure, and the SELECT statement can't stay open while we INSERT into chunk_fts.
-        let rows: Vec<(i64, crate::index::text_compression::ChunkTextRow)> = {
+        let rows: Vec<(i64, rag_rat_db::text_compression::ChunkTextRow)> = {
             let mut stmt = conn.prepare(
                 "SELECT chunks.id, chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version
                  FROM chunks JOIN chunk_text ON chunk_text.chunk_id = chunks.id",
             )?;
             let mapped = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, crate::index::text_compression::ChunkTextRow {
+                Ok((row.get::<_, i64>(0)?, rag_rat_db::text_compression::ChunkTextRow {
                     blob: row.get(1)?,
                     raw_len: row.get(2)?,
                     dict_version: row.get(3)?,
@@ -159,7 +161,7 @@ impl IndexDatabase {
             rows.collect::<Result<_, _>>()?
         };
         for repo_id in repos {
-            let live = crate::index::schema::live_files_generation(conn, &repo_id)?;
+            let live = rag_rat_db::schema::live_files_generation(conn, &repo_id)?;
             let staged: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND generation > ?2)",
                 rusqlite::params![repo_id, live],

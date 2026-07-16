@@ -178,7 +178,7 @@ pub(crate) fn record_pause(
     resume_at_ms: i64,
 ) -> anyhow::Result<()> {
     ensure_health_row(conn, binding)?;
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     conn.execute(
         "UPDATE papertrail_sync_cursor
          SET retry_not_before_ms=?4, error_class='rate_limited', error_detail=NULL
@@ -196,7 +196,7 @@ pub(crate) fn record_failure(
 ) -> anyhow::Result<()> {
     ensure_health_row(conn, binding)?;
     let detail = detail.map(sanitize_error_detail);
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     conn.execute(
         "UPDATE papertrail_sync_cursor
          SET retry_not_before_ms=NULL, error_class=?4, error_detail=?5
@@ -207,7 +207,7 @@ pub(crate) fn record_failure(
 }
 
 fn ensure_health_row(conn: &Connection, binding: &ResolvedTracker) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     conn.execute(
         "INSERT OR IGNORE INTO papertrail_sync_cursor(tracker, project, repo_id)
          VALUES (?1, ?2, ?3)",
@@ -222,7 +222,7 @@ fn update_health(
     assignment: &str,
     at_ms: i64,
 ) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let sql = format!(
         "UPDATE papertrail_sync_cursor SET {assignment}
          WHERE repo_id=?1 AND tracker=?2 AND project=?3"
@@ -286,10 +286,10 @@ pub(crate) fn load_persisted_health(
 #[cfg(test)]
 mod tests {
     use rag_rat_base::config::Tracker;
+    use rag_rat_db::schema;
 
     use super::*;
     use crate::index::papertrail::TrackerAuthentication;
-    use crate::index::schema;
 
     fn config() -> PapertrailConfig {
         PapertrailConfig::default()
@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn mirror_success_advances_probe_freshness_and_clears_pause() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         let binding = binding();
         record_pause(&conn, &binding, 20_000).unwrap();
         record_success(&conn, &binding, SuccessfulOperation::IncrementalMirror, 10_000).unwrap();
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn provider_pause_round_trips_through_binding_health() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         let binding = binding();
         record_pause(&conn, &binding, 20_000).unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn provider_pause_replaces_a_stale_failure() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         let binding = binding();
         record_failure(
             &conn,
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn non_rate_failure_clears_a_stale_provider_pause() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         let binding = binding();
         record_pause(&conn, &binding, 20_000).unwrap();
         record_failure(
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn persisted_cursor_work_and_filter_fingerprint_are_loaded_for_scheduling() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         let binding = binding();
         record_attempt(&conn, &binding, 1).unwrap();
         conn.execute(

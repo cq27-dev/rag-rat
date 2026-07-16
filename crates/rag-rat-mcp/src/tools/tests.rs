@@ -1381,7 +1381,7 @@ fn read_tool_lazy_write_retries_read_write_not_readonly_error() {
     let result = call_tool_for_config(&config, "read_chunk", json!({"chunk_id": chunk_id}));
     let err = result.expect_err("a deleted-source chunk reports gone");
     assert!(
-        !rag_rat_core::storage::is_readonly_violation(&err),
+        !rag_rat_db::storage::is_readonly_violation(&err),
         "the lazy write must be retried read-write, never surfaced as SQLITE_READONLY: {err:?}"
     );
 
@@ -1455,6 +1455,6 @@ fn busy_retry_rides_out_a_short_writer_but_is_bounded() {
         calls.set(calls.get() + 1);
         Err(busy())
     });
-    assert!(rag_rat_core::storage::is_busy(&exhausted.unwrap_err()));
+    assert!(rag_rat_db::storage::is_busy(&exhausted.unwrap_err()));
     assert_eq!(calls.get(), 3, "bounded to MAX_ATTEMPTS");
 }

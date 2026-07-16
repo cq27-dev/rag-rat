@@ -694,7 +694,7 @@ fn mark_processed(cursor: &mut MirrorCursor, lane: PageLane, key: ProcessedItem)
 }
 
 fn load_cursor(conn: &Connection, binding: &ResolvedTracker) -> anyhow::Result<MirrorCursor> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     Ok(conn
         .query_row(
             "SELECT high_mark_at, comment_high_mark_at, comment_page_token, comment_scan_since,
@@ -740,7 +740,7 @@ fn save_cursor(
     cursor: &MirrorCursor,
     full: bool,
 ) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let delta_processed_keys = serde_json::to_string(&cursor.delta_processed_keys)?;
     let backfill_processed_keys = serde_json::to_string(&cursor.backfill_processed_keys)?;
     let comment_stream_cursors = serde_json::to_string(&cursor.comment_stream_cursors)?;
@@ -871,7 +871,7 @@ fn reset_for_full_rewalk(
 }
 
 fn reset_full_seen(conn: &Connection, binding: &ResolvedTracker) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     conn.execute(
         "UPDATE papertrail_items SET full_rewalk_seen=0
          WHERE repo_id=?1 AND tracker=?2 AND project=?3",
@@ -885,7 +885,7 @@ fn mark_full_seen(
     binding: &ResolvedTracker,
     item: &PapertrailItem,
 ) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     conn.execute(
         "UPDATE papertrail_items SET full_rewalk_seen=1
          WHERE repo_id=?1 AND tracker=?2 AND project=?3 AND item_kind=?4 AND item_key=?5",
@@ -905,7 +905,7 @@ fn replace_tags(
     binding: &ResolvedTracker,
     item: &PapertrailItem,
 ) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     conn.execute(
         "DELETE FROM papertrail_item_tags WHERE tracker=?1 AND project=?2 AND item_kind=?3 AND \
          item_key=?4 AND repo_id=?5",
@@ -938,7 +938,7 @@ fn prune_unmatched(conn: &Connection, binding: &ResolvedTracker) -> anyhow::Resu
     if binding.tags.is_empty() {
         return Ok(0);
     }
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let wanted = normalized_tags(&binding.tags);
     let mut stmt = conn.prepare(
         "SELECT i.item_kind, i.item_key, t.tag
@@ -981,7 +981,7 @@ fn delete_item(
     kind: ItemKind,
     key: &str,
 ) -> anyhow::Result<bool> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let args =
         params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key];
     conn.execute(
@@ -1013,7 +1013,7 @@ fn prune_unseen_item_comments(
     key: &str,
     seen: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let stale = {
         let mut stmt = conn.prepare(
             "SELECT comment_id FROM papertrail_comments
@@ -1058,7 +1058,7 @@ fn prune_unseen_item_comments(
 }
 
 fn prune_missing(conn: &Connection, binding: &ResolvedTracker) -> anyhow::Result<usize> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let cached = {
         let mut stmt = conn.prepare(
             "SELECT item_kind, item_key FROM papertrail_items
@@ -1083,7 +1083,7 @@ fn store_repo_comments(
     comments: &[PapertrailComment],
     report: &mut MirrorBindingReport,
 ) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let fallback = item_numbering_is_shared(binding.provider);
     let tx = conn.unchecked_transaction()?;
     for comment in comments {
@@ -1231,8 +1231,9 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
+    use rag_rat_db::schema;
+
     use super::*;
-    use crate::index::schema;
 
     struct ScriptClient {
         comment_streams: &'static [&'static str],
@@ -1459,7 +1460,7 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn
     }
 

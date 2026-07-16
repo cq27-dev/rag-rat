@@ -287,7 +287,7 @@ fn co_touch_pairs(
     // `git_file_changes` is direct-scoped (V040); the `files` view join is by PATH, so the
     // explicit `repo_id` predicate is what keeps a sibling repo's co-touch history for a shared
     // path out of this repo's clusters in a consolidated DB.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT git_file_changes.commit_hash, git_file_changes.path

@@ -257,7 +257,7 @@ pub fn model_work_pending(
     model_id: &str,
 ) -> anyhow::Result<bool> {
     if verify {
-        let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+        let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
         let repo_id = scope.as_deref().unwrap_or("__unassigned__");
         let mut considered = 0usize;
         for entry in verify::verification_queue(conn, opts.now_ms, usize::MAX)? {
@@ -300,7 +300,7 @@ pub(super) mod tests {
     /// in this module and its `findings` / `verify` siblings.
     pub(super) fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&c).unwrap();
+        rag_rat_db::schema::apply(&c, &crate::index::migration_hooks()).unwrap();
         c
     }
 

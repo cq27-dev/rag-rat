@@ -16,6 +16,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use rag_rat_base::hash::hex_sha256;
+use rag_rat_base::paths::path_string;
 
 use super::*;
 
@@ -439,7 +440,7 @@ impl IndexDatabase {
                 continue;
             };
             if !live_worktrees.iter().any(|live| live == worktree_id) {
-                delete_repo_meta(conn, &self.active_repo_id, &key)?;
+                rag_rat_db::meta::delete_repo_meta(conn, &self.active_repo_id, &key)?;
             }
         }
         Ok(())
@@ -451,7 +452,7 @@ impl IndexDatabase {
     /// pass (#577 review).
     pub(crate) fn clear_worktree_overlay_basis(&self, worktree_id: &str) -> anyhow::Result<()> {
         let key = format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}");
-        delete_repo_meta(self.storage.connection(), &self.active_repo_id, &key)?;
+        rag_rat_db::meta::delete_repo_meta(self.storage.connection(), &self.active_repo_id, &key)?;
         Ok(())
     }
 

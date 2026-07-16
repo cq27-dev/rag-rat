@@ -76,7 +76,7 @@ pub(crate) fn validate_logical_symbol_binding(
     // `relocated` instead of `gone`/`stale`. The `files`-view queries elsewhere in this module are
     // repo-scoped for free through the scope view; `logical_symbols` is a direct table, so it needs
     // the explicit filter.
-    let active_repo_id = crate::index::schema::active_repo_id(conn)?;
+    let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     // #491: one qualified name can hold several live twins (a struct and its impl block;
     // overloads with distinct signatures), so a bare `LIMIT 1` is a plan-order coin flip that
     // can land a struct-bound memory on the impl row. The binding stores the V014 relocation
@@ -503,8 +503,8 @@ pub(crate) fn validate_path_binding(
 /// active checkout root and only falls back to this (#98 review).
 fn persisted_source_root(conn: &Connection) -> Option<PathBuf> {
     // `source_root` moved to `repo_meta` (V039); resolve the active repo (the lone one in phase A).
-    let repo_id = crate::index::schema::active_repo_id(conn).ok()?;
-    crate::index::repo_meta(conn, &repo_id, "source_root").ok().flatten().map(PathBuf::from)
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).ok()?;
+    rag_rat_db::meta::repo_meta(conn, &repo_id, "source_root").ok().flatten().map(PathBuf::from)
 }
 
 /// The filesystem root the off-index existence checks resolve against: the caller-supplied ACTIVE
@@ -546,8 +546,8 @@ fn path_is_file_on_disk(root: Option<&Path>, path: &str) -> bool {
 ///   base rows (worktree_id = '') and the active checkout's own dirty-scope rows are THIS context,
 ///   not another one — a path deleted at HEAD must stay `gone` through the pre-gc window.
 fn path_is_live_in_another_scope(conn: &Connection, path: &str) -> anyhow::Result<bool> {
-    let active_repo_id = crate::index::schema::active_repo_id(conn)?;
-    let live_generation = crate::index::schema::live_files_generation(conn, &active_repo_id)?;
+    let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let live_generation = rag_rat_db::schema::live_files_generation(conn, &active_repo_id)?;
     let active_worktree = context_worktree_id(conn);
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM main.files
@@ -561,7 +561,7 @@ fn path_is_live_in_another_scope(conn: &Connection, path: &str) -> anyhow::Resul
 
 /// The active context's worktree id, `''` when no scope view is installed on this connection.
 fn context_worktree_id(conn: &Connection) -> String {
-    crate::index::schema::connection_context_value(conn, "worktree_id").unwrap_or_default()
+    rag_rat_db::schema::connection_context_value(conn, "worktree_id").unwrap_or_default()
 }
 
 /// Whether `dir` (repo-root-relative, `""` = repo root) resolves to an existing directory under

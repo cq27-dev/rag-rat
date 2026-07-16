@@ -1,6 +1,8 @@
 //! File-row reads and scope mutations: fetch the file row, mark/remove files in the active scope,
 //! and count indexed files.
 
+use rag_rat_base::paths::path_string;
+
 use super::*;
 
 impl IndexDatabase {

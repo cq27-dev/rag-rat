@@ -519,8 +519,8 @@ fn memory_attention_count_reads_file_db_and_fails_open() {
 
     // A real file DB with one gone binding → 1.
     {
-        let rw = crate::storage::IndexConnection::open(&db_path).unwrap();
-        crate::index::schema::apply(rw.connection()).unwrap();
+        let rw = rag_rat_db::storage::IndexConnection::open(&db_path).unwrap();
+        rag_rat_db::schema::apply(rw.connection(), &crate::index::migration_hooks()).unwrap();
         let created = create_memory(rw.connection(), RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "drift".to_string(),

@@ -167,9 +167,9 @@ pub(crate) fn load_scoped_baseline_bags_for_paths(
 pub(crate) fn load_current_clone_df(
     conn: &Connection,
 ) -> anyhow::Result<std::collections::HashMap<i64, i64>> {
-    let df_scope = crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?;
+    let df_scope = rag_rat_db::schema::periphery_repo_scope(conn, "clone_token_df")?;
     let df_repo_clause =
-        crate::index::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
+        rag_rat_db::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
     let mut stmt = conn.prepare(&format!(
         "SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = \
          'baseline'{df_repo_clause}"

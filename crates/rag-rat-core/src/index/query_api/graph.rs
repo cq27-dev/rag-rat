@@ -683,7 +683,7 @@ impl IndexDatabase {
                         score_components: None,
                         importance: None,
                     },
-                    crate::index::text_compression::ChunkTextRow {
+                    rag_rat_db::text_compression::ChunkTextRow {
                         blob: row.get(7)?,
                         raw_len: row.get(8)?,
                         dict_version: row.get(9)?,
@@ -693,7 +693,7 @@ impl IndexDatabase {
         )?;
         let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         let dicts = crate::query::chunk_text_dicts(conn)?;
-        let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+        let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
         let mut hits = Vec::with_capacity(collected.len());
         for (mut hit, text_row) in collected {
             hit.summary = bounded_summary(&text_row.resolve(&mut decoder)?);

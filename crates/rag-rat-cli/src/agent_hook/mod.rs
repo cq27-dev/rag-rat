@@ -25,7 +25,7 @@ use rag_rat_base::locks;
 use rag_rat_core::index::{CloneCheckInput, IndexDatabase, TextCloneMatch};
 use rag_rat_core::query::grep_augment;
 use rag_rat_core::query::orientation::Orientation;
-use rag_rat_core::storage::IndexConnection;
+use rag_rat_db::storage::IndexConnection;
 use serde::Deserialize;
 
 /// Skip the write-time clone check above this many fingerprinted functions — but ONLY in the RAM
@@ -323,8 +323,8 @@ fn session_start(input: &HookInput) -> anyhow::Result<()> {
     // server this session just started, which is at most as new — will refuse every open. Say so
     // actionably instead of composing a digest that half-works today and errors tomorrow. The
     // schema message already carries the remedy (and the non-Linux no-hot-upgrade caveat).
-    let schema = rag_rat_core::index::schema::status(conn.connection())?;
-    if schema.state == rag_rat_core::index::schema::SchemaState::Newer {
+    let schema = rag_rat_db::schema::status(conn.connection())?;
+    if schema.state == rag_rat_db::schema::SchemaState::Newer {
         print!("{}", newer_schema_notice(&schema.message));
         return Ok(());
     }

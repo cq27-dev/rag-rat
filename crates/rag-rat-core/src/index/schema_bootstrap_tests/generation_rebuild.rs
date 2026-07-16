@@ -96,7 +96,7 @@ fn reader_sees_path(db_path: &Path, root: &Path, path: &str) -> bool {
 #[test]
 fn migration_043_adds_generation_to_the_files_unique_key() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -515,7 +515,7 @@ fn non_git_indexes_sweep_dead_generations_despite_the_context_prune_refusal() {
     // still reclaim it (files, chunks, symbols, FTS), keeping growth flat.
     let db = IndexDatabase::rebuild(&config).unwrap();
     let live =
-        crate::index::schema::live_files_generation(db.storage.connection(), &repo_id).unwrap();
+        rag_rat_db::schema::live_files_generation(db.storage.connection(), &repo_id).unwrap();
     let dead_count = |db: &IndexDatabase| -> i64 {
         db.storage
             .connection()
@@ -1102,12 +1102,12 @@ fn concurrent_create_or_migrate_applies_the_schema_exactly_once() {
     // (a lingering dirty marker or duplicate-column failure would surface as Dirty / an error
     // above).
     let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let status = crate::index::schema::status(&conn).unwrap();
-    assert_eq!(status.state, crate::index::schema::SchemaState::Compatible);
-    assert_eq!(status.current_version, crate::index::schema::LATEST_SCHEMA_VERSION);
+    let status = rag_rat_db::schema::status(&conn).unwrap();
+    assert_eq!(status.state, rag_rat_db::schema::SchemaState::Compatible);
+    assert_eq!(status.current_version, rag_rat_db::schema::LATEST_SCHEMA_VERSION);
     assert_eq!(
         status.migrations.len(),
-        crate::index::schema::LATEST_SCHEMA_VERSION as usize,
+        rag_rat_db::schema::LATEST_SCHEMA_VERSION as usize,
         "exactly one schema_version row per migration"
     );
 
@@ -1132,7 +1132,7 @@ fn a_tail_failure_leaves_git_meta_and_history_cursors_on_the_old_state() {
 
     let git_commit_meta = |db_path: &Path, repo_id: &str| -> Option<String> {
         let conn = rusqlite::Connection::open(db_path).unwrap();
-        crate::index::repo_meta(&conn, repo_id, "git_commit").unwrap()
+        rag_rat_db::meta::repo_meta(&conn, repo_id, "git_commit").unwrap()
     };
     let history_current = |db_path: &Path, root: &Path| -> bool {
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -1285,7 +1285,7 @@ fn a_tail_failure_leaves_source_root_on_the_old_checkout() {
     let repo_id = resolve_repo_id(&db_path, &root);
     let persisted_root = |db_path: &Path| -> Option<String> {
         let conn = rusqlite::Connection::open(db_path).unwrap();
-        crate::index::repo_meta(&conn, &repo_id, "source_root").unwrap()
+        rag_rat_db::meta::repo_meta(&conn, &repo_id, "source_root").unwrap()
     };
     assert_eq!(persisted_root(&db_path).as_deref(), Some(root.display().to_string().as_str()));
 
@@ -1357,7 +1357,7 @@ fn a_tail_failure_leaves_package_roots_on_the_old_state() {
     let repo_id = resolve_repo_id(&db_path, &root);
     let local_roots = |db_path: &Path| -> Option<String> {
         let conn = rusqlite::Connection::open(db_path).unwrap();
-        crate::index::repo_meta(&conn, &repo_id, "local_crate_roots").unwrap()
+        rag_rat_db::meta::repo_meta(&conn, &repo_id, "local_crate_roots").unwrap()
     };
     assert_eq!(
         local_roots(&db_path).as_deref(),

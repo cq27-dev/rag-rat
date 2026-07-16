@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/rag-rat-base",
+  "crates/rag-rat-db",
   "crates/rag-rat-cli",
   "crates/rag-rat-core",
   "crates/rag-rat-mcp",
@@ -30,6 +31,7 @@ categories = ["command-line-utilities", "development-tools"]
 # [workspace.package].version above. Members reference these via `{ workspace = true }` and add
 # their own feature toggles at the use site.
 rag-rat-base = { version = "0.19.0", path = "crates/rag-rat-base", default-features = false }
+rag-rat-db = { version = "0.19.0", path = "crates/rag-rat-db", default-features = false }
 rag-rat-core = { version = "0.19.0", path = "crates/rag-rat-core", default-features = false }
 rag-rat-mcp = { version = "0.19.0", path = "crates/rag-rat-mcp", default-features = false }
 anyhow = "1.0"

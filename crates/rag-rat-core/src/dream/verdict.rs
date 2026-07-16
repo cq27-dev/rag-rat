@@ -20,6 +20,7 @@
 //!     of a skip. `unverifiable` is decided in pass 0 and never asked of the model; the model only
 //!     proposes — #262's review flow decides, and nothing here mutates a memory's status.
 
+use rag_rat_db::schema;
 use rusqlite::Connection;
 
 use super::DreamFinding;
@@ -31,7 +32,6 @@ use super::verify::{
     self, EvidencePack, IdentifierResolution, ResolutionKind, VerificationQueueEntry,
     evidence_pack, verification_queue,
 };
-use crate::index::schema;
 
 /// The verdict prompt version, stamped into `memory_reality.prompt_version`. Bump on any change to
 /// [`VERDICT_PROMPT_HEAD`] or the pack rendering so a stale-prompt verdict is distinguishable — a
@@ -585,7 +585,7 @@ fn record_uncitable(conn: &Connection, r: Uncitable<'_>) -> rusqlite::Result<()>
 /// `checked_against_commit` stamping. `None` outside a repo scope or when unrecorded.
 fn indexed_commit(conn: &Connection, scope: &Option<String>) -> rusqlite::Result<Option<String>> {
     match scope {
-        Some(repo_id) => crate::index::repo_meta(conn, repo_id, "git_commit"),
+        Some(repo_id) => rag_rat_db::meta::repo_meta(conn, repo_id, "git_commit"),
         None => Ok(None),
     }
 }

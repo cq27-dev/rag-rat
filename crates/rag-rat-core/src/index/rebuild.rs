@@ -2,6 +2,7 @@
 // module stays last — clippy::items_after_test_module). `incremental.rs`'s wave loop calls
 // `run_after_wave_commit`; the reader-consistency tests register a database-keyed hook via
 // `set_after_wave_commit` and hold the returned guard.
+use rag_rat_db::schema;
 #[cfg(test)]
 pub(crate) use wave_barrier::{WaveBarrierGuard, run_after_wave_commit, set_after_wave_commit};
 
@@ -508,7 +509,7 @@ impl IndexDatabase {
         // authoritative for the periphery set.
         let df_scope = {
             let conn = self.storage.connection();
-            crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?
+            rag_rat_db::schema::periphery_repo_scope(conn, "clone_token_df")?
         };
 
         // Phase 1 (read): decode every (active-repo) fingerprint's bag and accumulate df in memory,

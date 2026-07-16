@@ -45,7 +45,7 @@ pub fn read_chunk(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<Rea
     // [`read_chunk_with`] instead — the per-call dict SELECT + dictionary prep is ~20x the
     // decompress itself, so reusing it across a batch is the win (#77 Phase 2 read-path perf).
     let dicts = chunk_text_dicts(conn)?;
-    let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+    let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
     read_chunk_with(conn, chunk_id, &mut decoder)
 }
 
@@ -56,9 +56,9 @@ pub fn read_chunk(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<Rea
 pub(crate) fn read_chunk_with(
     conn: &Connection,
     chunk_id: i64,
-    decoder: &mut crate::index::text_compression::ChunkTextDecoder,
+    decoder: &mut rag_rat_db::text_compression::ChunkTextDecoder,
 ) -> anyhow::Result<Option<ReadChunk>> {
-    use crate::index::text_compression::ChunkTextRow;
+    use rag_rat_db::text_compression::ChunkTextRow;
     let row = conn
         .query_row(
             "
@@ -102,7 +102,7 @@ pub(crate) fn read_chunk_with(
 }
 
 /// All chunk-text dictionary versions (version → dict bytes), loaded once and reused across a batch
-/// via [`crate::index::text_compression::ChunkTextDecoder`]. Each `chunk_text` blob records the
+/// via [`rag_rat_db::text_compression::ChunkTextDecoder`]. Each `chunk_text` blob records the
 /// version it was compressed against (#77 Phase 2); a dict is an immutable decode key and a retrain
 /// adds a version rather than replacing one, so a read may span multiple resident versions. An
 /// empty map (fresh DB, no dicts yet) decodes nothing — every chunk has a blob only once a dict

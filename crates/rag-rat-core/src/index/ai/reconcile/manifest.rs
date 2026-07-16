@@ -52,13 +52,13 @@ pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
 /// the subject, and "single repo ⇒ unambiguous" silently attributes the heal to it. Those callers
 /// use the schema-only migration path (`IndexDatabase::migrate_schema_only`) instead.
 pub(super) fn scoped_repo_witness(conn: &Connection) -> anyhow::Result<Option<String>> {
-    if let Some(repo_id) = crate::index::schema::scope_context_repo_id(conn) {
+    if let Some(repo_id) = rag_rat_db::schema::scope_context_repo_id(conn) {
         return Ok(Some(repo_id));
     }
-    if crate::index::schema::multiple_real_repos(conn)? {
+    if rag_rat_db::schema::multiple_real_repos(conn)? {
         return Ok(None);
     }
-    Ok(Some(crate::index::schema::sole_repo_id(conn)?))
+    Ok(Some(rag_rat_db::schema::sole_repo_id(conn)?))
 }
 
 /// Read-only test of whether `ensure_model_manifest` would be a no-op — i.e. the manifest is
@@ -70,7 +70,7 @@ pub(super) fn scoped_repo_witness(conn: &Connection) -> anyhow::Result<Option<St
 /// still owed (falling back to the read-write open, which heals once).
 pub(crate) fn model_manifest_is_current(conn: &Connection) -> anyhow::Result<bool> {
     // The active-model meta moved to `repo_meta` (V039); check the active repo's row there.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     for model_id in LEGACY_MODEL_IDS {
         let lingering: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM ai_models WHERE model_id = ?1)
@@ -109,7 +109,7 @@ pub(crate) fn model_manifest_is_current(conn: &Connection) -> anyhow::Result<boo
 
 pub(crate) fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
     // The active-model meta moved to `repo_meta` (V039); clear it for the active repo.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     for model_id in LEGACY_MODEL_IDS {
         conn.execute("DELETE FROM chunk_embeddings WHERE model_id = ?1", params![model_id])?;
         conn.execute("DELETE FROM ai_models WHERE model_id = ?1", params![model_id])?;
@@ -180,8 +180,9 @@ pub(crate) fn upsert_model(
 
 #[cfg(test)]
 mod manifest_idempotence_tests {
+    use rag_rat_db::storage::IndexConnection;
+
     use super::*;
-    use crate::storage::IndexConnection;
 
     // #143: `ensure_model_manifest` runs on every `IndexDatabase::open*`. It must be a no-op (no
     // write lock) once the manifest is current, or every read tool serializes on the SQLite writer.
@@ -195,7 +196,7 @@ mod manifest_idempotence_tests {
         // First open establishes the manifest (a write); afterward the read-only check sees it.
         {
             let rw = IndexConnection::open(&db).unwrap();
-            crate::index::schema::apply(rw.connection()).unwrap();
+            rag_rat_db::schema::apply(rw.connection(), &crate::index::migration_hooks()).unwrap();
             assert!(
                 !model_manifest_is_current(rw.connection()).unwrap(),
                 "a freshly applied schema has no model rows yet"

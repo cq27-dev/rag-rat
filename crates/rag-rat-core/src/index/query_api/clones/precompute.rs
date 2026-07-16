@@ -267,12 +267,12 @@ impl IndexDatabase {
 
     fn clear_clone_graph_quiet_candidate(&self) -> anyhow::Result<()> {
         let conn = self.storage.connection();
-        crate::index::meta::delete_repo_meta(
+        rag_rat_db::meta::delete_repo_meta(
             conn,
             &self.active_repo_id,
             CLONE_GRAPH_QUIET_REVISION_META,
         )?;
-        crate::index::meta::delete_repo_meta(
+        rag_rat_db::meta::delete_repo_meta(
             conn,
             &self.active_repo_id,
             CLONE_GRAPH_QUIET_SINCE_META,
@@ -894,8 +894,8 @@ pub(super) fn clone_df_epoch_exists(conn: &Connection, generation: i64) -> anyho
 /// the fresh branch re-pins against the re-refreshed df instead of tripping the PK.
 fn snapshot_clone_df_epoch(conn: &Connection, generation: i64) -> anyhow::Result<()> {
     conn.execute("DELETE FROM clone_df_epoch WHERE build_generation = ?1", params![generation])?;
-    let df_scope = crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?;
-    let df_clause = crate::index::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
+    let df_scope = rag_rat_db::schema::periphery_repo_scope(conn, "clone_token_df")?;
+    let df_clause = rag_rat_db::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
     conn.execute(
         &format!(
             "INSERT INTO clone_df_epoch(build_generation, token_hash, df)
@@ -914,14 +914,15 @@ fn snapshot_clone_df_epoch(conn: &Connection, generation: i64) -> anyhow::Result
 /// generation lifecycle sweeps (allocate/build/complete/invalidate) filter `repo_id` so a repo's
 /// precompute never touches a sibling's generations. See `schema::periphery_repo_scope`.
 pub(super) fn clone_generation_scope_clause(conn: &Connection) -> anyhow::Result<String> {
-    let scope = crate::index::schema::periphery_repo_scope(conn, "clone_graph_generations")?;
-    Ok(crate::index::schema::periphery_repo_scope_clause(&scope, "clone_graph_generations"))
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "clone_graph_generations")?;
+    Ok(rag_rat_db::schema::periphery_repo_scope_clause(&scope, "clone_graph_generations"))
 }
 
 /// The live (Complete) generation row, if one is published.
 pub(super) fn live_generation_row(conn: &Connection) -> anyhow::Result<Option<GenerationRow>> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    let Some(live) = crate::index::repo_meta(conn, &repo_id, "clone_graph_live_generation")? else {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let Some(live) = rag_rat_db::meta::repo_meta(conn, &repo_id, "clone_graph_live_generation")?
+    else {
         return Ok(None);
     };
     let Ok(generation) = live.parse::<i64>() else {
@@ -942,9 +943,9 @@ fn open_building_generation(
     // `{repo_clause}` empty pre-A5. The MAX(generation) allocation below stays GLOBAL so the
     // generation integer is unique across repos (keeping the transitive edges/postings scoped by
     // build_generation).
-    let scope = crate::index::schema::periphery_repo_scope(conn, "clone_graph_generations")?;
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "clone_graph_generations")?;
     let repo_clause =
-        crate::index::schema::periphery_repo_scope_clause(&scope, "clone_graph_generations");
+        rag_rat_db::schema::periphery_repo_scope_clause(&scope, "clone_graph_generations");
     let existing: Option<GenerationRow> = conn
         .query_row(
             &format!(

@@ -152,7 +152,7 @@ fn spine_load_bearing(conn: &Connection, limit: usize) -> anyhow::Result<Vec<(St
 fn recent_commit_subjects(conn: &Connection, limit: usize) -> anyhow::Result<Vec<String>> {
     // `git_commits` is direct-scoped (V040): orientation describes the ACTIVE repo, so a sibling
     // repo's commit subjects must not surface in a consolidated DB.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "-- Most recent indexed commit subjects for the active repo, newest first.
          -- Invariant: git_commits is direct-scoped by repo_id (V040); subjects only.
@@ -179,7 +179,7 @@ fn recently_changed_source_files(conn: &Connection, limit: usize) -> anyhow::Res
     // The `files` view join bounds output to this repo's indexed paths, but the join key is the
     // PATH — a sibling repo's git rows for a shared path (`src/lib.rs` in two repos) would still
     // match, so the direct-scoped tables (V040) carry the explicit `repo_id` predicate too.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "-- Most recently changed source paths that are currently indexed in the active scope.
          -- Invariant: files resolves to the scoped TEMP VIEW; git rows filter repo_id (V040).
@@ -210,8 +210,8 @@ fn active_non_dir_memory_titles(conn: &Connection, limit: usize) -> anyhow::Resu
     // repo's orientation. Scoping the outer `m` on `repo_memories.repo_id` is sufficient — the
     // inner `dir`-exclusion subquery only removes ids, and a sibling id can never equal an
     // active memory's. `{repo_clause}` empty pre-A5.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
     let mut stmt = conn.prepare(&format!(
         "-- Active memories not bound to a directory, newest-updated first.
          -- Invariant: excludes binding_kind='dir' rows so tree-shown titles are not repeated.
@@ -242,8 +242,8 @@ fn active_non_dir_memory_titles(conn: &Connection, limit: usize) -> anyhow::Resu
 fn active_non_dir_memory_count(conn: &Connection) -> anyhow::Result<u32> {
     // Scoped to the active repo (V042), matching `active_non_dir_memory_titles` so the `(+N more)`
     // total counts only this repo's memories. `{repo_clause}` empty pre-A5.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
     let count: i64 = conn.query_row(
         &format!(
             "-- Total active memories not bound to a directory (mirrors the titles query).

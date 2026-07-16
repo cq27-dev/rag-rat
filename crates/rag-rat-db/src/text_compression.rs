@@ -18,16 +18,16 @@ use anyhow::Result;
 /// 212 MB/s (~4.2x) vs level 19 = 4.1 MB/s (~4.9x) — 52x faster for ~80% of the ratio (levels
 /// 15->22 buy almost nothing). Level 3 keeps a full reindex's added compression cost negligible
 /// (the hard no-indexing-delay constraint); decompression throughput is level-independent.
-pub(crate) const COMPRESSION_LEVEL: i32 = 3;
+pub const COMPRESSION_LEVEL: i32 = 3;
 
 /// Default trained-dictionary size — zstd's own default; the #77 spike measured its ratios at this
 /// size. Stored once in the DB, so its cost is negligible against the per-row savings.
-pub(crate) const DEFAULT_DICT_SIZE: usize = 112 * 1024;
+pub const DEFAULT_DICT_SIZE: usize = 112 * 1024;
 
 /// Train a single shared zstd dictionary from a sample of chunk texts (`max_size` caps the dict;
 /// production passes [`DEFAULT_DICT_SIZE`]). The spike showed one global dict performs within ~3%
 /// of per-language dicts, so we train ONE — no per-language keying / `lang` column needed.
-pub(crate) fn train_dict(samples: &[Vec<u8>], max_size: usize) -> Result<Vec<u8>> {
+pub fn train_dict(samples: &[Vec<u8>], max_size: usize) -> Result<Vec<u8>> {
     let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
     Ok(zstd::dict::from_samples(&refs, max_size)?)
 }
@@ -37,10 +37,10 @@ pub(crate) fn train_dict(samples: &[Vec<u8>], max_size: usize) -> Result<Vec<u8>
 /// over a full corpus). An empty dict means no-dictionary (plain zstd) — the fallback for corpora
 /// too small to train on (`from_samples` hard-errors under ~7 samples); the read side recognizes
 /// the same empty-dict sentinel, so write and read stay consistent.
-pub(crate) struct ChunkCompressor<'a>(Option<zstd::bulk::Compressor<'a>>);
+pub struct ChunkCompressor<'a>(Option<zstd::bulk::Compressor<'a>>);
 
 impl<'a> ChunkCompressor<'a> {
-    pub(crate) fn new(dict: &'a [u8]) -> Result<Self> {
+    pub fn new(dict: &'a [u8]) -> Result<Self> {
         Ok(Self(if dict.is_empty() {
             None
         } else {
@@ -48,7 +48,7 @@ impl<'a> ChunkCompressor<'a> {
         }))
     }
 
-    pub(crate) fn compress(&mut self, text: &[u8]) -> Result<Vec<u8>> {
+    pub fn compress(&mut self, text: &[u8]) -> Result<Vec<u8>> {
         match &mut self.0 {
             Some(compressor) => Ok(compressor.compress(text)?),
             None => Ok(zstd::bulk::compress(text, COMPRESSION_LEVEL)?),
@@ -61,10 +61,9 @@ impl<'a> ChunkCompressor<'a> {
 /// empty `dict` means the blob was written without a dictionary (see [`ChunkCompressor`]).
 ///
 /// Single-shot convenience — production read paths all reuse a [`ChunkDecompressor`] across a batch
-/// (the per-call dictionary prep is the cost), so this now serves only round-trip tests (#77 Phase
-/// 2).
-#[cfg(test)]
-pub(crate) fn decompress(blob: &[u8], dict: &[u8], capacity: usize) -> Result<Vec<u8>> {
+/// (the per-call dictionary prep is the cost), so this now serves only the workspace's round-trip
+/// tests (#77 Phase 2; the engine's chunk-store migration tests call it cross-crate).
+pub fn decompress(blob: &[u8], dict: &[u8], capacity: usize) -> Result<Vec<u8>> {
     if dict.is_empty() {
         return Ok(zstd::bulk::decompress(blob, capacity)?);
     }
@@ -76,10 +75,10 @@ pub(crate) fn decompress(blob: &[u8], dict: &[u8], capacity: usize) -> Result<Ve
 /// paths (lexical snippets, the embedding scan) decompress many blobs, and the per-call
 /// [`decompress`] re-prepares the dictionary every time (~7x slower). An empty dict means
 /// no-dictionary (plain zstd). `capacity` per call is the row's stored `raw_len`.
-pub(crate) struct ChunkDecompressor<'a>(Option<zstd::bulk::Decompressor<'a>>);
+pub struct ChunkDecompressor<'a>(Option<zstd::bulk::Decompressor<'a>>);
 
 impl<'a> ChunkDecompressor<'a> {
-    pub(crate) fn new(dict: &'a [u8]) -> Result<Self> {
+    pub fn new(dict: &'a [u8]) -> Result<Self> {
         Ok(Self(if dict.is_empty() {
             None
         } else {
@@ -87,7 +86,7 @@ impl<'a> ChunkDecompressor<'a> {
         }))
     }
 
-    pub(crate) fn decompress(&mut self, blob: &[u8], capacity: usize) -> Result<Vec<u8>> {
+    pub fn decompress(&mut self, blob: &[u8], capacity: usize) -> Result<Vec<u8>> {
         match &mut self.0 {
             Some(decompressor) => Ok(decompressor.decompress(blob, capacity)?),
             None => Ok(zstd::bulk::decompress(blob, capacity)?),
@@ -102,14 +101,14 @@ impl<'a> ChunkDecompressor<'a> {
 /// [`ChunkTextDecoder`] — the shared shape every batch reader (lexical, graph, embedding scan)
 /// collects per row before decompressing in a post-loop, since decompress's `anyhow::Result` can't
 /// cross a rusqlite closure.
-pub(crate) struct ChunkTextRow {
-    pub(crate) blob: Vec<u8>,
-    pub(crate) raw_len: i64,
-    pub(crate) dict_version: i64,
+pub struct ChunkTextRow {
+    pub blob: Vec<u8>,
+    pub raw_len: i64,
+    pub dict_version: i64,
 }
 
 impl ChunkTextRow {
-    pub(crate) fn resolve(self, decoder: &mut ChunkTextDecoder) -> Result<String> {
+    pub fn resolve(self, decoder: &mut ChunkTextDecoder) -> Result<String> {
         let bytes =
             decoder.decompress(self.dict_version, &self.blob, self.raw_len.max(0) as usize)?;
         Ok(String::from_utf8(bytes)?)
@@ -122,17 +121,17 @@ impl ChunkTextRow {
 /// decompressor per version (built on first use) so the per-call dict prep is paid once per
 /// version, not per row. Borrows the resident dict bytes (load them once with `chunk_text_dicts`);
 /// an absent version falls back to the empty (no-dict) decompressor.
-pub(crate) struct ChunkTextDecoder<'a> {
+pub struct ChunkTextDecoder<'a> {
     dicts: &'a std::collections::HashMap<i64, Vec<u8>>,
     cache: std::collections::HashMap<i64, ChunkDecompressor<'a>>,
 }
 
 impl<'a> ChunkTextDecoder<'a> {
-    pub(crate) fn new(dicts: &'a std::collections::HashMap<i64, Vec<u8>>) -> Self {
+    pub fn new(dicts: &'a std::collections::HashMap<i64, Vec<u8>>) -> Self {
         Self { dicts, cache: std::collections::HashMap::new() }
     }
 
-    pub(crate) fn decompress(
+    pub fn decompress(
         &mut self,
         dict_version: i64,
         blob: &[u8],

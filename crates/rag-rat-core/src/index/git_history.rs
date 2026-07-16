@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use gix::object::tree::diff::{Action, Change};
 use gix::revision::walk::Sorting;
 use rag_rat_base::hash::hex_sha256;
+use rag_rat_db::meta::{delete_repo_meta, repo_meta, set_repo_meta};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::index::{delete_repo_meta, repo_meta, schema, scoped_table_row_count, set_repo_meta};
+use crate::index::{schema, scoped_table_row_count};
 use crate::search::lexical::SearchHit;
 
 const GIT_HISTORY_INDEXED_HEAD_META: &str = "git_history_indexed_head";
@@ -370,7 +371,7 @@ fn replace_history_rows(
     // never a `DELETE FROM commit_fts` + manual repopulate — the reinserted commit rows took new
     // rowids, so the stored mapping is stale. `'rebuild'` re-indexes all repos' commits, keeping
     // every repo searchable.
-    crate::index::schema::rebuild_commit_fts(conn)?;
+    rag_rat_db::schema::rebuild_commit_fts(conn)?;
     Ok(())
 }
 
@@ -385,7 +386,7 @@ fn append_history_rows(
         // The history cursor may still advance for an out-of-scope fast-forward. Since existing
         // `git_commits` rows are preserved, rebuild the external-content FTS so any prior desync
         // is not carried past the new cursor.
-        crate::index::schema::rebuild_commit_fts(conn)?;
+        rag_rat_db::schema::rebuild_commit_fts(conn)?;
         return Ok(());
     }
     // V1 keeps blame invalidation whole-repo even on append. Scoping by touched paths is a
@@ -396,7 +397,7 @@ fn append_history_rows(
     // External-content FTS can be missing or stale independently of `git_commits`. A fast-forward
     // append preserves existing rows, but still has to run the desync-safe rebuild so older
     // commits do not stay unsearchable until a later full history reload.
-    crate::index::schema::rebuild_commit_fts(conn)?;
+    rag_rat_db::schema::rebuild_commit_fts(conn)?;
     Ok(())
 }
 
@@ -962,7 +963,7 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
     conn.execute("DELETE FROM git_file_changes WHERE repo_id = ?1", params![repo_id])?;
     conn.execute("DELETE FROM git_commits WHERE repo_id = ?1", params![repo_id])?;
     delete_repo_chunk_blame(conn, &repo_id)?;
-    crate::index::schema::rebuild_commit_fts(conn)?;
+    rag_rat_db::schema::rebuild_commit_fts(conn)?;
     // The reload-gate keys moved to `repo_meta` (V039); clear them for the active repo.
     for key in [
         GIT_HISTORY_INDEXED_HEAD_META,
@@ -1395,7 +1396,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         let repo_id = "repo";
         conn.execute(
             "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, 'repo', 0)",

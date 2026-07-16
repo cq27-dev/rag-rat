@@ -435,7 +435,8 @@ fn full_ladder_replay_on_a_two_repo_db_is_idempotent() {
 
     // Replay the FULL ladder, exactly what `create_or_migrate` / `index --full` does. Before the
     // gate this HARD-ERRORS at V039 on the 2-repo registry.
-    schema::apply(&conn).expect("full-ladder replay on a consolidated 2-repo DB must not error");
+    schema::apply(&conn, &crate::index::migration_hooks())
+        .expect("full-ladder replay on a consolidated 2-repo DB must not error");
 
     // A no-op: no meta relocated, no rows resurrected in the source tables, no files moved.
     assert_eq!(dump_repo_meta(&conn), repo_meta_before, "the replay moved no repo_meta rows");
@@ -541,7 +542,7 @@ fn gc_prunes_a_dead_oracle_run_on_a_single_repo_db() {
 #[test]
 fn identical_content_in_two_repos_yields_distinct_logical_symbols() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    crate::index::schema::apply(&conn).unwrap();
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     let key = crate::index::graph_index::LogicalSymbolKey {
         language: "rust".to_string(),
@@ -615,7 +616,7 @@ fn active_repo_id_honors_an_installed_empty_scope() {
     let fx = two_repo_fixture();
     let conn = fx.db.storage.connection();
     // A repo_meta row under repo A that a config-blind sole/active pick WOULD surface.
-    crate::index::meta::set_repo_meta(conn, &fx.repo_a_id, "git_commit", "a-head").unwrap();
+    rag_rat_db::meta::set_repo_meta(conn, &fx.repo_a_id, "git_commit", "a-head").unwrap();
 
     // Install an EMPTY scope: overwrite the connection's repo_id context with "" (what
     // `install_worktree_scope_view(conn, "", ..)` writes when the repo is unprovable).
@@ -633,7 +634,7 @@ fn active_repo_id_honors_an_installed_empty_scope() {
     // Therefore a direct-scoped reader reads NOTHING, not repo A's (or a sibling's) row.
     let scoped = schema::active_repo_id(conn).unwrap();
     assert_eq!(
-        crate::index::meta::repo_meta(conn, &scoped, "git_commit").unwrap(),
+        rag_rat_db::meta::repo_meta(conn, &scoped, "git_commit").unwrap(),
         None,
         "installed-empty scope yields empty direct-scoped reads, never a sibling's rows",
     );
@@ -808,7 +809,7 @@ fn seed_search_leak_data(fx: &TwoRepoFixture) {
         [REPO_B],
     )
     .unwrap();
-    crate::index::schema::rebuild_commit_fts(conn).unwrap();
+    rag_rat_db::schema::rebuild_commit_fts(conn).unwrap();
 
     // Repo B's papertrail (must never leak) + repo A's own papertrail (the positive control).
     seed_papertrail_item(conn, REPO_B, "octob/rb", "77", B_ISSUE_TOKEN, "src/b_only.rs");
@@ -918,7 +919,7 @@ const A5_REPO_B: &str = "a5-repo-b";
 fn a5_scoped_two_repo_conn() -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     for repo in [A5_REPO_A, A5_REPO_B] {
         conn.execute(
             "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
@@ -1825,7 +1826,7 @@ fn incremental_open_heal_leaves_a_sibling_repos_model_meta_alone() {
         [],
     )
     .unwrap();
-    crate::index::meta::set_repo_meta(
+    rag_rat_db::meta::set_repo_meta(
         conn,
         "0-first-sibling",
         "active_embedding_model",
@@ -1842,7 +1843,7 @@ fn incremental_open_heal_leaves_a_sibling_repos_model_meta_alone() {
     let db = IndexDatabase::index_changed(&config).unwrap();
 
     // The sibling's legacy meta row SURVIVES: the heal ran scoped to repo A, never the sole pick.
-    let sibling_meta = crate::index::meta::repo_meta(
+    let sibling_meta = rag_rat_db::meta::repo_meta(
         db.storage.connection(),
         "0-first-sibling",
         "active_embedding_model",
@@ -1873,7 +1874,7 @@ fn config_less_migrate_on_a_multi_repo_db_leaves_sibling_model_meta_alone() {
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         // Two real repos make the DB consolidated; the first-sorting one carries a LEGACY
         // active-model value — the row a config-less heal would delete.
         conn.execute_batch(
@@ -1882,7 +1883,7 @@ fn config_less_migrate_on_a_multi_repo_db_leaves_sibling_model_meta_alone() {
              DELETE FROM repos WHERE repo_id = '__unassigned__';",
         )
         .unwrap();
-        crate::index::meta::set_repo_meta(
+        rag_rat_db::meta::set_repo_meta(
             &conn,
             "0-first-sibling",
             "active_embedding_model",
@@ -1895,7 +1896,7 @@ fn config_less_migrate_on_a_multi_repo_db_leaves_sibling_model_meta_alone() {
 
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let sibling_meta =
-        crate::index::meta::repo_meta(&conn, "0-first-sibling", "active_embedding_model").unwrap();
+        rag_rat_db::meta::repo_meta(&conn, "0-first-sibling", "active_embedding_model").unwrap();
     assert_eq!(
         sibling_meta.as_deref(),
         Some("fastembed-all-minilm-l6-v2"),
@@ -1922,7 +1923,7 @@ fn incremental_open_resets_source_root_from_the_config_before_heals() {
         [],
     )
     .unwrap();
-    crate::index::meta::set_repo_meta(
+    rag_rat_db::meta::set_repo_meta(
         conn,
         "0-first-sibling",
         "source_root",
@@ -2036,7 +2037,7 @@ fn rebuild_certifies_the_policy_version_only_for_the_active_repo() {
     // current — so this catches the regression the "seed B after the rebuild" shape could not.
     let fx = two_repo_fixture();
     let conn = fx.db.storage.connection();
-    crate::index::meta::set_repo_meta(
+    rag_rat_db::meta::set_repo_meta(
         conn,
         REPO_B,
         ai::EMBEDDING_POLICY_VERSION_KEY,
@@ -2054,14 +2055,14 @@ fn rebuild_certifies_the_policy_version_only_for_the_active_repo() {
     let conn = db.storage.connection();
 
     assert_eq!(
-        crate::index::meta::repo_meta(conn, &fx.repo_a_id, ai::EMBEDDING_POLICY_VERSION_KEY)
+        rag_rat_db::meta::repo_meta(conn, &fx.repo_a_id, ai::EMBEDDING_POLICY_VERSION_KEY)
             .unwrap()
             .as_deref(),
         Some(ai::EMBEDDING_POLICY_VERSION),
         "repo A's rebuild certified repo A"
     );
     assert_eq!(
-        crate::index::meta::repo_meta(conn, REPO_B, ai::EMBEDDING_POLICY_VERSION_KEY)
+        rag_rat_db::meta::repo_meta(conn, REPO_B, ai::EMBEDDING_POLICY_VERSION_KEY)
             .unwrap()
             .as_deref(),
         Some("repo-b-sentinel"),

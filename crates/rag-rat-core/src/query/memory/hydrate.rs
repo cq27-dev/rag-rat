@@ -143,7 +143,7 @@ pub(crate) fn heal_repo_memory_fts(conn: &Connection) -> anyhow::Result<()> {
         "repo_memory_fts is corrupt beyond an in-place rebuild and this pre-A5 store cannot be \
          repopulated from source"
     );
-    crate::index::schema::rebuild_repo_memory_fts_with_repo_id(conn)?;
+    rag_rat_db::schema::rebuild_repo_memory_fts_with_repo_id(conn)?;
     Ok(())
 }
 
@@ -275,7 +275,7 @@ pub(crate) fn current_summary_and_verdict(
     title: &str,
     body: &str,
 ) -> rusqlite::Result<(Option<String>, Option<String>)> {
-    use crate::index::schema;
+    use rag_rat_db::schema;
     // The dream freshness key is over the WHOLE note (title+body) — recompute it exactly as the
     // queue / verdict pass / compaction pass stamp it.
     let content_hash = crate::dream::note_content_hash(title, body);

@@ -420,21 +420,21 @@ pub(crate) fn delete_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
 /// `reconcile_meta`: the active embedding model, its freshness version, its provisional/remote-
 /// config provenance (V040), and the int8 reencode cursor.
 pub(crate) fn repo_meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    Ok(crate::index::repo_meta(conn, &repo_id, key)?)
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    Ok(rag_rat_db::meta::repo_meta(conn, &repo_id, key)?)
 }
 
 /// Upsert a per-repo meta value — the repo-scoped twin of [`set_meta`].
 pub(crate) fn set_repo_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    crate::index::set_repo_meta(conn, &repo_id, key, value)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    rag_rat_db::meta::set_repo_meta(conn, &repo_id, key, value)?;
     Ok(())
 }
 
 /// Delete a per-repo meta key from `repo_meta` (a no-op when absent).
 pub(crate) fn delete_repo_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    crate::index::delete_repo_meta(conn, &repo_id, key)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    rag_rat_db::meta::delete_repo_meta(conn, &repo_id, key)?;
     Ok(())
 }
 
@@ -541,7 +541,7 @@ mod tests {
 
     fn schema_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn
     }
 

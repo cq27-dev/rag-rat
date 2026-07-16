@@ -902,7 +902,7 @@ fn load_source_discriminators_builds_sha_span_strings_and_needs_full_hydration()
     use rusqlite::params;
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    crate::index::schema::apply(&conn).unwrap();
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn.execute(
         "INSERT INTO files(id, path, language, kind, sha256, modified_at_ms, indexed_at_ms)
          VALUES (1, 'a.rs', 'rust', 'source', 'shaAAA', 0, 0),

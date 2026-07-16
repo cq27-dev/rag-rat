@@ -18,12 +18,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::LazyLock;
 
+use rag_rat_db::schema;
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use super::DreamFinding;
-use crate::index::schema;
 
 /// The authoritative "resolves nowhere" verdict — trustworthy precisely because the index is
 /// whole-tree, so a miss is a real absence, not a scoping artifact.
@@ -1014,7 +1014,7 @@ fn text_probe(conn: &Connection, ident: &str) -> rusqlite::Result<TextProbe> {
         return Ok(TextProbe::Exhausted);
     };
     let dicts = chunk_text_dict_bytes(conn)?;
-    let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+    let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
     // Candidate chunks: contentless `chunk_fts.rowid` == `chunks.id`; the JOIN through the
     // repo-scoped `files` view keeps only the active repo's chunks (LIMIT is applied POST-join, so
     // a sibling repo's chunks never consume the guard budget). Rows are STEPPED lazily — the
@@ -1319,7 +1319,7 @@ fn bound_file_excerpts(
 /// Reconstruct a file's absolute line-number → text map from its indexed chunk text (decoded
 /// through the shared dict decoder), so excerpts read current source without touching disk.
 fn file_lines(conn: &Connection, file_id: i64) -> anyhow::Result<BTreeMap<i64, String>> {
-    use crate::index::text_compression::{ChunkTextDecoder, ChunkTextRow};
+    use rag_rat_db::text_compression::{ChunkTextDecoder, ChunkTextRow};
     let dicts = crate::query::chunk_text_dicts(conn)?;
     let mut decoder = ChunkTextDecoder::new(&dicts);
     let mut stmt = conn.prepare(

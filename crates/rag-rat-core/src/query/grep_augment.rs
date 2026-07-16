@@ -538,10 +538,10 @@ fn line_for_symbol(conn: &Connection, hit: &symbol::SymbolHit) -> anyhow::Result
 mod tests {
     use std::collections::HashSet;
 
+    use rag_rat_db::schema;
     use rusqlite::Connection;
 
     use super::*;
-    use crate::index::schema;
     use crate::query::memory::{self, RepoMemoryBindTarget, RepoMemoryCreate};
     use crate::search::lexical::SearchHit;
 
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn symbol_lane_dedups_duplicate_rows() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
              VALUES ('src/a.rs', 'rust', 'source', 'h', 0, 0)",
@@ -624,7 +624,7 @@ mod tests {
 
     fn seeded_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
              VALUES ('src/watch.rs', 'rust', 'source', 'abc', 0, 0)",

@@ -6,9 +6,9 @@ use std::path::PathBuf;
 
 use rag_rat_base::config::Config;
 use rag_rat_base::repo_identity;
+use rag_rat_db::storage::IndexConnection;
 
 use super::schema;
-use crate::storage::IndexConnection;
 
 /// `true` iff indexing `config` would walk at least one target file. `false` means the index would
 /// register the repo with EMPTY content — the exact zero-`[target_bindings]` footgun of #427. A
@@ -149,7 +149,8 @@ fn repo_indexed_at_this_root(
     if schema::repo_has_recorded_root(conn, repo_id, &config.root.to_string_lossy())? {
         return Ok(true);
     }
-    Ok(super::repo_meta(conn, repo_id, "source_root")? == Some(config.root.display().to_string()))
+    Ok(rag_rat_db::meta::repo_meta(conn, repo_id, "source_root")?
+        == Some(config.root.display().to_string()))
 }
 
 /// [`is_root_already_indexed`] against an ALREADY-OPEN connection — used by the indexing paths that

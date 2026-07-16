@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     drop_legacy_ai_prototype_tables(conn)?;
     conn.execute_batch(
         "
@@ -535,7 +535,7 @@ fn interned_qualified_name_indexes(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub(crate) fn rebuild_commit_fts(conn: &Connection) -> anyhow::Result<()> {
+pub fn rebuild_commit_fts(conn: &Connection) -> anyhow::Result<()> {
     // `commit_fts` is an external-content FTS5 table (content='git_commits'). The canonical way to
     // rebuild an external-content index is the built-in 'rebuild' command, which re-reads the
     // content table. An unqualified `DELETE FROM <table>` on an external-content FTS5 table
@@ -562,7 +562,7 @@ mod rebuild_fts_tests {
     #[test]
     fn rebuild_commit_fts_recovers_a_desynced_external_content_index() {
         let conn = Connection::open_in_memory().unwrap();
-        super::super::apply(&conn).unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
         // Seed a commit WITHOUT a matching commit_fts row — the out-of-sync state from #51.
         conn.execute(
             "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s,

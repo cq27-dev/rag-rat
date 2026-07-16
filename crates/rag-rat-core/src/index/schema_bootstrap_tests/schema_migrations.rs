@@ -684,7 +684,7 @@ fn compatible_open_refuses_dirty_and_newer_schema() {
 #[test]
 fn forward_migrate_replay_never_touches_the_dirty_marker() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     truncate_schema_to(&conn, 50);
 
     // Audit every write that targets the marker: the stamp (the INSERT half of `INSERT OR
@@ -702,7 +702,7 @@ fn forward_migrate_replay_never_touches_the_dirty_marker() {
     )
     .unwrap();
 
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
 
     let marker_writes: i64 =
         conn.query_row("SELECT COUNT(*) FROM dirty_marker_audit", [], |row| row.get(0)).unwrap();
@@ -723,7 +723,7 @@ fn forward_migrate_replay_never_touches_the_dirty_marker() {
 #[test]
 fn forward_migrate_step_failure_leaves_a_retryable_older_schema_not_dirty() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     truncate_schema_to(&conn, 50);
 
     conn.execute_batch(
@@ -734,7 +734,10 @@ fn forward_migrate_step_failure_leaves_a_retryable_older_schema_not_dirty() {
         ",
     )
     .unwrap();
-    assert!(schema::migrate_forward(&conn).is_err(), "the injected failure fails the migrate");
+    assert!(
+        schema::migrate_forward(&conn, &crate::index::migration_hooks()).is_err(),
+        "the injected failure fails the migrate"
+    );
 
     let status = schema::status(&conn).unwrap();
     assert_eq!(
@@ -746,7 +749,7 @@ fn forward_migrate_step_failure_leaves_a_retryable_older_schema_not_dirty() {
 
     // With the failure gone, the next migrate completes the pending step exactly once.
     conn.execute_batch("DROP TRIGGER fail_051_record;").unwrap();
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     let status = schema::status(&conn).unwrap();
     assert_eq!(status.state, schema::SchemaState::Compatible);
     assert_eq!(status.current_version, schema::LATEST_SCHEMA_VERSION);
@@ -767,7 +770,7 @@ fn forward_migrate_step_failure_leaves_a_retryable_older_schema_not_dirty() {
 #[test]
 fn forward_migrate_when_nothing_is_owed_leaves_the_ledger_untouched() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     conn.execute_batch(
         "
@@ -782,7 +785,7 @@ fn forward_migrate_when_nothing_is_owed_leaves_the_ledger_untouched() {
     )
     .unwrap();
 
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
 
     let mut stmt = conn.prepare("SELECT op, id FROM ledger_write_audit").unwrap();
     let writes: Vec<(String, String)> = stmt
@@ -805,7 +808,7 @@ fn forward_migrate_when_nothing_is_owed_leaves_the_ledger_untouched() {
 #[test]
 fn apply_clears_a_stranded_dirty_marker() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
          VALUES ('__dirty__', 1, '', 'partial migration in progress')",
@@ -814,7 +817,7 @@ fn apply_clears_a_stranded_dirty_marker() {
     .unwrap();
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Dirty);
 
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     let status = schema::status(&conn).unwrap();
     assert_eq!(
@@ -833,7 +836,7 @@ fn apply_clears_a_stranded_dirty_marker() {
 #[test]
 fn forward_migrate_replay_preserves_chunk_summaries() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // Seed a bare summary row (FK off — the parent chunk chain is irrelevant to what this test
     // pins: the replay must not touch the rows).
     conn.execute_batch(
@@ -845,7 +848,7 @@ fn forward_migrate_replay_preserves_chunk_summaries() {
     .unwrap();
     truncate_schema_to(&conn, 50);
 
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
 
     let kept: i64 =
         conn.query_row("SELECT COUNT(*) FROM chunk_summaries", [], |row| row.get(0)).unwrap();
@@ -875,7 +878,7 @@ fn baseline_replay_still_converts_the_legacy_prototype_ai_tables() {
     )
     .unwrap();
 
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     assert!(!conn_table_exists(&conn, "embeddings"), "the prototype embeddings table is dropped");
     assert!(
@@ -894,7 +897,10 @@ fn a_failed_first_provision_reads_dirty_with_the_failure_recorded() {
     // `CREATE TABLE IF NOT EXISTS files` and then fails its index build (`no such column`).
     conn.execute_batch("CREATE TABLE files(id INTEGER PRIMARY KEY);").unwrap();
 
-    assert!(schema::apply(&conn).is_err(), "the poisoned baseline fails the first provision");
+    assert!(
+        schema::apply(&conn, &crate::index::migration_hooks()).is_err(),
+        "the poisoned baseline fails the first provision"
+    );
 
     let status = schema::status(&conn).unwrap();
     assert_eq!(status.state, schema::SchemaState::Dirty);
@@ -916,7 +922,7 @@ fn a_failed_first_provision_reads_dirty_with_the_failure_recorded() {
 #[test]
 fn apply_recovers_a_baseline_checksum_mismatch() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn.execute(
         "UPDATE schema_version SET checksum = 'sha256:corrupted'
          WHERE id = '001_sqlite_storage_baseline'",
@@ -925,7 +931,7 @@ fn apply_recovers_a_baseline_checksum_mismatch() {
     .unwrap();
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Dirty);
 
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     let status = schema::status(&conn).unwrap();
     assert_eq!(
@@ -952,7 +958,7 @@ fn concurrent_forward_migrate_applies_the_pending_step_exactly_once() {
 
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         truncate_schema_to(&conn, 50);
         // Make the pending step real work again, as on a live V050 DB.
         conn.execute_batch("DROP TABLE IF EXISTS clone_df_epoch;").unwrap();
@@ -1027,7 +1033,7 @@ fn discover_mode_indexes_new_files_and_removes_deleted_files() {
 #[test]
 fn migration_046_creates_the_verification_tables_on_fresh_apply() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -1069,7 +1075,7 @@ fn migration_046_creates_the_verification_tables_on_fresh_apply() {
     );
 
     // Re-apply is a no-op (the memory_reality existence sentinel short-circuits).
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert!(conn_table_exists(&conn, "memory_reality"), "tables survive a re-apply");
 }
 
@@ -1078,7 +1084,7 @@ fn migration_046_creates_the_verification_tables_on_fresh_apply() {
 #[test]
 fn migration_047_creates_the_model_failure_table_on_fresh_apply() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // The absolute-tip pin moved to `migration_048_*` (V048 is the tip now); this test keeps the
     // symbolic "schema at LATEST after apply" check and its V047 table coverage.
     assert_eq!(
@@ -1125,14 +1131,14 @@ fn migration_047_creates_the_model_failure_table_on_fresh_apply() {
         "one current failure row per repo/memory/pass"
     );
 
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert!(conn_table_exists(&conn, "memory_model_failures"), "failure table survives a re-apply");
 }
 
 #[test]
 fn migration_048_adds_the_memory_payload_json_column() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // Symbolic freshness check — the absolute tip pin lives on the NEWEST migration's test
     // (migration_050_*), per the ladder convention.
     assert_eq!(
@@ -1145,7 +1151,7 @@ fn migration_048_adds_the_memory_payload_json_column() {
         "repo_memories carries the payload_json column (#465)"
     );
     // Additive + nullable: a re-apply is idempotent and the column survives.
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert!(
         conn_table_columns(&conn, "repo_memories").contains(&"payload_json".to_string()),
         "payload_json survives a re-apply"
@@ -1155,7 +1161,7 @@ fn migration_048_adds_the_memory_payload_json_column() {
 #[test]
 fn migration_049_adds_the_repo_node_edges_table() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // Symbolic freshness check — the absolute tip pin lives on the NEWEST migration's test
     // (migration_050_*), per the ladder convention.
     assert_eq!(
@@ -1198,7 +1204,7 @@ fn migration_049_adds_the_repo_node_edges_table() {
     assert_eq!(pk_cols, vec!["edge_key".to_string()], "edge_key is the stable PK");
 
     // Idempotent re-apply.
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert!(conn_table_exists(&conn, "repo_node_edges"), "edge table survives a re-apply");
 }
 
@@ -1215,7 +1221,7 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
             > 0
     };
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // Symbolic freshness check (the absolute tip pin lives on the NEWEST migration's test —
     // migration_051 — per the ladder convention).
     assert_eq!(
@@ -1244,7 +1250,7 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
         [],
     )
     .unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert!(index_exists(&conn), "the postings path index survives a re-apply");
     assert!(
         conn_table_columns(&conn, "clone_graph_generations")
@@ -1281,7 +1287,7 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
 #[test]
 fn migration_051_adds_clone_df_epoch_and_backfills_existing_generations() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // V052 now holds the absolute tip pin (migration_052's test); this drops to the symbolic
     // `current_version == LATEST` freshness check.
     assert_eq!(
@@ -1369,7 +1375,7 @@ fn migration_052_adds_oplog_storage_tables() {
     const OPLOG_TABLES: [&str; 4] =
         ["oplog_entries", "oplog_projected_nodes", "oplog_projected_edges", "oplog_meta"];
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // V053 now holds the absolute tip pin (migration_053's test); this drops to the symbolic
     // `current_version == LATEST` freshness check.
     assert_eq!(
@@ -1402,7 +1408,7 @@ fn migration_052_adds_oplog_storage_tables() {
 #[test]
 fn migration_053_scopes_the_oplog_by_stream_and_adds_fork_evidence() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // V054 now holds the absolute tip pin (migration_054's test); this drops to the symbolic
     // `current_version == LATEST` freshness check.
     assert_eq!(
@@ -1468,7 +1474,7 @@ fn migration_053_scopes_the_oplog_by_stream_and_adds_fork_evidence() {
 #[test]
 fn migration_054_adds_the_single_row_device_identity_table() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // The absolute-tip pin moved to `migration_055_*` (V055 is the tip now); this drops to the
     // symbolic check, per the ladder convention.
     assert_eq!(
@@ -1533,7 +1539,7 @@ fn migration_054_adds_the_single_row_device_identity_table() {
 #[test]
 fn migration_055_adds_the_binding_downgrade_marker_column() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // The absolute tip pin lives with the newest migration's test (`migration_057_*` now); this
     // drops to the symbolic `current_version == LATEST` freshness check.
     assert_eq!(
@@ -1547,7 +1553,7 @@ fn migration_055_adds_the_binding_downgrade_marker_column() {
         "repo_memory_bindings carries the downgrade hysteresis marker (#492)"
     );
     // Additive + nullable: a re-apply is idempotent and the column survives.
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert!(
         conn_table_columns(&conn, "repo_memory_bindings")
             .contains(&"downgrade_pending_at_ms".to_string()),
@@ -1556,7 +1562,7 @@ fn migration_055_adds_the_binding_downgrade_marker_column() {
     // A forward migrate over a ledger truncated below V055 replays the step and lands the
     // column (the standard lagging-index path).
     truncate_schema_to(&conn, 54);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -1567,7 +1573,7 @@ fn migration_055_adds_the_binding_downgrade_marker_column() {
 #[test]
 fn migration_056_adds_the_git_change_couplings_table() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // The absolute tip pin lives with the newest migration's test (`migration_057_*` now); this
     // drops to the symbolic `current_version == LATEST` freshness check.
     assert_eq!(
@@ -1612,7 +1618,7 @@ fn migration_056_adds_the_git_change_couplings_table() {
 
     // A forward migrate over a ledger truncated below V056 replays the step and reaches the tip.
     truncate_schema_to(&conn, 55);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -1623,7 +1629,7 @@ fn migration_056_adds_the_git_change_couplings_table() {
 #[test]
 fn migration_057_adds_the_external_symbols_table() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // The absolute tip pin moved to `migration_058_*` (V058 is the tip now); this drops to the
     // symbolic `current_version == LATEST` check, per the ladder convention.
     assert_eq!(
@@ -1744,7 +1750,7 @@ fn migration_057_adds_the_external_symbols_table() {
     // A forward migrate over a ledger truncated below V057 replays the step and lands the table.
     conn.execute_batch("DROP TABLE external_symbols;").unwrap();
     truncate_schema_to(&conn, 56);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -1759,7 +1765,7 @@ fn migration_057_adds_the_external_symbols_table() {
 #[test]
 fn migration_058_adds_the_oplog_device_x25519_columns() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // V058 is no longer the tip — symbolic tip check.
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
@@ -1797,7 +1803,7 @@ fn migration_058_adds_the_oplog_device_x25519_columns() {
 
     // A forward migrate over a ledger truncated below V058 replays the step and keeps the columns.
     truncate_schema_to(&conn, 57);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -1814,7 +1820,7 @@ fn migration_058_adds_the_oplog_device_x25519_columns() {
 #[test]
 fn migration_059_creates_the_account_candidate_dag() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // V059 is no longer the tip (the absolute pin moved to the V060 papertrail test).
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
@@ -1852,7 +1858,7 @@ fn migration_059_creates_the_account_candidate_dag() {
 
     // A forward migrate over a ledger truncated below V059 replays the step and keeps the tables.
     truncate_schema_to(&conn, 58);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -1867,7 +1873,7 @@ fn migration_059_creates_the_account_candidate_dag() {
 #[test]
 fn migration_064_creates_account_authority_shadow_tables() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     for table in [
         "account_auth_state",
         "account_roster_history",
@@ -1912,7 +1918,7 @@ fn migration_064_creates_account_authority_shadow_tables() {
          DROP TABLE account_auth_state;",
     )
     .unwrap();
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     assert!(conn_table_exists(&conn, "account_auth_state"));
 }
@@ -1920,7 +1926,7 @@ fn migration_064_creates_account_authority_shadow_tables() {
 #[test]
 fn migration_065_adds_historical_authority_boundaries() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert!(conn_table_exists(&conn, "account_roster_content_boundaries"));
     for table in ["account_roster_history", "account_owner_incarnations"] {
         for column in [
@@ -1943,7 +1949,7 @@ fn migration_065_adds_historical_authority_boundaries() {
 #[test]
 fn migration_066_adds_the_content_candidate_dag() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     for table in ["content_entries", "content_entry_status", "content_pre_verify"] {
         assert!(conn_table_exists(&conn, table), "V066 creates {table}");
     }
@@ -2005,12 +2011,14 @@ fn migration_066_adds_the_content_candidate_dag() {
     )
     .unwrap();
     assert!(!conn_table_exists(&conn, "content_entries"));
-    schema::migrate_forward(&conn).expect("V065 upgrades through V066");
+    schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("V065 upgrades through V066");
     assert!(conn_index_exists(&conn, "content_entries_chain"));
     assert!(conn_index_exists(&conn, "content_entries_predecessor"));
     assert!(conn_index_exists(&conn, "content_accepted_slot"));
     assert!(conn_index_exists(&conn, "content_pre_verify_author"));
-    schema::migrate_forward(&conn).expect("a second V066 forward migration is a no-op");
+    schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("a second V066 forward migration is a no-op");
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 }
 
@@ -2019,7 +2027,7 @@ fn migration_068_hides_suppressed_edge_candidates() {
     // The absolute-tip pin moved to `migration_069_*` (V069 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -2058,7 +2066,7 @@ fn migration_068_hides_suppressed_edge_candidates() {
         conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap();
     assert_eq!(visible_before_upgrade, 1, "the V067 view exposes the retained candidate");
 
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     let raw_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM edges_data", [], |row| row.get(0)).unwrap();
     let visible_count: i64 =
@@ -2080,7 +2088,7 @@ fn migration_069_adds_the_local_account_pointer() {
     // The absolute-tip pin moved to `migration_070_*` (V070 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -2148,7 +2156,7 @@ fn migration_069_adds_the_local_account_pointer() {
 
     // A forward migrate over a ledger truncated below V069 replays the step and records V069.
     truncate_schema_to(&conn, 68);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -2169,7 +2177,7 @@ fn migration_070_adds_the_content_projected_tables() {
     // The absolute-tip pin moved to `migration_071_*` (V071 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -2232,7 +2240,7 @@ fn migration_070_adds_the_content_projected_tables() {
 
     // A forward migrate over a ledger truncated below V070 replays the step and records V070.
     truncate_schema_to(&conn, 69);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -2253,7 +2261,7 @@ fn migration_071_indexes_edge_target_qname() {
     // The absolute-tip pin moved to `migration_072_*` (V072 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -2280,7 +2288,7 @@ fn migration_071_indexes_edge_target_qname() {
 
     // A forward migrate over a ledger truncated below V071 replays the step and records V071.
     truncate_schema_to(&conn, 70);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -2300,7 +2308,7 @@ fn migration_071_indexes_edge_target_qname() {
 fn migration_072_is_the_tip_and_queues_pending_refold() {
     assert_eq!(schema::LATEST_SCHEMA_VERSION, 72, "move this pin with the next schema migration");
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     // The deferred-refold work queue exists with just its stream_id primary key.
     assert!(
@@ -2356,7 +2364,7 @@ fn migration_072_is_the_tip_and_queues_pending_refold() {
 
     // A forward migrate over a ledger truncated below V072 replays the step and records V072.
     truncate_schema_to(&conn, 71);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -2480,7 +2488,7 @@ fn applying_the_schema_records_migration_provenance() {
     use rusqlite::OptionalExtension;
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     let read = |key: &str| -> Option<String> {
         conn.query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
             .optional()
@@ -2494,7 +2502,7 @@ fn applying_the_schema_records_migration_provenance() {
     );
     assert_eq!(
         read("last_migration_binary_version").as_deref(),
-        Some(crate::binary_version()),
+        Some(rag_rat_base::version::binary_version()),
         "provenance records this binary's version string"
     );
     assert!(read("last_migration_binary_exe").is_some(), "provenance records the binary path");
@@ -2509,7 +2517,7 @@ fn applying_the_schema_records_migration_provenance() {
 #[test]
 fn newer_schema_refusal_names_the_migrating_binary_and_ceiling() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap(); // stamps provenance for THIS binary
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap(); // stamps provenance for THIS binary
     // Fabricate a Newer schema: an applied migration this binary doesn't know.
     conn.execute(
         "INSERT INTO schema_version(id, applied_at_ms, checksum, description) VALUES \
@@ -2521,7 +2529,7 @@ fn newer_schema_refusal_names_the_migrating_binary_and_ceiling() {
     let status = schema::status(&conn).unwrap();
     assert_eq!(status.state, schema::SchemaState::Newer);
     assert!(
-        status.message.contains(crate::binary_version()),
+        status.message.contains(rag_rat_base::version::binary_version()),
         "refusal should name the migrating binary version; got: {}",
         status.message
     );
@@ -2539,7 +2547,7 @@ fn forward_migration_records_migration_provenance() {
     use rusqlite::OptionalExtension;
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // Roll back one migration and clear provenance, then forward-migrate.
     conn.execute(
         "DELETE FROM schema_version WHERE id = (SELECT id FROM schema_version ORDER BY id DESC \
@@ -2550,7 +2558,7 @@ fn forward_migration_records_migration_provenance() {
     conn.execute("DELETE FROM index_meta WHERE key LIKE 'last_migration_%'", []).unwrap();
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
 
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
 
     let to: Option<String> = conn
         .query_row(

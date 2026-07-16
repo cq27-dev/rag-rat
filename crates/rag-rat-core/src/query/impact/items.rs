@@ -223,7 +223,7 @@ pub(crate) fn coupling_items(
     path: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<ImpactItem>> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let coupled =
         crate::index::change_coupling::coupled_files_for_path(conn, &repo_id, path, limit)?;
     Ok(coupled

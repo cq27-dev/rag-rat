@@ -8,14 +8,14 @@ use crate::index::ai;
 
 fn policy_version(db: &IndexDatabase) -> Option<String> {
     let conn = db.storage.connection();
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
-    crate::index::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY).unwrap()
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
+    rag_rat_db::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY).unwrap()
 }
 
 fn stale_the_stamp(db: &IndexDatabase) {
     let conn = db.storage.connection();
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
-    crate::index::meta::set_repo_meta(
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
+    rag_rat_db::meta::set_repo_meta(
         conn,
         &repo_id,
         ai::EMBEDDING_POLICY_VERSION_KEY,
@@ -43,10 +43,10 @@ fn rebuild_stamps_the_policy_version_current() {
     rust_fixture(&root);
     let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
     let conn = db.storage.connection();
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
     assert_eq!(policy_version(&db).as_deref(), Some(ai::EMBEDDING_POLICY_VERSION));
     assert_eq!(
-        crate::index::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_CAP_KEY)
+        rag_rat_db::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_CAP_KEY)
             .unwrap()
             .as_deref(),
         Some(ai::DEFAULT_MAX_EMBEDDING_CHARS.to_string().as_str()),
@@ -243,14 +243,14 @@ fn absent_stamp_takes_the_recompute_path() {
     rust_fixture(&root);
     let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
     let conn = db.storage.connection();
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
     conn.execute(
         "UPDATE main.chunks SET embedding_policy = 'SkipGenerated'
          WHERE id = (SELECT MIN(id) FROM main.chunks WHERE embedding_policy = 'Embed')",
         [],
     )
     .unwrap();
-    crate::index::meta::delete_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY).unwrap();
+    rag_rat_db::meta::delete_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY).unwrap();
 
     let summary = ai::embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
     assert_eq!(

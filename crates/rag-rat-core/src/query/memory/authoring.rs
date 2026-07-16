@@ -506,7 +506,7 @@ mod tests {
     fn scoped_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
             [REPO],
@@ -640,7 +640,7 @@ mod tests {
     fn authored_durability_raises_full_then_restores_normal() {
         let dir = std::env::temp_dir().join(format!("ragrat-authdur-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = crate::storage::IndexConnection::open(&dir.join("index.db")).unwrap();
+        let storage = rag_rat_db::storage::IndexConnection::open(&dir.join("index.db")).unwrap();
         let conn = storage.connection();
         let synchronous = |c: &Connection| -> i64 {
             c.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap()
@@ -873,7 +873,7 @@ mod tests {
         // an immutable owner stream that adoption can never re-point, so it must no-op even with
         // memories present.
         let conn = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
         )
@@ -907,7 +907,7 @@ mod tests {
         // A machine-local `local:` shallow-clone id is upgraded to a portable id when the clone is
         // deepened, re-pointing the rows — so an immutable owner stream must not be rooted on it.
         let conn = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         let local_id = format!("{}deadbeef", rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX);
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
@@ -937,7 +937,7 @@ mod tests {
     fn backfill_is_a_noop_on_an_unscoped_db() {
         // No repos row, no connection scope → memory_repo_scope is None → nothing to root a stream.
         let conn = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         backfill_memory_oplog(&conn, 1_000).unwrap();
         assert_eq!(entry_count(&conn), 0);
         assert_eq!(local_account_count(&conn), 0, "an unscoped DB mints no account");
@@ -1000,7 +1000,7 @@ mod tests {
     fn a_scope_less_create_authors_nothing() {
         // No repos row / no active-repo context → the scope gate skips authoring entirely.
         let conn = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         create_concept(&conn, "t1").unwrap();
         assert_eq!(entry_count(&conn), 0, "a scope-less create never touches the log");
         assert_eq!(local_account_count(&conn), 0, "a scope-less create mints no account");
@@ -1355,7 +1355,7 @@ mod tests {
         // for the reconcile to author (the racers must converge on authoring it exactly once).
         let setup = Connection::open(&path).unwrap();
         setup.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        crate::index::schema::apply(&setup).unwrap();
+        rag_rat_db::schema::apply(&setup, &crate::index::migration_hooks()).unwrap();
         setup
             .execute(
                 "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",

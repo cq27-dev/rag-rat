@@ -866,7 +866,7 @@ pub(crate) fn stamp_bindings_from_parent_repo(
     conn: &Connection,
     memory_id: &str,
 ) -> anyhow::Result<()> {
-    if crate::index::schema::periphery_repo_scope(conn, "repo_memory_bindings")?.is_some() {
+    if rag_rat_db::schema::periphery_repo_scope(conn, "repo_memory_bindings")?.is_some() {
         conn.execute(
             "UPDATE repo_memory_bindings
              SET repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)

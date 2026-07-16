@@ -2,6 +2,7 @@
 //! indexed/unindexed/changed/removed files.
 
 use rag_rat_base::hash::hex_sha256;
+use rag_rat_base::paths::path_string;
 
 use super::*;
 

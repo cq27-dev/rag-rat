@@ -356,7 +356,7 @@ mod seed_active_embedding_model_tests {
     /// never collide on a shared path (#394 review).
     fn fresh_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         ensure_model_manifest(&conn).unwrap();
         conn
     }

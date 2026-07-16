@@ -947,7 +947,7 @@ fn clone_substrate_has_token_bag_blob_and_no_postings_on_fresh_and_migrated_dbs(
     // (R5 — V029 is never edited), so after apply()/migrate_forward the postings table must be GONE
     // and the column present. The other clone tables (refinements, df) survive.
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    crate::index::schema::apply(&conn).expect("apply");
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     for table in ["symbol_fingerprints", "clone_token_df", "clone_refinements"] {
         let n: i64 = conn
             .query_row(
@@ -974,14 +974,15 @@ fn clone_substrate_has_token_bag_blob_and_no_postings_on_fresh_and_migrated_dbs(
         "symbol_fingerprints gains the token_bag BLOB column on a fresh apply()"
     );
 
-    let status = crate::index::schema::status(&conn).expect("status");
-    assert_eq!(status.current_version, crate::index::schema::LATEST_SCHEMA_VERSION);
-    assert!(matches!(status.state, crate::index::schema::SchemaState::Compatible));
+    let status = rag_rat_db::schema::status(&conn).expect("status");
+    assert_eq!(status.current_version, rag_rat_db::schema::LATEST_SCHEMA_VERSION);
+    assert!(matches!(status.state, rag_rat_db::schema::SchemaState::Compatible));
 
     // Migrated DB: a DB driven through migrate_forward reaches the same post-V032 shape.
     let conn2 = rusqlite::Connection::open_in_memory().expect("open2");
-    crate::index::schema::apply(&conn2).expect("apply2"); // already-latest is a no-op forward
-    crate::index::schema::migrate_forward(&conn2).expect("migrate_forward");
+    rag_rat_db::schema::apply(&conn2, &crate::index::migration_hooks()).expect("apply2"); // already-latest is a no-op forward
+    rag_rat_db::schema::migrate_forward(&conn2, &crate::index::migration_hooks())
+        .expect("migrate_forward");
     let postings: i64 = conn2
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND \

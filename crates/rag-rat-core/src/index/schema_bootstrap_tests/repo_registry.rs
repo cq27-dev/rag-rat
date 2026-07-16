@@ -3,9 +3,9 @@
 //! path, deferred-absence anchored to the migration DDL in isolation — see the directory memory).
 
 use rag_rat_base::repo_identity::{LEGACY_REPO_ID, RepoIdentity, RepoIdentityClass};
+use rag_rat_db::schema::{self, register_repo};
 
 use super::*;
-use crate::index::schema::{self, register_repo};
 
 fn identity(repo_id: &str, display_name: &str) -> RepoIdentity {
     RepoIdentity {
@@ -75,7 +75,7 @@ fn meta_present(conn: &rusqlite::Connection, table: &str, key: &str) -> bool {
 #[test]
 fn migration_038_creates_repos_registry_tables() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
     assert_eq!(conn_table_columns(&conn, "repos"), vec![
         "repo_id",
@@ -141,7 +141,7 @@ fn v038_registry_ddl_is_self_contained_and_introduces_the_registry() {
 #[test]
 fn migration_038_forward_migrates_a_v037_index() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
     // Revert to the V037 shape: drop children before the parent (FK), then drop the ledger row.
     conn.execute_batch("DROP TABLE repo_meta; DROP TABLE repo_roots; DROP TABLE repos;")
@@ -153,7 +153,7 @@ fn migration_038_forward_migrates_a_v037_index() {
         "schema is Older after removing the V038 ledger row"
     );
 
-    schema::migrate_forward(&conn).expect("migrate_forward");
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).expect("migrate_forward");
     for table in ["repos", "repo_roots", "repo_meta"] {
         assert!(conn_table_exists(&conn, table), "V038 recreates {table} on forward migrate");
     }
@@ -170,11 +170,16 @@ fn migration_038_forward_migrates_a_v037_index() {
 #[test]
 fn register_repo_adopts_the_placeholder() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
-    let returned =
-        register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/myrepo"), 123)
-            .expect("register");
+    let returned = register_repo(
+        &conn,
+        &identity("repo-abc", "myrepo"),
+        Path::new("/src/myrepo"),
+        123,
+        &crate::index::migration_hooks(),
+    )
+    .expect("register");
     assert_eq!(returned, "repo-abc");
 
     assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "placeholder is gone after adoption");
@@ -204,12 +209,20 @@ fn register_repo_adopts_the_placeholder() {
 #[test]
 fn reapplying_schema_after_adoption_does_not_resurrect_the_placeholder() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
-    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/myrepo"), 1).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    register_repo(
+        &conn,
+        &identity("repo-abc", "myrepo"),
+        Path::new("/src/myrepo"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "adopted: placeholder gone");
 
     // The exact re-run `create_or_migrate` (hence `rebuild`) performs on an existing index.
-    schema::apply(&conn).expect("re-apply is idempotent on an already-migrated DB");
+    schema::apply(&conn, &crate::index::migration_hooks())
+        .expect("re-apply is idempotent on an already-migrated DB");
 
     assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "placeholder must NOT reappear");
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0)).unwrap();
@@ -228,12 +241,19 @@ fn reapplying_schema_after_adoption_does_not_resurrect_the_placeholder() {
 #[test]
 fn reapplying_schema_after_adoption_keeps_single_repo_id_and_repo_meta_under_the_real_id() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // As V039 leaves a not-yet-adopted DB: per-repo meta under the placeholder.
-    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
-    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
+    rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
+    rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
 
-    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-abc", "myrepo"),
+        Path::new("/src/repo"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     // Adoption re-pointed the meta to the real id and `sole_repo_id` resolves it.
     assert_eq!(
         schema::sole_repo_id(&conn).unwrap(),
@@ -242,7 +262,8 @@ fn reapplying_schema_after_adoption_keeps_single_repo_id_and_repo_meta_under_the
     );
 
     // The exact re-run `create_or_migrate` (hence `rebuild`) performs on an existing index.
-    schema::apply(&conn).expect("re-apply is idempotent on an already-migrated DB");
+    schema::apply(&conn, &crate::index::migration_hooks())
+        .expect("re-apply is idempotent on an already-migrated DB");
 
     // Exactly one repos row (the real id) survives the re-apply — the conditional seed did NOT
     // resurrect the placeholder beside it (the resolver no longer carries a one-row `debug_assert`,
@@ -256,11 +277,11 @@ fn reapplying_schema_after_adoption_keeps_single_repo_id_and_repo_meta_under_the
     );
     // The relocated meta stays scoped to the real id, with its values, across the re-apply.
     assert_eq!(
-        crate::index::meta::repo_meta(&conn, "repo-abc", "source_root").unwrap().as_deref(),
+        rag_rat_db::meta::repo_meta(&conn, "repo-abc", "source_root").unwrap().as_deref(),
         Some("/src/repo"),
     );
     assert_eq!(
-        crate::index::meta::repo_meta(&conn, "repo-abc", "indexed_at_ms").unwrap().as_deref(),
+        rag_rat_db::meta::repo_meta(&conn, "repo-abc", "indexed_at_ms").unwrap().as_deref(),
         Some("9"),
     );
     let placeholder_meta: i64 = conn
@@ -280,11 +301,16 @@ fn reapplying_schema_after_adoption_keeps_single_repo_id_and_repo_meta_under_the
 #[test]
 fn register_repo_refuses_the_reserved_placeholder_and_stays_adoptable() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
-    let err =
-        register_repo(&conn, &identity(LEGACY_REPO_ID, "myrepo"), Path::new("/src/myrepo"), 1)
-            .expect_err("registering the reserved placeholder must be refused");
+    let err = register_repo(
+        &conn,
+        &identity(LEGACY_REPO_ID, "myrepo"),
+        Path::new("/src/myrepo"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .expect_err("registering the reserved placeholder must be refused");
     assert!(err.to_string().contains(LEGACY_REPO_ID), "refusal names the reserved value: {err}");
 
     // DB unchanged: exactly the placeholder row, no real repo, no root recorded under the marker.
@@ -295,8 +321,14 @@ fn register_repo_refuses_the_reserved_placeholder_and_stays_adoptable() {
     assert_eq!(roots, 0, "no root recorded under the marker");
 
     // A subsequent REAL registration adopts cleanly (the failed attempt left nothing behind).
-    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/myrepo"), 2)
-        .expect("a real repo still adopts after the refused placeholder attempt");
+    register_repo(
+        &conn,
+        &identity("repo-abc", "myrepo"),
+        Path::new("/src/myrepo"),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .expect("a real repo still adopts after the refused placeholder attempt");
     assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "placeholder adopted away");
     assert_eq!(repo_row_count(&conn, "repo-abc"), 1, "the real repo owns the DB");
     assert_eq!(root_count(&conn, "repo-abc"), 1, "its root is recorded");
@@ -308,11 +340,17 @@ fn register_repo_refuses_the_reserved_placeholder_and_stays_adoptable() {
 #[test]
 fn register_repo_refuses_an_empty_or_whitespace_repo_id() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
     for blank in ["", "   "] {
-        let err = register_repo(&conn, &identity(blank, "myrepo"), Path::new("/src/myrepo"), 1)
-            .expect_err("an empty/whitespace repo_id must be refused");
+        let err = register_repo(
+            &conn,
+            &identity(blank, "myrepo"),
+            Path::new("/src/myrepo"),
+            1,
+            &crate::index::migration_hooks(),
+        )
+        .expect_err("an empty/whitespace repo_id must be refused");
         assert!(err.to_string().contains("empty"), "refusal explains the empty id: {err}");
     }
     // Untouched: still just the placeholder, nothing minted by the refusals.
@@ -325,11 +363,13 @@ fn register_repo_refuses_an_empty_or_whitespace_repo_id() {
 #[test]
 fn register_repo_is_idempotent() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     let id = identity("repo-abc", "myrepo");
 
-    register_repo(&conn, &id, Path::new("/src/myrepo"), 1).unwrap();
-    register_repo(&conn, &id, Path::new("/src/myrepo"), 2).unwrap();
+    register_repo(&conn, &id, Path::new("/src/myrepo"), 1, &crate::index::migration_hooks())
+        .unwrap();
+    register_repo(&conn, &id, Path::new("/src/myrepo"), 2, &crate::index::migration_hooks())
+        .unwrap();
 
     assert_eq!(repo_row_count(&conn, "repo-abc"), 1);
     assert_eq!(root_count(&conn, "repo-abc"), 1, "same root is not duplicated");
@@ -340,11 +380,19 @@ fn register_repo_is_idempotent() {
 #[test]
 fn register_repo_appends_a_second_root() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     let id = identity("repo-abc", "myrepo");
 
-    register_repo(&conn, &id, Path::new("/src/myrepo"), 1).unwrap();
-    register_repo(&conn, &id, Path::new("/src/myrepo-worktree"), 2).unwrap();
+    register_repo(&conn, &id, Path::new("/src/myrepo"), 1, &crate::index::migration_hooks())
+        .unwrap();
+    register_repo(
+        &conn,
+        &id,
+        Path::new("/src/myrepo-worktree"),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     assert_eq!(repo_row_count(&conn, "repo-abc"), 1, "still one repo");
     assert_eq!(root_count(&conn, "repo-abc"), 2, "both roots recorded");
@@ -357,11 +405,24 @@ fn register_repo_appends_a_second_root() {
 #[test]
 fn register_repo_registers_a_second_repo_in_a_consolidated_db() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
-    register_repo(&conn, &identity("repo-abc", "a"), Path::new("/src/a"), 1).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    register_repo(
+        &conn,
+        &identity("repo-abc", "a"),
+        Path::new("/src/a"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
-    let registered = register_repo(&conn, &identity("repo-xyz", "b"), Path::new("/src/b"), 2)
-        .expect("a different real repo at an unclaimed root registers as a second repo");
+    let registered = register_repo(
+        &conn,
+        &identity("repo-xyz", "b"),
+        Path::new("/src/b"),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .expect("a different real repo at an unclaimed root registers as a second repo");
     assert_eq!(registered, "repo-xyz");
     // Both repos are real, each with its own recorded root; neither was re-pointed.
     assert_eq!(repo_row_count(&conn, "repo-abc"), 1);
@@ -380,7 +441,7 @@ fn register_repo_registers_a_second_repo_in_a_consolidated_db() {
 #[test]
 fn migration_039_relocates_per_repo_meta_and_leaves_global_keys() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -408,7 +469,7 @@ fn migration_039_relocates_per_repo_meta_and_leaves_global_keys() {
         ("vector_int8_reencode_cursor", "42\nmodel-a"),
     ] {
         assert_eq!(
-            crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, key).unwrap().as_deref(),
+            rag_rat_db::meta::repo_meta(&conn, LEGACY_REPO_ID, key).unwrap().as_deref(),
             Some(value),
             "{key} relocated to repo_meta under the placeholder"
         );
@@ -423,7 +484,7 @@ fn migration_039_relocates_per_repo_meta_and_leaves_global_keys() {
         "reconcile timing key stays"
     );
     assert!(
-        crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, "generated_flags_version")
+        rag_rat_db::meta::repo_meta(&conn, LEGACY_REPO_ID, "generated_flags_version")
             .unwrap()
             .is_none(),
         "machine-level key did not leak into repo_meta"
@@ -435,7 +496,7 @@ fn migration_039_relocates_per_repo_meta_and_leaves_global_keys() {
 #[test]
 fn migration_039_forward_migrates_a_v038_index() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
     // Simulate the V038 state: per-repo keys still in the GLOBAL tables, ledger reverted to 38.
     upsert_meta(&conn, "index_meta", "indexed_at_ms", "5000");
@@ -447,7 +508,7 @@ fn migration_039_forward_migrates_a_v038_index() {
         "schema is Older after removing the V039 ledger row"
     );
 
-    schema::migrate_forward(&conn).expect("migrate_forward");
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).expect("migrate_forward");
 
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
@@ -455,12 +516,12 @@ fn migration_039_forward_migrates_a_v038_index() {
         "schema is at LATEST after forward migrate"
     );
     assert_eq!(
-        crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms").unwrap().as_deref(),
+        rag_rat_db::meta::repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms").unwrap().as_deref(),
         Some("5000"),
         "index_meta key relocated on forward migrate"
     );
     assert_eq!(
-        crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, "embedding_active_model_version")
+        rag_rat_db::meta::repo_meta(&conn, LEGACY_REPO_ID, "embedding_active_model_version")
             .unwrap()
             .as_deref(),
         Some("hash-v1"),
@@ -492,11 +553,11 @@ fn v039_relocation_runs_standalone_and_is_idempotent() {
     schema::apply_move_per_repo_meta(&bare).expect("V039 relocation is idempotent");
 
     assert_eq!(
-        crate::index::meta::repo_meta(&bare, LEGACY_REPO_ID, "git_commit").unwrap().as_deref(),
+        rag_rat_db::meta::repo_meta(&bare, LEGACY_REPO_ID, "git_commit").unwrap().as_deref(),
         Some("abc123"),
     );
     assert_eq!(
-        crate::index::meta::repo_meta(&bare, LEGACY_REPO_ID, "vector_int8_reencode_cursor")
+        rag_rat_db::meta::repo_meta(&bare, LEGACY_REPO_ID, "vector_int8_reencode_cursor")
             .unwrap()
             .as_deref(),
         Some("7\nm"),
@@ -542,14 +603,14 @@ fn v039_leaves_reclassified_global_keys_in_index_meta() {
     for key in ["content_revision", "fts_dirty", "fts_source_revision", "fts_synced_at_ms"] {
         assert!(meta_present(&bare, "index_meta", key), "{key} stays GLOBAL in index_meta");
         assert!(
-            crate::index::meta::repo_meta(&bare, LEGACY_REPO_ID, key).unwrap().is_none(),
+            rag_rat_db::meta::repo_meta(&bare, LEGACY_REPO_ID, key).unwrap().is_none(),
             "{key} did NOT relocate to repo_meta",
         );
     }
     // The per-repo control still relocated — V039's behavior for non-reclassified keys is intact.
     assert!(!meta_present(&bare, "index_meta", "source_root"), "per-repo key still relocates");
     assert_eq!(
-        crate::index::meta::repo_meta(&bare, LEGACY_REPO_ID, "source_root").unwrap().as_deref(),
+        rag_rat_db::meta::repo_meta(&bare, LEGACY_REPO_ID, "source_root").unwrap().as_deref(),
         Some("/src/repo"),
     );
 }
@@ -560,19 +621,26 @@ fn v039_leaves_reclassified_global_keys_in_index_meta() {
 #[test]
 fn register_repo_adoption_relocates_repo_meta_rows() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // As V039 leaves it: per-repo meta under the placeholder.
-    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
-    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
+    rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
+    rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
 
-    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-abc", "myrepo"),
+        Path::new("/src/repo"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     assert_eq!(
-        crate::index::meta::repo_meta(&conn, "repo-abc", "source_root").unwrap().as_deref(),
+        rag_rat_db::meta::repo_meta(&conn, "repo-abc", "source_root").unwrap().as_deref(),
         Some("/src/repo"),
     );
     assert_eq!(
-        crate::index::meta::repo_meta(&conn, "repo-abc", "indexed_at_ms").unwrap().as_deref(),
+        rag_rat_db::meta::repo_meta(&conn, "repo-abc", "indexed_at_ms").unwrap().as_deref(),
         Some("9"),
     );
     let placeholder_rows: i64 = conn
@@ -591,13 +659,15 @@ fn register_repo_adoption_relocates_repo_meta_rows() {
 /// "home" checkout the hint names).
 #[test]
 fn recorded_root_helpers_report_membership_and_earliest() {
-    use crate::index::schema::{earliest_recorded_root, repo_has_recorded_root};
+    use rag_rat_db::schema::{earliest_recorded_root, repo_has_recorded_root};
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     let id = identity("repo-x", "repo-x");
     // First root A (registered_at 100), then a second checkout B (registered_at 200).
-    register_repo(&conn, &id, Path::new("/checkout-a"), 100).unwrap();
-    register_repo(&conn, &id, Path::new("/checkout-b"), 200).unwrap();
+    register_repo(&conn, &id, Path::new("/checkout-a"), 100, &crate::index::migration_hooks())
+        .unwrap();
+    register_repo(&conn, &id, Path::new("/checkout-b"), 200, &crate::index::migration_hooks())
+        .unwrap();
 
     assert!(repo_has_recorded_root(&conn, &id.repo_id, "/checkout-a").unwrap());
     assert!(repo_has_recorded_root(&conn, &id.repo_id, "/checkout-b").unwrap());
@@ -611,8 +681,10 @@ fn recorded_root_helpers_report_membership_and_earliest() {
     // Tiebreak: two roots registered at the SAME instant → the lexicographically-smaller root wins
     // deterministically (the `ORDER BY registered_at_ms, root` secondary key).
     let tied = identity("repo-tied", "repo-tied");
-    register_repo(&conn, &tied, Path::new("/z-checkout"), 500).unwrap();
-    register_repo(&conn, &tied, Path::new("/a-checkout"), 500).unwrap();
+    register_repo(&conn, &tied, Path::new("/z-checkout"), 500, &crate::index::migration_hooks())
+        .unwrap();
+    register_repo(&conn, &tied, Path::new("/a-checkout"), 500, &crate::index::migration_hooks())
+        .unwrap();
     assert_eq!(
         earliest_recorded_root(&conn, &tied.repo_id).unwrap().as_deref(),
         Some("/a-checkout"),
@@ -625,14 +697,21 @@ fn recorded_root_helpers_report_membership_and_earliest() {
 #[test]
 fn single_repo_id_returns_the_sole_repo() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     assert_eq!(
         schema::sole_repo_id(&conn).unwrap(),
         LEGACY_REPO_ID,
         "the placeholder is the sole repo before adoption"
     );
 
-    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-abc", "myrepo"),
+        Path::new("/src/repo"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     assert_eq!(
         schema::sole_repo_id(&conn).unwrap(),
         "repo-abc",
@@ -644,11 +723,9 @@ fn single_repo_id_returns_the_sole_repo() {
 /// `(repo_id, key)` so the same key under a different repo is independent.
 #[test]
 fn repo_meta_accessors_round_trip_and_scope_by_repo() {
-    use crate::index::meta::{
-        delete_repo_meta, repo_meta, set_repo_meta, set_repo_meta_if_changed,
-    };
+    use rag_rat_db::meta::{delete_repo_meta, repo_meta, set_repo_meta, set_repo_meta_if_changed};
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // A second repos row so the (repo_id, key) scoping is observable (inserted directly — the
     // phase-A single-repo invariant is about register_repo, not the storage layer).
     conn.execute(
@@ -699,7 +776,7 @@ fn migration_039_relocates_under_the_real_id_on_an_adopted_v038_db() {
     // Match production: the FK is enforced, so a relocation targeting the vanished placeholder
     // aborts (rather than silently orphaning the rows under a dangling id).
     conn.execute_batch("PRAGMA foreign_keys = ON;").expect("enable FK enforcement");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
     // The pre-relocation legacy shape: the per-repo keys still sit in the GLOBAL k/v tables.
     upsert_meta(&conn, "index_meta", "source_root", "/src/repo");
@@ -707,13 +784,20 @@ fn migration_039_relocates_under_the_real_id_on_an_adopted_v038_db() {
     upsert_meta(&conn, "reconcile_meta", "embedding_active_model_version", "hash-v1");
 
     // Adopt: the placeholder row is deleted, leaving exactly one REAL repos row.
-    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-abc", "myrepo"),
+        Path::new("/src/repo"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "adopted: placeholder gone");
 
     // Rewind the ledger to V038 and forward-migrate: V039 re-runs against the adopted DB.
     truncate_schema_to(&conn, 38);
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
-    schema::migrate_forward(&conn)
+    schema::migrate_forward(&conn, &crate::index::migration_hooks())
         .expect("V039 forward-migrates an adopted DB without an FK abort");
 
     assert_eq!(
@@ -730,7 +814,7 @@ fn migration_039_relocates_under_the_real_id_on_an_adopted_v038_db() {
         ("embedding_active_model_version", "hash-v1"),
     ] {
         assert_eq!(
-            crate::index::meta::repo_meta(&conn, "repo-abc", key).unwrap().as_deref(),
+            rag_rat_db::meta::repo_meta(&conn, "repo-abc", key).unwrap().as_deref(),
             Some(value),
             "{key} relocated under the real repo id",
         );
@@ -756,10 +840,10 @@ fn migration_039_relocates_under_the_real_id_on_an_adopted_v038_db() {
 fn register_repo_adoption_is_atomic_on_a_mid_sequence_failure() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     conn.execute_batch("PRAGMA foreign_keys = ON;").expect("enable FK enforcement");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // As V039 leaves a not-yet-adopted DB: per-repo meta under the placeholder.
-    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
-    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
+    rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
+    rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
 
     // Fail the adoption at its LAST mutation (the placeholder delete), mid-transaction.
     conn.execute_batch(
@@ -769,8 +853,14 @@ fn register_repo_adoption_is_atomic_on_a_mid_sequence_failure() {
     )
     .expect("install failure trigger");
 
-    let err = register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 1)
-        .expect_err("adoption must fail while the trigger blocks the placeholder delete");
+    let err = register_repo(
+        &conn,
+        &identity("repo-abc", "myrepo"),
+        Path::new("/src/repo"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .expect_err("adoption must fail while the trigger blocks the placeholder delete");
     assert!(
         err.to_string().contains("injected adoption failure"),
         "surfaces the trigger RAISE: {err}",
@@ -782,12 +872,12 @@ fn register_repo_adoption_is_atomic_on_a_mid_sequence_failure() {
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0)).unwrap();
     assert_eq!(total, 1, "exactly the placeholder row remains");
     assert_eq!(
-        crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, "source_root").unwrap().as_deref(),
+        rag_rat_db::meta::repo_meta(&conn, LEGACY_REPO_ID, "source_root").unwrap().as_deref(),
         Some("/src/repo"),
         "repo_meta stays under the placeholder (the re-point rolled back)",
     );
     assert_eq!(
-        crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms").unwrap().as_deref(),
+        rag_rat_db::meta::repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms").unwrap().as_deref(),
         Some("9"),
     );
     let real_meta: i64 = conn
@@ -799,13 +889,19 @@ fn register_repo_adoption_is_atomic_on_a_mid_sequence_failure() {
 
     // Remove the fault and adopt again: a clean success, proving nothing was left half-done.
     conn.execute_batch("DROP TRIGGER fail_placeholder_delete;").expect("drop trigger");
-    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 2)
-        .expect("adoption succeeds once the fault is removed");
+    register_repo(
+        &conn,
+        &identity("repo-abc", "myrepo"),
+        Path::new("/src/repo"),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .expect("adoption succeeds once the fault is removed");
     assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "placeholder adopted away");
     assert_eq!(repo_row_count(&conn, "repo-abc"), 1, "the real repo owns the DB");
     assert_eq!(schema::sole_repo_id(&conn).unwrap(), "repo-abc");
     assert_eq!(
-        crate::index::meta::repo_meta(&conn, "repo-abc", "source_root").unwrap().as_deref(),
+        rag_rat_db::meta::repo_meta(&conn, "repo-abc", "source_root").unwrap().as_deref(),
         Some("/src/repo"),
         "meta carried over to the real id on the successful adoption",
     );
@@ -916,7 +1012,7 @@ fn seed_pre_v040_commit(conn: &rusqlite::Connection, hash: &str, subject: &str) 
 #[test]
 fn migration_040_scopes_core_tables() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -990,7 +1086,8 @@ fn migration_040_git_rebuild_preserves_rows_commit_fts_and_reconverges_from_torn
     )
     .unwrap();
 
-    schema::apply_repo_id_core_scoping(&conn).expect("V040 converges from the torn state");
+    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+        .expect("V040 converges from the torn state");
 
     // The scratch tables are gone; the transform completed.
     assert!(!conn_table_exists(&conn, "files_new"));
@@ -1018,11 +1115,19 @@ fn migration_040_git_rebuild_preserves_rows_commit_fts_and_reconverges_from_torn
     assert_eq!(fc_repo, LEGACY_REPO_ID);
 
     // Idempotent re-run (the all-or-nothing sentinel short-circuits once files carries repo_id).
-    schema::apply_repo_id_core_scoping(&conn).expect("re-apply is a clean no-op");
+    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+        .expect("re-apply is a clean no-op");
 
     // Adoption re-points git_commits.repo_id → real, and the ON UPDATE CASCADE carries the change
     // row.
-    register_repo(&conn, &identity("repo-real", "r"), Path::new("/src/r"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-real", "r"),
+        Path::new("/src/r"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     let (gc_repo, fc_repo2): (String, String) = conn
         .query_row(
             "SELECT (SELECT repo_id FROM git_commits), (SELECT repo_id FROM git_file_changes)",
@@ -1049,11 +1154,11 @@ fn migration_040_reunites_active_model_provenance_meta_into_repo_meta() {
     upsert_meta(&conn, "index_meta", "active_embedding_remote_config", "{\"endpoint\":\"x\"}");
     upsert_meta(&conn, "index_meta", "generated_flags_version", "1"); // machine-level, stays
 
-    schema::apply_repo_id_core_scoping(&conn).unwrap();
+    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks()).unwrap();
 
     for key in ["active_embedding_model_provisional", "active_embedding_remote_config"] {
         assert!(
-            crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, key).unwrap().is_some(),
+            rag_rat_db::meta::repo_meta(&conn, LEGACY_REPO_ID, key).unwrap().is_some(),
             "{key} relocated to repo_meta"
         );
         assert!(!meta_present(&conn, "index_meta", key), "{key} removed from index_meta");
@@ -1068,10 +1173,10 @@ fn migration_040_reunites_active_model_provenance_meta_into_repo_meta() {
 #[test]
 fn migration_040_forward_migrates_a_v039_index() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     truncate_schema_to(&conn, 39);
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 }
 
@@ -1127,7 +1232,8 @@ fn migration_040_backfills_an_adopted_pre_v040_db_under_the_real_repo_id() {
     .unwrap();
     conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID]).unwrap();
 
-    schema::apply_repo_id_core_scoping(&conn).expect("V040 applies on an adopted DB");
+    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+        .expect("V040 applies on an adopted DB");
 
     for table in [
         "files",
@@ -1152,7 +1258,7 @@ fn migration_040_backfills_an_adopted_pre_v040_db_under_the_real_repo_id() {
     }
     // The straggler relocation targeted the sole (real) repos row, never the vanished placeholder.
     assert_eq!(
-        crate::index::meta::repo_meta(&conn, "repo-adopted", "active_embedding_model_provisional")
+        rag_rat_db::meta::repo_meta(&conn, "repo-adopted", "active_embedding_model_provisional")
             .unwrap()
             .as_deref(),
         Some("1"),
@@ -1161,7 +1267,14 @@ fn migration_040_backfills_an_adopted_pre_v040_db_under_the_real_repo_id() {
 
     // The runtime fast path (next open re-registers the same repo) stays a no-op and leaves the
     // backfill intact.
-    register_repo(&conn, &identity("repo-adopted", "r"), Path::new("/src/r"), 2).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-adopted", "r"),
+        Path::new("/src/r"),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     let stranded: i64 = conn
         .query_row("SELECT COUNT(*) FROM files WHERE repo_id = ?1", [LEGACY_REPO_ID], |r| r.get(0))
         .unwrap();
@@ -1255,7 +1368,8 @@ fn migration_040_realigns_logical_symbol_ids_and_carries_bound_memories() {
     let old_id = 424_242_i64; // an arbitrary pre-fold id
     seed_pre_v040_logical_symbol_with_a_bound_memory(&conn, old_id);
 
-    schema::apply_repo_id_core_scoping(&conn).expect("V040 applies");
+    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+        .expect("V040 applies");
 
     // The symbol's id was re-derived (repo_id folded in), so it CHANGED from the pre-fold value.
     let new_id: i64 = conn.query_row("SELECT id FROM logical_symbols", [], |r| r.get(0)).unwrap();
@@ -1285,12 +1399,20 @@ fn adoption_realigns_logical_symbol_ids_so_pre_v040_memories_survive() {
     let old_id = 999_001_i64;
     seed_pre_v040_logical_symbol_with_a_bound_memory(&conn, old_id);
 
-    schema::apply_repo_id_core_scoping(&conn).expect("V040 applies (unadopted → placeholder id)");
+    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+        .expect("V040 applies (unadopted → placeholder id)");
     let placeholder_id = bound_logical_symbol_id(&conn);
     assert_ne!(placeholder_id, old_id, "V040 already realigned under the placeholder repo_id");
 
     // Adopt the placeholder as a real repo — the id derivation changes with the real repo_id.
-    register_repo(&conn, &identity("real-repo", "r"), Path::new("/src/r"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("real-repo", "r"),
+        Path::new("/src/r"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     let real_id: i64 = conn
         .query_row("SELECT id FROM logical_symbols WHERE repo_id = 'real-repo'", [], |r| r.get(0))
@@ -1332,21 +1454,34 @@ fn register_repo_upgrades_a_local_only_id_to_a_portable_id_in_place() {
     .unwrap();
     seed_pre_v040_logical_symbol_with_a_bound_memory(&conn, 777_001);
 
-    schema::apply_repo_id_core_scoping(&conn).expect("V040 applies (unadopted → placeholder id)");
+    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+        .expect("V040 applies (unadopted → placeholder id)");
 
     // First registration: a cut shallow clone adopts under a machine-local id AND records its
     // shallow boundary (the proof material a later upgrade verifies against).
     let local_id = "local:deadbeefcafef00d";
-    register_repo(&conn, &identity_local(local_id, "shallow", vec![boundary]), repo.as_path(), 1)
-        .unwrap();
+    register_repo(
+        &conn,
+        &identity_local(local_id, "shallow", vec![boundary]),
+        repo.as_path(),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     assert_eq!(schema::sole_repo_id(&conn).unwrap(), local_id, "adopted under the LocalOnly id");
     let local_symbol_id = bound_logical_symbol_id(&conn);
 
     // Deepen + re-open: the incoming identity is now Portable and its HEAD reaches the recorded
     // boundary → PROVEN → UPGRADE, not a refusal.
     let portable_id = "0abc123root";
-    register_repo(&conn, &identity(portable_id, "deepened"), repo.as_path(), 2)
-        .expect("a PROVEN Portable id against a local: incumbent UPGRADES in place, not refused");
+    register_repo(
+        &conn,
+        &identity(portable_id, "deepened"),
+        repo.as_path(),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .expect("a PROVEN Portable id against a local: incumbent UPGRADES in place, not refused");
 
     // The portable id now solely owns the DB; the local id is gone.
     assert_eq!(schema::sole_repo_id(&conn).unwrap(), portable_id, "portable id owns the DB");
@@ -1397,10 +1532,17 @@ fn upgrade_blocks_until_the_outgoing_local_lock_holder_finishes() {
         [],
     )
     .unwrap();
-    schema::apply_repo_id_core_scoping(&conn).expect("V040 applies");
+    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+        .expect("V040 applies");
     let local_id = "local:aaaa1111bbbb";
-    register_repo(&conn, &identity_local(local_id, "shallow", vec![boundary]), repo.as_path(), 1)
-        .unwrap();
+    register_repo(
+        &conn,
+        &identity_local(local_id, "shallow", vec![boundary]),
+        repo.as_path(),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     // Writer 1: an in-flight pre-unshallow writer — holds the OUTGOING local-id lock while
     // writing two rows with a deliberate pause between them.
@@ -1432,8 +1574,14 @@ fn upgrade_blocks_until_the_outgoing_local_lock_holder_finishes() {
     // Writer 2 triggers the upgrade (the post-unshallow open). It must BLOCK on the outgoing
     // lock until writer 1 finishes, then re-point EVERYTHING — including writer 1's second row.
     let started = std::time::Instant::now();
-    register_repo(&conn, &identity("0abc123root", "deepened"), repo.as_path(), 2)
-        .expect("the upgrade proceeds once the outgoing-lock holder finishes");
+    register_repo(
+        &conn,
+        &identity("0abc123root", "deepened"),
+        repo.as_path(),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .expect("the upgrade proceeds once the outgoing-lock holder finishes");
     let elapsed = started.elapsed();
     writer.join().unwrap();
     assert!(
@@ -1473,6 +1621,7 @@ fn a_writer_whose_identity_upgrades_mid_run_extends_its_lock_to_the_resolved_id(
             &identity_local(local_id, "shallow", vec![boundary]),
             repo.as_path(),
             1,
+            &crate::index::migration_hooks(),
         )
         .unwrap();
     }
@@ -1563,18 +1712,25 @@ fn register_repo_adds_an_unrelated_repo_without_upgrading_the_local_incumbent() 
     let repo_y = real_git_repo("unrelated-y"); // an independent root — no shared history with X.
 
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     let local_id = "local:beefbeefcafe";
     register_repo(
         &conn,
         &identity_local(local_id, "shallow", vec![x_boundary]),
         repo_x.as_path(),
         1,
+        &crate::index::migration_hooks(),
     )
     .expect("the shallow clone of X adopts under its local id, recording X's boundary");
 
-    let registered = register_repo(&conn, &identity("y-portable-root", "y"), repo_y.as_path(), 2)
-        .expect("an unrelated repo at a new root registers as its own repo — no upgrade attempted");
+    let registered = register_repo(
+        &conn,
+        &identity("y-portable-root", "y"),
+        repo_y.as_path(),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .expect("an unrelated repo at a new root registers as its own repo — no upgrade attempted");
     assert_eq!(registered, "y-portable-root");
     // X's local incumbent is untouched (NOT re-pointed onto Y); both repos now coexist.
     assert_eq!(repo_row_count(&conn, local_id), 1, "X's local id is left as-is, never upgraded");
@@ -1591,15 +1747,26 @@ fn register_repo_adds_an_unrelated_repo_without_upgrading_the_local_incumbent() 
 fn register_repo_refuses_a_local_upgrade_without_a_recorded_boundary() {
     let repo = real_git_repo("no-boundary");
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // Register the local incumbent with an EMPTY boundary — nothing to prove against.
     let local_id = "local:nobound00";
-    register_repo(&conn, &identity_local(local_id, "shallow", vec![]), repo.as_path(), 1).expect(
-        "a LocalOnly registration succeeds even without a boundary — the gate is at UPGRADE",
-    );
+    register_repo(
+        &conn,
+        &identity_local(local_id, "shallow", vec![]),
+        repo.as_path(),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .expect("a LocalOnly registration succeeds even without a boundary — the gate is at UPGRADE");
 
-    let err = register_repo(&conn, &identity("would-be-portable", "p"), repo.as_path(), 2)
-        .expect_err("no recorded boundary ⇒ no proof ⇒ the upgrade is refused");
+    let err = register_repo(
+        &conn,
+        &identity("would-be-portable", "p"),
+        repo.as_path(),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .expect_err("no recorded boundary ⇒ no proof ⇒ the upgrade is refused");
     assert!(err.to_string().contains("repo_id"), "refusal names the pin remedy: {err}");
     assert_eq!(schema::sole_repo_id(&conn).unwrap(), local_id, "the incumbent is untouched");
     let _ = fs::remove_dir_all(&repo);
@@ -1612,11 +1779,24 @@ fn register_repo_refuses_a_local_upgrade_without_a_recorded_boundary() {
 #[test]
 fn register_repo_adds_a_second_portable_repo_without_repointing_the_incumbent() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
-    register_repo(&conn, &identity("portable-a", "a"), Path::new("/src/a"), 1).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    register_repo(
+        &conn,
+        &identity("portable-a", "a"),
+        Path::new("/src/a"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
-    register_repo(&conn, &identity("portable-b", "b"), Path::new("/src/b"), 2)
-        .expect("a second portable repo at an unclaimed root registers as its own repo");
+    register_repo(
+        &conn,
+        &identity("portable-b", "b"),
+        Path::new("/src/b"),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .expect("a second portable repo at an unclaimed root registers as its own repo");
     // The incumbent is untouched (still one row, its own root); portable-b is a distinct repo.
     assert_eq!(repo_row_count(&conn, "portable-a"), 1, "incumbent untouched — not re-pointed");
     assert_eq!(root_count(&conn, "portable-a"), 1);
@@ -1636,11 +1816,18 @@ fn second_shallow_clone_late_upgrades_into_the_existing_portable_repo() {
     let boundary_b = head_commit_hash(&root_b);
 
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
     // A's story already completed: the portable id P is registered at A's root (the in-place
     // upgrade path, covered by its own tests) and carries A's authored + derived data.
-    register_repo(&conn, &identity("P-portable", "up"), Path::new("/src/clone-a"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("P-portable", "up"),
+        Path::new("/src/clone-a"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms,          updated_at_ms, source, memory_version, repo_id)
          VALUES ('mem-a', 'Invariant', 'a title', 'a body', 'high', 'active', 0, 0, 'agent',          'v1', 'P-portable')",
@@ -1661,6 +1848,7 @@ fn second_shallow_clone_late_upgrades_into_the_existing_portable_repo() {
         &identity_local("local:bbbb", "clone-b", vec![boundary_b]),
         root_b.as_path(),
         2,
+        &crate::index::migration_hooks(),
     )
     .unwrap();
     conn.execute(
@@ -1701,8 +1889,14 @@ fn second_shallow_clone_late_upgrades_into_the_existing_portable_repo() {
 
     // B deepens: the incoming portable identity is the ALREADY-REGISTERED P at B's root — the
     // late-upgrade merge, not a refusal.
-    let registered = register_repo(&conn, &identity("P-portable", "up"), root_b.as_path(), 3)
-        .expect("the second clone's late upgrade must complete, never strand");
+    let registered = register_repo(
+        &conn,
+        &identity("P-portable", "up"),
+        root_b.as_path(),
+        3,
+        &crate::index::migration_hooks(),
+    )
+    .expect("the second clone's late upgrade must complete, never strand");
     assert_eq!(registered, "P-portable");
 
     // The local id is retired; BOTH roots live under P.
@@ -1762,8 +1956,14 @@ fn second_shallow_clone_late_upgrades_into_the_existing_portable_repo() {
     assert_eq!((a_mem, a_files), (1, 1), "P's existing (A's) data untouched by the merge");
 
     // The flow is now plainly idempotent: P at B's root re-registers without drama.
-    register_repo(&conn, &identity("P-portable", "up"), root_b.as_path(), 4)
-        .expect("post-merge re-registration is the plain idempotent path");
+    register_repo(
+        &conn,
+        &identity("P-portable", "up"),
+        root_b.as_path(),
+        4,
+        &crate::index::migration_hooks(),
+    )
+    .expect("post-merge re-registration is the plain idempotent path");
     let _ = fs::remove_dir_all(&root_b);
 }
 
@@ -1774,9 +1974,23 @@ fn second_shallow_clone_late_upgrades_into_the_existing_portable_repo() {
 #[test]
 fn read_only_resolver_declines_a_pin_onto_a_root_owned_by_another_repo() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
-    register_repo(&conn, &identity("repo-a", "a"), Path::new("/src/a"), 1).unwrap();
-    register_repo(&conn, &identity("repo-b", "b"), Path::new("/src/b"), 2).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    register_repo(
+        &conn,
+        &identity("repo-a", "a"),
+        Path::new("/src/a"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-b", "b"),
+        Path::new("/src/b"),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     // The pin names repo-b, but /src/a is recorded under repo-a → decline (mirror of the write
     // path's mismatched-root refusal).
@@ -1797,7 +2011,7 @@ fn read_only_resolver_declines_a_pin_onto_a_root_owned_by_another_repo() {
 #[test]
 fn adoption_repoints_files_through_a_connection_carrying_the_scope_view() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // A placeholder-scoped file row awaiting adoption.
     conn.execute(
         "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
@@ -1813,8 +2027,14 @@ fn adoption_repoints_files_through_a_connection_carrying_the_scope_view() {
     )
     .unwrap();
 
-    register_repo(&conn, &identity("repo-viewed", "v"), Path::new("/src/v"), 1)
-        .expect("adoption must write main.files through the shadowing temp view");
+    register_repo(
+        &conn,
+        &identity("repo-viewed", "v"),
+        Path::new("/src/v"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .expect("adoption must write main.files through the shadowing temp view");
     let adopted: i64 = conn
         .query_row("SELECT COUNT(*) FROM main.files WHERE repo_id = 'repo-viewed'", [], |row| {
             row.get(0)
@@ -1834,7 +2054,7 @@ fn upgrade_picks_the_root_matching_incumbent_among_two_shallow_clones() {
     let boundary = head_commit_hash(&repo);
 
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // Clone A: a SIBLING shallow clone of the same upstream at a DIFFERENT root, whose id sorts
     // FIRST — the incumbent a boundary-only scan would wrongly pick (its boundary is equally
     // reachable from the deepened HEAD).
@@ -1843,6 +2063,7 @@ fn upgrade_picks_the_root_matching_incumbent_among_two_shallow_clones() {
         &identity_local("local:aaa", "clone-a", vec![boundary.clone()]),
         Path::new("/src/clone-a"),
         1,
+        &crate::index::migration_hooks(),
     )
     .expect("sibling shallow clone registers fresh at its own root");
     // Clone B: the clone that will be deepened, registered at the REAL working tree.
@@ -1851,13 +2072,20 @@ fn upgrade_picks_the_root_matching_incumbent_among_two_shallow_clones() {
         &identity_local("local:bbb", "clone-b", vec![boundary]),
         repo.as_path(),
         2,
+        &crate::index::migration_hooks(),
     )
     .expect("second shallow clone registers fresh at its own root");
 
     // B deepens (its HEAD reaches both recorded boundaries) and re-registers portable from B's
     // root: ONLY B's incumbent upgrades.
-    register_repo(&conn, &identity("portable-root", "b"), repo.as_path(), 3)
-        .expect("the deepened clone upgrades its own incumbent");
+    register_repo(
+        &conn,
+        &identity("portable-root", "b"),
+        repo.as_path(),
+        3,
+        &crate::index::migration_hooks(),
+    )
+    .expect("the deepened clone upgrades its own incumbent");
     assert_eq!(repo_row_count(&conn, "local:bbb"), 0, "B's local id upgraded in place");
     assert_eq!(repo_row_count(&conn, "portable-root"), 1);
     assert_eq!(
@@ -1871,6 +2099,7 @@ fn upgrade_picks_the_root_matching_incumbent_among_two_shallow_clones() {
         &identity_local("local:aaa", "clone-a", vec![]),
         Path::new("/src/clone-a"),
         4,
+        &crate::index::migration_hooks(),
     )
     .expect("the sibling clone keeps re-registering under its own id");
     let _ = fs::remove_dir_all(&repo);
@@ -1883,14 +2112,34 @@ fn upgrade_picks_the_root_matching_incumbent_among_two_shallow_clones() {
 #[test]
 fn idempotent_reregistration_refuses_a_root_owned_by_another_repo() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
-    register_repo(&conn, &identity("repo-abc", "a"), Path::new("/src/a"), 1).unwrap();
-    register_repo(&conn, &identity("repo-xyz", "b"), Path::new("/src/b"), 2).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    register_repo(
+        &conn,
+        &identity("repo-abc", "a"),
+        Path::new("/src/a"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-xyz", "b"),
+        Path::new("/src/b"),
+        2,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     // repo-xyz (already registered) shows up at repo-abc's root — an identity change, not a new
     // worktree of xyz. Refused; the root stays mapped to exactly one repo.
-    let err = register_repo(&conn, &identity("repo-xyz", "b"), Path::new("/src/a"), 3)
-        .expect_err("an owned root must not be recorded under a second repo");
+    let err = register_repo(
+        &conn,
+        &identity("repo-xyz", "b"),
+        Path::new("/src/a"),
+        3,
+        &crate::index::migration_hooks(),
+    )
+    .expect_err("an owned root must not be recorded under a second repo");
     assert!(err.to_string().contains("repo-abc"), "refusal names the owning repo: {err}");
     let owners: i64 = conn
         .query_row(
@@ -1901,8 +2150,14 @@ fn idempotent_reregistration_refuses_a_root_owned_by_another_repo() {
         .unwrap();
     assert_eq!(owners, 1, "one physical root maps to exactly one repo");
     // The same repo's own root re-registration stays idempotent (self-ownership never trips).
-    register_repo(&conn, &identity("repo-xyz", "b"), Path::new("/src/b"), 4)
-        .expect("re-registering an owned root under its OWN repo is idempotent");
+    register_repo(
+        &conn,
+        &identity("repo-xyz", "b"),
+        Path::new("/src/b"),
+        4,
+        &crate::index::migration_hooks(),
+    )
+    .expect("re-registering an owned root under its OWN repo is idempotent");
 }
 
 /// Two repos' concurrent FIRST registrations on one shared file DB both succeed (A7): the
@@ -1919,7 +2174,7 @@ fn concurrent_registrations_on_a_shared_db_both_succeed() {
     let db_path = root.join("global.sqlite");
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     }
 
     // Round 1: two DIFFERENT repos race their first registration.
@@ -1934,7 +2189,13 @@ fn concurrent_registrations_on_a_shared_db_both_succeed() {
                 conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
                 conn.pragma_update(None, "foreign_keys", "ON").unwrap();
                 barrier.wait();
-                register_repo(&conn, &identity(id, id), Path::new(&format!("/src/{id}")), 1)
+                register_repo(
+                    &conn,
+                    &identity(id, id),
+                    Path::new(&format!("/src/{id}")),
+                    1,
+                    &crate::index::migration_hooks(),
+                )
             })
         })
         .collect();
@@ -1954,7 +2215,13 @@ fn concurrent_registrations_on_a_shared_db_both_succeed() {
                 conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
                 conn.pragma_update(None, "foreign_keys", "ON").unwrap();
                 barrier.wait();
-                register_repo(&conn, &identity("repo-same", "s"), Path::new("/src/same"), 2)
+                register_repo(
+                    &conn,
+                    &identity("repo-same", "s"),
+                    Path::new("/src/same"),
+                    2,
+                    &crate::index::migration_hooks(),
+                )
             })
         })
         .collect();
@@ -1977,8 +2244,15 @@ fn concurrent_registrations_on_a_shared_db_both_succeed() {
 #[test]
 fn register_repo_refuses_a_local_only_downgrade_of_an_owned_root() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
-    register_repo(&conn, &identity("portable-a", "a"), Path::new("/src/a"), 1).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    register_repo(
+        &conn,
+        &identity("portable-a", "a"),
+        Path::new("/src/a"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     // Same root as portable-a: a re-shallowed clone of A resolving to a machine-local id.
     let err = register_repo(
@@ -1986,6 +2260,7 @@ fn register_repo_refuses_a_local_only_downgrade_of_an_owned_root() {
         &identity_local("local:beef", "shallow", vec![]),
         Path::new("/src/a"),
         2,
+        &crate::index::migration_hooks(),
     )
     .expect_err("a LocalOnly incoming must not downgrade the portable id its root already owns");
     assert!(err.to_string().contains("portable-a"), "refusal names the owning repo: {err}");
@@ -2107,10 +2382,17 @@ fn unshallow_upgrades_a_shallow_clone_index_from_local_to_portable_in_place() {
 #[test]
 fn resolve_config_repo_id_binds_a_recorded_root_over_the_sole_pick() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // Repo A adopted (sorts first). A sibling repo B seeded directly with its recorded root — the
     // A7 consolidated shape (register_repo forbids a second real repo before A7).
-    register_repo(&conn, &identity("repo-a", "a"), Path::new("/src/a"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-a", "a"),
+        Path::new("/src/a"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('sibling-b', 'b', 0)",
         [],
@@ -2155,8 +2437,15 @@ fn resolve_config_repo_id_returns_none_for_a_rejected_pin() {
     run_git(&root, &["commit", "-q", "--allow-empty", "-m", "genesis"]);
 
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
-    register_repo(&conn, &identity("repo-a", "a"), root.as_path(), 1).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    register_repo(
+        &conn,
+        &identity("repo-a", "a"),
+        root.as_path(),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     // A reserved pin is the Rejected class → None, even though the root is a real registered repo.
     assert_eq!(
@@ -2182,10 +2471,17 @@ fn resolve_config_repo_id_returns_none_for_a_new_unregistered_pin() {
     run_git(&root, &["commit", "-q", "--allow-empty", "-m", "genesis"]);
 
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // The root is registered (and recorded) under repo-a — so the pre-fix by-root fallback would
     // resolve the new pin to repo-a.
-    register_repo(&conn, &identity("repo-a", "a"), root.as_path(), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-a", "a"),
+        root.as_path(),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     assert_eq!(
         schema::resolve_config_repo_id(&conn, &root, Some("brand-new-pin")).unwrap(),
@@ -2219,10 +2515,16 @@ fn resolve_config_repo_id_returns_none_for_a_newly_portable_local_incumbent() {
     assert!(!portable_id.starts_with("local:"), "full history → a portable root id");
 
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn).expect("apply");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // Incumbent: registered (and root recorded) under a machine-local id, as a prior shallow index.
-    register_repo(&conn, &identity_local("local:beef", "shallow", vec![]), root.as_path(), 1)
-        .unwrap();
+    register_repo(
+        &conn,
+        &identity_local("local:beef", "shallow", vec![]),
+        root.as_path(),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     assert!(!repo_id_is_registered_probe(&conn, &portable_id), "portable id is not yet registered");
 
     // No pin: the identity route derives the portable id (unregistered) → None. The pre-fix by-root
@@ -2430,7 +2732,7 @@ fn seed_pre_v041_github_schema(conn: &rusqlite::Connection) {
 #[test]
 fn fresh_apply_scopes_the_papertrail_tables_by_repo_id() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -2519,7 +2821,7 @@ fn migration_041_github_rebuild_preserves_rows_and_reconverges_from_torn_state()
 fn register_repo_repoints_papertrail_rows_to_the_real_id() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // A synced item + its FTS mirror seeded under the placeholder, as a pre-adoption index carries
     // them (both explicitly stamped LEGACY_REPO_ID so adoption's placeholder re-point matches).
     conn.execute(
@@ -2539,7 +2841,14 @@ fn register_repo_repoints_papertrail_rows_to_the_real_id() {
     )
     .unwrap();
 
-    register_repo(&conn, &identity("repo-real", "r"), Path::new("/src/r"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-real", "r"),
+        Path::new("/src/r"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     let item_repo: String =
         conn.query_row("SELECT repo_id FROM papertrail_items", [], |r| r.get(0)).unwrap();
@@ -2695,7 +3004,7 @@ fn migration_041_leaves_github_rows_at_the_placeholder_on_a_consolidated_db() {
 #[test]
 fn a_syncing_repo_is_isolated_from_stranded_placeholder_papertrail_rows() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // The state the consolidated-DB gate leaves: papertrail rows stranded under the placeholder
     // on a two-real-repo DB.
     conn.execute_batch(&format!(
@@ -2813,10 +3122,10 @@ fn a_syncing_repo_is_isolated_from_stranded_placeholder_papertrail_rows() {
 #[test]
 fn migration_041_forward_migrates_a_v040_index() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     truncate_schema_to(&conn, 40);
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 }
 
@@ -2873,7 +3182,7 @@ fn seed_pre_v042_periphery_schema(conn: &rusqlite::Connection) {
 #[test]
 fn migration_042_is_the_latest_tip_and_scopes_periphery() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // V042 is no longer the ABSOLUTE tip (V043 adds files.generation, V044 widens the github keys);
     // the tip pin lives with the newest migration's test (`v044_widens_the_github_natural_keys_...`
     // in github_papertrail). Here just assert `apply` reaches LATEST — V042 is on the way to the
@@ -2937,7 +3246,8 @@ fn migration_042_periphery_rebuild_preserves_rows_and_reconverges_from_torn_stat
     // TORN STATE: a prior V042 pass crashed after creating a rebuild scratch table.
     conn.execute_batch("CREATE TABLE clone_token_df_new(bogus INTEGER);").unwrap();
 
-    schema::apply_repo_id_periphery_scoping(&conn).expect("V042 converges from the torn state");
+    schema::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
+        .expect("V042 converges from the torn state");
 
     assert!(!conn_table_exists(&conn, "clone_token_df_new"), "scratch table swept");
     for table in V042_PERIPHERY_TABLES {
@@ -2971,7 +3281,8 @@ fn migration_042_periphery_rebuild_preserves_rows_and_reconverges_from_torn_stat
     assert_eq!(matched, 1, "repo_memory_fts still MATCHes the seeded memory after the rebuild");
 
     // Idempotent re-run (the repo_memories.repo_id sentinel short-circuits).
-    schema::apply_repo_id_periphery_scoping(&conn).expect("re-apply is a clean no-op");
+    schema::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
+        .expect("re-apply is a clean no-op");
 }
 
 /// P1 backfill (the V040 class): applying V042 on an ALREADY-ADOPTED DB (a real `repos` row, the
@@ -3007,7 +3318,8 @@ fn migration_042_backfills_an_adopted_pre_v042_db_under_the_real_repo_id() {
     .unwrap();
     conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID]).unwrap();
 
-    schema::apply_repo_id_periphery_scoping(&conn).expect("V042 applies on an adopted DB");
+    schema::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
+        .expect("V042 applies on an adopted DB");
 
     let df_repo: String = conn
         .query_row("SELECT repo_id FROM clone_token_df WHERE token_hash = 42", [], |r| r.get(0))
@@ -3071,7 +3383,7 @@ fn migration_042_leaves_periphery_rows_at_the_placeholder_on_a_consolidated_db()
     .unwrap();
     conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID]).unwrap();
 
-    schema::apply_repo_id_periphery_scoping(&conn)
+    schema::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
         .expect("V042 must not abort the upgrade on a consolidated DB");
 
     for table in ["repo_memories", "clone_token_df", "repo_memory_fts"] {
@@ -3108,10 +3420,10 @@ fn migration_042_leaves_periphery_rows_at_the_placeholder_on_a_consolidated_db()
 #[test]
 fn migration_042_forward_migrates_a_v041_index() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     truncate_schema_to(&conn, 41);
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 }
 
@@ -3126,7 +3438,7 @@ fn migration_042_forward_migrates_a_v041_index() {
 fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     // Seed A4 (papertrail) + A5 (memory / oracle / clone) rows under the LEGACY placeholder — the
     // shape a legacy single-repo index carries before adoption.
@@ -3202,7 +3514,7 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
     // Roll the ledger back to the pre-A-phase tip and forward-migrate the WHOLE A-phase ladder.
     truncate_schema_to(&conn, 37);
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
-    schema::migrate_forward(&conn).unwrap();
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -3244,7 +3556,14 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
     }
 
     // ONE adoption re-points BOTH workstreams' rows onto the real id.
-    register_repo(&conn, &identity("repo-real", "r"), std::path::Path::new("/src/r"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-real", "r"),
+        std::path::Path::new("/src/r"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     let real_repo = |sql: &str| -> String { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     assert_eq!(
         real_repo("SELECT repo_id FROM papertrail_items WHERE item_key = '7'"),
@@ -3296,7 +3615,7 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
 #[test]
 fn adoption_repoints_change_couplings_consistently_with_its_stamp() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     // A derived coupling row + a CONSISTENT freshness stamp (head h1 + params 1), both under the
     // placeholder — the shape a legacy single-repo index carries pre-adoption.
@@ -3312,10 +3631,17 @@ fn adoption_repoints_change_couplings_consistently_with_its_stamp() {
     // files axis), so the post-adoption `ensure_coupling_fresh` sees a matching stamp and does
     // NOT recompute.
     let consistent_stamp = format!(":{}", crate::index::change_coupling::COUPLING_PARAMS_VERSION);
-    crate::index::set_repo_meta(&conn, LEGACY_REPO_ID, "git_coupling_stamp", &consistent_stamp)
+    rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "git_coupling_stamp", &consistent_stamp)
         .unwrap();
 
-    register_repo(&conn, &identity("repo-real", "r"), Path::new("/src/r"), 1).unwrap();
+    register_repo(
+        &conn,
+        &identity("repo-real", "r"),
+        Path::new("/src/r"),
+        1,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     // Rows re-pointed onto the real id, none stranded under the placeholder.
     let count_for = |repo: &str| -> i64 {

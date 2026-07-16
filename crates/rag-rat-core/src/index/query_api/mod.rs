@@ -1,4 +1,6 @@
 use rag_rat_base::hash::hex_sha256;
+use rag_rat_base::paths::path_string;
+use rag_rat_db::schema;
 use rusqlite::OptionalExtension;
 
 use super::*;
@@ -470,7 +472,7 @@ impl IndexDatabase {
         chunk_id: i64,
     ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
         let dicts = crate::query::chunk_text_dicts(self.storage.connection())?;
-        let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+        let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
         self.read_chunk_current_with(chunk_id, &mut decoder)
     }
 
@@ -479,7 +481,7 @@ impl IndexDatabase {
     pub(crate) fn read_chunk_current_with(
         &self,
         chunk_id: i64,
-        decoder: &mut crate::index::text_compression::ChunkTextDecoder,
+        decoder: &mut rag_rat_db::text_compression::ChunkTextDecoder,
     ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
         let Some(mut chunk) =
             crate::query::read_chunk_with(self.storage.connection(), chunk_id, decoder)?

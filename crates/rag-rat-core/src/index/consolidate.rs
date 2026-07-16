@@ -43,10 +43,10 @@ use anyhow::Context;
 use rag_rat_base::config::{self, Config};
 use rag_rat_base::repo_identity::{self, RepoIdentity};
 use rag_rat_base::{data_dir, locks};
+use rag_rat_db::storage::IndexConnection;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::index::{IndexDatabase, schema};
-use crate::storage::IndexConnection;
 
 /// The `repo_meta` keys consolidate carries from the legacy DB into the global DB. Carried as a
 /// per-key MIRROR of the source (the import's mirror invariant): a key present in the legacy DB
@@ -249,7 +249,13 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
     // row is stamped with — the legacy DB's own `repo_id` (placeholder or otherwise) is discarded.
     // Consolidation IMPORTS an indexed repo, so `register_repo` records the working-tree root
     // (#427).
-    let repo_id = schema::register_repo(target_conn, &identity, &config.root, schema::now_ms())?;
+    let repo_id = schema::register_repo(
+        target_conn,
+        &identity,
+        &config.root,
+        schema::now_ms(),
+        &crate::index::migration_hooks(),
+    )?;
 
     // Bring the SOURCE to current schema too (read-write, under the source-side locks held above,
     // and about to be renamed `.imported` anyway): an old-vintage legacy DB this binary never
@@ -1259,7 +1265,7 @@ mod tests {
     /// the model-identity meta keys.
     fn seeded_source() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         for (id, title) in [("m1", "one"), ("m2", "two"), ("m3", "three")] {
             conn.execute(
                 "INSERT INTO repo_memories(id, kind, title, body, confidence, status, \
@@ -1366,7 +1372,7 @@ mod tests {
 
     fn fresh_target() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         // The target must hold the repo `import_from_source` stamps: `repo_meta.repo_id` has a FK
         // to `repos` (in production `register_repo` creates this row before the import runs).
         conn.execute(

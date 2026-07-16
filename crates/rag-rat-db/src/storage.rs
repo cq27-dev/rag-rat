@@ -214,7 +214,7 @@ mod tests {
         let db = dir.join("index.db");
         {
             let rw = IndexConnection::open(&db).unwrap();
-            crate::index::schema::apply(rw.connection()).unwrap();
+            crate::schema::apply(rw.connection(), &crate::hooks::MigrationHooks::noop()).unwrap();
         }
         let ro = IndexConnection::open_read_only(&db).unwrap();
         let n: i64 =
@@ -238,7 +238,7 @@ mod tests {
         let db = dir.join("index.db");
         {
             let rw = IndexConnection::open(&db).unwrap();
-            crate::index::schema::apply(rw.connection()).unwrap();
+            crate::schema::apply(rw.connection(), &crate::hooks::MigrationHooks::noop()).unwrap();
         }
         let ro = IndexConnection::open_read_only(&db).unwrap();
 

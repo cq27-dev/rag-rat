@@ -846,13 +846,13 @@ impl From<ResolvedAnchorRow> for ResolvedAnchor {
 #[cfg(test)]
 mod tests {
     use minicbor::Encoder;
+    use rag_rat_db::schema;
     use rusqlite::Connection;
 
     use super::super::device::DeviceSecret;
     use super::super::entry;
     use super::super::op::MemoryOp;
     use super::*;
-    use crate::index::schema;
 
     /// The frozen op-wire domain tag — hardcoded here (it is private to `op`) to build the
     /// unknown-op and poison payloads the typed `sign_entry` can't.
@@ -860,7 +860,7 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn
     }
 
@@ -1262,7 +1262,7 @@ mod tests {
         let expected;
         {
             let conn = Connection::open(&path).unwrap();
-            schema::apply(&conn).unwrap();
+            schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
             append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1).unwrap();
             append(&conn, stream_a(), &g_other.signed_bytes, &t.public(), 2).unwrap();
             append(&conn, stream_a(), &status.signed_bytes, &s.public(), 3).unwrap();

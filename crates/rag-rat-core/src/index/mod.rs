@@ -8,7 +8,6 @@ pub(crate) mod languages;
 pub mod oracle;
 pub mod papertrail;
 pub mod parser;
-pub mod schema;
 pub mod symbols;
 pub mod walker;
 
@@ -40,7 +39,6 @@ mod rebuild;
 mod staleness;
 // #77 Phase 2 chunk-text compression. pub(crate) so the read layer (`crate::query`) can decompress
 // stored blobs, not just the index write path.
-pub(crate) mod text_compression;
 mod util;
 mod worktree_overlay;
 pub use adoption_hints::{
@@ -52,6 +50,18 @@ pub use discovery::DiscoveryStatus;
 pub(crate) use discovery::*;
 pub use git_context::resolve_git_context;
 pub(crate) use git_context::*;
+
+/// The domain builders the db layer's migrations/adoption may invoke (see
+/// `rag_rat_db::hooks::MigrationHooks`) — constructed here because this crate is the one that
+/// links every domain the hooks reach into.
+pub fn migration_hooks() -> rag_rat_db::MigrationHooks {
+    rag_rat_db::MigrationHooks {
+        rederive_dream_finding_ids: crate::dream::rederive_finding_ids,
+        backfill_authority_projection: crate::oplog::backfill_authority_projection,
+        rebuild_papertrail_fts: papertrail::rebuild_fts,
+        realign_logical_symbol_ids: graph_index::realign_logical_symbol_ids,
+    }
+}
 // Only tests reach `install_scope_view` directly now: non-test code resolves the repo id
 // explicitly (`resolve_scope_repo_id`) and passes it into `install_worktree_scope_view`, which
 // writes the scope itself rather than routing through the config-blind `active_repo_id`
@@ -60,9 +70,6 @@ pub(crate) use git_context::*;
 pub(crate) use lifecycle::install_scope_view;
 pub use lifecycle::{GlobalStoreOverview, install_worktree_scope_view, resolve_scope_repo_id};
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
-pub(crate) use meta::{
-    delete_repo_meta, record_watch_placement_failures_scoped, repo_meta, set_repo_meta,
-};
 pub use parser_failures::ParserFailure;
 pub(crate) use prep::*;
 pub use query_api::{
@@ -96,6 +103,8 @@ use gix::bstr::{BString, ByteSlice};
 use gix::status::{UntrackedFiles, tree_index};
 use rag_rat_base::config::{Config, TargetKind};
 use rag_rat_base::language::Language;
+use rag_rat_db::schema;
+use rag_rat_db::storage::{IndexConnection, StorageStatus};
 use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::{OptionalExtension, params};
@@ -116,7 +125,6 @@ use crate::index::papertrail::{
 use crate::index::symbols::Symbol;
 use crate::query::graph_meta::{self, GraphMetaMode};
 use crate::search::lexical::SearchHit;
-use crate::storage::{IndexConnection, StorageStatus};
 
 #[derive(Debug)]
 pub struct IndexDatabase {

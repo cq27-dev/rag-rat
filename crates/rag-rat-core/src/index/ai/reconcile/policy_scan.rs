@@ -143,9 +143,9 @@ fn policy_skip_summary_from_column(
     conn: &Connection,
     max_embedding_chars: usize,
 ) -> anyhow::Result<Option<BTreeMap<String, u64>>> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    let version = crate::index::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_VERSION_KEY)?;
-    let cap = crate::index::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_CAP_KEY)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let version = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_VERSION_KEY)?;
+    let cap = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_CAP_KEY)?;
     // Trust the column ONLY when the CURRENT classifier stamped it (version) AND at the cap the
     // caller wants: a different cap re-buckets SkipTooLarge/truncation, which the
     // default-stamped column can't reflect. Both gates fail SAFE — a miss just recomputes.
@@ -221,7 +221,7 @@ fn for_each_recomputed_chunk_policy(
     mut emit: impl FnMut(&ChunkForPolicy, EmbeddingPolicyDecision) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let dicts = crate::query::chunk_text_dicts(conn)?;
-    let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+    let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
     let mut stmt = conn.prepare(
         "
         SELECT files.id, files.path, files.language, files.kind, files.sha256, chunks.id,
@@ -272,7 +272,7 @@ fn for_each_recomputed_chunk_policy(
             symbol_path: row.get(7)?,
             start_byte: row.get::<_, i64>(8)? as usize,
             end_byte: row.get::<_, i64>(9)? as usize,
-            text: crate::index::text_compression::ChunkTextRow {
+            text: rag_rat_db::text_compression::ChunkTextRow {
                 blob: row.get(10)?,
                 raw_len: row.get(11)?,
                 dict_version: row.get(12)?,
@@ -366,7 +366,7 @@ fn for_each_recomputed_chunk_policy(
 /// dirty split (both share one of the active keys) and only trips on a second linked-worktree
 /// overlay / other-commit leftover.
 fn active_scope_covers_all_live_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<bool> {
-    use crate::index::schema::{active_generation, connection_context_value};
+    use rag_rat_db::schema::{active_generation, connection_context_value};
     let generation = active_generation(conn)?;
     let commit_sha = connection_context_value(conn, "commit_sha").unwrap_or_default();
     let worktree_id = connection_context_value(conn, "worktree_id").unwrap_or_default();
@@ -405,9 +405,9 @@ pub(crate) fn maybe_heal_embedding_policy(conn: &Connection, max_embedding_chars
 }
 
 pub(crate) fn ensure_embedding_policy_current(conn: &Connection) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    let version = crate::index::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_VERSION_KEY)?;
-    let cap = crate::index::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_CAP_KEY)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let version = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_VERSION_KEY)?;
+    let cap = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_CAP_KEY)?;
     if version.as_deref() == Some(EMBEDDING_POLICY_VERSION)
         && cap.as_deref() == Some(DEFAULT_MAX_EMBEDDING_CHARS.to_string().as_str())
     {
@@ -470,13 +470,13 @@ fn heal_embedding_policy_locked(conn: &Connection, repo_id: &str) -> anyhow::Res
          WHERE id IN (SELECT id FROM temp.embedding_policy_heal)",
         [],
     )?;
-    crate::index::meta::set_repo_meta(
+    rag_rat_db::meta::set_repo_meta(
         conn,
         repo_id,
         EMBEDDING_POLICY_VERSION_KEY,
         EMBEDDING_POLICY_VERSION,
     )?;
-    crate::index::meta::set_repo_meta(
+    rag_rat_db::meta::set_repo_meta(
         conn,
         repo_id,
         EMBEDDING_POLICY_CAP_KEY,

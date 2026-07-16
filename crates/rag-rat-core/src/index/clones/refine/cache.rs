@@ -169,9 +169,8 @@ pub(crate) fn refine_lookup(
     // scope the read to the active repo. `{repo_clause}` is empty pre-A5. Read-only-safe (both the
     // column probe and the active-repo resolve are reads), so it stays callable on a read-only
     // conn.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "clone_refinements")?;
-    let repo_clause =
-        crate::index::schema::periphery_repo_scope_clause(&scope, "clone_refinements");
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "clone_refinements")?;
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "clone_refinements");
     #[allow(clippy::type_complexity)]
     let hit: Option<(f64, String, f64, i64, String, String, String, f64)> = conn
         .query_row(
@@ -343,7 +342,7 @@ pub(crate) fn refine_compute_and_store_budgeted(
     // across repos). The repo id is a per-call literal prefix so the bound params (`?1`..`?14`)
     // stay unchanged.
     let (repo_col, repo_val) =
-        match crate::index::schema::periphery_repo_scope(conn, "clone_refinements")? {
+        match rag_rat_db::schema::periphery_repo_scope(conn, "clone_refinements")? {
             Some(repo_id) =>
                 ("repo_id, ".to_string(), format!("'{}', ", repo_id.replace('\'', "''"))),
             None => (String::new(), String::new()),
@@ -426,9 +425,8 @@ pub(crate) fn refine_class(
 /// (`clone_refinements` is repo-scoped since A5); the dropped classes recompute lazily on the next
 /// `find_clones` refine pass.
 pub(crate) fn invalidate_scip_refinements(conn: &Connection) -> anyhow::Result<usize> {
-    let scope = crate::index::schema::periphery_repo_scope(conn, "clone_refinements")?;
-    let repo_clause =
-        crate::index::schema::periphery_repo_scope_clause(&scope, "clone_refinements");
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "clone_refinements")?;
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "clone_refinements");
     let dropped = conn.execute(
         &format!(
             "DELETE FROM clone_refinements
@@ -585,7 +583,7 @@ mod tests {
     #[test]
     fn refine_compute_on_long_members_is_cheap_and_sampled() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         let members = vec![
             long_member(1, "h1", LCS_MAX_SEQ_TOKENS + 1),
@@ -617,7 +615,7 @@ mod tests {
     #[test]
     fn lcs_sampled_survives_cache_hit_for_long_seq_small_class() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         // A 2-member class (well below LCS_MEMBER_SAMPLE) with sequences past LCS_MAX_SEQ_TOKENS:
         // the member-count cap does NOT engage, only the per-pair length proxy does — exactly the
@@ -672,7 +670,7 @@ mod tests {
     #[test]
     fn refine_lookup_returns_none_on_miss_without_writing() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         let count_rows = |conn: &rusqlite::Connection| -> i64 {
             conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap()
@@ -693,7 +691,7 @@ mod tests {
     #[test]
     fn refine_class_read_through_computes_once_then_serves_cache() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         let count_rows = |conn: &rusqlite::Connection| -> i64 {
             conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap()
@@ -742,7 +740,7 @@ mod tests {
             std::env::temp_dir().join(format!("ragrat-refine-ro-probe-{}.db", std::process::id()));
         {
             let rw = rusqlite::Connection::open(&rw_path).unwrap();
-            crate::index::schema::apply(&rw).unwrap();
+            rag_rat_db::schema::apply(&rw, &crate::index::migration_hooks()).unwrap();
         }
 
         // Open it read-only.
@@ -758,7 +756,7 @@ mod tests {
         // Wrap in anyhow so `is_readonly_violation` can walk the chain.
         let anyhow_err = anyhow::Error::from(probe_err);
         assert!(
-            crate::storage::is_readonly_violation(&anyhow_err),
+            rag_rat_db::storage::is_readonly_violation(&anyhow_err),
             "the DELETE probe on a RO connection must produce SQLITE_READONLY: {anyhow_err}"
         );
 
@@ -775,7 +773,7 @@ mod tests {
     #[test]
     fn cache_round_trips_template_variation_points_signature() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         // A class that differs only in a literal kind → one value_param variation point + a real
         // proposed signature (non-trivial template / VP / sig payload to round-trip).
@@ -848,7 +846,7 @@ mod tests {
         assert_eq!(ALIGNMENT_VERSION, 3, "this test pins the current alignment version");
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         let members = vec![
             member(1, "fn f() { let x = 10; sink(x); }"),
@@ -924,7 +922,7 @@ mod tests {
     #[test]
     fn refinement_key_collides_only_for_identical_content() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         let class_a = vec![
             member(1, "fn f() { let x = 10; sink(x); }"),
@@ -989,7 +987,7 @@ mod tests {
     #[test]
     fn refinement_cache_not_poisoned_by_structurally_identical_different_source() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         // Class A and class B differ only in the literal KIND per column (int vs float) — alpha-
         // renaming + literal-bucketing makes their struct_hash multiset IDENTICAL — but the real
@@ -1093,7 +1091,7 @@ mod tests {
     #[test]
     fn invalidate_scip_refinements_drops_scip_rows_and_spares_baseline() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         let members = vec![
             member(1, "fn f() { let x = 10; sink(x); }"),
@@ -1136,7 +1134,7 @@ mod tests {
     #[test]
     fn content_addressable_byte_identical_source_shares_template() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         // Class 1 and class 2 are BYTE-IDENTICAL member bodies (a true cross-location duplicate),
         // only the symbol_ids differ. Identical source bytes → identical discriminators → identical

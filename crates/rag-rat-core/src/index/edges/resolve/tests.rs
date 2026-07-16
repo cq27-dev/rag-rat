@@ -1,14 +1,14 @@
+use rag_rat_db::schema;
 use rusqlite::{Connection, params};
 
 use super::*;
-use crate::index::schema;
 
 const NEW: &str = "newcommitsha";
 const OLD: &str = "oldcommitsha";
 
 fn seeded_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn
 }
 

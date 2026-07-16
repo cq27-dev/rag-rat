@@ -18,7 +18,7 @@ use super::*;
 // mirror is a whole-project cache instead of a small referenced-only one.
 
 pub(crate) fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     // `idx_papertrail_refs_unique` leads with `repo_id`, so a conflict is always THIS repo
     // re-discovering its OWN ref — keep the first-sighting row untouched (`DO NOTHING` preserves
     // the original `discovered_at_ms`/`ref_kind`). A sibling repo referencing the same item gets
@@ -59,7 +59,7 @@ pub(crate) fn store_item(
     tracker: Tracker,
     item: &PapertrailItem,
 ) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     conn.execute(
         "
         INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, title, \
@@ -125,7 +125,7 @@ pub(crate) fn store_comment(
     tracker: Tracker,
     comment: &PapertrailComment,
 ) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     conn.execute(
         "
         INSERT INTO papertrail_comments(tracker, project, item_kind, item_key, comment_id, url, \
@@ -272,10 +272,10 @@ pub(crate) fn insert_fts(conn: &Connection, row: FtsRow<'_>) -> rusqlite::Result
 
 #[cfg(test)]
 mod fts_mirror_tests {
+    use rag_rat_db::schema;
     use rusqlite::Connection;
 
     use super::*;
-    use crate::index::schema;
 
     fn item(kind: ItemKind, key: &str, title: &str, body: &str) -> PapertrailItem {
         PapertrailItem {
@@ -329,7 +329,7 @@ mod fts_mirror_tests {
     #[test]
     fn writers_mirror_every_row_with_the_right_title_slot() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         store_item(&conn, Tracker::Github, &item(ItemKind::Issue, "1", "issuetitle", "issuebody"))
             .unwrap();
@@ -394,7 +394,7 @@ mod fts_mirror_tests {
     #[test]
     fn store_item_touches_only_its_own_mirror_rows() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         store_item(&conn, Tracker::Github, &item(ItemKind::Issue, "1", "one", "first body"))
             .unwrap();
@@ -452,7 +452,7 @@ mod fts_mirror_tests {
     #[test]
     fn store_comment_touches_only_its_own_mirror_row() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         store_comment(&conn, Tracker::Github, &comment("1", "10", "keep me")).unwrap();
         conn.execute(

@@ -1,3 +1,6 @@
+use rag_rat_db::meta::{read_meta, repo_meta};
+use rag_rat_db::schema;
+
 use super::*;
 
 /// How long an `open` waits for the index write lock before giving up on auto-migrating a schema
@@ -97,9 +100,15 @@ impl IndexDatabase {
                     "timed out waiting for the schema-migration lock to auto-migrate the schema"
                 )
             })?;
-            schema::ensure_compatible_or_migrate(storage.connection())?;
+            schema::ensure_compatible_or_migrate(
+                storage.connection(),
+                &crate::index::migration_hooks(),
+            )?;
         } else {
-            schema::ensure_compatible_or_migrate(storage.connection())?;
+            schema::ensure_compatible_or_migrate(
+                storage.connection(),
+                &crate::index::migration_hooks(),
+            )?;
         }
         Ok(storage)
     }
@@ -238,10 +247,20 @@ impl IndexDatabase {
             Ok(identity) => {
                 let now = schema::now_ms();
                 match intent {
-                    AdoptIntent::Indexing =>
-                        schema::register_repo(conn, &identity, &config.root, now)?,
-                    AdoptIntent::ReadOnly =>
-                        schema::register_repo_read_only(conn, &identity, &config.root, now)?,
+                    AdoptIntent::Indexing => schema::register_repo(
+                        conn,
+                        &identity,
+                        &config.root,
+                        now,
+                        &crate::index::migration_hooks(),
+                    )?,
+                    AdoptIntent::ReadOnly => schema::register_repo_read_only(
+                        conn,
+                        &identity,
+                        &config.root,
+                        now,
+                        &crate::index::migration_hooks(),
+                    )?,
                 }
             },
             Err(err) if err.is_absent() => {
@@ -534,7 +553,7 @@ impl IndexDatabase {
             // Missing is first-time init) unless RAG_RAT_ALLOW_MIGRATE / an installed binary.
             super::migration_gate::MigrationGate::from_env()
                 .ensure_migration_permitted(path, state)?;
-            schema::apply(conn)?;
+            schema::apply(conn, &crate::index::migration_hooks())?;
         }
         Ok(())
     }
@@ -828,10 +847,10 @@ mod global_store_overview_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use rag_rat_base::repo_identity::{RepoIdentity, RepoIdentityClass};
+    use rag_rat_db::schema::{self, register_repo};
+    use rag_rat_db::storage::IndexConnection;
 
     use crate::index::IndexDatabase;
-    use crate::index::schema::{self, register_repo};
-    use crate::storage::IndexConnection;
 
     static N: AtomicU64 = AtomicU64::new(0);
 
@@ -862,7 +881,7 @@ mod global_store_overview_tests {
         let path = temp_db();
         {
             let conn = IndexConnection::open(&path).unwrap();
-            schema::apply(conn.connection()).unwrap();
+            schema::apply(conn.connection(), &crate::index::migration_hooks()).unwrap();
             register_repo(
                 conn.connection(),
                 &RepoIdentity {
@@ -873,6 +892,7 @@ mod global_store_overview_tests {
                 },
                 Path::new("/src/demo"),
                 42,
+                &crate::index::migration_hooks(),
             )
             .unwrap();
         }

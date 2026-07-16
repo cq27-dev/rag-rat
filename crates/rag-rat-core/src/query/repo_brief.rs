@@ -516,8 +516,8 @@ pub(crate) fn summary_counts(conn: &Connection) -> anyhow::Result<SummaryCounts>
     // pre-flip, and the superseded generation's linger until gc — a repo-only join would report
     // old+new (roughly double) edges. `active_generation` matches the `files` count above (the
     // view filters the same value), keeping the two counts one consistent snapshot.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    let generation = crate::index::schema::active_generation(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let generation = rag_rat_db::schema::active_generation(conn)?;
     let graph_edges: u64 = conn.query_row(
         "SELECT COUNT(*) FROM edges_data e
            JOIN main.files f ON f.id = e.source_file_id
@@ -553,7 +553,7 @@ pub(crate) fn file_rows(
     // for a SHARED path (two repos both having `src/lib.rs`) out of this repo's brief — the
     // outer join is by path, so the scoped `files` view alone cannot exclude a sibling's
     // colliding-path row.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         WITH file_size AS (
@@ -688,7 +688,7 @@ fn enrich_rows<T: Clone + Default>(
 fn newest_commit_time(conn: &Connection) -> anyhow::Result<i64> {
     // Direct-scoped (V040): the recency floor tracks the ACTIVE repo's newest commit, not a more
     // recently indexed sibling's.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     Ok(conn
         .query_row(
             "SELECT MAX(authored_at_s) FROM git_commits WHERE repo_id = ?1",
@@ -706,8 +706,8 @@ fn memory_counts(conn: &Connection, path: Option<&str>) -> anyhow::Result<RepoBr
     // Scoped to the active repo (V042): these counts drive the per-repo brief, so a sibling repo's
     // memories (including a same-path binding that collides with one of ours) must not inflate them
     // on a consolidated DB. `{repo_clause}` empty pre-A5 — see `schema::periphery_repo_scope`.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memories");
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "repo_memories");
     if let Some(path) = path {
         let mut stmt = conn.prepare(&format!(
             "
@@ -798,8 +798,8 @@ fn memory_counts_by_path(
     // Scoped to the active repo (V042): the join is by `repo_memory_bindings.path`, so a sibling
     // repo's path-bound memory whose path collides with one of ours (the same-path poison tripwire)
     // would attribute its counts to our file without this predicate. `{repo_clause}` empty pre-A5.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memories");
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "repo_memories");
     let mut stmt = conn.prepare(&format!(
         "
         SELECT repo_memory_bindings.path,
@@ -845,15 +845,15 @@ fn row_u64(row: &Row<'_>, idx: usize) -> rusqlite::Result<u64> {
 
 #[cfg(test)]
 mod summary_tests {
+    use rag_rat_db::schema;
     use rusqlite::Connection;
 
     use super::summary_counts;
-    use crate::index::schema;
 
     #[test]
     fn summary_excludes_suppressed_edge_candidates() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
              VALUES ('App.swift', 'swift', 'source', 'sha', 0, 0)",

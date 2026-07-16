@@ -466,10 +466,10 @@ pub fn important_symbols(
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_db::schema;
     use rusqlite::params;
 
     use super::*;
-    use crate::index::schema;
 
     fn approx_desc(scores: &[f64]) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..scores.len()).collect();
@@ -557,7 +557,7 @@ mod tests {
     #[test]
     fn important_symbols_ranks_the_most_depended_on_first() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
              VALUES ('a.rs', 'rust', 'source', 'h', 0, 0)",
@@ -597,7 +597,7 @@ mod tests {
 
         // No resolved symbol→symbol edges → empty (not an error).
         let bare = Connection::open_in_memory().unwrap();
-        schema::apply(&bare).unwrap();
+        schema::apply(&bare, &crate::index::migration_hooks()).unwrap();
         assert!(important_symbols(&bare, opts(10, &[])).unwrap().symbols.is_empty());
     }
 
@@ -670,7 +670,7 @@ mod tests {
     /// map by them.
     fn conf_conn(n: usize, edges: &[(i64, i64, &str)]) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
              VALUES ('a.rs', 'rust', 'source', 'h', 0, 0)",
@@ -709,7 +709,7 @@ mod tests {
         // PageRank via EdgeOracleEffect::Retarget, or compiler-recovered calls are dropped from the
         // ranking (the very upgrade case SCIP-aware ranking exists to capture).
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
              VALUES ('a.rs', 'rust', 'source', 'h', 0, 0)",

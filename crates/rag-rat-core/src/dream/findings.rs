@@ -136,10 +136,10 @@ pub(super) fn coverage_gap(conn: &Connection, limit: usize) -> anyhow::Result<Ve
     }
     // `{binding_clause}`/`{b_clause}` are ` AND <table>.repo_id = '<id>'` under scope, empty
     // pre-A5.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
     let binding_clause =
-        crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memory_bindings");
-    let b_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "b");
+        rag_rat_db::schema::periphery_repo_scope_clause(&scope, "repo_memory_bindings");
+    let b_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "b");
 
     // Covered symbol ids: a direct `symbol_id` binding OR any member of a bound logical symbol.
     let mut covered_symbols: HashSet<i64> = conn
@@ -256,8 +256,8 @@ pub(super) fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFi
     // moved/deleted path — scan them too, matching the memory layer's status IN ('active','stale').
     // Scoped to the ACTIVE repo (V042): a sibling repo's memory referencing a path that does not
     // resolve in THIS repo's index must not surface as this repo's stale_reference finding.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memories");
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "repo_memories");
     let mut stmt = conn.prepare(&format!(
         "SELECT id, body FROM repo_memories WHERE status IN ('active', 'stale'){repo_clause}"
     ))?;
@@ -293,13 +293,13 @@ pub(super) fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFi
 /// schema (the column is absent, so the reads/writes run unscoped — the original repo-global SQL).
 /// Probes `dream_findings` — see `schema::periphery_repo_scope`.
 pub(super) fn dream_repo_scope(conn: &Connection) -> rusqlite::Result<Option<String>> {
-    crate::index::schema::periphery_repo_scope(conn, "dream_findings")
+    rag_rat_db::schema::periphery_repo_scope(conn, "dream_findings")
 }
 
 /// The ` AND dream_findings.repo_id = '…'` predicate for a scoped `dream_findings` read/write, or
 /// `""` when unscoped.
 pub(super) fn dream_repo_scope_clause(scope: &Option<String>) -> String {
-    crate::index::schema::periphery_repo_scope_clause(scope, "dream_findings")
+    rag_rat_db::schema::periphery_repo_scope_clause(scope, "dream_findings")
 }
 
 /// Sync findings into `dream_findings` with the identity-keyed lifecycle (refresh / supersede /
@@ -1043,7 +1043,7 @@ mod tests {
         let a = Connection::open(&path).unwrap();
         a.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
         a.busy_timeout(std::time::Duration::ZERO).unwrap();
-        crate::index::schema::apply(&a).unwrap();
+        rag_rat_db::schema::apply(&a, &crate::index::migration_hooks()).unwrap();
 
         let b = Connection::open(&path).unwrap();
         b.busy_timeout(std::time::Duration::ZERO).unwrap();
@@ -1051,7 +1051,7 @@ mod tests {
 
         let err = sync(&a, &[], 1, BASE_FINDING_KINDS).unwrap_err();
         assert!(
-            crate::storage::is_busy(&anyhow::Error::new(err)),
+            rag_rat_db::storage::is_busy(&anyhow::Error::new(err)),
             "an empty sync under a concurrently-held writer must fail busy — proving BEGIN \
              IMMEDIATE, not DEFERRED (which would do no writes and silently succeed)"
         );

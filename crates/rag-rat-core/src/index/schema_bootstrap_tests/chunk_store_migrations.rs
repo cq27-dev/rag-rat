@@ -6,7 +6,7 @@ fn v026_recreates_chunk_fts_contentless_and_repopulates() {
     // table that supports delete-by-rowid (contentless_delete=1); the forward-migrate (V026)
     // converts an existing external-content table and repopulates it from chunks.text.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     let fts_sql: String = conn
         .query_row("SELECT sql FROM sqlite_master WHERE name = 'chunk_fts'", [], |r| r.get(0))
@@ -55,7 +55,7 @@ fn v026_recreates_chunk_fts_contentless_and_repopulates() {
          DELETE FROM schema_version WHERE id = '027_drop_chunks_text';",
     )
     .unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     let migrated_sql: String = conn
         .query_row("SELECT sql FROM sqlite_master WHERE name = 'chunk_fts'", [], |r| r.get(0))
@@ -150,7 +150,8 @@ fn full_rebuild_populates_the_chunk_text_store() {
     let mut checked = 0;
     for row in rows {
         let (blob, raw_len) = row.unwrap();
-        let back = super::text_compression::decompress(&blob, &dict, raw_len as usize).unwrap();
+        let back =
+            rag_rat_db::text_compression::decompress(&blob, &dict, raw_len as usize).unwrap();
         corpus.push_str(std::str::from_utf8(&back).expect("chunk_text blob decompresses to UTF-8"));
         checked += 1;
     }
@@ -199,7 +200,8 @@ fn incremental_heal_maintains_the_chunk_text_store() {
     let mut corpus = String::new();
     for row in rows {
         let (blob, raw_len) = row.unwrap();
-        let back = super::text_compression::decompress(&blob, &dict, raw_len as usize).unwrap();
+        let back =
+            rag_rat_db::text_compression::decompress(&blob, &dict, raw_len as usize).unwrap();
         corpus.push_str(std::str::from_utf8(&back).expect("chunk_text blob decompresses to UTF-8"));
     }
     assert!(
@@ -318,7 +320,7 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
 #[test]
 fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
@@ -368,7 +370,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
 #[test]
 fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // Simulate a pre-V022 index: drop the V022 artifacts and its schema_version row. (SQLite ≥3.35
     // supports DROP COLUMN; the bundled rusqlite is current.)
     conn.execute_batch(
@@ -394,7 +396,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
     assert!(!conn_table_exists(&conn, "packages"));
 
     // Forward-migrate: re-running apply (the Older→apply path) converges to the latest version.
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     assert!(conn_table_exists(&conn, "packages"), "forward migrate creates packages");
     assert!(
@@ -415,7 +417,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
 #[test]
 fn v028_fresh_apply_interns_symbol_qualified_names() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     for table in ["symbols", "logical_symbols"] {
         let cols = conn_table_columns(&conn, table);
@@ -446,7 +448,7 @@ fn v028_fresh_apply_interns_symbol_qualified_names() {
 #[test]
 fn v028_forward_migrate_interns_and_drops_the_inline_column() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     // Seed a file + a symbol + a logical symbol in the CURRENT (interned) shape.
     conn.execute(
@@ -522,7 +524,7 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
     );
 
     // --- Forward-migrate ---
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 
     // The rename happened and the inline columns are gone.
@@ -657,7 +659,7 @@ fn gc_preserves_a_name_strings_entry_referenced_only_by_a_symbol() {
 #[test]
 fn name_strings_max_id_stays_in_the_three_byte_range() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // Seed a representative spread of interned names across edges + symbols.
     conn.execute(
         "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
@@ -734,7 +736,7 @@ fn files_has_test_code_flag_survives_the_heal_path() {
     // ambiguous (and after heal re-inserts the primary row at a higher rowid, would return the
     // sibling's flag). This is a single-repo test, but the fix is to scope the query, not disable
     // the harness.
-    let repo_id = crate::index::schema::active_repo_id(db.storage.connection()).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(db.storage.connection()).unwrap();
     let flag = || -> i64 {
         db.storage
             .connection()
@@ -779,7 +781,7 @@ fn heal_reindexes_a_file_to_the_same_chunk_policies_as_a_full_rebuild() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let repo_id = crate::index::schema::active_repo_id(db.storage.connection()).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(db.storage.connection()).unwrap();
     // Content-keyed (not rowid-keyed: heal removes + re-inserts, so ids change) chunk-policy
     // snapshot for the file, scoped to the active repo (the poison-sibling harness seeds a
     // same-path row under a sibling repo).
@@ -828,7 +830,7 @@ fn has_test_code_backfill_is_case_sensitive() {
     // `contains("test(")` is false) leaves at 0 — a migrated-vs-reindexed divergence. `instr`
     // is case-sensitive, so they agree.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // V024's backfill reads chunks.text, which V027 retired; this test exercises the backfill as a
     // pre-V027 forward-migrate would, so re-add the column it reads.
     conn.execute("ALTER TABLE chunks ADD COLUMN text TEXT NOT NULL DEFAULT ''", []).unwrap();

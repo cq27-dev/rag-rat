@@ -251,7 +251,7 @@ pub(crate) fn doctor(config: &Config, args: &DoctorArgs) -> anyhow::Result<()> {
     }
     let schema = IndexDatabase::migration_check(&config.database)?;
     let (index, discovery, storage, clone_fingerprints, file_health) =
-        if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
+        if schema.state == rag_rat_db::schema::SchemaState::Compatible {
             let db = IndexDatabase::open_config(config)?;
             let mut index_status = serde_json::to_value(db.status(&config.database)?)?;
             // Schema (incl. the migrations list) is reported once at the top level from

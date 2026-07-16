@@ -132,13 +132,13 @@ impl IndexDatabase {
         // temp view ("views may not be indexed"). A pragma'd bare open matches the manual
         // `sqlite3 <db> VACUUM` remedy and rewrites the same file; `self` sees the compacted result
         // on its next read.
-        let vacuum_conn = crate::storage::IndexConnection::open(&path)?;
+        let vacuum_conn = rag_rat_db::storage::IndexConnection::open(&path)?;
         // A concurrent writer (any repo's watcher/index, or a reader holding a txn) makes VACUUM
         // fail busy — the schema lock doesn't hold those off. Turn a raw SQLITE_BUSY into an
         // actionable refusal (no corruption, just retry once quiet).
         if let Err(err) = vacuum_conn.connection().execute_batch("VACUUM") {
             let err = anyhow::Error::from(err);
-            return Err(if crate::storage::is_busy(&err) {
+            return Err(if rag_rat_db::storage::is_busy(&err) {
                 anyhow::anyhow!(
                     "VACUUM could not get exclusive access to the database — a rag-rat writer (a \
                      watcher/index for any repo, or an active reader) is running. Stop \
@@ -155,7 +155,7 @@ impl IndexDatabase {
         // wrong/missing commits. Rebuild it against the post-VACUUM rowids. It is the ONLY
         // at-risk FTS: `chunk_fts` is contentless and `github_fts`/`repo_memory_fts` are
         // standalone (not rowid-linked).
-        crate::index::schema::rebuild_commit_fts(vacuum_conn.connection())?;
+        rag_rat_db::schema::rebuild_commit_fts(vacuum_conn.connection())?;
         // In WAL mode VACUUM's compaction lands in the `-wal`; fold it back and truncate the
         // sidecar so the main file physically shrinks (and doesn't just move dead space to the
         // WAL). The checkpoint returns (busy, log, checkpointed): busy = 1 means a reader

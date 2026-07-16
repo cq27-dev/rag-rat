@@ -95,7 +95,7 @@ impl IndexDatabase {
             ",
         )?;
         let live_generation =
-            crate::index::schema::live_files_generation(conn, &self.active_repo_id)?;
+            rag_rat_db::schema::live_files_generation(conn, &self.active_repo_id)?;
         conn.execute(
             "INSERT OR IGNORE INTO temp.staged_file_ids(id)
              SELECT id FROM main.files WHERE repo_id = ?1 AND generation != ?2",

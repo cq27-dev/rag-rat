@@ -57,7 +57,7 @@ pub(crate) fn evidence_for_item(
     item_kind: Option<ItemKind>,
     limit: u32,
 ) -> anyhow::Result<Vec<PapertrailEvidence>> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT tracker, project, item_kind, item_key, doc_kind, comment_id, url, title, body, \
@@ -91,7 +91,7 @@ pub(crate) fn evidence_for_commit_refs(
     commit_hash: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<PapertrailEvidence>> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT tracker, project, item_key, item_kind
@@ -135,7 +135,7 @@ pub(crate) fn search_fts(
     limit: u32,
 ) -> anyhow::Result<Vec<PapertrailEvidence>> {
     let fts_query = fts_query(query);
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     // The `repo_id` filter is MANDATORY (V041): `papertrail_fts` is one index over every repo's
     // papertrail in a consolidated DB, so a bare MATCH would surface a sibling repo's issues. Its
     // parameter index trails the optional `doc_kind` bind, so it shifts with the kind clause.
@@ -236,7 +236,7 @@ pub(crate) fn ref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PapertrailRef
 }
 #[cfg(test)]
 pub(crate) fn refs(conn: &Connection) -> anyhow::Result<Vec<PapertrailRef>> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "SELECT tracker, project, item_key, item_kind, ref_kind, source_kind, source_path, \
          source_commit, source_text FROM papertrail_refs WHERE repo_id = ?1",

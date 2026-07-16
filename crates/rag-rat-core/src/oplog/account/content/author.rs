@@ -206,10 +206,10 @@ fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_db::schema;
     use rusqlite::{Connection, TransactionBehavior};
 
     use super::*;
-    use crate::index::schema;
     use crate::oplog::op::{EdgeSpec, NodeContent, NodeId};
     use crate::query::memory::EdgeRelation;
 
@@ -219,7 +219,7 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn
     }
 

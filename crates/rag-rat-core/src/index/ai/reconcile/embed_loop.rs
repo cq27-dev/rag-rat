@@ -81,7 +81,7 @@ pub(crate) fn reconcile_with_options_progress(
     // unchanged; pre-A5 uses the original 4-column shape. The finalize UPDATE keys the row by its
     // autoincrement `id`, so it needs no repo predicate.
     let (repo_col, repo_val) =
-        match crate::index::schema::periphery_repo_scope(conn, "reconcile_attempts")? {
+        match rag_rat_db::schema::periphery_repo_scope(conn, "reconcile_attempts")? {
             Some(repo_id) =>
                 ("repo_id, ".to_string(), format!("'{}', ", repo_id.replace('\'', "''"))),
             None => (String::new(), String::new()),
@@ -289,7 +289,7 @@ pub(crate) fn reconcile_with_options_progress(
     // from the compressed `chunk_text` store (#77 Phase 2), and reusing this decoder keeps the dict
     // SELECT + dictionary prep to once per run rather than once per batch.
     let dicts = crate::query::chunk_text_dicts(conn)?;
-    let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+    let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
     let mut cursor = 0usize;
     let mut processed_ids: HashSet<i64> = HashSet::new();
     let mut remaining = options.limit.map(u64::from);
@@ -538,7 +538,7 @@ mod freshness_version_tests {
 
     fn schema_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         ensure_model_manifest(&conn).unwrap();
         conn
     }

@@ -318,7 +318,7 @@ pub(crate) fn setup_index(config: &Config) -> anyhow::Result<IndexDatabase> {
     // unregistered-subject rule consolidate follows (see `scoped_repo_witness`'s limit). The
     // config-bearing index open below registers the new repo and runs the heals correctly scoped.
     let migration = IndexDatabase::migrate_schema_only(&config.database)?;
-    if migration.state != rag_rat_core::index::schema::SchemaState::Compatible {
+    if migration.state != rag_rat_db::schema::SchemaState::Compatible {
         anyhow::bail!("{}", migration.message);
     }
     eprintln!("init: indexing discovered files");

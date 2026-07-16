@@ -38,9 +38,8 @@
 
 use std::collections::HashMap;
 
+use rag_rat_db::meta::{repo_meta, set_repo_meta};
 use rusqlite::{Connection, params};
-
-use crate::index::{repo_meta, set_repo_meta};
 
 /// The last N *eligible* commits per repo define the window, ordered `(committed_at_s DESC, hash
 /// DESC)` for determinism (commit timestamps collide, so the hash breaks the tie). A commit-count
@@ -111,7 +110,7 @@ struct PairAcc {
 /// writers serialize on SQLite's write lock and last-writer-wins an identical result; readers see
 /// old-or-new rows, never a mix (the recompute is one transaction).
 pub(crate) fn ensure_coupling_fresh(conn: &Connection, now_ms: i64) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     if coupling_stamp_current(conn, &repo_id)? {
         return Ok(());
     }

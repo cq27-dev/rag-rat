@@ -295,14 +295,14 @@ pub(crate) fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol
     // the active repo in both cases: redundant under a scope view (view rows ⊆ active repo),
     // and the sole repo predicate on the view-less path. `active_repo_id` falls back to
     // `sole_repo_id` when no context is installed, matching the bare-open scope.
-    let active_repo_id = crate::index::schema::active_repo_id(conn)?;
+    let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     // Also pin the pool to the active GENERATION (A6): a full rebuild leaves the superseded
     // generation's rows in place until gc, so a bare `repo_id` pin would pull a dead generation's
     // symbols into the pool. `active_generation` reads the connection's scope context (the WRITE
     // generation on the rebuild connection, so edge resolution during a rebuild resolves onto the
     // symbols it is building) and falls back to the repo's LIVE generation from `repo_meta` on the
     // view-less bare-open heal path — matching the `active_repo_id` fallback exactly.
-    let active_generation = crate::index::schema::active_generation(conn)?;
+    let active_generation = rag_rat_db::schema::active_generation(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, qn.value, symbols.kind,

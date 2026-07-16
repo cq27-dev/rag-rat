@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn migration_032_adds_token_bag_drops_postings() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    crate::index::schema::apply(&conn).expect("apply");
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
     // --- Simulate a V031-era index: postings table present, no token_bag column ---
     conn.execute_batch(
@@ -28,13 +28,14 @@ fn migration_032_adds_token_bag_drops_postings() {
     );
     assert!(conn_table_exists(&conn, "symbol_token_postings"), "postings present at V031");
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().state,
-        crate::index::schema::SchemaState::Older,
+        rag_rat_db::schema::status(&conn).unwrap().state,
+        rag_rat_db::schema::SchemaState::Older,
         "schema is Older after removing the V032 ledger row"
     );
 
     // --- Run the forward migration ---
-    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+    rag_rat_db::schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("migrate_forward");
 
     assert!(
         conn_table_columns(&conn, "symbol_fingerprints").contains(&"token_bag".to_string()),
@@ -46,15 +47,16 @@ fn migration_032_adds_token_bag_drops_postings() {
         .query_row("SELECT COUNT(token_bag) FROM symbol_fingerprints", [], |r| r.get(0))
         .expect("SELECT token_bag must succeed after V032");
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().current_version,
-        crate::index::schema::LATEST_SCHEMA_VERSION,
+        rag_rat_db::schema::status(&conn).unwrap().current_version,
+        rag_rat_db::schema::LATEST_SCHEMA_VERSION,
         "schema is at LATEST_SCHEMA_VERSION after V032"
     );
     // Idempotency: a second migrate_forward is a clean no-op (guarded on the token_bag column).
-    crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
+    rag_rat_db::schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("migrate_forward is idempotent");
     assert!(matches!(
-        crate::index::schema::status(&conn).unwrap().state,
-        crate::index::schema::SchemaState::Compatible
+        rag_rat_db::schema::status(&conn).unwrap().state,
+        rag_rat_db::schema::SchemaState::Compatible
     ));
 }
 
@@ -65,7 +67,7 @@ fn migration_032_adds_token_bag_drops_postings() {
 #[test]
 fn migration_034_adds_content_anchored_clone_graph_tables() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    crate::index::schema::apply(&conn).expect("apply");
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
     // --- Simulate a V033-era index: clone-graph tables absent, schema rolled back to V033 ---
     conn.execute_batch(
@@ -75,13 +77,14 @@ fn migration_034_adds_content_anchored_clone_graph_tables() {
     truncate_schema_to(&conn, 33);
     assert!(!conn_table_exists(&conn, "clone_edges"), "clone_edges absent at V033");
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().state,
-        crate::index::schema::SchemaState::Older,
+        rag_rat_db::schema::status(&conn).unwrap().state,
+        rag_rat_db::schema::SchemaState::Older,
         "schema is Older after removing the V034 ledger row"
     );
 
     // --- Run the forward migration ---
-    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+    rag_rat_db::schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("migrate_forward");
     assert!(
         conn_table_exists(&conn, "clone_graph_generations"),
         "V034 adds clone_graph_generations"
@@ -93,7 +96,7 @@ fn migration_034_adds_content_anchored_clone_graph_tables() {
     // now HAS the table — that is V037's job, verified by
     // `migration_037_adds_content_anchored_clone_subblock_postings`.)
     let v034_only = rusqlite::Connection::open_in_memory().expect("open v034-only conn");
-    crate::index::schema::apply_clone_graph_tables(&v034_only).expect("apply V034 clone-graph DDL");
+    rag_rat_db::schema::apply_clone_graph_tables(&v034_only).expect("apply V034 clone-graph DDL");
     assert!(
         !conn_table_exists(&v034_only, "clone_subblock_postings"),
         "the persisted postings table is deferred to V037 — the V034 DDL must NOT create it"
@@ -139,8 +142,8 @@ fn migration_034_adds_content_anchored_clone_graph_tables() {
     assert_eq!(edges, 1, "round-tripped one edge");
 
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().current_version,
-        crate::index::schema::LATEST_SCHEMA_VERSION,
+        rag_rat_db::schema::status(&conn).unwrap().current_version,
+        rag_rat_db::schema::LATEST_SCHEMA_VERSION,
         "schema is at LATEST_SCHEMA_VERSION after V034"
     );
 }
@@ -152,7 +155,7 @@ fn migration_034_adds_content_anchored_clone_graph_tables() {
 #[test]
 fn migration_035_adds_symbols_is_test() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    crate::index::schema::apply(&conn).expect("apply");
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
     conn.execute_batch("ALTER TABLE symbols DROP COLUMN is_test;").expect("revert to V034 shape");
     truncate_schema_to(&conn, 34);
@@ -161,12 +164,13 @@ fn migration_035_adds_symbols_is_test() {
         "is_test absent at V034"
     );
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().state,
-        crate::index::schema::SchemaState::Older,
+        rag_rat_db::schema::status(&conn).unwrap().state,
+        rag_rat_db::schema::SchemaState::Older,
         "schema is Older after removing the V035 ledger row"
     );
 
-    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+    rag_rat_db::schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("migrate_forward");
     assert!(
         conn_table_columns(&conn, "symbols").contains(&"is_test".to_string()),
         "V035 adds symbols.is_test"
@@ -183,17 +187,18 @@ fn migration_035_adds_symbols_is_test() {
 #[test]
 fn migration_036_adds_content_addressed_embedding_cache() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    crate::index::schema::apply(&conn).expect("apply");
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
     conn.execute_batch("DROP TABLE embedding_cache;").expect("revert to V035 shape");
     truncate_schema_to(&conn, 35);
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().state,
-        crate::index::schema::SchemaState::Older,
+        rag_rat_db::schema::status(&conn).unwrap().state,
+        rag_rat_db::schema::SchemaState::Older,
         "schema is Older after removing the V036 ledger row"
     );
 
-    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+    rag_rat_db::schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("migrate_forward");
     assert!(
         conn_table_columns(&conn, "embedding_cache").contains(&"input_hash".to_string()),
         "V036 adds the embedding_cache table"
@@ -213,7 +218,7 @@ fn migration_036_adds_content_addressed_embedding_cache() {
 #[test]
 fn migration_037_adds_content_anchored_clone_subblock_postings() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    crate::index::schema::apply(&conn).expect("apply");
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     // NB: V037 is no longer the schema tip (V038 added the repos registry), so this test no longer
     // pins LATEST_SCHEMA_VERSION to an absolute number — that pin lives on the current-tip test.
 
@@ -294,11 +299,12 @@ fn migration_037_adds_content_anchored_clone_subblock_postings() {
     .expect("revert to V036 shape");
     truncate_schema_to(&conn, 36);
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().state,
-        crate::index::schema::SchemaState::Older,
+        rag_rat_db::schema::status(&conn).unwrap().state,
+        rag_rat_db::schema::SchemaState::Older,
         "schema is Older after removing the V037 ledger row"
     );
-    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+    rag_rat_db::schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("migrate_forward");
     assert!(
         conn_table_exists(&conn, "clone_subblock_postings"),
         "V037 recreates clone_subblock_postings on forward migrate"
@@ -325,8 +331,8 @@ fn migration_037_adds_content_anchored_clone_subblock_postings() {
         .expect("count postings");
     assert_eq!(postings, 1, "round-tripped one posting");
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().current_version,
-        crate::index::schema::LATEST_SCHEMA_VERSION,
+        rag_rat_db::schema::status(&conn).unwrap().current_version,
+        rag_rat_db::schema::LATEST_SCHEMA_VERSION,
         "schema is at LATEST_SCHEMA_VERSION after V037"
     );
 }
@@ -340,10 +346,10 @@ fn migration_037_adds_content_anchored_clone_subblock_postings() {
 fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     // Start from a fully-applied schema (includes V029 DDL which already has lcs_sampled).
-    crate::index::schema::apply(&conn).expect("apply");
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().current_version,
-        crate::index::schema::LATEST_SCHEMA_VERSION,
+        rag_rat_db::schema::status(&conn).unwrap().current_version,
+        rag_rat_db::schema::LATEST_SCHEMA_VERSION,
         "fresh apply reaches V30"
     );
 
@@ -363,13 +369,14 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     // Truncate the ledger to V29 so the schema reads Older and migrate_forward replays V030.
     truncate_schema_to(&conn, 29);
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().state,
-        crate::index::schema::SchemaState::Older,
+        rag_rat_db::schema::status(&conn).unwrap().state,
+        rag_rat_db::schema::SchemaState::Older,
         "schema is Older after truncating the ledger to V29"
     );
 
     // --- Run the forward migration ---
-    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+    rag_rat_db::schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("migrate_forward");
 
     // --- Assert the column is now present and the schema is current ---
     let cols_after: Vec<String> = {
@@ -386,15 +393,16 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
         .query_row("SELECT COUNT(lcs_sampled) FROM clone_refinements", [], |r| r.get(0))
         .expect("SELECT lcs_sampled must succeed after V030 migration");
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().current_version,
-        crate::index::schema::LATEST_SCHEMA_VERSION,
+        rag_rat_db::schema::status(&conn).unwrap().current_version,
+        rag_rat_db::schema::LATEST_SCHEMA_VERSION,
         "schema is at LATEST_SCHEMA_VERSION after V030 migration"
     );
     // Idempotency: running migrate_forward again must not error.
-    crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
+    rag_rat_db::schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("migrate_forward is idempotent");
     assert_eq!(
-        crate::index::schema::status(&conn).unwrap().state,
-        crate::index::schema::SchemaState::Compatible,
+        rag_rat_db::schema::status(&conn).unwrap().state,
+        rag_rat_db::schema::SchemaState::Compatible,
         "schema is still Compatible after second migrate_forward"
     );
 }
@@ -408,7 +416,7 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
 fn migration_031_edge_oracle_no_fk_content_key() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-    crate::index::schema::apply(&conn).expect("apply reaches V31");
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply reaches V31");
 
     // Simulate a V030-era index whose `edge_oracle` still has the OLD edge_id-keyed FK shape: drop
     // the content-anchored table and recreate the V018 shape, then remove the V031 ledger row so
@@ -446,7 +454,8 @@ fn migration_031_edge_oracle_no_fk_content_key() {
         .unwrap();
     assert!(fk_before > 0, "legacy edge_oracle has an edges_data FK before V031");
 
-    crate::index::schema::migrate_forward(&conn).expect("migrate_forward replays V031");
+    rag_rat_db::schema::migrate_forward(&conn, &crate::index::migration_hooks())
+        .expect("migrate_forward replays V031");
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -533,13 +542,14 @@ fn migration_031_edge_oracle_no_fk_content_key() {
 #[test]
 fn no_table_has_a_reindex_cascading_fk_to_a_volatile_parent() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
-    crate::index::schema::apply(&conn).expect("apply reaches LATEST");
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks())
+        .expect("apply reaches LATEST");
 
     // Every declared oracle-derived table exists and is implicitly covered by the scan below (a
     // typo in the const would otherwise drift from reality unnoticed). The const stays the
     // canonical declaration of which outputs MUST survive reindex; the scan is what ENFORCES
     // the FK shape.
-    for &table in crate::index::schema::ORACLE_PERSISTED_TABLES {
+    for &table in rag_rat_db::schema::ORACLE_PERSISTED_TABLES {
         let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -553,7 +563,7 @@ fn no_table_has_a_reindex_cascading_fk_to_a_volatile_parent() {
     let disallowed: Vec<(String, String, String)> = cascading_fks_to_volatile_parents(&conn)
         .into_iter()
         .filter(|(table, parent, _)| {
-            !crate::index::schema::CASCADE_FK_ALLOWLIST.contains(&(table.as_str(), parent.as_str()))
+            !rag_rat_db::schema::CASCADE_FK_ALLOWLIST.contains(&(table.as_str(), parent.as_str()))
         })
         .collect();
 
@@ -571,7 +581,8 @@ fn no_table_has_a_reindex_cascading_fk_to_a_volatile_parent() {
     // volatile parent (`edges_data`) IS flagged by the scan — proving a future offender would not
     // slip through. Built on its own connection so the production scan above stays clean.
     let probe = rusqlite::Connection::open_in_memory().expect("open probe");
-    crate::index::schema::apply(&probe).expect("apply reaches LATEST");
+    rag_rat_db::schema::apply(&probe, &crate::index::migration_hooks())
+        .expect("apply reaches LATEST");
     probe
         .execute_batch(
             "CREATE TABLE __trip_wire_probe__(

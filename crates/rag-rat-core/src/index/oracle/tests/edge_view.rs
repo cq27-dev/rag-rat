@@ -9,7 +9,7 @@ use super::*;
 #[test]
 fn edges_is_a_compat_view_over_interned_tables() {
     let conn = Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     let object_type = |name: &str| -> String {
         conn.query_row("SELECT type FROM sqlite_master WHERE name = ?1", [name], |r| r.get(0))
@@ -98,7 +98,7 @@ fn view_writes_round_trip_and_dedup() {
 #[test]
 fn v020_converts_a_legacy_edges_table() {
     let conn = Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     // Recreate the LEGACY world: drop the view shape and install a real old-format table with a
     // row, plus an edge_oracle row referencing it.
     conn.execute_batch(
@@ -185,7 +185,7 @@ fn v020_converts_a_legacy_edges_table() {
 #[test]
 fn or_branch_name_predicates_use_the_to_name_index() {
     let conn = Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     let plan = |sql: &str| -> String {
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -229,7 +229,7 @@ fn or_branch_name_predicates_use_the_to_name_index() {
 #[test]
 fn graph_traversal_seed_predicates_use_edge_id_indexes() {
     let conn = Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     let plan = |sql: &str| -> String {
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -309,7 +309,7 @@ fn graph_traversal_seed_predicates_use_edge_id_indexes() {
 #[test]
 fn impact_and_grep_augment_seeds_use_edge_id_indexes() {
     let conn = Connection::open_in_memory().unwrap();
-    schema::apply(&conn).unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
     let plan = |sql: &str| -> String {
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();

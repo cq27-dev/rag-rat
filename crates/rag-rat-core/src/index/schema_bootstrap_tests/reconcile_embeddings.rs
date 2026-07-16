@@ -49,7 +49,7 @@ fn dirty_git_files_are_indexed_as_worktree_overlay() {
     // appear as an extra `(true, false)`. Reading through the scope view is wrong here (the test
     // needs both the raw committed row AND the overlay row), so scope by `repo_id` instead.
     let conn = db.storage.connection();
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
     let scopes = conn
         .prepare(
             "
@@ -1087,10 +1087,11 @@ fn skip_summary_shared_parse_matches_per_chunk_text() {
     use std::collections::BTreeMap;
     use std::path::Path;
 
+    use rag_rat_db::text_compression::{ChunkTextDecoder, ChunkTextRow};
+
     use crate::index::ai::{
         self, LowSignalCheck, embedding_policy_for_chunk, embedding_policy_skip_summary,
     };
-    use crate::index::text_compression::{ChunkTextDecoder, ChunkTextRow};
 
     // The FromSpan (shared-parse) summary must equal the per-chunk FromText computation on a real
     // index — exercising reconstruction + sha-verify + one-parse-per-file span classification, and
@@ -1193,8 +1194,8 @@ fn skip_summary_shared_parse_matches_per_chunk_text() {
 
     // Clear the stamp → the slow recompute (#572's subject: FromSpan reconstruction + sha-verify)
     // runs and must also equal the reference.
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
-    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
+    rag_rat_db::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
         .unwrap();
     let span = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
     assert_eq!(span, reference, "slow recompute must equal the per-chunk FromText reference");
@@ -1264,8 +1265,8 @@ fn skip_summary_fast_path_reads_certified_column_and_falls_back_when_stale() {
     );
 
     // Clear the stamp → recompute from source ignores the poisoned column and returns ground truth.
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
-    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
+    rag_rat_db::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
         .unwrap();
     let recomputed = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
     assert_eq!(
@@ -1304,7 +1305,7 @@ fn reconcile_self_heals_stale_policy_column_and_restamps() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
 
     // Ground truth from the freshly certified column.
     let truth = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
@@ -1316,14 +1317,14 @@ fn reconcile_self_heals_stale_policy_column_and_restamps() {
         [],
     )
     .unwrap();
-    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+    rag_rat_db::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
         .unwrap();
 
     // A reconcile (no model → NotReady, but it still runs the summary + self-heal) must repair the
     // column and restamp the version current.
     let _ = db.reconcile(None, Some(8)).unwrap();
     assert_eq!(
-        crate::index::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY)
+        rag_rat_db::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY)
             .unwrap()
             .as_deref(),
         Some(ai::EMBEDDING_POLICY_VERSION),
@@ -1366,11 +1367,11 @@ fn self_heal_does_not_certify_a_repo_with_another_live_scope() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
-    let generation = crate::index::schema::active_generation(conn).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
+    let generation = rag_rat_db::schema::active_generation(conn).unwrap();
 
     // Stale the stamp (simulate a version bump) so the self-heal would otherwise fire and restamp.
-    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+    rag_rat_db::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
         .unwrap();
     // A live row OUTSIDE the active base scope (git-less fixture ⇒ active commit_sha/worktree_id
     // are both ''): commit_sha != '' AND worktree_id != '' is what
@@ -1386,7 +1387,7 @@ fn self_heal_does_not_certify_a_repo_with_another_live_scope() {
 
     let _ = db.reconcile(None, Some(8)).unwrap();
     assert_eq!(
-        crate::index::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY)
+        rag_rat_db::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY)
             .unwrap()
             .as_deref(),
         Some("stale"),
@@ -1447,7 +1448,7 @@ fn reconcile_heals_an_op_log_ghost_in_an_idle_repo() {
 
     // A ghost written by RAW SQL — never authored into the signed log.
     let conn = db.storage.connection();
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
     conn.execute(
         "INSERT INTO repo_memories(
              id, kind, title, body, confidence, status, created_by, created_at_ms, updated_at_ms,

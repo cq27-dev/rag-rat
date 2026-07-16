@@ -105,16 +105,16 @@ fn activate_ephemeral_model(config: &Config, repo_id: &str, query_endpoint: Opti
         rusqlite::params![FASTEMBED_MODEL_ID, i64::try_from(model_spec.dim).unwrap()],
     )
     .unwrap();
-    crate::index::set_repo_meta(&conn, repo_id, "active_embedding_model", FASTEMBED_MODEL_ID)
+    rag_rat_db::meta::set_repo_meta(&conn, repo_id, "active_embedding_model", FASTEMBED_MODEL_ID)
         .unwrap();
-    crate::index::set_repo_meta(
+    rag_rat_db::meta::set_repo_meta(
         &conn,
         repo_id,
         "active_embedding_remote_config",
         &serde_json::to_string(&remote).unwrap(),
     )
     .unwrap();
-    crate::index::set_repo_meta(
+    rag_rat_db::meta::set_repo_meta(
         &conn,
         repo_id,
         "embedding_active_model_version",

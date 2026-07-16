@@ -42,7 +42,7 @@ impl MigrationGate {
         Self {
             is_dev_build: cfg!(debug_assertions)
                 || running_from_target_dir()
-                || version_indicates_dev_build(crate::binary_version()),
+                || version_indicates_dev_build(rag_rat_base::version::binary_version()),
             allow_override: env_flag(ALLOW_MIGRATE_ENV),
             global_db_path: rag_rat_base::data_dir::global_database_path(),
         }

@@ -19,12 +19,6 @@ pub(crate) fn grow_stack<R>(f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, f)
 }
 
-pub(crate) fn read_meta(conn: &rusqlite::Connection, key: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
-        .optional()?)
-}
-
 /// Whole-table row count — DELIBERATELY UNSCOPED, so on a consolidated multi-repo DB it reports
 /// the union across every repo. TEST-ONLY, structurally: the A7 sweep converted every production
 /// reporting caller to [`scoped_table_row_count`] (direct `repo_id` tables) or
@@ -101,12 +95,8 @@ pub(crate) fn duration_ms(duration: std::time::Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-pub(crate) fn path_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
 /// `path_string` for the read path: the importance auto-seed normalizes a `git_changed_paths` entry
 /// to the same `/`-separated form the `files` table stores, so the scoped-view lookup matches.
 pub(crate) fn path_string_for_seed(path: &Path) -> String {
-    path_string(path)
+    rag_rat_base::paths::path_string(path)
 }

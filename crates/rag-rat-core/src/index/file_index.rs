@@ -2,6 +2,7 @@
 //! symbol, and logical-group rows; heal a stale file in place.
 
 use rag_rat_base::hash::hex_sha256;
+use rag_rat_base::paths::path_string;
 
 use super::*;
 use crate::index::graph_index::{LogicalSymbolKey, LogicalSymbolMemberRow};
@@ -264,7 +265,7 @@ impl IndexDatabase {
         // params (`?1` kind, `?2` token) stay unchanged. Pre-A5 (no `repo_id` column) uses the
         // original SQL.
         let clone_df_bump_sql =
-            match crate::index::schema::periphery_repo_scope(conn, "clone_token_df")? {
+            match rag_rat_db::schema::periphery_repo_scope(conn, "clone_token_df")? {
                 Some(repo_id) => format!(
                     "INSERT INTO clone_token_df(repo_id, normalizer_kind, token_hash, df)
                  VALUES ('{}', ?1, ?2, 1)
@@ -344,7 +345,7 @@ impl IndexDatabase {
         let latest_dict = self.latest_chunk_text_dict()?;
         let mut compressor = latest_dict
             .as_ref()
-            .map(|(_, dict)| text_compression::ChunkCompressor::new(dict))
+            .map(|(_, dict)| rag_rat_db::text_compression::ChunkCompressor::new(dict))
             .transpose()?;
         let dict_version = latest_dict.as_ref().map(|(version, _)| *version);
         let conn = self.storage.connection();

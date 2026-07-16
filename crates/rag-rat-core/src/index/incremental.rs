@@ -1,4 +1,5 @@
 use rag_rat_base::hash::hex_sha256;
+use rag_rat_db::schema;
 
 use super::*;
 

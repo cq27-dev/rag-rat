@@ -107,8 +107,8 @@ pub(super) fn oracle_repo_scope_clause(
     conn: &Connection,
     qualifier: &str,
 ) -> anyhow::Result<String> {
-    let scope = crate::index::schema::periphery_repo_scope(conn, "oracle_runs")?;
-    Ok(crate::index::schema::periphery_repo_scope_clause(&scope, qualifier))
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "oracle_runs")?;
+    Ok(rag_rat_db::schema::periphery_repo_scope_clause(&scope, qualifier))
 }
 
 /// The active `repo_id` to STAMP on an oracle-periphery write (`oracle_runs` / `edge_oracle` /
@@ -116,7 +116,7 @@ pub(super) fn oracle_repo_scope_clause(
 /// the writers so their bound params (and the ON CONFLICT target column list) are the only things
 /// that change with scoping.
 fn oracle_repo_scope(conn: &Connection) -> anyhow::Result<Option<String>> {
-    Ok(crate::index::schema::periphery_repo_scope(conn, "oracle_runs")?)
+    Ok(rag_rat_db::schema::periphery_repo_scope(conn, "oracle_runs")?)
 }
 
 /// An edge candidate to feed the oracle join: the callee identifier byte range (the SCIP key, #67)

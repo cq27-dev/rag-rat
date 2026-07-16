@@ -263,7 +263,7 @@ fn additional_context(stdout: &str) -> Option<String> {
 /// vacuously (an empty context would otherwise look like a deduped no-op).
 #[cfg(unix)]
 fn assert_symbol_indexed(config: &rag_rat_base::config::Config, symbol: &str) {
-    use rag_rat_core::storage::IndexConnection;
+    use rag_rat_db::storage::IndexConnection;
     let conn = IndexConnection::open_read_only(&config.database).unwrap();
     let count: i64 = conn
         .connection()

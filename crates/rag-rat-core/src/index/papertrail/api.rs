@@ -1,5 +1,7 @@
+use rag_rat_db::meta::{repo_meta, set_repo_meta};
+
 use super::*;
-use crate::index::{repo_meta, schema, scoped_table_row_count, set_repo_meta};
+use crate::index::{schema, scoped_table_row_count};
 
 /// Mirror every resolved binding, unconditionally (the explicit `papertrail sync` command).
 /// Provider-client-pending and unauthenticatable bindings surface as report errors so the
@@ -766,9 +768,10 @@ pub(crate) fn mark_fallback_evidence(evidence: &mut [PapertrailEvidence]) {
 
 #[cfg(test)]
 mod capability_tests {
+    use rag_rat_db::schema;
+
     use super::super::transport::stub::{StubResponse, spawn_script_stub};
     use super::*;
-    use crate::index::schema;
 
     fn github(base_url: Option<&str>) -> ResolvedTracker {
         ResolvedTracker {
@@ -828,7 +831,7 @@ mod capability_tests {
         let ctx =
             PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         record_pause(&conn, &binding, i64::MAX).unwrap();
 
         let binding_status = status(&conn, &ctx).unwrap().bindings.remove(0);
@@ -954,7 +957,7 @@ mod capability_tests {
             ..PapertrailContext::default()
         };
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         let report = block_on(sync_mirror(&conn, Path::new("."), false, &ctx)).unwrap();
         assert_eq!(report.synced_items, 2);
         assert_eq!(report.bindings.len(), 2);
@@ -976,7 +979,7 @@ mod capability_tests {
         let ctx =
             PapertrailContext { trackers: vec![first, second], ..PapertrailContext::default() };
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         let error = block_on(sync_mirror(&conn, Path::new("."), false, &ctx)).unwrap_err();
         assert!(
@@ -1036,7 +1039,7 @@ mod capability_tests {
             ..PapertrailContext::default()
         };
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
         let report = block_on(sync_mirror(&conn, Path::new("."), false, &ctx)).unwrap();
         assert_eq!(report.bindings.len(), 0);
@@ -1060,11 +1063,12 @@ mod capability_tests {
 
 #[cfg(test)]
 mod scheduled_tests {
+    use rag_rat_db::schema;
+
     use super::super::transport::stub::{
         StubResponse, spawn_script_stub, spawn_script_stub_coordinated,
     };
     use super::*;
-    use crate::index::schema;
 
     const HOUR_MS: i64 = 3_600_000;
     const HIGH_MARK: &str = "2026-01-01T00:00:00Z";
@@ -1082,7 +1086,7 @@ mod scheduled_tests {
 
     fn open_schema() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn
     }
 

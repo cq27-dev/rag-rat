@@ -1,0 +1,23 @@
+[package]
+name = "rag-rat-db"
+version.workspace = true
+description = "Database layer for the rag-rat workspace: SQLite schema, migration ladder, repo adoption, meta accessors, and the chunk-text content store."
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rag-rat-base.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+tracing.workspace = true
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile.workspace = true

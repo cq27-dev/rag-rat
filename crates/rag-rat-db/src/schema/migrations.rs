@@ -554,7 +554,7 @@ pub(crate) fn apply_edge_callee_byte_range(conn: &Connection) -> rusqlite::Resul
     Ok(())
 }
 
-pub(crate) fn apply_oracle_tables(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_oracle_tables(conn: &Connection) -> rusqlite::Result<()> {
     // SCIP-oracle side tables (#68). Greenfield, STRICT per repo convention.
     //
     // INVARIANT (load-bearing, #248): every oracle-DERIVED persisted table here is enumerated in
@@ -656,7 +656,7 @@ pub(crate) fn apply_oracle_tables(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub(crate) fn apply_scip_moniker_anchors(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_scip_moniker_anchors(conn: &Connection) -> rusqlite::Result<()> {
     // SCIP moniker anchors (#70, phase 3). Greenfield table STRICT per repo convention.
     //
     // `logical_symbol_monikers`: the SCIP symbol string ("moniker") for a logical symbol, written
@@ -727,7 +727,7 @@ pub(crate) fn apply_scip_moniker_anchors(conn: &Connection) -> rusqlite::Result<
 /// erase a sibling checkout's contracts (the same multi-worktree isolation `edge_oracle` /
 /// `oracle_runs` already enforce). `tool_version` rides along as write provenance; the moniker's
 /// version component still distinguishes dependency versions within a checkout.
-pub(crate) fn apply_external_symbols(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_external_symbols(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS external_symbols(
@@ -777,7 +777,7 @@ pub(crate) fn ensure_edges_data_indexes(conn: &Connection) -> rusqlite::Result<(
 /// index lets the planner drive a MULTI-INDEX OR instead. Purely additive and idempotent
 /// (`CREATE INDEX IF NOT EXISTS`); a fresh DB gets it from `ensure_edges_data_indexes`, an existing
 /// DB from this forward migration.
-pub(crate) fn apply_edge_target_qname_index(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_edge_target_qname_index(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_edges_target_qname ON \
          edges_data(target_qualified_name_id);",
@@ -815,7 +815,7 @@ pub(crate) fn apply_edges_view_refresh(conn: &Connection) -> rusqlite::Result<()
 /// for ASCII, so it would match an uppercase `TEST(` that the case-sensitive `str::contains` at
 /// index time does not, diverging a forward-migrated row from a freshly-indexed one. (`instr` also
 /// needs no `%`-escaping of the `[`/`(` in the markers.)
-pub(crate) fn apply_files_has_test_code(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_files_has_test_code(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "files", "has_test_code", "INTEGER NOT NULL DEFAULT 0")?;
     // The backfill reads chunks.text. On a fresh DB the baseline omits that column (V027 retired
     // it), and there is nothing to backfill — chunks is empty and the index-time path sets
@@ -1085,7 +1085,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
 /// `edge_oracle`'s FK at `edges_data`. Idempotent: a DB already on the view shape skips the
 /// conversion entirely. The copy runs in ONE transaction (legacy table intact on a crash);
 /// `PRAGMA foreign_keys` toggles outside it (it is a no-op inside one).
-pub(crate) fn apply_edge_string_interning(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_edge_string_interning(conn: &Connection) -> rusqlite::Result<()> {
     let legacy = conn
         .query_row("SELECT type FROM sqlite_master WHERE name = 'edges'", [], |row| {
             row.get::<_, String>(0)
@@ -1490,7 +1490,7 @@ pub(crate) fn record_migration_provenance(conn: &Connection) -> rusqlite::Result
          CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![
             MIGRATION_PROVENANCE_KEYS[0],
-            crate::binary_version(),
+            rag_rat_base::version::binary_version(),
             MIGRATION_PROVENANCE_KEYS[1],
             exe,
             MIGRATION_PROVENANCE_KEYS[2],
@@ -1522,7 +1522,7 @@ pub(crate) fn migration_provenance_note(conn: &Connection) -> String {
     }
 }
 
-pub(crate) fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+pub fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
     let exists = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual table') AND name = ?1",
@@ -1534,7 +1534,7 @@ pub(crate) fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<boo
     Ok(exists)
 }
 
-pub(crate) fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
@@ -1558,11 +1558,7 @@ pub(crate) fn add_column_if_missing(
     conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))
 }
 
-pub(crate) fn column_exists(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-) -> rusqlite::Result<bool> {
+pub fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
     for row in rows {
@@ -1582,7 +1578,7 @@ pub(crate) fn apply_drop_chunks_text(conn: &Connection) -> rusqlite::Result<()> 
     if !column_exists(conn, "chunks", "text")? {
         return Ok(());
     }
-    crate::index::chunk_text_store::build_store(conn, "(SELECT id AS chunk_id, text FROM chunks)")
+    crate::chunk_text_store::build_store(conn, "(SELECT id AS chunk_id, text FROM chunks)")
         .map_err(|err| {
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
@@ -1663,7 +1659,7 @@ pub(crate) const CLONE_FINGERPRINT_DDL: &str = "
 /// backfill here. An existing index migrated forward therefore has EMPTY clone tables until a
 /// `rag-rat index --full`. Backfilling at migration time is intentionally NOT done: it would
 /// require parsing the entire repo inside a migration.
-pub(crate) fn apply_clone_fingerprint_tables(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_clone_fingerprint_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CLONE_FINGERPRINT_DDL)?;
     Ok(())
 }
@@ -1740,7 +1736,7 @@ pub(crate) const CLONE_GRAPH_DDL: &str = "
 ";
 
 /// V034: create the precomputed clone-graph tables (see [`CLONE_GRAPH_DDL`]).
-pub(crate) fn apply_clone_graph_tables(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_clone_graph_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CLONE_GRAPH_DDL)?;
     Ok(())
 }
@@ -1823,7 +1819,7 @@ pub(crate) fn apply_clone_subblock_postings_tables(conn: &Connection) -> rusqlit
 /// A fresh DB (empty `repos`), a forward-migrated V037 index (empty `repos`), and a re-apply of an
 /// adopted DB (a real row present) all converge correctly: the first two seed the placeholder, the
 /// last leaves the real row untouched.
-pub(crate) fn apply_repos_registry(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_repos_registry(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(REPOS_REGISTRY_DDL)
 }
 
@@ -1907,7 +1903,7 @@ const V039_RECONCILE_META_KEYS: &[&str] =
 /// legacy DB converges on the identical shape. Copy-before-delete on each table means even a torn
 /// run (crash between the copy and the delete) re-converges: the re-run's copy is ignored and the
 /// delete finishes, and readers already read `repo_meta` (the authoritative side).
-pub(crate) fn apply_move_per_repo_meta(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_move_per_repo_meta(conn: &Connection) -> rusqlite::Result<()> {
     relocate_meta_keys(conn, "index_meta", V039_INDEX_META_KEYS)?;
     relocate_meta_keys(conn, "reconcile_meta", V039_RECONCILE_META_KEYS)?;
     Ok(())
@@ -2095,7 +2091,10 @@ fn move_repo_meta_keys_to_global(conn: &Connection, keys: &[&str]) -> rusqlite::
 /// #51 GUARD: `commit_fts` is external-content over `git_commits`; after the git_commits rebuild its
 /// stored rowids are stale, so it is resynced with the desync-safe `'rebuild'` command, NEVER a
 /// `DELETE FROM commit_fts` (which corrupts a desynced external-content index).
-pub(crate) fn apply_repo_id_core_scoping(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_repo_id_core_scoping(
+    conn: &Connection,
+    hooks: &crate::hooks::MigrationHooks,
+) -> rusqlite::Result<()> {
     // Reclassify the global-infrastructure keys V039 over-relocated to `repo_meta` back to the
     // GLOBAL `index_meta`. Runs BEFORE the `files.repo_id` short-circuit so it also corrects a DB a
     // PRIOR commit of THIS (unreleased) branch already migrated to V040 with those keys in
@@ -2135,7 +2134,7 @@ pub(crate) fn apply_repo_id_core_scoping(conn: &Connection) -> rusqlite::Result<
         // parent-id remap needs. On a not-yet-adopted DB the rows carry the placeholder
         // here; `register_repo` runs the same realign again after adopting the real id
         // (idempotent — already-aligned rows are skipped).
-        crate::index::graph_index::realign_logical_symbol_ids(conn)?;
+        (hooks.realign_logical_symbol_ids)(conn)?;
         // Reunite the two active-model provenance stragglers with their family in `repo_meta`
         // (relocated under the sole repo via `relocate_meta_keys`' own `sole_repo_id` resolution;
         // `register_repo` keeps them there). Runs inside the txn so it is atomic with the rebuilds.
@@ -2252,7 +2251,7 @@ fn rebuild_files_table_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
 /// which is exactly the live generation a fresh index carries (`repo_meta[live_files_generation]`
 /// absent ⇒ 0). So existing rows stay visible under the live-generation scope view with no per-repo
 /// resolution, on an adopted or an un-adopted DB alike.
-pub(crate) fn apply_files_generation(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_files_generation(conn: &Connection) -> rusqlite::Result<()> {
     // All-or-nothing sentinel: the rebuild commits atomically, so `files.generation` present means
     // the whole migration already ran. Short-circuit before taking the write lock.
     if column_exists(conn, "files", "generation")? {
@@ -2468,7 +2467,7 @@ const V041_GITHUB_SCOPED_TABLES: &[&str] = &[
 /// fresh-from-target DB or a `create_or_migrate` / `rebuild` re-apply short-circuits before
 /// touching anything (and never resolves `sole_repo_id`, keeping the ladder replay-safe on a
 /// consolidated DB).
-pub(crate) fn apply_github_repo_id_scoping(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_github_repo_id_scoping(conn: &Connection) -> rusqlite::Result<()> {
     // Post-V060 the legacy github_* tables no longer exist AT ALL: the baseline creates the
     // provider-neutral papertrail_* tables instead, so on a fresh DB (or any DB the V060
     // normalization already converged) there is nothing for this migration to scope — the ladder
@@ -2832,7 +2831,7 @@ const GITHUB_COMMENTS_REPO_UNIQUE_INDEX: &str = "idx_github_comments_repo_unique
 /// repo's sync inserts its own row. The `github_fts` mirror is re-derived INSIDE the migration
 /// ([`rebuild_github_fts_from_widened_bases`]) so the duplicated rows are scoped-searchable
 /// immediately, not only after the next sync.
-pub(crate) fn apply_github_child_key_widening(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_github_child_key_widening(conn: &Connection) -> rusqlite::Result<()> {
     // Post-V060 / fresh-DB no-op, exactly like V041/V044: the legacy child caches don't exist.
     if !sqlite_object_exists(conn, "table", "github_comments")? {
         return Ok(());
@@ -2895,7 +2894,7 @@ const MEMORY_REALITY_TABLE: &str = "memory_reality";
 /// `rebuild` / `index --full` re-apply short-circuits before taking the write lock. The leading
 /// `DROP TABLE IF EXISTS` re-converges after a hard-kill that bypassed a clean rollback (the tables
 /// hold only regenerable data, so a drop-and-recreate is always safe here).
-pub(crate) fn apply_memory_verification_tables(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_memory_verification_tables(conn: &Connection) -> rusqlite::Result<()> {
     // All-or-nothing sentinel (see the doc comment): both CREATEs commit atomically, so
     // `memory_reality` present means the whole migration already ran. Probes `sqlite_master`
     // directly (a `rusqlite::Result`, like V044's `sqlite_object_exists`) so the ladder's
@@ -2963,7 +2962,7 @@ pub(crate) fn apply_memory_verification_tables(conn: &Connection) -> rusqlite::R
 /// stamps the queues already consult (`content_hash`, optional `checked_inputs_hash`,
 /// `prompt_version`, `model_id`). A current row whose persisted enum reason is deterministic
 /// suppresses another model call; content/evidence/prompt/model churn invalidates it.
-pub(crate) fn apply_memory_model_failures_table(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_memory_model_failures_table(conn: &Connection) -> rusqlite::Result<()> {
     if column_exists(conn, "memory_model_failures", "reason")? {
         return Ok(());
     }
@@ -3246,7 +3245,10 @@ pub(crate) fn create_papertrail_tables(conn: &Connection) -> rusqlite::Result<()
 ///     populated; the three github_* columns are then dropped. The `github` binding kind ceases to
 ///     exist.
 ///  4. The `github_last_sync_ms` repo_meta key renames to `papertrail_last_sync_ms`.
-pub(crate) fn apply_papertrail_provider_neutral_schema(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_papertrail_provider_neutral_schema(
+    conn: &Connection,
+    hooks: &crate::hooks::MigrationHooks,
+) -> rusqlite::Result<()> {
     // Fast path: nothing legacy left anywhere — the common post-V060 replay
     // (`create_or_migrate` / `rebuild` / `index --full`) short-circuits before the write lock.
     if sqlite_object_exists(conn, "table", "papertrail_items")?
@@ -3262,7 +3264,7 @@ pub(crate) fn apply_papertrail_provider_neutral_schema(conn: &Connection) -> rus
             backfill_papertrail_from_github_tables(conn)?;
             // Re-derive the mirror from the freshly-backfilled base tables so the migrated cache
             // is scoped-searchable immediately (no sync required) — the V045 posture.
-            crate::index::papertrail::rebuild_fts(conn)?;
+            (hooks.rebuild_papertrail_fts)(conn)?;
             conn.execute_batch(
                 "
                 DROP TABLE IF EXISTS github_refs;
@@ -3325,7 +3327,7 @@ pub(crate) fn apply_papertrail_comment_cursor(conn: &Connection) -> rusqlite::Re
 /// pause. The processed-key sets are bounded by one provider page; `full_rewalk_seen` lives on the
 /// item row so a full walk can mark/sweep across arbitrarily many invocations without a giant
 /// in-memory set.
-pub(crate) fn apply_papertrail_mirror_resume_state(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_papertrail_mirror_resume_state(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "papertrail_sync_cursor", "comment_scan_since", "TEXT")?;
     add_column_if_missing(conn, "papertrail_sync_cursor", "comment_stream_cursors", "TEXT")?;
     add_column_if_missing(conn, "papertrail_sync_cursor", "item_delta_page_token", "TEXT")?;
@@ -3364,7 +3366,7 @@ pub(crate) fn apply_papertrail_mirror_resume_state(conn: &Connection) -> rusqlit
 
 /// V067 (#592): scheduling and failures are binding-local. Error classes are stable machine
 /// values; detail is sanitized and bounded by the recording API rather than used for policy.
-pub(crate) fn apply_papertrail_binding_health(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_papertrail_binding_health(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "papertrail_sync_cursor", "last_attempt_ms", "INTEGER")?;
     add_column_if_missing(conn, "papertrail_sync_cursor", "last_successful_probe_ms", "INTEGER")?;
     add_column_if_missing(conn, "papertrail_sync_cursor", "last_successful_mirror_ms", "INTEGER")?;
@@ -3749,7 +3751,10 @@ const A5_ADDITIVE_SCOPED_TABLES: &[&str] = &[
 /// re-run once this is registered) short-circuits before taking the write lock. Each rebuild starts
 /// `DROP TABLE IF EXISTS <scratch>_new` so a prior pass killed mid-rebuild (bypassing a clean
 /// rollback) re-converges from a clean slate rather than failing on `CREATE`.
-pub(crate) fn apply_repo_id_periphery_scoping(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_repo_id_periphery_scoping(
+    conn: &Connection,
+    hooks: &crate::hooks::MigrationHooks,
+) -> rusqlite::Result<()> {
     // All-or-nothing sentinel (see the doc comment): everything below commits atomically, so
     // `repo_memories.repo_id` present means the whole migration already ran.
     if column_exists(conn, "repo_memories", "repo_id")? {
@@ -3786,7 +3791,7 @@ pub(crate) fn apply_repo_id_periphery_scoping(conn: &Connection) -> rusqlite::Re
         // `superseded_by` (the only persisted reference to a finding id, in-table) is remapped by
         // the helper. Replay-safe: the sentinel short-circuits a re-apply, and the re-derivation
         // is idempotent anyway.
-        crate::dream::rederive_finding_ids(conn)?;
+        (hooks.rederive_dream_finding_ids)(conn)?;
         Ok(())
     })();
     if result.is_err() {
@@ -4048,7 +4053,7 @@ fn rebuild_dream_findings_with_repo_id(conn: &Connection) -> rusqlite::Result<()
 /// `repo_id` come from each memory's freshly-added column and needs no FTS `RENAME` (which has
 /// historically been fragile on shadow tables); the DROP + CREATE keeps the canonical table name.
 /// `memory_search` then filters `repo_id` after the MATCH.
-pub(crate) fn rebuild_repo_memory_fts_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+pub fn rebuild_repo_memory_fts_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         DROP TABLE IF EXISTS repo_memory_fts;
@@ -4149,7 +4154,7 @@ pub(crate) fn apply_repo_node_edges(conn: &Connection) -> rusqlite::Result<()> {
 /// the epoch at its own build). Gated on the delta column being freshly ADDED, so only the first
 /// run (a genuinely pre-freeze index) invalidates — a re-apply on an already-frozen index must
 /// not throw away a valid graph.
-pub(crate) fn apply_clone_delta_maintenance(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_clone_delta_maintenance(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_clone_subblock_postings_path
              ON clone_subblock_postings(build_generation, path);",
@@ -4187,7 +4192,7 @@ pub(crate) fn apply_clone_delta_maintenance(conn: &Connection) -> rusqlite::Resu
 /// post-V051 (moving) df rows into an already-pinned epoch. Known degenerate edge: a generation
 /// built while its repo's df table was empty backfills nothing; the runtime treats a missing
 /// epoch like `postings_written = 0` (one self-healing rebuild).
-pub(crate) fn apply_clone_df_epoch(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_clone_df_epoch(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS clone_df_epoch(
              build_generation INTEGER NOT NULL REFERENCES clone_graph_generations(generation)
@@ -4243,7 +4248,7 @@ pub(crate) fn apply_clone_df_epoch(conn: &Connection) -> rusqlite::Result<()> {
 ///
 /// Idempotent (`CREATE TABLE IF NOT EXISTS`), self-transaction-free, replay-write-free (#498); the
 /// tables are fresh with no backfill.
-pub(crate) fn apply_oplog_storage(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_oplog_storage(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS oplog_entries(
              entry_hash         BLOB PRIMARY KEY,
@@ -4290,7 +4295,7 @@ pub(crate) fn apply_oplog_storage(conn: &Connection) -> rusqlite::Result<()> {
 /// data-preserving recipe instead. `oplog_meta` is left untouched (its projector-version stamp is
 /// not stream-scoped). Idempotent (a replay rebuilds the same empty tables); the self-wrapped
 /// IMMEDIATE transaction makes an interrupted rebuild reconverge on the next run.
-pub(crate) fn apply_oplog_stream_scoping(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_oplog_stream_scoping(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "BEGIN IMMEDIATE;
 
@@ -4352,7 +4357,7 @@ pub(crate) fn apply_oplog_stream_scoping(conn: &Connection) -> rusqlite::Result<
 /// Purely ADDITIVE (`CREATE TABLE IF NOT EXISTS` — a brand-new table, nothing to drop or backfill),
 /// unlike the V053 rebuild. Idempotent; the self-wrapped IMMEDIATE transaction reconverges an
 /// interrupted create on the next run.
-pub(crate) fn apply_oplog_device_identity(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_oplog_device_identity(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "BEGIN IMMEDIATE;
 
@@ -4377,7 +4382,7 @@ pub(crate) fn apply_oplog_device_identity(conn: &Connection) -> rusqlite::Result
 /// mint-if-absent race), so a concurrent open cannot split into two encryption identities.
 /// Idempotent via `add_column_if_missing`; on a fresh DB this runs right after V054 creates the
 /// table, so both columns are present before the first `local_device` call.
-pub(crate) fn apply_oplog_device_x25519(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_oplog_device_x25519(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "oplog_device_identity", "x25519_secret", "BLOB")?;
     add_column_if_missing(conn, "oplog_device_identity", "x25519_public", "BLOB")?;
     Ok(())
@@ -4393,7 +4398,7 @@ pub(crate) fn apply_oplog_device_x25519(conn: &Connection) -> rusqlite::Result<(
 /// (`sha256(pk) == fingerprint` not found among genesis + stored candidates), retried when a later
 /// DeviceAdd/AccountGenesis for the claimed account arrives (Codex-8). Idempotent — every statement
 /// is `CREATE ... IF NOT EXISTS`, so a torn replay reconverges without a wrapping txn.
-pub(crate) fn apply_account_candidate_dag(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_account_candidate_dag(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS account_entries(
              entry_hash         BLOB    PRIMARY KEY,
@@ -4444,7 +4449,7 @@ pub(crate) fn apply_account_candidate_dag(conn: &Connection) -> rusqlite::Result
 /// i64 and would reject or truncate valid `u64` sequence/authentication counters. Lexicographic
 /// ordering of equal-width big-endian blobs is the unsigned numeric ordering required by dense
 /// chain queries.
-pub(crate) fn apply_content_candidate_dag(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_content_candidate_dag(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS content_entries(
              entry_hash          BLOB    PRIMARY KEY CHECK(length(entry_hash) = 32),
@@ -4505,7 +4510,7 @@ pub(crate) fn apply_content_candidate_dag(conn: &Connection) -> rusqlite::Result
 /// atomically with the other by the minting transaction). Store-global like
 /// `oplog_device_identity`, not repo-scoped. Purely additive; `CREATE ... IF NOT EXISTS`, so a torn
 /// replay reconverges without a wrapping transaction.
-pub(crate) fn apply_oplog_local_account(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_oplog_local_account(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS oplog_local_account(
              id                 INTEGER PRIMARY KEY CHECK (id = 0),
@@ -4528,7 +4533,7 @@ pub(crate) fn apply_oplog_local_account(conn: &Connection) -> rusqlite::Result<(
 /// only when acceptance changes (the content refold), never by the `/1` sweep. Purely additive;
 /// `CREATE ... IF NOT EXISTS`, so a torn replay reconverges without a wrapping transaction; nothing
 /// pre-existing to backfill.
-pub(crate) fn apply_content_projected_tables(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_content_projected_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS content_projected_nodes(
              stream_id    BLOB NOT NULL,
@@ -4558,7 +4563,7 @@ pub(crate) fn apply_content_projected_tables(conn: &Connection) -> rusqlite::Res
 /// acceptance verdict — every successful refold (ingest-settle or account fold) deletes its row.
 /// Purely additive; `CREATE ... IF NOT EXISTS`, so a torn replay reconverges without a wrapping
 /// transaction; nothing pre-existing to backfill.
-pub(crate) fn apply_content_streams_pending_refold(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_content_streams_pending_refold(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS content_streams_pending_refold(
              stream_id BLOB PRIMARY KEY CHECK (length(stream_id) = 32)
@@ -4573,7 +4578,7 @@ pub(crate) fn apply_content_streams_pending_refold(conn: &Connection) -> rusqlit
 /// only a synchronization assertion: ahead parks for refetch, while behind is informational and
 /// never selects historical authority. Exact citations and device cuts make authorization keyed
 /// lookups instead of adversary-amplified replay of up to 4096 candidates.
-pub(crate) fn apply_account_authority_projection(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_account_authority_projection(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS account_auth_state(
              account_id        BLOB PRIMARY KEY,
@@ -4647,7 +4652,7 @@ pub(crate) fn apply_account_authority_projection(conn: &Connection) -> rusqlite:
 /// V065: retain the exact chain boundaries of closed roster and owner citations. The V064 rows
 /// remain historical facts; these columns make their valid prefix explicit instead of forcing a
 /// caller to choose between accepting a revoked citation and rejecting valid late delivery.
-pub(crate) fn apply_account_authority_boundaries(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_account_authority_boundaries(conn: &Connection) -> rusqlite::Result<()> {
     for (table, prefix) in [
         ("account_roster_history", "control"),
         ("account_roster_history", "secrets"),
@@ -4713,7 +4718,7 @@ pub(crate) fn apply_binding_downgrade_marker(conn: &Connection) -> rusqlite::Res
 ///
 /// Additive + idempotent (`CREATE ... IF NOT EXISTS`); a fresh DB creates it empty and the first
 /// git-inclusive `impact_surface` read fills it.
-pub(crate) fn apply_git_change_couplings(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_git_change_couplings(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS git_change_couplings(
@@ -4902,7 +4907,7 @@ pub(crate) fn apply_token_bag_blob(conn: &Connection) -> rusqlite::Result<()> {
 /// `repo_memories.id` for memory-scoped kinds, a symbol/path ref for `coverage_gap`) so it carries
 /// NO FK. `status` drives the lifecycle; `base_rank` + the `first_seen_at_ms` clock drive age
 /// decay. Additive + idempotent.
-pub(crate) fn apply_dream_findings(conn: &Connection) -> rusqlite::Result<()> {
+pub fn apply_dream_findings(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS dream_findings(

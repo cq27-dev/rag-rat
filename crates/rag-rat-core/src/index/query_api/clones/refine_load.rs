@@ -117,8 +117,8 @@ pub(crate) fn oracle_callee_coverage_exists(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<bool> {
-    let repo_clause = crate::index::schema::periphery_repo_scope_clause(
-        &crate::index::schema::periphery_repo_scope(conn, "edge_oracle")?,
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(
+        &rag_rat_db::schema::periphery_repo_scope(conn, "edge_oracle")?,
         "edge_oracle",
     );
     for chunk in member_ids.chunks(HYDRATION_CHUNK) {

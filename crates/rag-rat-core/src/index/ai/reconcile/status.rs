@@ -232,9 +232,8 @@ pub(crate) fn last_reconcile_status(
     // Scoped to the active repo (V042): `reconcile_attempts` is a global append-only log, so the
     // "latest attempt" pick must filter `repo_id` — else a sibling repo's newer attempt on a
     // consolidated DB would be reported as this repo's status. `{repo_clause}` empty pre-A5.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "reconcile_attempts")?;
-    let repo_clause =
-        crate::index::schema::periphery_repo_scope_clause(&scope, "reconcile_attempts");
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "reconcile_attempts")?;
+    let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "reconcile_attempts");
     conn.query_row(
         &format!(
             "

@@ -457,7 +457,7 @@ mod dispatch_tests {
     /// `active_embedder` resolves the active spec exactly as in production.
     fn conn_with_active_model(model_id: &str) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&conn).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         crate::index::ai::ensure_model_manifest(&conn).unwrap();
         let spec = spec(model_id).unwrap();
         conn.execute(

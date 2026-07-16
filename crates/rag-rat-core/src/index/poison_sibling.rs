@@ -1256,7 +1256,7 @@ mod tests {
             "the sibling is registered as a real repo on a git fixture"
         );
         assert!(
-            crate::index::schema::multiple_real_repos(conn).unwrap(),
+            rag_rat_db::schema::multiple_real_repos(conn).unwrap(),
             "the fixture + the sibling make the DB genuinely multi-repo",
         );
         // The sibling's registry rows are counted by the intact check (the registry tripwires are

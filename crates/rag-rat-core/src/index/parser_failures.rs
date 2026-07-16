@@ -1,5 +1,7 @@
 //! Parser-failure bookkeeping: record a failed parse and report failure counts/paths.
 
+use rag_rat_base::paths::path_string;
+
 use super::*;
 
 #[derive(Debug, Serialize)]

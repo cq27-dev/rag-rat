@@ -19,7 +19,7 @@ fn repo() -> String {
 
 fn fresh_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    crate::index::schema::apply(&conn).unwrap();
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn
 }
 
@@ -560,11 +560,11 @@ fn set_history_cursors(
     complete: bool,
 ) {
     let bit = |b: bool| if b { "1" } else { "0" };
-    crate::index::set_repo_meta(conn, repo_id, "git_history_indexed_head", head).unwrap();
-    crate::index::set_repo_meta(conn, repo_id, "git_history_indexed_root", root).unwrap();
-    crate::index::set_repo_meta(conn, repo_id, "git_history_indexed_shallow", bit(shallow))
+    rag_rat_db::meta::set_repo_meta(conn, repo_id, "git_history_indexed_head", head).unwrap();
+    rag_rat_db::meta::set_repo_meta(conn, repo_id, "git_history_indexed_root", root).unwrap();
+    rag_rat_db::meta::set_repo_meta(conn, repo_id, "git_history_indexed_shallow", bit(shallow))
         .unwrap();
-    crate::index::set_repo_meta(conn, repo_id, "git_history_indexed_complete", bit(complete))
+    rag_rat_db::meta::set_repo_meta(conn, repo_id, "git_history_indexed_complete", bit(complete))
         .unwrap();
 }
 
@@ -608,7 +608,7 @@ fn stamp_gates_recompute_on_head_and_params() {
     assert_eq!(coupling_computed_at(&conn, &repo), 300, "head move forces recompute");
 
     // Params version drift (simulated by rewriting the stored stamp) → recompute.
-    crate::index::set_repo_meta(&conn, &repo, "git_coupling_stamp", "bogus").unwrap();
+    rag_rat_db::meta::set_repo_meta(&conn, &repo, "git_coupling_stamp", "bogus").unwrap();
     ensure_coupling_fresh(&conn, 400).unwrap();
     assert_eq!(coupling_computed_at(&conn, &repo), 400, "a params mismatch forces recompute");
 }
@@ -652,7 +652,7 @@ fn files_generation_change_does_not_invalidate_stamp() {
     assert_eq!(coupling_computed_at(&conn, &repo), 100, "first read recomputes");
 
     // Bump the live files generation — the stored table doesn't depend on it, so NO recompute.
-    crate::index::set_repo_meta(&conn, &repo, "live_files_generation", "1").unwrap();
+    rag_rat_db::meta::set_repo_meta(&conn, &repo, "live_files_generation", "1").unwrap();
     ensure_coupling_fresh(&conn, 200).unwrap();
     assert_eq!(
         coupling_computed_at(&conn, &repo),
@@ -707,7 +707,7 @@ fn impact_report_surfaces_and_gates_coupling_section() {
     // Synthetic history on the indexed DB: store.rs + helper.rs co-change twice; two filler commits
     // (non-indexed paths) raise N = 4 so (store,helper)'s lift = 2.0 clears the floor.
     let conn = db.storage.connection();
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
     add_commit(conn, &repo_id, "c1", 10, &["src/store.rs", "src/helper.rs"]);
     add_commit(conn, &repo_id, "c2", 20, &["src/store.rs", "src/helper.rs"]);
     add_commit(conn, &repo_id, "c3", 30, &["ext_a.rs", "ext_b.rs"]);
@@ -777,7 +777,7 @@ fn dirty_co_changed_file_counts_toward_stale_files() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let conn = db.storage.connection();
-    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
     add_commit(conn, &repo_id, "c1", 10, &["src/store.rs", "src/helper.rs"]);
     add_commit(conn, &repo_id, "c2", 20, &["src/store.rs", "src/helper.rs"]);
     add_commit(conn, &repo_id, "c3", 30, &["ext_a.rs", "ext_b.rs"]);

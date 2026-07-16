@@ -159,7 +159,7 @@ pub(crate) fn papertrail_ref_synced(
     conn: &Connection,
     reference: &PapertrailRef,
 ) -> anyhow::Result<bool> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let cached = conn.query_row(
         "
         SELECT EXISTS(
@@ -184,7 +184,7 @@ pub(crate) fn discover_commit_refs(
     // `git_commits` is direct-scoped (V040), so discovery only mines the ACTIVE repo's commit
     // messages for issue refs — a consolidated DB must not attribute a sibling repo's `#N` refs to
     // this repo.
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt =
         conn.prepare("SELECT hash, subject, body FROM git_commits WHERE repo_id = ?1")?;
     let rows = stmt.query_map([&repo_id], |row| {

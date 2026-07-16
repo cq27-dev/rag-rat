@@ -263,10 +263,11 @@ pub fn scoped_weighted_fan_in(
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_db::schema;
     use rusqlite::params;
 
     use super::*;
-    use crate::index::{install_scope_view, schema};
+    use crate::index::install_scope_view;
 
     /// #142 review: the wire label for the oracle tier must match `as_str()` and the documented
     /// contract (`"compiler"`), not the variant name `"Compiler"` — MCP/CLI consumers key off the
@@ -294,7 +295,7 @@ mod tests {
     /// worktree), ready for fan-in queries against the `files` view.
     fn scoped_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn
     }
 

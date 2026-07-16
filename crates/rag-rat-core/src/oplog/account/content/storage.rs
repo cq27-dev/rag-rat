@@ -1406,18 +1406,19 @@ fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_db::schema;
+
     use super::super::super::envelope::{AccountEntryHeader, sign_account_entry};
     use super::super::super::id::account_id_from_genesis_payload;
     use super::super::ContentEntryHeader;
     use super::*;
-    use crate::index::schema;
     use crate::oplog::account::ops::entry_type;
     use crate::oplog::device::{DeviceSecret, DeviceX25519Secret};
     use crate::oplog::stream::StreamId;
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn
     }
 

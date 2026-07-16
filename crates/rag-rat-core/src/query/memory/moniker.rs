@@ -48,9 +48,9 @@ pub(crate) fn moniker_for_logical_symbol(
 ) -> anyhow::Result<Option<MonikerRow>> {
     // Per-repo (A5): `logical_symbol_id` is content-derived and collides across repos, so scope to
     // the active repo. `{repo_clause}` empty pre-A5.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "logical_symbol_monikers")?;
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "logical_symbol_monikers")?;
     let repo_clause =
-        crate::index::schema::periphery_repo_scope_clause(&scope, "logical_symbol_monikers");
+        rag_rat_db::schema::periphery_repo_scope_clause(&scope, "logical_symbol_monikers");
     conn.query_row(
         &format!(
             "
@@ -76,9 +76,9 @@ pub(crate) fn moniker_for_logical_symbol_tool(
     logical_symbol_id: i64,
     tool: &str,
 ) -> anyhow::Result<Option<MonikerRow>> {
-    let scope = crate::index::schema::periphery_repo_scope(conn, "logical_symbol_monikers")?;
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "logical_symbol_monikers")?;
     let repo_clause =
-        crate::index::schema::periphery_repo_scope_clause(&scope, "logical_symbol_monikers");
+        rag_rat_db::schema::periphery_repo_scope_clause(&scope, "logical_symbol_monikers");
     conn.query_row(
         &format!(
             "
@@ -129,11 +129,10 @@ pub(crate) fn resolve_moniker(
     // `repo_id` into its content hash. The `tool_has_rows` probe (the Gone-vs-NoData
     // discriminator) is scoped identically so a sibling's rows can't make this repo's tool look
     // populated. `{repo_clause}` empty pre-A5.
-    let scope = crate::index::schema::periphery_repo_scope(conn, "logical_symbol_monikers")?;
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "logical_symbol_monikers")?;
     let moniker_clause =
-        crate::index::schema::periphery_repo_scope_clause(&scope, "logical_symbol_monikers");
-    let symbol_clause =
-        crate::index::schema::periphery_repo_scope_clause(&scope, "logical_symbols");
+        rag_rat_db::schema::periphery_repo_scope_clause(&scope, "logical_symbol_monikers");
+    let symbol_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "logical_symbols");
     let mut stmt = conn.prepare(&format!(
         "
         SELECT logical_symbol_monikers.logical_symbol_id, logical_symbol_monikers.tool_version,

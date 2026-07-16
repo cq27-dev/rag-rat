@@ -1649,8 +1649,9 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use rag_rat_db::schema;
+
     use super::*;
-    use crate::index::schema;
     use crate::oplog::account::envelope::sign_account_entry;
     use crate::oplog::account::ops::{ContentCut, DeviceCut, DeviceRole, GrantRole};
     use crate::oplog::device::{DeviceSecret, DeviceX25519Secret};
@@ -1660,7 +1661,7 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn
     }
 
@@ -2077,7 +2078,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grant-snapshot.db");
         let setup = Connection::open(&path).unwrap();
-        schema::apply(&setup).unwrap();
+        schema::apply(&setup, &crate::index::migration_hooks()).unwrap();
         setup.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
 
         let founder = Dev::new(1);
@@ -2234,7 +2235,7 @@ mod tests {
         )
         .unwrap();
 
-        schema::migrate_forward(&conn).unwrap();
+        schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
         assert_eq!(
             stream_owner_effective(&conn, account_id, stream_id).unwrap(),
             fold::AuthorityQuery::Effective(own_hash),
@@ -2273,7 +2274,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(schema::migrate_forward(&conn).is_err());
+        assert!(schema::migrate_forward(&conn, &crate::index::migration_hooks()).is_err());
         let table_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -2828,7 +2829,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account-cap.db");
         let setup = Connection::open(&path).unwrap();
-        schema::apply(&setup).unwrap();
+        schema::apply(&setup, &crate::index::migration_hooks()).unwrap();
         let tx = Transaction::new_unchecked(&setup, TransactionBehavior::Immediate).unwrap();
         seed_global_candidate_rows(&tx, CANDIDATES_GLOBAL_MAX - 1, 0);
         tx.commit().unwrap();
@@ -2875,7 +2876,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("known-key.db");
         let setup = Connection::open(&path).unwrap();
-        schema::apply(&setup).unwrap();
+        schema::apply(&setup, &crate::index::migration_hooks()).unwrap();
         let founder = Dev::new(1);
         let (_account_id, mut forged, _) = genesis(&founder);
         account_ingest(&setup, &forged, NOW).unwrap();
@@ -3259,7 +3260,7 @@ mod tests {
             [add_owner.as_slice()],
         )
         .unwrap();
-        schema::migrate_forward(&conn).unwrap();
+        schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
         assert!(matches!(
             owner_control_authority(&conn, account_id, add_owner, owner.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::OwnerChainAuthority {
