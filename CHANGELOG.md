@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.18.0...rag-rat-core-v0.19.0) - 2026-07-16
+
+### Added
+
+- *(index)* scoped reconcile over an explicit path set (index --paths) ([#687](https://github.com/cq27-dev/rag-rat/pull/687))
+- *(oplog)* content-key crypto primitives — content keys, key_id, X25519 sealed-box wrap (C4.1) ([#709](https://github.com/cq27-dev/rag-rat/pull/709))
+- *(evals)* regenerate memory-compaction verify-packs corpus + add a committed generator ([#695](https://github.com/cq27-dev/rag-rat/pull/695)) ([#700](https://github.com/cq27-dev/rag-rat/pull/700))
+- *(oplog)* defer the /3 content-ingest refold + exclude local authoring from the remote budget ([#699](https://github.com/cq27-dev/rag-rat/pull/699))
+- *(memory)* author the live memory path onto owner-bound /2//3 streams ([#681](https://github.com/cq27-dev/rag-rat/pull/681))
+- *(watch)* surface silently-dropped filesystem watches in index_status ([#670](https://github.com/cq27-dev/rag-rat/pull/670))
+- *(account)* add the in-tx owner-stream ownership ensure seam ([#677](https://github.com/cq27-dev/rag-rat/pull/677))
+- *(account)* add the /3 local-content authoring seam + accepted→memory projection ([#668](https://github.com/cq27-dev/rag-rat/pull/668))
+- *(papertrail)* native GitLab provider — namespaced ids, parallel list legs, events comment lane ([#654](https://github.com/cq27-dev/rag-rat/pull/654))
+- *(account)* mint the store's local account (C3.4a bootstrap) ([#666](https://github.com/cq27-dev/rag-rat/pull/666))
+- *(account)* wire the /3 acceptance refold into ingest and the account fold ([#653](https://github.com/cq27-dev/rag-rat/pull/653))
+- *(swift)* add the SwiftPM corpus, and fix the calls it exposed ([#650](https://github.com/cq27-dev/rag-rat/pull/650))
+- *(papertrail)* automatic sync orchestration — watcher deadline, hook trigger, coalesced single-flight ([#646](https://github.com/cq27-dev/rag-rat/pull/646))
+
+### Fixed
+
+- Android/Termux support — flock via libc, static libc++ in the prebuilt ([#710](https://github.com/cq27-dev/rag-rat/pull/710))
+- *(dream)* cut divergence false positives — memory-id cross-refs, verbatim, documented removals ([#686](https://github.com/cq27-dev/rag-rat/pull/686))
+- *(fts)* detect FTS5 shadow corruption at the query layer and self-heal from durable sources ([#675](https://github.com/cq27-dev/rag-rat/pull/675))
+- *(account)* guard the ancestry contiguity check against a u64::MAX seq ([#657](https://github.com/cq27-dev/rag-rat/pull/657))
+- *(swift)* recover force-unwrapped receiver method calls ([#656](https://github.com/cq27-dev/rag-rat/pull/656))
+
+### Other
+
+- *(memory)* pin the read path unchanged under /3 + mark the foreign read projection phase-D ([#693](https://github.com/cq27-dev/rag-rat/pull/693))
+- *(graph)* index-seed the remaining edges-view readers — grep_augment + impact_surface ([#692](https://github.com/cq27-dev/rag-rat/pull/692)) ([#694](https://github.com/cq27-dev/rag-rat/pull/694))
+- *(graph)* seed find_callers/trace_callees on indexed edge id columns ([#682](https://github.com/cq27-dev/rag-rat/pull/682)) ([#684](https://github.com/cq27-dev/rag-rat/pull/684))
+- neutral wording for the sync feature in repo_identity docs ([#674](https://github.com/cq27-dev/rag-rat/pull/674))
+- split config.md into per-topic pages under docs/config/ ([#669](https://github.com/cq27-dev/rag-rat/pull/669))
+
 ## [0.18.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.17.0...rag-rat-core-v0.18.0) - 2026-07-14
 
 ### Added
