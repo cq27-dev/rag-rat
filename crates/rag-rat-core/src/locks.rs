@@ -1,6 +1,6 @@
-//! Cross-platform file locks for the index file watcher, using std's native `File::{lock,
-//! try_lock, unlock}` (stable since Rust 1.89 — `flock` on Unix, `LockFileEx` on Windows, no
-//! external crate). Two distinct locks coordinate writers without an HTTP daemon:
+//! Cross-platform file locks for the index file watcher: `flock(2)` via libc on unix (see
+//! [`sys`] for why not std's `File::{lock, try_lock, unlock}`), std's `LockFileEx`-backed
+//! `File` locks on Windows. Two distinct locks coordinate writers without an HTTP daemon:
 //!
 //! - the **per-worktree election lock** (one watcher per worktree), keyed by the canonicalized
 //!   worktree root and living under the git common dir;
@@ -37,6 +37,70 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 
+/// The lock syscall layer. On unix this calls `libc::flock` directly instead of std's
+/// `File::{lock, try_lock, unlock}`: std's unix implementation sits behind a cfg allowlist that
+/// omits `target_os = "android"`, so on android (Termux) the std methods compile to stubs that
+/// return `ErrorKind::Unsupported` ("lock() not supported") even though bionic fully supports
+/// `flock(2)` (#707). Implementing the flock path for ALL unix targets — byte-for-byte what std
+/// does on linux/macOS — keeps it exercised by every unix CI job rather than rotting in an
+/// android-only branch. Windows keeps std's `LockFileEx`-backed methods.
+mod sys {
+    use std::fs::{File, TryLockError};
+    use std::io;
+
+    #[cfg(unix)]
+    fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        // A blocking flock can be interrupted by any signal the process handles (EINTR);
+        // retrying keeps a stray SIGCHLD from surfacing as a spurious lock error.
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                return Err(err);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn lock_exclusive(file: &File) -> io::Result<()> {
+        flock(file, libc::LOCK_EX)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn try_lock_exclusive(file: &File) -> Result<(), TryLockError> {
+        flock(file, libc::LOCK_EX | libc::LOCK_NB).map_err(|err| {
+            if err.kind() == io::ErrorKind::WouldBlock {
+                TryLockError::WouldBlock
+            } else {
+                TryLockError::Error(err)
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    pub(super) fn unlock(file: &File) -> io::Result<()> {
+        flock(file, libc::LOCK_UN)
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn lock_exclusive(file: &File) -> io::Result<()> {
+        file.lock()
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn try_lock_exclusive(file: &File) -> Result<(), TryLockError> {
+        file.try_lock()
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn unlock(file: &File) -> io::Result<()> {
+        file.unlock()
+    }
+}
+
 /// A held exclusive file lock. Released on drop.
 #[derive(Debug)]
 pub struct FileLock {
@@ -60,7 +124,7 @@ impl FileLock {
     /// Non-blocking. `Ok(Some)` if acquired now, `Ok(None)` if another holder has it.
     pub fn try_acquire(path: &Path) -> anyhow::Result<Option<FileLock>> {
         let file = Self::open(path)?;
-        match file.try_lock() {
+        match sys::try_lock_exclusive(&file) {
             Ok(()) => Ok(Some(FileLock { _file: file })),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(err)) =>
@@ -72,7 +136,7 @@ impl FileLock {
     /// [`FileLock::acquire_timeout`] so a hung holder can't hang `git checkout`.
     pub fn acquire_blocking(path: &Path) -> anyhow::Result<FileLock> {
         let file = Self::open(path)?;
-        file.lock().with_context(|| format!("locking {}", path.display()))?;
+        sys::lock_exclusive(&file).with_context(|| format!("locking {}", path.display()))?;
         Ok(FileLock { _file: file })
     }
 
@@ -101,7 +165,7 @@ impl Drop for FileLock {
         // releasing the lock until the child execs (#409). `unlock()` (flock `LOCK_UN`) drops the
         // lock now, regardless of surviving OFD references in pre-exec children. Best-effort: the
         // fd still closes right after, so ignore the error.
-        let _ = self._file.unlock();
+        let _ = sys::unlock(&self._file);
     }
 }
 
