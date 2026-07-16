@@ -137,15 +137,24 @@ pub(crate) fn impact_graph_predicate(reverse: bool, mode: GraphResolutionMode) -
         (true, GraphResolutionMode::Exact) => "edges.to_symbol_id = ?1",
         (false, GraphResolutionMode::Exact) =>
             "edges.from_symbol_id = ?1 AND edges.to_symbol_id IS NOT NULL",
+        // #692: seed on the `edges` view's raw id columns compared to an interned-id lookup, not
+        // the value-joined `target_qualified_name` / `from_name`, so the planner drives a
+        // MULTI-INDEX OR over idx_edges_to_symbol/idx_edges_target_qname (reverse) or
+        // idx_edges_from_symbol/idx_edges_from_name (forward) instead of full-scanning edges_data.
+        // Same class as #682; the Fuzzy REVERSE arm already used the id form.
         (true, GraphResolutionMode::Syntactic) =>
-            "edges.to_symbol_id = ?1 OR edges.target_qualified_name = ?2",
+            "edges.to_symbol_id = ?1 OR edges.target_qualified_name_id = (SELECT id FROM \
+             name_strings WHERE value = ?2)",
         (false, GraphResolutionMode::Syntactic) =>
-            "(edges.from_symbol_id = ?1 OR edges.from_name = ?2)
+            "(edges.from_symbol_id = ?1 OR edges.from_name_id = (SELECT id FROM name_strings WHERE \
+             value = ?2))
              AND (edges.to_symbol_id IS NOT NULL OR edges.target_qualified_name IS NOT NULL)",
         (true, GraphResolutionMode::Fuzzy) =>
             "edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM name_strings WHERE \
              value = ?2)",
-        (false, GraphResolutionMode::Fuzzy) => "edges.from_symbol_id = ?1 OR edges.from_name = ?2",
+        (false, GraphResolutionMode::Fuzzy) =>
+            "edges.from_symbol_id = ?1 OR edges.from_name_id = (SELECT id FROM name_strings WHERE \
+             value = ?2)",
     }
 }
 
@@ -307,4 +316,36 @@ pub(crate) fn textual_fallback(
         surface.push(ImpactCategory::ProbableTextual, file_symbol, "textual_fallback", evidence);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #692: pin the real predicate strings to the indexed-id form so a refactor cannot silently
+    /// reintroduce the value-joined `target_qualified_name` / `from_name` seed (which full-scans
+    /// edges_data — the plan is asserted in
+    /// `edge_view::impact_and_grep_augment_seeds_use_edge_id_indexes`).
+    #[test]
+    fn syntactic_and_fuzzy_predicates_seed_on_interned_ids() {
+        use GraphResolutionMode::{Fuzzy, Syntactic};
+        for (reverse, mode, id_col) in [
+            (true, Syntactic, "target_qualified_name_id"),
+            (false, Syntactic, "from_name_id"),
+            (false, Fuzzy, "from_name_id"),
+        ] {
+            let p = impact_graph_predicate(reverse, mode);
+            assert!(
+                p.contains(&format!("{id_col} = (SELECT id FROM name_strings WHERE value = ?2)")),
+                "({reverse}, {mode:?}) must seed on {id_col} via an interned-id lookup, got: {p}"
+            );
+            // The value-joined forms must never come back (they defeat the edge indexes).
+            assert!(
+                !p.contains("target_qualified_name = ?") && !p.contains("from_name = ?"),
+                "({reverse}, {mode:?}) must not compare a value-joined column, got: {p}"
+            );
+            // `?2` must stay present so `graph_neighbors`' `binds_name` name-pass still fires.
+            assert!(p.contains("?2"), "({reverse}, {mode:?}) must still bind ?2, got: {p}");
+        }
+    }
 }

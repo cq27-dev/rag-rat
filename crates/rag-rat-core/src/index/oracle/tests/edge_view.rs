@@ -301,3 +301,54 @@ fn graph_traversal_seed_predicates_use_edge_id_indexes() {
         "forward seed must not full-scan the edge rows, got plan:\n{forward}"
     );
 }
+
+/// #692: the same indexed-seed contract for the other hot edges-view readers #682 did not touch —
+/// `grep_augment::edge_counts`' caller-count (runs on every grep-augmented hit) and
+/// `impact_surface`'s Syntactic/Fuzzy neighbor predicates. Each seed must drive the edge id
+/// indexes, never full-scan `edges_data` through the view's value joins.
+#[test]
+fn impact_and_grep_augment_seeds_use_edge_id_indexes() {
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    let plan = |sql: &str| -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+    };
+
+    // grep_augment::edge_counts caller-count shape (reverse: to_symbol_id OR
+    // target_qualified_name_id).
+    let callers = plan(
+        "SELECT COUNT(*) FROM edges JOIN files source_files ON source_files.id = \
+         edges.source_file_id
+         WHERE edges.to_symbol_id = 5
+            OR edges.target_qualified_name_id = (SELECT id FROM name_strings WHERE value = 'x')",
+    );
+    assert!(
+        callers.contains("idx_edges_to_symbol") && callers.contains("idx_edges_target_qname"),
+        "grep_augment caller-count must drive the edge id indexes, got:\n{callers}"
+    );
+    assert!(
+        !callers.contains("SCAN d") && !callers.contains("SCAN edges_data"),
+        "grep_augment caller-count must not full-scan the edge rows, got:\n{callers}"
+    );
+
+    // impact_surface forward Syntactic/Fuzzy neighbor shape (from_symbol_id OR from_name_id).
+    let fwd = plan(
+        "SELECT id FROM edges
+         WHERE edges.from_symbol_id = 5
+            OR edges.from_name_id = (SELECT id FROM name_strings WHERE value = 'x')",
+    );
+    assert!(
+        fwd.contains("idx_edges_from_symbol") && fwd.contains("idx_edges_from_name"),
+        "impact forward neighbor seed must drive the edge id indexes, got:\n{fwd}"
+    );
+    assert!(
+        !fwd.contains("SCAN d") && !fwd.contains("SCAN edges_data"),
+        "impact forward neighbor seed must not full-scan the edge rows, got:\n{fwd}"
+    );
+}

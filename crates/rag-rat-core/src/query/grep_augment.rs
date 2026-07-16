@@ -497,12 +497,17 @@ fn render(
 fn edge_counts(conn: &Connection, hit: &symbol::SymbolHit) -> anyhow::Result<(i64, i64)> {
     // GENERATION-SCOPED via the `files` view (batch 6, count-scoping class; `compose` installs the
     // worktree scope view before calling in). The `to_symbol_id = ?1` arm keys on a LIVE rowid, but
-    // the `OR target_qualified_name = ?2` arm matches callers purely by NAME and so double-counts
-    // dead-generation edges during a dead-generation window, inflating the "{N} callers" line.
+    // the interned-name arm matches callers purely by NAME and so double-counts dead-generation
+    // edges during a dead-generation window, inflating the "{N} callers" line.
+    // #692: the name arm compares the raw `target_qualified_name_id` against an interned-id lookup,
+    // not the value-joined `target_qualified_name`, so the planner drives idx_edges_to_symbol +
+    // idx_edges_target_qname (a MULTI-INDEX OR) instead of full-scanning edges_data — this count
+    // runs on every grep-augmented hit. Same matching semantics; same class as #682.
     let callers: i64 = conn.query_row(
         "SELECT COUNT(*) FROM edges
          JOIN files source_files ON source_files.id = edges.source_file_id
-         WHERE edges.to_symbol_id = ?1 OR edges.target_qualified_name = ?2",
+         WHERE edges.to_symbol_id = ?1
+            OR edges.target_qualified_name_id = (SELECT id FROM name_strings WHERE value = ?2)",
         rusqlite::params![hit.symbol_id, hit.qualified_name],
         |row| row.get(0),
     )?;
