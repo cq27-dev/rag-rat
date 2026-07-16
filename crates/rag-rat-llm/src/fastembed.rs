@@ -1,7 +1,7 @@
 use rag_rat_base::embedding_models::{BGE_SMALL_MODEL_ID, JINA_CODE_MODEL_ID};
 
-use super::Embedder;
-use crate::index::ai::fastembed_cache_dir;
+use crate::providers::Embedder;
+use crate::serving::fastembed_cache_dir;
 
 pub struct FastEmbedEmbedder {
     model: std::sync::Mutex<fastembed::TextEmbedding>,

@@ -210,3 +210,18 @@ pub fn scoped_table_row_count(
     )?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
+
+pub fn set_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO index_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+pub fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
+        .optional()?)
+}

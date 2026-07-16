@@ -12,7 +12,7 @@ pub const MODEL2VEC_HF_REPO: &str = "minishlab/potion-retrieval-32M";
 use rag_rat_base::embedding_models::{MODEL2VEC_EMBEDDING_DIM, MODEL2VEC_MODEL_ID};
 
 #[cfg(feature = "model2vec")]
-use super::Embedder;
+use crate::providers::Embedder;
 
 #[cfg(feature = "model2vec")]
 pub struct Model2VecEmbedder {

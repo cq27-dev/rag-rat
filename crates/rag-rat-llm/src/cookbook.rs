@@ -46,8 +46,8 @@ use rag_rat_base::config::{RemoteBackend, RemoteEmbeddingConfig};
 use rag_rat_base::embedding_models::EmbeddingModelSpec;
 use serde::{Deserialize, Serialize};
 
-use super::Embedder;
-use super::openai::{OpenAiEmbedder, ProvisionedEmbedderParams};
+use crate::openai::{OpenAiEmbedder, ProvisionedEmbedderParams};
+use crate::providers::Embedder;
 
 /// The env var carrying the cookbook's JSON input. The recipe reads + parses it at startup.
 pub const COOKBOOK_INPUT_ENV: &str = "RAG_RAT_COOKBOOK_INPUT";
@@ -561,7 +561,7 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
 /// Context for the in-Rust throughput sweep (see [`crate::index::ai::throughput_tune`]). Present
 /// only on the reconcile path (which has the DB `conn` for the tune cache and the configured chunk
 /// size); the install probe / wizard verify pass `None` (they just ping — no sweep).
-pub(crate) struct TuneRequest<'a> {
+pub struct TuneRequest<'a> {
     pub conn: &'a rusqlite::Connection,
     pub max_embedding_chars: usize,
     /// Whether to run a NEW concurrency sweep on a cache miss. The tune cache is ALWAYS consulted
@@ -572,7 +572,7 @@ pub(crate) struct TuneRequest<'a> {
     pub allow_sweep: bool,
 }
 
-pub(crate) fn provision_and_build(
+pub fn provision_and_build(
     remote: &RemoteEmbeddingConfig,
     spec: &EmbeddingModelSpec,
     tune: Option<TuneRequest<'_>>,
@@ -623,7 +623,7 @@ fn provision_and_build_cancellable(
     let effective_remote = remote.clone();
     let cap = remote.bounded_concurrency();
     let client_concurrency = match tune {
-        Some(t) => crate::index::ai::throughput_tune::tune_remote_concurrency(
+        Some(t) => crate::throughput_tune::tune_remote_concurrency(
             t.conn,
             remote.cookbook.as_deref().unwrap_or("cookbook"),
             &provisioned.endpoint,

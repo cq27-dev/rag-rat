@@ -153,25 +153,6 @@ pub(crate) fn expected_dim(model_id: &str) -> Option<usize> {
     spec(model_id).map(|s| s.dim)
 }
 
-pub(crate) fn fastembed_cache_dir() -> PathBuf {
-    if let Ok(cache) = std::env::var("RAG_RAT_MODEL_CACHE") {
-        return PathBuf::from(cache);
-    }
-    if let Ok(cache) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(cache).join("rag-rat").join("models");
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".cache").join("rag-rat").join("models");
-    }
-    // On Windows HOME/XDG_CACHE_HOME are usually unset; land the model cache per-user under
-    // %LOCALAPPDATA% rather than per-checkout in the repo-relative fallback below.
-    #[cfg(windows)]
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return PathBuf::from(local).join("rag-rat").join("models");
-    }
-    PathBuf::from(".rag-rat").join("models")
-}
-
 /// Symmetric int8 scalar-quantization range: codes span [-127, 127] (not 128) so a value and its
 /// negation map to opposite codes. The largest-magnitude component maps to ±127; the rest round
 /// proportionally.
@@ -223,69 +204,6 @@ pub(crate) fn encode_vector(vector: &[f32]) -> Vec<u8> {
         out.resize(4 + vector.len(), 0);
     }
     out
-}
-
-pub(crate) fn hash_embed_text(text: &str, dim: usize) -> Vec<f32> {
-    let mut vector = vec![0.0_f32; dim];
-    let tokens = tokens(text);
-    for token in &tokens {
-        add_feature(&mut vector, token, 1.0);
-    }
-    for pair in tokens.windows(2) {
-        add_feature(&mut vector, &format!("{}::{}", pair[0], pair[1]), 0.6);
-    }
-    normalize(&mut vector);
-    vector
-}
-
-pub(crate) fn tokens(text: &str) -> Vec<String> {
-    text.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .filter(|part| !part.is_empty())
-        .flat_map(split_identifier)
-        .filter(|part| part.len() > 1)
-        .collect()
-}
-
-pub(crate) fn split_identifier(value: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut previous_lower = false;
-    for ch in value.chars() {
-        if ch == '_' || ch == '-' {
-            if !current.is_empty() {
-                parts.push(current.to_ascii_lowercase());
-                current.clear();
-            }
-            previous_lower = false;
-            continue;
-        }
-        if previous_lower && ch.is_uppercase() && !current.is_empty() {
-            parts.push(current.to_ascii_lowercase());
-            current.clear();
-        }
-        previous_lower = ch.is_lowercase() || ch.is_ascii_digit();
-        current.push(ch);
-    }
-    if !current.is_empty() {
-        parts.push(current.to_ascii_lowercase());
-    }
-    parts
-}
-
-pub(crate) fn add_feature(vector: &mut [f32], feature: &str, weight: f32) {
-    let digest = Sha256::digest(feature.as_bytes());
-    let index = u16::from_le_bytes([digest[0], digest[1]]) as usize % vector.len();
-    let sign = if digest[2] & 1 == 0 { 1.0 } else { -1.0 };
-    vector[index] += sign * weight;
-}
-
-pub(crate) fn normalize(vector: &mut [f32]) {
-    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for value in vector {
-            *value /= norm;
-        }
-    }
 }
 
 pub(crate) fn chunk_count(conn: &Connection) -> anyhow::Result<u64> {
@@ -389,21 +307,6 @@ pub(crate) fn count_query3(
 pub(crate) fn artifact_table_sql(_capability: &str, template: &str) -> String {
     let table = "chunk_embeddings";
     template.replace("{table}", table)
-}
-
-pub(crate) fn set_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
-    conn.execute(
-        "INSERT INTO index_meta(key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )?;
-    Ok(())
-}
-
-pub(crate) fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
-        .optional()?)
 }
 
 /// Delete a GLOBAL meta key from `index_meta` (a no-op when absent) — the `index_meta` counterpart

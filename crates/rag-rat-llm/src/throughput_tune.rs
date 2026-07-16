@@ -20,12 +20,12 @@ use std::time::Instant;
 use rag_rat_base::config::RemoteEmbeddingConfig;
 use rag_rat_base::embedding_models::EmbeddingModelSpec;
 use rag_rat_base::time::now_ms;
+use rag_rat_db::meta::{meta, set_meta};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::index::ai::helpers::{meta, set_meta};
-use crate::index::ai::providers::{Embedder, OpenAiEmbedder, ProvisionedEmbedderParams};
+use crate::providers::{Embedder, OpenAiEmbedder, ProvisionedEmbedderParams};
 
 /// `index_meta` key holding the throughput-tune cache (a JSON map, so no schema migration).
 const TUNE_CACHE_META_KEY: &str = "embedding_throughput_tune_v1";
@@ -218,7 +218,7 @@ pub struct MeasuredCandidate {
 /// [`tune_remote_concurrency`]: it builds the probe params + per-candidate `build` closure the SAME
 /// way (so each probe request matches a live reconcile request's weight), runs the shared
 /// [`measure_candidates`] loop, and maps every [`SweepResult`] to a [`MeasuredCandidate`]. The
-/// caller owns the [`crate::index::ai::ProvisionedBox`] (keep it alive for the whole call — the
+/// caller owns the [`crate::ProvisionedBox`] (keep it alive for the whole call — the
 /// embedders only hold the endpoint URL). `endpoint`/`auth_token` come from the cookbook handshake.
 ///
 /// Takes `selected_model_id` + `dim` DIRECTLY rather than an [`EmbeddingModelSpec`]: an
@@ -350,7 +350,7 @@ pub fn min_benchmark_budget_ms(num_candidates: usize) -> u64 {
 ///
 /// `estimated_jobs = None` (the count query errored) is treated as "maybe" — sweep if unbounded
 /// rather than skip real tuning on a transient error.
-pub(crate) fn sweep_is_worthwhile(
+pub fn sweep_is_worthwhile(
     max_seconds: Option<u64>,
     estimated_jobs: Option<u64>,
     cap: u32,
@@ -875,7 +875,7 @@ mod tests {
 
     fn mem_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
         conn
     }
 

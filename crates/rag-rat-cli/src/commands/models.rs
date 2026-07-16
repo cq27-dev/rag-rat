@@ -110,7 +110,7 @@ pub(crate) fn benchmark_embedding(
     // The candidate ladder: explicit `--candidates` when given, else the tuner's default ladder for
     // the config's concurrency cap (powers of two up to the cap, plus the exact cap).
     let candidates: Vec<u32> = if args.candidates.is_empty() {
-        rag_rat_core::index::ai::default_benchmark_candidates(cap)
+        rag_rat_llm::throughput_tune::default_benchmark_candidates(cap)
     } else {
         // Normalize explicit `--candidates`: clamp each to the effective range (the server +
         // embedder cap concurrency at 1..=MAX, so a raw 1024 would measure the 512 cap
@@ -148,12 +148,12 @@ pub(crate) fn benchmark_embedding(
         ..base
     };
     let budget_ms =
-        args.budget_ms.unwrap_or_else(rag_rat_core::index::ai::default_benchmark_budget_ms);
+        args.budget_ms.unwrap_or_else(rag_rat_llm::throughput_tune::default_benchmark_budget_ms);
 
     // Reject a budget too small to measure ANY candidate BEFORE provisioning a paid box: the sweep
     // floors each candidate at a ~1s slice and stops once <1s of the budget remains, so a tiny
     // `--budget-ms` would provision + tear down a box while measuring zero rows.
-    let min_budget = rag_rat_core::index::ai::min_benchmark_budget_ms(candidates.len());
+    let min_budget = rag_rat_llm::throughput_tune::min_benchmark_budget_ms(candidates.len());
     anyhow::ensure!(
         budget_ms >= min_budget,
         "--budget-ms {budget_ms} is too small to benchmark {} candidate(s): need at least \
@@ -165,7 +165,7 @@ pub(crate) fn benchmark_embedding(
     // one probe embed, then benchmark. Either way the ProvisionedBox is kept bound for the
     // whole sweep.
     let spec = rag_rat_base::embedding_models::spec(&args.model);
-    let provisioned = rag_rat_core::index::ai::provision_box_for_benchmark(
+    let provisioned = rag_rat_llm::cookbook_internals::provision_box_for_benchmark(
         &remote,
         spec_or_measure_placeholder(spec),
     )?;
@@ -173,7 +173,7 @@ pub(crate) fn benchmark_embedding(
         Some(spec) => (spec.model_id.to_string(), spec.dim),
         None => {
             // Off-registry: learn the dim from the server's first response.
-            let dim = rag_rat_core::index::ai::measure_remote_dim(
+            let dim = rag_rat_llm::throughput_tune::measure_remote_dim(
                 &provisioned.endpoint,
                 provisioned.auth_token.as_deref(),
                 &remote,
@@ -182,7 +182,7 @@ pub(crate) fn benchmark_embedding(
         },
     };
 
-    let measured = rag_rat_core::index::ai::benchmark_remote_concurrency(
+    let measured = rag_rat_llm::throughput_tune::benchmark_remote_concurrency(
         &provisioned.endpoint,
         provisioned.auth_token.as_deref(),
         &remote,

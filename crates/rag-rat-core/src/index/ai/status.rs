@@ -3,6 +3,7 @@ use rag_rat_base::embedding_models::{
     Backend, EmbeddingModelSpec, FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM,
     FASTEMBED_MODEL_ID, spec,
 };
+use rag_rat_llm::serving::fastembed_cache_dir;
 
 use super::*;
 
@@ -31,9 +32,9 @@ pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyh
             "UPDATE ai_models
              SET installed = 0, disabled = 0, status = 'MissingRuntime', last_error = ?2
              WHERE model_id = ?1",
-            params![model_id, FASTEMBED_MISSING_FEATURE_MESSAGE],
+            params![model_id, rag_rat_llm::providers::FASTEMBED_MISSING_FEATURE_MESSAGE],
         )?;
-        anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
+        anyhow::bail!("{}", rag_rat_llm::providers::FASTEMBED_MISSING_FEATURE_MESSAGE)
     }
 }
 

@@ -3562,6 +3562,7 @@ dependencies = [
  "rag-rat-base",
  "rag-rat-core",
  "rag-rat-db",
+ "rag-rat-llm",
  "rag-rat-mcp",
  "rag-rat-papertrail",
  "ratatui",
@@ -3622,6 +3623,7 @@ dependencies = [
  "protobuf",
  "rag-rat-base",
  "rag-rat-db",
+ "rag-rat-llm",
  "rag-rat-papertrail",
  "rayon",
  "regex",
@@ -3667,6 +3669,27 @@ dependencies = [
  "tempfile",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "rag-rat-llm"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "fastembed",
+ "libc",
+ "model2vec-rs",
+ "rag-rat-base",
+ "rag-rat-db",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "ureq 3.3.0",
 ]
 
 [[package]]

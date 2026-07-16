@@ -1,3 +1,5 @@
+use rag_rat_db::meta::{meta, set_meta};
+
 use super::*;
 
 /// Meta key marking the one-time legacy-f32 → int8 vector re-encode as done. Once set to `"1"`,

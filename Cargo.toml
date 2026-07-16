@@ -2,6 +2,7 @@
 members = [
   "crates/rag-rat-base",
   "crates/rag-rat-db",
+  "crates/rag-rat-llm",
   "crates/rag-rat-papertrail",
   "crates/rag-rat-cli",
   "crates/rag-rat-core",
@@ -33,6 +34,7 @@ categories = ["command-line-utilities", "development-tools"]
 # their own feature toggles at the use site.
 rag-rat-base = { version = "0.19.0", path = "crates/rag-rat-base", default-features = false }
 rag-rat-db = { version = "0.19.0", path = "crates/rag-rat-db", default-features = false }
+rag-rat-llm = { version = "0.19.0", path = "crates/rag-rat-llm", default-features = false }
 rag-rat-papertrail = { version = "0.19.0", path = "crates/rag-rat-papertrail", default-features = false }
 rag-rat-core = { version = "0.19.0", path = "crates/rag-rat-core", default-features = false }
 rag-rat-mcp = { version = "0.19.0", path = "crates/rag-rat-mcp", default-features = false }

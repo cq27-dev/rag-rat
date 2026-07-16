@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 rag-rat-base.workspace = true
 rag-rat-db.workspace = true
+rag-rat-llm = { workspace = true, default-features = false }
 rag-rat-papertrail.workspace = true
 anyhow.workspace = true
 clap = { version = "4.6", features = ["derive"] }
@@ -64,4 +65,4 @@ fastembed = ["rag-rat-core/fastembed", "rag-rat-mcp/fastembed"]
 model2vec = ["rag-rat-core/model2vec", "rag-rat-mcp/model2vec"]
 # The `rag-rat eval` subcommand (search-quality + oracle precision/recall gate). OFF by default so
 # the shipped binary omits it; CI builds `--features eval` to run the gate.
-eval = ["rag-rat-core/eval"]
+eval = ["rag-rat-core/eval", "rag-rat-llm/eval"]

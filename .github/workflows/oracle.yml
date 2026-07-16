@@ -20,6 +20,7 @@ on:
       # drive it. Only the mcp crate can't move it — narrow from crates/** to core + cli (drops mcp).
       - 'crates/rag-rat-base/**'
       - 'crates/rag-rat-db/**'
+      - 'crates/rag-rat-llm/**'
       - 'crates/rag-rat-papertrail/**'
       - 'crates/rag-rat-core/**'
       - 'crates/rag-rat-cli/**'
@@ -43,6 +44,7 @@ on:
       # drive it. Only the mcp crate can't move it — narrow from crates/** to core + cli (drops mcp).
       - 'crates/rag-rat-base/**'
       - 'crates/rag-rat-db/**'
+      - 'crates/rag-rat-llm/**'
       - 'crates/rag-rat-papertrail/**'
       - 'crates/rag-rat-core/**'
       - 'crates/rag-rat-cli/**'

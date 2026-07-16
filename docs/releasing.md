@@ -1,7 +1,7 @@
 # Releasing
 
 Releases are automated by [release-plz](https://release-plz.dev) and the three crates ship in
-**lockstep** — `rag-rat`, `rag-rat-core`, `rag-rat-mcp`, `rag-rat-papertrail`, `rag-rat-db`, and `rag-rat-base` always carry the same version. That
+**lockstep** — `rag-rat`, `rag-rat-core`, `rag-rat-mcp`, `rag-rat-papertrail`, `rag-rat-llm`, `rag-rat-db`, and `rag-rat-base` always carry the same version. That
 version has a single source of truth in `[workspace.package].version` (root `Cargo.toml`); every
 crate inherits it via `version.workspace = true`, and `release-plz.toml` puts all three in one
 `version_group` so the bump is shared.
@@ -15,7 +15,7 @@ Configured in `.github/workflows/release-plz.yml`; runs on every push to `main`.
    Commits](https://www.conventionalcommits.org). Nothing ships until a human merges it — review the
    bump and changelog there.
 2. **Publish + tag.** When that PR merges, release-plz publishes each crate to crates.io in
-   dependency order (`rag-rat-base` → `rag-rat-db` → `rag-rat-papertrail` → `rag-rat-core` → `rag-rat-mcp` → `rag-rat`, waiting for the registry to
+   dependency order (`rag-rat-base` → `rag-rat-db` → `rag-rat-llm` / `rag-rat-papertrail` → `rag-rat-core` → `rag-rat-mcp` → `rag-rat`, waiting for the registry to
    propagate each before the next), then creates a single `vX.Y.Z` git tag and GitHub release for
    the whole workspace.
 

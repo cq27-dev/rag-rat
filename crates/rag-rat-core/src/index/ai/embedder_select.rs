@@ -1,71 +1,17 @@
-//! Embedding-provider layer: the `Embedder` trait, the backend dispatch (`embedder_for_spec`),
-//! the active-model resolution (`active_embedder`), and one concrete backend per submodule.
-//! This module is the single construction site for every embedder — callers reach it through the
-//! curated re-exports in `index::ai`.
-
-// Ungated: the ephemeral cookbook lifecycle (#318) spawns a subprocess via std::process — no heavy
-// optional dependency, so it ships unconditionally like the Ollama backend.
-mod cookbook;
-#[cfg(feature = "fastembed")]
-mod fastembed;
-mod hash;
-// Ungated: the module compiles in all builds so its dep-free `MODEL2VEC_HF_REPO` const stays
-// available; only `Model2VecEmbedder` (which needs `model2vec-rs`) is feature-gated inside it.
-mod model2vec;
-// Ungated: the Ollama backend uses `ureq` (already a non-optional workspace dep — see the crates.io
-// version check), so there is no heavy optional dependency to gate. No `remote-embed` feature.
-mod openai;
+//! Embedder selection glue: resolve the ACTIVE model/remote config from the index and
+//! construct the right provider from rag-rat-llm — the index-coupled half of what was
+//! `ai::providers`.
 
 use rag_rat_base::config::RemoteEmbeddingConfig;
-use rag_rat_base::embedding_models::{Backend, EmbeddingModelSpec, spec};
+use rag_rat_base::embedding_models::{self, Backend, EmbeddingModelSpec};
+use rag_rat_llm::cookbook_internals::provision_and_build;
+use rag_rat_llm::providers::*;
 use rusqlite::Connection;
 
-pub(crate) use self::cookbook::provision_and_build;
-// EVAL-ONLY `pub` seam (#346): the `benchmark-embedding` subcommand (a separate crate)
-// provisions an ephemeral box and runs its own measured sweep against it; re-exported `pub`
-// under `eval` so it reaches the CLI through `index::ai`.
-#[cfg(feature = "eval")]
-pub use self::cookbook::provision_box_for_benchmark;
-// `verify_ephemeral_remote` is the `pub` init-wizard seam (the CLI's Remote step calls it);
-// the underlying `provision_and_build` stays `pub(crate)`.
-pub use self::cookbook::{
-    CookbookInput, CookbookProvisioner, ProvisionedBox, abort_active_provisioning,
-    install_provision_log_sink, verify_ephemeral_remote, verify_ephemeral_remote_cancellable,
-};
-#[cfg(feature = "fastembed")]
-pub use self::fastembed::FastEmbedEmbedder;
-pub use self::hash::HashEmbedder;
-pub use self::model2vec::MODEL2VEC_HF_REPO;
-#[cfg(feature = "model2vec")]
-pub use self::model2vec::Model2VecEmbedder;
-// Ungated `pub` re-export (crate-public path `crate::index::ai::providers::OpenAiEmbedder`):
-// wired into `embedder_for_spec` in #317 task 5, so nothing constructs it yet. The `pub`
-// visibility (same pattern as the other backends) exempts it from dead-code/unused-import
-// analysis under `-D warnings` until the dispatch arm lands.
-pub use self::openai::OpenAiEmbedder;
-// The tuning sweep (index::ai::throughput_tune) builds embedders at varied concurrencies.
-pub(crate) use self::openai::ProvisionedEmbedderParams;
-// The shared connect-mode auth resolver — reused by the dream verdict client
-// (`dream/model.rs`) so a configured-but-unresolved `auth_env` errors identically for
-// embeddings and the dream model.
-pub(crate) use self::openai::resolve_auth_header;
-use crate::index::ai::{
+use super::{
     EmbeddingScan, ReconcileOptions, active_embedding_model_id, active_remote_config,
     estimated_reconcile_jobs, model, validate_ready_model,
 };
-
-pub const MODEL2VEC_MISSING_FEATURE_MESSAGE: &str =
-    "Model2Vec backend requested, but this binary was built without Model2Vec support.\nRebuild \
-     with default features enabled:\n  cargo install rag-rat";
-pub const FASTEMBED_MISSING_FEATURE_MESSAGE: &str =
-    "FastEmbed backend requested, but this binary was built without default FastEmbed \
-     support.\nRebuild with default features enabled:\n  cargo install rag-rat";
-
-pub trait Embedder {
-    fn model_id(&self) -> &str;
-    fn dim(&self) -> usize;
-    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
-}
 
 pub(crate) fn active_embedder(
     conn: &Connection,
@@ -74,7 +20,7 @@ pub(crate) fn active_embedder(
     let model_id = active_embedding_model_id(conn)?;
     let model = model(conn, &model_id)?;
     validate_ready_model(&model)?;
-    let spec = spec(&model.model_id)
+    let spec = embedding_models::spec(&model.model_id)
         .ok_or_else(|| anyhow::anyhow!("unknown active embedding model `{}`", model.model_id))?;
     // The remote config (persisted at install) flips the effective runtime to Ollama for the active
     // model — same `spec`, only the transport changes. `active_embedder` is the CONNECT-chunk +
@@ -88,7 +34,6 @@ pub(crate) fn active_embedder(
     let query_remote = remote.as_ref().map(query_embed_config);
     embedder_for_spec(spec, intra_threads, query_remote.as_ref())
 }
-
 /// Map a persisted remote config to the one `active_embedder` should embed QUERIES with. Connect →
 /// the config unchanged (its `endpoint`). Ephemeral → a connect-shaped config pointed at the LOCAL
 /// `query_endpoint`, so the query embeds against the local box (same model) rather than
@@ -121,12 +66,6 @@ fn query_embed_config(remote: &RemoteEmbeddingConfig) -> RemoteEmbeddingConfig {
         remote.clone()
     }
 }
-
-/// Per-request timeout ceiling for the LIGHT (local `query_endpoint`) path — bounds both the route
-/// probe and each single-flight incremental embed so a slow/hung local server can't stall a watcher
-/// pass. The provisioned-box path is unaffected (it keeps the configured timeout).
-const LIGHT_REQUEST_TIMEOUT_S: u64 = 30;
-
 /// The remote config for a LIGHT (watcher / incremental) embed against the local `query_endpoint`:
 /// `query_embed_config` (connect-shaped, local endpoint, backend preserved) but clamped to
 /// SINGLE-FLIGHT concurrency and a SHORT request timeout. The query server is a user's local box
@@ -143,7 +82,6 @@ fn light_incremental_config(remote: &RemoteEmbeddingConfig) -> RemoteEmbeddingCo
         ..transport
     }
 }
-
 /// Build the active model's embedder against a caller-supplied connect-shaped `transport` — used by
 /// the light path to point at the local `query_endpoint` at clamped concurrency. Like
 /// `active_embedder`, but the transport is the passed config, not `query_embed_config` of the
@@ -156,11 +94,10 @@ fn light_embedder(
     let model_id = active_embedding_model_id(conn)?;
     let model = model(conn, &model_id)?;
     validate_ready_model(&model)?;
-    let spec = spec(&model.model_id)
+    let spec = embedding_models::spec(&model.model_id)
         .ok_or_else(|| anyhow::anyhow!("unknown active embedding model `{}`", model.model_id))?;
     embedder_for_spec(spec, intra_threads, Some(transport))
 }
-
 /// The outcome of acquiring the CHUNK-embed embedder for a reconcile. `Ready` carries the optional
 /// `ProvisionedBox` guard so the caller keeps it alive for the whole embed loop (its `Drop` is the
 /// box teardown). This is the ONE place that branches on `is_ephemeral()` for chunk embedding — the
@@ -192,35 +129,6 @@ pub(crate) enum ChunkEmbedder {
     /// diagnostics; the caller reports a generic "model not ready".
     NotReady(anyhow::Error),
 }
-
-/// Acquire the CHUNK-embed embedder for a reconcile. EPHEMERAL active model: on a provisioning
-/// reconcile, FIRST check for pending candidate chunks — if none, `NoEphemeralWork` (never
-/// provision a paid box for zero work, #330-6); otherwise provision the cookbook box + build an
-/// embedder against it (the bulk path, `provision_and_build`). On a non-provisioning pass (watcher
-/// / maintenance): embed the changed chunks LOCALLY against `query_endpoint` when a probe embed on
-/// it SUCCEEDS (the light/incremental path — no cold-start, single-flight, same vector space as the
-/// box); `SkipEphemeral` when there is no local query server or the probe fails. CONNECT/local: the
-/// usual `active_embedder`. Provisioning happens ONCE here, not per batch. `provision_remote` gates
-/// the cold-start (only an explicit `rag-rat reconcile` sets it); `scan`/`options` size the
-/// provision-path pending-work check.
-/// Strip credentials + path from an endpoint URL before logging it: keep `scheme://host[:port]`
-/// only. A debug log is a shared, greppable on-disk artifact, and an endpoint may carry inline
-/// `user:pass@` userinfo (the connect/query endpoints support it — see `endpoint_is_loopback`), so
-/// the raw URL must never land in a log line.
-pub(crate) fn sanitize_endpoint(url: &str) -> String {
-    let (scheme, rest) = match url.split_once("://") {
-        Some((scheme, rest)) => (Some(scheme), rest),
-        None => (None, url),
-    };
-    // Authority is up to the first path/query/fragment delimiter; drop any `user:pass@` userinfo.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host_port)| host_port);
-    match scheme {
-        Some(scheme) => format!("{scheme}://{host_port}"),
-        None => host_port.to_string(),
-    }
-}
-
 pub(crate) fn acquire_chunk_embedder(
     conn: &Connection,
     intra_threads: Option<usize>,
@@ -297,7 +205,7 @@ pub(crate) fn acquire_chunk_embedder(
             Ok(id) => id,
             Err(err) => return ChunkEmbedder::NotReady(err),
         };
-        let Some(spec) = spec(&active_model_id) else {
+        let Some(spec) = embedding_models::spec(&active_model_id) else {
             return ChunkEmbedder::NotReady(anyhow::anyhow!(
                 "unknown active embedding model `{active_model_id}`"
             ));
@@ -314,10 +222,10 @@ pub(crate) fn acquire_chunk_embedder(
         // raw cap even on a bounded/tiny pass); `allow_sweep` gates only a fresh sweep —
         // off for a bounded `--max-seconds` run or one too small to fan out
         // (`sweep_is_worthwhile`).
-        let tune = self::cookbook::TuneRequest {
+        let tune = rag_rat_llm::cookbook_internals::TuneRequest {
             conn,
             max_embedding_chars: scan.max_embedding_chars,
-            allow_sweep: crate::index::ai::throughput_tune::sweep_is_worthwhile(
+            allow_sweep: rag_rat_llm::throughput_tune::sweep_is_worthwhile(
                 options.max_seconds,
                 estimated_jobs,
                 remote.bounded_concurrency(),
@@ -358,7 +266,6 @@ pub(crate) fn acquire_chunk_embedder(
         Err(err) => ChunkEmbedder::NotReady(err),
     }
 }
-
 /// Build the embedder for a registry spec. The EFFECTIVE runtime is `remote.is_some() ? Ollama :
 /// spec.backend` (#317 rework): a `[llm.embedding.remote]` block serves the SELECTED model
 /// (`spec`) via Ollama instead of in-process — same `model_id` + `dim`, transport overridden. The
@@ -418,34 +325,6 @@ pub(crate) fn embedder_for_spec(
 }
 
 #[cfg(test)]
-pub struct MockEmbedder {
-    model_id: String,
-    dim: usize,
-}
-
-#[cfg(test)]
-impl MockEmbedder {
-    pub fn new(model_id: impl Into<String>, dim: usize) -> Self {
-        Self { model_id: model_id.into(), dim }
-    }
-}
-
-#[cfg(test)]
-impl Embedder for MockEmbedder {
-    fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|text| crate::index::ai::hash_embed_text(text, self.dim)).collect())
-    }
-}
-
-#[cfg(test)]
 mod dispatch_tests {
     use rag_rat_base::embedding_models::FASTEMBED_MODEL_ID;
 
@@ -459,7 +338,7 @@ mod dispatch_tests {
         let conn = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         crate::index::ai::ensure_model_manifest(&conn).unwrap();
-        let spec = spec(model_id).unwrap();
+        let spec = embedding_models::spec(model_id).unwrap();
         conn.execute(
             "UPDATE ai_models
              SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2
@@ -504,14 +383,14 @@ mod dispatch_tests {
 
         let embedder = active_embedder(&conn, None).expect("ollama embedder constructs");
         assert_eq!(embedder.model_id(), FASTEMBED_MODEL_ID, "keeps the selected model's id");
-        assert_eq!(embedder.dim(), spec(FASTEMBED_MODEL_ID).unwrap().dim);
+        assert_eq!(embedder.dim(), embedding_models::spec(FASTEMBED_MODEL_ID).unwrap().dim);
     }
 
     #[test]
     fn embedder_for_spec_with_remote_serves_any_model_over_ollama() {
         // The effective runtime is `remote.is_some() ? Ollama : spec.backend`: passing a remote
         // config builds an OpenAiEmbedder for the selected spec regardless of its local backend.
-        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        let spec = embedding_models::spec(FASTEMBED_MODEL_ID).unwrap();
         let embedder =
             embedder_for_spec(spec, None, Some(&remote_at("http://127.0.0.1:1"))).unwrap();
         assert_eq!(embedder.model_id(), FASTEMBED_MODEL_ID);
@@ -521,7 +400,7 @@ mod dispatch_tests {
     fn embedder_for_spec_without_remote_uses_the_local_backend() {
         // No remote → dispatch on the model's local backend. Hash is always available, so it's the
         // feature-independent assertion.
-        let spec = spec(rag_rat_base::embedding_models::HASH_MODEL_ID).unwrap();
+        let spec = embedding_models::spec(rag_rat_base::embedding_models::HASH_MODEL_ID).unwrap();
         let embedder = embedder_for_spec(spec, None, None).unwrap();
         assert_eq!(embedder.model_id(), rag_rat_base::embedding_models::HASH_MODEL_ID);
     }
@@ -574,7 +453,7 @@ mod dispatch_tests {
 
         let embedder = active_embedder(&conn, None).expect("query embedder constructs locally");
         assert_eq!(embedder.model_id(), FASTEMBED_MODEL_ID);
-        assert_eq!(embedder.dim(), spec(FASTEMBED_MODEL_ID).unwrap().dim);
+        assert_eq!(embedder.dim(), embedding_models::spec(FASTEMBED_MODEL_ID).unwrap().dim);
     }
 
     #[test]

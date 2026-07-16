@@ -14,6 +14,7 @@ categories.workspace = true
 [dependencies]
 rag-rat-base.workspace = true
 rag-rat-db.workspace = true
+rag-rat-llm = { workspace = true, default-features = false }
 rag-rat-papertrail.workspace = true
 tokio = { workspace = true }
 anyhow.workspace = true
@@ -71,12 +72,12 @@ libc.workspace = true
 
 [features]
 default = ["fastembed", "model2vec"]
-fastembed = ["dep:fastembed"]
-model2vec = ["dep:model2vec-rs"]
+fastembed = ["dep:fastembed", "rag-rat-llm/fastembed"]
+model2vec = ["dep:model2vec-rs", "rag-rat-llm/model2vec"]
 # Search-quality + SCIP-oracle precision/recall eval harness (the `crate::eval` module). OFF by
 # default so the shipped client doesn't carry it; built only in CI (the eval gate) via
 # `--features eval`.
-eval = []
+eval = ["rag-rat-llm/eval"]
 
 [dev-dependencies]
 # Instruction-count benchmarking (deterministic, CI-noise-immune). Needs the matching

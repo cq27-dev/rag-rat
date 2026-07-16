@@ -6,6 +6,7 @@ use rag_rat_base::embedding_models::{Backend, spec};
 // feature-gated.
 #[cfg(feature = "fastembed")]
 use rag_rat_base::embedding_models::{FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID};
+use rag_rat_llm::serving::fastembed_cache_dir;
 
 use super::super::*;
 
@@ -338,14 +339,16 @@ pub(crate) fn install_model2vec_model(conn: &Connection, model_id: &str) -> anyh
             "UPDATE ai_models
              SET installed = 0, disabled = 0, status = 'MissingRuntime', last_error = ?2
              WHERE model_id = ?1",
-            params![model_id, MODEL2VEC_MISSING_FEATURE_MESSAGE],
+            params![model_id, rag_rat_llm::providers::MODEL2VEC_MISSING_FEATURE_MESSAGE],
         )?;
-        anyhow::bail!("{}", MODEL2VEC_MISSING_FEATURE_MESSAGE)
+        anyhow::bail!("{}", rag_rat_llm::providers::MODEL2VEC_MISSING_FEATURE_MESSAGE)
     }
 }
 
 #[cfg(test)]
 mod seed_active_embedding_model_tests {
+    use rag_rat_db::meta::meta;
+
     use super::*;
 
     const JINA: &str = "jinaai/jina-embeddings-v2-base-code";

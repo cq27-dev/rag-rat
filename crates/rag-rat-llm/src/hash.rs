@@ -1,7 +1,7 @@
 use rag_rat_base::embedding_models::{HASH_EMBEDDING_DIM, HASH_MODEL_ID};
 
-use super::Embedder;
-use crate::index::ai::hash_embed_text;
+use crate::providers::Embedder;
+use crate::serving::hash_embed_text;
 
 pub struct HashEmbedder;
 

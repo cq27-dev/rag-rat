@@ -55,3 +55,8 @@ changelog_path = "./CHANGELOG.md"
 name = "rag-rat-papertrail"
 version_group = "rag-rat"
 changelog_path = "./CHANGELOG.md"
+
+[[package]]
+name = "rag-rat-llm"
+version_group = "rag-rat"
+changelog_path = "./CHANGELOG.md"

@@ -16,7 +16,7 @@ use std::time::Duration;
 use rag_rat_base::config::RemoteEmbeddingConfig;
 use serde::{Deserialize, Serialize};
 
-use super::Embedder;
+use crate::providers::Embedder;
 
 /// Request body for the OpenAI-compatible `POST /v1/embeddings`. `input` is an array — the batch
 /// endpoint embeds every text in one request. `encoding_format: "float"` is the OpenAI default,
@@ -452,7 +452,7 @@ fn response_excerpt(body: &str) -> String {
 /// auth (`Ok(None)`); a named-but-missing/empty value → `Err` (the operator asked for auth but the
 /// token isn't there). Closure-injected so the env-mutation footgun (unsafe + flaky under nextest's
 /// parallel runner in Rust 2024) never enters the test path.
-pub(crate) fn resolve_auth_header(
+pub fn resolve_auth_header(
     auth_env: Option<&str>,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<Option<String>> {

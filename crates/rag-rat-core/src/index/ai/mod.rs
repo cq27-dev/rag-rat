@@ -1,34 +1,29 @@
+pub(crate) mod embedder_select;
 mod helpers;
 mod policy;
-mod providers;
 mod reconcile;
 mod reencode;
 mod status;
 mod store;
-mod throughput_tune;
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
-pub(crate) use helpers::*;
-pub(crate) use policy::*;
-#[cfg(feature = "fastembed")]
-pub use providers::FastEmbedEmbedder;
-#[cfg(test)]
-pub use providers::MockEmbedder;
-#[cfg(feature = "model2vec")]
-pub use providers::Model2VecEmbedder;
 // EVAL-ONLY seam for the `rag-rat benchmark-embedding` subcommand (#346): the CLI (a separate
 // crate) provisions an ephemeral box (`provision_box_for_benchmark`, holding the
 // `ProvisionedBox` for teardown) and runs its OWN measured concurrency sweep
 // (`benchmark_remote_concurrency`), emitting every per-candidate `MeasuredCandidate`. No knee
 // selection, no tune-cache write — those stay on the reconcile path.
-#[cfg(feature = "eval")]
-pub use providers::provision_box_for_benchmark;
-pub(crate) use providers::{
-    ChunkEmbedder, acquire_chunk_embedder, active_embedder, provision_and_build,
-    resolve_auth_header,
-};
+pub(crate) use embedder_select::{ChunkEmbedder, acquire_chunk_embedder, active_embedder};
+pub(crate) use helpers::*;
+pub(crate) use policy::*;
+use rag_rat_base::language::Language;
+use rag_rat_base::time::now_ms;
+pub(crate) use rag_rat_llm::cookbook_internals::{provision_and_build, resolve_auth_header};
+#[cfg(feature = "fastembed")]
+pub(crate) use rag_rat_llm::providers::FastEmbedEmbedder;
+#[cfg(feature = "model2vec")]
+pub(crate) use rag_rat_llm::providers::Model2VecEmbedder;
 // Curate the provider surface onto the `index::ai` path so existing `super::*` callers
 // (`reconcile`, `status`, `helpers`) and the external `ai::Embedder` /
 // `ai::FASTEMBED_MISSING_*` references keep resolving after the move into `providers/`. mod.rs
@@ -38,14 +33,9 @@ pub(crate) use providers::{
 // analysis even when a given feature build has no live caller (`MockEmbedder`, the
 // `#[cfg(not(...))]`-only consts). A `pub(crate)` re-export would narrow that and redden `-D
 // warnings`.
-pub use providers::{
-    CookbookInput, CookbookProvisioner, Embedder, FASTEMBED_MISSING_FEATURE_MESSAGE, HashEmbedder,
-    MODEL2VEC_HF_REPO, MODEL2VEC_MISSING_FEATURE_MESSAGE, OpenAiEmbedder, ProvisionedBox,
-    abort_active_provisioning, install_provision_log_sink, verify_ephemeral_remote,
-    verify_ephemeral_remote_cancellable,
+pub(crate) use rag_rat_llm::providers::{
+    CookbookInput, CookbookProvisioner, Embedder, HashEmbedder, OpenAiEmbedder, ProvisionedBox,
 };
-use rag_rat_base::language::Language;
-use rag_rat_base::time::now_ms;
 pub(crate) use reconcile::*;
 pub(crate) use reencode::*;
 use rusqlite::types::Value;
@@ -54,12 +44,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 pub(crate) use status::*;
 pub(crate) use store::*;
-#[cfg(feature = "eval")]
-pub use throughput_tune::{
-    MeasuredCandidate, benchmark_remote_concurrency, default_benchmark_budget_ms,
-    default_benchmark_candidates, measure_remote_dim, min_benchmark_budget_ms,
-};
-
 const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
 const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_version";
 /// `"1"` when the active embedding model was set AUTOMATICALLY — a config seed

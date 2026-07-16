@@ -124,12 +124,15 @@ fn fastembed_missing_feature_reports_rebuild_command() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let err = db.install_model(FASTEMBED_MODEL_ID, None).unwrap_err();
-    assert!(err.to_string().contains(ai::FASTEMBED_MISSING_FEATURE_MESSAGE));
+    assert!(err.to_string().contains(rag_rat_llm::providers::FASTEMBED_MISSING_FEATURE_MESSAGE));
 
     let status = db.llm_status().unwrap();
     assert!(!status.fastembed.build_feature_enabled);
     assert_eq!(status.fastembed.status, "MissingRuntime");
-    assert_eq!(status.fastembed.message.as_deref(), Some(ai::FASTEMBED_MISSING_FEATURE_MESSAGE));
+    assert_eq!(
+        status.fastembed.message.as_deref(),
+        Some(rag_rat_llm::providers::FASTEMBED_MISSING_FEATURE_MESSAGE)
+    );
     assert_eq!(status.fastembed.next.as_deref(), Some("cargo install rag-rat"));
 
     let _ = fs::remove_dir_all(root);

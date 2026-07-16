@@ -237,7 +237,7 @@ impl ProbeRegistry {
     /// (Ctrl-C / SIGTERM) is backstopped there.
     ///
     /// A clean-process-exit quit (`q`/`Esc`, no signal) is closed by Task 14b: this path calls
-    /// [`abort_active_provisioning`](rag_rat_core::index::ai::abort_active_provisioning), which
+    /// [`abort_active_provisioning`](rag_rat_llm::providers::abort_active_provisioning), which
     /// runs the same bounded SIGTERM → grace → SIGKILL teardown against the live `ACTIVE_PGID`
     /// from outside the detached worker. It is a no-op when no box is live (`ACTIVE_PGID ==
     /// 0`), so it is safe to call unconditionally on every in-flight ephemeral probe at quit.
@@ -254,7 +254,7 @@ impl ProbeRegistry {
                     // Billable box. Tear down the live process group from outside the detached
                     // worker: a bounded SIGTERM → grace → SIGKILL against `ACTIVE_PGID`.
                     ProbeKind::EphemeralTest => {
-                        rag_rat_core::index::ai::abort_active_provisioning();
+                        rag_rat_llm::providers::abort_active_provisioning();
                     },
                 }
                 *status = ProbeStatus::Idle;
@@ -271,7 +271,7 @@ impl ProbeRegistry {
     fn cancel_active_ephemeral(&mut self) {
         let Some(worker) = self.active_ephemeral.take() else { return };
         worker.cancel.store(true, Ordering::Release);
-        rag_rat_core::index::ai::abort_active_provisioning();
+        rag_rat_llm::providers::abort_active_provisioning();
         let _ = worker.handle.join();
         if self.generations[worker.step.index()] == worker.generation {
             self.status[worker.step.index()] = ProbeStatus::Idle;

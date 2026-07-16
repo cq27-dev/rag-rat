@@ -1,0 +1,38 @@
+[package]
+name = "rag-rat-llm"
+version.workspace = true
+description = "Embedding and LLM serving layer for the rag-rat workspace: embedder providers, ephemeral box provisioning, and throughput tuning."
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["fastembed", "model2vec"]
+fastembed = ["dep:fastembed"]
+model2vec = ["dep:model2vec-rs"]
+# Benchmark-only surface (`provision_box_for_benchmark`, the measured concurrency sweep).
+eval = []
+
+[dependencies]
+anyhow.workspace = true
+fastembed = { workspace = true, optional = true }
+model2vec-rs = { version = "0.2.1", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }
+rag-rat-base.workspace = true
+rag-rat-db.workspace = true
+reqwest.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+ureq.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

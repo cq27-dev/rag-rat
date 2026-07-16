@@ -9,10 +9,10 @@ use rag_rat_base::config::{
 };
 use rag_rat_base::embedding_models::{Backend, EMBEDDING_MODELS, EmbeddingModelSpec, spec};
 #[cfg(feature = "fastembed")]
-use rag_rat_core::index::ai::FastEmbedEmbedder;
+use rag_rat_llm::providers::FastEmbedEmbedder;
 #[cfg(feature = "model2vec")]
-use rag_rat_core::index::ai::Model2VecEmbedder;
-use rag_rat_core::index::ai::{
+use rag_rat_llm::providers::Model2VecEmbedder;
+use rag_rat_llm::providers::{
     Embedder, HashEmbedder, OpenAiEmbedder, verify_ephemeral_remote_cancellable,
 };
 use ratatui::Frame;
@@ -687,7 +687,7 @@ pub(super) fn handle_embedding(key: KeyEvent, state: &mut WizardState) -> Outcom
                     let (log_tx, log_rx) = std::sync::mpsc::channel();
                     state.start_provision_log(log_rx);
                     state.probes.spawn_ephemeral(StepId::Embedding, move |cancel| {
-                        let _guard = rag_rat_core::index::ai::install_provision_log_sink(log_tx);
+                        let _guard = rag_rat_llm::providers::install_provision_log_sink(log_tx);
                         probe_ephemeral(r, s, cancel.as_ref())
                     });
                 }
