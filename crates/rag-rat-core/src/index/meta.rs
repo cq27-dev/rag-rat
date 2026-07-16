@@ -1,7 +1,9 @@
 //! Index key-value meta (the `index_meta` table) and the content-revision digest.
 
+use rag_rat_base::config::{Config, ResolvedTarget};
+use rag_rat_base::hash::hex_sha256;
+
 use super::*;
-use crate::config::{Config, ResolvedTarget};
 use crate::storage::IndexConnection;
 
 const WATCH_SHUTDOWN_RECONCILE_PENDING_META: &str = "watch_shutdown_reconcile_pending";

@@ -897,7 +897,7 @@ impl IndexDatabase {
             return Ok(());
         };
         let signature_hash =
-            signature.map(|sig| crate::index::util::hex_sha256(sig.trim().as_bytes()));
+            signature.map(|sig| rag_rat_base::hash::hex_sha256(sig.trim().as_bytes()));
         // Snapshot the current binding_ids before mutating, so the rename loop is not walking a
         // live cursor it is also writing to.
         let stale_binding_ids: Vec<(String, String)> = {

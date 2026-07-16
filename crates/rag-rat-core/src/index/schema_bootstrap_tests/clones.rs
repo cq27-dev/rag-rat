@@ -3959,7 +3959,7 @@ fn scip_moniker_collapse_lifts_a_same_symbol_callee_class() {
     for (dir, name, _var, callee) in fixtures {
         let rel = format!("{dir}/{name}.rs");
         let src = fs::read_to_string(root.join(&rel)).unwrap();
-        let sha = crate::index::hex_sha256(src.as_bytes());
+        let sha = rag_rat_base::hash::hex_sha256(src.as_bytes());
         // The real edge the extractor emitted for `callee(...)` — its source span is the whole
         // call expression, its callee span the identifier. The verdict is keyed by BOTH.
         let (src_lo, src_hi, cal_lo, cal_hi): (i64, i64, i64, i64) = conn

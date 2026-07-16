@@ -12,10 +12,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rag_rat_base::config::Config;
+use rag_rat_base::locks::{self, FileLock};
+
 use super::{AutosyncRequest, PapertrailContext, PapertrailSyncReport};
-use crate::config::Config;
 use crate::index::IndexDatabase;
-use crate::locks::{self, FileLock};
 
 /// What one auto-sync trigger produced.
 #[derive(Debug)]
@@ -439,8 +440,8 @@ mod tests {
     fn racing_triggers_never_orphan_a_coalesced_request() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = test_config(tmp.path());
-        config.trackers = vec![crate::config::TrackerConfig {
-            provider: crate::config::Tracker::Github,
+        config.trackers = vec![rag_rat_base::config::TrackerConfig {
+            provider: rag_rat_base::config::Tracker::Github,
             project: Some("o/r".to_string()),
             remote: "origin".to_string(),
             // The discard port: connection refused, so flights fail fast without network.
@@ -500,8 +501,8 @@ mod tests {
     fn concurrent_triggers_coalesce_into_the_held_flight() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = test_config(tmp.path());
-        config.trackers = vec![crate::config::TrackerConfig {
-            provider: crate::config::Tracker::Github,
+        config.trackers = vec![rag_rat_base::config::TrackerConfig {
+            provider: rag_rat_base::config::Tracker::Github,
             project: Some("o/r".to_string()),
             remote: "origin".to_string(),
             base_url: None,
@@ -546,8 +547,8 @@ mod tests {
         let (url, _stub) = spawn_script_stub(script);
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = test_config(tmp.path());
-        config.trackers = vec![crate::config::TrackerConfig {
-            provider: crate::config::Tracker::Github,
+        config.trackers = vec![rag_rat_base::config::TrackerConfig {
+            provider: rag_rat_base::config::Tracker::Github,
             project: Some("o/r".to_string()),
             remote: "origin".to_string(),
             base_url: Some(url),
@@ -594,8 +595,8 @@ mod tests {
     fn triggers_before_any_store_exists_defer_without_creating_the_database() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = test_config(tmp.path());
-        config.trackers = vec![crate::config::TrackerConfig {
-            provider: crate::config::Tracker::Github,
+        config.trackers = vec![rag_rat_base::config::TrackerConfig {
+            provider: rag_rat_base::config::Tracker::Github,
             project: Some("o/r".to_string()),
             remote: "origin".to_string(),
             base_url: Some("http://127.0.0.1:9".to_string()),
@@ -633,8 +634,8 @@ mod tests {
         let unindexed_root = temp_git_repo("autosync-unindexed");
         let mut config = test_config(&unindexed_root);
         config.database = indexed_config.database.clone();
-        config.trackers = vec![crate::config::TrackerConfig {
-            provider: crate::config::Tracker::Github,
+        config.trackers = vec![rag_rat_base::config::TrackerConfig {
+            provider: rag_rat_base::config::Tracker::Github,
             project: Some("o/r".to_string()),
             remote: "origin".to_string(),
             base_url: Some("http://127.0.0.1:9".to_string()),
@@ -729,8 +730,8 @@ mod tests {
         let (url, _stub) = spawn_script_stub(script);
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = test_config(tmp.path());
-        config.trackers = vec![crate::config::TrackerConfig {
-            provider: crate::config::Tracker::Github,
+        config.trackers = vec![rag_rat_base::config::TrackerConfig {
+            provider: rag_rat_base::config::Tracker::Github,
             project: Some("o/r".to_string()),
             remote: "origin".to_string(),
             base_url: Some(url),
@@ -770,8 +771,8 @@ mod tests {
     fn stale_keyed_runner_steps_aside_before_any_mirror_work() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = test_config(tmp.path());
-        config.trackers = vec![crate::config::TrackerConfig {
-            provider: crate::config::Tracker::Github,
+        config.trackers = vec![rag_rat_base::config::TrackerConfig {
+            provider: rag_rat_base::config::Tracker::Github,
             project: Some("o/r".to_string()),
             remote: "origin".to_string(),
             base_url: Some("http://127.0.0.1:9".to_string()),

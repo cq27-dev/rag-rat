@@ -12,7 +12,7 @@ use crate::language::Language;
 impl Config {
     /// The deduplicated set of target directories (relative to [`Config::root`]) across all
     /// targets, in stable order. Used to scope `.gitignore` nested-discovery to the indexed trees
-    /// (see [`crate::index::ignore_rules::IgnoreMatcher::compile`]) instead of recursing the whole
+    /// (see `IgnoreMatcher::compile`) instead of recursing the whole
     /// root into unindexed siblings.
     pub fn target_directories(&self) -> Vec<PathBuf> {
         let mut seen = BTreeSet::new();
@@ -46,7 +46,7 @@ impl Config {
         let linked_targets = (|| {
             // `linked_path` may be the checkout root, a subdir of it, or the git dir (a hook); the
             // branch `rag-rat.toml` lives at the WORKDIR top, so resolve the workdir first.
-            let workdir = crate::index::discover_repo(linked_path)
+            let workdir = crate::repo_discover::discover_repo(linked_path)
                 .ok()
                 .and_then(|repo| repo.workdir().map(Path::to_path_buf))
                 .unwrap_or_else(|| linked_path.to_path_buf());
@@ -401,7 +401,7 @@ fn push_target(
 /// root to the repo top changed the indexed file set and could fail config load when a target dir
 /// exists only under the subdir (#219 review).
 pub(crate) fn anchor_root_to_main_worktree(root: &Path) -> PathBuf {
-    let Ok(repo) = crate::index::discover_repo(root) else {
+    let Ok(repo) = crate::repo_discover::discover_repo(root) else {
         return root.to_path_buf();
     };
     let (Some(workdir), Some(main_root)) = (repo.workdir(), config::main_worktree_root(root))

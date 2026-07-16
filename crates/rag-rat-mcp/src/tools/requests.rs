@@ -317,8 +317,8 @@ pub struct SymbolArgs {
     #[serde(
         rename = "id",
         default,
-        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
@@ -352,8 +352,8 @@ pub struct SymbolRefArgs {
     #[serde(
         rename = "id",
         default,
-        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
@@ -372,8 +372,8 @@ pub struct SymbolGraphArgs {
     #[serde(
         rename = "id",
         default,
-        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
@@ -406,8 +406,8 @@ pub struct CompareGraphTextArgs {
     #[serde(
         rename = "id",
         default,
-        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
@@ -437,8 +437,8 @@ pub struct ImpactArgs {
     #[serde(
         rename = "id",
         default,
-        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
@@ -617,8 +617,8 @@ pub struct MemoryBindArgs {
     #[serde(
         rename = "id",
         default,
-        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
@@ -636,16 +636,16 @@ pub struct MemoryBindArgs {
     #[serde(
         rename = "start_id",
         default,
-        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
     pub start_logical_symbol_id: Option<i64>,
     #[serde(
         rename = "end_id",
         default,
-        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
     pub end_logical_symbol_id: Option<i64>,
@@ -720,8 +720,8 @@ pub struct MemoryForSymbolArgs {
     #[serde(
         rename = "id",
         default,
-        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
@@ -1001,8 +1001,8 @@ pub struct ClonesForSymbolArgs {
     #[serde(
         rename = "id",
         default,
-        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
@@ -1037,7 +1037,7 @@ impl ClonesForSymbolArgs {
         }
 
         if let Some(id) = self.logical_symbol_id {
-            return Ok(CloneSymbolSelector::Id(rag_rat_core::serde_big_id::format_sym_handle(id)));
+            return Ok(CloneSymbolSelector::Id(rag_rat_base::serde_big_id::format_sym_handle(id)));
         }
         if let Some(r) = self.symbol_ref {
             return Ok(CloneSymbolSelector::Ref(r));

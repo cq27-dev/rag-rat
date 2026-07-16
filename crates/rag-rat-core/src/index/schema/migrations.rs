@@ -1807,11 +1807,11 @@ pub(crate) fn apply_clone_subblock_postings_tables(conn: &Connection) -> rusqlit
 /// STRICT per repo convention.
 ///
 /// The seed placeholder row (`repo_id = '__unassigned__'`, which MUST equal
-/// [`super::LEGACY_REPO_ID`]) marks a legacy single-repo DB awaiting adoption: the first
-/// post-migration open calls [`super::register_repo`], which rewrites the placeholder to the real
-/// content-derived `repo_id` in one step. A consolidated DB holding more than one repo never
-/// carries the placeholder — `register_repo` refuses to adopt when a different real id already
-/// owns the DB.
+/// [`rag_rat_base::repo_identity::LEGACY_REPO_ID`]) marks a legacy single-repo DB awaiting
+/// adoption: the first post-migration open calls [`super::register_repo`], which rewrites the
+/// placeholder to the real content-derived `repo_id` in one step. A consolidated DB holding more
+/// than one repo never carries the placeholder — `register_repo` refuses to adopt when a different
+/// real id already owns the DB.
 ///
 /// `repo_roots`/`repo_meta` carry an `ON DELETE CASCADE` FK to `repos` (NOT to a reindex-volatile
 /// parent), so the volatile-FK trip-wire does not flag them and they need no allowlist entry.
@@ -1827,9 +1827,9 @@ pub(crate) fn apply_repos_registry(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(REPOS_REGISTRY_DDL)
 }
 
-/// V038 DDL. The placeholder literal `'__unassigned__'` MUST equal [`super::LEGACY_REPO_ID`] —
-/// `super::register_repo` reads that constant when it adopts the row (a matching bootstrap test
-/// pins the two together).
+/// V038 DDL. The placeholder literal `'__unassigned__'` MUST equal
+/// [`rag_rat_base::repo_identity::LEGACY_REPO_ID`] — `super::register_repo` reads that constant
+/// when it adopts the row (a matching bootstrap test pins the two together).
 pub(crate) const REPOS_REGISTRY_DDL: &str = "
     CREATE TABLE IF NOT EXISTS repos(
         repo_id          TEXT PRIMARY KEY,
@@ -1897,10 +1897,10 @@ const V039_RECONCILE_META_KEYS: &[&str] =
 /// V039 (memory-sync phase A2): relocate the per-repo singleton meta keys out of the global
 /// `index_meta` / `reconcile_meta` into `repo_meta`, under the SOLE `repos` row that owns this DB
 /// (see [`sole_repo_id`]) — the real repo_id when the DB was already adopted, else the
-/// [`super::LEGACY_REPO_ID`] placeholder V038 seeds. Targeting the sole row (not a hardcoded
-/// placeholder) is what keeps the `repo_meta → repos` FK satisfied on an ADOPTED DB, where the
-/// placeholder row is gone. The read/write call sites move to the `repo_meta` accessors in the same
-/// change, so a moved key is never read from the table it was deleted from.
+/// [`rag_rat_base::repo_identity::LEGACY_REPO_ID`] placeholder V038 seeds. Targeting the sole row
+/// (not a hardcoded placeholder) is what keeps the `repo_meta → repos` FK satisfied on an ADOPTED
+/// DB, where the placeholder row is gone. The read/write call sites move to the `repo_meta`
+/// accessors in the same change, so a moved key is never read from the table it was deleted from.
 ///
 /// Idempotent (`INSERT OR IGNORE` deduped by the `(repo_id, key)` PK + `DELETE` of the source
 /// rows): a fresh DB has empty meta tables → the copy/delete are no-ops, and a forward-migrated
@@ -1973,7 +1973,8 @@ fn relocate_meta_keys(
 }
 
 /// The single `repos` row that owns this DB at migration time — the real repo_id if it was already
-/// adopted via [`super::register_repo`], else the [`super::LEGACY_REPO_ID`] placeholder V038 seeds.
+/// adopted via [`super::register_repo`], else the [`rag_rat_base::repo_identity::LEGACY_REPO_ID`]
+/// placeholder V038 seeds.
 ///
 /// The relocation MUST target this id, not a hardcoded placeholder: on an adopted DB the
 /// placeholder row is deleted, so an `INSERT` into `repo_meta` under it trips the `repo_meta →
@@ -2002,9 +2003,9 @@ fn sole_repo_id(conn: &Connection) -> rusqlite::Result<String> {
 }
 
 /// The `repo_id` column added to every direct-scoped core table in V040. `NOT NULL DEFAULT` the
-/// [`super::LEGACY_REPO_ID`] placeholder: existing rows backfill to the placeholder, which
-/// `register_repo` rewrites to the real id at adoption (the A1/A2 pattern), and any writer that
-/// forgets to stamp still produces a scannable single-repo value rather than NULL.
+/// [`rag_rat_base::repo_identity::LEGACY_REPO_ID`] placeholder: existing rows backfill to the
+/// placeholder, which `register_repo` rewrites to the real id at adoption (the A1/A2 pattern), and
+/// any writer that forgets to stamp still produces a scannable single-repo value rather than NULL.
 const REPO_ID_COLUMN_DEF: &str = "TEXT NOT NULL DEFAULT '__unassigned__'";
 
 /// The `index_meta` keys V040 relocates into `repo_meta` — the active-embedding-model provenance
@@ -2169,7 +2170,7 @@ pub(crate) fn apply_repo_id_core_scoping(conn: &Connection) -> rusqlite::Result<
 fn backfill_repo_id_to_sole_repo(conn: &Connection) -> rusqlite::Result<()> {
     let target = sole_repo_id(conn)?;
     // Not adopted yet: rows already carry the placeholder; `register_repo` re-points at adoption.
-    if target == super::LEGACY_REPO_ID {
+    if target == rag_rat_base::repo_identity::LEGACY_REPO_ID {
         return Ok(());
     }
     for table in [
@@ -2183,7 +2184,7 @@ fn backfill_repo_id_to_sole_repo(conn: &Connection) -> rusqlite::Result<()> {
     ] {
         conn.execute(&format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"), [
             target.as_str(),
-            super::LEGACY_REPO_ID,
+            rag_rat_base::repo_identity::LEGACY_REPO_ID,
         ])?;
     }
     Ok(())
@@ -2568,20 +2569,20 @@ fn backfill_github_repo_id_to_sole_repo(conn: &Connection) -> rusqlite::Result<(
         return Ok(());
     }
     let target = sole_repo_id(conn)?;
-    if target == super::LEGACY_REPO_ID {
+    if target == rag_rat_base::repo_identity::LEGACY_REPO_ID {
         return Ok(());
     }
     for table in V041_GITHUB_SCOPED_TABLES {
         conn.execute(&format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"), [
             target.as_str(),
-            super::LEGACY_REPO_ID,
+            rag_rat_base::repo_identity::LEGACY_REPO_ID,
         ])?;
     }
     // The own-content FTS mirror carries its own `repo_id UNINDEXED` value; re-point it in place
     // too.
     conn.execute("UPDATE github_fts SET repo_id = ?1 WHERE repo_id = ?2", [
         target.as_str(),
-        super::LEGACY_REPO_ID,
+        rag_rat_base::repo_identity::LEGACY_REPO_ID,
     ])?;
     Ok(())
 }
@@ -3833,7 +3834,7 @@ fn backfill_periphery_repo_id_to_sole_repo(conn: &Connection) -> rusqlite::Resul
         return Ok(());
     }
     let target = sole_repo_id(conn)?;
-    if target == super::LEGACY_REPO_ID {
+    if target == rag_rat_base::repo_identity::LEGACY_REPO_ID {
         return Ok(());
     }
     for table in [
@@ -3851,7 +3852,7 @@ fn backfill_periphery_repo_id_to_sole_repo(conn: &Connection) -> rusqlite::Resul
     ] {
         conn.execute(&format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"), [
             target.as_str(),
-            super::LEGACY_REPO_ID,
+            rag_rat_base::repo_identity::LEGACY_REPO_ID,
         ])?;
     }
     Ok(())

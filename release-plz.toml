@@ -40,3 +40,8 @@ changelog_path = "./CHANGELOG.md"
 name = "rag-rat-mcp"
 version_group = "rag-rat"
 changelog_path = "./CHANGELOG.md"
+
+[[package]]
+name = "rag-rat-base"
+version_group = "rag-rat"
+changelog_path = "./CHANGELOG.md"

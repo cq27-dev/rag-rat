@@ -1,7 +1,8 @@
 //! Repo-memory commands, split out of the `commands` god-module: `memory` (doctor / rebind / list
 //! / show) with its `*_bind_target` selector helpers, and `dream` (the deterministic
 //! memory-maintenance worklist pass).
-use rag_rat_core::{Config, OutputFormat};
+use rag_rat_base::config::Config;
+use rag_rat_core::OutputFormat;
 
 use crate::cli::{DreamArgs, MemoryArgs, MemoryCommand};
 use crate::commands::output_format;
@@ -28,8 +29,8 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     // indexer block for the run's duration. That is acceptable because `dream --verify/--compact`
     // is an EXPLICIT, human-invoked batch command run at most a few times a day — not a hot path.
     // A finer-grained lock (release during model I/O) is deferred until that cadence proves wrong.
-    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
-    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     let db = open_index(config)?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

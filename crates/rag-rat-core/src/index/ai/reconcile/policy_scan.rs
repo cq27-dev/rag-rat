@@ -88,9 +88,9 @@ fn classify_collected_file(
     let parsed = needs_low_signal
         .then(|| {
             reconstruct_file_text(chunks)
-                .filter(|buf| crate::index::util::hex_sha256(buf.as_bytes()) == sha256)
+                .filter(|buf| rag_rat_base::hash::hex_sha256(buf.as_bytes()) == sha256)
                 .and_then(|buf| {
-                    let lang = language.parse::<crate::language::Language>().ok()?;
+                    let lang = language.parse::<rag_rat_base::language::Language>().ok()?;
                     crate::index::parser::parse_file(std::path::Path::new(path), lang, &buf)
                         .map(|pf| (lang, pf))
                 })
@@ -286,8 +286,8 @@ fn for_each_recomputed_chunk_policy(
         // gate).
         let structural = file_kind != "generated"
             && language
-                .parse::<crate::language::Language>()
-                .is_ok_and(|l| l != crate::language::Language::Markdown);
+                .parse::<rag_rat_base::language::Language>()
+                .is_ok_and(|l| l != rag_rat_base::language::Language::Markdown);
         if streaming {
             emit(
                 &chunk,

@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::config::Config;
+use rag_rat_base::config::Config;
+
 use crate::index::ai::ReconcileOptions;
 use crate::index::{IndexDatabase, IndexProgress};
 
@@ -300,8 +301,8 @@ pub fn reindex_paths<F>(
 where
     F: FnMut(IndexProgress),
 {
-    let lock_repo = crate::locks::write_lock_repo_id(config);
-    let _lock = crate::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
 
     let WorktreePartition { base_paths, linked_roots, manifest_roots } =
         partition_paths_by_worktree(config, paths);

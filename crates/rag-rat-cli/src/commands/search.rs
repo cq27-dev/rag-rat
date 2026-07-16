@@ -1,7 +1,7 @@
 //! Search / orientation commands, split out of the `commands` god-module: `query`, `brief`,
 //! `clusters`, and `important_symbols` (with its auto-run ranking-hint nudge). All read-only over
 //! an already-built index.
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 
 use crate::cli::{BriefArgs, ClustersArgs, ImportantSymbolsArgs, QueryArgs};
 use crate::open_index;

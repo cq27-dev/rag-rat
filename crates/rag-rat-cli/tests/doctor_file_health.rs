@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 

@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use rag_rat_base::config::{Tracker, TrackerAuth, TrackerConfig};
 use sha2::{Digest, Sha256};
 
 use super::TrackerAuthentication;
-use crate::config::{Tracker, TrackerAuth, TrackerConfig};
 
 /// One tracker binding with its `project` resolved to a concrete value — the runtime shape
 /// behind [`super::PapertrailContext`]. The context carries a LIST of these so the mirror sync
@@ -266,7 +266,7 @@ pub(crate) fn parse_git_remote_url(url: &str) -> Option<GitRemoteParts> {
 /// from git config via gix — no subprocess, works offline, and resolves the SHARED repo config
 /// from any linked worktree.
 fn git_remote_url(root: &Path, remote: &str) -> Option<String> {
-    let repo = crate::index::git_context::discover_repo(root).ok()?;
+    let repo = rag_rat_base::repo_discover::discover_repo(root).ok()?;
     let key = format!("remote.{remote}.url");
     let url = repo.config_snapshot().string(key.as_str())?.to_string();
     let url = url.trim();

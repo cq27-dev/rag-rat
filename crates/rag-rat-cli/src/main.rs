@@ -14,9 +14,10 @@ use clap::Parser;
 pub(crate) use commands::*;
 pub(crate) use fs_atomic::*;
 pub(crate) use hooks_support::*;
+use rag_rat_base::config::Config;
+use rag_rat_core::IndexDatabase;
 use rag_rat_core::index::IndexProgress;
 use rag_rat_core::search::lexical::SearchHit;
-use rag_rat_core::{Config, IndexDatabase};
 pub(crate) use render::*;
 
 use crate::cli::{Cli, Command as Cmd, DoctorArgs};
@@ -95,7 +96,7 @@ fn main() -> anyhow::Result<()> {
     // `Cmd::Init` / `Cmd::AgentHook` returned above (no config, and agent-hook fires
     // per-tool-call — logging it would flood the per-process dir and evict the mcp/maintenance
     // signal).
-    let _log = rag_rat_core::logging::init_logging(&config, log_role(&cli.command));
+    let _log = rag_rat_base::logging::init_logging(&config, log_role(&cli.command));
 
     match cli.command {
         Cmd::Init(_) | Cmd::AgentHook | Cmd::Mcp | Cmd::Doctor(_) =>
@@ -122,9 +123,9 @@ fn main() -> anyhow::Result<()> {
             // abandoned, not in-progress — and every rebuild entry now takes the flock
             // too (batch 6), so a gc racing a mid-flight rebuild serializes with it
             // instead of sweeping the staged generation out from under it.
-            let lock_repo = rag_rat_core::locks::write_lock_repo_id(&config);
+            let lock_repo = rag_rat_base::locks::write_lock_repo_id(&config);
             let _lock =
-                rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+                rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
             let db = open_index(&config)?;
             print_output(&db.garbage_collect()?)?;
         },
@@ -149,7 +150,7 @@ fn main() -> anyhow::Result<()> {
 /// SessionStart digest read that cache. Best-effort + non-blocking: the actual crates.io call runs
 /// at most once per TTL (gated by `needs_refresh`), fail-open; the thread dies with the process (a
 /// hot-upgrade re-exec re-spawns it). No-op when version checking is disabled.
-fn spawn_detached_version_refresh(config: &rag_rat_core::Config) {
+fn spawn_detached_version_refresh(config: &rag_rat_base::config::Config) {
     use rag_rat_core::version_check;
     /// Poll cadence — well under the TTL so the once-per-day network refresh actually fires on a
     /// server that outlives the TTL, while the cache read in between is trivially cheap.
@@ -189,7 +190,7 @@ fn spawn_detached_version_refresh(config: &rag_rat_core::Config) {
 /// through the minutes-long subprocess, and the #82/#83 TOCTOU gates stay armed. A `Blocked`
 /// outcome (tool not installed) is a no-op: the loop simply sleeps to the next tick rather than
 /// spinning on it.
-fn spawn_detached_oracle_auto_run(config: &rag_rat_core::Config) {
+fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
     use rag_rat_core::index::oracle::{self, AutoRunDecision, AutoRunInputs, OracleTool};
     if !config.oracle.auto_run {
         return;
@@ -223,7 +224,7 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_core::Config) {
     /// take the lock-free production path. Returns `Ok(())` even when nothing ran — the caller only
     /// uses it to swallow errors fail-open.
     fn maybe_run_oracle_once(
-        config: &rag_rat_core::Config,
+        config: &rag_rat_base::config::Config,
         quiet_period_ms: i64,
         min_interval_ms: i64,
     ) -> anyhow::Result<()> {
@@ -280,7 +281,7 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_core::Config) {
     /// `.scip` OUTSIDE the lock, then run only the join/write under the lock. A `Blocked`
     /// production is a no-op (returns `Ok`).
     fn run_oracle_tool_background(
-        config: &rag_rat_core::Config,
+        config: &rag_rat_base::config::Config,
         tool: OracleTool,
     ) -> anyhow::Result<()> {
         // Stamp the start INSIDE the same write-lock as the pre-spawn snapshot so no watcher
@@ -340,7 +341,7 @@ pub(crate) fn load_config_or_hint(explicit: Option<&str>) -> anyhow::Result<Conf
         None => anyhow::bail!(
             "No rag-rat config found at `{}`.\nRun `rag-rat init` to create one, or pass --config \
              <path>.",
-            rag_rat_core::config::discover_config_path(Path::new(".")).display()
+            rag_rat_base::config::discover_config_path(Path::new(".")).display()
         ),
     }
 }
@@ -348,7 +349,7 @@ pub(crate) fn load_config_or_hint(explicit: Option<&str>) -> anyhow::Result<Conf
 /// Resolve a config WITHOUT the fail-fast hint, distinguishing "absent" from "broken":
 ///  * explicit `--config` given → taken literally; a MISSING file is a loud error (a user override
 ///    that can't be honored), an invalid file propagates its parse error.
-///  * no `--config` → discover from cwd via [`rag_rat_core::config::discover_config_path`] (the
+///  * no `--config` → discover from cwd via [`rag_rat_base::config::discover_config_path`] (the
 ///    governing seam: local file, else linked-worktree main, else the ancestor walk). Absent ⇒
 ///    `Ok(None)` so the caller can degrade gracefully (dormant `mcp`, global-store `doctor`);
 ///    present-but-invalid ⇒ the parse error — a real repo with a broken config must NOT silently
@@ -367,7 +368,7 @@ fn discover_config_optional(explicit: Option<&str>) -> anyhow::Result<Option<Con
             Ok(Some(Config::load(path)?))
         },
         None => {
-            let path = rag_rat_core::config::discover_config_path(Path::new("."));
+            let path = rag_rat_base::config::discover_config_path(Path::new("."));
             // Only a GENUINELY ABSENT path is "no config" (graceful). A path that EXISTS but is not
             // a readable config file (e.g. a directory named `rag-rat.toml`) is
             // present-but-invalid: let `Config::load` surface the error rather than
@@ -393,7 +394,7 @@ fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> {
     // the server's lifetime; a dormant server writes no log (there is no repo to anchor it to).
     let _log = config.as_ref().map(|config| {
         apply_embedding_runtime_env(&config.llm.embedding.runtime);
-        rag_rat_core::logging::init_logging(config, rag_rat_core::logging::Role::Mcp)
+        rag_rat_base::logging::init_logging(config, rag_rat_base::logging::Role::Mcp)
     });
     if let Some(config) = &config {
         // Detached, fail-open, dies with the process — no-ops unless opted in. Never spawned for a
@@ -422,9 +423,9 @@ fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> {
 /// report fall back to the friendly "run rag-rat init" hint.
 fn run_doctor(args: &DoctorArgs, explicit: Option<&str>) -> anyhow::Result<()> {
     if let Some(config) = discover_config_optional(explicit)? {
-        let _log = rag_rat_core::logging::init_logging(
+        let _log = rag_rat_base::logging::init_logging(
             &config,
-            rag_rat_core::logging::Role::Cli("doctor".to_string()),
+            rag_rat_base::logging::Role::Cli("doctor".to_string()),
         );
         return doctor(&config, args);
     }
@@ -437,23 +438,23 @@ fn run_doctor(args: &DoctorArgs, explicit: Option<&str>) -> anyhow::Result<()> {
         );
     }
     // A plain config-less `doctor` reports the machine-global store instead of erroring.
-    match rag_rat_core::data_dir::global_database_path() {
+    match rag_rat_base::data_dir::global_database_path() {
         Some(database) => doctor_global_store(&database),
         None => anyhow::bail!(
             "No rag-rat config found at `{}`, and this platform has no data directory for a \
              machine-global store.\nRun `rag-rat init` to create a config, or pass --config \
              <path>.",
-            rag_rat_core::config::discover_config_path(Path::new(".")).display()
+            rag_rat_base::config::discover_config_path(Path::new(".")).display()
         ),
     }
 }
 
-/// Map the invoked subcommand to a debug-log [`Role`](rag_rat_core::logging::Role) (drives the log
+/// Map the invoked subcommand to a debug-log [`Role`](rag_rat_base::logging::Role) (drives the log
 /// file name + startup event). The git hooks invoke `rag-rat maintenance --trigger post-*`, so a
 /// maintenance pass with a git-origin trigger is the `hook` role — the reconcile/embedding path we
 /// most want to trace. A manual `maintenance` and every other command are `cli:<name>`.
-fn log_role(cmd: &Cmd) -> rag_rat_core::logging::Role {
-    use rag_rat_core::logging::Role;
+fn log_role(cmd: &Cmd) -> rag_rat_base::logging::Role {
+    use rag_rat_base::logging::Role;
     match cmd {
         Cmd::Mcp => Role::Mcp,
         Cmd::Maintenance(args) if is_git_hook_trigger(args.trigger.as_deref()) => Role::Hook,

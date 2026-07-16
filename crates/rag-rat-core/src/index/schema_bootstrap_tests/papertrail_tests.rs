@@ -184,7 +184,7 @@ fn production_discovery_persists_refs_for_every_configured_tracker() {
                 provider: papertrail::Tracker::Gitlab,
                 project: "group/sub/repo".to_string(),
                 base_url: None,
-                auth: Some(crate::config::TrackerAuth::Env("GITLAB_TOKEN".to_string())),
+                auth: Some(rag_rat_base::config::TrackerAuth::Env("GITLAB_TOKEN".to_string())),
                 authentication: papertrail::TrackerAuthentication::AuthConfigured,
                 tags: Vec::new(),
             },

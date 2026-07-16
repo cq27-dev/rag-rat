@@ -4,9 +4,10 @@
 
 use std::path::PathBuf;
 
+use rag_rat_base::config::Config;
+use rag_rat_base::repo_identity;
+
 use super::schema;
-use crate::config::Config;
-use crate::repo_identity;
 use crate::storage::IndexConnection;
 
 /// `true` iff indexing `config` would walk at least one target file. `false` means the index would
@@ -222,9 +223,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
+    use rag_rat_base::language::Language;
+
     use super::*;
-    use crate::config::{Config, ResolvedTarget, TargetKind};
-    use crate::language::Language;
 
     // `schema_bootstrap_tests::source_config` / `unique_temp_root` are private to that module and
     // not reachable from here (a sibling of `index`, not a descendant of `schema_bootstrap_tests`)
@@ -348,7 +350,7 @@ mod tests {
         config_b.root = root_b.clone();
 
         let expected_repo_id =
-            crate::repo_identity::resolve_repo_identity(&root_a, None).unwrap().repo_id;
+            rag_rat_base::repo_identity::resolve_repo_identity(&root_a, None).unwrap().repo_id;
         let note = same_identity_join_note(&config_b).unwrap().unwrap();
         assert_eq!(note.repo_id, expected_repo_id);
         assert_eq!(note.existing_root, root_a);

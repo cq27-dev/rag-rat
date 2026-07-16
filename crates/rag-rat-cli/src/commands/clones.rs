@@ -1,7 +1,7 @@
 //! Clone-detection commands, split out of the `commands` god-module: `clones` (listing / recall /
 //! explain / precompute) and `clones-for` (per-symbol clone class), plus the pure
 //! `recall_signature` / `print_clone_explain` render helpers they call.
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 
 use crate::cli::{ClonesArgs, ClonesForArgs};
 use crate::open_index;
@@ -11,8 +11,8 @@ pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
     // `--precompute`: the WRITER path — build/refresh the persisted clone-edge graph (#286) under a
     // write lock (mirroring `maintenance`), then print the build report instead of a clone listing.
     if args.precompute {
-        let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
-        let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+        let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+        let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
         let db = open_index(config)?;
         let report: rag_rat_core::index::CloneEdgeReport =
             db.precompute_clone_graph(args.max_seconds)?;
@@ -182,7 +182,7 @@ pub(crate) fn clones_for(config: &Config, args: &ClonesForArgs) -> anyhow::Resul
         // `sym_utils.rs::load_user`) AND the token parses as a valid sym_<hex> handle. A
         // file named `sym_*` with a `::` separator must route to Ref, not Id, so it resolves
         // by qualified name instead of failing `parse_sym_handle` and returning unresolved.
-            if !sym.contains("::") && rag_rat_core::serde_big_id::parse_sym_handle(sym).is_some() {
+            if !sym.contains("::") && rag_rat_base::serde_big_id::parse_sym_handle(sym).is_some() {
                 CloneSymbolSelector::Id(sym.clone())
             } else {
                 CloneSymbolSelector::Ref(sym.clone())
@@ -214,9 +214,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use rag_rat_core::config::{ResolvedTarget, TargetKind};
-    use rag_rat_core::language::Language;
-    use rag_rat_core::{Config, IndexDatabase};
+    use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
+    use rag_rat_base::language::Language;
+    use rag_rat_core::IndexDatabase;
 
     use crate::cli::ClonesArgs;
 
@@ -228,15 +228,15 @@ mod tests {
     /// Id ONLY when there is no `::` AND `parse_sym_handle` succeeds.
     #[test]
     fn clones_for_sym_prefixed_ref_routes_to_ref_not_id() {
+        use rag_rat_base::serde_big_id::parse_sym_handle;
         use rag_rat_core::index::CloneSymbolSelector;
-        use rag_rat_core::serde_big_id::parse_sym_handle;
 
         fn classify(sym: &str) -> &'static str {
             if !sym.contains("::") && parse_sym_handle(sym).is_some() { "Id" } else { "Ref" }
         }
 
         // A valid opaque handle (no `::`, valid hex suffix) → Id.
-        let valid_handle = rag_rat_core::serde_big_id::format_sym_handle(42i64);
+        let valid_handle = rag_rat_base::serde_big_id::format_sym_handle(42i64);
         assert_eq!(classify(&valid_handle), "Id", "a valid sym_<hex> handle must route to Id");
 
         // A file named `sym_*` with a `::` separator → Ref (the bug case).

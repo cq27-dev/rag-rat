@@ -16,6 +16,7 @@ name = "rag-rat"
 path = "src/main.rs"
 
 [dependencies]
+rag-rat-base.workspace = true
 anyhow.workspace = true
 clap = { version = "4.6", features = ["derive"] }
 dialoguer = "0.12"

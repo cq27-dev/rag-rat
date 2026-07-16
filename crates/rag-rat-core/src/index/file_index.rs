@@ -1,6 +1,8 @@
 //! The file → rows indexing pipeline: parse/chunk/symbol one file and write its chunk,
 //! symbol, and logical-group rows; heal a stale file in place.
 
+use rag_rat_base::hash::hex_sha256;
+
 use super::*;
 use crate::index::graph_index::{LogicalSymbolKey, LogicalSymbolMemberRow};
 

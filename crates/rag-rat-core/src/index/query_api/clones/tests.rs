@@ -192,20 +192,20 @@ fn find_clones_rejects_nan_and_non_finite_min_similarity() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let config = crate::Config {
+    let config = rag_rat_base::config::Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
-        targets: vec![crate::config::ResolvedTarget {
+        targets: vec![rag_rat_base::config::ResolvedTarget {
             name: "rust".to_string(),
-            language: crate::language::Language::Rust,
+            language: rag_rat_base::language::Language::Rust,
             directories: vec![std::path::PathBuf::from("src")],
             include: vec!["src/".to_string()],
             exclude: Vec::new(),
-            kind: crate::config::TargetKind::Source,
+            kind: rag_rat_base::config::TargetKind::Source,
         }],
         llm: Default::default(),
         watch: Default::default(),
@@ -459,10 +459,10 @@ fn small_component_metrics_sampled_is_false() {
 
 #[test]
 fn parse_sym_handle_accepts_valid_handles_and_rejects_others() {
-    use crate::serde_big_id::parse_sym_handle;
+    use rag_rat_base::serde_big_id::parse_sym_handle;
 
     // A valid sym_<hex> handle round-trips.
-    let h = crate::serde_big_id::format_sym_handle(12345i64);
+    let h = rag_rat_base::serde_big_id::format_sym_handle(12345i64);
     assert!(parse_sym_handle(&h).is_some());
 
     // A qualified name like `sym_utils.rs::load_user` is NOT a valid handle — it has `::`
@@ -780,20 +780,20 @@ fn recall_candidates_identical_blob_vs_postings_grouping() {
          } t + 1 }\n",
     )
     .unwrap();
-    let config = crate::Config {
+    let config = rag_rat_base::config::Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
-        targets: vec![crate::config::ResolvedTarget {
+        targets: vec![rag_rat_base::config::ResolvedTarget {
             name: "rust".to_string(),
-            language: crate::language::Language::Rust,
+            language: rag_rat_base::language::Language::Rust,
             directories: vec![std::path::PathBuf::from("src")],
             include: vec!["src/".to_string()],
             exclude: Vec::new(),
-            kind: crate::config::TargetKind::Source,
+            kind: rag_rat_base::config::TargetKind::Source,
         }],
         llm: Default::default(),
         watch: Default::default(),

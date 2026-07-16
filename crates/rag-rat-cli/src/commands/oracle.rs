@@ -6,7 +6,8 @@
 use std::fs;
 use std::path::Path;
 
-use rag_rat_core::{Config, IndexDatabase};
+use rag_rat_base::config::Config;
+use rag_rat_core::IndexDatabase;
 
 use crate::cli::{OracleArgs, OracleCommand, OracleReportArgs, OracleRunArgs, OracleStatusArgs};
 use crate::{open_index, print_output};
@@ -40,8 +41,8 @@ pub(crate) fn with_oracle_write_lock<T>(
     config: &Config,
     body: impl FnOnce(&IndexDatabase) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
-    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     let db = open_index(config)?;
     body(&db)
 }
@@ -445,10 +446,10 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use rag_rat_core::config::{ResolvedTarget, TargetKind};
-    use rag_rat_core::language::Language;
-    use rag_rat_core::locks::{FileLock, write_lock_path, write_lock_repo_id};
-    use rag_rat_core::{Config, IndexDatabase};
+    use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
+    use rag_rat_base::language::Language;
+    use rag_rat_base::locks::{FileLock, write_lock_path, write_lock_repo_id};
+    use rag_rat_core::IndexDatabase;
 
     use crate::cli::{OracleArgs, OracleCommand, OracleRunArgs, OracleToolArg};
 

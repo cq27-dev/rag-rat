@@ -107,7 +107,7 @@ fn memory_search_self_heals_fts_corruption() {
     );
 
     let hits = db
-        .memory_search("witness", 10, crate::config::MemorySurface::Full)
+        .memory_search("witness", 10, rag_rat_base::config::MemorySurface::Full)
         .expect("memory_search self-heals");
     assert_eq!(hits.len(), 1, "the healed FTS serves the memory");
     assert_eq!(hits[0].title, "corruption witness memory");

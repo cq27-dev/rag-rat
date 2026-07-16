@@ -1107,8 +1107,9 @@ fn swift_enum_has_explicit_raw_value(declaration: Node<'_>) -> bool {
 mod tests {
     use std::path::Path;
 
+    use rag_rat_base::language::Language;
+
     use super::*;
-    use crate::language::Language;
 
     fn edges(src: &str) -> Vec<EdgeCandidate> {
         syntactic_edges(Path::new("Sources/App/App.swift"), Language::Swift, src, &[])

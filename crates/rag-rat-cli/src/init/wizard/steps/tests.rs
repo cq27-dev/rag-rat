@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use rag_rat_core::config::{DEFAULT_QUERY_ENDPOINT, RemoteBackend, RemoteEmbeddingConfig};
-use rag_rat_core::embedding_models::{Backend, EMBEDDING_MODELS};
-use rag_rat_core::language::Language;
+use rag_rat_base::config::{DEFAULT_QUERY_ENDPOINT, RemoteBackend, RemoteEmbeddingConfig};
+use rag_rat_base::embedding_models::{Backend, EMBEDDING_MODELS};
+use rag_rat_base::language::Language;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

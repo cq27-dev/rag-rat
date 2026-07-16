@@ -19,6 +19,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use rag_rat_base::language::Language;
 use rusqlite::types::Value;
 use rusqlite::{Connection, params, params_from_iter};
 use serde::Serialize;
@@ -31,7 +32,6 @@ use super::{HYDRATION_CHUNK, THETA};
 use crate::index::clones::bag_blob::decode_token_bag;
 use crate::index::clones::{NORM_VERSION, SymbolFingerprint, fingerprint_symbols};
 use crate::index::{IndexDatabase, parser, symbols};
-use crate::language::Language;
 
 /// One file to clone-check (owns its data so a batch can be assembled from disparate sources).
 pub struct CloneCheckInput {
@@ -664,20 +664,20 @@ mod tests {
             "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n",
         )
         .unwrap();
-        let config = crate::Config {
+        let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
-            targets: vec![crate::config::ResolvedTarget {
+            targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
-                language: crate::language::Language::Rust,
+                language: rag_rat_base::language::Language::Rust,
                 directories: vec![std::path::PathBuf::from("src")],
                 include: vec!["src/".to_string()],
                 exclude: Vec::new(),
-                kind: crate::config::TargetKind::Source,
+                kind: rag_rat_base::config::TargetKind::Source,
             }],
             llm: Default::default(),
             watch: Default::default(),
@@ -700,7 +700,7 @@ mod tests {
         let hits = db
             .clones_of_text(
                 exact_text,
-                crate::language::Language::Rust,
+                rag_rat_base::language::Language::Rust,
                 std::path::Path::new("new.rs"),
                 super::THETA,
             )
@@ -718,12 +718,12 @@ mod tests {
             CloneCheckInput {
                 text: "pub fn a_clone(s: Db) -> i32 { let x = s.get(1); validate(x); x + 1 }\n"
                     .to_string(),
-                language: crate::language::Language::Rust,
+                language: rag_rat_base::language::Language::Rust,
                 path: std::path::PathBuf::from("a.rs"),
             },
             CloneCheckInput {
                 text: "pub fn unrelated() -> i32 { 42 }\n".to_string(),
-                language: crate::language::Language::Rust,
+                language: rag_rat_base::language::Language::Rust,
                 path: std::path::PathBuf::from("b.rs"),
             },
         ];
@@ -743,7 +743,7 @@ mod tests {
         let hits = db
             .clones_of_text(
                 edited,
-                crate::language::Language::Rust,
+                rag_rat_base::language::Language::Rust,
                 std::path::Path::new("src/lib.rs"),
                 super::THETA,
             )
@@ -757,7 +757,7 @@ mod tests {
         let none = db
             .clones_of_text(
                 "not real code !!!",
-                crate::language::Language::Rust,
+                rag_rat_base::language::Language::Rust,
                 std::path::Path::new("x.rs"),
                 super::THETA,
             )
@@ -781,20 +781,20 @@ mod tests {
         )
         .unwrap();
         let db_path = root.join(".rag-rat/index.sqlite");
-        let config = crate::Config {
+        let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
             database: db_path.clone(),
-            targets: vec![crate::config::ResolvedTarget {
+            targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
-                language: crate::language::Language::Rust,
+                language: rag_rat_base::language::Language::Rust,
                 directories: vec![std::path::PathBuf::from("src")],
                 include: vec!["src/".to_string()],
                 exclude: Vec::new(),
-                kind: crate::config::TargetKind::Source,
+                kind: rag_rat_base::config::TargetKind::Source,
             }],
             llm: Default::default(),
             watch: Default::default(),
@@ -852,20 +852,20 @@ mod tests {
              } }\n",
         )
         .unwrap();
-        let config = crate::Config {
+        let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
-            targets: vec![crate::config::ResolvedTarget {
+            targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
-                language: crate::language::Language::Rust,
+                language: rag_rat_base::language::Language::Rust,
                 directories: vec![std::path::PathBuf::from("src")],
                 include: vec!["src/".to_string()],
                 exclude: Vec::new(),
-                kind: crate::config::TargetKind::Source,
+                kind: rag_rat_base::config::TargetKind::Source,
             }],
             llm: Default::default(),
             watch: Default::default(),
@@ -885,7 +885,7 @@ mod tests {
         let hits = db
             .clones_of_text(
                 new_code,
-                crate::language::Language::Rust,
+                rag_rat_base::language::Language::Rust,
                 std::path::Path::new("src/other.rs"),
                 super::THETA,
             )
@@ -903,7 +903,7 @@ mod tests {
         let test_hits = db
             .clones_of_text(
                 new_code,
-                crate::language::Language::Rust,
+                rag_rat_base::language::Language::Rust,
                 std::path::Path::new("tests/it.rs"),
                 super::THETA,
             )
@@ -946,15 +946,15 @@ mod tests {
             "def load_user(db):\n    u = db.get(10)\n    validate(u)\n    return u + 1\n",
         )
         .unwrap();
-        let target = |name: &str, language, dir: &str| crate::config::ResolvedTarget {
+        let target = |name: &str, language, dir: &str| rag_rat_base::config::ResolvedTarget {
             name: name.to_string(),
             language,
             directories: vec![std::path::PathBuf::from(dir)],
             include: vec![format!("{dir}/")],
             exclude: Vec::new(),
-            kind: crate::config::TargetKind::Source,
+            kind: rag_rat_base::config::TargetKind::Source,
         };
-        let config = crate::Config {
+        let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             repo_id_override: None,
@@ -962,8 +962,8 @@ mod tests {
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![
-                target("rust", crate::language::Language::Rust, "src"),
-                target("python", crate::language::Language::Python, "py"),
+                target("rust", rag_rat_base::language::Language::Rust, "src"),
+                target("python", rag_rat_base::language::Language::Python, "py"),
             ],
             llm: Default::default(),
             watch: Default::default(),
@@ -1000,7 +1000,7 @@ mod tests {
                 corpus,
                 conn,
                 text,
-                crate::language::Language::Rust,
+                rag_rat_base::language::Language::Rust,
                 std::path::Path::new(path),
                 super::THETA,
             )
@@ -1013,7 +1013,7 @@ mod tests {
     /// `check_against` builds per new function) so a test can call `near_candidate_bags` directly.
     fn probe_bag(text: &str, df: &std::collections::HashMap<i64, i64>) -> super::SymbolBag {
         let path = std::path::Path::new("probe.rs");
-        let lang = crate::language::Language::Rust;
+        let lang = rag_rat_base::language::Language::Rust;
         let syms = crate::index::symbols::symbols_for_file(path, lang, text);
         let parsed = crate::index::parser::parse_file(path, lang, text).unwrap();
         let fps = crate::index::clones::fingerprint_symbols(parsed.root(), text, lang, &syms);

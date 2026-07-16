@@ -2,7 +2,7 @@
 //! (memory-sync phase A7). The logic lives in `rag_rat_core::index::consolidate`; this is the thin
 //! CLI shim that renders the outcome (a pinned `database` key is refused inside `run` with the
 //! remove-the-key remedy, so every rendered import is a completed import + rename).
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 use rag_rat_core::index::consolidate::{self, ConsolidateOutcome};
 
 use crate::render::print_output;

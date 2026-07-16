@@ -1,3 +1,5 @@
+use rag_rat_base::hash::hex_sha256;
+
 use super::*;
 
 /// What an incremental file pass did, split by what each count gates downstream: `indexed`
@@ -124,8 +126,9 @@ impl IndexDatabase {
         // just depth-increment and a CLI one-shot `index` acquires it fresh. GLOBAL-LOCK
         // ORDERING RULE holds: per-repo taken before the global schema lock `open_bare` may
         // take (per-repo → global), same as every rebuild entry.
-        let lock_repo = crate::locks::write_lock_repo_id(config);
-        let _write_lock = crate::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+        let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+        let _write_lock =
+            rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
 
         // Open in ADOPTION-PENDING mode: the multi-repo fail-fast must not fire (the config below
         // supplies the scope, unlike a genuinely config-less `Self::open`), and the graph check is

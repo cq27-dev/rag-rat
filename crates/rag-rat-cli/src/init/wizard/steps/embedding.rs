@@ -3,11 +3,11 @@
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 
-use rag_rat_core::config::{
+use rag_rat_base::config::{
     DEFAULT_QUERY_ENDPOINT, MAX_REMOTE_EMBEDDING_CONCURRENCY, RemoteBackend, RemoteEmbeddingConfig,
     endpoint_authority_has_userinfo,
 };
-use rag_rat_core::embedding_models::{Backend, EMBEDDING_MODELS, EmbeddingModelSpec, spec};
+use rag_rat_base::embedding_models::{Backend, EMBEDDING_MODELS, EmbeddingModelSpec, spec};
 #[cfg(feature = "fastembed")]
 use rag_rat_core::index::ai::FastEmbedEmbedder;
 #[cfg(feature = "model2vec")]

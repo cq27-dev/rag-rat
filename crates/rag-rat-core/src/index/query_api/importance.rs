@@ -232,7 +232,8 @@ impl IndexDatabase {
             // dropped `symbol_id` (reindex-churned), so a bare number would be a stale
             // rowid that silently seeds the wrong symbol.
             if entry.starts_with("sym_") {
-                let Some(logical_symbol_id) = crate::serde_big_id::parse_sym_handle(entry) else {
+                let Some(logical_symbol_id) = rag_rat_base::serde_big_id::parse_sym_handle(entry)
+                else {
                     unresolved += 1;
                     continue;
                 };

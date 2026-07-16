@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+rag-rat-base.workspace = true
 anyhow.workspace = true
 rag-rat-core = { workspace = true }
 rmcp.workspace = true

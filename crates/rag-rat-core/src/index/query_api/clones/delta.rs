@@ -839,7 +839,7 @@ mod tests {
 
     /// One incremental index over the fixture root (the watcher's discover path — works without
     /// git), returning a fresh handle.
-    fn reindex(config: &crate::Config) -> crate::IndexDatabase {
+    fn reindex(config: &rag_rat_base::config::Config) -> crate::IndexDatabase {
         let (db, _changed) = crate::IndexDatabase::index_discover_reporting(config).unwrap();
         db
     }

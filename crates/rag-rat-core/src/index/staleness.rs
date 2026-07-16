@@ -1,6 +1,8 @@
 //! Staleness detection + lazy-heal reads: is an indexed file stale vs disk, which search hits are
 //! stale, regex/line reads over current source.
 
+use rag_rat_base::hash::hex_sha256;
+
 use super::*;
 
 /// Whether `search_with_heal` may lazily re-index files whose chunks have drifted from disk.

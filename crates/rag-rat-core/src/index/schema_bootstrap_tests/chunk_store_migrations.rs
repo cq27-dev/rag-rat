@@ -302,7 +302,7 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
     // Pre-#226 the open-time migrate took the SAME lock and self-deadlocked; A6 moved the migrate
     // onto the GLOBAL schema lock, so it is now an INDEPENDENT lock — the held per-repo write lock
     // never blocks it, and the open migrates immediately.
-    let _lock = crate::locks::WriteLock::acquire_blocking(&db_path, "testrepo0000").unwrap();
+    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&db_path, "testrepo0000").unwrap();
     let db =
         IndexDatabase::open(&db_path).expect("open migrates the Older schema under the held lock");
     assert_eq!(

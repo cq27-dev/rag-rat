@@ -42,12 +42,12 @@ use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
+use rag_rat_base::config::{RemoteBackend, RemoteEmbeddingConfig};
+use rag_rat_base::embedding_models::EmbeddingModelSpec;
 use serde::{Deserialize, Serialize};
 
 use super::Embedder;
 use super::openai::{OpenAiEmbedder, ProvisionedEmbedderParams};
-use crate::config::{RemoteBackend, RemoteEmbeddingConfig};
-use crate::embedding_models::EmbeddingModelSpec;
 
 /// The env var carrying the cookbook's JSON input. The recipe reads + parses it at startup.
 pub const COOKBOOK_INPUT_ENV: &str = "RAG_RAT_COOKBOOK_INPUT";
@@ -1241,7 +1241,7 @@ mod tests {
         let remote = RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
             cookbook: Some("@rag-rat/cookbook modal".to_string()),
-            query_endpoint: Some(crate::config::DEFAULT_QUERY_ENDPOINT.to_string()),
+            query_endpoint: Some(rag_rat_base::config::DEFAULT_QUERY_ENDPOINT.to_string()),
             ..RemoteEmbeddingConfig::default()
         };
         assert_eq!(cookbook_input_for(&remote).capability, "embed");
@@ -1287,10 +1287,11 @@ mod tests {
         let remote = RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
             cookbook: Some("definitely-missing-rag-rat-cookbook-test-command".to_string()),
-            query_endpoint: Some(crate::config::DEFAULT_QUERY_ENDPOINT.to_string()),
+            query_endpoint: Some(rag_rat_base::config::DEFAULT_QUERY_ENDPOINT.to_string()),
             ..RemoteEmbeddingConfig::default()
         };
-        let spec = crate::embedding_models::spec("sentence-transformers/all-MiniLM-L6-v2").unwrap();
+        let spec =
+            rag_rat_base::embedding_models::spec("sentence-transformers/all-MiniLM-L6-v2").unwrap();
 
         let err = verify_ephemeral_remote_cancellable(&remote, spec, || true).unwrap_err();
 
@@ -1310,7 +1311,7 @@ mod tests {
         let ephemeral = |gpu: Option<&str>, concurrency: u32| RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
             cookbook: Some("@rag-rat/cookbook modal".to_string()),
-            query_endpoint: Some(crate::config::DEFAULT_QUERY_ENDPOINT.to_string()),
+            query_endpoint: Some(rag_rat_base::config::DEFAULT_QUERY_ENDPOINT.to_string()),
             gpu: gpu.map(str::to_string),
             concurrency,
             ..RemoteEmbeddingConfig::default()
@@ -1322,10 +1323,10 @@ mod tests {
         assert_eq!(
             cookbook_input_for(&ephemeral(
                 None,
-                crate::config::MAX_REMOTE_EMBEDDING_CONCURRENCY + 1
+                rag_rat_base::config::MAX_REMOTE_EMBEDDING_CONCURRENCY + 1
             ))
             .server_concurrency,
-            crate::config::MAX_REMOTE_EMBEDDING_CONCURRENCY
+            rag_rat_base::config::MAX_REMOTE_EMBEDDING_CONCURRENCY
         );
         // The model is trimmed into the input regardless of gpu.
         assert_eq!(cookbook_input_for(&ephemeral(Some("A100"), 16)).model, "all-minilm");
@@ -1336,8 +1337,8 @@ mod tests {
         let infinity = RemoteEmbeddingConfig {
             model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             cookbook: Some("@rag-rat/cookbook modal".to_string()),
-            query_endpoint: Some(crate::config::DEFAULT_QUERY_ENDPOINT.to_string()),
-            backend: crate::config::RemoteBackend::Infinity,
+            query_endpoint: Some(rag_rat_base::config::DEFAULT_QUERY_ENDPOINT.to_string()),
+            backend: rag_rat_base::config::RemoteBackend::Infinity,
             num_ctx: Some(4096),
             ..RemoteEmbeddingConfig::default()
         };

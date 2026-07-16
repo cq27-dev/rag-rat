@@ -4,6 +4,8 @@
 //! chunk/symbol/edge/embedding/memory-binding hanging off it, survives — so a HEAD move costs
 //! roughly its diff, not a full reindex.
 
+use rag_rat_base::hash::hex_sha256;
+
 use super::*;
 
 /// A repo with two committed rust files, returning `(root, config)`. `keep.rs` stays unchanged

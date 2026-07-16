@@ -918,8 +918,8 @@ fn gc_serializes_on_the_flock_while_a_rebuild_is_mid_flight() {
     // Mid-pause the staged (above-live) generation is committed. A production collector takes
     // the per-repo flock first — held by the paused rebuild — so it SERIALIZES rather than
     // sweeping the in-progress staging (the `!= live` predicate is only safe under that lock).
-    let lock_repo = crate::locks::write_lock_repo_id(&config);
-    let contended = crate::locks::WriteLock::acquire_timeout(
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(&config);
+    let contended = rag_rat_base::locks::WriteLock::acquire_timeout(
         &config.database,
         &lock_repo,
         std::time::Duration::from_millis(150),
@@ -935,7 +935,8 @@ fn gc_serializes_on_the_flock_while_a_rebuild_is_mid_flight() {
     resume_tx.send(()).unwrap();
     handle.join().unwrap();
     assert!(live_generation(&db_path, &repo_id) > old_live, "the rebuild flipped");
-    let _flock = crate::locks::WriteLock::acquire_blocking(&config.database, &lock_repo).unwrap();
+    let _flock =
+        rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo).unwrap();
     let db = IndexDatabase::open_config(&config).unwrap();
     db.garbage_collect().unwrap();
     assert_eq!(
@@ -1250,8 +1251,9 @@ fn gc_reclaims_abandoned_staged_generations_from_failed_rebuilds() {
     assert_eq!(above_live(&db_path), 2, "each failed rebuild abandoned one staged generation");
 
     // A production collector (flock held — no rebuild can be mid-flight) reclaims BOTH.
-    let lock_repo = crate::locks::write_lock_repo_id(&config);
-    let _flock = crate::locks::WriteLock::acquire_blocking(&config.database, &lock_repo).unwrap();
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(&config);
+    let _flock =
+        rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo).unwrap();
     let db = IndexDatabase::open_config(&config).unwrap();
     db.garbage_collect().unwrap();
     drop(db);
@@ -1759,8 +1761,8 @@ fn a_lockless_init_rebuild_serializes_a_concurrent_flock_gc() {
     // A production collector takes the per-repo flock first — held by the paused init rebuild — so
     // it SERIALIZES rather than cascading the in-progress staging (the exact race that
     // published empty).
-    let lock_repo = crate::locks::write_lock_repo_id(&config);
-    let contended = crate::locks::WriteLock::acquire_timeout(
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(&config);
+    let contended = rag_rat_base::locks::WriteLock::acquire_timeout(
         &config.database,
         &lock_repo,
         std::time::Duration::from_millis(150),

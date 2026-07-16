@@ -10,8 +10,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use rag_rat_base::hash::hex_sha256;
 use rusqlite::Connection;
-use sha2::{Digest, Sha256};
 
 use super::join::{self, JoinInput};
 use super::scip::{self, ScipIndex};
@@ -473,20 +473,6 @@ pub(crate) fn run_in_tx(
     crate::index::clones::refine::cache::invalidate_scip_refinements(conn)?;
 
     Ok(report)
-}
-
-/// Hex SHA-256 of a byte slice — matches `files.sha256` (computed as `hex_sha256(fs::read(file))`),
-/// so the content-integrity check compares the same hash space the indexer wrote. `pub(crate)` so
-/// the production-time snapshot in `produce_scip_with_tool` hashes disk bytes in the SAME space the
-/// join's `disk_sha` / the candidate's `file_sha` live in (the scip-vs-disk gate, #82 TOCTOU).
-pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 /// Count *call-like* reference occurrences whose symbol is defined inside **rag-rat's indexed set**

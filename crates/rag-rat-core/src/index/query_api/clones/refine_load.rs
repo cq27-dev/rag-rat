@@ -22,7 +22,7 @@ pub(crate) struct RefineRow {
     pub(crate) path: String,
     pub(crate) start_byte: usize,
     pub(crate) end_byte: usize,
-    pub(crate) language: crate::language::Language,
+    pub(crate) language: rag_rat_base::language::Language,
     pub(crate) struct_hash: String,
 }
 
@@ -78,7 +78,7 @@ pub(crate) fn load_refine_rows(
             };
             // An unparseable language string means the row's language is no longer one this build
             // understands — bail to the un-refined fallback.
-            let Ok(language) = lang_str.parse::<crate::language::Language>() else {
+            let Ok(language) = lang_str.parse::<rag_rat_base::language::Language>() else {
                 return Ok(None);
             };
             rows.push(RefineRow { symbol_id, path, start_byte, end_byte, language, struct_hash });

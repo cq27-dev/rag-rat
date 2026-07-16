@@ -439,7 +439,7 @@ mod contains_edges_tests {
 mod collect_edges_depth_tests {
     use std::path::Path;
 
-    use crate::language::Language;
+    use rag_rat_base::language::Language;
 
     #[test]
     fn deeply_nested_input_does_not_overflow_the_edge_walk() {
@@ -465,7 +465,7 @@ mod collect_edges_depth_tests {
 mod deep_expression_helper_tests {
     use std::path::Path;
 
-    use crate::language::Language;
+    use rag_rat_base::language::Language;
 
     // The whole-tree walks (collect_edges/collect_symbols) are iterative (#520), but the extractors
     // call name-finding helpers that recurse to full SUBTREE depth. A hostile file whose CALLEE is

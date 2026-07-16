@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use rag_rat_base::config::{PapertrailConfig, TrackerAuth};
 use reqwest::header::{self, HeaderMap};
 
 use super::auth;
@@ -13,7 +14,6 @@ use super::governor::{
     Admission, GovernorConfig, GovernorKey, GovernorRegistry, PauseReason, QuotaSnapshot,
     RateGovernor, RetryHold, backoff_delay_ms,
 };
-use crate::config::{PapertrailConfig, TrackerAuth};
 use crate::index::util::now_ms;
 
 /// How one transport call ends besides success.

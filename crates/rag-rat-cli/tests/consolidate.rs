@@ -360,7 +360,7 @@ fn consolidate_drains_a_pre_deepen_writers_legacy_lock() {
 
     // A simulated PRE-DEEPEN writer: holds the `local:` id's legacy-side flock (the exact lock a
     // watcher/memory command started before the unshallow would hold).
-    let lock_path = rag_rat_core::locks::write_lock_path(&legacy, "local:predeepen00");
+    let lock_path = rag_rat_base::locks::write_lock_path(&legacy, "local:predeepen00");
     let lock_file =
         fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).unwrap();
     lock_file.lock().unwrap();

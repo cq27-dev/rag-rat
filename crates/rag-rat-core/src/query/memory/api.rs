@@ -865,7 +865,7 @@ pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDocto
     // (rebind-by-hand territory — no computable candidates). Skipped when the active repo IS the
     // placeholder (an un-adopted single-repo DB, where placeholder scope is the normal state).
     if let Some(active) = &scope
-        && active != crate::index::schema::LEGACY_REPO_ID
+        && active != rag_rat_base::repo_identity::LEGACY_REPO_ID
     {
         let mut stmt = conn.prepare(
             "
@@ -874,7 +874,7 @@ pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDocto
             ORDER BY id
             ",
         )?;
-        let rows = stmt.query_map([crate::index::schema::LEGACY_REPO_ID], |row| {
+        let rows = stmt.query_map([rag_rat_base::repo_identity::LEGACY_REPO_ID], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -883,7 +883,7 @@ pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDocto
                 memory_id,
                 title,
                 binding_kind: "repo".to_string(),
-                binding_id: crate::index::schema::LEGACY_REPO_ID.to_string(),
+                binding_id: rag_rat_base::repo_identity::LEGACY_REPO_ID.to_string(),
                 anchor_status: "placeholder_repo".to_string(),
                 candidates: Vec::new(),
             });

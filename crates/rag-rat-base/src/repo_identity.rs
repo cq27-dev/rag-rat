@@ -13,7 +13,10 @@
 
 use std::path::Path;
 
-use crate::index::schema::LEGACY_REPO_ID;
+/// The pre-adoption placeholder repo id: rows written before a repository identity is
+/// registered carry this marker, and schema adoption (`register_repo`) re-points them at the
+/// real id. Reserved — never accepted as a user-supplied identity.
+pub const LEGACY_REPO_ID: &str = "__unassigned__";
 
 /// The prefix every machine-local [`LocalOnly`](RepoIdentityClass::LocalOnly) id carries (a cut
 /// shallow clone's boundary hash). RESERVED: the resolver only ever mints it for a shallow clone,
@@ -181,7 +184,7 @@ pub fn identity_is_resolvable(root: &Path, override_id: Option<&str>) -> bool {
     if override_id.map(str::trim).is_some_and(|id| !id.is_empty()) {
         return true;
     }
-    let Ok(repo) = crate::index::discover_repo(root) else {
+    let Ok(repo) = crate::repo_discover::discover_repo(root) else {
         return false;
     };
     repo.head_id().is_ok()
@@ -189,9 +192,7 @@ pub fn identity_is_resolvable(root: &Path, override_id: Option<&str>) -> bool {
 
 /// The remedy-naming error for pinning the reserved placeholder id: it marks a pre-adoption
 /// single-repo DB, so adopting under it would rewrite the placeholder PK to itself and leave the DB
-/// unadopted while reporting success (see [`register_repo`]).
-///
-/// [`register_repo`]: crate::index::schema::register_repo
+/// unadopted while reporting success (see `register_repo`).
 fn reserved_repo_id_error() -> String {
     format!(
         "`{LEGACY_REPO_ID}` is a reserved repo_id (the pre-adoption placeholder marker) and \
@@ -232,7 +233,7 @@ fn derive_repo_id(
     root: &Path,
 ) -> Result<(String, RepoIdentityClass, Vec<String>), RepoIdentityError> {
     // Not a git repository at all → the EXPECTED-absence class (config-less temp dirs, tests).
-    let repo = crate::index::discover_repo(root).map_err(|err| {
+    let repo = crate::repo_discover::discover_repo(root).map_err(|err| {
         RepoIdentityError::Absent(format!(
             "cannot derive a repo_id: {} is not a git repository ({err}). Run `git init`, or pin \
              `[index] repo_id = \"…\"` in rag-rat.toml.",
@@ -310,7 +311,7 @@ fn local_only_id_from_hashes(hashes: &[String]) -> String {
         material.push_str(hash);
         material.push('\n');
     }
-    format!("{LOCAL_ONLY_ID_PREFIX}{}", crate::index::hex_sha256(material.as_bytes()))
+    format!("{LOCAL_ONLY_ID_PREFIX}{}", crate::hash::hex_sha256(material.as_bytes()))
 }
 
 /// Whether EVERY commit in `boundary` is reachable from the repository's HEAD at `root` — the PROOF
@@ -325,14 +326,11 @@ fn local_only_id_from_hashes(hashes: &[String]) -> String {
 /// boundary" as no proof. Errors surface (the caller refuses on them) rather than silently
 /// upgrading. Walks HEAD's ancestry once, short-circuiting as soon as every boundary commit is
 /// found — mirrors [`derive_repo_id`]'s `rev_walk`.
-pub(crate) fn boundary_reachable_from_head(
-    root: &Path,
-    boundary: &[String],
-) -> anyhow::Result<bool> {
+pub fn boundary_reachable_from_head(root: &Path, boundary: &[String]) -> anyhow::Result<bool> {
     if boundary.is_empty() {
         return Ok(false);
     }
-    let repo = crate::index::discover_repo(root).map_err(|err| {
+    let repo = crate::repo_discover::discover_repo(root).map_err(|err| {
         anyhow::anyhow!("cannot open the repository at {}: {err}", root.display())
     })?;
     let head = repo
@@ -537,7 +535,7 @@ mod tests {
         let base = temp_root();
         let (shallow, origin_root) = shallow_clone(&base, 5, 1, "shallow");
         // Sanity: the fixture is really a shallow clone that cut history.
-        assert!(crate::index::discover_repo(&shallow).unwrap().is_shallow());
+        assert!(crate::repo_discover::discover_repo(&shallow).unwrap().is_shallow());
 
         let identity = resolve_repo_identity(&shallow, None)
             .expect("a cut shallow clone must NOT fail — it derives a LocalOnly id");
@@ -575,7 +573,7 @@ mod tests {
         // depth == commit count: git still writes `.git/shallow`, but nothing is actually cut.
         let (shallow, origin_root) = shallow_clone(&base, 5, 5, "shallow");
         assert!(
-            crate::index::discover_repo(&shallow).unwrap().is_shallow(),
+            crate::repo_discover::discover_repo(&shallow).unwrap().is_shallow(),
             "git flags a depth-exact clone shallow"
         );
 

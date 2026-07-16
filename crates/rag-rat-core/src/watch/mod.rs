@@ -2,7 +2,7 @@
 //! change, so graph/symbol queries reflect uncommitted edits without waiting for a commit.
 //!
 //! - **One watcher per worktree** via the election lock; **one writer at a time per DB** via the
-//!   write lock (see [`crate::locks`]).
+//!   write lock (see [`rag_rat_base::locks`]).
 //! - Watches the configured target *directories* and their non-ignored subtrees (so **new files**
 //!   are seen) — placing a watch per non-ignored directory rather than one recursive watch, so a
 //!   gitignored build/dependency tree can't exhaust `fs.inotify.max_user_watches` (issue #331).

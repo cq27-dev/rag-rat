@@ -1,5 +1,6 @@
+use rag_rat_base::embedding_models::{BGE_SMALL_MODEL_ID, JINA_CODE_MODEL_ID};
+
 use super::Embedder;
-use crate::embedding_models::{BGE_SMALL_MODEL_ID, JINA_CODE_MODEL_ID};
 use crate::index::ai::fastembed_cache_dir;
 
 pub struct FastEmbedEmbedder {

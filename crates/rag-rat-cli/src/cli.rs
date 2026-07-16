@@ -487,7 +487,7 @@ pub(crate) struct BenchmarkEmbeddingArgs {
     pub cookbook: String,
     /// Which OpenAI-compatible backend to provision + benchmark (`ollama` | `infinity` | `vllm`).
     #[arg(long, default_value = "ollama", value_parser = parse_remote_backend)]
-    pub backend: rag_rat_core::config::RemoteBackend,
+    pub backend: rag_rat_base::config::RemoteBackend,
     /// The server-side model to serve: an ollama model name (ollama backend) or a HuggingFace id
     /// (infinity/vLLM). Required. Off-registry HF models fall back to a measured dim (one probe
     /// embed) since they have no registry spec.
@@ -510,11 +510,11 @@ pub(crate) struct BenchmarkEmbeddingArgs {
 }
 
 /// clap `value_parser` for `--backend`: parse the backend selector via the SAME
-/// [`RemoteBackend::from_db_str`](rag_rat_core::config::RemoteBackend::from_db_str) the config
+/// [`RemoteBackend::from_db_str`](rag_rat_base::config::RemoteBackend::from_db_str) the config
 /// layer uses, so the CLI and config accept identical spellings.
 #[cfg(feature = "eval")]
-fn parse_remote_backend(s: &str) -> Result<rag_rat_core::config::RemoteBackend, String> {
-    rag_rat_core::config::RemoteBackend::from_db_str(s)
+fn parse_remote_backend(s: &str) -> Result<rag_rat_base::config::RemoteBackend, String> {
+    rag_rat_base::config::RemoteBackend::from_db_str(s)
         .ok_or_else(|| format!("unknown backend `{s}` (expected ollama, infinity, or vllm)"))
 }
 
@@ -896,7 +896,7 @@ mod tests {
         match cli.command {
             Command::BenchmarkEmbedding(args) => {
                 assert_eq!(args.cookbook, "@rag-rat/cookbook modal");
-                assert_eq!(args.backend, rag_rat_core::config::RemoteBackend::Infinity);
+                assert_eq!(args.backend, rag_rat_base::config::RemoteBackend::Infinity);
                 assert_eq!(args.model, "sentence-transformers/all-MiniLM-L6-v2");
                 assert_eq!(args.candidates, vec![1, 2, 4]);
                 assert_eq!(args.budget_ms, Some(30_000));
@@ -923,7 +923,7 @@ mod tests {
         .expect("parse");
         match cli.command {
             Command::BenchmarkEmbedding(args) => {
-                assert_eq!(args.backend, rag_rat_core::config::RemoteBackend::Ollama);
+                assert_eq!(args.backend, rag_rat_base::config::RemoteBackend::Ollama);
                 assert!(args.candidates.is_empty());
                 assert!(args.budget_ms.is_none());
             },

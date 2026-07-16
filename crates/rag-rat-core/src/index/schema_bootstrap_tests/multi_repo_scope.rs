@@ -665,7 +665,8 @@ fn orientation_pins_the_fork_repo_over_a_shared_root_sibling() {
 
     // The portable id the shared root commit derives — the UPSTREAM sibling's id. Seed it directly
     // (register_repo refuses a second real repo before A7).
-    let upstream_id = crate::repo_identity::resolve_repo_identity(&root, None).unwrap().repo_id;
+    let upstream_id =
+        rag_rat_base::repo_identity::resolve_repo_identity(&root, None).unwrap().repo_id;
     assert_ne!(upstream_id, "fork-pin", "the shared-root id differs from the fork's pin");
     let conn = db.storage.connection();
     conn.execute(

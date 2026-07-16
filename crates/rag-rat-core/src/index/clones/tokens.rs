@@ -17,7 +17,7 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Content hash of the exact normalized token sequence — the exact-after-normalization fast path.
 pub(crate) fn struct_hash(tokens: &[String]) -> String {
-    crate::index::hex_sha256(tokens.join("\u{1}").as_bytes())
+    rag_rat_base::hash::hex_sha256(tokens.join("\u{1}").as_bytes())
 }
 
 /// Build a `(token_hash, freq)` multiset from a token sequence. `token_hash` is

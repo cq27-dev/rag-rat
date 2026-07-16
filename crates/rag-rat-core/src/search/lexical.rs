@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use rag_rat_base::language::Language;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use crate::index::text_compression::ChunkTextRow;
 use crate::index::{ai, text_compression};
-use crate::language::Language;
 use crate::query::graph_meta::GraphEvidence;
 
 const BM25_WEIGHT: f64 = 0.45;

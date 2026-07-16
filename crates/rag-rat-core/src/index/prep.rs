@@ -1,6 +1,8 @@
 //! File-preparation pipeline: read/parse/chunk/symbol source files into prepared rows (off the DB
 //! connection, in parallel) before insertion.
 
+use rag_rat_base::hash::hex_sha256;
+
 use super::*;
 
 #[derive(Debug)]

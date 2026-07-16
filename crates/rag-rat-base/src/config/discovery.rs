@@ -62,7 +62,7 @@ pub fn nearest_config_at_or_above(dir: &Path) -> Option<PathBuf> {
     // The enclosing git repo's workdir root — the ceiling the climb must not cross (canonicalized
     // so it compares equal to the canonicalized `cur`). `None` for a non-git `dir` ⇒ no
     // ceiling.
-    let boundary = crate::index::discover_repo(start)
+    let boundary = crate::repo_discover::discover_repo(start)
         .ok()
         .and_then(|repo| repo.workdir().map(Path::to_path_buf))
         .and_then(|workdir| workdir.canonicalize().ok());
@@ -91,7 +91,7 @@ pub fn nearest_config_at_or_above(dir: &Path) -> Option<PathBuf> {
 /// root` (Codex batch 8, findings 1+3). Both `Config::load`'s governing seam and the CLI's
 /// `init` refusal resolve linked-ness through this one helper.
 pub fn linked_worktree_main_root(root: &Path) -> Option<PathBuf> {
-    let repo = crate::index::discover_repo(root).ok()?;
+    let repo = crate::repo_discover::discover_repo(root).ok()?;
     let main = main_worktree_root(root)?;
     let workdir = repo.workdir()?;
     let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
@@ -99,7 +99,7 @@ pub fn linked_worktree_main_root(root: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn main_worktree_root(root: &Path) -> Option<PathBuf> {
-    let repo = crate::index::discover_repo(root).ok()?;
+    let repo = crate::repo_discover::discover_repo(root).ok()?;
     let common_dir = repo.common_dir().canonicalize().ok()?;
     // Only the standard `<main>/.git` layout maps cleanly to a main worktree root.
     if common_dir.file_name()?.to_str()? != ".git" {

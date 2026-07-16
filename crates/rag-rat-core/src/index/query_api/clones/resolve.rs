@@ -18,7 +18,7 @@ pub(crate) fn resolve_selector_to_symbol_id(
 ) -> anyhow::Result<Option<i64>> {
     match selector {
         CloneSymbolSelector::Id(handle) => {
-            let Some(logical_id) = crate::serde_big_id::parse_sym_handle(handle) else {
+            let Some(logical_id) = rag_rat_base::serde_big_id::parse_sym_handle(handle) else {
                 return Ok(None);
             };
             // A logical-symbol may have multiple member rows (cfg splits, overloads). We PREFER

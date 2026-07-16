@@ -49,8 +49,9 @@ impl IndexDatabase {
         // resolves from git WITHOUT opening the DB, so it precedes `create_or_migrate`
         // (which opens it). Blocking (non-interactive writer); a racing collector holds the
         // flock only for its brief sweep.
-        let lock_repo = crate::locks::write_lock_repo_id(config);
-        let _write_lock = crate::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+        let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+        let _write_lock =
+            rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
         // #427 — enforce the empty-index invariant on the FULL-rebuild entry. Split around
         // `create_or_migrate` so it mirrors the incremental path (open+migrate, THEN check) while
         // still leaving NO stray DB file behind on a fresh refusal:

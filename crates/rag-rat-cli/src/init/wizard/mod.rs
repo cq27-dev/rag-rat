@@ -16,7 +16,7 @@ use std::io::{Stdout, stdout};
 use std::path::Path;
 use std::time::Duration;
 
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -824,14 +824,14 @@ mod tests {
         let mut w = headless(test_scan(), None);
         w.state.draft.remote = Some(draft::RemoteDraft {
             model: "all-minilm".to_string(),
-            backend: rag_rat_core::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             mode: draft::RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
             query_endpoint: None,
             gpu: None,
             num_ctx: None,
             batch_size: 256,
             concurrency: 32,
-            max_batch_chars: rag_rat_core::config::RemoteEmbeddingConfig::default().max_batch_chars,
+            max_batch_chars: rag_rat_base::config::RemoteEmbeddingConfig::default().max_batch_chars,
             auth_env: None,
         });
         w.state.probes.spawn(
@@ -864,14 +864,14 @@ mod tests {
         w.state.draft.model = "none".to_string();
         w.state.draft.remote = Some(draft::RemoteDraft {
             model: "all-minilm".to_string(),
-            backend: rag_rat_core::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             mode: draft::RemoteMode::Connect("http://localhost:11434".to_string()),
             query_endpoint: None,
             gpu: None,
             num_ctx: None,
             batch_size: 256,
-            concurrency: rag_rat_core::config::RemoteEmbeddingConfig::default().concurrency,
-            max_batch_chars: rag_rat_core::config::RemoteEmbeddingConfig::default().max_batch_chars,
+            concurrency: rag_rat_base::config::RemoteEmbeddingConfig::default().concurrency,
+            max_batch_chars: rag_rat_base::config::RemoteEmbeddingConfig::default().max_batch_chars,
             auth_env: None,
         });
         w.state.checks[StepId::Embedding.index()] = steps::CheckResult::ok();
@@ -921,17 +921,17 @@ mod tests {
         w.state
             .draft
             .bindings
-            .insert(rag_rat_core::language::Language::Rust, vec![Path::new(".").to_path_buf()]);
+            .insert(rag_rat_base::language::Language::Rust, vec![Path::new(".").to_path_buf()]);
         w.state.draft.remote = Some(draft::RemoteDraft {
             model: "all-minilm".to_string(),
-            backend: rag_rat_core::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             mode: draft::RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
             query_endpoint: None,
             gpu: None,
             num_ctx: None,
             batch_size: 256,
-            concurrency: rag_rat_core::config::RemoteEmbeddingConfig::default().concurrency,
-            max_batch_chars: rag_rat_core::config::RemoteEmbeddingConfig::default().max_batch_chars,
+            concurrency: rag_rat_base::config::RemoteEmbeddingConfig::default().concurrency,
+            max_batch_chars: rag_rat_base::config::RemoteEmbeddingConfig::default().max_batch_chars,
             auth_env: None,
         });
         w.state.ui.ephemeral_keep_acknowledged = true;

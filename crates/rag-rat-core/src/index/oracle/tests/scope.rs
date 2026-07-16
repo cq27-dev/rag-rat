@@ -1141,7 +1141,7 @@ fn stale_production_snapshot_is_skipped_not_verdicted() {
         // Hash the disk bytes the way the join does, so MatchesDisk pins the actual current
         // content.
         let disk_hash =
-            |rel: &str| super::run::hex_sha256(&std::fs::read(h.root().join(rel)).unwrap());
+            |rel: &str| rag_rat_base::hash::hex_sha256(&std::fs::read(h.root().join(rel)).unwrap());
         let stale = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
         let mut production: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();

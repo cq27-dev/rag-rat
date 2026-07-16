@@ -1,5 +1,6 @@
+use rag_rat_base::embedding_models::{EMBEDDING_MODELS, HASH_MODEL_ID};
+
 use super::super::*;
-use crate::embedding_models::{EMBEDDING_MODELS, HASH_MODEL_ID};
 
 pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
     // SCOPED-REPO WITNESS (A7): the heal's repo-scoped mutations (`remove_legacy_models` clears

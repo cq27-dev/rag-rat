@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 
 mod common;
 
@@ -101,13 +101,13 @@ fn init_yes_writes_a_config_that_config_load_accepts() {
     // oracle/version surface).
     let config = Config::load(&config_path).expect("Config::load must accept the written config");
     assert!(
-        config.targets.iter().any(|t| t.language == rag_rat_core::language::Language::Rust),
+        config.targets.iter().any(|t| t.language == rag_rat_base::language::Language::Rust),
         "the rust source tree must bind a rust target, got: {:?}",
         config.targets
     );
     assert!(
         config.targets.iter().any(|target| {
-            target.language == rag_rat_core::language::Language::Swift
+            target.language == rag_rat_base::language::Language::Swift
                 && target.directories == [std::path::PathBuf::from("Sources")]
                 && target.include == ["**/*.swift"]
         }),

@@ -27,6 +27,7 @@ pub(crate) use mirror::{
 };
 pub(crate) use parse::*;
 pub use parse::{TrackerParsedRef, parse_tracker_refs};
+pub use rag_rat_base::config::Tracker;
 use rusqlite::{Connection, OptionalExtension, params};
 pub use schedule::AutosyncRequest;
 pub(crate) use schedule::*;
@@ -36,7 +37,6 @@ pub(crate) use sync::*;
 pub(crate) use trackers::resolve_trackers;
 pub use trackers::{ResolvedTracker, detect_tracker_from_remote_url, normalized_tags};
 
-pub use crate::config::Tracker;
 use crate::index::now_ms;
 
 /// Resolved tracker context, injected into the sync/query paths instead of being resolved inside
@@ -50,14 +50,14 @@ pub struct PapertrailContext {
     /// Production discovery, rationale lookup, and manual mirror sync consume every binding.
     pub trackers: Vec<ResolvedTracker>,
     pub(crate) transport_options: transport::TransportOptions,
-    pub(crate) schedule: crate::config::PapertrailConfig,
+    pub(crate) schedule: rag_rat_base::config::PapertrailConfig,
 }
 
 impl PapertrailContext {
     /// Resolve from the repo config: `[[tracker]]` bindings when present, otherwise a binding
     /// auto-detected from the git `origin` remote. Call ONLY at the real-usage boundary
     /// (open_config), never inside the library internals or tests.
-    pub(crate) fn resolve(config: &crate::config::Config) -> Self {
+    pub(crate) fn resolve(config: &rag_rat_base::config::Config) -> Self {
         let mut trackers = resolve_trackers(&config.trackers, &config.root);
         // GitHub's provider-native fallback is environment auth. Materialize the ENV-VAR NAME
         // into the binding (never its value) so status and transport use the same per-binding
@@ -87,7 +87,7 @@ impl PapertrailContext {
         Self {
             trackers,
             transport_options: transport::TransportOptions::default(),
-            schedule: crate::config::PapertrailConfig::default(),
+            schedule: rag_rat_base::config::PapertrailConfig::default(),
         }
     }
 
@@ -114,7 +114,7 @@ fn apply_implicit_github_auth(
                 .into_iter()
                 .find(|name| env(name).is_some_and(|value| !value.trim().is_empty()))
         {
-            tracker.auth = Some(crate::config::TrackerAuth::Env(name.to_string()));
+            tracker.auth = Some(rag_rat_base::config::TrackerAuth::Env(name.to_string()));
             tracker.authentication = TrackerAuthentication::AuthConfigured;
         }
     }
@@ -638,7 +638,7 @@ mod token_tests {
 
         assert!(matches!(
             trackers[0].auth,
-            Some(crate::config::TrackerAuth::Env(ref name)) if name == "GH_TOKEN"
+            Some(rag_rat_base::config::TrackerAuth::Env(ref name)) if name == "GH_TOKEN"
         ));
         assert_eq!(trackers[0].authentication, TrackerAuthentication::AuthConfigured);
         assert!(trackers[1].auth.is_none());

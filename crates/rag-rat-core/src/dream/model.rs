@@ -6,9 +6,8 @@
 
 use std::time::Duration;
 
+use rag_rat_base::config::RemoteDreamConfig;
 use serde::{Deserialize, Serialize};
-
-use crate::config::RemoteDreamConfig;
 
 /// A single-turn verdict model: given a fully-rendered prompt, return the model's raw completion
 /// text. Object-safe so the verdict pass takes a `&dyn VerdictModel` and a test can swap in a mock.
@@ -348,8 +347,9 @@ mod http_tests {
     use std::net::TcpListener;
     use std::thread;
 
+    use rag_rat_base::config::RemoteDreamConfig;
+
     use super::{HttpVerdictModel, VerdictModel, provision_verdict_model};
-    use crate::config::RemoteDreamConfig;
 
     /// A one-shot HTTP/1.1 server on `127.0.0.1:0`: accepts one connection, reads the full request
     /// (headers + Content-Length body), replies `status`/`response_body`, and returns the RAW
@@ -472,7 +472,7 @@ mod http_tests {
 
     #[test]
     fn chat_cookbook_input_pins_chat_and_maps_backend_gpu_and_budget() {
-        use crate::config::RemoteBackend;
+        use rag_rat_base::config::RemoteBackend;
         let remote = RemoteDreamConfig {
             backend: RemoteBackend::Vllm,
             endpoint: None,

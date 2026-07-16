@@ -46,9 +46,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use common::{git, git_commit, unique_dir};
-use rag_rat_core::language::Language;
+use rag_rat_base::config::Config;
+use rag_rat_base::language::Language;
+use rag_rat_core::IndexDatabase;
 use rag_rat_core::query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
-use rag_rat_core::{Config, IndexDatabase};
 
 /// A body with > `MIN_TOKENS` (20) normalized tokens so it fingerprints as a clone candidate and
 /// surfaces a real symbol row. Interpolates the fn name; the arithmetic is identical across names
@@ -472,7 +473,7 @@ fn memories_are_isolated_across_repos() {
 
     // memory_search (library, FTS): each scope returns its OWN memory id, never the sibling's.
     let a_found = open_scoped(&repo_a, &data_dir)
-        .memory_search("quokkamarker", 10, rag_rat_core::config::MemorySurface::Full)
+        .memory_search("quokkamarker", 10, rag_rat_base::config::MemorySurface::Full)
         .unwrap();
     assert!(
         a_found.iter().any(|m| m.memory_id == a_mem)
@@ -480,7 +481,7 @@ fn memories_are_isolated_across_repos() {
         "A's memory_search returns A's memory id only: {a_found:?}"
     );
     let b_found = open_scoped(&repo_b, &data_dir)
-        .memory_search("lorikeetmarker", 10, rag_rat_core::config::MemorySurface::Full)
+        .memory_search("lorikeetmarker", 10, rag_rat_base::config::MemorySurface::Full)
         .unwrap();
     assert!(
         b_found.iter().any(|m| m.memory_id == b_mem)
@@ -489,7 +490,7 @@ fn memories_are_isolated_across_repos() {
     );
     // B's distinctive token — present in no A memory — is unreachable from A's scope.
     let a_cross = open_scoped(&repo_a, &data_dir)
-        .memory_search("lorikeetmarker", 10, rag_rat_core::config::MemorySurface::Full)
+        .memory_search("lorikeetmarker", 10, rag_rat_base::config::MemorySurface::Full)
         .unwrap();
     assert!(a_cross.is_empty(), "A's FTS scope never matches B's body: {a_cross:?}");
 
@@ -749,7 +750,7 @@ fn consolidate_lands_a_third_legacy_repos_memories_fts_searchable() {
         .unwrap();
     assert_eq!(global_hit, 1, "the legacy memory landed in the global store");
     let found = open_scoped(&repo_c, &data_dir)
-        .memory_search(unique_token, 10, rag_rat_core::config::MemorySurface::Full)
+        .memory_search(unique_token, 10, rag_rat_base::config::MemorySurface::Full)
         .unwrap();
     assert!(
         found.iter().any(|m| m.memory_id == legacy_mem),
@@ -758,14 +759,14 @@ fn consolidate_lands_a_third_legacy_repos_memories_fts_searchable() {
     // The import stayed scoped: NEITHER pre-existing repo can reach C's token.
     assert!(
         open_scoped(&repo_a, &data_dir)
-            .memory_search(unique_token, 10, rag_rat_core::config::MemorySurface::Full)
+            .memory_search(unique_token, 10, rag_rat_base::config::MemorySurface::Full)
             .unwrap()
             .is_empty(),
         "repo A cannot see C's imported memory"
     );
     assert!(
         open_scoped(&repo_b, &data_dir)
-            .memory_search(unique_token, 10, rag_rat_core::config::MemorySurface::Full)
+            .memory_search(unique_token, 10, rag_rat_base::config::MemorySurface::Full)
             .unwrap()
             .is_empty(),
         "repo B cannot see C's imported memory"
@@ -799,9 +800,9 @@ fn concurrent_index_of_a_and_write_on_b_are_lock_disjoint() {
     let b_id = repo_id_other_than(&data_dir, &a_id);
 
     // HOLD repo B's per-repo write flock explicitly — the exact lock a B-side writer takes.
-    let b_lock_id = rag_rat_core::locks::write_lock_repo_id(&scoped_config(&repo_b, &data_dir));
+    let b_lock_id = rag_rat_base::locks::write_lock_repo_id(&scoped_config(&repo_b, &data_dir));
     let b_lock =
-        rag_rat_core::locks::WriteLock::acquire_blocking(&global_db(&data_dir), &b_lock_id)
+        rag_rat_base::locks::WriteLock::acquire_blocking(&global_db(&data_dir), &b_lock_id)
             .unwrap();
 
     // With B's lock held, run a full rebuild of A as a subprocess. A takes A's OWN flock.

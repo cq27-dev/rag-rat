@@ -11,7 +11,7 @@ pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Res
     // every worktree of a repo through the MAIN worktree's `rag-rat.toml`, so a branch-local file
     // would be ignored the moment main gains one (and governs only by fallback until then).
     // Refuse with the pointer instead of writing a file that doesn't do what it says.
-    if let Some(main_root) = rag_rat_core::config::linked_worktree_main_root(&root) {
+    if let Some(main_root) = rag_rat_base::config::linked_worktree_main_root(&root) {
         anyhow::bail!(
             "this is a linked git worktree; the repo's rag-rat.toml lives in the main worktree — \
              run `rag-rat init` there instead: {}",
@@ -623,7 +623,7 @@ mod default_plan_tests {
             .list_models()
             .unwrap()
             .into_iter()
-            .find(|m| m.model_id == rag_rat_core::embedding_models::HASH_MODEL_ID)
+            .find(|m| m.model_id == rag_rat_base::embedding_models::HASH_MODEL_ID)
             .unwrap();
         assert!(!active.installed, "hash must NOT have been installed as a silent fallback");
 

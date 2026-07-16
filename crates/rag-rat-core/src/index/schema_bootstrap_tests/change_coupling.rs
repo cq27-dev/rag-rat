@@ -14,7 +14,7 @@ use crate::index::change_coupling::{
 /// The active repo id a fresh `schema::apply` connection resolves to (the legacy placeholder), used
 /// for the single-repo fixtures whose inserts default `repo_id` to the same value.
 fn repo() -> String {
-    crate::index::schema::LEGACY_REPO_ID.to_string()
+    rag_rat_base::repo_identity::LEGACY_REPO_ID.to_string()
 }
 
 fn fresh_conn() -> Connection {

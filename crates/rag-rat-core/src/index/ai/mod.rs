@@ -44,6 +44,7 @@ pub use providers::{
     abort_active_provisioning, install_provision_log_sink, verify_ephemeral_remote,
     verify_ephemeral_remote_cancellable,
 };
+use rag_rat_base::language::Language;
 pub(crate) use reconcile::*;
 pub(crate) use reencode::*;
 use rusqlite::types::Value;
@@ -59,7 +60,6 @@ pub use throughput_tune::{
 };
 
 use crate::index::now_ms;
-use crate::language::Language;
 
 const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
 const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_version";

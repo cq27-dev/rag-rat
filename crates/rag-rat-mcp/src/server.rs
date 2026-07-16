@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
@@ -347,8 +347,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
-    use rag_rat_core::language::Language;
-    use rag_rat_core::{Config, IndexDatabase, OutputFormat, ResolvedTarget, TargetKind};
+    use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
+    use rag_rat_base::language::Language;
+    use rag_rat_core::{IndexDatabase, OutputFormat};
     use serde_json::json;
 
     use super::*;

@@ -83,9 +83,10 @@ see the README's "Connect it to your agent (MCP)" section).
 
 ## Repo orientation
 
-- Rust workspace, three crates: `rag-rat-core` (engine: indexing, tree-sitter graph, embeddings,
-  git/GitHub, repo memories), `rag-rat-mcp` (the STDIO MCP server), `rag-rat-cli` (the `rag-rat`
-  binary). Rust 2024 edition.
+- Rust workspace, four crates: `rag-rat-base` (foundation: config, repo identity/discovery,
+  language + embedding-model registries, locks, logging), `rag-rat-core` (engine: indexing,
+  tree-sitter graph, embeddings, git/GitHub, repo memories), `rag-rat-mcp` (the STDIO MCP server),
+  `rag-rat-cli` (the `rag-rat` binary). Rust 2024 edition.
 - `rag-rat.toml` (repo root) configures what gets indexed and the SQLite database path.
 
 ## Style

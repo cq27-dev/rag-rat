@@ -62,7 +62,7 @@ impl IndexDatabase {
         &self,
         query: &str,
         limit: u32,
-        surface: crate::config::MemorySurface,
+        surface: rag_rat_base::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
         // #582: both the MATCH and the surface hydration (whose Summary path runs a RANKED
@@ -82,7 +82,7 @@ impl IndexDatabase {
         &self,
         symbol: &crate::query::symbol::SymbolHit,
         limit: u32,
-        surface: crate::config::MemorySurface,
+        surface: rag_rat_base::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
         // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
@@ -100,7 +100,7 @@ impl IndexDatabase {
         &self,
         path: &str,
         limit: u32,
-        surface: crate::config::MemorySurface,
+        surface: rag_rat_base::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
         // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
@@ -118,7 +118,7 @@ impl IndexDatabase {
         &self,
         edge_ids: &[i64],
         limit: u32,
-        surface: crate::config::MemorySurface,
+        surface: rag_rat_base::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
         // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
@@ -138,7 +138,7 @@ impl IndexDatabase {
         caller_edge_ids: &[i64],
         callee_edge_ids: &[i64],
         limit: u32,
-        surface: crate::config::MemorySurface,
+        surface: rag_rat_base::config::MemorySurface,
     ) -> anyhow::Result<crate::query::memory::RepoMemoryEvidence> {
         // This wrapper exposes only the evidence; the impact builder consumes the truncation flag
         // directly from the core fn. `find_callers` / `trace_callees` emit the evidence FULL (not
@@ -167,7 +167,7 @@ impl IndexDatabase {
         &self,
         edge_sequence_hash: &str,
         limit: u32,
-        surface: crate::config::MemorySurface,
+        surface: rag_rat_base::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
         // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.

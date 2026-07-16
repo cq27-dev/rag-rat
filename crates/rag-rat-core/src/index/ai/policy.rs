@@ -391,9 +391,10 @@ mod low_signal_tests {
 mod low_signal_span_tests {
     use std::path::Path;
 
+    use rag_rat_base::language::Language;
+
     use super::is_low_signal_span;
     use crate::index::parser;
-    use crate::language::Language;
 
     fn parsed(path: &str, language: Language, src: &str) -> parser::ParsedFile {
         parser::parse_file(Path::new(path), language, src).expect("fixture parses")
@@ -472,13 +473,14 @@ mod policy_version_tests {
     use std::fmt::Write as _;
     use std::path::Path;
 
+    use rag_rat_base::hash::hex_sha256;
+    use rag_rat_base::language::Language;
+
     use super::{
         DEFAULT_MAX_EMBEDDING_CHARS, EMBEDDING_POLICY_VERSION, LowSignalCheck, MIN_EMBEDDING_CHARS,
         embedding_policy_for_chunk,
     };
     use crate::index::parser;
-    use crate::index::util::hex_sha256;
-    use crate::language::Language;
 
     fn record(sig: &mut String, label: &str, d: &super::EmbeddingPolicyDecision) {
         let _ = writeln!(sig, "{label}|{}|{}|{}", d.policy, d.priority, d.eligible);

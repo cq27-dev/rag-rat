@@ -217,8 +217,8 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // (an unadopted DB, re-pointed on adoption) and a machine-local `local:` shallow-clone id
     // (upgraded to a portable id when the clone is deepened). No-op until a stable id is active
     // — as if unscoped.
-    if repo_id == crate::index::schema::LEGACY_REPO_ID
-        || repo_id.starts_with(crate::repo_identity::LOCAL_ONLY_ID_PREFIX)
+    if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
+        || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
     {
         return Ok(());
     }
@@ -318,8 +318,8 @@ fn stable_owner_stream(conn: &Connection) -> anyhow::Result<Option<StreamId>> {
     let Some(repo_id) = memory_repo_scope(conn)? else {
         return Ok(None);
     };
-    if repo_id == crate::index::schema::LEGACY_REPO_ID
-        || repo_id.starts_with(crate::repo_identity::LOCAL_ONLY_ID_PREFIX)
+    if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
+        || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
     {
         return Ok(None);
     }
@@ -880,7 +880,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', ?1)",
-            [crate::index::schema::LEGACY_REPO_ID],
+            [rag_rat_base::repo_identity::LEGACY_REPO_ID],
         )
         .unwrap();
         conn.execute(
@@ -889,7 +889,7 @@ mod tests {
                  updated_at_ms, source, input_hash, memory_version, repo_id)
              VALUES ('mem_a', 'Invariant', 'mem_a', 'body', 'high', 'active', 'agent', 1, 1,
                  'agent', 'h', 'v1', ?1)",
-            [crate::index::schema::LEGACY_REPO_ID],
+            [rag_rat_base::repo_identity::LEGACY_REPO_ID],
         )
         .unwrap();
 
@@ -908,7 +908,7 @@ mod tests {
         // deepened, re-pointing the rows — so an immutable owner stream must not be rooted on it.
         let conn = Connection::open_in_memory().unwrap();
         crate::index::schema::apply(&conn).unwrap();
-        let local_id = format!("{}deadbeef", crate::repo_identity::LOCAL_ONLY_ID_PREFIX);
+        let local_id = format!("{}deadbeef", rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX);
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
         )

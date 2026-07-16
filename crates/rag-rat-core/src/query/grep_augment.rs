@@ -225,7 +225,7 @@ pub fn compose(
     raw_pattern: &str,
     search_path: Option<&str>,
     dedupe: &DedupeFilter,
-    surface: crate::config::MemorySurface,
+    surface: rag_rat_base::config::MemorySurface,
 ) -> anyhow::Result<Option<GrepAugment>> {
     let normalized = normalize_pattern(raw_pattern);
     if normalized.is_empty() {
@@ -610,7 +610,7 @@ mod tests {
             "foo",
             None,
             &DedupeFilter::default(),
-            crate::config::MemorySurface::Full,
+            rag_rat_base::config::MemorySurface::Full,
         )
         .unwrap()
         .expect("symbol lane augments");
@@ -723,7 +723,7 @@ mod tests {
             r"watcher_main\b",
             None,
             &DedupeFilter::default(),
-            crate::config::MemorySurface::Full,
+            rag_rat_base::config::MemorySurface::Full,
         )
         .unwrap()
         .expect("payload expected");
@@ -781,7 +781,7 @@ mod tests {
             r"watcher_main\b",
             None,
             &DedupeFilter::default(),
-            crate::config::MemorySurface::Summary,
+            rag_rat_base::config::MemorySurface::Summary,
         )
         .unwrap()
         .expect("payload expected");
@@ -807,7 +807,7 @@ mod tests {
             "watcher_main",
             None,
             &DedupeFilter::default(),
-            crate::config::MemorySurface::Full,
+            rag_rat_base::config::MemorySurface::Full,
         )
         .unwrap()
         .expect("first payload");
@@ -816,9 +816,15 @@ mod tests {
             symbol_keys: first.symbol_keys.iter().cloned().collect::<HashSet<_>>(),
         };
         assert!(
-            compose(&conn, "watcher_main", None, &filter, crate::config::MemorySurface::Full)
-                .unwrap()
-                .is_none()
+            compose(
+                &conn,
+                "watcher_main",
+                None,
+                &filter,
+                rag_rat_base::config::MemorySurface::Full
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -862,7 +868,7 @@ mod tests {
             r"fn watcher_main",
             None,
             &DedupeFilter::default(),
-            crate::config::MemorySurface::Full,
+            rag_rat_base::config::MemorySurface::Full,
         )
         .unwrap()
         .expect("payload expected");
@@ -885,7 +891,7 @@ mod tests {
             "election retry loop",
             None,
             &DedupeFilter::default(),
-            crate::config::MemorySurface::Full,
+            rag_rat_base::config::MemorySurface::Full,
         )
         .unwrap()
         .expect("lexical payload");
@@ -901,7 +907,7 @@ mod tests {
                 "zzqqyyxx_nothing",
                 None,
                 &DedupeFilter::default(),
-                crate::config::MemorySurface::Full
+                rag_rat_base::config::MemorySurface::Full
             )
             .unwrap()
             .is_none()
@@ -1052,7 +1058,7 @@ mod tests {
             "watcher_main",
             None,
             &DedupeFilter::default(),
-            crate::config::MemorySurface::Full,
+            rag_rat_base::config::MemorySurface::Full,
         )
         .unwrap()
         .expect("payload expected");

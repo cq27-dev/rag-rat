@@ -105,7 +105,7 @@ pub struct RepoMemoryBinding {
     #[serde(
         rename = "id",
         skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"
     )]
     pub logical_symbol_id: Option<i64>,
     // Internal rowid — never serialized (reindex-churned, #149); the handle is logical_symbol_id.
@@ -149,13 +149,13 @@ pub struct RepoMemoryCallPath {
     #[serde(
         rename = "start_id",
         skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"
     )]
     pub start_logical_symbol_id: Option<i64>,
     #[serde(
         rename = "end_id",
         skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"
     )]
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: String,
@@ -194,7 +194,7 @@ pub struct RepoMemoryBindTarget {
     #[serde(
         rename = "id",
         default,
-        deserialize_with = "crate::serde_big_id::sym_handle_opt::deserialize"
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     pub logical_symbol_id: Option<i64>,
     // Internal rowid — NOT accepted from the wire (reindex-churned, #149); bind by handle/path.
@@ -213,13 +213,13 @@ pub struct RepoMemoryBindTarget {
     #[serde(
         rename = "start_id",
         default,
-        deserialize_with = "crate::serde_big_id::sym_handle_opt::deserialize"
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     pub start_logical_symbol_id: Option<i64>,
     #[serde(
         rename = "end_id",
         default,
-        deserialize_with = "crate::serde_big_id::sym_handle_opt::deserialize"
+        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
     )]
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: Option<String>,
@@ -340,7 +340,7 @@ impl RepoMemoryEvidence {
     pub(crate) fn apply_surface(
         &mut self,
         conn: &Connection,
-        surface: crate::config::MemorySurface,
+        surface: rag_rat_base::config::MemorySurface,
     ) -> rusqlite::Result<()> {
         for lane in
             [&mut self.direct, &mut self.path_crossed, &mut self.call_path_crossed, &mut self.stale]
@@ -362,9 +362,9 @@ impl RepoMemoryEvidence {
 pub(crate) fn apply_memory_surface(
     conn: &Connection,
     memories: &mut [RepoMemory],
-    surface: crate::config::MemorySurface,
+    surface: rag_rat_base::config::MemorySurface,
 ) -> rusqlite::Result<()> {
-    if !matches!(surface, crate::config::MemorySurface::Summary) {
+    if !matches!(surface, rag_rat_base::config::MemorySurface::Summary) {
         return Ok(());
     }
     for memory in memories.iter_mut() {
@@ -425,7 +425,7 @@ pub struct CompactRepoMemory {
     #[serde(
         rename = "id",
         skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"
     )]
     pub logical_symbol_id: Option<i64>,
     /// The dream-compacted summary of the memory's CURRENT body, populated ONLY under `[memory]
@@ -929,7 +929,8 @@ mod tests {
         seed_summary(&c, "m1", body, "A compacted summary in place of the body.");
         seed_reality(&c, "m1", body, "diverged", None);
         let mut memories = vec![memory_with_body("m1", body)];
-        apply_memory_surface(&c, &mut memories, crate::config::MemorySurface::Summary).unwrap();
+        apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Summary)
+            .unwrap();
         assert_eq!(memories[0].body, "", "the full body is deferred under summary");
         assert_eq!(
             memories[0].summary.as_deref(),
@@ -948,7 +949,8 @@ mod tests {
         // is still deferred: the reader sees the title (+ structure) and expands via `memory show`.
         let c = summary_conn();
         let mut memories = vec![memory_with_body("m1", "some body")];
-        apply_memory_surface(&c, &mut memories, crate::config::MemorySurface::Summary).unwrap();
+        apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Summary)
+            .unwrap();
         assert_eq!(memories[0].body, "", "body deferred even without a summary (title-only)");
         assert_eq!(memories[0].summary, None);
         assert_eq!(memories[0].verdict, None);
@@ -961,7 +963,7 @@ mod tests {
         let body = "kept verbatim in full mode";
         seed_summary(&c, "m1", body, "would-be summary");
         let mut memories = vec![memory_with_body("m1", body)];
-        apply_memory_surface(&c, &mut memories, crate::config::MemorySurface::Full).unwrap();
+        apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Full).unwrap();
         assert_eq!(memories[0].body, body, "full surface keeps the body");
         assert_eq!(memories[0].summary, None, "full surface never hydrates a summary");
         assert_eq!(memories[0].verdict, None);

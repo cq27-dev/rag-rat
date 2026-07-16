@@ -31,7 +31,7 @@ pub(crate) mod score;
 /// source slice via `text.get(node_spans[i].start_byte..node_spans[i].end_byte)`.
 pub(crate) struct RefineMember {
     pub(crate) symbol_id: i64,
-    pub(crate) lang: crate::language::Language,
+    pub(crate) lang: rag_rat_base::language::Language,
     /// Persisted baseline struct_hash — the canonical sort key + cache key.
     pub(crate) struct_hash: String,
     /// Ordered baseline token sequence (LCS input). Parallel to `node_spans`.

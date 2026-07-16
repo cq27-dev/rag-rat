@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
+use rag_rat_base::config::RemoteEmbeddingConfig;
+
 use super::super::*;
-use crate::config::RemoteEmbeddingConfig;
 
 pub(crate) fn automatic_reconcile_can_skip_noop(
     conn: &Connection,
@@ -315,11 +316,11 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use rag_rat_base::config::{RemoteBackend, RemoteEmbeddingConfig};
+    use rag_rat_base::embedding_models::FASTEMBED_MODEL_ID;
     use rusqlite::{Connection, params};
 
     use super::*;
-    use crate::config::{RemoteBackend, RemoteEmbeddingConfig};
-    use crate::embedding_models::FASTEMBED_MODEL_ID;
     use crate::index::ai::{self, ReconcileReason};
 
     fn schema_conn() -> Connection {
@@ -466,7 +467,7 @@ mod tests {
     #[test]
     fn automatic_reconcile_can_skip_when_bounded_and_remote_is_connect() {
         let conn = schema_conn();
-        let spec = crate::embedding_models::spec(FASTEMBED_MODEL_ID).unwrap();
+        let spec = rag_rat_base::embedding_models::spec(FASTEMBED_MODEL_ID).unwrap();
         ai::set_active_remote_config(&conn, &remote_at("http://127.0.0.1:11434")).unwrap();
         ai::set_repo_meta(&conn, ai::ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
         ai::set_repo_meta(&conn, ai::ACTIVE_EMBEDDING_MODEL_VERSION_META, spec.version).unwrap();
@@ -543,7 +544,7 @@ mod tests {
     fn embed_and_write_jobs_without_remote_marks_vector_mismatch_failed() {
         let conn = schema_conn();
         let chunk_id = seed_embedding_chunk(&conn, 0);
-        let dim = crate::embedding_models::spec(FASTEMBED_MODEL_ID).unwrap().dim;
+        let dim = rag_rat_base::embedding_models::spec(FASTEMBED_MODEL_ID).unwrap().dim;
         let embedder = WrongCountEmbedder { dim };
 
         let (written, failed) = embed_and_write_jobs(
@@ -597,7 +598,7 @@ mod tests {
     #[test]
     fn remote_scoped_splits_ranges_by_max_batch_chars() {
         let conn = schema_conn();
-        let dim = crate::embedding_models::spec(FASTEMBED_MODEL_ID).unwrap().dim;
+        let dim = rag_rat_base::embedding_models::spec(FASTEMBED_MODEL_ID).unwrap().dim;
         let jobs = (0..3)
             .map(|i| {
                 let text = format!("{}{}", "a".repeat(4), i);

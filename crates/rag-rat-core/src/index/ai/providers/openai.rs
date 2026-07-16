@@ -13,10 +13,10 @@
 
 use std::time::Duration;
 
+use rag_rat_base::config::RemoteEmbeddingConfig;
 use serde::{Deserialize, Serialize};
 
 use super::Embedder;
-use crate::config::RemoteEmbeddingConfig;
 
 /// Request body for the OpenAI-compatible `POST /v1/embeddings`. `input` is an array — the batch
 /// endpoint embeds every text in one request. `encoding_format: "float"` is the OpenAI default,
@@ -559,7 +559,7 @@ mod tests {
 
     const DIM: usize = 384;
     // The SELECTED model's registry id — what `model_id()` must return regardless of the runtime.
-    const SELECTED_ID: &str = crate::embedding_models::FASTEMBED_MODEL_ID;
+    const SELECTED_ID: &str = rag_rat_base::embedding_models::FASTEMBED_MODEL_ID;
 
     /// Construct the embedder for the selected model over the given remote config + dim. Thin
     /// wrapper so the many tests don't repeat the `selected_model_id` arg.
@@ -683,7 +683,7 @@ mod tests {
     fn config_for(endpoint: &str, timeout_s: u64) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
-            backend: crate::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             endpoint: Some(endpoint.to_string()),
             cookbook: None,
             query_endpoint: None,

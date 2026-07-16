@@ -1,8 +1,9 @@
 use std::path::Path;
 
+use rag_rat_base::repo_identity::{
+    LEGACY_REPO_ID, LOCAL_ONLY_ID_PREFIX, RepoIdentity, RepoIdentityClass,
+};
 use rusqlite::{Connection, OptionalExtension, params};
-
-use crate::repo_identity::{LOCAL_ONLY_ID_PREFIX, RepoIdentity, RepoIdentityClass};
 
 /// The `temp.connection_context` key under which the scope view stashes the active repo id (beside
 /// `commit_sha` / `worktree_id`). [`active_repo_id`] reads it; `install_scope_view` writes it.
@@ -99,13 +100,7 @@ const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
     "repo_node_edges",
 ];
 
-/// The placeholder `repo_id` a freshly-migrated single-repo DB carries until it is adopted (see the
-/// V038 DDL) — and the backfill value every direct-scoped table gets when later migrations add
-/// `repo_id` columns (phase A3). A consolidated DB holding more than one repo NEVER carries this id
-/// (enforced by [`register_repo`]).
-pub const LEGACY_REPO_ID: &str = "__unassigned__";
-
-/// The `repo_meta` key a [`LocalOnly`](crate::repo_identity::RepoIdentityClass::LocalOnly)
+/// The `repo_meta` key a [`LocalOnly`](rag_rat_base::repo_identity::RepoIdentityClass::LocalOnly)
 /// registration records its SORTED shallow-boundary commit hashes under (newline-joined), so a
 /// later LocalOnly→Portable upgrade can PROVE the incoming deepened clone is the same repository —
 /// its HEAD must reach these boundary commits. Absent ⇒ no proof recorded ⇒ the upgrade is refused.
@@ -223,7 +218,7 @@ fn register_repo_inner(
     // pathless (in-memory) connection skips it — no cross-process writer can exist for it.
     let _registry_lock = match conn.path().filter(|p| !p.is_empty()) {
         Some(db_path) => Some(
-            crate::locks::WriteLock::acquire_registry_timeout(
+            rag_rat_base::locks::WriteLock::acquire_registry_timeout(
                 Path::new(db_path),
                 REGISTRY_LOCK_TIMEOUT,
             )
@@ -526,24 +521,28 @@ fn acquire_dual_repo_locks(
     db_path: &Path,
     outgoing_id: &str,
     target_id: &str,
-) -> rusqlite::Result<Vec<crate::locks::WriteLock>> {
-    let (first, second) = crate::locks::canonical_lock_order(outgoing_id, target_id);
+) -> rusqlite::Result<Vec<rag_rat_base::locks::WriteLock>> {
+    let (first, second) = rag_rat_base::locks::canonical_lock_order(outgoing_id, target_id);
     let mut guards = Vec::with_capacity(2);
     for repo in [first, second] {
         guards.push(
-            crate::locks::WriteLock::acquire_timeout(db_path, repo, UPGRADE_OUTGOING_LOCK_TIMEOUT)
-                .map_err(|err| {
-                    registry_refusal(format!(
-                        "cannot upgrade {outgoing_id}: failed acquiring the write lock for \
-                         {repo}: {err}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    registry_refusal(format!(
-                        "cannot upgrade {outgoing_id}: timed out waiting for an in-flight writer \
-                         holding the write lock for {repo}"
-                    ))
-                })?,
+            rag_rat_base::locks::WriteLock::acquire_timeout(
+                db_path,
+                repo,
+                UPGRADE_OUTGOING_LOCK_TIMEOUT,
+            )
+            .map_err(|err| {
+                registry_refusal(format!(
+                    "cannot upgrade {outgoing_id}: failed acquiring the write lock for {repo}: \
+                     {err}"
+                ))
+            })?
+            .ok_or_else(|| {
+                registry_refusal(format!(
+                    "cannot upgrade {outgoing_id}: timed out waiting for an in-flight writer \
+                     holding the write lock for {repo}"
+                ))
+            })?,
         );
     }
     Ok(guards)
@@ -586,7 +585,8 @@ fn late_upgrade_is_proven(
     }
     let boundary = read_shallow_boundary(conn, owner)?;
     Ok(!boundary.is_empty()
-        && crate::repo_identity::boundary_reachable_from_head(root, &boundary).unwrap_or(false))
+        && rag_rat_base::repo_identity::boundary_reachable_from_head(root, &boundary)
+            .unwrap_or(false))
 }
 
 /// LATE-upgrade merge: retire the `local:` incumbent `owner` INTO the already-registered
@@ -811,7 +811,8 @@ fn find_upgradeable_local_incumbent(
         }
         let boundary = read_shallow_boundary(conn, id)?;
         if !boundary.is_empty()
-            && crate::repo_identity::boundary_reachable_from_head(root, &boundary).unwrap_or(false)
+            && rag_rat_base::repo_identity::boundary_reachable_from_head(root, &boundary)
+                .unwrap_or(false)
         {
             return Ok(Some(id.clone()));
         }
@@ -1091,11 +1092,11 @@ pub(crate) fn registered_repos(conn: &Connection) -> rusqlite::Result<Vec<Regist
 /// empty scope rather than a sibling's rows.
 ///
 /// Resolution routes, in order:
-///  1. by IDENTITY — [`resolve_repo_identity`](crate::repo_identity::resolve_repo_identity) derives
-///     the id (honoring an `[index] repo_id` override); if it is a REGISTERED real repo, use it. A
-///     derivable-but-UNREGISTERED id (a new/changed pin, or a now-portable shallow clone) returns
-///     `None` — a changed identity must adopt/surface on the read-write path, never silently keep
-///     serving the old scope.
+///  1. by IDENTITY — [`resolve_repo_identity`](rag_rat_base::repo_identity::resolve_repo_identity)
+///     derives the id (honoring an `[index] repo_id` override); if it is a REGISTERED real repo,
+///     use it. A derivable-but-UNREGISTERED id (a new/changed pin, or a now-portable shallow clone)
+///     returns `None` — a changed identity must adopt/surface on the read-write path, never
+///     silently keep serving the old scope.
 ///  2. by ROOT (ABSENT configs only) — when there is NO derivable identity (non-git / unborn HEAD),
 ///     the recorded `repo_roots` mapping for this root path (registration always records the root,
 ///     so this binds the registered repo for a non-git root, e.g. a directly-seeded test repo).
@@ -1111,7 +1112,7 @@ pub(crate) fn resolve_config_repo_id(
     root: &Path,
     repo_id_override: Option<&str>,
 ) -> rusqlite::Result<Option<String>> {
-    match crate::repo_identity::resolve_repo_identity(root, repo_id_override) {
+    match rag_rat_base::repo_identity::resolve_repo_identity(root, repo_id_override) {
         // Route 1: a derivable id that is registered scopes correctly even in a consolidated DB —
         // UNLESS this root is recorded under a DIFFERENT real repo. That is the read-only MIRROR
         // of `register_repo`'s root-owner refusal: after an `[index] repo_id` pin is switched to a

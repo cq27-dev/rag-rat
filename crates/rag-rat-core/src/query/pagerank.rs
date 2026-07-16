@@ -285,7 +285,7 @@ pub struct SymbolImportance {
     #[serde(
         rename = "id",
         skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"
     )]
     pub logical_symbol_id: Option<i64>,
     pub qualified_name: String,

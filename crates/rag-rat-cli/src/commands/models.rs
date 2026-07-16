@@ -4,7 +4,7 @@
 #[cfg(feature = "eval")]
 use std::path::PathBuf;
 
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 #[cfg(feature = "eval")]
 use rag_rat_core::OutputFormat;
 
@@ -92,7 +92,7 @@ pub(crate) fn benchmark_embedding(
     config: &Config,
     args: &BenchmarkEmbeddingArgs,
 ) -> anyhow::Result<()> {
-    use rag_rat_core::config::RemoteEmbeddingConfig;
+    use rag_rat_base::config::RemoteEmbeddingConfig;
 
     // Build an EPHEMERAL remote config directly (no rag-rat.toml round-trip): `cookbook` set,
     // `endpoint` None. Struct construction bypasses the config layer's connect/ephemeral
@@ -164,7 +164,7 @@ pub(crate) fn benchmark_embedding(
     // Registry model → trust `spec.dim`. Off-registry HF model → provision, measure the dim from
     // one probe embed, then benchmark. Either way the ProvisionedBox is kept bound for the
     // whole sweep.
-    let spec = rag_rat_core::embedding_models::spec(&args.model);
+    let spec = rag_rat_base::embedding_models::spec(&args.model);
     let provisioned = rag_rat_core::index::ai::provision_box_for_benchmark(
         &remote,
         spec_or_measure_placeholder(spec),
@@ -260,10 +260,10 @@ pub(crate) fn benchmark_embedding(
 /// measured separately via `measure_remote_dim`.
 #[cfg(feature = "eval")]
 fn spec_or_measure_placeholder(
-    spec: Option<&'static rag_rat_core::embedding_models::EmbeddingModelSpec>,
-) -> &'static rag_rat_core::embedding_models::EmbeddingModelSpec {
+    spec: Option<&'static rag_rat_base::embedding_models::EmbeddingModelSpec>,
+) -> &'static rag_rat_base::embedding_models::EmbeddingModelSpec {
     spec.unwrap_or_else(|| {
-        rag_rat_core::embedding_models::spec(rag_rat_core::embedding_models::FASTEMBED_MODEL_ID)
+        rag_rat_base::embedding_models::spec(rag_rat_base::embedding_models::FASTEMBED_MODEL_ID)
             .expect("the fallback all-MiniLM spec is always registered")
     })
 }
@@ -280,13 +280,13 @@ fn spec_or_measure_placeholder(
 fn remote_for_install<'a>(
     config: &'a Config,
     model_id: &str,
-) -> anyhow::Result<Option<&'a rag_rat_core::config::RemoteEmbeddingConfig>> {
+) -> anyhow::Result<Option<&'a rag_rat_base::config::RemoteEmbeddingConfig>> {
     let Some(remote) = config.llm.embedding.remote.as_ref() else {
         return Ok(None);
     };
     // Resolve the requested id to its canonical spec id and compare to the configured selected
     // model.
-    let requested = rag_rat_core::embedding_models::spec(model_id).map(|s| s.model_id);
+    let requested = rag_rat_base::embedding_models::spec(model_id).map(|s| s.model_id);
     let configured = config.llm.embedding.backend.model_id();
     if requested.is_some() && requested == configured {
         Ok(Some(remote))
@@ -316,7 +316,7 @@ pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
 /// not embedded), costing precision/recall on large functions. `rag-rat init`'s model help covers
 /// this interactively; this catches the `rag-rat models install` CLI path.
 fn warn_if_short_context(model_id: &str) {
-    let Some(spec) = rag_rat_core::embedding_models::spec(model_id) else { return };
+    let Some(spec) = rag_rat_base::embedding_models::spec(model_id) else { return };
     let (Some(max_tokens), Some(model_chars)) = (spec.max_tokens, spec.max_input_chars()) else {
         return;
     };
@@ -335,7 +335,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use rag_rat_core::Config;
+    use rag_rat_base::config::Config;
 
     static N: AtomicU64 = AtomicU64::new(0);
 

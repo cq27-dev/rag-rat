@@ -3,7 +3,7 @@
 //! sync).
 use std::fs;
 
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 use rag_rat_core::index::papertrail::autosync;
 
 use crate::cli::{HookAction, HooksArgs, PapertrailArgs, PapertrailCommand};

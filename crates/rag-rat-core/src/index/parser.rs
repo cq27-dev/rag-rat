@@ -5,9 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use rag_rat_base::language::Language;
 use tree_sitter::{Node, ParseOptions, ParseState, Parser, Tree};
-
-use crate::language::Language;
 
 /// Wall-clock budget for a single file's tree-sitter parse. A normal file parses in well under this
 /// (tens of ms even for thousands of lines); a pathological input that drives tree-sitter into
@@ -591,8 +590,9 @@ mod budget_tests {
 mod is_test_detection {
     use std::path::Path;
 
+    use rag_rat_base::language::Language;
+
     use super::parse_symbols;
-    use crate::language::Language;
 
     fn is_test(path: &str, language: Language, text: &str, name: &str) -> bool {
         parse_symbols(Path::new(path), language, text)

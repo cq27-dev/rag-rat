@@ -100,7 +100,7 @@ pub(crate) struct SymbolFingerprint {
 pub(crate) fn fingerprint_symbol(
     node: Node<'_>,
     text: &str,
-    lang: crate::language::Language,
+    lang: rag_rat_base::language::Language,
 ) -> Option<SymbolFingerprint> {
     let tokens = normalize::normalize_baseline(node, text, lang);
     if tokens.len() < MIN_TOKENS {
@@ -146,7 +146,7 @@ fn symbol_is_function_valued(node: Node<'_>) -> bool {
 pub(crate) fn fingerprint_symbols(
     root: Node<'_>,
     text: &str,
-    lang: crate::language::Language,
+    lang: rag_rat_base::language::Language,
     symbols: &[crate::index::symbols::Symbol],
 ) -> Vec<(usize, SymbolFingerprint)> {
     let mut out = Vec::new();
@@ -174,9 +174,10 @@ pub(crate) fn fingerprint_symbols(
 mod tests {
     use std::path::Path;
 
+    use rag_rat_base::language::Language;
+
     use super::*;
     use crate::index::{parser, symbols};
-    use crate::language::Language;
 
     #[test]
     fn normalizer_kind_db_str_round_trips() {

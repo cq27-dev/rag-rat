@@ -1,0 +1,30 @@
+[package]
+name = "rag-rat-base"
+version.workspace = true
+description = "Foundation layer for the rag-rat workspace: configuration, repo identity and discovery, language and embedding-model registries, locks, and logging."
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gix.workspace = true
+libc.workspace = true
+path-slash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

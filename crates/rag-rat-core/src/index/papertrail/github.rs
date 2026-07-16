@@ -675,7 +675,7 @@ mod tests {
     fn multi_lane_client_resolves_a_token_command_once() {
         let counter = tempfile::NamedTempFile::new().unwrap();
         let mut tracker = binding("http://127.0.0.1:9".to_string());
-        tracker.auth = Some(crate::config::TrackerAuth::TokenCommand(format!(
+        tracker.auth = Some(rag_rat_base::config::TrackerAuth::TokenCommand(format!(
             "printf x >> {}; printf token",
             counter.path().display()
         )));

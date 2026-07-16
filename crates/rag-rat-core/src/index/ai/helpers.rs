@@ -1,6 +1,7 @@
+use rag_rat_base::config::RemoteEmbeddingConfig;
+use rag_rat_base::embedding_models::{HASH_MODEL_ID, spec};
+
 use super::*;
-use crate::config::RemoteEmbeddingConfig;
-use crate::embedding_models::{HASH_MODEL_ID, spec};
 
 pub(crate) fn embed_query(
     conn: &Connection,
@@ -547,7 +548,7 @@ mod tests {
     fn sample_remote() -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
-            backend: crate::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             endpoint: Some("http://localhost:11434".to_string()),
             cookbook: None,
             query_endpoint: None,
@@ -612,7 +613,7 @@ mod tests {
 
     #[test]
     fn active_embedding_model_version_is_scoped_to_the_active_model() {
-        use crate::embedding_models::{BGE_SMALL_MODEL_ID, FASTEMBED_MODEL_ID};
+        use rag_rat_base::embedding_models::{BGE_SMALL_MODEL_ID, FASTEMBED_MODEL_ID};
 
         // The fastembed all-minilm model is active with a dynamic (remote) freshness key in the
         // meta.
@@ -633,7 +634,7 @@ mod tests {
 
     #[test]
     fn embed_query_falls_back_to_lexical_when_the_remote_query_embed_fails() {
-        use crate::embedding_models::FASTEMBED_MODEL_ID;
+        use rag_rat_base::embedding_models::FASTEMBED_MODEL_ID;
 
         // The active model is served over Ollama (a persisted remote config) whose endpoint points
         // at a CLOSED port: construction succeeds (from_remote_config doesn't connect), but
@@ -647,7 +648,7 @@ mod tests {
         activate_model(&conn, FASTEMBED_MODEL_ID);
         let remote = RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
-            backend: crate::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             endpoint: Some(format!("http://127.0.0.1:{port}")),
             cookbook: None,
             query_endpoint: None,
@@ -717,7 +718,7 @@ mod tests {
         // the table-driven helpers — else the reconcile freshness key (model_version) is
         // wrong and embeddings silently mis-track. Regression guard for `expected_dim` /
         // `default_model_version` now reading the `EMBEDDING_MODELS` registry (#112).
-        for spec in crate::embedding_models::EMBEDDING_MODELS {
+        for spec in rag_rat_base::embedding_models::EMBEDDING_MODELS {
             assert_eq!(
                 expected_dim(spec.model_id),
                 Some(spec.dim),
@@ -732,7 +733,7 @@ mod tests {
             );
         }
         // jina-v2-base-code is the 768-dim code tier; pin its identity explicitly.
-        use crate::embedding_models::JINA_CODE_MODEL_ID;
+        use rag_rat_base::embedding_models::JINA_CODE_MODEL_ID;
         assert_eq!(expected_dim(JINA_CODE_MODEL_ID), Some(768));
         assert_eq!(
             default_model_version(JINA_CODE_MODEL_ID),

@@ -12,8 +12,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use rag_rat_core::language::Language;
-use rag_rat_core::{Config, IndexDatabase};
+use rag_rat_base::config::Config;
+use rag_rat_base::language::Language;
+use rag_rat_core::IndexDatabase;
 
 mod common;
 

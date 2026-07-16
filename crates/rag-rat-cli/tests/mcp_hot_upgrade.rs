@@ -16,7 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 use serde_json::{Value, json};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -103,7 +103,7 @@ impl TestEnv {
     /// listener and the CLI client use (`hook_socket_path_for` handles the XDG/temp budget
     /// cascade), so the probe can't drift from where the server actually binds.
     fn hook_socket_path(&self) -> PathBuf {
-        rag_rat_core::locks::hook_socket_path_for(&self.config)
+        rag_rat_base::locks::hook_socket_path_for(&self.config)
     }
 
     /// A `/bin/sh` wrapper that touches `sentinel` then `exec`s the real binary with our argv —

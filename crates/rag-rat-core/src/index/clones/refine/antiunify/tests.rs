@@ -1,11 +1,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use rag_rat_base::language::Language;
+
 use super::*;
 use crate::index::clones::normalize::normalize_baseline_spanned;
 use crate::index::clones::tokens;
 use crate::index::parser;
-use crate::language::Language;
 
 /// Build a `RefineMember` from a Rust snippet, mirroring `load_refine_members`: parse, descend
 /// to the first `function` symbol, span-normalize, compute the faithfulness struct_hash.

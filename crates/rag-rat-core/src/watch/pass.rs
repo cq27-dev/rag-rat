@@ -3,13 +3,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use notify::Event;
+use rag_rat_base::config::Config;
+use rag_rat_base::locks::{self};
 
 use super::overlay::{OverlayScope, ReconcileBudget, refresh_worktree_overlays};
 use super::placement::WatchPlacementCounters;
-use crate::config::Config;
 use crate::index::IndexDatabase;
 use crate::index::ai::ReconcileOptions;
-use crate::locks::{self};
 
 pub(crate) const GC_EVERY_PASSES: u64 = 20;
 pub(crate) const PASS_RECONCILE_MAX_SECONDS: u64 = 60;

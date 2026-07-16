@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
+use rag_rat_base::language::Language;
 use tree_sitter::Node;
-
-use crate::language::Language;
 
 /// A leaf tree-sitter kind that names a binding/reference identifier (kept language-agnostic by
 /// matching the `*identifier` suffix tree-sitter grammars use).
@@ -244,9 +243,10 @@ fn walk_spanned(
 mod tests {
     use std::path::Path;
 
+    use rag_rat_base::language::Language;
+
     use super::*;
     use crate::index::parser;
-    use crate::language::Language;
 
     /// Pick the target symbol's AST node for a normalization test: the symbol whose subtree
     /// normalizes to the MOST tokens (the actual body under test, language-agnostic). Choosing by

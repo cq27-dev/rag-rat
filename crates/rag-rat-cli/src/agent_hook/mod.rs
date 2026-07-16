@@ -19,10 +19,10 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::Duration;
 
-use rag_rat_core::config::Config;
+use rag_rat_base::config::Config;
+use rag_rat_base::language::Language;
+use rag_rat_base::locks;
 use rag_rat_core::index::{CloneCheckInput, IndexDatabase, TextCloneMatch};
-use rag_rat_core::language::Language;
-use rag_rat_core::locks;
 use rag_rat_core::query::grep_augment;
 use rag_rat_core::query::orientation::Orientation;
 use rag_rat_core::storage::IndexConnection;
@@ -738,9 +738,9 @@ pub fn format_digest(o: &Orientation, live: bool, enabled: bool) -> String {
 
 /// Walk up from the hook's cwd to the nearest rag-rat.toml and load it. `None` ⇒ not a rag-rat repo
 /// ⇒ silent no-op (what makes `--global` install safe). Shares the upward-walk primitive with
-/// `Config::load`'s discovery seam ([`rag_rat_core::config::nearest_config_at_or_above`]).
+/// `Config::load`'s discovery seam ([`rag_rat_base::config::nearest_config_at_or_above`]).
 fn find_config(start: &Path) -> Option<Config> {
-    rag_rat_core::config::nearest_config_at_or_above(start)
+    rag_rat_base::config::nearest_config_at_or_above(start)
         .and_then(|path| Config::load(&path).ok())
 }
 

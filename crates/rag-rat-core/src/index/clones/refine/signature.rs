@@ -9,10 +9,11 @@
 //! Gapped metavars are NOT promoted to params; they go into `unresolved_type_slots` and depress
 //! the typedness signal to at most `Partial` (the class isn't cleanly extractable).
 
+use rag_rat_base::language::Language;
+
 use super::antiunify::{MetavarKind, Template, VariationPoint};
 use super::score::Confidence;
 use crate::index::clones::refine::RefineMember;
-use crate::language::Language;
 
 /// How well the syntactic type recovery succeeded for the proposed signature.
 ///
@@ -658,6 +659,8 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    use rag_rat_base::language::Language;
+
     use super::*;
     use crate::index::clones::normalize::normalize_baseline_spanned;
     use crate::index::clones::refine::antiunify::{
@@ -665,7 +668,6 @@ mod tests {
     };
     use crate::index::clones::tokens;
     use crate::index::parser;
-    use crate::language::Language;
 
     /// Build a `RefineMember` from a Rust snippet (mirrors the `member` helper in antiunify tests).
     fn member(symbol_id: i64, src: &str) -> RefineMember {

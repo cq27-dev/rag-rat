@@ -3,11 +3,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rag_rat_base::config::Config;
 use serde::{Deserialize, Serialize};
 
+use crate::IndexDatabase;
 use crate::index::oracle::{OracleEvalMetrics, OracleTool, RecallCalls};
 use crate::index::{OracleShaSnapshots, git_history};
-use crate::{Config, IndexDatabase};
 
 const TOP_K: usize = 10;
 
@@ -969,9 +970,10 @@ fn hash_vector_baseline(
         )?);
     }
     let metrics = aggregate(&results);
-    let current_artifacts = db.current_embedding_count(crate::embedding_models::HASH_MODEL_ID)?;
+    let current_artifacts =
+        db.current_embedding_count(rag_rat_base::embedding_models::HASH_MODEL_ID)?;
     Ok(EvalBaselineReport {
-        model_id: crate::embedding_models::HASH_MODEL_ID.to_string(),
+        model_id: rag_rat_base::embedding_models::HASH_MODEL_ID.to_string(),
         available: current_artifacts > 0,
         current_artifacts,
         delta_mrr_at_10: active_metrics.mrr_at_10 - metrics.mrr_at_10,
@@ -1217,8 +1219,10 @@ fn write_baseline(path: &Path, expected: Vec<ExpectedQuery>) -> anyhow::Result<(
 mod tests {
     use std::path::PathBuf;
 
+    use rag_rat_base::config::Config;
+
     use super::*;
-    use crate::{Config, IndexDatabase};
+    use crate::IndexDatabase;
 
     #[test]
     fn replay_eval_query_maps_commit_to_query() {

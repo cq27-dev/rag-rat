@@ -358,7 +358,7 @@ fn line_diff(before: &str, after: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use rag_rat_core::language::Language;
+    use rag_rat_base::language::Language;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -394,14 +394,14 @@ mod tests {
         let mut st = bare_state();
         st.draft.remote = Some(RemoteDraft {
             model: "all-minilm".to_string(),
-            backend: rag_rat_core::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             mode: RemoteMode::Ephemeral("some-cookbook".to_string()),
             query_endpoint: None,
             gpu: None,
             num_ctx: None,
             batch_size: 32,
-            concurrency: rag_rat_core::config::RemoteEmbeddingConfig::default().concurrency,
-            max_batch_chars: rag_rat_core::config::RemoteEmbeddingConfig::default().max_batch_chars,
+            concurrency: rag_rat_base::config::RemoteEmbeddingConfig::default().concurrency,
+            max_batch_chars: rag_rat_base::config::RemoteEmbeddingConfig::default().max_batch_chars,
             auth_env: None,
         });
         st

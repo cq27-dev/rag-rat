@@ -11,14 +11,15 @@
 mod shared;
 
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
-use rag_rat_core::{Config, IndexDatabase};
+use rag_rat_base::config::Config;
+use rag_rat_core::IndexDatabase;
 use shared::{bench_config, built_config, built_index, open_like_production};
 
 /// Small subtree — keeps each callgrind run (including setups) fast.
 const SUBDIR: &str = "src/cargo/core/resolver";
 const QUERY: &str = "resolve dependency version conflict";
 
-fn resolver_config() -> rag_rat_core::Config {
+fn resolver_config() -> rag_rat_base::config::Config {
     bench_config(SUBDIR)
 }
 fn resolver_index() -> IndexDatabase {
@@ -31,7 +32,7 @@ fn resolver_built_config() -> Config {
 // Index cost: full rebuild of the subtree. Setup (clone + Config) is not measured; only `rebuild`.
 #[library_benchmark]
 #[bench::cargo_resolver(setup = resolver_config)]
-fn index(config: rag_rat_core::Config) -> IndexDatabase {
+fn index(config: rag_rat_base::config::Config) -> IndexDatabase {
     IndexDatabase::rebuild(&config).expect("rebuild corpus index")
 }
 

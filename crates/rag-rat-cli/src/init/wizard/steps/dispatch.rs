@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use rag_rat_core::language::Language;
+use rag_rat_base::language::Language;
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;

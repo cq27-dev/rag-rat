@@ -15,6 +15,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use rag_rat_base::hash::hex_sha256;
+
 use super::*;
 
 /// Repo-relative paths whose linked-worktree state differs from the base scope, split into files to
@@ -109,8 +111,8 @@ fn resolve_overlay_scope(
     if worktree_id == git_context::worktree_id_of(&config.root) {
         return Ok(None);
     }
-    let base_repo = git_context::discover_repo(&config.root)?;
-    let linked_repo = git_context::discover_repo(linked_path)?;
+    let base_repo = rag_rat_base::repo_discover::discover_repo(&config.root)?;
+    let linked_repo = rag_rat_base::repo_discover::discover_repo(linked_path)?;
     let (_, source_root) =
         linked_config_subdir_and_root(config, &base_repo, &linked_repo, linked_path);
     Ok(Some((base_sha, worktree_id, source_root)))
@@ -127,8 +129,8 @@ pub(crate) fn compute_linked_worktree_delta(
     config: &Config,
     linked_path: &Path,
 ) -> anyhow::Result<WorktreeOverlayDelta> {
-    let base_repo = git_context::discover_repo(&config.root)?;
-    let linked_repo = git_context::discover_repo(linked_path)?;
+    let base_repo = rag_rat_base::repo_discover::discover_repo(&config.root)?;
+    let linked_repo = rag_rat_base::repo_discover::discover_repo(linked_path)?;
     // `config.root` may be a SUBDIR of the repo. Tree-diff and status entries are repo-relative
     // (e.g. `crate/src/lib.rs`), but `target_for_path` / the overlay path keys are config-root-
     // relative (e.g. `src/lib.rs`), and the readable files are read from the LINKED checkout's

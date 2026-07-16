@@ -1,6 +1,6 @@
 //! Config / version introspection commands, split out of the `commands` god-module: `dump-config`
 //! (the resolved config as JSON) and `version-check` (crates.io current-vs-latest).
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 
 use crate::render::print_output;
 

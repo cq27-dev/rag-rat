@@ -16,6 +16,8 @@ mod model2vec;
 // version check), so there is no heavy optional dependency to gate. No `remote-embed` feature.
 mod openai;
 
+use rag_rat_base::config::RemoteEmbeddingConfig;
+use rag_rat_base::embedding_models::{Backend, EmbeddingModelSpec, spec};
 use rusqlite::Connection;
 
 pub(crate) use self::cookbook::provision_and_build;
@@ -47,8 +49,6 @@ pub(crate) use self::openai::ProvisionedEmbedderParams;
 // (`dream/model.rs`) so a configured-but-unresolved `auth_env` errors identically for
 // embeddings and the dream model.
 pub(crate) use self::openai::resolve_auth_header;
-use crate::config::RemoteEmbeddingConfig;
-use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
 use crate::index::ai::{
     EmbeddingScan, ReconcileOptions, active_embedding_model_id, active_remote_config,
     estimated_reconcile_jobs, model, validate_ready_model,
@@ -447,8 +447,9 @@ impl Embedder for MockEmbedder {
 
 #[cfg(test)]
 mod dispatch_tests {
+    use rag_rat_base::embedding_models::FASTEMBED_MODEL_ID;
+
     use super::*;
-    use crate::embedding_models::FASTEMBED_MODEL_ID;
     use crate::index::ai::set_active_remote_config;
 
     /// An in-memory index with the schema applied + the manifest seeded, with `model_id` forced
@@ -473,7 +474,7 @@ mod dispatch_tests {
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
-            backend: crate::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             endpoint: Some(endpoint.to_string()),
             cookbook: None,
             query_endpoint: None,
@@ -520,15 +521,15 @@ mod dispatch_tests {
     fn embedder_for_spec_without_remote_uses_the_local_backend() {
         // No remote → dispatch on the model's local backend. Hash is always available, so it's the
         // feature-independent assertion.
-        let spec = spec(crate::embedding_models::HASH_MODEL_ID).unwrap();
+        let spec = spec(rag_rat_base::embedding_models::HASH_MODEL_ID).unwrap();
         let embedder = embedder_for_spec(spec, None, None).unwrap();
-        assert_eq!(embedder.model_id(), crate::embedding_models::HASH_MODEL_ID);
+        assert_eq!(embedder.model_id(), rag_rat_base::embedding_models::HASH_MODEL_ID);
     }
 
     fn ephemeral_at(query_endpoint: &str, auth_env: Option<&str>) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
-            backend: crate::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             endpoint: None,
             cookbook: Some("@rag-rat/cookbook/modal".to_string()),
             query_endpoint: Some(query_endpoint.to_string()),

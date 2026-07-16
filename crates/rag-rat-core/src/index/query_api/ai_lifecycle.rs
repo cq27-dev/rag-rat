@@ -20,7 +20,7 @@ impl IndexDatabase {
     pub fn install_model(
         &self,
         model_id: &str,
-        remote: Option<&crate::config::RemoteEmbeddingConfig>,
+        remote: Option<&rag_rat_base::config::RemoteEmbeddingConfig>,
     ) -> anyhow::Result<ModelInfo> {
         ai::install_model(self.storage.connection(), model_id, remote)
     }

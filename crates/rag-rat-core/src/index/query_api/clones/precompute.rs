@@ -1039,7 +1039,7 @@ pub(super) mod tests {
     /// → identical content-key edges, so two builds are directly comparable. Split out so a
     /// test can `rebuild` the SAME config twice (identical content) to exercise the
     /// full-rebuild df refresh.
-    pub(in super::super) fn clone_fixture_config(tag: &str) -> crate::Config {
+    pub(in super::super) fn clone_fixture_config(tag: &str) -> rag_rat_base::config::Config {
         let root = std::env::temp_dir().join(format!(
             "rag-rat-precompute-{tag}-{}-{}",
             std::process::id(),
@@ -1061,20 +1061,20 @@ pub(super) mod tests {
              t += v * 2; } t + 1 }\n",
         )
         .unwrap();
-        crate::Config {
+        rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
-            targets: vec![crate::config::ResolvedTarget {
+            targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
-                language: crate::language::Language::Rust,
+                language: rag_rat_base::language::Language::Rust,
                 directories: vec![std::path::PathBuf::from("src")],
                 include: vec!["src/".to_string()],
                 exclude: Vec::new(),
-                kind: crate::config::TargetKind::Source,
+                kind: rag_rat_base::config::TargetKind::Source,
             }],
             llm: Default::default(),
             watch: Default::default(),

@@ -40,13 +40,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use rag_rat_base::config::{self, Config};
+use rag_rat_base::repo_identity::{self, RepoIdentity};
+use rag_rat_base::{data_dir, locks};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::config::{self, Config};
 use crate::index::{IndexDatabase, schema};
-use crate::repo_identity::{self, RepoIdentity};
 use crate::storage::IndexConnection;
-use crate::{data_dir, locks};
 
 /// The `repo_meta` keys consolidate carries from the legacy DB into the global DB. Carried as a
 /// per-key MIRROR of the source (the import's mirror invariant): a key present in the legacy DB
@@ -222,7 +222,7 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
         source_side_ids.push(identity.repo_id.clone());
     }
     source_side_ids.sort_by(|a, b| {
-        if crate::locks::canonical_lock_order(a, b).0 == a.as_str() {
+        if rag_rat_base::locks::canonical_lock_order(a, b).0 == a.as_str() {
             std::cmp::Ordering::Less
         } else {
             std::cmp::Ordering::Greater

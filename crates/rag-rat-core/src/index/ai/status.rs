@@ -1,9 +1,10 @@
-use super::*;
-use crate::config::RemoteEmbeddingConfig;
-use crate::embedding_models::{
+use rag_rat_base::config::RemoteEmbeddingConfig;
+use rag_rat_base::embedding_models::{
     Backend, EmbeddingModelSpec, FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM,
     FASTEMBED_MODEL_ID, spec,
 };
+
+use super::*;
 
 pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyhow::Result<()> {
     #[cfg(feature = "fastembed")]
@@ -292,8 +293,9 @@ mod ollama_install_tests {
     use std::thread;
     use std::time::Duration;
 
+    use rag_rat_base::embedding_models::FASTEMBED_MODEL_ID;
+
     use super::*;
-    use crate::embedding_models::FASTEMBED_MODEL_ID;
 
     /// Fully consume the request (headers + Content-Length body) before replying. A single read is
     /// NOT enough: on Windows the request can arrive in multiple TCP segments, leaving the tail in
@@ -363,7 +365,7 @@ mod ollama_install_tests {
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
-            backend: crate::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             endpoint: Some(endpoint.to_string()),
             cookbook: None,
             query_endpoint: None,
@@ -467,7 +469,7 @@ mod ollama_install_tests {
 
     #[test]
     fn remote_freshness_version_differs_by_backend() {
-        use crate::config::RemoteBackend;
+        use rag_rat_base::config::RemoteBackend;
         // The SAME model served by a DIFFERENT backend can pool/normalize differently, so the
         // backend is part of the vector-space identity — switching it must re-embed.
         let spec = spec(FASTEMBED_MODEL_ID).unwrap();

@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::ResolvedTarget;
+use rag_rat_base::config::ResolvedTarget;
+
 use crate::index::ignore_rules::IgnoreMatcher;
 
 /// Walk one target's directories, honoring the repo's compiled `.gitignore` rules (root + nested)
@@ -90,9 +91,10 @@ fn matches_simple_pattern(path: &str, pattern: &str) -> bool {
 mod tests {
     use std::fs;
 
+    use rag_rat_base::config::TargetKind;
+    use rag_rat_base::language::Language;
+
     use super::*;
-    use crate::config::TargetKind;
-    use crate::language::Language;
 
     fn rust_target() -> ResolvedTarget {
         ResolvedTarget {

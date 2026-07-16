@@ -128,7 +128,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct TestRepo {
     root: PathBuf,
     config_path: PathBuf,
-    config: rag_rat_core::Config,
+    config: rag_rat_base::config::Config,
 }
 
 #[cfg(unix)]
@@ -149,7 +149,7 @@ impl TestRepo {
              \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = [\"src\"]\n",
         )
         .unwrap();
-        let config = rag_rat_core::Config::load(&config_path).unwrap();
+        let config = rag_rat_base::config::Config::load(&config_path).unwrap();
         rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
         // Guard against a vacuous test: the symbol lane only fires if the symbol is really indexed.
         assert_symbol_indexed(&config, "frobnicate_xyz");
@@ -158,7 +158,7 @@ impl TestRepo {
 
     /// Same client computation as the CLI: the deterministic socket path for this config.
     fn socket_path(&self) -> PathBuf {
-        rag_rat_core::locks::hook_socket_path_for(&self.config)
+        rag_rat_base::locks::hook_socket_path_for(&self.config)
     }
 
     /// Spawn `rag-rat mcp` and drive `initialize` so the server is fully up and `run_stdio_unix`
@@ -262,7 +262,7 @@ fn additional_context(stdout: &str) -> Option<String> {
 /// Independently confirm the symbol is in the index, so a missing symbol can't make the e2e pass
 /// vacuously (an empty context would otherwise look like a deduped no-op).
 #[cfg(unix)]
-fn assert_symbol_indexed(config: &rag_rat_core::Config, symbol: &str) {
+fn assert_symbol_indexed(config: &rag_rat_base::config::Config, symbol: &str) {
     use rag_rat_core::storage::IndexConnection;
     let conn = IndexConnection::open_read_only(&config.database).unwrap();
     let count: i64 = conn
@@ -314,7 +314,7 @@ fn session_start_warns_when_the_index_schema_is_newer() {
          [\"src\"]\n",
     )
     .unwrap();
-    let config = rag_rat_core::Config::load(dir.join("rag-rat.toml")).unwrap();
+    let config = rag_rat_base::config::Config::load(dir.join("rag-rat.toml")).unwrap();
     rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
 
     // Make the schema read as created-by-a-future-rag-rat: an unrecognized migration id.

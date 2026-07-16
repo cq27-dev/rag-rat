@@ -88,14 +88,15 @@ impl IndexDatabase {
             // Reentrant on the holding thread, so a CLI write command that opens under
             // its per-repo write lock and migrates here takes a DIFFERENT (schema) lock
             // without self-deadlocking.
-            let _lock =
-                crate::locks::WriteLock::acquire_schema_timeout(path, SCHEMA_MIGRATE_LOCK_TIMEOUT)?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "timed out waiting for the schema-migration lock to auto-migrate the \
-                             schema"
-                        )
-                    })?;
+            let _lock = rag_rat_base::locks::WriteLock::acquire_schema_timeout(
+                path,
+                SCHEMA_MIGRATE_LOCK_TIMEOUT,
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "timed out waiting for the schema-migration lock to auto-migrate the schema"
+                )
+            })?;
             schema::ensure_compatible_or_migrate(storage.connection())?;
         } else {
             schema::ensure_compatible_or_migrate(storage.connection())?;
@@ -208,7 +209,7 @@ impl IndexDatabase {
 
     /// Resolve this config's repo IDENTITY and register/adopt it, stamping `self.active_repo_id`.
     /// Identity-resolution failures split by class
-    /// ([`RepoIdentityError`](crate::repo_identity::RepoIdentityError)):
+    /// ([`RepoIdentityError`](rag_rat_base::repo_identity::RepoIdentityError)):
     /// - `Absent` (not a git repo / unborn HEAD — many tests, and any bare temp-dir index) is NOT
     ///   an error: fall back to the sole registered repo (the placeholder on a fresh DB), leaving
     ///   the DB single-repo and un-adopted exactly as before A3.
@@ -225,7 +226,7 @@ impl IndexDatabase {
         intent: AdoptIntent,
     ) -> anyhow::Result<()> {
         let conn = self.storage.connection();
-        let repo_id = match crate::repo_identity::resolve_repo_identity(
+        let repo_id = match rag_rat_base::repo_identity::resolve_repo_identity(
             &config.root,
             config.repo_id_override.as_deref(),
         ) {
@@ -275,11 +276,11 @@ impl IndexDatabase {
         // order (the resolved portable id sorts before the held `local:` one), so it is BOUNDED —
         // a timeout is a retryable error, never a hang (see the locks module doc).
         let db_path = self.storage.database_path().to_path_buf();
-        if crate::locks::thread_holds_any_repo_write_lock(&db_path)
-            && !crate::locks::thread_holds_write_lock(&db_path, &repo_id)
+        if rag_rat_base::locks::thread_holds_any_repo_write_lock(&db_path)
+            && !rag_rat_base::locks::thread_holds_write_lock(&db_path, &repo_id)
         {
             self._identity_lock = Some(
-                crate::locks::WriteLock::acquire_timeout(
+                rag_rat_base::locks::WriteLock::acquire_timeout(
                     &db_path,
                     &repo_id,
                     SCHEMA_MIGRATE_LOCK_TIMEOUT,
@@ -519,13 +520,13 @@ impl IndexDatabase {
     /// all repos in the DB file, so appliers must serialize across repos, which the per-repo write
     /// flock deliberately does not do.
     fn apply_schema_under_lock(path: &Path, conn: &rusqlite::Connection) -> anyhow::Result<()> {
-        let _lock =
-            crate::locks::WriteLock::acquire_schema_timeout(path, SCHEMA_MIGRATE_LOCK_TIMEOUT)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "timed out waiting for the schema-migration lock to apply the schema"
-                    )
-                })?;
+        let _lock = rag_rat_base::locks::WriteLock::acquire_schema_timeout(
+            path,
+            SCHEMA_MIGRATE_LOCK_TIMEOUT,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!("timed out waiting for the schema-migration lock to apply the schema")
+        })?;
         let state = schema::status(conn)?.state;
         if state != schema::SchemaState::Compatible {
             // #585: a dev/test build must not silently forward-migrate the shared global store —
@@ -826,9 +827,10 @@ mod global_store_overview_tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use rag_rat_base::repo_identity::{RepoIdentity, RepoIdentityClass};
+
     use crate::index::IndexDatabase;
     use crate::index::schema::{self, register_repo};
-    use crate::repo_identity::{RepoIdentity, RepoIdentityClass};
     use crate::storage::IndexConnection;
 
     static N: AtomicU64 = AtomicU64::new(0);

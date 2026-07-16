@@ -40,8 +40,8 @@ mod listener {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use rag_rat_core::config::Config;
-    use rag_rat_core::locks::{self, FileLock};
+    use rag_rat_base::config::Config;
+    use rag_rat_base::locks::{self, FileLock};
     use rag_rat_core::query::grep_augment::{self, DedupeFilter};
     use rag_rat_core::storage::IndexConnection;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -222,7 +222,7 @@ mod listener {
 mod listener_tests {
     use std::time::Duration;
 
-    use rag_rat_core::Config;
+    use rag_rat_base::config::Config;
     use rag_rat_core::index::schema;
     use rag_rat_core::storage::IndexConnection;
 
@@ -400,7 +400,7 @@ fn degrade_when_fts_corrupt<T>(
 /// listener's read-only connection cannot rebuild. Without this, a grep-hook-only session
 /// (no MCP queries to trigger the query-layer self-heal) would serve null context indefinitely
 /// after a torn write, even though the repair is one lossless rebuild away.
-fn spawn_background_fts_heal(config: rag_rat_core::Config) {
+fn spawn_background_fts_heal(config: rag_rat_base::config::Config) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static HEAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
     if HEAL_IN_FLIGHT.swap(true, Ordering::SeqCst) {

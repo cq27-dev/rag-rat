@@ -346,7 +346,7 @@ fn authentication_failure_detail(
     error: &anyhow::Error,
 ) -> Option<String> {
     match binding.auth {
-        Some(crate::config::TrackerAuth::TokenCommand(_)) =>
+        Some(rag_rat_base::config::TrackerAuth::TokenCommand(_)) =>
             Some("configured token command failed".to_string()),
         _ => Some(error.to_string()),
     }
@@ -990,8 +990,9 @@ mod capability_tests {
     #[test]
     fn token_command_failure_detail_is_redacted_before_persistence() {
         let mut binding = github(None);
-        binding.auth =
-            Some(crate::config::TrackerAuth::TokenCommand("secret-bearing command".to_string()));
+        binding.auth = Some(rag_rat_base::config::TrackerAuth::TokenCommand(
+            "secret-bearing command".to_string(),
+        ));
         let error = anyhow::anyhow!("token_command `secret-bearing command` failed: secret stderr");
         assert_eq!(
             authentication_failure_detail(&binding, &error).as_deref(),

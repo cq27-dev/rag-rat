@@ -873,7 +873,7 @@ impl IndexDatabase {
                     return Ok(None);
                 };
                 if attach_callee_monikers {
-                    let disk_sha = crate::index::hex_sha256(content.as_bytes());
+                    let disk_sha = rag_rat_base::hash::hex_sha256(content.as_bytes());
                     moniker_cache.insert(
                         row.path.clone(),
                         crate::index::oracle::current_callee_monikers(

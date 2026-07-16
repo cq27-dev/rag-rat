@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
 use dialoguer::Confirm;
-use rag_rat_core::config::EmbeddingBackend;
-use rag_rat_core::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, MODEL2VEC_MODEL_ID};
+use rag_rat_base::config::{Config, EmbeddingBackend};
+use rag_rat_base::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, MODEL2VEC_MODEL_ID};
+use rag_rat_base::language::Language;
+use rag_rat_core::IndexDatabase;
 use rag_rat_core::index::ai::ReconcileOptions;
 use rag_rat_core::index::ignore_rules::{IgnoreMatcher, is_virtualenv_dir};
-use rag_rat_core::language::Language;
-use rag_rat_core::{Config, IndexDatabase};
 pub(crate) use render::*;
 pub(crate) use run::*;
 pub(crate) use scan::*;
@@ -419,7 +419,7 @@ mod tests {
         let config = Config::load(root.join("rag-rat.toml")).unwrap();
         assert_eq!(
             config.database,
-            rag_rat_core::data_dir::global_database_path()
+            rag_rat_base::data_dir::global_database_path()
                 .expect("a data dir resolves in the test environment"),
             "a fresh init's keyless config lands on the machine-global store",
         );

@@ -6,7 +6,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use rag_rat_core::{Config, IndexDatabase, OutputFormat};
+use rag_rat_base::config::Config;
+use rag_rat_core::{IndexDatabase, OutputFormat};
 
 use crate::cli::{DoctorArgs, IndexArgs, MaintenanceArgs, ReconcileArgs};
 use crate::commands::output_format;
@@ -35,8 +36,8 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     // Serialize with the background watcher / other writers OF THIS REPO (busy_timeout backstops
     // any heal on the query path). The write lock is per-repo (A6), so a rebuild here never
     // blocks an unrelated repo's writer in a shared global DB.
-    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
-    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     // `--worktree`: index a linked worktree's branch overlay on top of the existing base index
     // (#219). A distinct mode — the delta vs the base, not a base (re)build — so handle it before
     // the full/discover/changed branches.
@@ -395,12 +396,12 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // "rerun pending" marker and exit immediately; the runner re-checks the marker after its pass
     // and runs once more to cover a change that arrived mid-pass. The pass still takes the write
     // lock internally, so serialization with the watcher is unchanged.
-    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
-    let pending = rag_rat_core::locks::maintenance_pending_path(&config.database, &lock_repo);
-    let lock_path = rag_rat_core::locks::maintenance_lock_path(&config.database, &lock_repo);
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+    let pending = rag_rat_base::locks::maintenance_pending_path(&config.database, &lock_repo);
+    let lock_path = rag_rat_base::locks::maintenance_lock_path(&config.database, &lock_repo);
     let mut report;
     {
-        let Some(_maint) = rag_rat_core::locks::FileLock::try_acquire(&lock_path)? else {
+        let Some(_maint) = rag_rat_base::locks::FileLock::try_acquire(&lock_path)? else {
             let _ = fs::File::create(&pending);
             let mut skip_report = serde_json::json!({
                 "trigger": trigger,
@@ -503,8 +504,8 @@ fn run_maintenance_pass(
     // Serialize with the background watcher (and other writers) OF THIS REPO. The hook backgrounds
     // this command, so blocking here never holds up the git operation; busy_timeout backstops the
     // query-path heal. Per-repo write lock (A6).
-    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
-    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "lock_acquired", elapsed_ms = started.elapsed().as_millis() as u64, "write lock acquired");
 
     // #427: the core refuses a first-time-empty registration (a post-commit/checkout hook on a repo
@@ -713,9 +714,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use rag_rat_core::config::{ResolvedTarget, TargetKind};
-    use rag_rat_core::language::Language;
-    use rag_rat_core::{Config, IndexDatabase};
+    use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
+    use rag_rat_base::language::Language;
+    use rag_rat_core::IndexDatabase;
 
     static N: AtomicU64 = AtomicU64::new(0);
 
@@ -1090,7 +1091,7 @@ mod tests {
 
     #[test]
     fn maintenance_coalesces_a_concurrent_trigger() {
-        use rag_rat_core::locks::{
+        use rag_rat_base::locks::{
             FileLock, maintenance_lock_path, maintenance_pending_path, write_lock_repo_id,
         };
 
@@ -1257,9 +1258,9 @@ mod papertrail_hook_tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use rag_rat_core::config::{ResolvedTarget, TargetKind, Tracker, TrackerConfig};
-    use rag_rat_core::language::Language;
-    use rag_rat_core::{Config, IndexDatabase};
+    use rag_rat_base::config::{Config, ResolvedTarget, TargetKind, Tracker, TrackerConfig};
+    use rag_rat_base::language::Language;
+    use rag_rat_core::IndexDatabase;
 
     static N: AtomicU64 = AtomicU64::new(0);
 
@@ -1337,9 +1338,9 @@ mod papertrail_hook_tests {
         assert_eq!(error_class.as_deref(), Some("network"), "the failure class is persisted");
 
         // The flight consumed its own coordination state: no pending marker survives a run.
-        let lock_repo = rag_rat_core::locks::write_lock_repo_id(&config);
+        let lock_repo = rag_rat_base::locks::write_lock_repo_id(&config);
         assert!(
-            !rag_rat_core::locks::papertrail_pending_path(&config.database, &lock_repo).exists()
+            !rag_rat_base::locks::papertrail_pending_path(&config.database, &lock_repo).exists()
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1351,7 +1352,7 @@ mod papertrail_hook_tests {
     /// mirror-free.
     #[test]
     fn coalesced_hook_trigger_still_fires_papertrail() {
-        use rag_rat_core::locks::{FileLock, maintenance_lock_path, write_lock_repo_id};
+        use rag_rat_base::locks::{FileLock, maintenance_lock_path, write_lock_repo_id};
 
         let root = std::env::temp_dir().join(format!(
             "rag-rat-cli-papertrail-coalesced-{}-{}",

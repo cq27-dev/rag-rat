@@ -94,6 +94,8 @@ use std::{fs, thread};
 
 use gix::bstr::{BString, ByteSlice};
 use gix::status::{UntrackedFiles, tree_index};
+use rag_rat_base::config::{Config, TargetKind};
+use rag_rat_base::language::Language;
 use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::{OptionalExtension, params};
@@ -101,7 +103,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::config::{Config, TargetKind};
 use crate::index::ai::{LlmStatus, ModelInfo, ReconcilePlan, ReconcileReport};
 use crate::index::anchors::{AnchorStatus, ChunkAnchor};
 use crate::index::chunker::Chunk;
@@ -113,7 +114,6 @@ use crate::index::papertrail::{
     Papertrail, PapertrailEvidence, PapertrailStatus, PapertrailSyncReport,
 };
 use crate::index::symbols::Symbol;
-use crate::language::Language;
 use crate::query::graph_meta::{self, GraphMetaMode};
 use crate::search::lexical::SearchHit;
 use crate::storage::{IndexConnection, StorageStatus};
@@ -153,7 +153,7 @@ pub struct IndexDatabase {
     /// `local:` lock while a fresh portable-lock writer runs concurrently. RULE: a writer's held
     /// lock must match the repo id it writes under. `None` on the lockless open paths (they stay
     /// lockless by design) and whenever the entry lock already covers the resolved id.
-    _identity_lock: Option<crate::locks::WriteLock>,
+    _identity_lock: Option<rag_rat_base::locks::WriteLock>,
     /// The lazily captured #493 drift-heal snapshot, tagged with the repo it was captured for.
     /// Populated by the FIRST [`Self::remove_file_in_scope`] of a pass while the key-version
     /// stamp is stale — the symbol rows about to be deleted carry the snapshot's signature

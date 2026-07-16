@@ -441,9 +441,10 @@ fn accept_produced_index(
 /// Hash each `.scip` document's CURRENT disk bytes under `checkout_root`, returning `relative_path
 /// -> hex sha256`. Backs the scip-vs-disk content gate (#82 TOCTOU): the caller captures this right
 /// after the tool exits so the join can verify a document hasn't drifted since production. Hashes
-/// in the same space as `files.sha256` / the join's `disk_sha` (via [`run::hex_sha256`]) so the
-/// three compare directly. Unreadable documents (and an unparseable `.scip`, which can't have
-/// produced usable verdicts anyway) are simply absent from the map.
+/// in the same space as `files.sha256` / the join's `disk_sha` (via
+/// [`rag_rat_base::hash::hex_sha256`]) so the three compare directly. Unreadable documents (and an
+/// unparseable `.scip`, which can't have produced usable verdicts anyway) are simply absent from
+/// the map.
 fn snapshot_document_disk_hashes(
     scip_bytes: &[u8],
     checkout_root: &Path,
@@ -454,7 +455,7 @@ fn snapshot_document_disk_hashes(
     let mut out = HashMap::with_capacity(paths.len());
     for path in paths {
         if let Ok(bytes) = std::fs::read(checkout_root.join(&path)) {
-            out.insert(path, run::hex_sha256(&bytes));
+            out.insert(path, rag_rat_base::hash::hex_sha256(&bytes));
         }
     }
     out

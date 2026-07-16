@@ -1,7 +1,6 @@
+use rag_rat_base::language::Language;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-
-use crate::language::Language;
 
 /// SQL fragment appended to a name/symbol_path search to drop generated-binding rows (ubrn FFI
 /// output, codegen) — navigation noise that buries the source symbol a search is after (#202).
@@ -24,7 +23,7 @@ pub struct SymbolHit {
     #[serde(
         rename = "id",
         skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"
     )]
     pub logical_symbol_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,7 +65,7 @@ pub struct SymbolLookup {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogicalSymbolHit {
-    #[serde(rename = "id", serialize_with = "crate::serde_big_id::sym_handle::serialize")]
+    #[serde(rename = "id", serialize_with = "rag_rat_base::serde_big_id::sym_handle::serialize")]
     pub logical_symbol_id: i64,
     #[serde(rename = "lang")]
     pub language: String,
@@ -109,8 +108,9 @@ impl SymbolSelector {
     /// return null. Routing it here (a qualified name never looks like a `sym_` handle, so there's
     /// no ambiguity) makes the handle work in EITHER slot across every symbol-shaped tool.
     pub fn effective_logical_symbol_id(&self) -> Option<i64> {
-        self.logical_symbol_id
-            .or_else(|| self.symbol_path.as_deref().and_then(crate::serde_big_id::parse_sym_handle))
+        self.logical_symbol_id.or_else(|| {
+            self.symbol_path.as_deref().and_then(rag_rat_base::serde_big_id::parse_sym_handle)
+        })
     }
 
     /// Whether the `ref`/`symbol_path` slot holds a value SHAPED like a `sym_<hex>` handle — it
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn effective_logical_symbol_id_accepts_a_handle_in_either_slot() {
         let handle = 0x688b_7144_3793_b726_u64 as i64;
-        let token = crate::serde_big_id::format_sym_handle(handle);
+        let token = rag_rat_base::serde_big_id::format_sym_handle(handle);
         // Explicit `id` wins.
         assert_eq!(selector(Some(handle), None).effective_logical_symbol_id(), Some(handle));
         // #201: a sym_<hex> handle fed into the `ref`/symbol_path slot resolves as the handle.

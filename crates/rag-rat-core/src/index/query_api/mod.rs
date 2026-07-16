@@ -1,3 +1,4 @@
+use rag_rat_base::hash::hex_sha256;
 use rusqlite::OptionalExtension;
 
 use super::*;
@@ -408,7 +409,7 @@ impl IndexDatabase {
             GraphMetaMode::Full,
             20,
             true,
-            crate::config::MemorySurface::Full,
+            rag_rat_base::config::MemorySurface::Full,
         )
     }
 
@@ -424,7 +425,7 @@ impl IndexDatabase {
             graph_mode,
             graph_limit,
             false,
-            crate::config::MemorySurface::Full,
+            rag_rat_base::config::MemorySurface::Full,
         )
     }
 
@@ -434,7 +435,7 @@ impl IndexDatabase {
         graph_mode: GraphMetaMode,
         graph_limit: u32,
         include_memories: bool,
-        surface: crate::config::MemorySurface,
+        surface: rag_rat_base::config::MemorySurface,
     ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
         let Some(mut chunk) = self.read_chunk_current(chunk_id)? else {
             return Ok(None);
@@ -733,7 +734,7 @@ mod name_based_tests {
         // #201 review (P2): a `sym_<hex>` handle in the ref/symbol_path slot resolves as a logical
         // id, so it must be treated as id-based — a stale handle then fails cheaply instead of
         // tripping the #152 zero-hit heal/reindex meant for genuinely-new name/path lookups.
-        let token = crate::serde_big_id::format_sym_handle(0x688b_7144_3793_b726_u64 as i64);
+        let token = rag_rat_base::serde_big_id::format_sym_handle(0x688b_7144_3793_b726_u64 as i64);
         assert!(!super::selector_is_name_based(&selector(None, Some(&token))));
         // A MALFORMED handle (typo/bad hex) is still handle-SHAPED → id-based, so it also cannot
         // trip the heal even though it doesn't parse (#201 review follow-up).

@@ -7,17 +7,17 @@ use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, Flag, ModifyKind};
 use notify::{Event, RecursiveMode, Watcher as _, recommended_watcher};
-
-use super::*;
-use crate::IndexDatabase;
-use crate::config::{
+use rag_rat_base::config::{
     Config, LlmConfig, RemoteBackend, RemoteEmbeddingConfig, ResolvedTarget, TargetKind,
     WatchConfig,
 };
-use crate::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
+use rag_rat_base::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
+use rag_rat_base::language::Language;
+
+use super::*;
+use crate::IndexDatabase;
 use crate::index::ai::ReconcileOptions;
 use crate::index::ignore_rules::IgnoreMatcher;
-use crate::language::Language;
 
 fn mutation_event(path: PathBuf) -> Event {
     Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path)
@@ -3428,14 +3428,14 @@ fn shutdown_discover_skips_when_write_lock_is_held() {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
     let config = whole_root_config(root, &[PathBuf::from("src")]);
-    let lock_repo = crate::locks::write_lock_repo_id(&config);
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(&config);
     let holder_config = config.clone();
     let holder_repo = lock_repo.clone();
     let release = Arc::new(AtomicBool::new(false));
     let release_for_holder = Arc::clone(&release);
     let holder = std::thread::spawn(move || {
         let _held =
-            crate::locks::WriteLock::acquire_blocking(&holder_config.database, &holder_repo)
+            rag_rat_base::locks::WriteLock::acquire_blocking(&holder_config.database, &holder_repo)
                 .unwrap();
         while !release_for_holder.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(25));
@@ -3502,8 +3502,8 @@ fn papertrail_tick_interval_requires_bindings_and_takes_the_tightest_cadence() {
     let mut config = whole_root_config(tmp.path(), &[PathBuf::from("src")]);
     assert_eq!(papertrail_tick_interval(&config), None);
 
-    config.trackers = vec![crate::config::TrackerConfig {
-        provider: crate::config::Tracker::Github,
+    config.trackers = vec![rag_rat_base::config::TrackerConfig {
+        provider: rag_rat_base::config::Tracker::Github,
         project: Some("o/r".to_string()),
         remote: "origin".to_string(),
         base_url: None,

@@ -613,8 +613,9 @@ mod coverage_tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use rag_rat_base::language::Language;
+
     use super::*;
-    use crate::language::Language;
 
     fn span(start_byte: usize, end_byte: usize, kind: &'static str, is_leaf: bool) -> NodeSpan {
         NodeSpan { start_byte, end_byte, kind, is_leaf }

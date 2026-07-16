@@ -4,8 +4,8 @@
 use std::process::Command;
 
 use anyhow::Context as _;
+use rag_rat_base::config::TrackerAuth;
 
-use crate::config::TrackerAuth;
 use crate::index::papertrail::TrackerAuthentication;
 
 /// Snapshot a binding's authentication capability without running configured shell code merely

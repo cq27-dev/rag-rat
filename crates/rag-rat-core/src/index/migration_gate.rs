@@ -44,7 +44,7 @@ impl MigrationGate {
                 || running_from_target_dir()
                 || version_indicates_dev_build(crate::binary_version()),
             allow_override: env_flag(ALLOW_MIGRATE_ENV),
-            global_db_path: crate::data_dir::global_database_path(),
+            global_db_path: rag_rat_base::data_dir::global_database_path(),
         }
     }
 

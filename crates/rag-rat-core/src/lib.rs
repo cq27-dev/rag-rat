@@ -1,15 +1,9 @@
 pub(crate) mod canonical;
-pub mod config;
-pub mod data_dir;
 pub mod dream;
-pub mod embedding_models;
 #[cfg(feature = "eval")]
 pub mod eval;
 pub mod fleet;
 pub mod index;
-pub mod language;
-pub mod locks;
-pub mod logging;
 // Phase B op-log (#404). The authoring half is now wired into the memory write path (#532), but the
 // SYNC-TRANSPORT half — `append` (receiving a foreign signed entry), the fork quarantine,
 // `AppendOutcome` — is still unconsumed (a later increment), so the module keeps
@@ -18,14 +12,11 @@ pub mod logging;
 pub(crate) mod oplog;
 pub mod output;
 pub mod query;
-pub mod repo_identity;
 pub mod search;
-pub mod serde_big_id;
 pub mod storage;
 pub mod version_check;
 pub mod watch;
 
-pub use config::{Config, ResolvedTarget, TargetKind, WatchConfig};
 pub use index::{IndexDatabase, IndexStatus};
 pub use output::{OutputFormat, render};
 

@@ -8,9 +8,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{env, fs};
 
-use rag_rat_core::config::{ResolvedTarget, TargetKind};
-use rag_rat_core::language::Language;
-use rag_rat_core::{Config, IndexDatabase};
+use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
+use rag_rat_base::language::Language;
+use rag_rat_core::IndexDatabase;
 
 const CORPUS_REPO: &str = "https://github.com/rust-lang/cargo.git";
 /// cargo tag 0.97.1 — pinned by commit SHA for reproducibility.

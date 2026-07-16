@@ -501,9 +501,10 @@ mod freshness_version_tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use rag_rat_base::config::RemoteEmbeddingConfig;
+    use rag_rat_base::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
+
     use super::{batch_write, *};
-    use crate::config::RemoteEmbeddingConfig;
-    use crate::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
 
     /// One-shot HTTP/1.1 stub replying to the install probe's `/api/embed` with a `dim`-wide
     /// vector.
@@ -553,7 +554,7 @@ mod freshness_version_tests {
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
-            backend: crate::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             endpoint: Some(endpoint.to_string()),
             cookbook: None,
             query_endpoint: None,
@@ -1615,7 +1616,7 @@ mod freshness_version_tests {
         set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
         let remote = RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
-            backend: crate::config::RemoteBackend::Ollama,
+            backend: rag_rat_base::config::RemoteBackend::Ollama,
             endpoint: None,
             cookbook: Some("@rag-rat/cookbook/modal".to_string()),
             query_endpoint: query_endpoint.map(str::to_string),

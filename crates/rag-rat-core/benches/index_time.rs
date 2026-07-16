@@ -12,7 +12,8 @@ mod shared;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use rag_rat_core::{Config, IndexDatabase};
+use rag_rat_base::config::Config;
+use rag_rat_core::IndexDatabase;
 use shared::{bench_config, corpus_dir};
 
 /// Index the entire corpus checkout — the realistic "index this repo" workload, not a cherry-picked

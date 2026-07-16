@@ -101,16 +101,6 @@ pub(crate) fn duration_ms(duration: std::time::Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
-    let hash = Sha256::digest(bytes);
-    let mut out = String::with_capacity(hash.len() * 2);
-    for byte in hash {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
 pub(crate) fn path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }

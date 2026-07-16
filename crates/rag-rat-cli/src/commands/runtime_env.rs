@@ -3,7 +3,7 @@
 //! initializes FastEmbed/ONNX.
 use std::env;
 
-use rag_rat_core::config::EmbeddingRuntimeConfig;
+use rag_rat_base::config::EmbeddingRuntimeConfig;
 
 pub(crate) fn apply_embedding_runtime_env(runtime: &EmbeddingRuntimeConfig) {
     // `ort_threads` is applied via fastembed's session `with_intra_threads` (see

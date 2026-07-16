@@ -9,8 +9,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use rag_rat_base::config::Config;
+
 use super::pass::LoopMsg;
-use crate::config::Config;
 use crate::index::papertrail::{AutosyncRequest, PapertrailContext};
 
 /// Clock for the periodic papertrail evaluation deadline, pure like `Debounce` / `SweepClock`

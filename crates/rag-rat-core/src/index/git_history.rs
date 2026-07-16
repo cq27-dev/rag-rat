@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 use gix::object::tree::diff::{Action, Change};
 use gix::revision::walk::Sorting;
+use rag_rat_base::hash::hex_sha256;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::index::{delete_repo_meta, repo_meta, schema, scoped_table_row_count, set_repo_meta};
 use crate::search::lexical::SearchHit;
@@ -872,7 +872,7 @@ fn blame_lines_via_gix(
     start_line: i64,
     end_line: i64,
 ) -> anyhow::Result<Vec<BlameLine>> {
-    let repo = crate::index::git_context::discover_repo(root)?;
+    let repo = rag_rat_base::repo_discover::discover_repo(root)?;
     let head = repo.head_id()?.detach();
     // gix blames a path relative to the WORKTREE root; the caller's path is relative to the index
     // root, which may be a subdirectory of the worktree.
@@ -1015,7 +1015,7 @@ fn read_history_inner(
     commits: &mut Vec<CommitRecord>,
     changes: &mut Vec<FileChange>,
 ) -> anyhow::Result<bool> {
-    let mut repo = crate::index::git_context::discover_repo(root)?;
+    let mut repo = rag_rat_base::repo_discover::discover_repo(root)?;
     // The by-commit-time walk + per-commit tree diffs look up each commit/tree more than once; an
     // object cache avoids repeated zlib inflation (gitoxide's own recommendation for these passes).
     repo.object_cache_size_if_unset(16 * 1024 * 1024);
@@ -1274,11 +1274,11 @@ fn collect_rows<T>(
 /// git call (the ignore matcher anchors its `.gitignore` ancestor stack here — issue #62 finding 3:
 /// a `config.root` that is a subdirectory of a larger worktree must honor the worktree-root rules).
 pub(crate) fn worktree_root(root: &Path) -> Option<PathBuf> {
-    crate::index::git_context::discover_repo(root).ok()?.workdir().map(Path::to_path_buf)
+    rag_rat_base::repo_discover::discover_repo(root).ok()?.workdir().map(Path::to_path_buf)
 }
 
 fn git_repo(root: &Path) -> Option<GitRepo> {
-    let repo = crate::index::git_context::discover_repo(root).ok()?;
+    let repo = rag_rat_base::repo_discover::discover_repo(root).ok()?;
     // `workdir()` is `None` for a bare repo — there is no worktree to index, so treat it as
     // "no git" (the previous `--show-toplevel` failed there too).
     let worktree_root = repo.workdir()?.to_path_buf();
@@ -1290,7 +1290,7 @@ fn git_repo(root: &Path) -> Option<GitRepo> {
 
 fn is_fast_forward(root: &Path, old_head: &str, new_head: &str) -> bool {
     let probe = || -> anyhow::Result<bool> {
-        let mut repo = crate::index::git_context::discover_repo(root)?;
+        let mut repo = rag_rat_base::repo_discover::discover_repo(root)?;
         repo.object_cache_size_if_unset(16 * 1024 * 1024);
         let old_id = gix::ObjectId::from_hex(old_head.as_bytes())?;
         let new_id = gix::ObjectId::from_hex(new_head.as_bytes())?;
@@ -1347,16 +1347,6 @@ fn fts_query(query: &str) -> String {
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>();
     if terms.is_empty() { "\"\"".to_string() } else { terms.join(" OR ") }
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    let hash = Sha256::digest(bytes);
-    let mut out = String::with_capacity(hash.len() * 2);
-    for byte in hash {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 fn path_string(path: &Path) -> String {

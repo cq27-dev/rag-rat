@@ -7,11 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use rag_rat_core::config::{
+use rag_rat_base::config::{
     Config, DEFAULT_QUERY_ENDPOINT, EmbeddingBackend, OracleConfig, RemoteBackend,
     RemoteEmbeddingConfig, VersionCheckConfig,
 };
-use rag_rat_core::language::Language;
+use rag_rat_base::language::Language;
 use toml_edit::{Array, DocumentMut, Item, Table};
 
 use crate::init::render::{config_root_value, display_rel, render_config};
@@ -292,7 +292,7 @@ impl WizardDraft {
 
         // The RESOLVED landing spot for the keyless config this draft renders (display only):
         // the machine-global store, or a pre-existing legacy `.rag-rat/index.sqlite`.
-        let db_path = rag_rat_core::config::default_database_path(&root_abs, &root_abs, None)
+        let db_path = rag_rat_base::config::default_database_path(&root_abs, &root_abs, None)
             .display()
             .to_string();
 
@@ -667,7 +667,7 @@ fn raw_remote_draft(doc: &DocumentMut) -> Option<RemoteDraft> {
 
 #[cfg(test)]
 mod tests {
-    use rag_rat_core::embedding_models::{Backend, EMBEDDING_MODELS};
+    use rag_rat_base::embedding_models::{Backend, EMBEDDING_MODELS};
 
     use super::*;
 
@@ -749,7 +749,7 @@ mod tests {
                    \"custom/index.sqlite\"\n\n[llm.embedding]\nmodel = \
                    \"none\"\n\n[target_bindings]\nrust = [\"src\"]\n";
         std::fs::write(&config_path, raw).unwrap();
-        let cfg = rag_rat_core::config::Config::load(&config_path).unwrap();
+        let cfg = rag_rat_base::config::Config::load(&config_path).unwrap();
 
         let d = WizardDraft::from_existing(raw, &cfg, &config_path);
         // The display seam shows the RESOLVED path (the explicit key, made absolute by load).
@@ -785,7 +785,7 @@ mod tests {
              [\"src\"]\n",
         )
         .unwrap();
-        let cfg = rag_rat_core::config::Config::load(&config_path).unwrap();
+        let cfg = rag_rat_base::config::Config::load(&config_path).unwrap();
         let d = WizardDraft::from_config(&cfg, &config_path);
         assert_eq!(d.model, "none");
         assert_eq!(d.bindings.get(&Language::Rust).unwrap(), &vec![std::path::PathBuf::from(
@@ -817,7 +817,7 @@ mod tests {
              8\nmax_batch_chars = 96000\n",
         )
         .unwrap();
-        let cfg = rag_rat_core::config::Config::load(&config_path).unwrap();
+        let cfg = rag_rat_base::config::Config::load(&config_path).unwrap();
         let d = WizardDraft::from_config(&cfg, &config_path);
         let remote = d.remote.expect("remote block should be present");
         assert_eq!(remote.model, "all-minilm");
@@ -841,7 +841,7 @@ mod tests {
              300\nauto_run_min_interval_secs = 7200\n\n[version_check]\nenabled = false\n",
         )
         .unwrap();
-        let cfg = rag_rat_core::config::Config::load(&config_path).unwrap();
+        let cfg = rag_rat_base::config::Config::load(&config_path).unwrap();
         let d = WizardDraft::from_config(&cfg, &config_path);
         assert!(d.oracle_auto_run);
         assert_eq!(d.oracle_quiet_secs, 300);
@@ -855,7 +855,7 @@ mod tests {
                         1\n[target_bindings]\nrust = [\"src\"]\n";
         let mut d =
             WizardDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."));
-        d.bindings.insert(rag_rat_core::language::Language::Rust, vec!["crates".into()]);
+        d.bindings.insert(rag_rat_base::language::Language::Rust, vec!["crates".into()]);
         let out = d.patch_existing(original).unwrap();
         assert!(out.contains("# my notes"), "comment must be kept");
         assert!(out.contains("[future]"), "unknown table must be kept");
@@ -1020,7 +1020,7 @@ mod tests {
              \"http://localhost:7997\"\nquery_endpoint = \"http://localhost:7997\"\n",
         )
         .unwrap();
-        let cfg = rag_rat_core::config::Config::load(&config_path).unwrap();
+        let cfg = rag_rat_base::config::Config::load(&config_path).unwrap();
         let d = WizardDraft::from_existing(
             &std::fs::read_to_string(&config_path).unwrap(),
             &cfg,
@@ -1066,7 +1066,7 @@ mod tests {
         );
 
         // The written config must LOAD — this is exactly what regressed without the query_endpoint.
-        let cfg = rag_rat_core::config::Config::load(&config_path)
+        let cfg = rag_rat_base::config::Config::load(&config_path)
             .expect("wizard-written ephemeral infinity config must load");
         let r = cfg.llm.embedding.remote.expect("remote present");
         assert_eq!(r.backend, RemoteBackend::Infinity);

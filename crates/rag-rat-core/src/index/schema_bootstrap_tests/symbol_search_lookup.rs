@@ -389,7 +389,7 @@ pub fn caller() {
     // disambiguation — every member shares that one handle, so the client has no more specific
     // token to give. (Before the fix, `disambiguation_required` was computed from the raw
     // 2-candidate count → a dead end.)
-    let handle = crate::serde_big_id::format_sym_handle(logical_symbol_id);
+    let handle = rag_rat_base::serde_big_id::format_sym_handle(logical_symbol_id);
     let by_ref_handle = db
         .symbol_candidates(
             &crate::query::symbol::SymbolSelector {

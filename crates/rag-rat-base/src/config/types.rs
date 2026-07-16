@@ -44,7 +44,7 @@ pub struct Config {
     pub source_root_reanchored_from: Option<PathBuf>,
     /// Opt in to registering an EMPTY index (zero discovered files). Default `false`: the core
     /// registration path (`rebuild_with_progress`) refuses a first-time-empty registration with
-    /// [`crate::index::EmptyIndexRefused`], so no entry point silently creates one (#427). The CLI
+    /// `EmptyIndexRefused`, so no entry point silently creates one (#427). The CLI
     /// `index --allow-empty` flag sets this `true`; every other caller (watcher, git-hook
     /// `maintenance`, MCP, init) leaves it `false`. Not read from TOML — set per invocation.
     pub allow_empty: bool,
@@ -137,7 +137,7 @@ pub struct SearchConfig {
     /// Replace the binary git has-history boost with a graded recency+churn magnitude and add the
     /// generated/test demotion at the wide-pool rerank site (default false — opt in explicitly).
     /// A/B-swept on the commit-replay eval (`rag-rat eval --replay --rerank`); see
-    /// [`crate::search::lexical::SearchOptions::graded_history`].
+    /// `SearchOptions::graded_history`.
     pub graded_git_rerank: bool,
 }
 
@@ -190,7 +190,7 @@ impl MemorySurface {
 /// Background auto-fresh oracle (`[oracle]`). Opt-in; default OFF. When `auto_run` is enabled, the
 /// long-lived `rag-rat mcp` server runs the SCIP oracle for the active checkout when the index is
 /// stale and quiet, heavily throttled by two gates (a long quiet-period debounce + a
-/// minimum-interval floor) — see [`crate::index::oracle::auto_run_decision`]. SCIP production takes
+/// minimum-interval floor) — see `oracle::auto_run_decision`. SCIP production takes
 /// minutes while edits arrive in seconds, so edge-collapsing alone would thrash; both gates are
 /// required. Fail-open and detached: it never blocks a request and dies with the server process.
 #[derive(Debug, Clone, PartialEq, Eq)]

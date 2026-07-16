@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use rag_rat_core::Config;
+use rag_rat_base::config::Config;
 use rag_rat_core::query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
 use rag_rat_core::query::symbol::SymbolSelector;
 use serde::Deserialize;
@@ -105,8 +105,8 @@ pub(crate) fn dump_verify_packs(config: &Config, args: &DumpVerifyPacksArgs) -> 
     // per-repo write flock like every other CLI writer. The index this runs against is a
     // THROWAWAY built over a checkout, so the inserts are discarded with it — no live index is
     // mutated.
-    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
-    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     let db = open_index(config)?;
 
     // Insert each eval memory; map its `eval_id` to the minted id (or, if identical content is

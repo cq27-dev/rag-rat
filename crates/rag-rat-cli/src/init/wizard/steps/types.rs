@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use rag_rat_core::config::RemoteBackend;
-use rag_rat_core::language::Language;
+use rag_rat_base::config::RemoteBackend;
+use rag_rat_base::language::Language;
 use tui_tree_widget::TreeState;
 
 use crate::init::DirCandidate;

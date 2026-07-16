@@ -1,6 +1,8 @@
 //! Discovery: compare configured targets against the index to find
 //! indexed/unindexed/changed/removed files.
 
+use rag_rat_base::hash::hex_sha256;
+
 use super::*;
 
 #[derive(Debug, Serialize)]
@@ -247,8 +249,9 @@ pub(crate) fn target_for_path(
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use rag_rat_base::language::Language;
+
     use super::*;
-    use crate::language::Language;
 
     #[test]
     fn h_resolves_to_cpp_when_both_c_and_cpp_bindings_cover_it() {
@@ -263,7 +266,7 @@ mod tests {
             "[index]\nroot = \".\"\n[target_bindings]\nc = [\".\"]\ncpp = [\".\"]\n",
         )
         .unwrap();
-        let config = crate::config::Config::load(root.join("rag-rat.toml")).unwrap();
+        let config = rag_rat_base::config::Config::load(root.join("rag-rat.toml")).unwrap();
 
         assert_eq!(target_for_path(&config, Path::new("a.h")).map(|(l, _)| l), Some(Language::Cpp));
         assert_eq!(target_for_path(&config, Path::new("a.c")).map(|(l, _)| l), Some(Language::C));

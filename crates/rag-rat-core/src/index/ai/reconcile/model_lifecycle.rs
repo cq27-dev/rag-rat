@@ -1,12 +1,13 @@
-use super::super::*;
-use crate::config::RemoteEmbeddingConfig;
-use crate::embedding_models::{Backend, spec};
+use rag_rat_base::config::RemoteEmbeddingConfig;
+use rag_rat_base::embedding_models::{Backend, spec};
 // `FASTEMBED_MODEL_ID` is only referenced by the fastembed-gated cache recovery (and tests);
 // the manifest's stale-`'v1'` check now scopes to `HASH_MODEL_ID` only (the old fastembed id
 // was renamed to an HF path in #317 and is legacy-cleaned), so the prod import is
 // feature-gated.
 #[cfg(feature = "fastembed")]
-use crate::embedding_models::{FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID};
+use rag_rat_base::embedding_models::{FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID};
+
+use super::super::*;
 
 pub(crate) fn recover_cached_fastembed_model(conn: &Connection) -> anyhow::Result<()> {
     recover_cached_fastembed_model_from(conn, &fastembed_cache_dir())

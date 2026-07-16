@@ -756,7 +756,7 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
 fn primary_is_real(conn: &Connection) -> anyhow::Result<bool> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM repos WHERE repo_id != ?1 AND repo_id != ?2",
-        params![crate::index::schema::LEGACY_REPO_ID, POISON_REPO_ID],
+        params![rag_rat_base::repo_identity::LEGACY_REPO_ID, POISON_REPO_ID],
         |row| row.get(0),
     )?;
     Ok(count > 0)

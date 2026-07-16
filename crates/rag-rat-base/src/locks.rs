@@ -232,7 +232,7 @@ fn lock_dir(database: &Path) -> PathBuf {
 }
 
 /// The GLOBAL schema-migration lock path, beside the DB (A6): ONE per database file, taken only by
-/// the open-time auto-migrate ([`crate::index`] lifecycle). A schema migration rewrites the SHARED
+/// the open-time auto-migrate (the index lifecycle). A schema migration rewrites the SHARED
 /// migration ladder — every repo's tables — so it must serialize across ALL repos, unlike the
 /// per-repo [`write_lock_path`]. Keeping it separate means a repo's ordinary write is neither
 /// blocked by nor blocks an unrelated repo except during the brief migration itself.

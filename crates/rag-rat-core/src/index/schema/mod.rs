@@ -15,7 +15,7 @@ pub(crate) use registry::{
     repo_has_recorded_root, repo_id_is_registered, resolve_config_repo_id, scope_context_repo_id,
     sole_repo_id,
 };
-pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_read_only};
+pub use registry::{RegisteredRepo, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 

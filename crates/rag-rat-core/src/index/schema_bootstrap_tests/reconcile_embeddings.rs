@@ -1,3 +1,5 @@
+use rag_rat_base::hash::hex_sha256;
+
 use super::*;
 
 #[cfg(unix)]
@@ -331,7 +333,7 @@ fn cached_fastembed_model_recovers_ready_state() {
     // The recovered model's version meta is its OWN static spec.version — not the stale legacy key.
     assert_eq!(
         ai::active_embedding_model_version(db.storage.connection(), FASTEMBED_MODEL_ID).unwrap(),
-        crate::embedding_models::spec(FASTEMBED_MODEL_ID).unwrap().version,
+        rag_rat_base::embedding_models::spec(FASTEMBED_MODEL_ID).unwrap().version,
         "recovery stamps the recovered model's version (R3b)",
     );
 

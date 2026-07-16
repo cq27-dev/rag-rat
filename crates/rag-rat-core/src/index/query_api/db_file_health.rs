@@ -117,13 +117,14 @@ impl IndexDatabase {
     /// never automatic: it can rewrite hundreds of MB.
     pub fn reclaim_freelist(&self) -> anyhow::Result<FreelistReclaimReport> {
         let path = self.storage.database_path().to_path_buf();
-        let _lock = crate::locks::WriteLock::acquire_schema_timeout(&path, VACUUM_LOCK_TIMEOUT)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "timed out waiting for the schema lock to VACUUM the database — another \
-                     rag-rat writer is active; stop agents/watchers and retry"
-                )
-            })?;
+        let _lock =
+            rag_rat_base::locks::WriteLock::acquire_schema_timeout(&path, VACUUM_LOCK_TIMEOUT)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "timed out waiting for the schema lock to VACUUM the database — another \
+                         rag-rat writer is active; stop agents/watchers and retry"
+                    )
+                })?;
         // Snapshot under the lock so `before` can't drift against a concurrent writer.
         let before = self.database_file_health()?;
         // VACUUM on a FRESH bare connection, not `self`: a scoped `IndexDatabase` installs a
@@ -255,27 +256,27 @@ mod tests {
 
     /// Minimal single-file fixture: file-health tests need a real WAL-mode database with a
     /// registered repo, not any particular indexed content.
-    fn fixture_config(tag: &str) -> crate::Config {
+    fn fixture_config(tag: &str) -> rag_rat_base::config::Config {
         let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir()
             .join(format!("rag-rat-file-health-{tag}-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn health_probe() -> i32 { 1 }\n").unwrap();
-        crate::Config {
+        rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
-            targets: vec![crate::config::ResolvedTarget {
+            targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
-                language: crate::language::Language::Rust,
+                language: rag_rat_base::language::Language::Rust,
                 directories: vec![std::path::PathBuf::from("src")],
                 include: vec!["src/".to_string()],
                 exclude: Vec::new(),
-                kind: crate::config::TargetKind::Source,
+                kind: rag_rat_base::config::TargetKind::Source,
             }],
             llm: Default::default(),
             watch: Default::default(),

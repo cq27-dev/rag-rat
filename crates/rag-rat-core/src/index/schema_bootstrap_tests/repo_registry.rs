@@ -2,9 +2,10 @@
 //! adoption. Bootstrap-migration coverage follows the directory conventions (fresh `apply`, forward
 //! path, deferred-absence anchored to the migration DDL in isolation — see the directory memory).
 
+use rag_rat_base::repo_identity::{LEGACY_REPO_ID, RepoIdentity, RepoIdentityClass};
+
 use super::*;
-use crate::index::schema::{self, LEGACY_REPO_ID, register_repo};
-use crate::repo_identity::{RepoIdentity, RepoIdentityClass};
+use crate::index::schema::{self, register_repo};
 
 fn identity(repo_id: &str, display_name: &str) -> RepoIdentity {
     RepoIdentity {
@@ -1407,7 +1408,8 @@ fn upgrade_blocks_until_the_outgoing_local_lock_holder_finishes() {
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         let _lock =
-            crate::locks::WriteLock::acquire_blocking(&writer_db, "local:aaaa1111bbbb").unwrap();
+            rag_rat_base::locks::WriteLock::acquire_blocking(&writer_db, "local:aaaa1111bbbb")
+                .unwrap();
         let conn = rusqlite::Connection::open(&writer_db).unwrap();
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
@@ -1479,7 +1481,7 @@ fn a_writer_whose_identity_upgrades_mid_run_extends_its_lock_to_the_resolved_id(
     // gave), then the open resolves the portable id, upgrades, and — the fix — stashes the
     // resolved id's lock on the connection for its lifetime.
     let _entry_lock =
-        crate::locks::WriteLock::acquire_blocking(&config.database, local_id).unwrap();
+        rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, local_id).unwrap();
     let db = IndexDatabase::open_config(&config).unwrap();
     let resolved = db.active_repo_id.clone();
     assert!(
@@ -1492,7 +1494,7 @@ fn a_writer_whose_identity_upgrades_mid_run_extends_its_lock_to_the_resolved_id(
     let probe_db = config.database.clone();
     let probe_id = resolved.clone();
     let blocked = std::thread::spawn(move || {
-        crate::locks::WriteLock::acquire_timeout(
+        rag_rat_base::locks::WriteLock::acquire_timeout(
             &probe_db,
             &probe_id,
             std::time::Duration::from_millis(150),
@@ -1508,7 +1510,7 @@ fn a_writer_whose_identity_upgrades_mid_run_extends_its_lock_to_the_resolved_id(
     drop(db);
     let probe_db = config.database.clone();
     let free = std::thread::spawn(move || {
-        crate::locks::WriteLock::acquire_timeout(
+        rag_rat_base::locks::WriteLock::acquire_timeout(
             &probe_db,
             &resolved,
             std::time::Duration::from_millis(500),
@@ -2012,7 +2014,8 @@ fn unshallow_upgrades_a_shallow_clone_index_from_local_to_portable_in_place() {
     // The portable id the deepened clone must resolve to: origin has full history, so its identity
     // is the (Portable) root-commit hash — the exact id `git fetch --unshallow` makes reachable
     // again.
-    let origin_root = crate::repo_identity::resolve_repo_identity(&origin, None).unwrap().repo_id;
+    let origin_root =
+        rag_rat_base::repo_identity::resolve_repo_identity(&origin, None).unwrap().repo_id;
 
     // --depth 1 < history: a genuinely CUT shallow clone (root unreachable → LocalOnly id).
     let url = format!("file://{}", origin.display());
@@ -2211,7 +2214,8 @@ fn resolve_config_repo_id_returns_none_for_a_newly_portable_local_incumbent() {
     run_git(&root, &["commit", "-q", "-m", "one"]);
 
     // The portable id the full-history root derives (what a deepened clone would resolve to).
-    let portable_id = crate::repo_identity::resolve_repo_identity(&root, None).unwrap().repo_id;
+    let portable_id =
+        rag_rat_base::repo_identity::resolve_repo_identity(&root, None).unwrap().repo_id;
     assert!(!portable_id.starts_with("local:"), "full history → a portable root id");
 
     let conn = rusqlite::Connection::open_in_memory().expect("open");

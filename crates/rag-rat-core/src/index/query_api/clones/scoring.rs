@@ -23,7 +23,7 @@ pub(crate) fn class_key_for(member_refs: &[String]) -> String {
     let mut sorted = member_refs.to_vec();
     sorted.sort_unstable();
     let joined = sorted.join("\n");
-    crate::index::hex_sha256(joined.as_bytes())[..16].to_string()
+    rag_rat_base::hash::hex_sha256(joined.as_bytes())[..16].to_string()
 }
 
 /// The REINDEX-STABLE canonical member ordering key (#215 Plan 4b Fix 2, Codex round-4).

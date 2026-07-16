@@ -424,7 +424,7 @@ fn queue_reason(
 /// `pub(crate)` so the surfacing hydrator recomputes it IDENTICALLY to the queue / verdict-pass
 /// stamp.
 pub(crate) fn note_content_hash(title: &str, body: &str) -> String {
-    crate::index::hex_sha256(format!("{}\n{}", title.trim(), body.trim()).as_bytes())
+    rag_rat_base::hash::hex_sha256(format!("{}\n{}", title.trim(), body.trim()).as_bytes())
 }
 
 /// sha256 fingerprint of a memory's ENTIRE deterministic evidence pack — the churn comparator that
@@ -468,7 +468,7 @@ pub(crate) fn checked_inputs_hash(
     let idents = ident_pairs.into_iter().collect::<Vec<_>>().join("\u{1e}");
     // `\u{1d}` (group separator) splits the two sections so a path can never collide with an
     // identifier pair.
-    Ok(crate::index::hex_sha256(format!("{files}\u{1d}{idents}").as_bytes()))
+    Ok(rag_rat_base::hash::hex_sha256(format!("{files}\u{1d}{idents}").as_bytes()))
 }
 
 /// The `(identifier, resolution)` half of the evidence-pack fingerprint — the memory's identifiers

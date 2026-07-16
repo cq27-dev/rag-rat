@@ -17,12 +17,12 @@
 
 use std::time::Instant;
 
+use rag_rat_base::config::RemoteEmbeddingConfig;
+use rag_rat_base::embedding_models::EmbeddingModelSpec;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::RemoteEmbeddingConfig;
-use crate::embedding_models::EmbeddingModelSpec;
 use crate::index::ai::helpers::{meta, set_meta};
 use crate::index::ai::providers::{Embedder, OpenAiEmbedder, ProvisionedEmbedderParams};
 use crate::index::util::now_ms;
@@ -586,7 +586,7 @@ fn select_knee(results: &[SweepResult], cap: u32) -> Option<(u32, f64)> {
 /// Powers of two `<= cap`, plus the EXACT cap (a non-power-of-two cap like 24/127 must be tested so
 /// the tuner can use all the capacity the user allowed).
 fn sweep_candidates(cap: u32) -> Vec<u32> {
-    let cap = cap.clamp(1, crate::config::MAX_REMOTE_EMBEDDING_CONCURRENCY);
+    let cap = cap.clamp(1, rag_rat_base::config::MAX_REMOTE_EMBEDDING_CONCURRENCY);
     let mut values: Vec<u32> = CONCURRENCY_CANDIDATES.into_iter().filter(|c| *c <= cap).collect();
     if values.last() != Some(&cap) {
         values.push(cap);
@@ -1017,8 +1017,10 @@ mod tests {
         // each carrying the per-candidate counters (here: all failures, no successes). We
         // assert the SHAPE (per-candidate rows), not throughput.
         let remote = tune_remote(4);
-        let spec =
-            crate::embedding_models::spec(crate::embedding_models::FASTEMBED_MODEL_ID).unwrap();
+        let spec = rag_rat_base::embedding_models::spec(
+            rag_rat_base::embedding_models::FASTEMBED_MODEL_ID,
+        )
+        .unwrap();
         let candidates = [1u32, 2, 4];
         let measured = benchmark_remote_concurrency(
             "http://127.0.0.1:1",
@@ -1068,8 +1070,10 @@ mod tests {
     fn tune_remote_concurrency_returns_a_fresh_cached_knee_without_probing() {
         let conn = mem_conn();
         let remote = tune_remote(32);
-        let spec =
-            crate::embedding_models::spec(crate::embedding_models::FASTEMBED_MODEL_ID).unwrap();
+        let spec = rag_rat_base::embedding_models::spec(
+            rag_rat_base::embedding_models::FASTEMBED_MODEL_ID,
+        )
+        .unwrap();
         // Pre-seed the cache with the exact key the tuner will compute (gpu None → "cpu", num_ctx
         // 0).
         let key = tune_cache_key(TuneKey {
@@ -1102,8 +1106,10 @@ mod tests {
     fn tune_remote_concurrency_uses_the_cap_on_a_miss_when_sweep_disallowed() {
         let conn = mem_conn();
         let remote = tune_remote(8);
-        let spec =
-            crate::embedding_models::spec(crate::embedding_models::FASTEMBED_MODEL_ID).unwrap();
+        let spec = rag_rat_base::embedding_models::spec(
+            rag_rat_base::embedding_models::FASTEMBED_MODEL_ID,
+        )
+        .unwrap();
         // No cache entry + `allow_sweep = false` (a bounded / non-fan-out run) → the raw cap, and
         // the unreachable endpoint is never probed (no sweep runs).
         let knee = tune_remote_concurrency(
@@ -1126,8 +1132,10 @@ mod tests {
         // Small cap → few candidates; unreachable endpoint → every probe fails fast (connection
         // refused), so the sweep finds no stable candidate.
         let remote = tune_remote(2);
-        let spec =
-            crate::embedding_models::spec(crate::embedding_models::FASTEMBED_MODEL_ID).unwrap();
+        let spec = rag_rat_base::embedding_models::spec(
+            rag_rat_base::embedding_models::FASTEMBED_MODEL_ID,
+        )
+        .unwrap();
         let knee = tune_remote_concurrency(
             &conn,
             "modal",

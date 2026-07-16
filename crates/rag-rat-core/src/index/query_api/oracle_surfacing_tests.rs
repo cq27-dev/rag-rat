@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ::protobuf::{EnumOrUnknown, Message};
 use ::scip::types::{Document, Index, Occurrence, PositionEncoding, SymbolRole};
+use rag_rat_base::config::ResolvedTarget;
 
 use super::*;
-use crate::config::ResolvedTarget;
 use crate::index::oracle::OracleTool;
 
 static N: AtomicU64 = AtomicU64::new(0);
@@ -943,7 +943,7 @@ fn explicit_seed_resolves_names_and_skips_misses() {
         .unwrap();
     let handle = crate::query::symbol::logical_for_symbol_id(db.storage.connection(), target_id)
         .unwrap()
-        .map(|logical| crate::serde_big_id::format_sym_handle(logical.logical_symbol_id))
+        .map(|logical| rag_rat_base::serde_big_id::format_sym_handle(logical.logical_symbol_id))
         .expect("the `target` symbol has a logical handle");
     let by_handle = db
         .important_symbols(ImportantSymbolsRequest {

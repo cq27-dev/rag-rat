@@ -58,7 +58,7 @@ pub struct ImpactSurfaceOptions {
     /// default) hydrates each header with the dream-compacted summary and verdict marker for
     /// the memory's current body (dream v2 pass 2); `Full` keeps the mechanical header. Only
     /// consulted when `compact_memories` is set; the full-body view is unaffected.
-    pub surface: crate::config::MemorySurface,
+    pub surface: rag_rat_base::config::MemorySurface,
 }
 
 /// `impact_surface`'s `repo_memories` payload — compact by default (#37), full on request. The two
@@ -149,7 +149,7 @@ impl Default for ImpactSurfaceOptions {
             include_text_fallback: true,
             include_memories: true,
             compact_memories: true,
-            surface: crate::config::MemorySurface::default(),
+            surface: rag_rat_base::config::MemorySurface::default(),
         }
     }
 }
@@ -336,8 +336,9 @@ pub fn impact_surface_report_for_symbol(
         // `full` keeps the purely mechanical projection. The full-BODY view (compact_memories =
         // false) is unaffected — `memory show` remains the expand path there.
         let compact = match options.surface {
-            crate::config::MemorySurface::Summary => repo_memories.compact_summary_first(conn)?,
-            crate::config::MemorySurface::Full => repo_memories.compact(),
+            rag_rat_base::config::MemorySurface::Summary =>
+                repo_memories.compact_summary_first(conn)?,
+            rag_rat_base::config::MemorySurface::Full => repo_memories.compact(),
         };
         RepoMemoryEvidenceView::Compact(compact)
     } else {

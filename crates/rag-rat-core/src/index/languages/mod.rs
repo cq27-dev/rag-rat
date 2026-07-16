@@ -8,11 +8,11 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use rag_rat_base::language::Language;
 use tree_sitter::Node;
 
 use super::edges::{EdgeCandidate, IndexedSymbol};
 use super::parser::ParserKind;
-use crate::language::Language;
 
 mod c_family;
 mod kotlin;
@@ -271,9 +271,10 @@ pub(super) fn requires_same_language_target(
 mod tests {
     use std::path::Path;
 
+    use rag_rat_base::language::Language;
+
     use super::{edge_backend, parser_backend};
     use crate::index::parser::{self, ParserKind};
-    use crate::language::Language;
 
     #[test]
     fn registry_agrees_with_structural_capabilities() {

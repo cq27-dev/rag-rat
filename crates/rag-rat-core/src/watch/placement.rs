@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
 use notify::{Event, RecursiveMode};
+use rag_rat_base::config::Config;
 
 use super::overlay::{OverlayScope, enclosing_worktree_id};
-use crate::config::Config;
 use crate::index::ignore_rules::{IgnoreMatcher, target_ancestor_dirs};
 use crate::index::target_for_path;
 
@@ -682,7 +682,7 @@ pub(crate) fn worktree_watch_targets(config: &Config) -> (Vec<PathBuf>, Option<P
     // subscribe to the whole repo root outside the configured target (#219 review).
     let base = enclosing_worktree_id(&config.root);
     let roots = worktrees.into_iter().filter(|w| *w != base).map(PathBuf::from).collect();
-    let registry = crate::index::discover_repo(&config.root)
+    let registry = rag_rat_base::repo_discover::discover_repo(&config.root)
         .ok()
         .map(|repo| repo.common_dir().join("worktrees"));
     (roots, registry)

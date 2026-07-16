@@ -63,7 +63,8 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
     assert!(!created.duplicate);
     assert_eq!(created.memory.bindings[0].binding_kind, "logical_symbol");
 
-    let memories = db.memory_for_symbol(&symbol, 10, crate::config::MemorySurface::Full).unwrap();
+    let memories =
+        db.memory_for_symbol(&symbol, 10, rag_rat_base::config::MemorySurface::Full).unwrap();
     assert_eq!(memories.len(), 1);
     assert_eq!(memories[0].kind, "Invariant");
     let chunk_id = memories[0].bindings[0].chunk_id.expect("bound chunk");
@@ -332,7 +333,8 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
     // Re-validation re-anchors the binding to keystone's new location, not "gone".
     db.memory_validate().unwrap();
     let symbol = db.select_symbol(&selector).unwrap().unwrap().expect("symbol after move");
-    let anchored = db.memory_for_symbol(&symbol, 10, crate::config::MemorySurface::Full).unwrap();
+    let anchored =
+        db.memory_for_symbol(&symbol, 10, rag_rat_base::config::MemorySurface::Full).unwrap();
     assert_eq!(anchored.len(), 1, "memory did not re-anchor to moved symbol");
     assert_ne!(anchored[0].bindings[0].anchor_status, "gone");
 
@@ -414,7 +416,8 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
         .unwrap();
     let report = db.memory_validate().unwrap();
     assert_eq!(report.stale, 1);
-    let stale = db.memory_for_symbol(&symbol, 10, crate::config::MemorySurface::Full).unwrap();
+    let stale =
+        db.memory_for_symbol(&symbol, 10, rag_rat_base::config::MemorySurface::Full).unwrap();
     assert_eq!(stale[0].memory_id, created.memory.memory_id);
     assert_eq!(stale[0].bindings[0].anchor_status, "stale");
 
@@ -423,7 +426,8 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
     db.memory_validate().unwrap();
     let report = db.memory_validate().unwrap();
     assert_eq!(report.gone, 1);
-    let gone = db.memory_for_symbol(&symbol, 10, crate::config::MemorySurface::Full).unwrap();
+    let gone =
+        db.memory_for_symbol(&symbol, 10, rag_rat_base::config::MemorySurface::Full).unwrap();
     assert_eq!(gone[0].bindings[0].anchor_status, "gone");
 
     let _ = fs::remove_dir_all(root);
@@ -835,7 +839,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
         .memory_for_call_path_hash(
             "edge-sequence-test-hash",
             10,
-            crate::config::MemorySurface::Full,
+            rag_rat_base::config::MemorySurface::Full,
         )
         .unwrap();
     assert_eq!(call_path.len(), 1);
@@ -888,12 +892,13 @@ fn memory_search_defers_the_body_under_the_summary_surface() {
     })
     .unwrap();
 
-    let full = db.memory_search("surfaceprobe", 10, crate::config::MemorySurface::Full).unwrap();
+    let full =
+        db.memory_search("surfaceprobe", 10, rag_rat_base::config::MemorySurface::Full).unwrap();
     assert_eq!(full.len(), 1, "the memory is found");
     assert!(!full[0].body.is_empty(), "the `full` surface returns the whole body");
 
     let summary =
-        db.memory_search("surfaceprobe", 10, crate::config::MemorySurface::Summary).unwrap();
+        db.memory_search("surfaceprobe", 10, rag_rat_base::config::MemorySurface::Summary).unwrap();
     assert_eq!(summary.len(), 1, "the same hit under the default surface");
     assert_eq!(summary[0].memory_id, full[0].memory_id);
     assert!(
@@ -992,7 +997,7 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
     assert_eq!(call_path_status(&db), "current");
     // memory_for_call_path resolves the server hash.
     let found =
-        db.memory_for_call_path_hash(&hash, 10, crate::config::MemorySurface::Full).unwrap();
+        db.memory_for_call_path_hash(&hash, 10, rag_rat_base::config::MemorySurface::Full).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].memory_id, created.memory.memory_id);
 
@@ -1007,7 +1012,9 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
     db.memory_validate().unwrap();
     assert_eq!(call_path_status(&db), "current", "server hash survives edge row-id churn");
     assert_eq!(
-        db.memory_for_call_path_hash(&hash, 10, crate::config::MemorySurface::Full).unwrap().len(),
+        db.memory_for_call_path_hash(&hash, 10, rag_rat_base::config::MemorySurface::Full)
+            .unwrap()
+            .len(),
         1
     );
 
@@ -1216,7 +1223,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
             .unwrap()
             .expect("target in b.rs"),
             10,
-            crate::config::MemorySurface::Full,
+            rag_rat_base::config::MemorySurface::Full,
         )
         .unwrap()[0]
         .bindings[0]
@@ -2279,7 +2286,7 @@ fn memory_doctor_surfaces_placeholder_scoped_memories() {
                  memory_version, repo_id)
              VALUES ('mem_placeholder', 'Invariant', 'stranded memory', 'body', 'high', 'active', \
              0, 0, 'manual', 'v1', ?1)",
-            [crate::index::schema::LEGACY_REPO_ID],
+            [rag_rat_base::repo_identity::LEGACY_REPO_ID],
         )
         .unwrap();
 
@@ -2677,7 +2684,8 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
     // #426: memory_for_symbol / memory_for_path / read_chunk / memory_evidence_for_symbol_and_edges
     // all honor `[memory] surface = "summary"` — the full body is deferred to `memory show`, the
     // compacted summary + verdict marker take its place, and the binding structure is preserved.
-    use crate::config::MemorySurface;
+    use rag_rat_base::config::MemorySurface;
+
     use crate::query::graph_meta::GraphMetaMode;
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
@@ -6296,7 +6304,7 @@ fn a_drift_heal_refreshes_the_binding_discriminators() {
     assert_eq!(symbol_kind, live_kind, "symbol_kind must be refreshed to the live kind");
     assert_eq!(
         signature_hash,
-        crate::index::util::hex_sha256(live_sig.trim().as_bytes()),
+        rag_rat_base::hash::hex_sha256(live_sig.trim().as_bytes()),
         "signature_hash must be refreshed to the live capture's hash"
     );
 

@@ -1,15 +1,16 @@
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::*;
-use crate::config::ResolvedTarget;
+use rag_rat_base::config::ResolvedTarget;
 // The embedding-model constants moved from `index::ai` to the crate-root registry (#112).
 // Import them here so the existing `HASH_MODEL_ID` / `FASTEMBED_*` references resolve to the
 // new path.
-use crate::embedding_models::{
+use rag_rat_base::embedding_models::{
     FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID, HASH_EMBEDDING_DIM,
     HASH_MODEL_ID,
 };
+
+use super::*;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 

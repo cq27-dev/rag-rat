@@ -13,8 +13,9 @@
 
 use std::path::Path;
 
+use rag_rat_base::language::Language;
+
 use crate::index::chunker::{self, Chunk};
-use crate::language::Language;
 
 /// A chunk's `[start_byte, end_byte)` must slice the real on-disk bytes whose CRLF-normalized form
 /// reproduces the chunk's stored (LF-normalized) text. Trailing newlines are compared loosely (a

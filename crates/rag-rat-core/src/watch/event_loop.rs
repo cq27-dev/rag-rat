@@ -7,6 +7,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use notify::recommended_watcher;
+use rag_rat_base::config::Config;
+use rag_rat_base::locks::{self, FileLock};
 
 use super::overlay::OverlayScope;
 use super::papertrail::{self, PapertrailClock, PapertrailScheduler};
@@ -19,12 +21,10 @@ use super::placement::{
     event_targets_binary, is_gitignore_path, kind_is_mutation, place_initial_watch_state,
     recompile_ignore_and_place_watches, sync_linked_worktrees_after_pass,
 };
-use crate::config::Config;
 use crate::fleet;
 use crate::index::IndexDatabase;
 use crate::index::ignore_rules::IgnoreMatcher;
 use crate::index::papertrail::{AutosyncRequest, autosync};
-use crate::locks::{self, FileLock};
 
 pub(crate) const FLEET_DEBOUNCE: Duration = Duration::from_millis(500);
 pub(crate) const FLEET_MAX_LATENCY: Duration = Duration::from_millis(2000);

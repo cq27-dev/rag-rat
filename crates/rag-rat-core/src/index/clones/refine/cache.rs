@@ -149,7 +149,7 @@ pub(crate) fn refinement_key(
         material.push_str(d);
         material.push('\0');
     }
-    crate::index::hex_sha256(material.as_bytes())
+    rag_rat_base::hash::hex_sha256(material.as_bytes())
 }
 
 /// PURE READ: return the cached `clone_refinements` row for `refinement_key` (filtered to the
@@ -444,12 +444,13 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    use rag_rat_base::language::Language;
+
     use super::*;
     use crate::index::clones::normalize::{NodeSpan, normalize_baseline_spanned};
     use crate::index::clones::refine::align::LCS_MAX_SEQ_TOKENS;
     use crate::index::clones::tokens;
     use crate::index::parser;
-    use crate::language::Language;
 
     /// Build a `RefineMember` from a Rust snippet, mirroring `load_refine_members`: parse, descend
     /// to the first `function` symbol, span-normalize (so `node_spans.len() == seq.len()`),
@@ -484,7 +485,7 @@ mod tests {
             .iter()
             .map(|m| {
                 let src = m.text.as_ref();
-                format!("{}:{}-{}", crate::index::hex_sha256(src.as_bytes()), 0, src.len())
+                format!("{}:{}-{}", rag_rat_base::hash::hex_sha256(src.as_bytes()), 0, src.len())
             })
             .collect()
     }

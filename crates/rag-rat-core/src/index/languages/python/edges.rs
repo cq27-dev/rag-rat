@@ -587,8 +587,9 @@ fn python_import_target(
 mod python_edge_tests {
     use std::path::Path;
 
+    use rag_rat_base::language::Language;
+
     use super::*;
-    use crate::language::Language;
 
     fn edges(src: &str) -> Vec<EdgeCandidate> {
         // No symbol table needed: the syntactic pass emits NameOnly candidates regardless of

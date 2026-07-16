@@ -1,8 +1,8 @@
+use rag_rat_base::config::PapertrailConfig;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use super::{MirrorContinuation, ResolvedTracker, load_mirror_continuation};
-use crate::config::PapertrailConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScheduleDecision {
@@ -285,8 +285,9 @@ pub(crate) fn load_persisted_health(
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_base::config::Tracker;
+
     use super::*;
-    use crate::config::Tracker;
     use crate::index::papertrail::TrackerAuthentication;
     use crate::index::schema;
 
