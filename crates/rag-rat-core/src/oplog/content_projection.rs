@@ -59,6 +59,13 @@ pub(in crate::oplog) fn reproject_accepted_content_stream(
     let entries = load_accepted_entries(tx, stream_id)?;
     let state = project::project(&entries);
     write_projection(tx, stream_id, &state)?;
+    // This stamps the STORE-GLOBAL version but rebuilt only THIS stream. Safe only while
+    // `CONTENT_PROJECTOR_VERSION` is never bumped: the stored version is then only ever unset or
+    // current, so there is no stale store to falsely mark done. BEFORE the first bump, add a
+    // store-global rebuild-on-upgrade (rebuild every `/3` stream, THEN stamp — mirroring `/1`'s
+    // `store::reproject_if_projector_stale`), or the first per-stream reproject on an
+    // old-version store would mark every OTHER (still-old) stream's projection current and the
+    // reconcile anti-join would trust a stale projection. Tracked in #688.
     stamp_content_projector_version(tx)?;
     Ok(())
 }

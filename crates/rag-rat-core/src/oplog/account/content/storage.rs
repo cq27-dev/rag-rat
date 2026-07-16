@@ -581,6 +581,17 @@ pub(in crate::oplog::account) fn refold_streams_for_account(
             streams.insert(fixed::<32>(&stream_bytes)?);
         }
     }
+    // This re-derives `accepted` but deliberately does NOT refresh the accepted-`/3` → memory
+    // projection (`content_projected_*`). That is safe ONLY while no path here can FLIP an accepted
+    // set: pre-transport the reconcile publishes a stream's `StreamOwn` before authoring its
+    // content (no retro-accept) and there is no local revoke/demote op (no retro-condemn), so
+    // this loop re-derives the identical accepted set the authoring path already reprojected.
+    // When transport (or any retro-accept/declassify op) lands, a flip here would leave
+    // `content_projected_*` stale and the memory reconcile's anti-join would mass-duplicate or
+    // skip rows — so phase-D must call `content_projection::reproject_accepted_content_stream`
+    // for each stream below, GUARDED on the V070 `content_projected_*` tables existing (this fn
+    // also runs in the pre-V070 V064/V065 authority backfill; mirror the
+    // `content_entries_exists` guard above). Tracked in #683.
     for stream in streams {
         refold_content_stream(tx, StreamId::from_bytes(stream))?;
     }
