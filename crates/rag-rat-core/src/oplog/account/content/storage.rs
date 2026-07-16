@@ -122,6 +122,13 @@ pub(in crate::oplog) fn content_ingest(
     // this is a no-op and the entry stays `retained_unfolded` until the account→content trigger
     // refolds it; with authority present the entry lands on its real verdict in this same txn.
     refold_content_stream(&tx, verified.header.stream_id)?;
+    // TODO(phase D): project a newly-ACCEPTED FOREIGN entry into `repo_memories` /
+    // `repo_node_edges` here (and from the account→content retro-trigger that retro-accepts
+    // foreign content), so a remote memory surfaces in the local read APIs — those read ONLY
+    // the memory tables, never this `/3` stream or its projection. Deferrable until transport
+    // lands because no foreign entry can exist before then; the local author path needs no such
+    // write-back (it authors `/3` content FROM `repo_memories`, so the reader's row is already
+    // present). Tracked in #691.
     let status = status_for(&tx, &verified.entry_hash)?
         .unwrap_or_else(|| ContentStatus::RetainedUnfolded.as_db_str().to_string());
     tx.commit()?;

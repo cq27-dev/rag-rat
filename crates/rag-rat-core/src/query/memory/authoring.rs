@@ -1414,4 +1414,44 @@ mod tests {
         );
         assert_eq!(entry_count(&conn), 0, "the oversized batch rolled back — no /3 content stored");
     }
+
+    // --- read path is unchanged by the retarget (#665) ---
+
+    #[test]
+    fn local_reads_come_from_repo_memories_not_the_v3_stream() {
+        // The retarget moved AUTHORING onto /3, but local reads must be unchanged: they come from
+        // repo_memories, never the /3 stream or its content_projected_* shadow (whose only consumer
+        // is the reconcile's completeness anti-join). Prove it: author via the live path, then WIPE
+        // the entire /3 substrate and confirm a read returns the same memories. A read that
+        // consulted any /3 table would change here.
+        let conn = scoped_conn();
+        let created = create_concept(&conn, "readable").unwrap().memory.memory_id;
+
+        let read_ids = |c: &Connection| -> Vec<String> {
+            crate::query::memory::list_memories(c, None)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.memory_id)
+                .collect()
+        };
+        let before = read_ids(&conn);
+        assert!(before.contains(&created), "the authored memory lists before the wipe");
+
+        // Wipe every /3 table the live path writes (FKs off so delete order is irrelevant).
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DELETE FROM content_projected_nodes;
+             DELETE FROM content_projected_edges;
+             DELETE FROM content_entry_status;
+             DELETE FROM content_entries;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_ids(&conn),
+            before,
+            "reads are identical with the whole /3 substrate wiped — they never consult it",
+        );
+    }
 }
