@@ -105,6 +105,13 @@ pub(crate) enum Command {
     #[cfg(feature = "eval")]
     BenchmarkEmbedding(BenchmarkEmbeddingArgs),
 
+    /// Regenerate the memory-compaction eval's `verify-packs` corpus (#695): insert the eval
+    /// memories from a spec into the configured (throwaway) index and dump each memory's
+    /// `render_pack(evidence_pack(...))`. Requires the `eval` build feature.
+    #[cfg(feature = "eval")]
+    #[command(hide = true)]
+    DumpVerifyPacks(DumpVerifyPacksArgs),
+
     /// SCIP-oracle pass: compiler-grade edge resolution from a language indexer.
     Oracle(OracleArgs),
 
@@ -389,6 +396,23 @@ pub(crate) struct ReconcileArgs {
     /// on a later run).
     #[arg(long)]
     pub reencode_vectors: bool,
+}
+
+#[cfg(feature = "eval")]
+#[derive(Debug, Args)]
+pub(crate) struct DumpVerifyPacksArgs {
+    /// Spec JSON: `{ "memories": [{eval_id, kind, title, body, confidence?, binding_path?}],
+    /// "dump": [eval_id, ...] }`. Memories are inserted into the configured index; `dump` names
+    /// which of them to render packs for.
+    #[arg(long)]
+    pub spec: PathBuf,
+    /// Root label the output packs are keyed by (`<eval_id>|<root_label>`), e.g. `/repo` or
+    /// `/repo-drift`.
+    #[arg(long)]
+    pub root_label: String,
+    /// Output JSON path: `{ "<eval_id>|<root_label>": "<pack text>" }`.
+    #[arg(long)]
+    pub out: PathBuf,
 }
 
 #[cfg(feature = "eval")]

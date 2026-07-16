@@ -8,17 +8,19 @@ stale copy of the tree, this script regenerates it from the CURRENT checkout by 
 surgical edits, so the drift stays anchored to real code as the repo evolves.
 
 The two edits (both in the write-time clone-check path):
-  (a) precompute.rs — remove the linked-overlay gate
-        `if self.active_scope_is_linked_overlay() { return Ok(None); }`
-      and its preceding comment. Backs `real_22` at /repo-drift (memory says the fast path is
-      disabled under a linked overlay; the doctored code no longer disables it).
-  (b) scoring.rs — remove the refined-class self-guard
+  (a) scoring.rs — remove the refined-class self-guard
         `if class.refined { return; }`
-      and its preceding comment. Backs `real_27` at /repo-drift (memory says a refined class is
-      never re-dampened; the doctored code drops that guard).
+      and its preceding comment. Backs `real_22` at /repo-drift (its note says a refined class is
+      never re-dampened; the doctored code drops that guard). `real_22`'s pack is anchored to
+      scoring.rs, so the removed guard lands in the excerpt — this IS the pack-method drift case.
+  (b) precompute.rs — remove the linked-overlay gate
+        `if self.active_scope_is_linked_overlay() { return Ok(None); }`
+      and its preceding comment. Backs `real_27`'s fast-path note, but is NO LONGER a pack-method
+      case (#695): the gate is past the excerpt cap in a large file and the method still exists
+      elsewhere, so no pack reflects it. Kept for the agentic drift_test/verify_test arms.
 
 If either anchor is missing (the code has moved), the script FAILS LOUDLY: the drift can no
-longer be reproduced faithfully and the two manifest cases must be re-derived by hand.
+longer be reproduced faithfully and the doctored cases must be re-derived by hand.
 
 Usage:
     python3 make-drift-tree.py            # regenerate ./drift-crates from ../../../crates

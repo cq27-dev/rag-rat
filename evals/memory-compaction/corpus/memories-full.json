@@ -104,8 +104,8 @@
    {
     "memory_id": "mem_19f291adc8d_cf982d0b4ec4",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/github/store.rs",
-    "path": "crates/rag-rat-core/src/index/github/store.rs",
+    "binding_id": "crates/rag-rat-core/src/index/papertrail/store.rs",
+    "path": "crates/rag-rat-core/src/index/papertrail/store.rs",
     "anchor_status": "current",
     "created_at_ms": 1783101054093
    }
@@ -671,9 +671,9 @@
   "bindings": [
    {
     "memory_id": "mem_19f23bc9be2_a0afc84c3276",
-    "binding_kind": "dir",
-    "binding_id": "crates/rag-rat-core/src/index/query_api/clones",
-    "path": "crates/rag-rat-core/src/index/query_api/clones",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/query_api/clones/scoring.rs",
+    "path": "crates/rag-rat-core/src/index/query_api/clones/scoring.rs",
     "anchor_status": "current",
     "created_at_ms": 1783010991074
    }

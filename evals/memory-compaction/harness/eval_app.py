@@ -87,13 +87,18 @@ def strip_think(text: str) -> str:
 
 @app.function(image=vllm_image, gpu="L40S", volumes={CACHE_PATH: CACHE}, timeout=3600)
 def run_model(model_id: str, chat_kwargs: dict | None, system_prefix: str | None,
-              prompts: list[str], max_tokens: int) -> dict:
-    """Batch-generate with one model. Returns summaries + timings, or an error record."""
+              prompts: list[str], max_tokens: int, max_model_len: int = 8192) -> dict:
+    """Batch-generate with one model. Returns summaries + timings, or an error record.
+
+    `max_model_len` defaults to 8192 (the round-1 candidate sweep — some candidates cap there), but
+    verify_pack_test passes a larger window: a regenerated evidence pack + its full note can run to
+    ~10K tokens (the shipped render_pack emits a path-prefixed line per excerpt line), so an 8192
+    window would truncate the largest cases instead of measuring verdict accuracy."""
     from vllm import LLM, SamplingParams
 
     t0 = time.monotonic()
     try:
-        llm = LLM(model=model_id, max_model_len=8192, dtype="bfloat16",
+        llm = LLM(model=model_id, max_model_len=max_model_len, dtype="bfloat16",
                   gpu_memory_utilization=0.92, enforce_eager=False)
     except Exception as e:  # engine/arch unsupported -> report, don't crash the sweep
         return {"model": model_id, "error": f"engine init failed: {e!r}"}
@@ -355,16 +360,27 @@ TITLE: {title}
 # graded on. The two `unverifiable` synthetics are NOT here — they are decided deterministically in
 # pass 0 (verify.rs `unverifiable_findings`) and never reach the model, so they live in
 # PASS0_UNVERIFIABLE below, excluded from the model gate.
+# Regenerated (#695) by harness/regen-verify-packs.py against the CURRENT tree, then every verdict
+# re-derived by hand against the code the packs resolve over. The 5 original `note_ahead` cases have
+# aged out: real_0 / real_1 / real_9 / real_14 describe work that has since LANDED (their cited symbols
+# now resolve — so `current`; real_0 stays a useful trap because the note's `…`-truncated test names
+# read as NOT FOUND in the pack yet exist under fuller names), while real_3's `github` index module was
+# RENAMED to `papertrail` and its schema redesigned (its `store_*` writers are gone) — still `diverged`,
+# now `code_ahead`. real_27's `/repo-drift` case was dropped: its removed gate sits past the 140-line
+# excerpt cap in a large file, so no evidence pack (production's included) can reflect the divergence.
+# The split is now current-heavy (12:2) because the tracked work merged; add fresh diverged cases if a
+# more balanced false-negative signal is wanted.
 VERIFY_MANIFEST = [
+    # current — nothing in the pack contradicts a load-bearing claim
+    ("real_0", "current", None, "/repo"), ("real_1", "current", None, "/repo"),
+    ("real_9", "current", None, "/repo"), ("real_14", "current", None, "/repo"),
     ("real_16", "current", None, "/repo"), ("real_17", "current", None, "/repo"),
     ("real_20", "current", None, "/repo"), ("real_21", "current", None, "/repo"),
     ("real_22", "current", None, "/repo"), ("real_26", "current", None, "/repo"),
     ("real_27", "current", None, "/repo"), ("real_29", "current", None, "/repo"),
-    ("real_0", "diverged", "note_ahead", "/repo"), ("real_1", "diverged", "note_ahead", "/repo"),
-    ("real_3", "diverged", "note_ahead", "/repo"), ("real_9", "diverged", "note_ahead", "/repo"),
-    ("real_14", "diverged", "note_ahead", "/repo"),
+    # diverged — a load-bearing claim is contradicted by current code
+    ("real_3", "diverged", "code_ahead", "/repo"),
     ("real_22", "diverged", "code_ahead", "/repo-drift"),
-    ("real_27", "diverged", "code_ahead", "/repo-drift"),
 ]
 
 # Deterministic pass-0 cases: the fictional synthetics whose named modules resolve NOWHERE, decided
@@ -458,7 +474,9 @@ def verify_pack_test():
         for iid, _, _, root in rows]
     out = []
     for model, ck, sp_ in V2_MODELS:
-        r = run_model.remote(model, ck, sp_, prompts, 350)
+        # 16384-token window: an evidence pack + its full note can approach ~10K tokens, so the
+        # default 8192 would truncate the largest cases (real_0/real_14/real_16) instead of scoring.
+        r = run_model.remote(model, ck, sp_, prompts, 350, max_model_len=16384)
         if "error" in r:
             print(f"{model}: ERROR {r['error'][:80]}")
             continue

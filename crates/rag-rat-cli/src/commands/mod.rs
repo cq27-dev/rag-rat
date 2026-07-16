@@ -7,6 +7,8 @@
 mod clones;
 mod config_info;
 mod consolidate;
+#[cfg(feature = "eval")]
+mod dump_verify_packs;
 mod format;
 mod hooks;
 mod index_ops;
@@ -19,6 +21,8 @@ mod search;
 pub(crate) use clones::{clones, clones_for};
 pub(crate) use config_info::{dump_config, version_check};
 pub(crate) use consolidate::consolidate;
+#[cfg(feature = "eval")]
+pub(crate) use dump_verify_packs::dump_verify_packs;
 pub(crate) use format::{output_format, set_output_format};
 pub(crate) use hooks::{hooks, papertrail};
 pub(crate) use index_ops::{doctor, doctor_global_store, index, maintenance, reconcile};

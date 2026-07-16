@@ -79,12 +79,11 @@ evals/memory-compaction/
     memories-full.json   full memory records (binding paths for the verify manifest)
     anchors.json         identifier-anchored code excerpts (anchor-context variants)
     drift-anchors.json   doctored anchors for the drift-detection variant
-    verify-packs.json     mechanically-built evidence packs (verify-pack method), keyed id|root
-                          ⚠ STALE FORMAT (issue #695): frozen in the legacy `IDENTIFIER RESOLUTION`
-                          shape, predates the current `render_pack` output — regenerate before trusting
-                          verify_pack_test numbers
+    verify-packs.json     mechanically-built evidence packs (verify-pack method), keyed id|root —
+                          REGENERATE with harness/regen-verify-packs.py after any render_pack change
   harness/
     eval_app.py          Modal app: candidates, judge, HHEM, the v2 variants, verify + drift
+    regen-verify-packs.py  rebuilds verify-packs.json against the current + doctored trees (#695)
     score.py             folds judge verdicts + HHEM + format checks into the round-1 scoreboard
     score_v2.py          scores the v2 variants; carries the offline ref-leakage metric
     make-drift-tree.py   regenerates the doctored crates/ copy the manifest's two cases need
@@ -123,30 +122,43 @@ modal run harness/eval_app.py::verify_test        # agentic grep/read method (th
 ```
 
 `verify_pack_test` reads the static `corpus/verify-packs.json` (evidence packs pre-built from the
-current + doctored trees), so it does not mount the repo. **Caveat:** that snapshot is frozen in the
-legacy `IDENTIFIER RESOLUTION` pack format and predates the current `render_pack` output (which emits
-`` `id` -> … `` rows and hides `mem_<hex>` cross-references); regenerate it against the current +
-doctored trees before trusting these numbers — see issue #695. `verify_test` and `drift_test` mount the
-live checkout at `/repo` and the doctored copy at `/repo-drift`, so **run
-`make-drift-tree.py` first** for those.
+current + doctored trees), so it does not mount the repo. **Regenerate it whenever `render_pack`
+changes** (its format IS what the packs must mirror) with:
+
+```bash
+cargo build -p rag-rat --features eval          # builds `rag-rat dump-verify-packs`
+python3 harness/regen-verify-packs.py           # -> corpus/verify-packs.json (+ prints the case list)
+```
+
+`regen-verify-packs.py` builds a throwaway rag-rat index over a clean checkout and over the doctored
+drift tree, inserts the eval memories (from `memories-full.json`), and dumps each case's
+`render_pack(evidence_pack(...))` through the SHIPPED entrypoint — so the corpus can't silently drift
+from the pack format again. Re-derive the `VERIFY_MANIFEST` verdicts by hand after regenerating: the
+packs resolve against *current* code, so a note whose in-flight work has since landed flips
+`diverged`→`current`, and one whose code was renamed/moved stays `diverged` but turns `code_ahead`.
+`verify_test` and `drift_test` mount the live checkout at `/repo` and the doctored copy at
+`/repo-drift`, so **run `make-drift-tree.py` first** for those.
 
 ### The drift tree
 
 `make-drift-tree.py` copies the repo's `crates/` to `drift-crates/` and applies exactly **two
 surgical edits**, both in the write-time clone-check path:
 
-- **`precompute.rs`** — removes the linked-overlay gate
-  (`if self.active_scope_is_linked_overlay() { return Ok(None); }`) and its comment. This makes
-  `real_22` diverge (`code_ahead`): the note says the postings fast path is disabled under a
-  linked overlay; the doctored code no longer disables it.
 - **`scoring.rs`** — removes the refined-class self-guard (`if class.refined { return; }`) and its
-  comment. This makes `real_27` diverge (`code_ahead`): the note says a refined class is never
-  re-dampened; the doctored code drops that guard.
+  comment. This makes **`real_22`** diverge (`code_ahead`): its note ("RANKING-only member_count
+  dampen on un-refined clones") says a refined class is never re-dampened; the doctored code drops the
+  guard. `real_22`'s pack is anchored to `scoring.rs`, so the removed guard lands in the excerpt.
+- **`precompute.rs`** — removes the linked-overlay gate
+  (`if self.active_scope_is_linked_overlay() { return Ok(None); }`) and its comment. This backs
+  **`real_27`**'s fast-path note. It is **no longer a pack-method case** (`real_27|/repo-drift` was
+  dropped from `VERIFY_MANIFEST`, #695): the gate sits past the 140-line excerpt cap in a large file and
+  the method still exists elsewhere, so no evidence pack can reflect the removal. The edit stays for the
+  agentic `drift_test`/`verify_test` arms, which grep/read the doctored tree rather than a frozen pack.
 
 It **fails loudly** if either anchor is missing — the surrounding code drifts over time, and a
-missing anchor means the doctored cases must be re-derived by hand. The two `/repo-drift` cases in
-the manifest depend on these edits; `corpus/verify-packs.json` encodes the same two edits as a
-frozen snapshot for the pack method.
+missing anchor means the doctored cases must be re-derived by hand. `real_22|/repo-drift` is the pack
+method's one `code_ahead` case; `corpus/verify-packs.json` is regenerated from the doctored tree by
+`regen-verify-packs.py`, not hand-frozen.
 
 ## Measured baseline (2026-07-04, Modal)
 

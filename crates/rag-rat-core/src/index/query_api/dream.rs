@@ -75,6 +75,13 @@ impl IndexDatabase {
         )
     }
 
+    /// Render one memory's evidence pack into the exact text the verdict model is shown — the
+    /// generator behind the memory-compaction eval's `verify-packs` corpus (#695). See
+    /// [`crate::dream::render_evidence_pack`].
+    pub fn dream_render_pack(&self, memory_id: &str) -> anyhow::Result<String> {
+        crate::dream::render_evidence_pack(self.storage.connection(), memory_id)
+    }
+
     /// Apply a human review verdict (accept / dismiss / reset) to a dream finding by id or prefix —
     /// the `rag-rat dream <id> --accept|--dismiss|--reset` surface. Repo-scoped; only a
     /// non-terminal finding is reviewable. See [`crate::dream::review_dream_finding`].

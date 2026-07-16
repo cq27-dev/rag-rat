@@ -132,6 +132,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Eval(args) => eval(&config, &args)?,
         #[cfg(feature = "eval")]
         Cmd::BenchmarkEmbedding(args) => benchmark_embedding(&config, &args)?,
+        #[cfg(feature = "eval")]
+        Cmd::DumpVerifyPacks(args) => dump_verify_packs(&config, &args)?,
         Cmd::Oracle(args) => oracle(&config, &args)?,
         Cmd::Consolidate => consolidate(&config)?,
         Cmd::DumpConfig => dump_config(&config)?,
