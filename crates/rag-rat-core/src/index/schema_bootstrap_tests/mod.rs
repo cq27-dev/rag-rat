@@ -9,6 +9,7 @@ use rag_rat_base::embedding_models::{
     FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID, HASH_EMBEDDING_DIM,
     HASH_MODEL_ID,
 };
+use rag_rat_base::time::now_ms;
 
 use super::*;
 

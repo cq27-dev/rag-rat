@@ -11,28 +11,23 @@ use std::time::{Duration, Instant};
 
 /// One scripted response. The stub serves them in order, one connection each
 /// (`Connection: close`).
-pub(crate) struct StubResponse {
+pub struct StubResponse {
     pub status: &'static str,
     pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
 impl StubResponse {
-    pub(crate) fn ok(body: &str) -> Self {
+    pub fn ok(body: &str) -> Self {
         Self::status("200 OK", body)
     }
 
-    pub(crate) fn status(status: &'static str, body: &str) -> Self {
+    pub fn status(status: &'static str, body: &str) -> Self {
         Self { status, headers: Vec::new(), body: body.to_string() }
     }
 
     /// A `200 OK` carrying GitHub-style quota headers.
-    pub(crate) fn ok_with_quota(
-        body: &str,
-        limit: i64,
-        remaining: i64,
-        reset_epoch_s: i64,
-    ) -> Self {
+    pub fn ok_with_quota(body: &str, limit: i64, remaining: i64, reset_epoch_s: i64) -> Self {
         Self {
             status: "200 OK",
             headers: vec![
@@ -49,7 +44,7 @@ impl StubResponse {
 /// connection per response — and returns the base URL plus a join handle yielding the captured
 /// request HEADS (request line + headers) in arrival order, so tests can assert the exact page
 /// sequence. Accepts poll with a deadline so a client-side bug can't hang the join forever.
-pub(crate) fn spawn_script_stub(
+pub fn spawn_script_stub(
     responses: Vec<StubResponse>,
 ) -> (String, thread::JoinHandle<Vec<String>>) {
     spawn_script_stub_with_timeout(responses, Duration::from_secs(10))
@@ -60,7 +55,7 @@ pub(crate) fn spawn_script_stub(
 /// holds the FIRST response until the paired stub signals. A gate that times out serves a `500`
 /// instead of hanging the test — a serial (non-overlapping) client then observes a failure the
 /// test can assert on.
-pub(crate) fn spawn_script_stub_coordinated(
+pub fn spawn_script_stub_coordinated(
     responses: Vec<StubResponse>,
     notify_first_request: Option<std::sync::mpsc::Sender<()>>,
     gate_first_response: Option<std::sync::mpsc::Receiver<()>>,

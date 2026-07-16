@@ -45,6 +45,7 @@ pub use providers::{
     verify_ephemeral_remote_cancellable,
 };
 use rag_rat_base::language::Language;
+use rag_rat_base::time::now_ms;
 pub(crate) use reconcile::*;
 pub(crate) use reencode::*;
 use rusqlite::types::Value;
@@ -58,8 +59,6 @@ pub use throughput_tune::{
     MeasuredCandidate, benchmark_remote_concurrency, default_benchmark_budget_ms,
     default_benchmark_candidates, measure_remote_dim, min_benchmark_budget_ms,
 };
-
-use crate::index::now_ms;
 
 const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
 const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_version";

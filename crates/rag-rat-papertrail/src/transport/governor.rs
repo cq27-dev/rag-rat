@@ -50,7 +50,7 @@ pub(crate) struct GovernorKey {
 }
 
 impl GovernorKey {
-    pub(crate) fn new(provider: &str, host: &str, token: Option<&str>, lane: &str) -> Self {
+    pub fn new(provider: &str, host: &str, token: Option<&str>, lane: &str) -> Self {
         Self {
             provider: provider.to_string(),
             host: host.to_string(),
@@ -116,7 +116,7 @@ fn token_fingerprint(token: Option<&str>) -> String {
 /// Fixed request budget for providers that report no quota headers: at most `max_requests` per
 /// `window_ms`, then pause until the window rolls.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BudgetPolicy {
+pub struct BudgetPolicy {
     pub max_requests: u32,
     pub window_ms: i64,
 }
@@ -127,7 +127,7 @@ pub(crate) const DEFAULT_FALLBACK_BUDGET: BudgetPolicy =
     BudgetPolicy { max_requests: 300, window_ms: 3_600_000 };
 
 #[derive(Debug, Clone)]
-pub(crate) struct GovernorConfig {
+pub struct GovernorConfig {
     /// Stop-consuming threshold: paused while `remaining <= reserve * limit`.
     pub reserve: f64,
     /// Applied only while no header-reported quota view exists.
@@ -236,7 +236,7 @@ pub(crate) struct RateGovernor {
 }
 
 impl RateGovernor {
-    pub(crate) fn new(config: GovernorConfig) -> Self {
+    pub fn new(config: GovernorConfig) -> Self {
         Self { config, state: Mutex::new(GovernorState::default()) }
     }
 

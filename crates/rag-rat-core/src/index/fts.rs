@@ -9,6 +9,7 @@
 //! pay a full FTS rebuild forever after a sibling synced (stale-dirty loop). Do NOT route these
 //! back through `self.repo_meta` / `self.set_repo_meta`.
 
+use rag_rat_base::time::now_ms;
 use rag_rat_db::schema;
 
 use super::*;
@@ -216,7 +217,7 @@ impl IndexDatabase {
             Vec::new()
         };
         crate::query::memory::heal_repo_memory_fts(conn)?;
-        crate::index::papertrail::rebuild_fts(conn)?;
+        rag_rat_papertrail::rebuild_fts(conn)?;
         fence.commit()?;
         Ok(deferred)
     }
@@ -278,7 +279,7 @@ impl IndexDatabase {
             outcome.healed.push("repo_memory_fts".to_string());
         }
         if papertrail_corrupt {
-            crate::index::papertrail::rebuild_fts(conn)?;
+            rag_rat_papertrail::rebuild_fts(conn)?;
             outcome.healed.push("papertrail_fts".to_string());
         }
         fence.commit()?;

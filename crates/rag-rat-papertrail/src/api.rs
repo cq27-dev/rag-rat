@@ -1,12 +1,12 @@
-use rag_rat_db::meta::{repo_meta, set_repo_meta};
+use rag_rat_db::meta::{repo_meta, scoped_table_row_count, set_repo_meta};
+use rag_rat_db::schema;
 
 use super::*;
-use crate::index::{schema, scoped_table_row_count};
 
 /// Mirror every resolved binding, unconditionally (the explicit `papertrail sync` command).
 /// Provider-client-pending and unauthenticatable bindings surface as report errors so the
 /// operator sees exactly what a manual run could not do.
-pub(crate) async fn sync_mirror(
+pub async fn sync_mirror(
     conn: &Connection,
     root: &Path,
     full: bool,
@@ -50,7 +50,7 @@ pub(crate) async fn sync_mirror(
 /// same capability gap every 15 minutes — `status` reports it), `Skip` decisions never record an
 /// attempt, and reference discovery does not run (it re-reads every indexed file from disk; the
 /// annotation layer refreshes on manual sync).
-pub(crate) async fn sync_mirror_scheduled(
+pub async fn sync_mirror_scheduled(
     conn: &Connection,
     ctx: &PapertrailContext,
     request: AutosyncRequest,
@@ -412,8 +412,8 @@ fn ensure_unique_mirror_bindings(trackers: &[ResolvedTracker]) -> anyhow::Result
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) async fn sync_from_refs<C: PapertrailClient>(
+// Not test-gated: the engine crate's schema tests drive this cross-crate (test support only).
+pub async fn sync_from_refs<C: PapertrailClient>(
     conn: &Connection,
     root: &Path,
     client: Option<&C>,
@@ -422,8 +422,7 @@ pub(crate) async fn sync_from_refs<C: PapertrailClient>(
 ) -> anyhow::Result<PapertrailSyncReport> {
     sync_from_refs_with_progress(conn, root, client, offline, ctx, |_| {}).await
 }
-#[cfg(test)]
-pub(crate) async fn sync_from_refs_with_progress<C: PapertrailClient>(
+pub async fn sync_from_refs_with_progress<C: PapertrailClient>(
     conn: &Connection,
     root: &Path,
     client: Option<&C>,
@@ -461,8 +460,7 @@ pub(crate) async fn sync_from_refs_with_progress<C: PapertrailClient>(
         status: status(conn, ctx)?,
     })
 }
-#[cfg(test)]
-pub(crate) async fn sync_issue<C: PapertrailClient>(
+pub async fn sync_issue<C: PapertrailClient>(
     conn: &Connection,
     issue_ref: &str,
     client: Option<&C>,
@@ -506,10 +504,7 @@ pub(crate) async fn sync_issue<C: PapertrailClient>(
         status: status(conn, ctx)?,
     })
 }
-pub(crate) fn status(
-    conn: &Connection,
-    ctx: &PapertrailContext,
-) -> anyhow::Result<PapertrailStatus> {
+pub fn status(conn: &Connection, ctx: &PapertrailContext) -> anyhow::Result<PapertrailStatus> {
     // The papertrail_* tables are direct-scoped; report only the ACTIVE repo's counts, not the
     // union across a consolidated DB.
     let repo_id = schema::active_repo_id(conn)?;
@@ -571,7 +566,6 @@ pub(crate) fn status(
 
 /// Test-only compatibility routing for the retired reference-driven sync fixtures. Production
 /// synchronization uses [`sync_mirror`]; references are annotations only.
-#[cfg(test)]
 fn discovered_ref_uses_legacy_github_client(
     ctx: &PapertrailContext,
     reference: &PapertrailRef,
@@ -617,7 +611,7 @@ fn binding_status_flags(
         error_class.is_some_and(|class| class != PapertrailErrorClass::RateLimited),
     )
 }
-pub(crate) fn issue_search(
+pub fn issue_search(
     conn: &Connection,
     query: &str,
     limit: u32,
@@ -625,7 +619,7 @@ pub(crate) fn issue_search(
     // Item rows only (issues AND change requests — their titles/bodies), not comment rows.
     search_fts(conn, query, Some("item"), limit)
 }
-pub(crate) fn rationale_search(
+pub fn rationale_search(
     conn: &Connection,
     query: &str,
     limit: u32,
@@ -659,7 +653,7 @@ pub(crate) fn rationale_search(
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(evidence)
 }
-pub(crate) fn refs_for_path(
+pub fn refs_for_path(
     conn: &Connection,
     path: &str,
     limit: u32,
@@ -678,52 +672,69 @@ pub(crate) fn refs_for_path(
     let rows = stmt.query_map(params![path, i64::from(limit), repo_id], ref_row)?;
     collect_rows(rows)
 }
-pub(crate) fn papertrail_for_chunk(
+
+/// Boundary view of a resolved chunk the query layer wants papertrail evidence for — this crate
+/// takes only the fields it reads, so it never depends on the query layer's rich types.
+pub struct ChunkRef<'a> {
+    pub path: &'a str,
+    pub chunk_id: i64,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub symbol_path: Option<&'a str>,
+}
+
+/// Boundary view of a resolved symbol hit (same posture as [`ChunkRef`]).
+pub struct SymbolRef<'a> {
+    pub path: &'a str,
+    pub qualified_name: &'a str,
+    pub symbol_path: &'a str,
+}
+pub fn papertrail_for_chunk(
     conn: &Connection,
-    chunk: &crate::query::ReadChunk,
+    chunk: &ChunkRef<'_>,
     limit: u32,
     ctx: &PapertrailContext,
 ) -> anyhow::Result<Papertrail> {
-    let mut evidence = evidence_for_path(conn, &chunk.path, limit)?;
+    let mut evidence = evidence_for_path(conn, chunk.path, limit)?;
     if evidence.is_empty() {
-        evidence = rationale_search(conn, &chunk.path, limit, ctx)?;
+        evidence = rationale_search(conn, chunk.path, limit, ctx)?;
     }
     Ok(Papertrail {
         current_source: Some(CurrentSourceEvidence {
             chunk_id: Some(chunk.chunk_id),
-            path: chunk.path.clone(),
+            path: chunk.path.to_string(),
             start_line: Some(chunk.start_line),
             end_line: Some(chunk.end_line),
-            symbol: chunk.symbol_path.clone(),
+            symbol: chunk.symbol_path.map(str::to_string),
         }),
         evidence,
         fallback_evidence: Vec::new(),
     })
 }
-pub(crate) fn papertrail_for_symbol(
+pub fn papertrail_for_symbol(
     conn: &Connection,
-    symbol: &crate::query::symbol::SymbolHit,
+    symbol: &SymbolRef<'_>,
     limit: u32,
     ctx: &PapertrailContext,
 ) -> anyhow::Result<Papertrail> {
-    let mut evidence = evidence_for_path(conn, &symbol.path, limit)?;
-    evidence.extend(rationale_search(conn, &symbol.qualified_name, limit, ctx)?);
+    let mut evidence = evidence_for_path(conn, symbol.path, limit)?;
+    evidence.extend(rationale_search(conn, symbol.qualified_name, limit, ctx)?);
     dedupe_evidence(&mut evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     let (start_line, end_line, chunk_id) = current_symbol_span(conn, symbol)?;
     Ok(Papertrail {
         current_source: Some(CurrentSourceEvidence {
             chunk_id,
-            path: symbol.path.clone(),
+            path: symbol.path.to_string(),
             start_line,
             end_line,
-            symbol: Some(symbol.qualified_name.clone()),
+            symbol: Some(symbol.qualified_name.to_string()),
         }),
         evidence,
         fallback_evidence: Vec::new(),
     })
 }
-pub(crate) fn papertrail_for_commit(
+pub fn papertrail_for_commit(
     conn: &Connection,
     commit_hash: &str,
     limit: u32,
@@ -831,7 +842,7 @@ mod capability_tests {
         let ctx =
             PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         record_pause(&conn, &binding, i64::MAX).unwrap();
 
         let binding_status = status(&conn, &ctx).unwrap().bindings.remove(0);
@@ -957,7 +968,7 @@ mod capability_tests {
             ..PapertrailContext::default()
         };
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         let report = block_on(sync_mirror(&conn, Path::new("."), false, &ctx)).unwrap();
         assert_eq!(report.synced_items, 2);
         assert_eq!(report.bindings.len(), 2);
@@ -979,7 +990,7 @@ mod capability_tests {
         let ctx =
             PapertrailContext { trackers: vec![first, second], ..PapertrailContext::default() };
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
 
         let error = block_on(sync_mirror(&conn, Path::new("."), false, &ctx)).unwrap_err();
         assert!(
@@ -1039,7 +1050,7 @@ mod capability_tests {
             ..PapertrailContext::default()
         };
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
 
         let report = block_on(sync_mirror(&conn, Path::new("."), false, &ctx)).unwrap();
         assert_eq!(report.bindings.len(), 0);
@@ -1086,7 +1097,7 @@ mod scheduled_tests {
 
     fn open_schema() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
     }
 

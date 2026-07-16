@@ -50,7 +50,7 @@ pub(crate) struct GitHubClient {
 }
 
 impl GitHubClient {
-    pub(crate) fn new(
+    pub fn new(
         binding: &ResolvedTracker,
         registry: &GovernorRegistry,
         options: TransportOptions,
@@ -788,7 +788,7 @@ mod tests {
             GitHubClient::new(&binding, &GovernorRegistry::default(), TransportOptions::default())
                 .unwrap();
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
 
         let error = block_on(mirror_binding(&conn, &binding, &client, false)).unwrap_err();
         assert!(error.to_string().contains("GitHub HTTP 403"));

@@ -17,7 +17,7 @@ use super::*;
 // migration backfill); routine syncs never pay the whole-mirror cost, which matters once the
 // mirror is a whole-project cache instead of a small referenced-only one.
 
-pub(crate) fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result<()> {
+pub fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result<()> {
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     // `idx_papertrail_refs_unique` leads with `repo_id`, so a conflict is always THIS repo
     // re-discovering its OWN ref — keep the first-sighting row untouched (`DO NOTHING` preserves
@@ -54,7 +54,7 @@ pub(crate) fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow:
 /// item — `item_kind` is part of the identity, so a change request is NOT shadowed by an issue row
 /// (the github_* schema's shared-numbering shadow is gone). The item's own `papertrail_fts` mirror
 /// row is refreshed INCREMENTALLY: delete + reinsert of this item's `doc_kind = 'item'` row only.
-pub(crate) fn store_item(
+pub fn store_item(
     conn: &Connection,
     tracker: Tracker,
     item: &PapertrailItem,
@@ -120,7 +120,7 @@ pub(crate) fn store_item(
 /// review event carries `review_state`, a file-anchored comment carries `anchor_path`, a plain
 /// thread comment carries neither. The comment's own `papertrail_fts` mirror row is refreshed
 /// INCREMENTALLY, keyed by its `(repo_id, tracker, project, comment_id)` identity.
-pub(crate) fn store_comment(
+pub fn store_comment(
     conn: &Connection,
     tracker: Tracker,
     comment: &PapertrailComment,
@@ -185,7 +185,7 @@ pub(crate) fn store_comment(
 /// external-content chunk_fts / commit_fts, which must rebuild via INSERT(t) VALUES('rebuild').
 /// Every repo's rows are re-derived (each stamped its base row's `repo_id`), and `classification`
 /// is recomputed by [`insert_fts`].
-pub(crate) fn rebuild_fts(conn: &Connection) -> rusqlite::Result<()> {
+pub fn rebuild_fts(conn: &Connection) -> rusqlite::Result<()> {
     // Whole-table delete + per-row reinserts must be one atomic unit when standalone (#610);
     // the full-rewalk caller already runs inside its own transaction and SQLite rejects nested
     // BEGINs, so the fence only wraps autocommit callers (the corruption heals hold their own).
@@ -329,7 +329,7 @@ mod fts_mirror_tests {
     #[test]
     fn writers_mirror_every_row_with_the_right_title_slot() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
 
         store_item(&conn, Tracker::Github, &item(ItemKind::Issue, "1", "issuetitle", "issuebody"))
             .unwrap();
@@ -394,7 +394,7 @@ mod fts_mirror_tests {
     #[test]
     fn store_item_touches_only_its_own_mirror_rows() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
 
         store_item(&conn, Tracker::Github, &item(ItemKind::Issue, "1", "one", "first body"))
             .unwrap();
@@ -452,7 +452,7 @@ mod fts_mirror_tests {
     #[test]
     fn store_comment_touches_only_its_own_mirror_row() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
 
         store_comment(&conn, Tracker::Github, &comment("1", "10", "keep me")).unwrap();
         conn.execute(

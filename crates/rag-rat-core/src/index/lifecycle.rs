@@ -1,5 +1,6 @@
 use rag_rat_db::meta::{read_meta, repo_meta};
 use rag_rat_db::schema;
+use rag_rat_papertrail as papertrail;
 
 use super::*;
 
@@ -245,7 +246,7 @@ impl IndexDatabase {
             // read can't make an unindexed checkout look indexed (which would let a later empty
             // index prune the shared scope).
             Ok(identity) => {
-                let now = schema::now_ms();
+                let now = rag_rat_base::time::now_ms();
                 match intent {
                     AdoptIntent::Indexing => schema::register_repo(
                         conn,

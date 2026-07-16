@@ -1,6 +1,8 @@
 //! Git- and GitHub-history query surface on `IndexDatabase`: commit/rationale search, per-path and
 //! per-symbol history, blame, and GitHub ref/issue sync + lookup.
 
+use rag_rat_papertrail as papertrail;
+
 use super::*;
 
 impl IndexDatabase {
@@ -239,9 +241,16 @@ impl IndexDatabase {
         let Some(chunk) = self.read_chunk(chunk_id)? else {
             return Ok(None);
         };
+        let chunk_ref = papertrail::ChunkRef {
+            path: &chunk.path,
+            chunk_id: chunk.chunk_id,
+            start_line: chunk.start_line,
+            end_line: chunk.end_line,
+            symbol_path: chunk.symbol_path.as_deref(),
+        };
         Ok(Some(papertrail::papertrail_for_chunk(
             self.storage.connection(),
-            &chunk,
+            &chunk_ref,
             limit,
             &self.papertrail,
         )?))
@@ -258,7 +267,11 @@ impl IndexDatabase {
         };
         Ok(Some(papertrail::papertrail_for_symbol(
             self.storage.connection(),
-            &symbol,
+            &papertrail::SymbolRef {
+                path: &symbol.path,
+                qualified_name: &symbol.qualified_name,
+                symbol_path: &symbol.symbol_path,
+            },
             limit,
             &self.papertrail,
         )?))
@@ -271,7 +284,11 @@ impl IndexDatabase {
     ) -> anyhow::Result<Papertrail> {
         papertrail::papertrail_for_symbol(
             self.storage.connection(),
-            symbol,
+            &papertrail::SymbolRef {
+                path: &symbol.path,
+                qualified_name: &symbol.qualified_name,
+                symbol_path: &symbol.symbol_path,
+            },
             limit,
             &self.papertrail,
         )

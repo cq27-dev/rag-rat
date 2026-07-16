@@ -10,9 +10,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rag_rat_base::config::Config;
+use rag_rat_papertrail::{AutosyncRequest, PapertrailContext};
 
 use super::pass::LoopMsg;
-use crate::index::papertrail::{AutosyncRequest, PapertrailContext};
 
 /// Clock for the periodic papertrail evaluation deadline, pure like `Debounce` / `SweepClock`
 /// (clock injected). `None` interval — no resolved tracker bindings, or a zeroed cadence —

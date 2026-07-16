@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use rag_rat_db::meta::scoped_table_row_count;
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::Serialize;
-
-use crate::index::scoped_table_row_count;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoBriefMode {

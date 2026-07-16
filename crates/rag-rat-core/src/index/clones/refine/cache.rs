@@ -369,7 +369,7 @@ pub(crate) fn refine_compute_and_store_budgeted(
             refactorability,
             NORM_VERSION,
             ALIGNMENT_VERSION,
-            crate::index::now_ms(),
+            rag_rat_base::time::now_ms(),
             lcs_sampled as i64, // Fix 3: persist the sampling bit so warm hits keep it.
         ],
     )?;

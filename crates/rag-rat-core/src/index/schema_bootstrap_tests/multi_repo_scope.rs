@@ -887,9 +887,9 @@ fn papertrail_queries_never_surface_the_other_repo() {
     assert!(!own.is_empty(), "repo A must still see its own issue");
 
     // refs_for_path filters papertrail_refs.repo_id.
-    let leaked_refs = crate::index::papertrail::refs_for_path(conn, "src/b_only.rs", 10).unwrap();
+    let leaked_refs = rag_rat_papertrail::refs_for_path(conn, "src/b_only.rs", 10).unwrap();
     assert!(leaked_refs.is_empty(), "repo B papertrail ref leaked: {leaked_refs:?}");
-    let own_refs = crate::index::papertrail::refs_for_path(conn, "src/a_only.rs", 10).unwrap();
+    let own_refs = rag_rat_papertrail::refs_for_path(conn, "src/a_only.rs", 10).unwrap();
     assert!(!own_refs.is_empty(), "repo A must still see its own papertrail ref");
 
     let _ = fs::remove_dir_all(fx.root_a);

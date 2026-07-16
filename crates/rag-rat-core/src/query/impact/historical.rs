@@ -5,7 +5,7 @@ pub(crate) fn parser_failure_count(conn: &Connection) -> anyhow::Result<u64> {
     // the scoped `IndexDatabase::parser_failure_count` twin — a sibling repo's parse failures must
     // not depress this repo's graph-coverage confidence in a consolidated DB.
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-    crate::index::scoped_table_row_count(conn, "parser_failures", &repo_id)
+    rag_rat_db::meta::scoped_table_row_count(conn, "parser_failures", &repo_id)
 }
 
 pub(crate) fn historical_evidence(

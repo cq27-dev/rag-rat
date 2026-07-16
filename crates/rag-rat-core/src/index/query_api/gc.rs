@@ -1,6 +1,7 @@
 //! Index garbage collection on `IndexDatabase`: prune file/chunk/embedding/symbol/edge rows for
 //! git contexts that are no longer live, plus the [`GcReport`] it returns.
 
+use rag_rat_db::meta::scoped_table_row_count;
 use serde::Serialize;
 
 use super::*;

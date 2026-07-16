@@ -39,8 +39,7 @@ pub(crate) fn discover_and_store_refs(
     }
     Ok(refs)
 }
-#[cfg(test)]
-pub(crate) async fn sync_refs<'a, C: PapertrailClient>(
+pub async fn sync_refs<'a, C: PapertrailClient>(
     conn: &Connection,
     client: &C,
     refs: impl Iterator<Item = &'a PapertrailRef>,
@@ -109,7 +108,6 @@ pub(crate) async fn sync_refs<'a, C: PapertrailClient>(
 /// row landed, comment fetch failed) would masquerade as a completed sync forever. Storing nothing
 /// until every fetch succeeded keeps a failed ref retryable with no state row. The FTS mirror
 /// follows incrementally inside the store writers.
-#[cfg(test)]
 pub(crate) async fn sync_one_ref<C: PapertrailClient>(
     conn: &Connection,
     client: &C,
@@ -132,7 +130,6 @@ pub(crate) async fn sync_one_ref<C: PapertrailClient>(
     tx.commit()?;
     Ok(synced)
 }
-#[cfg(test)]
 pub(crate) fn sync_progress(
     reference: &PapertrailRef,
     current: usize,
@@ -154,11 +151,7 @@ pub(crate) fn sync_progress(
 /// mirror sync; the ref lane keeps no per-ref state). No `item_kind` filter: a bare `#N` ref could
 /// name either kind, and either cached kind means the item was synced. A not-found item retries on
 /// every sync (no memo) — acceptable for the referenced-only lane the mirror sync supersedes.
-#[cfg(test)]
-pub(crate) fn papertrail_ref_synced(
-    conn: &Connection,
-    reference: &PapertrailRef,
-) -> anyhow::Result<bool> {
+pub fn papertrail_ref_synced(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result<bool> {
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let cached = conn.query_row(
         "
@@ -172,7 +165,6 @@ pub(crate) fn papertrail_ref_synced(
     )?;
     Ok(cached)
 }
-#[cfg(test)]
 pub(crate) fn is_not_found_error(message: &str) -> bool {
     message.contains("HTTP 404") || message.to_ascii_lowercase().contains("not found")
 }

@@ -50,24 +50,6 @@ pub(crate) fn scoped_chunk_row_count(
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
-/// `table_row_count` for a directly-`repo_id`-scoped table: counts only the rows owned by `repo_id`
-/// (the active repo), so a status/freshness read reports THIS repo's totals rather than the union
-/// across every repo in a consolidated DB. `table` is always an internal string literal, never user
-/// input, and MUST carry a `repo_id` column (the V040/V041 direct-scoped tables — git_commits,
-/// git_file_changes, the papertrail_* tables).
-pub(crate) fn scoped_table_row_count(
-    conn: &rusqlite::Connection,
-    table: &str,
-    repo_id: &str,
-) -> anyhow::Result<u64> {
-    let count = conn.query_row(
-        &format!("SELECT COUNT(*) FROM main.{table} WHERE repo_id = ?1"),
-        [repo_id],
-        |row| row.get::<_, i64>(0),
-    )?;
-    Ok(u64::try_from(count).unwrap_or(0))
-}
-
 /// Whether `text` contains a test marker — the file-level `files.has_test_code` signal that lets
 /// `impact_surface`'s "tests touching this symbol" query filter on an indexed flag instead of a
 /// `chunks.text LIKE` scan (#77). INVARIANT: this marker set MUST match the V024 backfill SQL in
@@ -85,10 +67,6 @@ pub(crate) fn text_has_test_marker(text: &str) -> bool {
 pub(crate) fn file_metadata_ms(path: &Path) -> anyhow::Result<i64> {
     let modified = fs::metadata(path)?.modified()?;
     Ok(duration_ms(modified.duration_since(UNIX_EPOCH)?))
-}
-
-pub(crate) fn now_ms() -> i64 {
-    duration_ms(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default())
 }
 
 pub(crate) fn duration_ms(duration: std::time::Duration) -> i64 {

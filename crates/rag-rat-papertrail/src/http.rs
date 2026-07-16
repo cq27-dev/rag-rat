@@ -12,7 +12,7 @@ use super::transport::is_loopback_host;
 /// and plaintext ONLY to loopback. The transport enforces the loopback rule per request;
 /// accepting a non-loopback `http` origin here would mint a "native" binding whose every sync
 /// fails at the first request. Returns the trimmed API origin and the governor authority key.
-pub(crate) fn resolve_api_origin(
+pub fn resolve_api_origin(
     provider: &str,
     base_url: Option<&str>,
     default_origin: &str,

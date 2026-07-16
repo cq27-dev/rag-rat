@@ -907,12 +907,12 @@ fn both_repos_keep_a_shared_items_comments_across_syncs() {
             [repo_id],
         )
         .unwrap();
-        crate::index::papertrail::store_comment(
+        rag_rat_papertrail::store_comment(
             &conn,
-            crate::index::papertrail::Tracker::Github,
-            &crate::index::papertrail::PapertrailComment {
+            rag_rat_papertrail::Tracker::Github,
+            &rag_rat_papertrail::PapertrailComment {
                 project: "o/r".into(),
-                item_kind: crate::index::papertrail::ItemKind::Issue,
+                item_kind: rag_rat_papertrail::ItemKind::Issue,
                 item_key: "1".into(),
                 comment_id: "7".into(),
                 url: Some("http://c".into()),
@@ -1099,7 +1099,7 @@ fn papertrail_sync_rolls_back_the_item_when_a_comment_store_fails() {
 
 #[test]
 fn papertrail_client_batch_surface_round_trips_through_the_trait() {
-    use crate::index::papertrail::PapertrailClient;
+    use rag_rat_papertrail::PapertrailClient;
 
     let cursor = papertrail::PageCursor::default();
     let items = papertrail::block_on(MockGitHubClient.items_page("o/r", &cursor)).unwrap();
@@ -1496,10 +1496,10 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
 
     // Scoped readers work on the migrated data (the connection-context repo scope the production
     // reads resolve through).
-    let hits = crate::index::papertrail::issue_search(&conn, "sqlite", 10).unwrap();
+    let hits = rag_rat_papertrail::issue_search(&conn, "sqlite", 10).unwrap();
     assert_eq!(hits.len(), 1, "issue_search serves the migrated scoped cache");
     assert_eq!(hits[0].item_key, "1");
-    let refs = crate::index::papertrail::refs_for_path(&conn, "docs/a.md", 10).unwrap();
+    let refs = rag_rat_papertrail::refs_for_path(&conn, "docs/a.md", 10).unwrap();
     assert_eq!(refs.len(), 1, "refs_for_path serves the migrated scoped refs");
     assert_eq!(refs[0].item_key, "1");
 

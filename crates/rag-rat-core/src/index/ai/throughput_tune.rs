@@ -19,13 +19,13 @@ use std::time::Instant;
 
 use rag_rat_base::config::RemoteEmbeddingConfig;
 use rag_rat_base::embedding_models::EmbeddingModelSpec;
+use rag_rat_base::time::now_ms;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::index::ai::helpers::{meta, set_meta};
 use crate::index::ai::providers::{Embedder, OpenAiEmbedder, ProvisionedEmbedderParams};
-use crate::index::util::now_ms;
 
 /// `index_meta` key holding the throughput-tune cache (a JSON map, so no schema migration).
 const TUNE_CACHE_META_KEY: &str = "embedding_throughput_tune_v1";

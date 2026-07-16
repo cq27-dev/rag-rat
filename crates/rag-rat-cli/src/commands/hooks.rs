@@ -4,7 +4,7 @@
 use std::fs;
 
 use rag_rat_base::config::Config;
-use rag_rat_core::index::papertrail::autosync;
+use rag_rat_core::index::papertrail_autosync as autosync;
 
 use crate::cli::{HookAction, HooksArgs, PapertrailArgs, PapertrailCommand};
 use crate::render::print_output;

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use rag_rat_base::config::{PapertrailConfig, TrackerAuth};
+use rag_rat_base::time::now_ms;
 use reqwest::header::{self, HeaderMap};
 
 use super::auth;
@@ -14,7 +15,6 @@ use super::governor::{
     Admission, GovernorConfig, GovernorKey, GovernorRegistry, PauseReason, QuotaSnapshot,
     RateGovernor, RetryHold, backoff_delay_ms,
 };
-use crate::index::util::now_ms;
 
 /// How one transport call ends besides success.
 #[derive(Debug, thiserror::Error)]
@@ -54,7 +54,7 @@ pub(crate) struct TransportResponse {
 /// Transport knobs. Everything has a conservative default; the config layer maps `[[tracker]]`
 /// settings onto this.
 #[derive(Debug, Clone)]
-pub(crate) struct TransportOptions {
+pub struct TransportOptions {
     pub governor: GovernorConfig,
     pub request_timeout_s: u64,
     /// Wall-clock budget for the whole sync pass, measured from construction: no request is sent
@@ -132,13 +132,13 @@ impl Transport {
     /// missing one), joins the shared governor for (provider, host, token), and constructs the
     /// rustls HTTP client. The pass's wall-clock deadline starts here.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn new(params: TransportParams<'_>) -> anyhow::Result<Self> {
+    pub fn new(params: TransportParams<'_>) -> anyhow::Result<Self> {
         Self::with_clock(params, Arc::new(now_ms))
     }
 
     /// Build a sibling quota lane from one already-resolved binding credential. Provider clients
     /// with several lanes must snapshot auth once so token commands cannot yield split identities.
-    pub(crate) fn new_with_token(
+    pub fn new_with_token(
         params: TransportParams<'_>,
         token: Option<&str>,
     ) -> anyhow::Result<Self> {

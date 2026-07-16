@@ -3026,7 +3026,7 @@ fn a_syncing_repo_is_isolated_from_stranded_placeholder_papertrail_rows() {
     ))
     .unwrap();
     // Mirror state before any sync: derived from the stranded base rows.
-    crate::index::papertrail::rebuild_fts(&conn).unwrap();
+    rag_rat_papertrail::rebuild_fts(&conn).unwrap();
 
     // Pin the connection's active repo to repo-a (what `set_context` installs on a real open).
     conn.execute_batch(
@@ -3038,9 +3038,9 @@ fn a_syncing_repo_is_isolated_from_stranded_placeholder_papertrail_rows() {
     // repo-a's sync touches o/r#7: re-discovers the ref (same natural key as the stranded row)
     // and refetches the item with fresh content. The incremental FTS writer refreshes only
     // repo-a's own mirror row.
-    let reference = crate::index::papertrail::PapertrailRef {
+    let reference = rag_rat_papertrail::PapertrailRef {
         item_kind: None,
-        tracker: crate::index::papertrail::Tracker::Github,
+        tracker: rag_rat_papertrail::Tracker::Github,
         project: "o/r".to_string(),
         item_key: "7".to_string(),
         ref_kind: "unknown".to_string(),
@@ -3049,13 +3049,13 @@ fn a_syncing_repo_is_isolated_from_stranded_placeholder_papertrail_rows() {
         source_commit: None,
         source_text: "o/r#7".to_string(),
     };
-    crate::index::papertrail::store_ref(&conn, &reference).unwrap();
-    crate::index::papertrail::store_item(
+    rag_rat_papertrail::store_ref(&conn, &reference).unwrap();
+    rag_rat_papertrail::store_item(
         &conn,
-        crate::index::papertrail::Tracker::Github,
-        &crate::index::papertrail::PapertrailItem {
+        rag_rat_papertrail::Tracker::Github,
+        &rag_rat_papertrail::PapertrailItem {
             project: "o/r".to_string(),
-            item_kind: crate::index::papertrail::ItemKind::Issue,
+            item_kind: rag_rat_papertrail::ItemKind::Issue,
             item_key: "7".to_string(),
             url: "http://fresh".to_string(),
             state: "closed".to_string(),

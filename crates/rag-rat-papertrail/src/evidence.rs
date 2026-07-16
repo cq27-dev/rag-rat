@@ -22,7 +22,7 @@ pub(crate) fn evidence_for_path(
 }
 pub(crate) fn current_symbol_span(
     conn: &Connection,
-    symbol: &crate::query::symbol::SymbolHit,
+    symbol: &super::api::SymbolRef<'_>,
 ) -> anyhow::Result<(Option<i64>, Option<i64>, Option<i64>)> {
     let span = conn
         .query_row(
@@ -234,8 +234,8 @@ pub(crate) fn ref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PapertrailRef
         source_text: row.get(8)?,
     })
 }
-#[cfg(test)]
-pub(crate) fn refs(conn: &Connection) -> anyhow::Result<Vec<PapertrailRef>> {
+// Not test-gated: the engine crate's schema tests drive this cross-crate (test support only).
+pub fn refs(conn: &Connection) -> anyhow::Result<Vec<PapertrailRef>> {
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "SELECT tracker, project, item_key, item_kind, ref_kind, source_kind, source_path, \

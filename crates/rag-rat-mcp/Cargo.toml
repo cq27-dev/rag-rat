@@ -14,6 +14,7 @@ categories.workspace = true
 [dependencies]
 rag-rat-base.workspace = true
 rag-rat-db.workspace = true
+rag-rat-papertrail.workspace = true
 anyhow.workspace = true
 rag-rat-core = { workspace = true }
 rmcp.workspace = true

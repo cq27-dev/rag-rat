@@ -95,7 +95,7 @@ pub fn normalized_tags(tags: &[String]) -> Vec<String> {
 /// the old `gh repo view` failure, because this runs on every index open and an unresolvable
 /// binding is a no-op there, not an error. With NO configured binding, the `origin` remote picks
 /// the provider by host and the project from the URL path; Jira is never auto-detected.
-pub(crate) fn resolve_trackers(bindings: &[TrackerConfig], root: &Path) -> Vec<ResolvedTracker> {
+pub fn resolve_trackers(bindings: &[TrackerConfig], root: &Path) -> Vec<ResolvedTracker> {
     if bindings.is_empty() {
         return auto_detect_tracker(root).into_iter().collect();
     }

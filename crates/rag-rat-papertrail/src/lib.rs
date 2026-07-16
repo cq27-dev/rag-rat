@@ -1,5 +1,10 @@
+//! Issue-tracker papertrail for the rag-rat workspace: the provider-neutral whole-project
+//! mirror (items, comments, refs, closing metadata), the GitHub/GitLab clients on a shared
+//! rate-governed transport, ref-grammar parsing, evidence queries, and automatic sync
+//! scheduling. Sits on rag-rat-db + rag-rat-base; the engine crate supplies scheduling
+//! callers and query-surface integration.
+
 mod api;
-pub mod autosync;
 mod evidence;
 mod github;
 mod gitlab;
@@ -10,34 +15,31 @@ mod schedule;
 mod store;
 mod sync;
 mod trackers;
-pub(crate) mod transport;
+pub mod transport;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::OnceLock;
 
-pub(crate) use api::*;
-pub(crate) use evidence::*;
+pub use api::{sync_from_refs, sync_from_refs_with_progress, *};
+pub use evidence::{refs, *};
 pub(crate) use github::*;
 pub(crate) use gitlab::*;
-pub(crate) use http::*;
+pub use http::*;
 pub use mirror::MirrorBindingReport;
 pub(crate) use mirror::{
     MirrorContinuation, days_in_month, load_mirror_continuation, max_timestamp, mirror_binding,
     parse_date,
 };
-pub(crate) use parse::*;
-pub use parse::{TrackerParsedRef, parse_tracker_refs};
+pub use parse::{TrackerParsedRef, parse_tracker_refs, *};
 pub use rag_rat_base::config::Tracker;
+use rag_rat_base::time::now_ms;
 use rusqlite::{Connection, OptionalExtension, params};
-pub use schedule::AutosyncRequest;
-pub(crate) use schedule::*;
+pub use schedule::{AutosyncRequest, *};
 use serde::{Deserialize, Serialize};
-pub(crate) use store::*;
-pub(crate) use sync::*;
+pub use store::{rebuild_fts, *};
+pub use sync::*;
 pub(crate) use trackers::resolve_trackers;
 pub use trackers::{ResolvedTracker, detect_tracker_from_remote_url, normalized_tags};
-
-use crate::index::now_ms;
 
 /// Resolved tracker context, injected into the sync/query paths instead of being resolved inside
 /// the library. Resolution runs ONLY at the real-usage boundary (`IndexDatabase::open_config`)
@@ -49,15 +51,15 @@ pub struct PapertrailContext {
     /// Resolved tracker bindings, in config order (or the single auto-detected code host).
     /// Production discovery, rationale lookup, and manual mirror sync consume every binding.
     pub trackers: Vec<ResolvedTracker>,
-    pub(crate) transport_options: transport::TransportOptions,
-    pub(crate) schedule: rag_rat_base::config::PapertrailConfig,
+    pub transport_options: transport::TransportOptions,
+    pub schedule: rag_rat_base::config::PapertrailConfig,
 }
 
 impl PapertrailContext {
     /// Resolve from the repo config: `[[tracker]]` bindings when present, otherwise a binding
     /// auto-detected from the git `origin` remote. Call ONLY at the real-usage boundary
     /// (open_config), never inside the library internals or tests.
-    pub(crate) fn resolve(config: &rag_rat_base::config::Config) -> Self {
+    pub fn resolve(config: &rag_rat_base::config::Config) -> Self {
         let mut trackers = resolve_trackers(&config.trackers, &config.root);
         // GitHub's provider-native fallback is environment auth. Materialize the ENV-VAR NAME
         // into the binding (never its value) so status and transport use the same per-binding
@@ -72,7 +74,7 @@ impl PapertrailContext {
 
     /// An explicit GitHub-repo context that never touches git or `gh` — for tests and non-gh
     /// callers.
-    pub(crate) fn new(default_repo: Option<&str>) -> Self {
+    pub fn new(default_repo: Option<&str>) -> Self {
         let trackers = default_repo
             .map(|project| ResolvedTracker {
                 provider: Tracker::Github,
@@ -93,7 +95,6 @@ impl PapertrailContext {
 
     /// `owner/repo` qualifying a manually requested legacy GitHub reference. Production
     /// discovery and rationale parsing use all bindings through [`parse_tracker_refs`].
-    #[cfg(test)]
     fn default_repo(&self) -> Option<&str> {
         self.trackers
             .iter()
@@ -194,7 +195,6 @@ pub struct PapertrailSyncError {
     pub error: String,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct PapertrailSyncProgress {
     pub current: usize,
@@ -205,7 +205,6 @@ pub struct PapertrailSyncProgress {
     pub message: Option<String>,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PapertrailSyncAction {
     Syncing,
@@ -506,7 +505,7 @@ pub trait PapertrailClient {
 /// simply blocked). A caller on a CURRENT-THREAD ambient runtime has no sound way to block the
 /// thread — and the future cannot be offloaded, it borrows the `!Sync` connection — so that case
 /// returns an error instead of panicking; such callers need an async entry point.
-pub(crate) fn block_on<T>(
+pub fn block_on<T>(
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -527,9 +526,8 @@ pub(crate) fn block_on<T>(
     }
 }
 
-#[cfg(test)]
 #[derive(Default)]
-pub(crate) struct SyncRefsReport {
+pub struct SyncRefsReport {
     synced_items: usize,
     skipped_refs: usize,
     failed_refs: usize,
@@ -697,5 +695,16 @@ mod bridge_tests {
         let err =
             runtime.block_on(async { block_on(async { anyhow::Ok(7) }) }).unwrap_err().to_string();
         assert!(err.contains("current-thread"), "{err}");
+    }
+}
+
+/// Hooks for this crate's own scratch-DB test fixtures: the papertrail rebuild is REAL (these
+/// tests exercise the legacy-migration path that rebuilds the mirror FTS), the foreign domains'
+/// builders are no-ops (their tables are empty on a scratch DB).
+#[cfg(test)]
+pub(crate) fn test_hooks() -> rag_rat_db::MigrationHooks {
+    rag_rat_db::MigrationHooks {
+        rebuild_papertrail_fts: crate::rebuild_fts,
+        ..rag_rat_db::MigrationHooks::noop()
     }
 }

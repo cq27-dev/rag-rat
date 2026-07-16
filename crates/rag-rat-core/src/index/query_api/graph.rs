@@ -860,7 +860,7 @@ impl IndexDatabase {
     pub(crate) fn ensure_coupling_fresh(&self) -> anyhow::Result<()> {
         crate::index::change_coupling::ensure_coupling_fresh(
             self.storage.connection(),
-            crate::index::now_ms(),
+            rag_rat_base::time::now_ms(),
         )
     }
 }

@@ -121,7 +121,7 @@ pub enum AutosyncRequest {
 
 impl AutosyncRequest {
     /// The exact token persisted in the cross-process pending marker file.
-    pub(crate) fn as_marker_str(self) -> &'static str {
+    pub fn as_marker_str(self) -> &'static str {
         match self {
             Self::Evaluate => "evaluate",
             Self::Incremental => "incremental",
@@ -132,7 +132,7 @@ impl AutosyncRequest {
     /// Parse a pending-marker token. Unknown content (a torn write, a future token) degrades to
     /// `Evaluate`: the scheduling policy re-decides everything an evaluation can, and interrupted
     /// work resumes from the persisted cursor regardless.
-    pub(crate) fn from_marker_str(value: &str) -> Self {
+    pub fn from_marker_str(value: &str) -> Self {
         match value.trim() {
             "incremental" => Self::Incremental,
             "full" => Self::Full,
@@ -289,7 +289,7 @@ mod tests {
     use rag_rat_db::schema;
 
     use super::*;
-    use crate::index::papertrail::TrackerAuthentication;
+    use crate::TrackerAuthentication;
 
     fn config() -> PapertrailConfig {
         PapertrailConfig::default()
@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn mirror_success_advances_probe_freshness_and_clears_pause() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         let binding = binding();
         record_pause(&conn, &binding, 20_000).unwrap();
         record_success(&conn, &binding, SuccessfulOperation::IncrementalMirror, 10_000).unwrap();
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn provider_pause_round_trips_through_binding_health() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         let binding = binding();
         record_pause(&conn, &binding, 20_000).unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn provider_pause_replaces_a_stale_failure() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         let binding = binding();
         record_failure(
             &conn,
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn non_rate_failure_clears_a_stale_provider_pause() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         let binding = binding();
         record_pause(&conn, &binding, 20_000).unwrap();
         record_failure(
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn persisted_cursor_work_and_filter_fingerprint_are_loaded_for_scheduling() {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         let binding = binding();
         record_attempt(&conn, &binding, 1).unwrap();
         conn.execute(

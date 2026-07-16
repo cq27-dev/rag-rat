@@ -1458,7 +1458,7 @@ pub(crate) fn record_migration(
     conn.execute(
         "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
          VALUES (?1, ?2, ?3, ?4)",
-        params![id, now_ms(), checksum, description],
+        params![id, rag_rat_base::time::now_ms(), checksum, description],
     )?;
     Ok(())
 }
@@ -1496,7 +1496,7 @@ pub(crate) fn record_migration_provenance(conn: &Connection) -> rusqlite::Result
             MIGRATION_PROVENANCE_KEYS[2],
             LATEST_SCHEMA_VERSION.to_string(),
             MIGRATION_PROVENANCE_KEYS[3],
-            now_ms().to_string(),
+            rag_rat_base::time::now_ms().to_string(),
         ],
     )?;
     Ok(())
@@ -1532,13 +1532,6 @@ pub fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
         .optional()?
         .is_some();
     Ok(exists)
-}
-
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 pub(crate) fn add_column_if_missing(

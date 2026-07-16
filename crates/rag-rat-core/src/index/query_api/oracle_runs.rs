@@ -3,6 +3,8 @@
 
 use std::path::Path;
 
+use rag_rat_base::time::now_ms;
+
 use super::*;
 use crate::index::oracle::{
     self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls,

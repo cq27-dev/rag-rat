@@ -98,7 +98,7 @@ pub fn run_oracle(
         checkout_root,
         production_sha,
         pre_spawn_sha,
-        super::now_ms(),
+        rag_rat_base::time::now_ms(),
     )
 }
 
@@ -485,7 +485,7 @@ pub fn run_oracle_with_tool(
     // Stamp the run's start right after that snapshot (the indexed state it covers) and before the
     // subprocess: later than the indexed_at it's based on, yet before any mid-run reindex, so the
     // auto-run staleness gate is neither falsely rerun nor wrongly skipped. (#145 + #146 review)
-    let started_at_ms = super::now_ms();
+    let started_at_ms = rag_rat_base::time::now_ms();
     match produce_scip_with_tool(tool, checkout_root, scip_output)? {
         ScipProduction::Blocked { tool, program, hint } =>
             Ok(OracleRunOutcome::Blocked { tool, program, hint }),

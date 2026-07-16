@@ -192,3 +192,21 @@ pub fn delete_repo_meta(
     conn.execute("DELETE FROM repo_meta WHERE repo_id = ?1 AND key = ?2", params![repo_id, key])?;
     Ok(())
 }
+
+/// `table_row_count` for a directly-`repo_id`-scoped table: counts only the rows owned by `repo_id`
+/// (the active repo), so a status/freshness read reports THIS repo's totals rather than the union
+/// across every repo in a consolidated DB. `table` is always an internal string literal, never user
+/// input, and MUST carry a `repo_id` column (the V040/V041 direct-scoped tables — git_commits,
+/// git_file_changes, the papertrail_* tables).
+pub fn scoped_table_row_count(
+    conn: &rusqlite::Connection,
+    table: &str,
+    repo_id: &str,
+) -> anyhow::Result<u64> {
+    let count = conn.query_row(
+        &format!("SELECT COUNT(*) FROM main.{table} WHERE repo_id = ?1"),
+        [repo_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}

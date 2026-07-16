@@ -1,5 +1,7 @@
 //! Git history/GitHub status persistence and freshness for the active checkout.
 
+use rag_rat_papertrail as papertrail;
+
 use super::*;
 
 impl IndexDatabase {

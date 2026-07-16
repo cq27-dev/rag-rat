@@ -14,6 +14,7 @@ on:
     paths:
       - 'crates/rag-rat-base/**'
       - 'crates/rag-rat-db/**'
+      - 'crates/rag-rat-papertrail/**'
       - 'crates/rag-rat-core/**'
       - 'crates/rag-rat-cli/**'
       - 'evals/**'
@@ -26,6 +27,7 @@ on:
     paths:
       - 'crates/rag-rat-base/**'
       - 'crates/rag-rat-db/**'
+      - 'crates/rag-rat-papertrail/**'
       - 'crates/rag-rat-core/**'
       - 'crates/rag-rat-cli/**'
       - 'evals/**'

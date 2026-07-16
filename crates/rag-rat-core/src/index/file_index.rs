@@ -3,6 +3,7 @@
 
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::paths::path_string;
+use rag_rat_base::time::now_ms;
 
 use super::*;
 use crate::index::graph_index::{LogicalSymbolKey, LogicalSymbolMemberRow};

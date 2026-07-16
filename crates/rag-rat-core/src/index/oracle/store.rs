@@ -8,10 +8,10 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
+use rag_rat_base::time::now_ms;
 use rusqlite::{Connection, params};
 
 use super::{OracleResolutionKind, OracleTool};
-use crate::index::now_ms;
 
 /// Render the **active-checkout** `files` predicate for an oracle scope read/write, binding the
 /// commit-sha at SQL param `sha_param` and the worktree-id at `wt_param`. This is the SINGLE source

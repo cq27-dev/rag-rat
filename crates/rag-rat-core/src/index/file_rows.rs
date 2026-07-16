@@ -2,6 +2,7 @@
 //! and count indexed files.
 
 use rag_rat_base::paths::path_string;
+use rag_rat_base::time::now_ms;
 
 use super::*;
 

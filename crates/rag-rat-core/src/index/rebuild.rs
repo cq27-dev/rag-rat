@@ -309,7 +309,7 @@ impl IndexDatabase {
             // old generation or the whole new one, never a mix. The active-model seed rides the
             // flip (#394): it is advanced only when the fresh generation actually goes live.
             db.set_repo_meta(schema::LIVE_FILES_GENERATION_META_KEY, &target.to_string())?;
-            db.set_repo_meta("indexed_at_ms", &now_ms().to_string())?;
+            db.set_repo_meta("indexed_at_ms", &rag_rat_base::time::now_ms().to_string())?;
             ai::seed_active_embedding_model(
                 db.storage.connection(),
                 config.llm.embedding.backend.model_id(),

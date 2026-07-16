@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use gix::object::tree::diff::{Action, Change};
 use gix::revision::walk::Sorting;
 use rag_rat_base::hash::hex_sha256;
-use rag_rat_db::meta::{delete_repo_meta, repo_meta, set_repo_meta};
+use rag_rat_db::meta::{delete_repo_meta, repo_meta, scoped_table_row_count, set_repo_meta};
+use rag_rat_db::schema;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::index::{schema, scoped_table_row_count};
 use crate::search::lexical::SearchHit;
 
 const GIT_HISTORY_INDEXED_HEAD_META: &str = "git_history_indexed_head";
@@ -855,7 +855,7 @@ pub fn store_blame(conn: &Connection, summary: &ChunkBlameSummary) -> anyhow::Re
             summary.oldest_commit,
             summary.oldest_commit_time_s,
             counts,
-            crate::index::now_ms(),
+            rag_rat_base::time::now_ms(),
         ],
     )?;
     Ok(())

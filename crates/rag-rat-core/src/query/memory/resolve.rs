@@ -61,7 +61,7 @@ pub(crate) fn resolve_binding(
     {
         // The tracker token set is CLOSED — reject an unknown provider instead of persisting a
         // free-form string the papertrail readers would never resolve.
-        let tracker = crate::index::papertrail::Tracker::from_db_str(tracker)?;
+        let tracker = rag_rat_papertrail::Tracker::from_db_str(tracker)?;
         return Ok(Some(ResolvedBinding {
             binding_kind: "tracker".to_string(),
             binding_id: format!("{}:{project}#{item_key}", tracker.as_db_str()),

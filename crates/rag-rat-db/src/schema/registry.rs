@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use rag_rat_base::config::Config;
 use rag_rat_base::repo_identity::{
     LEGACY_REPO_ID, LOCAL_ONLY_ID_PREFIX, RepoIdentity, RepoIdentityClass,
 };
@@ -1215,4 +1216,62 @@ fn record_repo_root(
         params![repo_id, root, now_ms],
     )?;
     Ok(())
+}
+
+/// The single "this checkout is `repo_id`'s already-INDEXED home" signal, shared by every #427
+/// consumer (the empty-index guard AND the same-identity-join warning). Keep both consumers on THIS
+/// helper so a fix (or a footgun) can never apply to one and not the other.
+///
+/// Two indexing-only signals, either of which proves an indexing pass ran at this exact checkout:
+/// 1. Its working-tree root is recorded in `repo_roots` for `repo_id`. Recording is now
+///    INDEXING-ONLY (`register_repo` records; the read-only `register_repo_read_only` does not), so
+///    a recorded root is trustworthy — immune BOTH to a read-only `open_config` merely registering
+///    (the earlier fix's concern) AND to a same-identity sibling clone stealing recognition: each
+///    checkout records its OWN `repo_roots` row, so B indexing the shared repo leaves A's row
+///    intact (whereas the single-valued `source_root` is last-writer-wins — B's index overwrote it
+///    to B, wrongly making A look un-indexed, #427 review).
+/// 2. `repo_id`'s persisted `source_root` equals this root — the FALLBACK for an identity-less
+///    (non-git / unborn) root, which never gets a `repo_roots` entry (`adopt_repo_from_config`
+///    sole-picks WITHOUT `register_repo`). Also written only by an indexing pass.
+pub fn repo_indexed_at_this_root(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    config: &Config,
+) -> anyhow::Result<bool> {
+    if crate::schema::repo_has_recorded_root(conn, repo_id, &config.root.to_string_lossy())? {
+        return Ok(true);
+    }
+    Ok(crate::meta::repo_meta(conn, repo_id, "source_root")?
+        == Some(config.root.display().to_string()))
+}
+
+/// [`is_root_already_indexed`] against an ALREADY-OPEN connection — used by the indexing paths that
+/// hold a migrated read/write connection and must judge "already indexed" BEFORE they adopt (which
+/// would record this root and defeat a post-adoption check). See that function for the
+/// `source_root` rationale.
+pub fn is_root_already_indexed_conn(
+    conn: &rusqlite::Connection,
+    config: &Config,
+) -> anyhow::Result<bool> {
+    // Primary: the repo this config resolves to (a registered identity, or the recorded-root / sole
+    // fallback for an identity-less root) was last indexed at THIS root.
+    if let Some(repo_id) =
+        resolve_config_repo_id(conn, &config.root, config.repo_id_override.as_deref())?
+    {
+        return repo_indexed_at_this_root(conn, &repo_id, config);
+    }
+    // Fallback: the config's derived git identity is not registered yet, but a LEGACY index still
+    // living under the `__unassigned__` placeholder (a pre-adoption DB that predates open-time
+    // adoption) is single-repo and carries its `source_root` under that placeholder. Recognize it
+    // via the SOLE repo so a legacy index whose files were all deleted PRUNES on the first upgrade
+    // run instead of being refused as first-time-empty (the adoption that re-points the placeholder
+    // runs right after this check, in `adopt_repo_from_config`). Guarded to a single-repo DB: a
+    // multi-repo store has no sole placeholder, and matching on `source_root` means this can only
+    // ever be TRUE for THIS root's own prior index — never a sibling's or the primary's.
+    if !multiple_real_repos(conn)?
+        && let Ok(sole) = sole_repo_id(conn)
+    {
+        return repo_indexed_at_this_root(conn, &sole, config);
+    }
+    Ok(false)
 }

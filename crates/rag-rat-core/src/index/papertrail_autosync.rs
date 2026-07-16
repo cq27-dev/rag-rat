@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 use rag_rat_base::config::Config;
 use rag_rat_base::locks::{self, FileLock};
+use rag_rat_papertrail::{AutosyncRequest, PapertrailContext, PapertrailSyncReport};
 
-use super::{AutosyncRequest, PapertrailContext, PapertrailSyncReport};
 use crate::index::IndexDatabase;
 
 /// What one auto-sync trigger produced.
@@ -293,7 +293,7 @@ fn run_flight(
     // never creates an index), so on a shared database this repo can be registered yet never
     // indexed; the #427 "an index pass ran here" signal (a recorded root, or the source_root
     // meta an identity-less root gets) is what separates the two.
-    if !crate::index::is_root_already_indexed_conn(db.storage.connection(), config)? {
+    if !rag_rat_db::schema::is_root_already_indexed_conn(db.storage.connection(), config)? {
         return Ok(FlightPass::NotIndexed);
     }
     Ok(FlightPass::Report(Box::new(db.papertrail_sync_scheduled(request)?)))
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn flight_runs_the_scheduled_mirror_and_persists_binding_health_end_to_end() {
-        use super::super::transport::stub::{StubResponse, spawn_script_stub};
+        use rag_rat_papertrail::transport::stub::{StubResponse, spawn_script_stub};
         let script = vec![
             StubResponse::ok(
                 r#"{"incomplete_results":false,"items":[{"number":1,"html_url":"https://example.test/o/r/issues/1","state":"open","title":"one","body":"","updated_at":"2026-01-01T00:00:00Z","labels":[]}]}"#,
@@ -715,7 +715,7 @@ mod tests {
     /// requests that coalesced behind it before releasing.
     #[test]
     fn manual_sync_runs_under_the_flight_lock_and_drains_queued_followups() {
-        use super::super::transport::stub::{StubResponse, spawn_script_stub};
+        use rag_rat_papertrail::transport::stub::{StubResponse, spawn_script_stub};
         let script = vec![
             StubResponse::ok(
                 r#"{"incomplete_results":false,"items":[{"number":1,"html_url":"https://example.test/o/r/issues/1","state":"open","title":"one","body":"","updated_at":"2026-01-01T00:00:00Z","labels":[]}]}"#,

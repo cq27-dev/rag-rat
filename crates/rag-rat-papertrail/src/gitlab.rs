@@ -74,7 +74,7 @@ pub(crate) struct GitLabClient {
 }
 
 impl GitLabClient {
-    pub(crate) fn new(
+    pub fn new(
         binding: &ResolvedTracker,
         registry: &GovernorRegistry,
         options: TransportOptions,

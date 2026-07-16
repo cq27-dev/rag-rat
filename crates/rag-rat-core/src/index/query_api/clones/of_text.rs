@@ -655,7 +655,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "rag-rat-of-text-{tag}-{}-{}",
             std::process::id(),
-            crate::index::util::now_ms()
+            rag_rat_base::time::now_ms()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -771,7 +771,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "rag-rat-of-text-health-{}-{}",
             std::process::id(),
-            crate::index::util::now_ms()
+            rag_rat_base::time::now_ms()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -840,7 +840,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "rag-rat-of-text-exclude-{}-{}",
             std::process::id(),
-            crate::index::util::now_ms()
+            rag_rat_base::time::now_ms()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -922,7 +922,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "rag-rat-of-text-parity-{tag}-{}-{}",
             std::process::id(),
-            crate::index::util::now_ms()
+            rag_rat_base::time::now_ms()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();

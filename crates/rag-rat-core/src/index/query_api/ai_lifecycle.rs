@@ -87,7 +87,7 @@ impl IndexDatabase {
     pub(crate) fn heal_memory_oplog_ghosts(&self) -> anyhow::Result<()> {
         crate::query::memory::backfill_memory_oplog(
             self.storage.connection(),
-            crate::index::now_ms(),
+            rag_rat_base::time::now_ms(),
         )
     }
 

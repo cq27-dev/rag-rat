@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use notify::recommended_watcher;
 use rag_rat_base::config::Config;
 use rag_rat_base::locks::{self, FileLock};
+use rag_rat_papertrail::AutosyncRequest;
 
 use super::overlay::OverlayScope;
 use super::papertrail::{self, PapertrailClock, PapertrailScheduler};
@@ -22,9 +23,8 @@ use super::placement::{
     recompile_ignore_and_place_watches, sync_linked_worktrees_after_pass,
 };
 use crate::fleet;
-use crate::index::IndexDatabase;
 use crate::index::ignore_rules::IgnoreMatcher;
-use crate::index::papertrail::{AutosyncRequest, autosync};
+use crate::index::{IndexDatabase, papertrail_autosync as autosync};
 
 pub(crate) const FLEET_DEBOUNCE: Duration = Duration::from_millis(500);
 pub(crate) const FLEET_MAX_LATENCY: Duration = Duration::from_millis(2000);

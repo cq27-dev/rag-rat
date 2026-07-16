@@ -6,7 +6,7 @@ pub mod git_history;
 pub mod ignore_rules;
 pub(crate) mod languages;
 pub mod oracle;
-pub mod papertrail;
+pub mod papertrail_autosync;
 pub mod parser;
 pub mod symbols;
 pub mod walker;
@@ -43,8 +43,7 @@ mod util;
 mod worktree_overlay;
 pub use adoption_hints::{
     EmptyIndexRefused, SameIdentityJoin, is_first_time_empty, is_first_time_empty_conn,
-    is_root_already_indexed, is_root_already_indexed_conn, same_identity_join_note,
-    would_discover_any_file,
+    is_root_already_indexed, same_identity_join_note, would_discover_any_file,
 };
 pub use discovery::DiscoveryStatus;
 pub(crate) use discovery::*;
@@ -58,7 +57,7 @@ pub fn migration_hooks() -> rag_rat_db::MigrationHooks {
     rag_rat_db::MigrationHooks {
         rederive_dream_finding_ids: crate::dream::rederive_finding_ids,
         backfill_authority_projection: crate::oplog::backfill_authority_projection,
-        rebuild_papertrail_fts: papertrail::rebuild_fts,
+        rebuild_papertrail_fts: rag_rat_papertrail::rebuild_fts,
         realign_logical_symbol_ids: graph_index::realign_logical_symbol_ids,
     }
 }
@@ -96,7 +95,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 use std::{fs, thread};
 
 use gix::bstr::{BString, ByteSlice};
@@ -105,6 +104,8 @@ use rag_rat_base::config::{Config, TargetKind};
 use rag_rat_base::language::Language;
 use rag_rat_db::schema;
 use rag_rat_db::storage::{IndexConnection, StorageStatus};
+use rag_rat_papertrail as papertrail;
+use rag_rat_papertrail::{Papertrail, PapertrailEvidence, PapertrailStatus, PapertrailSyncReport};
 use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::{OptionalExtension, params};
@@ -118,9 +119,6 @@ use crate::index::chunker::Chunk;
 use crate::index::git_history::{
     ChunkBlameSummary, CommitSearchHit, GitHistoryIndexStatus, PathHistoryItem, QueryCommitHit,
     SymbolHistoryItem,
-};
-use crate::index::papertrail::{
-    Papertrail, PapertrailEvidence, PapertrailStatus, PapertrailSyncReport,
 };
 use crate::index::symbols::Symbol;
 use crate::query::graph_meta::{self, GraphMetaMode};

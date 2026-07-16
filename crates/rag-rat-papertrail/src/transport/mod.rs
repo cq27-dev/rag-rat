@@ -15,8 +15,9 @@ pub(crate) use auth::*;
 pub(crate) use client::*;
 pub(crate) use governor::*;
 
-#[cfg(test)]
-pub(super) mod stub;
+// Not test-gated: the engine crate's autosync tests drive mirror flights through this stub, so
+// it ships as ordinary (never-in-production-paths) test support.
+pub mod stub;
 
 #[cfg(test)]
 mod pagination_tests {

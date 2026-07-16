@@ -3479,7 +3479,7 @@ fn papertrail_clock_is_never_due_without_an_interval_and_rearms_on_tick() {
 
 #[test]
 fn papertrail_scheduler_single_flights_and_coalesces_max_wins() {
-    use crate::index::papertrail::AutosyncRequest;
+    use rag_rat_papertrail::AutosyncRequest;
     let mut scheduler = PapertrailScheduler::new();
     // Idle → dispatch immediately.
     assert_eq!(scheduler.admit(AutosyncRequest::Evaluate), Some(AutosyncRequest::Evaluate));
@@ -3561,7 +3561,7 @@ fn idle_watcher_enqueues_papertrail_evaluation_without_filesystem_activity() {
         // No filesystem events at all: the deadline alone must enqueue an evaluation.
         assert_eq!(
             papertrail_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(crate::index::papertrail::AutosyncRequest::Evaluate),
+            Ok(rag_rat_papertrail::AutosyncRequest::Evaluate),
         );
         stop.store(true, Ordering::Relaxed);
         tx.send(LoopMsg::Wake).unwrap();
@@ -3622,7 +3622,7 @@ fn papertrail_deadline_fires_during_an_in_flight_pass_and_ticks_coalesce() {
         // The papertrail deadline still fires — an in-flight pass must not postpone it.
         assert_eq!(
             papertrail_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(crate::index::papertrail::AutosyncRequest::Evaluate),
+            Ok(rag_rat_papertrail::AutosyncRequest::Evaluate),
             "the papertrail deadline must fire during an in-flight maintenance pass",
         );
 
@@ -3638,7 +3638,7 @@ fn papertrail_deadline_fires_during_an_in_flight_pass_and_ticks_coalesce() {
         tx.send(LoopMsg::PapertrailDone).unwrap();
         assert_eq!(
             papertrail_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(crate::index::papertrail::AutosyncRequest::Evaluate),
+            Ok(rag_rat_papertrail::AutosyncRequest::Evaluate),
         );
 
         stop.store(true, Ordering::Relaxed);

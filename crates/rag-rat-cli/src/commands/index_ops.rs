@@ -454,7 +454,8 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
 /// staleness detail is persisted as binding health inside the flight and retried by the
 /// scheduling policy on later triggers.
 fn papertrail_hook_trigger(config: &Config) -> serde_json::Value {
-    use rag_rat_core::index::papertrail::{AutosyncRequest, autosync};
+    use rag_rat_core::index::papertrail_autosync as autosync;
+    use rag_rat_papertrail::AutosyncRequest;
     match autosync::run(config, AutosyncRequest::Incremental) {
         Ok(autosync::AutosyncOutcome::Disabled) => {
             serde_json::json!({"status": "disabled", "reason": "no tracker bindings"})

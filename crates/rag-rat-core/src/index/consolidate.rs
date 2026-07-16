@@ -253,7 +253,7 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
         target_conn,
         &identity,
         &config.root,
-        schema::now_ms(),
+        rag_rat_base::time::now_ms(),
         &crate::index::migration_hooks(),
     )?;
 
@@ -295,7 +295,11 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
     // a window edge REMOVAL (a phantom projected edge). Both fall under the same out-of-scope
     // class as raw out-of-band content divergence; they are content/tombstone divergence, not the
     // missing-NodeCreate bug #541 fixes, and the log is a shadow until phase D.
-    crate::query::memory::reconcile_owner_stream_for_repo(target_conn, &repo_id, schema::now_ms())?;
+    crate::query::memory::reconcile_owner_stream_for_repo(
+        target_conn,
+        &repo_id,
+        rag_rat_base::time::now_ms(),
+    )?;
 
     // Rename the legacy file so a keyless config now resolves to the global store (via the
     // `.imported` latch), and a re-run is a no-op. AFTER the import commits, so a failure leaves
@@ -2194,7 +2198,7 @@ mod tests {
         crate::query::memory::reconcile_owner_stream_for_repo(
             &target,
             "global-repo",
-            schema::now_ms(),
+            rag_rat_base::time::now_ms(),
         )
         .unwrap();
 

@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::Context as _;
 use rag_rat_base::config::TrackerAuth;
 
-use crate::index::papertrail::TrackerAuthentication;
+use crate::TrackerAuthentication;
 
 /// Snapshot a binding's authentication capability without running configured shell code merely
 /// because an index is opened for search/status. Environment lookup is side-effect free; a token
@@ -26,7 +26,7 @@ pub(crate) fn authentication(spec: Option<&TrackerAuth>) -> TrackerAuthenticatio
 /// token is an error — the operator asked for auth, silently degrading to the anonymous quota
 /// would both surprise them and burn the shared unauthenticated pool. Error text names the env
 /// var / command, never any token value.
-pub(crate) fn resolve_token(spec: Option<&TrackerAuth>) -> anyhow::Result<Option<String>> {
+pub fn resolve_token(spec: Option<&TrackerAuth>) -> anyhow::Result<Option<String>> {
     resolve_token_with(spec, |var| std::env::var(var).ok(), run_token_command)
 }
 

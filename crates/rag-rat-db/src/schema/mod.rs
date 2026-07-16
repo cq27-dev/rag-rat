@@ -20,7 +20,7 @@ pub use migrations::{
     apply_papertrail_provider_neutral_schema, apply_repo_id_core_scoping,
     apply_repo_id_periphery_scoping, apply_repos_registry, apply_scip_moniker_anchors,
 };
-pub use migrations::{column_exists, now_ms, rebuild_repo_memory_fts_with_repo_id, table_exists};
+pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_exists};
 // `multiple_real_repos` lost its V042-era seam-guard callers (real `repo_id` predicates
 // superseded them, A5), but A7's bare-open fail-fast made it production again: a config-less
 // `IndexDatabase::open` refuses a multi-repo DB rather than silently scoping to the
@@ -29,10 +29,10 @@ pub use registry::multiple_real_repos;
 pub use registry::{
     CONNECTION_CONTEXT_GENERATION_KEY, CONNECTION_CONTEXT_REPO_KEY, LIVE_FILES_GENERATION_META_KEY,
     RegisteredRepo, active_generation, active_repo_id, connection_context_value,
-    earliest_recorded_root, live_files_generation, periphery_repo_scope,
-    periphery_repo_scope_clause, register_repo, register_repo_read_only, registered_repos,
-    repo_has_recorded_root, repo_id_is_registered, resolve_config_repo_id, scope_context_repo_id,
-    sole_repo_id,
+    earliest_recorded_root, is_root_already_indexed_conn, live_files_generation,
+    periphery_repo_scope, periphery_repo_scope_clause, register_repo, register_repo_read_only,
+    registered_repos, repo_has_recorded_root, repo_id_is_registered, repo_indexed_at_this_root,
+    resolve_config_repo_id, scope_context_repo_id, sole_repo_id,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -595,7 +595,12 @@ fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
              VALUES (?1, ?2, ?3, ?4)",
-            params![DIRTY_MIGRATION_ID, now_ms(), "", "partial migration in progress"],
+            params![
+                DIRTY_MIGRATION_ID,
+                rag_rat_base::time::now_ms(),
+                "",
+                "partial migration in progress"
+            ],
         )?;
     }
     // The string pool was `edge_strings` before the name-pool merge (#224, the V028 bump); it now

@@ -1215,7 +1215,7 @@ mod tests {
         // Intact on the seeded mirror…
         assert_sibling_intact(conn);
         // …and byte-equivalently intact on the re-derived mirror.
-        crate::index::papertrail::rebuild_fts(conn).unwrap();
+        rag_rat_papertrail::rebuild_fts(conn).unwrap();
         assert_sibling_intact(conn);
     }
 
