@@ -2165,10 +2165,16 @@ fn migration_069_adds_the_local_account_pointer() {
 }
 
 #[test]
-fn migration_070_is_the_tip_and_adds_the_content_projected_tables() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 70, "move this pin with the next schema migration");
+fn migration_070_adds_the_content_projected_tables() {
+    // The absolute-tip pin moved to `migration_071_*` (V071 is the tip now); this drops to the
+    // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply",
+    );
 
     // Both /3 projection tables exist with their full column set, mirroring the stream-keyed /1
     // shadow tables (V053).
@@ -2240,6 +2246,48 @@ fn migration_070_is_the_tip_and_adds_the_content_projected_tables() {
         )
         .unwrap();
     assert_eq!(v70_recorded, 1, "the forward migration records V070");
+}
+
+#[test]
+fn migration_071_is_the_tip_and_indexes_edge_target_qname() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 71, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    let index_on = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_edges_target_qname' AND tbl_name = 'edges_data'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(index_on(&conn), 1, "V071 creates idx_edges_target_qname on edges_data");
+
+    // Idempotent applier: drop it, re-run twice — CREATE INDEX IF NOT EXISTS reconverges.
+    conn.execute("DROP INDEX idx_edges_target_qname", []).unwrap();
+    assert_eq!(index_on(&conn), 0, "index dropped");
+    schema::apply_edge_target_qname_index(&conn).unwrap();
+    schema::apply_edge_target_qname_index(&conn).expect("replay is a no-op");
+    assert_eq!(index_on(&conn), 1, "the isolated applier recreates the index");
+
+    // A forward migrate over a ledger truncated below V071 replays the step and records V071.
+    truncate_schema_to(&conn, 70);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip",
+    );
+    let v71_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '071_edge_target_qname_index'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v71_recorded, 1, "the forward migration records V071");
 }
 
 #[test]

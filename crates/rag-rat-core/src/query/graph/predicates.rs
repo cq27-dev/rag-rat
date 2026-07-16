@@ -79,7 +79,8 @@ pub(crate) fn reverse_predicate(mode: GraphResolutionMode, logical: bool) -> &'s
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                   )
-                  OR edges.target_qualified_name = ?1)",
+                  OR edges.target_qualified_name_id =
+                        (SELECT id FROM name_strings WHERE value = ?1))",
             GraphResolutionMode::Fuzzy =>
                 "edges.to_symbol_id IN (
                     SELECT symbol_id
@@ -95,15 +96,31 @@ pub(crate) fn reverse_predicate(mode: GraphResolutionMode, logical: bool) -> &'s
                         (SELECT id FROM name_strings WHERE value = ?3))",
         };
     }
+    // #682 INDEXED-SEED CONTRACT: the Exact/Syntactic seed branches compare the `edges` view's raw
+    // dictionary/id columns (`to_symbol_id`, `target_qualified_name_id`) against a constant — a
+    // bare id or a `(SELECT id FROM name_strings WHERE value = ?)` — so the planner drives a
+    // MULTI-INDEX OR over `idx_edges_to_symbol` + `idx_edges_target_qname` instead of
+    // full-scanning `edges_data` through the view's value joins (`to_qn.value`,
+    // `edges.target_qualified_name`). Faithful transform of the value-column forms:
+    // `to_qn.value = ?1` (the to-symbol's qualified name) is exactly the edges whose
+    // `to_symbol_id` is a symbol with that interned qualified name, and `to_symbols.name = ?3`
+    // those whose to-symbol has that short name. Fuzzy keeps the `LIKE` forms (opt-in,
+    // inherently non-sargable). See the raw-id note in `ensure_edges_view`.
     match mode {
         GraphResolutionMode::Exact =>
             "edges.to_symbol_id IS NOT NULL
-             AND (edges.to_symbol_id = ?6 OR to_qn.value = ?1)",
+             AND (edges.to_symbol_id = ?6
+                  OR edges.to_symbol_id IN (
+                     SELECT id FROM symbols
+                     WHERE qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)))",
         GraphResolutionMode::Syntactic =>
             "(edges.to_symbol_id = ?6
-              OR to_qn.value = ?1
-              OR (?7 = 'true' AND to_symbols.name = ?3)
-              OR edges.target_qualified_name = ?1)",
+              OR edges.to_symbol_id IN (
+                 SELECT id FROM symbols
+                 WHERE qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1))
+              OR (?7 = 'true' AND edges.to_symbol_id IN (
+                 SELECT id FROM symbols WHERE name = ?3))
+              OR edges.target_qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1))",
         GraphResolutionMode::Fuzzy =>
             "to_symbols.name = ?3
              OR to_qn.value = ?1
@@ -137,19 +154,19 @@ pub(crate) fn forward_source_predicate(mode: GraphResolutionMode, logical: bool)
     if logical {
         return match mode {
             GraphResolutionMode::Exact =>
-                "from_symbols.id IS NOT NULL
-                 AND from_symbols.id IN (
+                "edges.from_symbol_id IS NOT NULL
+                 AND edges.from_symbol_id IN (
                     SELECT symbol_id
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                  )",
             GraphResolutionMode::Syntactic =>
-                "from_symbols.id IN (
+                "edges.from_symbol_id IN (
                     SELECT symbol_id
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                  )
-                 OR edges.from_name = ?1",
+                 OR edges.from_name_id = (SELECT id FROM name_strings WHERE value = ?1)",
             GraphResolutionMode::Fuzzy =>
                 "from_symbols.id IN (
                     SELECT symbol_id
@@ -163,15 +180,26 @@ pub(crate) fn forward_source_predicate(mode: GraphResolutionMode, logical: bool)
                  OR edges.from_name LIKE ?2",
         };
     }
+    // #682 INDEXED-SEED CONTRACT (mirror of reverse_predicate): Exact/Syntactic seed on the raw
+    // `edges` id columns (`from_symbol_id`, `from_name_id`) against a constant so the planner
+    // drives `idx_edges_from_symbol` + `idx_edges_from_name` instead of scanning `edges_data`
+    // through the view's `from_qn.value` / `edges.from_name` value joins. Fuzzy keeps the
+    // `LIKE` forms.
     match mode {
         GraphResolutionMode::Exact =>
-            "from_symbols.id IS NOT NULL
-             AND (from_symbols.id = ?6 OR from_qn.value = ?1)",
+            "edges.from_symbol_id IS NOT NULL
+             AND (edges.from_symbol_id = ?6
+                  OR edges.from_symbol_id IN (
+                     SELECT id FROM symbols
+                     WHERE qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)))",
         GraphResolutionMode::Syntactic =>
-            "from_symbols.id = ?6
-             OR from_qn.value = ?1
-             OR (?7 = 'true' AND from_symbols.name = ?3)
-             OR edges.from_name = ?1",
+            "edges.from_symbol_id = ?6
+             OR edges.from_symbol_id IN (
+                SELECT id FROM symbols
+                WHERE qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1))
+             OR (?7 = 'true' AND edges.from_symbol_id IN (
+                SELECT id FROM symbols WHERE name = ?3))
+             OR edges.from_name_id = (SELECT id FROM name_strings WHERE value = ?1)",
         GraphResolutionMode::Fuzzy =>
             "from_symbols.name = ?3
              OR from_qn.value = ?1

@@ -215,3 +215,89 @@ fn or_branch_name_predicates_use_the_to_name_index() {
         "plain to_name equality must use the int index, got plan:\n{simple}"
     );
 }
+
+/// #682: the graph-traversal SEED predicate (behind `find_callers` / `trace_callees`) must drive the
+/// `edges_data` id indexes, not full-scan the ~1M-row edge table. Before the fix the Syntactic seed
+/// OR mixed the indexed `to_symbol_id` with value-joined columns (`to_qn.value`,
+/// `edges.target_qualified_name`), so the planner abandoned the indexes and scanned every edge
+/// (~1.8-2.2s/call on a real index). The fix compares the view's raw id columns against a constant,
+/// exactly like the caller-count predicate above — this pins that the reverse seed drives
+/// `idx_edges_to_symbol` + `idx_edges_target_qname` and the forward seed `idx_edges_from_symbol` +
+/// `idx_edges_from_name`, and that NO full `SCAN` of the edge rows (`SCAN d` / `SCAN edges_data`)
+/// survives. The `idx_edges_target_qname` index (V071) is required for the reverse unresolved
+/// branch.
+#[test]
+fn graph_traversal_seed_predicates_use_edge_id_indexes() {
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    let plan = |sql: &str| -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+    };
+
+    // The V071 index the reverse unresolved-edge branch needs actually exists on edges_data.
+    let idx_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_edges_target_qname' AND tbl_name = 'edges_data'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx_count, 1, "V071 idx_edges_target_qname on edges_data");
+
+    // Reverse (find_callers) Syntactic seed shape — mirror of predicates::reverse_predicate.
+    let reverse = plan(
+        "SELECT id FROM edges
+         WHERE edge_kind IN ('calls_name', 'constructs')
+           AND (to_symbol_id = 5
+                OR to_symbol_id IN (
+                   SELECT id FROM symbols
+                   WHERE qualified_name_id = (SELECT id FROM name_strings WHERE value = 'x'))
+                OR ('true' = 'true' AND to_symbol_id IN (SELECT id FROM symbols WHERE name = 'y'))
+                OR target_qualified_name_id = (SELECT id FROM name_strings WHERE value = 'x'))",
+    );
+    assert!(
+        reverse.contains("idx_edges_to_symbol"),
+        "reverse seed must drive idx_edges_to_symbol, got plan:\n{reverse}"
+    );
+    assert!(
+        reverse.contains("idx_edges_target_qname"),
+        "reverse unresolved branch must drive idx_edges_target_qname (V071), got plan:\n{reverse}"
+    );
+    assert!(
+        !reverse.contains("SCAN d") && !reverse.contains("SCAN edges_data"),
+        "reverse seed must not full-scan the edge rows, got plan:\n{reverse}"
+    );
+
+    // Forward (trace_callees) Syntactic seed shape — mirror of
+    // predicates::forward_source_predicate.
+    let forward = plan(
+        "SELECT id FROM edges
+         WHERE edge_kind IN ('calls_name', 'constructs')
+           AND (from_symbol_id = 5
+                OR from_symbol_id IN (
+                   SELECT id FROM symbols
+                   WHERE qualified_name_id = (SELECT id FROM name_strings WHERE value = 'x'))
+                OR ('true' = 'true' AND from_symbol_id IN (SELECT id FROM symbols WHERE name = \
+         'y'))
+                OR from_name_id = (SELECT id FROM name_strings WHERE value = 'x'))",
+    );
+    assert!(
+        forward.contains("idx_edges_from_symbol"),
+        "forward seed must drive idx_edges_from_symbol, got plan:\n{forward}"
+    );
+    assert!(
+        forward.contains("idx_edges_from_name"),
+        "forward unresolved branch must drive idx_edges_from_name, got plan:\n{forward}"
+    );
+    assert!(
+        !forward.contains("SCAN d") && !forward.contains("SCAN edges_data"),
+        "forward seed must not full-scan the edge rows, got plan:\n{forward}"
+    );
+}

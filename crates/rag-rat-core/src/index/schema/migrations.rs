@@ -764,7 +764,23 @@ pub(crate) fn ensure_edges_data_indexes(conn: &Connection) -> rusqlite::Result<(
         CREATE INDEX IF NOT EXISTS idx_edges_source_file ON edges_data(source_file_id);
         CREATE INDEX IF NOT EXISTS idx_edges_from_name ON edges_data(from_name_id);
         CREATE INDEX IF NOT EXISTS idx_edges_to_name ON edges_data(to_name_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_target_qname ON edges_data(target_qualified_name_id);
         ",
+    )
+}
+
+/// V071 (#682): index the edge-side interned target-qualified-name id. The graph-traversal seed
+/// predicate behind `find_callers` / `trace_callees` matches unresolved edges by
+/// `edges.target_qualified_name_id = (SELECT id FROM name_strings WHERE value = ?)`; without an
+/// index on that column the whole seed OR degrades to a full scan of `edges_data` (the other seed
+/// branches are on the already-indexed `to_symbol_id` / `from_symbol_id` / `from_name_id`). This
+/// index lets the planner drive a MULTI-INDEX OR instead. Purely additive and idempotent
+/// (`CREATE INDEX IF NOT EXISTS`); a fresh DB gets it from `ensure_edges_data_indexes`, an existing
+/// DB from this forward migration.
+pub(crate) fn apply_edge_target_qname_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_edges_target_qname ON \
+         edges_data(target_qualified_name_id);",
     )
 }
 
@@ -1268,6 +1284,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_068_ID => Some(68),
             MIGRATION_069_ID => Some(69),
             MIGRATION_070_ID => Some(70),
+            MIGRATION_071_ID => Some(71),
             _ => None,
         })
         .max()
@@ -1347,6 +1364,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_068_ID
             | MIGRATION_069_ID
             | MIGRATION_070_ID
+            | MIGRATION_071_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1423,6 +1441,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_068_ID => migration.checksum != MIGRATION_068_CHECKSUM,
         MIGRATION_069_ID => migration.checksum != MIGRATION_069_CHECKSUM,
         MIGRATION_070_ID => migration.checksum != MIGRATION_070_CHECKSUM,
+        MIGRATION_071_ID => migration.checksum != MIGRATION_071_CHECKSUM,
         _ => false,
     }
 }

@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 70;
+pub const LATEST_SCHEMA_VERSION: u32 = 71;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -487,6 +487,14 @@ const MIGRATION_070_DESCRIPTION: &str =
      tables but updated only when acceptance changes (the content refold), never by the /1 \
      projector sweep — kept separate so a projector-version bump cannot wipe the /3 projection. \
      Purely additive, nothing pre-existing to backfill";
+const MIGRATION_071_ID: &str = "071_edge_target_qname_index";
+const MIGRATION_071_CHECKSUM: &str = "sha256:rag-rat-edge-target-qname-index-v71";
+const MIGRATION_071_DESCRIPTION: &str =
+    "Add idx_edges_target_qname on edges_data(target_qualified_name_id) so \
+     find_callers/trace_callees seed the graph traversal on an indexed id column (MULTI-INDEX OR) \
+     instead of full-scanning the edge table when matching unresolved edges by \
+     target_qualified_name. Purely additive; CREATE INDEX IF NOT EXISTS, nothing pre-existing to \
+     backfill";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1068,6 +1076,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_070_CHECKSUM,
         description: MIGRATION_070_DESCRIPTION,
         apply: apply_content_projected_tables,
+    },
+    Migration {
+        id: MIGRATION_071_ID,
+        checksum: MIGRATION_071_CHECKSUM,
+        description: MIGRATION_071_DESCRIPTION,
+        apply: apply_edge_target_qname_index,
     },
 ];
 
