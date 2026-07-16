@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
+use rag_rat_clones::NORM_VERSION;
 use rusqlite::types::Value;
 use rusqlite::{Connection, params, params_from_iter};
 use serde::Serialize;
@@ -44,7 +45,6 @@ use super::substrate::{
     sub_block_tokens, verified_clone,
 };
 use crate::index::IndexDatabase;
-use crate::index::clones::NORM_VERSION;
 
 /// SQLite bind-variable safety chunk for `IN (…)` lists (mirrors `of_text::HYDRATION_CHUNK`).
 const DELTA_SQL_CHUNK: usize = 400;
@@ -795,8 +795,7 @@ impl<'a> CandidateHydrator<'a> {
                 let (path, start_byte, live_sha, lang, struct_hash, token_len, blob, symbol_id) =
                     row?;
                 let Some(blob) = blob else { continue };
-                let Some(bag_pairs) = crate::index::clones::bag_blob::decode_token_bag(&blob)
-                else {
+                let Some(bag_pairs) = rag_rat_clones::bag_blob::decode_token_bag(&blob) else {
                     continue;
                 };
                 let tokens = bag_pairs
@@ -1074,7 +1073,7 @@ mod tests {
                 (generation, status, theta_floor, normalizer_kind, normalizer_version,
                  source_revision, started_at_ms, postings_written, repo_id)
              VALUES (9999, 'Building', 0.7, 'baseline', ?1, 'inflight-rev', 0, 1, ?2)",
-            rusqlite::params![crate::index::clones::NORM_VERSION, db.active_repo_id],
+            rusqlite::params![rag_rat_clones::NORM_VERSION, db.active_repo_id],
         )
         .unwrap();
         let report = db.apply_clone_graph_delta(64).unwrap();

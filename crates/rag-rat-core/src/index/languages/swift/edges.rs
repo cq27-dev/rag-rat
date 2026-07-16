@@ -824,7 +824,7 @@ fn swift_operator_stripped_path(target: Node<'_>) -> Option<Vec<Node<'_>>> {
     // `swift_callable_is_static_path` handling so the operator and plain forms agree.
     if swift_postfix_is_force_unwrap(target) {
         let inner = target.child_by_field_name("target")?;
-        return crate::index::grow_stack(|| swift_operator_stripped_path(inner));
+        return rag_rat_base::stack::grow_stack(|| swift_operator_stripped_path(inner));
     }
     if target.kind() == "navigation_expression" {
         let mut cursor = target.walk();
@@ -832,7 +832,7 @@ fn swift_operator_stripped_path(target: Node<'_>) -> Option<Vec<Node<'_>>> {
         let (&receiver, &suffix) = (children.first()?, children.last()?);
         // A pathological left-leaning navigation chain (`a.b.c.d…` thousands deep) recurses to full
         // depth; grow the stack rather than overflow the indexer on hostile input.
-        let mut path = crate::index::grow_stack(|| swift_operator_stripped_path(receiver))?;
+        let mut path = rag_rat_base::stack::grow_stack(|| swift_operator_stripped_path(receiver))?;
         path.push(syntax::identifier_nodes(suffix).last().copied()?);
         return Some(path);
     }

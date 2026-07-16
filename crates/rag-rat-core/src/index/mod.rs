@@ -16,7 +16,6 @@ pub mod consolidate;
 mod adoption_hints;
 pub(crate) mod change_coupling;
 pub(crate) mod chunk_text_store;
-pub(crate) mod clones;
 mod discovery;
 mod file_index;
 mod file_rows;

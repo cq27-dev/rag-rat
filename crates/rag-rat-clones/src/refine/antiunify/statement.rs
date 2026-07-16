@@ -4,7 +4,7 @@ use super::budget::CellBudget;
 use super::build::anti_unify_with_budget;
 use super::spans::direct_children;
 use super::types::{ClassAlignment, EmittedSpan};
-use crate::index::clones::normalize::NodeSpan;
+use crate::normalize::NodeSpan;
 
 /// `true` for a statement-like node kind — the granularity an inserted/removed statement snaps to.
 /// Punctuation children of a block (`{`, `}`) are NOT statements, so they never become a snap unit.

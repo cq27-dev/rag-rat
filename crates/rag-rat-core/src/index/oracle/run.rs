@@ -470,7 +470,7 @@ pub(crate) fn run_in_tx(
     // refinement's cache key changes when a moniker changes (#275 finding 3) — invalidate every
     // scip-mode row so the next refine pass recomputes against the fresh verdicts. Baseline rows
     // are oracle-independent and spared.
-    crate::index::clones::refine::cache::invalidate_scip_refinements(conn)?;
+    rag_rat_clones::refine::cache::invalidate_scip_refinements(conn)?;
 
     Ok(report)
 }

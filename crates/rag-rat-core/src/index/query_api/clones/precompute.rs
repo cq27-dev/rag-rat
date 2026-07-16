@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use rag_rat_base::time::now_ms;
+use rag_rat_clones::NORM_VERSION;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
@@ -30,7 +31,6 @@ use super::substrate::{
     verified_clone,
 };
 use crate::index::IndexDatabase;
-use crate::index::clones::NORM_VERSION;
 
 /// θ the graph is precomputed at — the default `find_clones` threshold. Queries at θ ≥ this read
 /// the stored edges (filtering the exact gate inputs); θ below falls back to the live path.

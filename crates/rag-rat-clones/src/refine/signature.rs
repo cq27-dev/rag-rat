@@ -13,7 +13,7 @@ use rag_rat_base::language::Language;
 
 use super::antiunify::{MetavarKind, Template, VariationPoint};
 use super::score::Confidence;
-use crate::index::clones::refine::RefineMember;
+use crate::refine::RefineMember;
 
 /// How well the syntactic type recovery succeeded for the proposed signature.
 ///
@@ -57,7 +57,7 @@ pub(crate) enum Typedness {
 }
 
 impl Typedness {
-    pub(crate) fn as_db_str(&self) -> &'static str {
+    pub fn as_db_str(&self) -> &'static str {
         (*self).into()
     }
 }
@@ -396,7 +396,7 @@ fn literal_bucket_to_type(bucket: &str) -> Option<&'static str> {
 fn try_annotation_type_span(
     anchor: &RefineMember,
     lo: usize,
-) -> Option<&crate::index::clones::normalize::NodeSpan> {
+) -> Option<&crate::normalize::NodeSpan> {
     let spans = &anchor.node_spans;
     if spans.is_empty() {
         return None;
@@ -427,11 +427,11 @@ fn try_annotation_type_span(
 }
 
 /// `true` for tree-sitter node kinds that represent a Rust type. Delegates to the shared
-/// [`crate::index::clones::normalize::is_rust_type_kind`] — the SAME predicate
+/// [`crate::normalize::is_rust_type_kind`] — the SAME predicate
 /// `antiunify::is_type_position` uses, so the type-recovery window and the anti-unify `type_param`
 /// classification can never diverge on what counts as a type node (Fix 4, #215 Plan 4b).
 fn is_type_kind(kind: &str) -> bool {
-    crate::index::clones::normalize::is_rust_type_kind(kind)
+    crate::normalize::is_rust_type_kind(kind)
 }
 
 /// Render a recovered type node (`tspan`), substituting the DECLARED generic for every `TypeParam`
@@ -453,11 +453,11 @@ fn is_type_kind(kind: &str) -> bool {
 /// class).
 fn substitute_type_params_in_type_node(
     anchor: &RefineMember,
-    tspan: &crate::index::clones::normalize::NodeSpan,
+    tspan: &crate::normalize::NodeSpan,
     type_param_cols: &[(usize, String)],
 ) -> Option<String> {
     let node_text = anchor.text.get(tspan.start_byte..tspan.end_byte)?;
-    let mut contained: Vec<(&crate::index::clones::normalize::NodeSpan, &String)> = type_param_cols
+    let mut contained: Vec<(&crate::normalize::NodeSpan, &String)> = type_param_cols
         .iter()
         .filter_map(|(col, generic)| {
             let csp = anchor.node_spans.get(*col)?;
@@ -660,14 +660,12 @@ mod tests {
     use std::sync::Arc;
 
     use rag_rat_base::language::Language;
+    use rag_rat_core::index::parser;
 
     use super::*;
-    use crate::index::clones::normalize::normalize_baseline_spanned;
-    use crate::index::clones::refine::antiunify::{
-        align_to_anchor, anti_unify, resolve_anchor_idx,
-    };
-    use crate::index::clones::tokens;
-    use crate::index::parser;
+    use crate::normalize::normalize_baseline_spanned;
+    use crate::refine::antiunify::{align_to_anchor, anti_unify, resolve_anchor_idx};
+    use crate::tokens;
 
     /// Build a `RefineMember` from a Rust snippet (mirrors the `member` helper in antiunify tests).
     fn member(symbol_id: i64, src: &str) -> RefineMember {
@@ -823,7 +821,7 @@ mod tests {
         // a synthetic anchor whose hole leaf is a `LIT_*` literal and a VP carrying the
         // unmapped bucket as its `type_hint` — exactly the shape the classifier would emit
         // for a uniform unmapped literal.
-        use crate::index::clones::normalize::NodeSpan;
+        use crate::normalize::NodeSpan;
 
         // Synthetic anchor: `fn ...` header reduced to a single literal leaf at column 0 (all that
         // `anchor_leaf_is_literal` / `recover_param_type` inspect). seq[0] = a LIT_* token.

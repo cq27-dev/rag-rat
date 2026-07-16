@@ -101,7 +101,7 @@ pub(crate) const MEMBER_VALUE_CAP: usize = MAX_MEMBERS; // = 50
 // in PRODUCTION (a module-level `const _`), not just under `#[cfg(test)]`, so a future bump that
 // inverts the two caps fails the build here rather than silently regressing the sampling flag.
 const _: () = assert!(
-    MEMBER_VALUE_CAP < crate::index::clones::refine::align::LCS_MEMBER_SAMPLE,
+    MEMBER_VALUE_CAP < rag_rat_clones::refine::align::LCS_MEMBER_SAMPLE,
     "MEMBER_VALUE_CAP must be below LCS_MEMBER_SAMPLE so the cap+1 member range is still flagged"
 );
 
@@ -112,6 +112,11 @@ const _: () = assert!(
 /// every statement well under the limit; results are accumulated then re-sorted by `symbol_id` so
 /// the full population is processed deterministically regardless of chunk boundaries.
 pub(crate) const HYDRATION_CHUNK: usize = 900;
+
+use rag_rat_clones::refine::cache::{
+    RefineMode, refine_compute_and_store_budgeted, refine_lookup, refinement_key,
+};
+use rag_rat_clones::refine::split::coherence_split;
 
 use self::build::{build_class, count_stale_member_paths};
 use self::refine_load::{
@@ -127,10 +132,6 @@ use self::substrate::{
     overlap, pairs_for_query, subject_component_bfs,
 };
 use crate::index::IndexDatabase;
-use crate::index::clones::refine::cache::{
-    RefineMode, refine_compute_and_store_budgeted, refine_lookup, refinement_key,
-};
-use crate::index::clones::refine::split::coherence_split;
 
 impl IndexDatabase {
     /// Candidate clone components over the ACTIVE scope, via the SourcererCC algorithm (design rev
@@ -800,7 +801,7 @@ impl IndexDatabase {
         // oracle-run invalidation), so the monikers that would let the classifier collapse a
         // callee are simply never attached in baseline mode.
         attach_callee_monikers: bool,
-    ) -> anyhow::Result<Option<Vec<crate::index::clones::refine::RefineMember>>> {
+    ) -> anyhow::Result<Option<Vec<rag_rat_clones::refine::RefineMember>>> {
         if member_ids.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -864,8 +865,7 @@ impl IndexDatabase {
             std::collections::HashMap<(usize, usize), String>,
         > = std::collections::HashMap::new();
 
-        let mut members: Vec<crate::index::clones::refine::RefineMember> =
-            Vec::with_capacity(rows.len());
+        let mut members: Vec<rag_rat_clones::refine::RefineMember> = Vec::with_capacity(rows.len());
         for row in rows {
             if !file_cache.contains_key(&row.path) {
                 let Ok(content) = std::fs::read_to_string(root.join(&row.path)) else {
@@ -903,18 +903,15 @@ impl IndexDatabase {
             // Plan 4b: use normalize_baseline_spanned so each token carries its AST span.
             // The seq (.0) is byte-identical to the old normalize_baseline output (faithfulness
             // pin).
-            let (seq, node_spans) = crate::index::clones::normalize::normalize_baseline_spanned(
-                node,
-                &text,
-                row.language,
-            );
+            let (seq, node_spans) =
+                rag_rat_clones::normalize::normalize_baseline_spanned(node, &text, row.language);
 
             // Faithfulness pin: the re-parse must reproduce Plan-1's normalization exactly. A
             // mismatch means the on-disk file no longer matches the indexed fingerprint (the
             // `files.sha256` staleness signal would also flag it) — refining a drifted member would
             // align stale tokens, so bail to the un-refined fallback rather than panic in
             // production.
-            let reparsed_hash = crate::index::clones::tokens::struct_hash(&seq);
+            let reparsed_hash = rag_rat_clones::tokens::struct_hash(&seq);
             if reparsed_hash != row.struct_hash {
                 // Silent degrade: a library read must not write to stderr. The drift is already
                 // surfaced to callers via `completeness.stale_members`; here we just fall back to
@@ -922,7 +919,7 @@ impl IndexDatabase {
                 return Ok(None);
             }
 
-            members.push(crate::index::clones::refine::RefineMember {
+            members.push(rag_rat_clones::refine::RefineMember {
                 symbol_id: row.symbol_id,
                 lang: row.language,
                 struct_hash: row.struct_hash,

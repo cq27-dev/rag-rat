@@ -767,7 +767,7 @@ fn every_recursive_tree_descender_grows_the_stack() {
     assert!(
         offenders.is_empty(),
         "recursive tree descenders missing a grow_stack wrap (a deeply-nested source file \
-         overflows the indexer stack via these — wrap the recursion in crate::index::grow_stack, \
-         #543):\n{offenders:#?}",
+         overflows the indexer stack via these — wrap the recursion in \
+         rag_rat_base::stack::grow_stack, #543):\n{offenders:#?}",
     );
 }

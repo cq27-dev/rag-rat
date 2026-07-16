@@ -15,14 +15,14 @@
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum Confidence {
+pub enum Confidence {
     High,
     Medium,
     Low,
 }
 
 impl Confidence {
-    pub(crate) fn as_db_str(&self) -> &'static str {
+    pub fn as_db_str(&self) -> &'static str {
         (*self).into()
     }
 

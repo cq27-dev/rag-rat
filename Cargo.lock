@@ -3590,6 +3590,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "stacker",
  "strum",
  "tempfile",
  "thiserror 2.0.18",
@@ -3597,6 +3598,22 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rag-rat-clones"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "rag-rat-base",
+ "rag-rat-core",
+ "rag-rat-db",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "strum",
+ "tempfile",
+ "tree-sitter",
 ]
 
 [[package]]
@@ -3622,6 +3639,7 @@ dependencies = [
  "path-slash",
  "protobuf",
  "rag-rat-base",
+ "rag-rat-clones",
  "rag-rat-db",
  "rag-rat-llm",
  "rag-rat-papertrail",

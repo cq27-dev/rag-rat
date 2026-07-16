@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 rag-rat-base.workspace = true
+rag-rat-clones.workspace = true
 rag-rat-db.workspace = true
 rag-rat-llm = { workspace = true, default-features = false }
 rag-rat-papertrail.workspace = true

@@ -1,3 +1,8 @@
+//! Clone detection for the rag-rat workspace: scope-independent structural fingerprints
+//! (computed from the engine's shared parse), token-bag postings, and the refine/antiunify
+//! pipeline that upgrades candidate pairs into ranked clone classes. The engine supplies
+//! parsed ASTs and symbol spans; this crate never parses or reads engine state upward.
+
 //! Clone-detection fingerprint substrate (#215 Phase 1): a scope-independent structural
 //! fingerprint per function symbol, computed during indexing.
 
@@ -6,10 +11,10 @@
 // They are dead until Plan 3 lands; the rest of the module is live (R4's candidate read uses it).
 #![allow(dead_code)]
 
-pub(crate) mod bag_blob;
-pub(crate) mod normalize;
-pub(crate) mod refine;
-pub(crate) mod tokens;
+pub mod bag_blob;
+pub mod normalize;
+pub mod refine;
+pub mod tokens;
 
 use tree_sitter::Node;
 
@@ -41,7 +46,7 @@ use tree_sitter::Node;
 /// (`let f = { … }`) and `constructor` (`init`) bodies now fingerprint like every other function
 /// body. Same auto-exclude-then-recompute path; the bump forces re-fingerprinting on the next
 /// reindex.
-pub(crate) const NORM_VERSION: i64 = 4;
+pub const NORM_VERSION: i64 = 4;
 /// Bumped when the LCS alignment / refinement algorithm changes; participates in the content-
 /// addressed `refinement_key` and in the `clone_refinements` cache freshness predicate, so a bump
 /// invalidates every cached refinement without a schema migration (the same discipline as
@@ -63,19 +68,19 @@ pub(crate) const NORM_VERSION: i64 = 4;
 /// cache-freshness discipline, not a behavior change to the over-claim contract.
 pub(crate) const ALIGNMENT_VERSION: i64 = 3;
 /// Smallest normalized-token count a symbol must reach to be fingerprinted (skip trivial getters).
-pub(crate) const MIN_TOKENS: usize = 20;
+pub const MIN_TOKENS: usize = 20;
 
 /// Which token space a fingerprint was computed in. Baseline is always present and is the only
 /// input to candidate recall; Scip is an optional precision signal (Plan 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
-pub(crate) enum NormalizerKind {
+pub enum NormalizerKind {
     Baseline,
     Scip,
 }
 
 impl NormalizerKind {
-    pub(crate) fn as_db_str(self) -> &'static str {
+    pub fn as_db_str(self) -> &'static str {
         self.into()
     }
 
@@ -86,7 +91,7 @@ impl NormalizerKind {
 
 /// One symbol's baseline fingerprint, ready to persist.
 #[derive(Debug, Clone)]
-pub(crate) struct SymbolFingerprint {
+pub struct SymbolFingerprint {
     pub struct_hash: String,
     pub token_len: i64,
     /// `(token_hash, freq)` multiset sorted by `token_hash`. Serialized into the
@@ -143,11 +148,18 @@ fn symbol_is_function_valued(node: Node<'_>) -> bool {
 /// that normalize below `MIN_TOKENS` are skipped. The full-rebuild prepare phase calls this from
 /// the parse it already did for symbols/edges; the incremental path re-parses and calls it from
 /// `store_symbol_fingerprints`.
-pub(crate) fn fingerprint_symbols(
+/// Boundary view of one indexed symbol the engine wants fingerprinted (span + kind only).
+pub struct FingerprintCandidate<'a> {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub kind: &'a str,
+}
+
+pub fn fingerprint_symbols(
     root: Node<'_>,
     text: &str,
     lang: rag_rat_base::language::Language,
-    symbols: &[crate::index::symbols::Symbol],
+    symbols: &[FingerprintCandidate<'_>],
 ) -> Vec<(usize, SymbolFingerprint)> {
     let mut out = Vec::new();
     for (i, symbol) in symbols.iter().enumerate() {
@@ -158,9 +170,7 @@ pub(crate) fn fingerprint_symbols(
         // and the direct analog of a Rust `fn new()`, which fingerprints as a `function`),
         // OR a function-valued declarator (the node check rejects plain-value consts —
         // `const x = 5;` — so symbol `kind` stays unchanged, #232 #5 / R2).
-        if !matches!(symbol.kind.as_str(), "function" | "constructor")
-            && !symbol_is_function_valued(node)
-        {
+        if !matches!(symbol.kind, "function" | "constructor") && !symbol_is_function_valued(node) {
             continue;
         }
         if let Some(fp) = fingerprint_symbol(node, text, lang) {
@@ -175,9 +185,22 @@ mod tests {
     use std::path::Path;
 
     use rag_rat_base::language::Language;
+    use rag_rat_core::index::{parser, symbols};
 
     use super::*;
-    use crate::index::{parser, symbols};
+
+    fn candidates_of(
+        symbols: &[rag_rat_core::index::symbols::Symbol],
+    ) -> Vec<FingerprintCandidate<'_>> {
+        symbols
+            .iter()
+            .map(|s| FingerprintCandidate {
+                start_byte: s.start_byte,
+                end_byte: s.end_byte,
+                kind: &s.kind,
+            })
+            .collect()
+    }
 
     #[test]
     fn normalizer_kind_db_str_round_trips() {
@@ -259,7 +282,7 @@ mod tests {
             parsed.root(),
             "struct S {\n  let plain = 5\n}\n",
             Language::Swift,
-            &symbols,
+            &candidates_of(&symbols),
         );
         assert!(
             fingerprints.is_empty(),
@@ -387,7 +410,7 @@ mod tests {
             parsed.root(),
             big_object,
             Language::TypeScript,
-            &symbols::from_parsed(&parsed.symbols),
+            &candidates_of(&symbols::from_parsed(&parsed.symbols)),
         );
         assert!(
             fps.is_empty(),

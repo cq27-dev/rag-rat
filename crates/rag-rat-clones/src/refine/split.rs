@@ -114,7 +114,7 @@ const MAX_SPLIT_GROUPS: usize = 256;
 /// Every returned class is internally coherent (all pairs ≥ theta): a member is only added to a
 /// group after it has passed the coherence check against every existing member, so the all-pairs
 /// property holds across all insertions.
-pub(crate) fn coherence_split(
+pub fn coherence_split(
     component: &[i64],
     edges: &[(i64, i64)],
     similarity: impl Fn(i64, i64) -> f64,

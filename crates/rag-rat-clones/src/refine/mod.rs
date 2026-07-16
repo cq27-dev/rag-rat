@@ -3,17 +3,17 @@
 //!
 //! Each step lives in a focused sibling file; this module curates the `pub(crate)` surface.
 
-pub(crate) mod split;
+pub mod split;
 
-pub(crate) mod align;
+pub mod align;
 
 pub(crate) mod antiunify;
 
 pub(crate) mod signature;
 
-pub(crate) mod cache;
+pub mod cache;
 
-pub(crate) mod score;
+pub mod score;
 
 /// Input to the LCS-based variation-point analysis for one clone-class member (#215 Plan 4a Task
 /// 2, extended in Plan 4b Task 5b).
@@ -29,22 +29,22 @@ pub(crate) mod score;
 /// ABSOLUTE file byte offsets for `seq[i]`, and `text` is the whole-file source. Members sharing
 /// one file share the same `Arc<str>` buffer (one allocation per file). Per §1.6: recover a token's
 /// source slice via `text.get(node_spans[i].start_byte..node_spans[i].end_byte)`.
-pub(crate) struct RefineMember {
-    pub(crate) symbol_id: i64,
-    pub(crate) lang: rag_rat_base::language::Language,
+pub struct RefineMember {
+    pub symbol_id: i64,
+    pub lang: rag_rat_base::language::Language,
     /// Persisted baseline struct_hash — the canonical sort key + cache key.
-    pub(crate) struct_hash: String,
+    pub struct_hash: String,
     /// Ordered baseline token sequence (LCS input). Parallel to `node_spans`.
-    pub(crate) seq: Vec<String>,
+    pub seq: Vec<String>,
     /// AST span for each token in `seq` (Plan-4b). `node_spans[i]` ↔ `seq[i]`.
     /// Byte offsets are ABSOLUTE file offsets (full-file `text` is the backing buffer).
     /// Produced by `normalize_baseline_spanned`; same length as `seq`.
-    pub(crate) node_spans: Vec<crate::index::clones::normalize::NodeSpan>,
+    pub node_spans: Vec<crate::normalize::NodeSpan>,
     /// Whole-file source for this member's file (Plan-4b). Members sharing one file share the
     /// same `Arc` — one allocation per distinct path. Use
     /// `text.get(span.start_byte..span.end_byte)` to recover real source for any `NodeSpan` in
     /// `node_spans`.
-    pub(crate) text: std::sync::Arc<str>,
+    pub text: std::sync::Arc<str>,
     /// SCIP-oracle callee resolutions for this member's file (#275, Plan 3): the callee-identifier
     /// byte range → the resolved SCIP moniker, from `edge_oracle` rows whose `file_sha` matches
     /// the EXACT bytes `text` was read from (so the spans line up — see
@@ -53,5 +53,5 @@ pub(crate) struct RefineMember {
     /// same-symbol-different-spelling callee back into the fixed spine instead of reopening it as
     /// a `differing_callee` variation. Byte ranges use the same ABSOLUTE file offsets as
     /// `node_spans`.
-    pub(crate) callee_monikers: std::collections::HashMap<(usize, usize), String>,
+    pub callee_monikers: std::collections::HashMap<(usize, usize), String>,
 }

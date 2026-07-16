@@ -85,7 +85,7 @@ fn property_name(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn variable_declaration(node: Node<'_>) -> Option<Node<'_>> {
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).find_map(|child| {
             if child.kind() == "variable_declaration" {

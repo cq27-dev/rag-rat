@@ -11,13 +11,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rag_rat_clones::NORM_VERSION;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::scoring::{canonical_member_order_key, class_key_for};
 use super::substrate::{METRIC_SAMPLE_CAP, SymbolBag, overlap};
 use super::types::{CandidateCloneClass, CloneMember, RoiFactors};
 use super::{HYDRATION_CHUNK, MAX_MEMBERS, MEMBER_VALUE_CAP};
-use crate::index::clones::NORM_VERSION;
 
 /// Build a [`CandidateCloneClass`] from a component (a slice of symbol ids). Returns `None` if
 /// any id is missing from `by_id` (shouldn't happen for a well-formed component derived from the

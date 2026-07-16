@@ -361,7 +361,7 @@ pub(super) fn first_descendant_node<'tree>(
 ) -> Option<Node<'tree>> {
     // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep subtree
     // (#543).
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if kinds.contains(&child.kind()) {
@@ -401,7 +401,7 @@ pub(super) fn last_descendant_node<'tree>(
     node: Node<'tree>,
     kinds: &[&str],
 ) -> Option<Node<'tree>> {
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         let mut last = None;
         for child in node.named_children(&mut cursor) {

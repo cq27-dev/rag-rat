@@ -5,10 +5,10 @@
 //! symbol carries no current-version fingerprint (generated / stale normalizer / non-function /
 //! below-min-tokens) in priority order.
 
+use rag_rat_clones::NORM_VERSION;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::types::{CloneIneligibilityReason, CloneSymbolSelector};
-use crate::index::clones::NORM_VERSION;
 
 /// Resolve a [`CloneSymbolSelector`] to an in-scope `symbols.id` rowid, or `None` if the selector
 /// doesn't match any symbol in the active scope.

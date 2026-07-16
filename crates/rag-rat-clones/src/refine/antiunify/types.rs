@@ -27,7 +27,7 @@ pub(crate) enum MetavarKind {
 
 impl MetavarKind {
     /// Stable lower-case machine string. Used both as the persisted role and as `extraction_role`.
-    pub(crate) fn as_db_str(&self) -> &'static str {
+    pub fn as_db_str(&self) -> &'static str {
         (*self).into()
     }
 }

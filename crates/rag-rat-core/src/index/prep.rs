@@ -3,6 +3,7 @@
 
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::paths::path_string;
+use rag_rat_clones as clones;
 
 use super::*;
 
@@ -564,7 +565,17 @@ pub(crate) fn prepare_index_content_from_text(
     } else {
         parsed
             .as_ref()
-            .map(|p| clones::fingerprint_symbols(p.root(), text, language, &symbols))
+            .map(|p| {
+                let candidates: Vec<rag_rat_clones::FingerprintCandidate<'_>> = symbols
+                    .iter()
+                    .map(|s| rag_rat_clones::FingerprintCandidate {
+                        start_byte: s.start_byte,
+                        end_byte: s.end_byte,
+                        kind: &s.kind,
+                    })
+                    .collect();
+                clones::fingerprint_symbols(p.root(), text, language, &candidates)
+            })
             .unwrap_or_default()
     };
 

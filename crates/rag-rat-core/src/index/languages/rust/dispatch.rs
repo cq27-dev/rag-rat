@@ -152,7 +152,7 @@ fn arm_rebinds_local(node: Node<'_>) -> bool {
         return true;
     }
     // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep arm (#543).
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).any(arm_rebinds_local)
     })
@@ -164,7 +164,7 @@ fn subtree_has_identifier(node: Node<'_>) -> bool {
     if node.kind() == "identifier" {
         return true;
     }
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).any(subtree_has_identifier)
     })
@@ -182,7 +182,7 @@ fn result_handler_calls<'a>(
 ) {
     // grow_stack: recurses to full expression depth across many arms; wrap the whole recursion so a
     // hostile deeply-nested handler expression grows the stack rather than overflowing (#543).
-    crate::index::grow_stack(|| result_handler_calls_impl(node, text, scope, out));
+    rag_rat_base::stack::grow_stack(|| result_handler_calls_impl(node, text, scope, out));
 }
 
 fn result_handler_calls_impl<'a>(
@@ -494,7 +494,7 @@ fn unwrap_to_call(node: Node<'_>) -> Option<Node<'_>> {
 fn pattern_binding_names(pattern: Node<'_>, text: &str, out: &mut Vec<String>) {
     // grow_stack: recurses to full pattern depth across several arms; wrap the whole recursion so a
     // hostile deeply-nested destructuring pattern grows the stack rather than overflowing (#543).
-    crate::index::grow_stack(|| pattern_binding_names_impl(pattern, text, out));
+    rag_rat_base::stack::grow_stack(|| pattern_binding_names_impl(pattern, text, out));
 }
 
 fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<String>) {

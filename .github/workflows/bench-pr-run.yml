@@ -13,6 +13,7 @@ on:
     types: [opened, reopened, edited, synchronize]
     paths:
       - 'crates/rag-rat-base/**'
+      - 'crates/rag-rat-clones/**'
       - 'crates/rag-rat-db/**'
       - 'crates/rag-rat-llm/**'
       - 'crates/rag-rat-papertrail/**'

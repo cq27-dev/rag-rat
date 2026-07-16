@@ -19,6 +19,7 @@ on:
       # over external corpora, so it gates core's parser/resolution AND the cli entry points that
       # drive it. Only the mcp crate can't move it — narrow from crates/** to core + cli (drops mcp).
       - 'crates/rag-rat-base/**'
+      - 'crates/rag-rat-clones/**'
       - 'crates/rag-rat-db/**'
       - 'crates/rag-rat-llm/**'
       - 'crates/rag-rat-papertrail/**'
@@ -43,6 +44,7 @@ on:
       # over external corpora, so it gates core's parser/resolution AND the cli entry points that
       # drive it. Only the mcp crate can't move it — narrow from crates/** to core + cli (drops mcp).
       - 'crates/rag-rat-base/**'
+      - 'crates/rag-rat-clones/**'
       - 'crates/rag-rat-db/**'
       - 'crates/rag-rat-llm/**'
       - 'crates/rag-rat-papertrail/**'

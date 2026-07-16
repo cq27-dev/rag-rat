@@ -20,6 +20,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rag_rat_base::language::Language;
+use rag_rat_clones::bag_blob::decode_token_bag;
+use rag_rat_clones::{NORM_VERSION, SymbolFingerprint, fingerprint_symbols};
 use rusqlite::types::Value;
 use rusqlite::{Connection, params, params_from_iter};
 use serde::Serialize;
@@ -29,8 +31,6 @@ use super::substrate::{
     load_scoped_baseline_bags, overlap, sub_block_tokens, verified_clone,
 };
 use super::{HYDRATION_CHUNK, THETA};
-use crate::index::clones::bag_blob::decode_token_bag;
-use crate::index::clones::{NORM_VERSION, SymbolFingerprint, fingerprint_symbols};
 use crate::index::{IndexDatabase, parser, symbols};
 
 /// One file to clone-check (owns its data so a batch can be assembled from disparate sources).
@@ -502,7 +502,15 @@ fn check_against(
     let Some(parsed) = parser::parse_file(path, language, text) else {
         return Ok(Vec::new());
     };
-    let new_fps = fingerprint_symbols(parsed.root(), text, language, &syms);
+    let candidates: Vec<rag_rat_clones::FingerprintCandidate<'_>> = syms
+        .iter()
+        .map(|s| rag_rat_clones::FingerprintCandidate {
+            start_byte: s.start_byte,
+            end_byte: s.end_byte,
+            kind: &s.kind,
+        })
+        .collect();
+    let new_fps = fingerprint_symbols(parsed.root(), text, language, &candidates);
     if new_fps.is_empty() {
         return Ok(Vec::new());
     }
@@ -810,7 +818,7 @@ mod tests {
 
         // Fresh index: fingerprints land at the current NORM_VERSION → healthy, no reindex prompt.
         let healthy = db.clone_fingerprint_health().unwrap();
-        assert_eq!(healthy.required_norm_version, crate::index::clones::NORM_VERSION);
+        assert_eq!(healthy.required_norm_version, rag_rat_clones::NORM_VERSION);
         assert!(healthy.usable > 0 && healthy.total > 0, "{healthy:?}");
         assert!(!healthy.needs_reindex && healthy.message.is_none(), "{healthy:?}");
 
@@ -823,7 +831,7 @@ mod tests {
             c.execute(
                 "UPDATE symbol_fingerprints SET normalizer_version = ?1 WHERE normalizer_kind = \
                  'baseline'",
-                [crate::index::clones::NORM_VERSION - 1],
+                [rag_rat_clones::NORM_VERSION - 1],
             )
             .unwrap();
         }
@@ -1016,7 +1024,15 @@ mod tests {
         let lang = rag_rat_base::language::Language::Rust;
         let syms = crate::index::symbols::symbols_for_file(path, lang, text);
         let parsed = crate::index::parser::parse_file(path, lang, text).unwrap();
-        let fps = crate::index::clones::fingerprint_symbols(parsed.root(), text, lang, &syms);
+        let candidates: Vec<rag_rat_clones::FingerprintCandidate<'_>> = syms
+            .iter()
+            .map(|s| rag_rat_clones::FingerprintCandidate {
+                start_byte: s.start_byte,
+                end_byte: s.end_byte,
+                kind: &s.kind,
+            })
+            .collect();
+        let fps = rag_rat_clones::fingerprint_symbols(parsed.root(), text, lang, &candidates);
         let (_, fp) = fps.into_iter().next().expect("one function in probe text");
         super::bag_from_fingerprint(&fp, "rust", df)
     }

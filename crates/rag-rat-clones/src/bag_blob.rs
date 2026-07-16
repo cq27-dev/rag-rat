@@ -23,7 +23,7 @@ const PAIR_LEN: usize = 16;
 /// Pack a `(token_hash, freq)` multiset into the versioned BLOB. The input is expected sorted by
 /// `token_hash` with no duplicate hashes (the contract of `tokens::token_bag`); this preserves that
 /// order verbatim, so the decode is byte-lossless and the bag never needs re-sorting on read.
-pub(crate) fn encode_token_bag(bag: &[(i64, i64)]) -> Vec<u8> {
+pub fn encode_token_bag(bag: &[(i64, i64)]) -> Vec<u8> {
     let count = bag.len();
     debug_assert!(count <= u32::MAX as usize, "token bag exceeds u32 count header");
     let mut buf = Vec::with_capacity(HEADER_LEN + count * PAIR_LEN);
@@ -41,7 +41,7 @@ pub(crate) fn encode_token_bag(bag: &[(i64, i64)]) -> Vec<u8> {
 /// the next reindex — never a panic): wrong version, header shorter than [`HEADER_LEN`], or a
 /// length that disagrees with the declared count. The returned pairs keep the stored order
 /// (token_hash ASC).
-pub(crate) fn decode_token_bag(blob: &[u8]) -> Option<Vec<(i64, i64)>> {
+pub fn decode_token_bag(blob: &[u8]) -> Option<Vec<(i64, i64)>> {
     if blob.len() < HEADER_LEN {
         return None;
     }
@@ -68,7 +68,7 @@ pub(crate) fn decode_token_bag(blob: &[u8]) -> Option<Vec<(i64, i64)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::clones::tokens;
+    use crate::tokens;
 
     #[test]
     fn token_bag_blob_round_trips() {

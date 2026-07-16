@@ -16,7 +16,7 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// Content hash of the exact normalized token sequence — the exact-after-normalization fast path.
-pub(crate) fn struct_hash(tokens: &[String]) -> String {
+pub fn struct_hash(tokens: &[String]) -> String {
     rag_rat_base::hash::hex_sha256(tokens.join("\u{1}").as_bytes())
 }
 

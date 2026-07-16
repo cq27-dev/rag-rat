@@ -100,7 +100,7 @@ pub(crate) fn lcs_align(a: &[String], b: &[String]) -> Alignment {
 /// defensive bound for a pathological direct caller (mirroring `align_to_anchor`'s defensive member
 /// cap), and is therefore deliberately NOT lowered to ≤ `MEMBER_VALUE_CAP`. What actually bounds
 /// the AGGREGATE exact-DP cost regardless of member count is [`LCS_AGGREGATE_CELLS_BUDGET`].
-pub(crate) const LCS_MEMBER_SAMPLE: usize = 64;
+pub const LCS_MEMBER_SAMPLE: usize = 64;
 
 /// AGGREGATE cap on the total number of exact-DP cells `class_lcs_ratio` will compute across ALL
 /// member pairs in one class. The per-pair length cap ([`LCS_MAX_SEQ_TOKENS`]) only fires when ONE

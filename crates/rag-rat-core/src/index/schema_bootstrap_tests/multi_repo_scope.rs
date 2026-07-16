@@ -1091,7 +1091,7 @@ fn clone_precompute_leaves_sibling_repo_generation_untouched() {
                  source_revision, cursor_symbol_id, edges_written, postings_written, started_at_ms,
                  finished_at_ms, repo_id)
              VALUES (5000, 'Complete', 0.7, 'baseline', ?1, 'revB', 0, 0, 1, 0, 0, ?2)",
-            rusqlite::params![crate::index::clones::NORM_VERSION, REPO_B],
+            rusqlite::params![rag_rat_clones::NORM_VERSION, REPO_B],
         )
         .unwrap();
     }
@@ -1159,7 +1159,7 @@ fn clone_token_df_recompute_excludes_a_sibling_repos_fingerprints() {
              VALUES (?1, 'baseline', 1, NULL, 'bstruct', 1, ?2, 0)",
             rusqlite::params![
                 symbol_id,
-                crate::index::clones::bag_blob::encode_token_bag(&[(SENTINEL_TOKEN, 1)])
+                rag_rat_clones::bag_blob::encode_token_bag(&[(SENTINEL_TOKEN, 1)])
             ],
         )
         .unwrap();

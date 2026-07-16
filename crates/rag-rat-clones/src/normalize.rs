@@ -130,13 +130,13 @@ pub(crate) fn is_rust_type_kind(kind: &str) -> bool {
 /// (`tokens[i]` ⇔ `spans[i]`). Pre-order; an internal node's span covers its WHOLE subtree,
 /// a leaf's span is the leaf. Byte offsets are ABSOLUTE file offsets (node.start_byte/end_byte).
 #[derive(Clone, Debug)]
-pub(crate) struct NodeSpan {
-    pub(crate) start_byte: usize,
-    pub(crate) end_byte: usize,
+pub struct NodeSpan {
+    pub start_byte: usize,
+    pub end_byte: usize,
     /// `node.kind()` returns a `&'static str` from the grammar — stored directly, no allocation.
-    pub(crate) kind: &'static str,
+    pub kind: &'static str,
     /// `true` iff `node.child_count() == 0`.
-    pub(crate) is_leaf: bool,
+    pub is_leaf: bool,
 }
 
 /// Spanned baseline normalization: identical token stream to `normalize_baseline`, PLUS one
@@ -145,7 +145,7 @@ pub(crate) struct NodeSpan {
 /// The returned vecs are always the same length: `tokens[i]` ↔ `spans[i]`.
 /// Internal-node tokens carry the span of the whole subtree (pre-order push before recursing);
 /// leaf tokens carry the span of the leaf node itself.
-pub(crate) fn normalize_baseline_spanned(
+pub fn normalize_baseline_spanned(
     node: Node<'_>,
     text: &str,
     lang: Language,
@@ -231,7 +231,7 @@ fn walk_spanned(
 
     // grow_stack: this recurses to full subtree depth; a hostile deeply-nested clone body must grow
     // the stack, not overflow it (#543).
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             walk_spanned(child, src, lang, idents, tokens, spans);
@@ -244,9 +244,9 @@ mod tests {
     use std::path::Path;
 
     use rag_rat_base::language::Language;
+    use rag_rat_core::index::parser;
 
     use super::*;
-    use crate::index::parser;
 
     /// Pick the target symbol's AST node for a normalization test: the symbol whose subtree
     /// normalizes to the MOST tokens (the actual body under test, language-agnostic). Choosing by

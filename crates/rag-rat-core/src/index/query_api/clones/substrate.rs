@@ -13,11 +13,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use rag_rat_clones::NORM_VERSION;
 use rayon::prelude::*;
 use rusqlite::Connection;
 
 use super::THETA;
-use crate::index::clones::NORM_VERSION;
 
 /// Pairwise metric work cap for huge components: when a component exceeds this count, the
 /// O(n²) pairwise metric loop (`similarity_min`, medoid, `similarity_medoid_min`,
@@ -251,7 +251,7 @@ fn load_scoped_baseline_bags_filtered(
             let Some(blob) = row.get::<_, Option<Vec<u8>>>(4)? else {
                 continue;
             };
-            let Some(bag_pairs) = crate::index::clones::bag_blob::decode_token_bag(&blob) else {
+            let Some(bag_pairs) = rag_rat_clones::bag_blob::decode_token_bag(&blob) else {
                 // A stale/corrupt blob (version mismatch / truncation) decodes to None — treat as
                 // no-bag, same as NULL. It is repopulated on the next reindex.
                 continue;

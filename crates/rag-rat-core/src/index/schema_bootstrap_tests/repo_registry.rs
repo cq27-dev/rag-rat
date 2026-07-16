@@ -3483,7 +3483,7 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
              cursor_symbol_id, edges_written, postings_written, started_at_ms, finished_at_ms,
              repo_id)
          VALUES (1, 'Complete', 0.7, 'baseline', ?1, 'rev', 0, 0, 1, 0, 0, ?2)",
-        rusqlite::params![crate::index::clones::NORM_VERSION, LEGACY_REPO_ID],
+        rusqlite::params![rag_rat_clones::NORM_VERSION, LEGACY_REPO_ID],
     )
     .unwrap();
     // A V046 dream-v2 verification sibling — repo_id-scoped from birth. Adoption must re-point it

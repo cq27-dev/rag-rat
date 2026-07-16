@@ -1,0 +1,30 @@
+[package]
+name = "rag-rat-clones"
+version.workspace = true
+description = "Clone detection for the rag-rat workspace: structural fingerprints, token-bag postings, and the refine/antiunify pipeline."
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rag-rat-base.workspace = true
+rag-rat-db.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+tree-sitter.workspace = true
+
+[dev-dependencies]
+# Cyclic dev-dependency (Cargo supports this): the normalization/refine tests drive the ENGINE's
+# real parser over fixture snippets instead of duplicating grammar wiring here. PATH-ONLY (no
+# version) on purpose: cargo strips version-less path dev-deps from the published manifest, so
+# the registry never sees the cycle and lockstep publishing stays orderable (clones before core).
+rag-rat-core = { path = "../rag-rat-core", default-features = false }
+tempfile.workspace = true

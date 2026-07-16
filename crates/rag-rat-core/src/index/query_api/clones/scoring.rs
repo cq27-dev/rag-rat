@@ -12,10 +12,11 @@
 
 use std::collections::BTreeMap;
 
+use rag_rat_clones::NORM_VERSION;
+
 use super::MEMBER_VALUE_CAP;
 use super::substrate::{SymbolBag, overlap};
 use super::types::{CandidateCloneClass, CloneCompleteness};
-use crate::index::clones::NORM_VERSION;
 
 /// Deterministic, order-independent class key: sort `member_refs`, join with `\n`,
 /// `hex_sha256`, take the first 16 hex chars.
@@ -174,11 +175,11 @@ pub(crate) fn dampen_unrefined_member_count(class: &mut CandidateCloneClass) {
 ///   member count regardless of cache hit/miss, so it flags the sample even for a row that predates
 ///   the persisted `lcs_sampled` bit (default 0 on an additively-migrated DB until recomputed).
 ///
-/// [`CachedRefinement`]: crate::index::clones::refine::cache::CachedRefinement
+/// [`CachedRefinement`]: rag_rat_clones::refine::cache::CachedRefinement
 /// [`IndexDatabase::refine_class_in_place`]: crate::index::IndexDatabase
 pub(crate) fn apply_refinement(
     class: &mut CandidateCloneClass,
-    refinement: crate::index::clones::refine::cache::CachedRefinement,
+    refinement: rag_rat_clones::refine::cache::CachedRefinement,
 ) {
     // Swap the ROI cohesion multiplier for `refactorability` on refined classes (Plan 4a). The
     // other factors are unchanged (cross-module spread × member count × medoid body tokens ×
@@ -249,7 +250,7 @@ pub(crate) fn build_completeness(
         normalizer_kind: "baseline",
         normalizer_version: NORM_VERSION,
         min_similarity,
-        min_tokens: crate::index::clones::MIN_TOKENS as i64,
+        min_tokens: rag_rat_clones::MIN_TOKENS as i64,
         min_copies,
         candidate_metric: "overlap_max_denominator",
         containment_metric: "overlap_min_denominator",

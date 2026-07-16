@@ -3,7 +3,7 @@ use super::super::score::Confidence;
 use super::types::{ClassAlignment, MetavarKind};
 use super::values::aligned_values;
 use super::widen::is_string_node_kind;
-use crate::index::clones::normalize::NodeSpan;
+use crate::normalize::NodeSpan;
 
 /// The role a reopened matched column takes — the output of [`matched_column_reopen`]. Each variant
 /// names a position the baseline normalizer ERASES the source value of, so a genuine difference
@@ -514,12 +514,12 @@ fn is_closureish_kind(kind: &str) -> bool {
 }
 
 /// `true` for a tree-sitter type-position node kind. Delegates to the shared
-/// [`crate::index::clones::normalize::is_rust_type_kind`] so the anti-unify classifier and the
+/// [`crate::normalize::is_rust_type_kind`] so the anti-unify classifier and the
 /// signature recoverer (`signature::is_type_kind`) can never disagree on what counts as a type —
 /// notably the OUTER composite type nodes (`&Foo`, `[T; N]`, `(A, B)`, `Box<Foo>`, …) the
 /// classifier previously omitted, mis-routing them to `closure_param` (Fix 4, #215 Plan 4b).
 pub(super) fn is_type_position(kind: &str) -> bool {
-    crate::index::clones::normalize::is_rust_type_kind(kind)
+    crate::normalize::is_rust_type_kind(kind)
 }
 
 /// `true` for a baseline leaf token that names a value-position leaf: a local identifier (`ID<n>`)

@@ -290,7 +290,7 @@ fn span_is_plumbing(
 ) -> bool {
     // grow_stack: this recurses into container children to full subtree depth; a hostile
     // deeply-nested chunk must grow the stack, not overflow it (#543).
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).all(|child| {
             if child.end_byte() <= start_byte || child.start_byte() >= end_byte {

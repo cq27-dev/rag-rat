@@ -655,7 +655,7 @@ fn indexing_writes_baseline_fingerprints_for_functions() {
         .map(|r| r.unwrap())
         .collect();
     for (token_len, blob) in &rows {
-        let bag = crate::index::clones::bag_blob::decode_token_bag(blob).expect("BLOB decodes");
+        let bag = rag_rat_clones::bag_blob::decode_token_bag(blob).expect("BLOB decodes");
         assert!(!bag.is_empty(), "a fingerprinted symbol has a non-empty bag");
         let total_freq: i64 = bag.iter().map(|&(_, f)| f).sum();
         assert_eq!(total_freq, *token_len, "token_len == sum of freqs (lossless bag)");
@@ -727,7 +727,7 @@ fn clone_token_df_recomputed_from_blobs_matches_postings_era() {
         let Some(blob) = row.get::<_, Option<Vec<u8>>>(1).unwrap() else {
             continue;
         };
-        let bag = crate::index::clones::bag_blob::decode_token_bag(&blob).expect("decodes");
+        let bag = rag_rat_clones::bag_blob::decode_token_bag(&blob).expect("decodes");
         for (token_hash, _freq) in bag {
             *expected.entry((kind.clone(), token_hash)).or_insert(0) += 1;
         }
@@ -1265,7 +1265,7 @@ fn candidate_read_ignores_stale_normalizer_version_rows() {
 /// directories form one candidate class; metrics are plausible and completeness block is populated.
 #[test]
 fn find_clones_ranks_a_clean_clone_class_with_metrics() {
-    use crate::index::clones::NORM_VERSION;
+    use rag_rat_clones::NORM_VERSION;
 
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
@@ -1954,7 +1954,7 @@ fn clones_for_symbol_returns_refined_class() {
 /// same key; the two key families never collide for the same class.
 #[test]
 fn refinement_key_is_content_addressed_and_distinct_from_read_key() {
-    use crate::index::clones::refine::cache::{RefineMode, refinement_key};
+    use rag_rat_clones::refine::cache::{RefineMode, refinement_key};
 
     let hashes = vec!["h1".to_string(), "h2".to_string(), "h3".to_string()];
     let shuffled = vec!["h3".to_string(), "h1".to_string(), "h2".to_string()];
@@ -2375,7 +2375,8 @@ fn find_clones_huge_limit_clamps_to_refine_budget() {
 /// loads).
 #[test]
 fn load_refine_members_returns_up_to_value_cap() {
-    use crate::index::clones::refine::align::LCS_MEMBER_SAMPLE;
+    use rag_rat_clones::refine::align::LCS_MEMBER_SAMPLE;
+
     use crate::index::query_api::{MAX_MEMBERS, MEMBER_VALUE_CAP};
     // Constant consistency assertions — these values are load-bearing.
     assert_eq!(MEMBER_VALUE_CAP, 50, "MEMBER_VALUE_CAP must be 50");
@@ -2716,7 +2717,7 @@ fn clones_for_symbol_reports_eligibility() {
 /// verdicts and the bool/enum consistency invariant.
 #[test]
 fn clones_for_symbol_distinguishes_ineligibility_reasons() {
-    use crate::index::clones::NORM_VERSION;
+    use rag_rat_clones::NORM_VERSION;
 
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
@@ -3283,7 +3284,7 @@ fn clones_for_symbol_prefers_fingerprinted_row_on_resolution() {
 /// bare stub source that definitely stays below MIN_TOKENS.
 #[test]
 fn pathline_tightest_span_wins_over_fingerprinted_enclosing() {
-    use crate::index::clones::NORM_VERSION;
+    use rag_rat_clones::NORM_VERSION;
 
     // Strategy: inject TWO symbols rows directly into the DB for the same file and same line,
     // with DIFFERENT spans. The OUTER has a wider span (lines 1-10) and IS fingerprinted (we
@@ -3555,7 +3556,7 @@ fn clones_for_symbol_ref_single_fingerprinted_resolves_unfingerprinted_falls_bac
 /// duplicates for the same file, but the index schema allows it and the code must handle it).
 #[test]
 fn clones_for_symbol_ref_ambiguous_fingerprinted_returns_err() {
-    use crate::index::clones::NORM_VERSION;
+    use rag_rat_clones::NORM_VERSION;
 
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
@@ -3722,7 +3723,7 @@ fn find_clones_stale_members_zero_on_clean_index_and_nonzero_after_disk_edit() {
 /// are populated.
 #[test]
 fn load_refine_members_reparse_is_faithful_to_persisted_struct_hash() {
-    use crate::index::clones::tokens::struct_hash;
+    use rag_rat_clones::tokens::struct_hash;
 
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);

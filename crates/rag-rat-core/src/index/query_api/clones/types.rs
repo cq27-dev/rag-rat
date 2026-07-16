@@ -193,7 +193,7 @@ pub enum CloneIneligibilityReason {
     /// Distinct from `BelowMinTokens` (where NO row exists at all): here the symbol WAS
     /// eligible, the index is just stale.
     ///
-    /// [`NORM_VERSION`]: crate::index::clones::NORM_VERSION
+    /// [`NORM_VERSION`]: rag_rat_clones::NORM_VERSION
     StaleNormalizerVersion,
     /// The symbol is function-shaped and in a non-generated file, but no current-version
     /// fingerprint row exists — its body normalized below [`MIN_TOKENS`](crate::index::clones)

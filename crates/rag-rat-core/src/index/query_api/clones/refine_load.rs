@@ -8,10 +8,10 @@
 //! refinement cache key. Both are all-or-nothing: a single un-hydratable member returns `Ok(None)`
 //! so the caller leaves the whole class un-refined rather than key over a partial multiset.
 
+use rag_rat_clones::NORM_VERSION;
 use rusqlite::Connection;
 
 use super::HYDRATION_CHUNK;
-use crate::index::clones::NORM_VERSION;
 
 /// One member's persisted hydration row before the re-parse: scoped path + byte range + language +
 /// the baseline `struct_hash` (the canonical sort/cache key). Mirrors `build_class`'s member
@@ -110,7 +110,7 @@ pub(crate) fn load_refine_rows(
 /// class). A class with NO covered file computes byte-identically to baseline, so it keeps the
 /// baseline key rather than duplicating rows into the scip namespace.
 ///
-/// [`RefineMode::Scip`]: crate::index::clones::refine::cache::RefineMode
+/// [`RefineMode::Scip`]: rag_rat_clones::refine::cache::RefineMode
 pub(crate) fn oracle_callee_coverage_exists(
     conn: &Connection,
     member_ids: &[i64],

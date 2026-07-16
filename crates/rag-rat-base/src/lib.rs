@@ -14,5 +14,6 @@ pub mod paths;
 pub mod repo_discover;
 pub mod repo_identity;
 pub mod serde_big_id;
+pub mod stack;
 pub mod time;
 pub mod version;

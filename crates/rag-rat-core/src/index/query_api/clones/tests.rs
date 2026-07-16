@@ -5,6 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rag_rat_clones::NORM_VERSION;
+
 use super::scoring::{
     COVERAGE_MILD_PENALTY, COVERAGE_STRONG_PENALTY, apply_refinement, canonical_member_order_key,
     class_key_for, coverage_roi_gate, dampen_unrefined_member_count,
@@ -16,7 +18,6 @@ use super::substrate::{
 };
 use super::types::{CandidateCloneClass, RoiFactors};
 use super::{MEMBER_VALUE_CAP, THETA};
-use crate::index::clones::NORM_VERSION;
 
 /// #256: the refined-ROI coverage gate is a mutually-exclusive band. A near-zero-coverage
 /// (degenerate `⟨m0⟩`) class gets the strong penalty so it can't float to the top on member
@@ -703,12 +704,12 @@ fn class_with_member_count(member_count: usize) -> CandidateCloneClass {
 
 /// A `CachedRefinement` whose `lcs_sampled` is FALSE — so the ONLY way `metrics_sampled` can
 /// flip is the member-count guard in `apply_refinement`.
-fn unsampled_refinement() -> crate::index::clones::refine::cache::CachedRefinement {
-    crate::index::clones::refine::cache::CachedRefinement {
+fn unsampled_refinement() -> rag_rat_clones::refine::cache::CachedRefinement {
+    rag_rat_clones::refine::cache::CachedRefinement {
         lcs_ratio: 1.0,
-        confidence: crate::index::clones::refine::score::Confidence::High,
+        confidence: rag_rat_clones::refine::score::Confidence::High,
         refactorability: 1.0,
-        refine_mode: crate::index::clones::refine::cache::RefineMode::Baseline,
+        refine_mode: rag_rat_clones::refine::cache::RefineMode::Baseline,
         template: String::new(),
         variation_points_json: "[]".to_string(),
         proposed_signature_json: "{}".to_string(),
@@ -839,7 +840,7 @@ fn recall_candidates_identical_blob_vs_postings_grouping() {
         .query_map([NORM_VERSION], |r| {
             let blob: Option<Vec<u8>> = r.get(4)?;
             let pairs = blob
-                .and_then(|b| crate::index::clones::bag_blob::decode_token_bag(&b))
+                .and_then(|b| rag_rat_clones::bag_blob::decode_token_bag(&b))
                 .unwrap_or_default();
             let mut tokens: Vec<(i64, i64, i64)> = pairs
                 .into_iter()

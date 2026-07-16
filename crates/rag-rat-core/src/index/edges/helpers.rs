@@ -129,7 +129,7 @@ pub(crate) fn child_name_text(node: Node<'_>, text: &str) -> Option<String> {
 pub(crate) fn first_identifier_text(node: Node<'_>, text: &str) -> Option<String> {
     // grow_stack: this recurses to full subtree depth; a hostile deeply-nested callee must grow
     // the stack, not overflow it (#543).
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if is_identifier_kind(child.kind()) {
@@ -161,7 +161,7 @@ pub(crate) fn collect_identifiers(node: Node<'_>, text: &str, out: &mut Vec<Stri
     }
     // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep subtree
     // (#543).
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             collect_identifiers(child, text, out);
@@ -172,7 +172,7 @@ pub(crate) fn collect_identifiers(node: Node<'_>, text: &str, out: &mut Vec<Stri
 /// order, so its byte range can be recorded for the SCIP join (#67). Same traversal, so the node it
 /// returns is exactly the token whose text [`first_identifier_text`] would have produced.
 pub(crate) fn first_identifier_node(node: Node<'_>) -> Option<Node<'_>> {
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if is_identifier_kind(child.kind()) {
@@ -203,7 +203,7 @@ fn collect_identifier_nodes<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>
         out.push(node);
         return;
     }
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             collect_identifier_nodes(child, out);

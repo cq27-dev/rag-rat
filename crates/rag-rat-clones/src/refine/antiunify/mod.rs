@@ -91,7 +91,7 @@ use super::align;
 #[cfg(test)]
 use super::score::Confidence;
 #[cfg(test)]
-use crate::index::clones::normalize::NodeSpan;
+use crate::normalize::NodeSpan;
 
 #[cfg(test)]
 mod tests;

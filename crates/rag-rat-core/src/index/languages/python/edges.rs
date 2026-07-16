@@ -227,7 +227,7 @@ fn emit_python_type_refs(
         | "type_parameter" => {
             // grow_stack: a deeply-nested annotation (a PEP 604 union `A|A|…`, nested generics)
             // recurses to full subtree depth here — grow rather than overflow (#543).
-            crate::index::grow_stack(|| {
+            rag_rat_base::stack::grow_stack(|| {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     emit_python_type_refs(child, symbols, text, out);
@@ -433,7 +433,7 @@ fn python_rebinding_effective_byte(node: Node<'_>, name: &str, text: &str) -> Op
             .map(|_| node.start_byte()),
         "expression_statement" => node.named_child(0).and_then(|inner| {
             // grow_stack: uniform depth guard (#543); shallow today, no-op fast path.
-            crate::index::grow_stack(|| python_rebinding_effective_byte(inner, name, text))
+            rag_rat_base::stack::grow_stack(|| python_rebinding_effective_byte(inner, name, text))
         }),
         "assignment"
             if node.child_by_field_name("right").is_some()
@@ -464,7 +464,7 @@ fn python_assignment_target_binds(target: Node<'_>, name: &str, text: &str) -> b
     match target.kind() {
         "identifier" => node_text(target, text) == name,
         "pattern_list" | "tuple_pattern" | "list_pattern" | "splat_pattern"
-        | "list_splat_pattern" | "expression_list" => crate::index::grow_stack(|| {
+        | "list_splat_pattern" | "expression_list" => rag_rat_base::stack::grow_stack(|| {
             // grow_stack: nested unpacking (`a, (b, (c, …))`) recurses to full depth (#543).
             let mut cursor = target.walk();
             target
@@ -484,7 +484,7 @@ fn python_import_binds_name(node: Node<'_>, name: &str, text: &str) -> bool {
     let module_id = node.child_by_field_name("module_name").map(|module| module.id());
     // grow_stack: uniform depth guard for a tree descender (#543); `import_list` doesn't nest
     // deeply today, so this is a no-op fast path.
-    crate::index::grow_stack(|| {
+    rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).any(|child| {
             if Some(child.id()) == module_id {
@@ -521,7 +521,7 @@ fn python_import_target(
     if child.kind() == "import_list" {
         // grow_stack: uniform depth guard for a tree descender (#543); `import_list` doesn't nest
         // deeply today, so this is a no-op fast path, but the invariant stays uniform.
-        crate::index::grow_stack(|| {
+        rag_rat_base::stack::grow_stack(|| {
             let mut cursor = child.walk();
             for clause in child.named_children(&mut cursor) {
                 python_import_target(
