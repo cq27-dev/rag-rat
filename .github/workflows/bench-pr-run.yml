@@ -12,6 +12,7 @@ on:
   pull_request:
     types: [opened, reopened, edited, synchronize]
     paths:
+      - 'crates/rag-rat-base/**'
       - 'crates/rag-rat-core/**'
       - 'Cargo.toml'
       - 'Cargo.lock'

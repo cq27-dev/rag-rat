@@ -45,8 +45,8 @@
    {
     "memory_id": "mem_19f2461f3ca_cc6db2285eae",
     "binding_kind": "logical_symbol",
-    "binding_id": "crates/rag-rat-core/src/locks.rs::FileLock",
-    "path": "crates/rag-rat-core/src/locks.rs",
+    "binding_id": "crates/rag-rat-base/src/locks.rs::FileLock",
+    "path": "crates/rag-rat-base/src/locks.rs",
     "start_line": 26,
     "end_line": 28,
     "id": "sym_52bbb8c03225aa2c",
@@ -245,8 +245,8 @@
    {
     "memory_id": "mem_19f283e7501_3bfff20fc7af",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/repo_identity.rs",
-    "path": "crates/rag-rat-core/src/repo_identity.rs",
+    "binding_id": "crates/rag-rat-base/src/repo_identity.rs",
+    "path": "crates/rag-rat-base/src/repo_identity.rs",
     "anchor_status": "gone",
     "created_at_ms": 1783086609665
    }
@@ -392,8 +392,8 @@
    {
     "memory_id": "mem_19f271576de_5a2c175154b0",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/repo_identity.rs",
-    "path": "crates/rag-rat-core/src/repo_identity.rs",
+    "binding_id": "crates/rag-rat-base/src/repo_identity.rs",
+    "path": "crates/rag-rat-base/src/repo_identity.rs",
     "anchor_status": "gone",
     "created_at_ms": 1783067145950
    }

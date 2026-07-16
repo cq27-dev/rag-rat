@@ -12,6 +12,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'crates/rag-rat-base/**'
       - 'crates/rag-rat-core/**'
       - 'crates/rag-rat-cli/**'
       - 'evals/**'
@@ -22,6 +23,7 @@ on:
       - '.github/workflows/eval.yml'
   pull_request:
     paths:
+      - 'crates/rag-rat-base/**'
       - 'crates/rag-rat-core/**'
       - 'crates/rag-rat-cli/**'
       - 'evals/**'

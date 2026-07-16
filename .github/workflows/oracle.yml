@@ -18,6 +18,7 @@ on:
       # oracle runs the `rag-rat` binary (`index --full` + `oracle report`, see tools/oracle-run.sh)
       # over external corpora, so it gates core's parser/resolution AND the cli entry points that
       # drive it. Only the mcp crate can't move it — narrow from crates/** to core + cli (drops mcp).
+      - 'crates/rag-rat-base/**'
       - 'crates/rag-rat-core/**'
       - 'crates/rag-rat-cli/**'
       # Root Cargo.toml/Cargo.lock change the built rag-rat binary (workspace deps / pinned
@@ -38,6 +39,7 @@ on:
       # oracle runs the `rag-rat` binary (`index --full` + `oracle report`, see tools/oracle-run.sh)
       # over external corpora, so it gates core's parser/resolution AND the cli entry points that
       # drive it. Only the mcp crate can't move it — narrow from crates/** to core + cli (drops mcp).
+      - 'crates/rag-rat-base/**'
       - 'crates/rag-rat-core/**'
       - 'crates/rag-rat-cli/**'
       - 'Cargo.toml'
