@@ -2,7 +2,7 @@
   "mcpServers": {
     "rag-rat": {
       "command": "npx",
-      "args": ["-y", "@rag-rat/bin@0.18.0", "mcp"]
+      "args": ["-y", "@rag-rat/bin@0.19.0", "mcp"]
     }
   }
 }
