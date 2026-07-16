@@ -14,7 +14,9 @@ categories.workspace = true
 [dependencies]
 tokio = { workspace = true }
 anyhow.workspace = true
+chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
+hkdf.workspace = true
 x25519-dalek.workspace = true
 fastembed = { workspace = true, optional = true }
 getrandom.workspace = true

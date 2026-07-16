@@ -23,6 +23,10 @@ mod cut;
 mod envelope;
 mod fold;
 mod id;
+// C4.1 content-key crypto primitives (#607). They land ahead of their consumers — C4.3 (`key_wrap`
+// authoring) and C5 (content sealing) — so nothing in a non-test build references them yet.
+#[allow(dead_code, reason = "C4.1 primitives precede their C4.3/C5 consumers (#607)")]
+mod keywrap;
 mod limits;
 mod ops;
 mod registers;

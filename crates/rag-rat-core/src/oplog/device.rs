@@ -18,7 +18,7 @@
 use anyhow::Context;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey as X25519PublicKey, SharedSecret, StaticSecret};
 use zeroize::Zeroizing;
 
 use super::op::DeviceFingerprint;
@@ -140,6 +140,16 @@ impl DeviceX25519Secret {
     /// The matching public encryption key.
     pub(super) fn public(&self) -> DeviceX25519Public {
         DeviceX25519Public(X25519PublicKey::from(&self.0).to_bytes())
+    }
+
+    /// The X25519 ECDH shared secret with `peer` — the C4 layer the C1 doc reserved ("ECDH + HKDF
+    /// is C4"). Returns the RAW [`SharedSecret`]: the caller MUST reject a non-contributory
+    /// (all-zero) result via [`SharedSecret::was_contributory`] before deriving any key material —
+    /// the RFC 7748 §6.1 output check that backstops the small-order blocklist on
+    /// [`DeviceX25519Public::from_bytes`]. The peer's `PublicKey` is reconstructed from its 32
+    /// bytes (a `PublicKey` here is only ever built from bytes a caller already validated).
+    pub(super) fn diffie_hellman(&self, peer: &DeviceX25519Public) -> SharedSecret {
+        self.0.diffie_hellman(&X25519PublicKey::from(peer.to_bytes()))
     }
 }
 
@@ -370,6 +380,21 @@ mod tests {
         let a = DeviceX25519Secret::generate().expect("OS CSPRNG available");
         let b = DeviceX25519Secret::generate().expect("OS CSPRNG available");
         assert_ne!(a.public().to_bytes(), b.public().to_bytes(), "generate must not repeat a key");
+    }
+
+    #[test]
+    fn x25519_diffie_hellman_agrees_and_is_contributory() {
+        // Both parties derive the SAME shared secret (esk·B == bsk·A), and DH between two genuine
+        // keys is always contributory — the invariant `seal`/`unwrap` rely on before HKDF.
+        let a = DeviceX25519Secret::from_seed(&seed_a());
+        let b = DeviceX25519Secret::from_seed(&seed_b());
+        let a_pub = DeviceX25519Public::from_bytes(&a.public().to_bytes()).unwrap();
+        let b_pub = DeviceX25519Public::from_bytes(&b.public().to_bytes()).unwrap();
+        let ab = a.diffie_hellman(&b_pub);
+        let ba = b.diffie_hellman(&a_pub);
+        assert_eq!(ab.as_bytes(), ba.as_bytes(), "X25519 DH must be symmetric");
+        assert!(ab.was_contributory(), "DH between genuine keys is contributory");
+        assert!(ba.was_contributory());
     }
 
     #[test]

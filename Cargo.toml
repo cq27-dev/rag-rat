@@ -42,6 +42,18 @@ ed25519-dalek = "2"
 # ed25519 key is rebuilt from its seed; the default `zeroize` scrubs it on drop. C1 only mints,
 # persists, and validates the key (rejecting small-order / identity public keys); ECDH + HKDF is C4.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# XChaCha20-Poly1305 AEAD for content-key wrapping (sync phase C4, #607). Wraps the audited RustCrypto
+# stream/MAC primitives (`chacha20`, `poly1305`) — constant-time (`subtle`) tag comparison and
+# zeroize-on-drop of the cipher key. `default-features = false` drops the `getrandom`/`rand_core` nonce
+# samplers (the wrap nonce is HKDF-derived, never sampled); `alloc` is the `Aead::encrypt` /
+# in-place-decrypt surface, and `zeroize` is re-added EXPLICITLY (it is off under
+# `default-features = false`) so the cipher's internal copy of the derived wrap key is scrubbed on
+# drop — the secret-hygiene invariant the module relies on.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+# HKDF-SHA256 for the key-wrap KDF (wrap key + nonce) and the content-key id. Rides the digest-0.11
+# line that rag-rat-core's own SHA-256 (`sha2` 0.11, used by oplog::cbor + oplog::device) already
+# links, so it adds NO second sha2/digest stack — `Hkdf::<sha2::Sha256>` reuses the existing hash.
+hkdf = "0.13"
 fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 # `join_all` drives the per-binding mirror jobs concurrently on the papertrail
 # current-thread runtime (reqwest already pulls futures-util transitively).
