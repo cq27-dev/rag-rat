@@ -20,8 +20,11 @@
 # the tag push and wait for cargo-dist to create the release + attach its assets before adding ours.
 #
 # The android binary ships the full feature set: fastembed statically links the pyke
-# aarch64-linux-android ONNX Runtime, so no libonnxruntime.so is needed at runtime (only bionic +
-# libc++_shared, both present on Termux). Requires the jemalloc-off-android gate (#615).
+# aarch64-linux-android ONNX Runtime, so no libonnxruntime.so is needed at runtime. libc++ is also
+# statically linked (CXXSTDLIB=c++_static, #708) — Termux ships libc++_shared.so in $PREFIX/lib, but
+# the bionic loader only searches there for Termux-built ELFs (DT_RUNPATH); a foreign NDK-built
+# binary gets the system search path, which has no libc++_shared, and fails to load. Static libc++
+# leaves bionic as the only runtime dependency. Requires the jemalloc-off-android gate (#615).
 name: release-android
 
 on:
@@ -63,7 +66,22 @@ jobs:
           # needed — the allocator's -lgcc link fails otherwise.
           export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:?no NDK on runner}"
           echo "Using NDK: $ANDROID_NDK_HOME"
+          # Static libc++ (#708): both the cc crate and ort-sys default to -lc++_shared on android
+          # targets, which Termux's loader can't resolve for a foreign binary. Both honor CXXSTDLIB.
+          export CXXSTDLIB=c++_static
+          # libc++_static.a needs libc++abi.a linked explicitly (the std exception vtables live
+          # there); the NDK clang driver adds it only when it owns the stdlib choice, and here the
+          # -lc++_static comes from cargo, so the link fails on undefined vtables without this.
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-lc++abi"
           cargo ndk -t "$ANDROID_ABI" --platform "$ANDROID_API" build --release -p rag-rat
+          # Fail the release here rather than ship a binary Termux can't load: the only DT_NEEDED
+          # entries a Termux-runnable binary may carry are bionic's own libraries.
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d \
+            "target/${ANDROID_TARGET}/release/rag-rat" | tee /tmp/dynamic-section
+          if grep -q 'libc++_shared' /tmp/dynamic-section; then
+            echo "::error::android binary still links libc++_shared.so — Termux cannot load it" >&2
+            exit 1
+          fi
       - name: Package + checksum (matches cargo-dist archive layout)
         run: |
           set -euo pipefail

@@ -19,6 +19,11 @@ both gaps on the same release cargo-dist publishes, using the scripts here:
 cargo-dist's own npm publisher is disabled (`publish-jobs = []` in `dist-workspace.toml`) so
 release-android.yml is the sole publisher of `@rag-rat/bin` — otherwise it would republish the
 android-less package under the same version. The android binary is the full build: FastEmbed's ONNX
-Runtime is statically linked (pyke ships an `aarch64-linux-android` prebuilt), so only bionic +
-`libc++_shared` are needed at runtime, both present on Termux. Requires the jemalloc-off-android gate
-(the allocator's `-lgcc` link fails on NDK r23+).
+Runtime is statically linked (pyke ships an `aarch64-linux-android` prebuilt), and libc++ is
+statically linked too (`CXXSTDLIB=c++_static`, honored by both the `cc` crate and `ort-sys`, plus
+an explicit `-lc++abi` — the NDK's `libc++_static.a` doesn't pull it in by itself), so bionic is
+the only runtime dependency. Termux does ship `libc++_shared.so`, but only in `$PREFIX/lib`,
+which the bionic loader searches for Termux-built ELFs (via their DT_RUNPATH) — never for a foreign
+NDK-built binary, so dynamic libc++ fails to load there (#708); the workflow greps the built binary's
+dynamic section and fails the release if `libc++_shared` sneaks back in. Requires the
+jemalloc-off-android gate (the allocator's `-lgcc` link fails on NDK r23+).
