@@ -2249,10 +2249,15 @@ fn migration_070_adds_the_content_projected_tables() {
 }
 
 #[test]
-fn migration_071_is_the_tip_and_indexes_edge_target_qname() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 71, "move this pin with the next schema migration");
+fn migration_071_indexes_edge_target_qname() {
+    // The absolute-tip pin moved to `migration_072_*`; this drops to the symbolic freshness check.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply",
+    );
 
     let index_on = |conn: &rusqlite::Connection| -> i64 {
         conn.query_row(
@@ -2288,6 +2293,74 @@ fn migration_071_is_the_tip_and_indexes_edge_target_qname() {
         )
         .unwrap();
     assert_eq!(v71_recorded, 1, "the forward migration records V071");
+}
+
+#[test]
+fn migration_072_is_the_tip_and_trigram_indexes_name_strings() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 72, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    // The FTS5 trigram table and its three sync triggers exist.
+    let object_kind = |name: &str| -> Option<String> {
+        conn.query_row("SELECT type FROM sqlite_master WHERE name = ?1", [name], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+    };
+    assert_eq!(object_kind("name_strings_trgm").as_deref(), Some("table"), "trigram FTS exists");
+    for trig in ["name_strings_trgm_ai", "name_strings_trgm_ad", "name_strings_trgm_au"] {
+        assert_eq!(object_kind(trig).as_deref(), Some("trigger"), "{trig} exists");
+    }
+
+    // # of indexed docs, read from the FTS docsize shadow (a plain SELECT on an external-content
+    // FTS reads the base table, so it cannot report the index's own population).
+    let indexed = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM name_strings_trgm_docsize", [], |r| r.get(0)).unwrap()
+    };
+
+    // AFTER INSERT trigger indexes newly interned names; the trigram LIKE finds them and agrees
+    // with the base pool's LIKE (identical substring-match set).
+    for v in ["reconcile_edges", "embed_chunk", "TargetQualifiedName"] {
+        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", [v]).unwrap();
+    }
+    let via_fts: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT rowid FROM name_strings_trgm WHERE value LIKE ?1 ORDER BY rowid")
+            .unwrap();
+        stmt.query_map(["%oncile%"], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+    };
+    let via_base: Vec<i64> = {
+        let mut stmt =
+            conn.prepare("SELECT id FROM name_strings WHERE value LIKE ?1 ORDER BY id").unwrap();
+        stmt.query_map(["%oncile%"], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+    };
+    assert_eq!(via_fts, via_base, "trigram LIKE returns the same ids as the base pool LIKE");
+    assert!(!via_fts.is_empty(), "the substring actually matched a seeded name");
+    assert_eq!(indexed(&conn), 3, "each interned name is indexed exactly once");
+
+    // Backfill + idempotency: the DROP-and-recreate applier rebuilds from the current pool, and a
+    // replay does not double-index (count stays equal to the pool size).
+    schema::apply_name_strings_trigram_index(&conn).unwrap();
+    schema::apply_name_strings_trigram_index(&conn).expect("replay reconverges");
+    assert_eq!(indexed(&conn), 3, "backfill re-indexes every existing name exactly once");
+
+    // A forward migrate over a ledger truncated below V072 replays the step and records V072.
+    truncate_schema_to(&conn, 71);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip",
+    );
+    let v72_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '072_name_strings_trigram_index'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v72_recorded, 1, "the forward migration records V072");
 }
 
 #[test]

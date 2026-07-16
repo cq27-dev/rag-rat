@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 71;
+pub const LATEST_SCHEMA_VERSION: u32 = 72;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -495,6 +495,13 @@ const MIGRATION_071_DESCRIPTION: &str =
      instead of full-scanning the edge table when matching unresolved edges by \
      target_qualified_name. Purely additive; CREATE INDEX IF NOT EXISTS, nothing pre-existing to \
      backfill";
+const MIGRATION_072_ID: &str = "072_name_strings_trigram_index";
+const MIGRATION_072_CHECKSUM: &str = "sha256:rag-rat-name-strings-trigram-index-v72";
+const MIGRATION_072_DESCRIPTION: &str =
+    "Add the name_strings_trgm FTS5 trigram index over name_strings(value) so symbol_lookup's \
+     bare-name fuzzy arm (a leading-wildcard LIKE) stops full-scanning the interned-name pool. \
+     External-content FTS kept in sync by insert/delete/update triggers; existing rows backfilled \
+     once. Additive and idempotent; preserves the exact substring-match set of the old LIKE";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1082,6 +1089,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_071_CHECKSUM,
         description: MIGRATION_071_DESCRIPTION,
         apply: apply_edge_target_qname_index,
+    },
+    Migration {
+        id: MIGRATION_072_ID,
+        checksum: MIGRATION_072_CHECKSUM,
+        description: MIGRATION_072_DESCRIPTION,
+        apply: apply_name_strings_trigram_index,
     },
 ];
 

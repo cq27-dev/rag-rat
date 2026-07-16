@@ -784,6 +784,52 @@ pub(crate) fn apply_edge_target_qname_index(conn: &Connection) -> rusqlite::Resu
     )
 }
 
+/// V072 (#685): a trigram FTS index over the interned-name pool. `symbol_lookup`'s bare-name fuzzy
+/// arm matches `name_strings.value LIKE '%name%'` — a LEADING-wildcard LIKE that cannot use the
+/// UNIQUE value index, so it full-scans the whole pool on every bare-name lookup. An FTS5 `trigram`
+/// index accelerates that exact `LIKE` (identical substring-match set for patterns ≥3 chars;
+/// shorter patterns still resolve correctly via a scan). External content
+/// (`content='name_strings'`, `content_rowid='id'`) means the FTS stores only the index and reads
+/// values from name_strings; the insert/delete/update triggers keep it in sync as names are
+/// interned.
+///
+/// DROP-and-recreate (like `ensure_edges_view`) makes it fully idempotent and torn-replay safe: the
+/// backfill always reflects the current pool. It runs once per DB (recorded in schema_version); on
+/// a fresh DB name_strings is still empty here, so the backfill inserts nothing and the AFTER
+/// INSERT trigger indexes each interned name as indexing fills the pool.
+pub(crate) fn apply_name_strings_trigram_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TRIGGER IF EXISTS name_strings_trgm_ai;
+        DROP TRIGGER IF EXISTS name_strings_trgm_ad;
+        DROP TRIGGER IF EXISTS name_strings_trgm_au;
+        DROP TABLE IF EXISTS name_strings_trgm;
+
+        CREATE VIRTUAL TABLE name_strings_trgm USING fts5(
+            value,
+            content='name_strings',
+            content_rowid='id',
+            tokenize='trigram'
+        );
+
+        CREATE TRIGGER name_strings_trgm_ai AFTER INSERT ON name_strings BEGIN
+            INSERT INTO name_strings_trgm(rowid, value) VALUES (new.id, new.value);
+        END;
+        CREATE TRIGGER name_strings_trgm_ad AFTER DELETE ON name_strings BEGIN
+            INSERT INTO name_strings_trgm(name_strings_trgm, rowid, value)
+                VALUES ('delete', old.id, old.value);
+        END;
+        CREATE TRIGGER name_strings_trgm_au AFTER UPDATE ON name_strings BEGIN
+            INSERT INTO name_strings_trgm(name_strings_trgm, rowid, value)
+                VALUES ('delete', old.id, old.value);
+            INSERT INTO name_strings_trgm(rowid, value) VALUES (new.id, new.value);
+        END;
+
+        INSERT INTO name_strings_trgm(rowid, value) SELECT id, value FROM name_strings;
+        ",
+    )
+}
+
 /// Create the `edges` compatibility VIEW + its INSTEAD OF triggers (#79) — but ONLY when no
 /// legacy `edges` TABLE is present (an INSTEAD OF trigger on a table is a hard error, and the
 /// legacy table must keep working until `apply_edge_string_interning` converts it).
@@ -1285,6 +1331,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_069_ID => Some(69),
             MIGRATION_070_ID => Some(70),
             MIGRATION_071_ID => Some(71),
+            MIGRATION_072_ID => Some(72),
             _ => None,
         })
         .max()
@@ -1365,6 +1412,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_069_ID
             | MIGRATION_070_ID
             | MIGRATION_071_ID
+            | MIGRATION_072_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1442,6 +1490,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_069_ID => migration.checksum != MIGRATION_069_CHECKSUM,
         MIGRATION_070_ID => migration.checksum != MIGRATION_070_CHECKSUM,
         MIGRATION_071_ID => migration.checksum != MIGRATION_071_CHECKSUM,
+        MIGRATION_072_ID => migration.checksum != MIGRATION_072_CHECKSUM,
         _ => false,
     }
 }

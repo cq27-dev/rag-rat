@@ -326,11 +326,14 @@ fn lookup_name(
     limit: u32,
     include_generated: bool,
 ) -> anyhow::Result<Vec<SymbolHit>> {
-    // Fuzzy qualified-name match is interned (#224): match against the shared `name_strings` pool
-    // (`qualified_name_id IN (SELECT id FROM name_strings WHERE value LIKE ?2)`) then scope back to
-    // `symbols` via the join. The `name = ?1` exact arm is unaffected and stays on
-    // `idx_symbols_name` — keep it first so a bare-name hit is indexed. The projection reads
-    // the value back through the `qn` join so the output `qualified_name` field is unchanged.
+    // Fuzzy qualified-name match is interned (#224) and trigram-indexed (#685): match the leading-
+    // wildcard `value LIKE ?2` against the `name_strings_trgm` FTS5 trigram index (rowid = the
+    // name_strings id) instead of the base pool — the plain `name_strings WHERE value LIKE '%x%'`
+    // form full-scans the whole pool on every bare-name lookup, the trigram index accelerates the
+    // exact same `LIKE` (identical substring-match set). Then scope back to `symbols` via the join.
+    // The `name = ?1` exact arm is unaffected and stays on `idx_symbols_name` — keep it first so a
+    // bare-name hit is indexed. The projection reads the value back through the `qn` join so the
+    // output `qualified_name` field is unchanged.
     let mut sql = "
         SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, \
                    qn.value,
@@ -339,7 +342,8 @@ fn lookup_name(
         JOIN files ON files.id = symbols.file_id
         LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         WHERE (symbols.name = ?1
-               OR symbols.qualified_name_id IN (SELECT id FROM name_strings WHERE value LIKE ?2))
+               OR symbols.qualified_name_id IN (SELECT rowid FROM name_strings_trgm WHERE value \
+                   LIKE ?2))
     "
     .to_string();
     if !include_generated {
