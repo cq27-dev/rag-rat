@@ -70,6 +70,10 @@ allow = ["MPL-2.0"]
 multiple-versions = "warn"
 # A `version = "*"` requirement in one of our own manifests is a supply-chain footgun — deny it.
 wildcards = "deny"
+# …except version-less path dev-dependencies (rag-rat-clones dev-deps on rag-rat-core so its
+# tests can drive the real parser). Cargo strips these from the published manifest, so no
+# wildcard ever reaches the registry; this flag exists for exactly that case.
+allow-wildcard-paths = true
 
 [sources]
 # crates.io only. An unknown registry or a git dependency must be a deliberate, reviewed choice.

@@ -490,7 +490,9 @@ fn the_event_loop_drain_persists_a_placement_failure_while_running() {
         tx.send(LoopMsg::Wake).unwrap();
         std::thread::sleep(Duration::from_millis(150));
         stop.store(true, Ordering::Relaxed);
-        tx.send(LoopMsg::Wake).unwrap();
+        // Best-effort wake: a timeout tick may have already observed `stop` and exited the loop,
+        // in which case `rx` is gone and this send fails — that is success, not an error.
+        let _ = tx.send(LoopMsg::Wake);
         drop(tx);
         drop(pass_tx);
         let _ = pass_rx;
@@ -2551,7 +2553,9 @@ fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
         );
 
         stop.store(true, Ordering::Relaxed);
-        tx.send(LoopMsg::Wake).unwrap();
+        // Best-effort wake: a timeout tick may have already observed `stop` and exited the loop,
+        // in which case `rx` is gone and this send fails — that is success, not an error.
+        let _ = tx.send(LoopMsg::Wake);
         let final_refresh_owed = loop_thread.join().unwrap();
         assert!(!final_refresh_owed, "every observed edit was consumed by a dispatched pass",);
     });
@@ -3414,7 +3418,9 @@ fn periodic_sweep_dispatches_all_overlay_scope() {
             "the periodic backstop must refresh every overlay"
         );
         stop.store(true, Ordering::Relaxed);
-        tx.send(LoopMsg::Wake).unwrap();
+        // Best-effort wake: a timeout tick may have already observed `stop` and exited the loop,
+        // in which case `rx` is gone and this send fails — that is success, not an error.
+        let _ = tx.send(LoopMsg::Wake);
         drop(tx);
         drop(pass_tx);
         let _ = handle.join();
@@ -3564,7 +3570,9 @@ fn idle_watcher_enqueues_papertrail_evaluation_without_filesystem_activity() {
             Ok(rag_rat_papertrail::AutosyncRequest::Evaluate),
         );
         stop.store(true, Ordering::Relaxed);
-        tx.send(LoopMsg::Wake).unwrap();
+        // Best-effort wake: a timeout tick may have already observed `stop` and exited the loop,
+        // in which case `rx` is gone and this send fails — that is success, not an error.
+        let _ = tx.send(LoopMsg::Wake);
         drop(tx);
         let _ = handle.join();
     });
@@ -3642,7 +3650,9 @@ fn papertrail_deadline_fires_during_an_in_flight_pass_and_ticks_coalesce() {
         );
 
         stop.store(true, Ordering::Relaxed);
-        tx.send(LoopMsg::Wake).unwrap();
+        // Best-effort wake: a timeout tick may have already observed `stop` and exited the loop,
+        // in which case `rx` is gone and this send fails — that is success, not an error.
+        let _ = tx.send(LoopMsg::Wake);
         drop(tx);
         drop(pass_tx);
         let _ = handle.join();
