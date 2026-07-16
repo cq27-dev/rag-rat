@@ -22,10 +22,10 @@ use crate::oplog::account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityQuery, GrantDeviceBoundary,
     GrantRole,
 };
-use crate::oplog::cbor;
 use crate::oplog::device::DevicePublic;
 use crate::oplog::op::DeviceFingerprint;
 use crate::oplog::stream::StreamId;
+use crate::oplog::{cbor, content_projection, identity};
 
 type EntryHash = [u8; 32];
 
@@ -76,6 +76,19 @@ pub(in crate::oplog::account) struct ContentPromotionOutcome {
     pub(in crate::oplog::account) entry_hashes: Vec<EntryHash>,
 }
 
+/// Ingest one REMOTE, untrusted `/3` content envelope: resolve its roster key, verify the
+/// signature, store the candidate under the §18b anti-abuse budgets, and classify it structurally
+/// against the dense chain.
+///
+/// The whole-stream acceptance fold is DEFERRED (#652). Running it inline on every ingested entry
+/// re-evaluates the O(stream) authority + branch-selection pass once per entry, so building an
+/// n-entry stream one candidate at a time is O(n^2) under the writer lock — and an attacker varying
+/// cited `auth_len` down the chain defeats the per-refold freshness cache, keeping each pass O(n).
+/// Instead this marks the stream owing a refold; [`settle_pending_content_refolds`] (or an account
+/// fold that touches the stream) runs it ONCE. The returned `Ingested { status }` therefore reports
+/// the STRUCTURAL verdict, not the acceptance verdict: a caller that needs foreign acceptance MUST
+/// settle first. Nothing reads foreign acceptance before transport lands (#691), so the deferral is
+/// invisible today; the local author path is unaffected (it never routes through here).
 pub(in crate::oplog) fn content_ingest(
     conn: &Connection,
     signed_bytes: &[u8],
@@ -117,18 +130,11 @@ pub(in crate::oplog) fn content_ingest(
     }
     insert_candidate(&tx, &verified, signed_bytes, now_ms)?;
     reclassify_chain(&tx, &verified)?;
-    // Structural classification is done; now fold authority + branch selection over the whole
-    // stream (§13) — the pass that can set `accepted`. With the owner's `StreamOwn` fact absent
-    // this is a no-op and the entry stays `retained_unfolded` until the account→content trigger
-    // refolds it; with authority present the entry lands on its real verdict in this same txn.
-    refold_content_stream(&tx, verified.header.stream_id)?;
-    // TODO(phase D): project a newly-ACCEPTED FOREIGN entry into `repo_memories` /
-    // `repo_node_edges` here (and from the account→content retro-trigger that retro-accepts
-    // foreign content), so a remote memory surfaces in the local read APIs — those read ONLY
-    // the memory tables, never this `/3` stream or its projection. Deferrable until transport
-    // lands because no foreign entry can exist before then; the local author path needs no such
-    // write-back (it authors `/3` content FROM `repo_memories`, so the reader's row is already
-    // present). Tracked in #691.
+    // Structural classification is done; the authority + branch-selection fold (the pass that sets
+    // `accepted`) is deferred off this per-entry path (#652) by marking the stream as owing a
+    // refold. `settle_pending_content_refolds`, or an account fold that touches the stream, folds
+    // it once. So the returned status is the STRUCTURAL verdict, not the acceptance verdict.
+    mark_stream_pending_refold(&tx, verified.header.stream_id)?;
     let status = status_for(&tx, &verified.entry_hash)?
         .unwrap_or_else(|| ContentStatus::RetainedUnfolded.as_db_str().to_string());
     tx.commit()?;
@@ -371,6 +377,12 @@ pub(in crate::oplog::account) fn promote_pre_verify_for_account(
             }
             insert_candidate(tx, &verified, &raw, now_ms)?;
             reclassify_chain(tx, &verified)?;
+            // Mark the stream for a deferred settle, exactly as the direct ingest path does (#652).
+            // The account fold that follows this promotion sets `accepted` but does NOT reproject,
+            // so without this mark a promoted (out-of-order, pre-verify) entry would become
+            // accepted with no queue row — settle would skip it and its `/3` projection
+            // would stay stale.
+            mark_stream_pending_refold(tx, verified.header.stream_id)?;
             delete_pre_verify(tx, &signed_hash)?;
             progressed = true;
         }
@@ -389,12 +401,27 @@ fn candidate_capacity(
     tx: &Transaction<'_>,
     entry: &VerifiedContentEntry,
     incoming_bytes: usize,
-) -> rusqlite::Result<Option<ContentCapacityScope>> {
+) -> anyhow::Result<Option<ContentCapacityScope>> {
+    // Both budgets are REMOTE-abuse ceilings (#652): exclude the local device's OWN signed rows so
+    // a large local history never starves foreign ingest. Key the exclusion on the local DEVICE
+    // FINGERPRINT, NOT `author_account_id` — the latter is attacker-settable (a self-signed
+    // DeviceAdd can store forged content under a claimed local account id), while a row can
+    // carry the local fingerprint only if it was signed with the local device key
+    // (`verify_content_signed` binds the signature to `header.device_fingerprint`). `None` (no
+    // local device minted yet) excludes nothing; the nullable `?local_fp` parameter selects the
+    // branch in-SQL.
+    let local_fp = identity::local_device_fingerprint(tx)?.map(DeviceFingerprint::to_bytes);
+    let local_fp = local_fp.as_ref().map(|fp| fp.as_slice());
+
+    // The per-author budget scopes to the INCOMING (foreign) author. Excluding the local device
+    // here is forward-compat for a second local device syncing under the same account;
+    // pre-transport it is a no-op, since no foreign author owns locally-signed rows.
     let author = entry.header.author_account_id.to_bytes();
     let (count, bytes): (i64, i64) = tx.query_row(
         "SELECT count(*), coalesce(sum(length(signed_bytes)), 0)
-         FROM content_entries WHERE author_account_id = ?1",
-        [author.as_slice()],
+         FROM content_entries
+         WHERE author_account_id = ?1 AND (device_fingerprint != ?2 OR ?2 IS NULL)",
+        params![author.as_slice(), local_fp],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if count >= CANDIDATES_PER_AUTHOR_MAX {
@@ -403,9 +430,12 @@ fn candidate_capacity(
     if bytes.saturating_add(incoming_bytes as i64) > CANDIDATE_BYTES_PER_AUTHOR_MAX {
         return Ok(Some(ContentCapacityScope::CandidateAuthorBytes));
     }
+    // The global budget is the remote-flood ceiling; the local device's own signed rows are not
+    // remote abuse and are excluded on the same forge-proof key.
     let (count, bytes): (i64, i64) = tx.query_row(
-        "SELECT count(*), coalesce(sum(length(signed_bytes)), 0) FROM content_entries",
-        [],
+        "SELECT count(*), coalesce(sum(length(signed_bytes)), 0)
+         FROM content_entries WHERE device_fingerprint != ?1 OR ?1 IS NULL",
+        params![local_fp],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if count >= CANDIDATES_GLOBAL_MAX {
@@ -460,20 +490,30 @@ fn reclassify_chain(tx: &Transaction<'_>, entry: &VerifiedContentEntry) -> anyho
             let Some(expected) = entry.header.seq.checked_sub(1).map(u64::to_be_bytes) else {
                 return Ok(());
             };
+            // Reachability is STRUCTURAL: the predecessor must be present at the adjacent seq AND
+            // its own chain must not itself be broken. The predicate is "status is NOT
+            // `parked{missing_predecessor}`", NOT "status IS `retained_unfolded`" — once a
+            // predecessor is settled its status becomes `accepted`/`forked`/`condemned{…}`/etc., so
+            // testing for `retained_unfolded` exactly would misclassify a dense continuation of an
+            // already-folded chain as `missing_predecessor` (the per-entry refold used to mask
+            // this; the deferred refold unmasks it). Both the structural
+            // missing-predecessor state and the acceptance-layer
+            // `parked{missing_predecessor}` render to the same db string, so the single
+            // `!=` covers both.
             tx.query_row(
                 "SELECT EXISTS(
                          SELECT 1 FROM content_entries p
                          JOIN content_entry_status s ON s.entry_hash = p.entry_hash
                          WHERE p.entry_hash = ?1 AND p.stream_id = ?2
                            AND p.author_account_id = ?3 AND p.device_fingerprint = ?4
-                           AND p.seq = ?5 AND s.status = ?6)",
+                           AND p.seq = ?5 AND s.status != ?6)",
                 params![
                     previous.as_slice(),
                     entry.header.stream_id.to_bytes().as_slice(),
                     entry.header.author_account_id.to_bytes().as_slice(),
                     entry.header.device_fingerprint.to_bytes().as_slice(),
                     expected.as_slice(),
-                    ContentStatus::RetainedUnfolded.as_db_str(),
+                    ContentStatus::MissingPredecessor.as_db_str(),
                 ],
                 |row| row.get(0),
             )?
@@ -626,12 +666,18 @@ pub(super) fn refold_content_stream(
     tx: &Transaction<'_>,
     stream_id: StreamId,
 ) -> anyhow::Result<()> {
-    // The owner is inside the stream identity (`stream_id = sha256(cbor([.., owner, ..]))`, §14)
-    // but not invertible, so it is resolved through the owner's `StreamOwn` fact. No fact ⇒
-    // authority cannot be evaluated: the entries revert to their structural state. This is a
-    // DECLASSIFY, not a skip — if ownership was dropped by a later fold (owner contested / branch
-    // reselection), previously accepted content must lose `accepted` here, or it would stay live
-    // with no current authority basis.
+    // NOTE: this seam does NOT clear the deferred-refold mark (#652). It re-derives `accepted` but
+    // does NOT refresh `content_projected_*`, and the account-fold path
+    // (`refold_streams_for_account`) reaches it WITHOUT a following reproject. Clearing the
+    // mark here would let an account fold that touches a still-pending foreign stream drop the
+    // mark while leaving the projection stale, so a later settle would skip it and the stale
+    // projection would persist. Only `settle_one_pending_refold` clears the mark — after it
+    // reprojects. The owner is inside the stream identity (`stream_id = sha256(cbor([.., owner,
+    // ..]))`, §14) but not invertible, so it is resolved through the owner's `StreamOwn` fact.
+    // No fact ⇒ authority cannot be evaluated: the entries revert to their structural state.
+    // This is a DECLASSIFY, not a skip — if ownership was dropped by a later fold (owner
+    // contested / branch reselection), previously accepted content must lose `accepted` here,
+    // or it would stay live with no current authority basis.
     let Some(owner_account_id) = account_storage::stream_owner_account(tx, stream_id)? else {
         declassify_stream_to_structural(tx, stream_id)?;
         return Ok(());
@@ -714,6 +760,117 @@ pub(super) fn refold_content_stream(
         write_verdict(tx, &hash, verdict)?;
     }
     Ok(())
+}
+
+/// Enqueue a `/2` stream as owing a deferred acceptance refold (#652). `content_ingest` records
+/// structural classification on its per-entry hot path and marks the stream here instead of folding
+/// inline, so a batch of ingests costs one refold per stream at settle rather than one per entry.
+/// `INSERT OR IGNORE` dedups repeat ingests to one stream into a single queued refold.
+fn mark_stream_pending_refold(tx: &Transaction<'_>, stream_id: StreamId) -> rusqlite::Result<()> {
+    tx.execute("INSERT OR IGNORE INTO content_streams_pending_refold(stream_id) VALUES (?1)", [
+        stream_id.to_bytes().as_slice(),
+    ])?;
+    Ok(())
+}
+
+/// Drop a stream's deferred-refold mark. The sole caller is [`settle_one_pending_refold`], which
+/// clears the mark ONLY after it has both refolded AND reprojected the stream — so the mark always
+/// means "this stream still owes a refold+reproject". An account-fold refold updates `accepted`
+/// without reprojecting and must therefore leave the mark standing for settle to finish.
+fn clear_pending_content_refold(tx: &Transaction<'_>, stream_id: StreamId) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM content_streams_pending_refold WHERE stream_id = ?1", [stream_id
+        .to_bytes()
+        .as_slice()])?;
+    Ok(())
+}
+
+/// Snapshot the dirty-refold queue — the streams `content_ingest` deferred, awaiting a fold to
+/// their acceptance verdict.
+fn list_streams_pending_refold(conn: &Connection) -> anyhow::Result<Vec<[u8; 32]>> {
+    let raw: Vec<Vec<u8>> = {
+        let mut stmt = conn.prepare("SELECT stream_id FROM content_streams_pending_refold")?;
+        stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    raw.iter().map(|bytes| fixed::<32>(bytes)).collect()
+}
+
+/// Whether the V070 `content_projected_*` tables exist yet — false on a DB upgrading past a
+/// pre-V070 ledger, where the reproject would target absent tables. `sqlite_master` is served from
+/// SQLite's in-memory schema, so this is cheap; mirrors [`content_entries_exists`].
+fn content_projected_tables_exist(tx: &Transaction<'_>) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'content_projected_nodes'",
+        [],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+}
+
+/// Settle ONE dirty stream in its OWN IMMEDIATE transaction: fold its acceptance verdict, reproject
+/// the accepted set into the memory projection, and drop its queue mark (the refold clears the mark
+/// on every path — see [`refold_content_stream`]). Its own txn is what isolates a poisoned stream:
+/// a failure here rolls back only this stream, leaving its mark intact for a later retry while the
+/// rest of the batch still settles.
+fn settle_one_pending_refold(conn: &Connection, stream_id: StreamId) -> anyhow::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    refold_content_stream(&tx, stream_id)?;
+    // Settle is the DELIBERATE fold boundary where foreign acceptance flips, so it closes the
+    // stale-projection hole here: an accepted-set flip that skipped the reproject would leave
+    // `content_projected_*` stale, and the memory reconcile's anti-join would then mass-duplicate
+    // the dropped rows into the immutable `/3` log (#683). Guarded on the V070 tables existing,
+    // mirroring the account-fold path's table-existence guard. (The account-fold path's OWN
+    // reproject is the incidental refold #683 still defers — this seam does not fix that
+    // sibling path.)
+    if content_projected_tables_exist(&tx)? {
+        content_projection::reproject_accepted_content_stream(&tx, stream_id)?;
+    }
+    // Clear the mark ONLY here — after the refold AND the reproject — so the queue entry means
+    // "this stream still owes a refold+reproject". An account-fold refold that ran meanwhile
+    // updated `accepted` but not the projection, so the mark must survive it and be cleared here.
+    // On any error above, the txn rolls back and the mark is preserved for retry.
+    clear_pending_content_refold(&tx, stream_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Fold every stream that `content_ingest` deferred and return the number settled — one refold per
+/// dirty stream (O(dirty streams), NOT O(ingested entries)). Each stream settles in its OWN txn and
+/// a failure never blocks the rest: a poisoned stream's txn rolls back (its queue mark kept for
+/// retry) while the others commit, and the first failure surfaces after the batch drains.
+///
+/// This is the transport-facing settle seam (#406): after transport drains a batch of foreign
+/// ingests it calls this ONCE so foreign acceptance (and its memory projection) becomes observable.
+/// The batching contract — "drain, then settle once", never settle per entry — lives in that
+/// caller, not here. Nothing reads foreign acceptance before transport lands (#691), so
+/// pre-transport a queue that is never settled is harmless.
+///
+/// RESIDUAL DoS (honest scope, #652): this bounds ONLY the `content_ingest` per-entry refold. The
+/// account-ingest → `refold_streams_for_account` path is an equally-remote sibling — a whole-stream
+/// content refold per `/1` account entry — that this change does NOT batch, and because C1 keeps
+/// the local owner's big stream outside the caps, a single foreign candidate on it still makes one
+/// refold O(local history). Extending defer/batch to the account→content trigger is tracked
+/// separately (retro-condemn atomicity must survive there).
+pub(in crate::oplog) fn settle_pending_content_refolds(conn: &Connection) -> anyhow::Result<usize> {
+    let mut settled = 0usize;
+    let mut failures = 0usize;
+    let mut first_error: Option<anyhow::Error> = None;
+    for stream in list_streams_pending_refold(conn)? {
+        match settle_one_pending_refold(conn, StreamId::from_bytes(stream)) {
+            Ok(()) => settled += 1,
+            Err(error) => {
+                failures += 1;
+                first_error.get_or_insert(error);
+            },
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error.context(format!(
+            "settled {settled} content stream(s); {failures} failed and kept their queue marks \
+             for retry",
+        )));
+    }
+    Ok(settled)
 }
 
 /// Narrow the branch-selected winners to a contiguous accepted prefix per coordinate.
@@ -1374,6 +1531,7 @@ mod tests {
     fn seed_content_candidates(
         conn: &Connection,
         author: super::super::super::AccountId,
+        device_fingerprint: [u8; 32],
         namespace: u64,
         count: usize,
         signed_bytes_len: usize,
@@ -1394,7 +1552,7 @@ mod tests {
                     hash.as_slice(),
                     [1_u8; 32].as_slice(),
                     author.to_bytes().as_slice(),
-                    [2_u8; 32].as_slice(),
+                    device_fingerprint.as_slice(),
                     (ordinal as u64).to_be_bytes().as_slice(),
                     [3_u8; 32].as_slice(),
                     [0_u8; 8].as_slice(),
@@ -1405,6 +1563,10 @@ mod tests {
             .unwrap();
         }
     }
+
+    /// A device fingerprint distinct from any real local device — the pre-#652 default seed used
+    /// for candidates that stand in for FOREIGN, remotely-signed rows in the capacity tests.
+    const FOREIGN_FP: [u8; 32] = [2_u8; 32];
 
     #[test]
     fn exact_roster_ref_verifies_and_full_u64_counters_persist() {
@@ -1528,6 +1690,32 @@ mod tests {
         assert_eq!((parked, stored), (0, 1));
         assert_eq!(status, "retained_unfolded");
         assert_eq!(accepted, 0, "promotion cannot cross the C2/C3 authority boundary");
+    }
+
+    #[test]
+    fn promoting_pre_verify_content_marks_the_stream_for_settle() {
+        // A pre-verify PARK does not mark the stream (the entry is not a candidate yet, and
+        // `content_ingest` returns before its mark). When the roster key later arrives and
+        // `account_ingest` PROMOTES the parked entry into a candidate, the promotion path must mark
+        // the stream — otherwise a promoted entry the account fold later accepts would carry no
+        // queue row, settle would skip it, and its /3 projection would stay stale (#652/#699).
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[7; 32]);
+        let (account, roster) = signed_roster(&secret);
+        let signed = content(&secret, account, roster.entry_hash, 0, None);
+
+        assert_eq!(
+            content_ingest(&conn, &signed.signed_bytes, 1).unwrap(),
+            ContentIngestOutcome::PreVerify,
+        );
+        assert_eq!(pending_refold_count(&conn), 0, "a pre-verify park does not mark the stream");
+
+        super::super::super::storage::account_ingest(&conn, &roster.signed_bytes, 2).unwrap();
+        assert_eq!(
+            pending_refold_count(&conn),
+            1,
+            "promoting the parked entry marks its stream so a later settle refolds + reprojects it",
+        );
     }
 
     #[test]
@@ -1792,7 +1980,14 @@ mod tests {
         let signed = content(&secret, account, roster_ref, 0, None);
         let verified =
             envelope::verify_content_signed(&signed.signed_bytes, &secret.public()).unwrap();
-        seed_content_candidates(&author_count, account, 1, CANDIDATES_PER_AUTHOR_MAX as usize, 1);
+        seed_content_candidates(
+            &author_count,
+            account,
+            FOREIGN_FP,
+            1,
+            CANDIDATES_PER_AUTHOR_MAX as usize,
+            1,
+        );
         let tx = author_count.unchecked_transaction().unwrap();
         assert_eq!(
             candidate_capacity(&tx, &verified, signed.signed_bytes.len()).unwrap(),
@@ -1807,6 +2002,7 @@ mod tests {
         seed_content_candidates(
             &author_bytes,
             account,
+            FOREIGN_FP,
             2,
             1,
             CANDIDATE_BYTES_PER_AUTHOR_MAX as usize,
@@ -1822,6 +2018,7 @@ mod tests {
             seed_content_candidates(
                 &global_count,
                 super::super::super::AccountId::from_bytes([author; 32]),
+                FOREIGN_FP,
                 10 + u64::from(author),
                 CANDIDATES_PER_AUTHOR_MAX as usize,
                 1,
@@ -1842,6 +2039,7 @@ mod tests {
             seed_content_candidates(
                 &global_bytes,
                 super::super::super::AccountId::from_bytes([author; 32]),
+                FOREIGN_FP,
                 20 + u64::from(author),
                 1,
                 13 * 1024 * 1024,
@@ -1896,7 +2094,14 @@ mod tests {
         let (account, roster_ref) = roster(&replay, &secret);
         let signed = content(&secret, account, roster_ref, 0, None);
         let expected = content_ingest(&replay, &signed.signed_bytes, 1).unwrap();
-        seed_content_candidates(&replay, account, 99, CANDIDATES_PER_AUTHOR_MAX as usize - 1, 1);
+        seed_content_candidates(
+            &replay,
+            account,
+            FOREIGN_FP,
+            99,
+            CANDIDATES_PER_AUTHOR_MAX as usize - 1,
+            1,
+        );
         assert_eq!(content_ingest(&replay, &signed.signed_bytes, 2).unwrap(), expected);
         assert_eq!(
             replay
@@ -2095,8 +2300,13 @@ mod tests {
         .unwrap()
     }
 
+    /// Ingest then SETTLE, and read the resulting acceptance verdict. `content_ingest` now defers
+    /// the acceptance fold (#652), so a test that wants the folded verdict must settle first —
+    /// this helper is the "ingest and observe acceptance" shorthand the acceptance tests are
+    /// written against.
     fn verdict_after_ingest(conn: &Connection, entry: &SignedContentEntry) -> (String, i64) {
         content_ingest(conn, &entry.signed_bytes, 1).unwrap();
+        settle_pending_content_refolds(conn).unwrap();
         verdict(conn, &entry.entry_hash)
     }
 
@@ -2109,10 +2319,13 @@ mod tests {
         seed_roster_fact(&conn, genesis, owner, &secret, "owner");
 
         let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        // Ingest DEFERS the acceptance fold (#652), so it returns the STRUCTURAL status; the
+        // acceptance verdict appears once the stream is settled.
         assert_eq!(
             content_ingest(&conn, &entry.signed_bytes, 1).unwrap(),
-            ContentIngestOutcome::Ingested { status: "accepted".into() },
+            ContentIngestOutcome::Ingested { status: "retained_unfolded".into() },
         );
+        assert_eq!(settle_pending_content_refolds(&conn).unwrap(), 1);
         assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
     }
 
@@ -2170,6 +2383,7 @@ mod tests {
             authored(&secret, owner, genesis, ContentSpec { body: 0xf7, ..ContentSpec::default() });
         content_ingest(&conn, &a.signed_bytes, 1).unwrap();
         content_ingest(&conn, &b.signed_bytes, 2).unwrap();
+        settle_pending_content_refolds(&conn).unwrap();
 
         let (winner, loser) = if a.entry_hash < b.entry_hash { (&a, &b) } else { (&b, &a) };
         assert_eq!(verdict(&conn, &winner.entry_hash), ("accepted".into(), 1));
@@ -2320,7 +2534,7 @@ mod tests {
         seed_ownership(&conn, owner);
         seed_roster_fact(&conn, genesis, owner, &secret, "owner");
 
-        // A dense chain seq 0 → 1, both accepted at ingest.
+        // A dense chain seq 0 → 1, both accepted once the ingests settle.
         let s0 = authored(&secret, owner, genesis, ContentSpec::default());
         content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
         let s1 = authored(&secret, owner, genesis, ContentSpec {
@@ -2329,6 +2543,7 @@ mod tests {
             ..ContentSpec::default()
         });
         content_ingest(&conn, &s1.signed_bytes, 2).unwrap();
+        settle_pending_content_refolds(&conn).unwrap();
         assert_eq!(verdict(&conn, &s0.entry_hash), ("accepted".into(), 1));
         assert_eq!(verdict(&conn, &s1.entry_hash), ("accepted".into(), 1));
 
@@ -2500,6 +2715,7 @@ mod tests {
             ..ContentSpec::default()
         });
         content_ingest(&conn, &s1.signed_bytes, 2).unwrap();
+        settle_pending_content_refolds(&conn).unwrap();
 
         assert_eq!(verdict(&conn, &s0.entry_hash), ("parked{auth_len_ahead}".into(), 0));
         assert_eq!(verdict(&conn, &s1.entry_hash), ("parked{auth_len_ahead}".into(), 0));
@@ -2527,6 +2743,7 @@ mod tests {
             ..ContentSpec::default()
         });
         content_ingest(&conn, &s1.signed_bytes, 2).unwrap();
+        settle_pending_content_refolds(&conn).unwrap();
 
         assert_eq!(verdict(&conn, &s0.entry_hash), ("rejected{unexpected_grant}".into(), 0));
         assert_eq!(verdict(&conn, &s1.entry_hash), ("parked{missing_predecessor}".into(), 0));
@@ -2591,6 +2808,7 @@ mod tests {
             ..ContentSpec::default()
         });
         content_ingest(&conn, &reader_entry.signed_bytes, 3).unwrap();
+        settle_pending_content_refolds(&conn).unwrap();
 
         assert_eq!(
             verdict(&conn, &reader_entry.entry_hash),
@@ -2599,5 +2817,430 @@ mod tests {
         // Hash order still decides — the reader cut did not steer the writers' branch.
         assert_eq!(verdict(&conn, &winner.entry_hash), ("accepted".into(), 1));
         assert_eq!(verdict(&conn, &loser.entry_hash), ("forked".into(), 0));
+    }
+
+    // ---- #652: deferred/batch ingest refold + local-vs-global budget ----
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum RefoldCadence {
+        /// Settle after EVERY ingest — reproduces the pre-#652 per-entry refold cadence.
+        PerEntry,
+        /// Settle ONCE after the whole batch — the deferred/batch path this change introduces.
+        Batch,
+    }
+
+    /// Ingest `entries` into a fresh DB seeded by `setup`, folding the deferred refold either after
+    /// every entry or once after the batch, and return the full sorted (entry_hash, status,
+    /// accepted) set. The acceptance fold is a pure function of the final candidate set, so both
+    /// cadences MUST produce a byte-identical result — this is what proves defer/batch changed only
+    /// WHEN the fold runs, not its outcome.
+    fn drive_ingest(
+        entries: &[SignedContentEntry],
+        setup: &dyn Fn(&Connection),
+        cadence: RefoldCadence,
+    ) -> Vec<(Vec<u8>, String, i64)> {
+        let conn = db();
+        setup(&conn);
+        for entry in entries {
+            content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
+            if cadence == RefoldCadence::PerEntry {
+                settle_pending_content_refolds(&conn).unwrap();
+            }
+        }
+        // A trailing settle folds whatever is still deferred: the whole batch under `Batch`, and
+        // nothing (an empty-queue no-op) under `PerEntry`.
+        settle_pending_content_refolds(&conn).unwrap();
+        all_verdicts(&conn)
+    }
+
+    fn all_verdicts(conn: &Connection) -> Vec<(Vec<u8>, String, i64)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.entry_hash, s.status, e.accepted
+                 FROM content_entries e JOIN content_entry_status s ON s.entry_hash = e.entry_hash
+                 ORDER BY e.entry_hash",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    fn pending_refold_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM content_streams_pending_refold", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn deferred_settle_matches_per_entry_refold_on_an_honest_chain() {
+        let secret = DeviceSecret::from_seed(&[0xa1; 32]);
+        let (owner, genesis) = signed_roster(&secret);
+        let genesis = genesis.entry_hash;
+
+        // A dense honest chain seq 0 → 1 → 2, all fresh (auth_len 0) → all accept.
+        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+        let s1 = authored(&secret, owner, genesis, ContentSpec {
+            seq: 1,
+            previous: Some(s0.entry_hash),
+            ..ContentSpec::default()
+        });
+        let s2 = authored(&secret, owner, genesis, ContentSpec {
+            seq: 2,
+            previous: Some(s1.entry_hash),
+            ..ContentSpec::default()
+        });
+        let entries = [s0, s1, s2];
+        let setup = |conn: &Connection| {
+            roster(conn, &secret);
+            seed_ownership(conn, owner);
+            seed_roster_fact(conn, genesis, owner, &secret, "owner");
+        };
+
+        let per_entry = drive_ingest(&entries, &setup, RefoldCadence::PerEntry);
+        let batch = drive_ingest(&entries, &setup, RefoldCadence::Batch);
+        assert_eq!(
+            per_entry, batch,
+            "deferred batch settle equals per-entry refold, byte for byte"
+        );
+        // Non-trivial: the fold actually accepted the chain (not two empty sets agreeing).
+        assert!(
+            batch.iter().all(|(_, status, accepted)| status == "accepted" && *accepted == 1),
+            "the honest chain accepts end to end: {batch:?}",
+        );
+    }
+
+    #[test]
+    fn deferred_settle_matches_per_entry_refold_on_an_adversarial_interleaving() {
+        let secret = DeviceSecret::from_seed(&[0xa2; 32]);
+        let (owner, genesis) = signed_roster(&secret);
+        let genesis = genesis.entry_hash;
+
+        // An equivocating fork at seq 0 (siblings a0/b0), plus a seq-1 descendant of a0 that cites
+        // a DIFFERENT (ahead) auth_len — the varying-auth_len-down-the-chain attack.
+        // Ingested OUT OF ORDER (descendant first, then one sibling, then the other) so the
+        // per-entry cadence genuinely folds partial states mid-flight while the batch
+        // cadence sees the whole set at once. Both must converge.
+        let a0 =
+            authored(&secret, owner, genesis, ContentSpec { body: 0xf6, ..ContentSpec::default() });
+        let b0 =
+            authored(&secret, owner, genesis, ContentSpec { body: 0xf7, ..ContentSpec::default() });
+        let child = authored(&secret, owner, genesis, ContentSpec {
+            seq: 1,
+            previous: Some(a0.entry_hash),
+            auth_len: 9,
+            ..ContentSpec::default()
+        });
+        let entries = [child, b0, a0];
+        let setup = |conn: &Connection| {
+            roster(conn, &secret);
+            seed_ownership(conn, owner);
+            seed_roster_fact(conn, genesis, owner, &secret, "owner");
+        };
+
+        let per_entry = drive_ingest(&entries, &setup, RefoldCadence::PerEntry);
+        let batch = drive_ingest(&entries, &setup, RefoldCadence::Batch);
+        assert_eq!(
+            per_entry, batch,
+            "deferred batch settle equals per-entry refold across an out-of-order fork with \
+             varying auth_len",
+        );
+        // Non-trivial: the fork resolved — one seq-0 sibling accepts, the other forks.
+        let statuses: Vec<&str> = batch.iter().map(|(_, status, _)| status.as_str()).collect();
+        assert!(statuses.contains(&"accepted"), "a seq-0 sibling accepts: {batch:?}");
+        assert!(statuses.contains(&"forked"), "the losing seq-0 sibling forks: {batch:?}");
+    }
+
+    #[test]
+    fn deferred_settle_matches_per_entry_refold_across_a_cut() {
+        let secret = DeviceSecret::from_seed(&[0xa3; 32]);
+        let (owner, genesis) = signed_roster(&secret);
+        let genesis = genesis.entry_hash;
+
+        // seq 0 sits ON a roster content cut (accepted); seq 1 is BEYOND the bound watermark
+        // (condemned). The cut exercises the condemn fold path under both cadences.
+        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+        let s0_hash = s0.entry_hash;
+        let s1 = authored(&secret, owner, genesis, ContentSpec {
+            seq: 1,
+            previous: Some(s0_hash),
+            ..ContentSpec::default()
+        });
+        let entries = [s0, s1];
+        let setup = |conn: &Connection| {
+            roster(conn, &secret);
+            seed_ownership(conn, owner);
+            seed_roster_fact(conn, genesis, owner, &secret, "owner");
+            seed_roster_content_cut(conn, genesis, owner, 0, s0_hash);
+        };
+
+        let per_entry = drive_ingest(&entries, &setup, RefoldCadence::PerEntry);
+        let batch = drive_ingest(&entries, &setup, RefoldCadence::Batch);
+        assert_eq!(per_entry, batch, "deferred batch settle equals per-entry refold across a cut");
+        let statuses: Vec<&str> = batch.iter().map(|(_, status, _)| status.as_str()).collect();
+        assert!(statuses.contains(&"accepted"), "seq 0 on the cut accepts: {batch:?}");
+        assert!(
+            statuses.iter().any(|status| status.starts_with("condemned")),
+            "seq 1 beyond the cut is condemned: {batch:?}",
+        );
+    }
+
+    #[test]
+    fn ingest_defers_all_refolds_and_one_settle_folds_the_dirty_stream_once() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0xb1; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        // Authority is present BEFORE ingest, so a refold — if one ran mid-ingest — WOULD accept
+        // these entries. Observing them still structural after N ingests is the proof it did not.
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // A dense honest chain. Pre-#652 this ran one whole-stream refold PER entry (O(n) each,
+        // O(n^2) cumulative under the writer lock).
+        let mut entries = Vec::new();
+        let mut previous = None;
+        for seq in 0..6_u64 {
+            let entry = authored(&secret, owner, genesis, ContentSpec {
+                seq,
+                previous,
+                ..ContentSpec::default()
+            });
+            previous = Some(entry.entry_hash);
+            entries.push(entry);
+        }
+        for entry in &entries {
+            content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
+        }
+
+        // BEFORE/AFTER measurement: the N ingests ran ZERO refolds. The refold is the only writer
+        // of a non-structural verdict, so every entry sitting at its structural
+        // `retained_unfolded` baseline — with authority a refold would have consumed to
+        // accept it — proves none ran.
+        for entry in &entries {
+            assert_eq!(
+                verdict(&conn, &entry.entry_hash),
+                ("retained_unfolded".into(), 0),
+                "no refold runs during ingest — the entry keeps its structural status",
+            );
+        }
+        // N ingests to one stream deduped into ONE queued refold, not N.
+        assert_eq!(pending_refold_count(&conn), 1, "N ingests to one stream queue one refold");
+
+        // One settle folds exactly one dirty stream: O(dirty streams), NOT O(entries).
+        assert_eq!(
+            settle_pending_content_refolds(&conn).unwrap(),
+            1,
+            "one refold per dirty stream"
+        );
+        assert_eq!(pending_refold_count(&conn), 0, "settle drains the queue");
+        for entry in &entries {
+            assert_eq!(
+                verdict(&conn, &entry.entry_hash),
+                ("accepted".into(), 1),
+                "the single settle folds the whole chain to its acceptance verdict",
+            );
+        }
+    }
+
+    #[test]
+    fn an_account_fold_refold_does_not_clear_the_mark_so_settle_still_reprojects() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0xb2; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // Two ingests to one stream leave exactly one queued refold (dedup), and it persists across
+        // the separate ingest calls (crash-safety: the mark survives until a fold consumes it).
+        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+        content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
+        assert_eq!(pending_refold_count(&conn), 1, "the first ingest queues the stream");
+        let s1 = authored(&secret, owner, genesis, ContentSpec {
+            seq: 1,
+            previous: Some(s0.entry_hash),
+            ..ContentSpec::default()
+        });
+        content_ingest(&conn, &s1.signed_bytes, 2).unwrap();
+        assert_eq!(
+            pending_refold_count(&conn),
+            1,
+            "a second ingest dedups onto the same queue row"
+        );
+
+        // The account-fold path refolds the stream (an authority change triggers it): it updates
+        // `accepted` but does NOT refresh `content_projected_*`. So it must NOT clear the dirty
+        // mark — clearing it here (a prior bug) would let settle skip the stream and leave its
+        // projection permanently stale. The mark survives the account fold; settle still owes the
+        // reproject.
+        run_account_trigger(&conn, owner);
+        assert_eq!(verdict(&conn, &s0.entry_hash), ("accepted".into(), 1), "it folds the stream");
+        assert_eq!(
+            pending_refold_count(&conn),
+            1,
+            "the account fold did NOT reproject, so it must NOT clear the mark",
+        );
+
+        // Settle refolds AND reprojects, then clears the mark — the only path that may.
+        assert_eq!(
+            settle_pending_content_refolds(&conn).unwrap(),
+            1,
+            "settle processes the still-marked stream and clears it after reprojecting",
+        );
+        assert_eq!(
+            pending_refold_count(&conn),
+            0,
+            "the mark is cleared only once settle reprojects"
+        );
+    }
+
+    #[test]
+    fn a_dense_continuation_of_a_settled_chain_is_retained_not_missing_predecessor() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0xb4; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // Ingest seq 0 and SETTLE it — its status becomes `accepted`, no longer
+        // `retained_unfolded`.
+        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+        content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
+        assert_eq!(settle_pending_content_refolds(&conn).unwrap(), 1);
+        assert_eq!(verdict(&conn, &s0.entry_hash), ("accepted".into(), 1));
+
+        // A dense continuation cites the now-SETTLED predecessor. Its STRUCTURAL classification
+        // must see the predecessor as present (any status but missing-predecessor), so it
+        // lands `retained_unfolded` — NOT wrongly `missing_predecessor` just because s0's
+        // status moved off `retained_unfolded` at settle. The RETURNED status is the
+        // contract, so assert it directly.
+        let s1 = authored(&secret, owner, genesis, ContentSpec {
+            seq: 1,
+            previous: Some(s0.entry_hash),
+            ..ContentSpec::default()
+        });
+        assert_eq!(
+            content_ingest(&conn, &s1.signed_bytes, 2).unwrap(),
+            ContentIngestOutcome::Ingested { status: "retained_unfolded".into() },
+            "a dense continuation of a settled chain reports the structural retained_unfolded \
+             status",
+        );
+        assert_eq!(verdict(&conn, &s1.entry_hash), ("retained_unfolded".into(), 0));
+        // And it folds to accepted on settle, extending the settled prefix.
+        assert_eq!(settle_pending_content_refolds(&conn).unwrap(), 1);
+        assert_eq!(verdict(&conn, &s1.entry_hash), ("accepted".into(), 1));
+    }
+
+    #[test]
+    fn settle_folds_each_dirty_stream_independently() {
+        let conn = db();
+        // Two distinct dirty streams. Each settles in its OWN txn: an ownerless stream declassifies
+        // (and clears its mark), exercising the per-stream loop without cross-stream coupling.
+        for stream in [[0x51_u8; 32], [0x52_u8; 32]] {
+            conn.execute("INSERT INTO content_streams_pending_refold(stream_id) VALUES (?1)", [
+                stream.as_slice(),
+            ])
+            .unwrap();
+        }
+        assert_eq!(pending_refold_count(&conn), 2);
+        assert_eq!(
+            settle_pending_content_refolds(&conn).unwrap(),
+            2,
+            "each dirty stream settles exactly once",
+        );
+        assert_eq!(pending_refold_count(&conn), 0, "both marks cleared");
+    }
+
+    #[test]
+    fn local_device_history_is_excluded_from_the_global_cap_but_a_foreign_flood_still_trips() {
+        let foreign_secret = DeviceSecret::from_seed(&[0xc1; 32]);
+
+        // A LOCAL history the size of the whole global ceiling must NOT starve foreign ingest. The
+        // exclusion keys on the local DEVICE FINGERPRINT (forge-proof — a row carries it only if
+        // signed by the local key), NOT the attacker-settable author_account_id, so seed the
+        // ceiling-sized history under the local device's own fingerprint.
+        let excluded = db();
+        let local_fp = crate::oplog::local_device(&excluded, 1).unwrap().fingerprint().to_bytes();
+        seed_content_candidates(
+            &excluded,
+            AccountId::from_bytes([0xd2; 32]),
+            local_fp,
+            1,
+            CANDIDATES_GLOBAL_MAX as usize,
+            1,
+        );
+        let (foreign, foreign_roster) = roster(&excluded, &foreign_secret);
+        let signed = content(&foreign_secret, foreign, foreign_roster, 0, None);
+        let verified =
+            envelope::verify_content_signed(&signed.signed_bytes, &foreign_secret.public())
+                .unwrap();
+        {
+            let tx = excluded.unchecked_transaction().unwrap();
+            assert_eq!(
+                candidate_capacity(&tx, &verified, signed.signed_bytes.len()).unwrap(),
+                None,
+                "a global-cap-sized LOCAL-DEVICE history does not trip the foreign global cap",
+            );
+        }
+
+        // The SAME volume of FOREIGN-signed entries (no local device fingerprint to exclude) still
+        // trips the ceiling — the anti-flood budget is intact for genuine remote abuse.
+        let flooded = db();
+        seed_content_candidates(
+            &flooded,
+            AccountId::from_bytes([0xd1; 32]),
+            FOREIGN_FP,
+            1,
+            CANDIDATES_GLOBAL_MAX as usize,
+            1,
+        );
+        let (foreign, foreign_roster) = roster(&flooded, &foreign_secret);
+        let signed = content(&foreign_secret, foreign, foreign_roster, 0, None);
+        let verified =
+            envelope::verify_content_signed(&signed.signed_bytes, &foreign_secret.public())
+                .unwrap();
+        let tx = flooded.unchecked_transaction().unwrap();
+        assert_eq!(
+            candidate_capacity(&tx, &verified, signed.signed_bytes.len()).unwrap(),
+            Some(ContentCapacityScope::CandidateGlobal),
+            "a genuine foreign flood past the global cap still trips CandidateGlobal",
+        );
+    }
+
+    #[test]
+    fn settle_on_an_empty_queue_is_a_noop_and_a_second_settle_authors_nothing() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0xb3; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // Empty queue: settle folds nothing and returns 0.
+        assert_eq!(
+            settle_pending_content_refolds(&conn).unwrap(),
+            0,
+            "settle on an empty queue is a no-op",
+        );
+
+        // Ingest, then settle drains it; a SECOND settle finds the queue empty and changes nothing.
+        let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
+        assert_eq!(
+            settle_pending_content_refolds(&conn).unwrap(),
+            1,
+            "the first settle folds the dirty stream",
+        );
+        let after_first = verdict(&conn, &entry.entry_hash);
+        assert_eq!(
+            settle_pending_content_refolds(&conn).unwrap(),
+            0,
+            "the second settle authors nothing new",
+        );
+        assert_eq!(
+            verdict(&conn, &entry.entry_hash),
+            after_first,
+            "a redundant settle leaves the verdict unchanged",
+        );
     }
 }

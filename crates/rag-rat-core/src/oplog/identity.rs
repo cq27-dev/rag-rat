@@ -72,6 +72,33 @@ impl LocalDevice {
     }
 }
 
+/// Read this store's local device fingerprint WITHOUT minting one — `None` when no identity has
+/// been persisted yet. Unlike [`local_device`] this has NO mint side effect, so it is safe in a
+/// read/gate path that must never create an identity as a side effect (e.g. the §18b
+/// candidate-capacity budget, which excludes the local device's own signed rows from the
+/// remote-flood ceiling but must not mint a device just to run a capacity check). Reads only the
+/// persisted `fingerprint` column, which is a forge-proof key: a content row can carry this
+/// fingerprint only if it was signed with the local device key (`verify_content_signed` binds the
+/// signature to `header.device_fingerprint`), unlike the attacker-settable `author_account_id`.
+pub(crate) fn local_device_fingerprint(
+    conn: &Connection,
+) -> anyhow::Result<Option<DeviceFingerprint>> {
+    let stored: Option<Vec<u8>> = conn
+        .query_row("SELECT fingerprint FROM oplog_device_identity WHERE id = 0", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    stored
+        .map(|bytes| {
+            let bytes: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .context("stored device fingerprint is not exactly 32 bytes")?;
+            Ok(DeviceFingerprint::from_bytes(bytes))
+        })
+        .transpose()
+}
+
 /// The identity row as stored: the ed25519 device (always present) plus the X25519 encryption key
 /// IF it has been minted/backfilled yet (a pre-V058 row carries neither X25519 column).
 struct StoredIdentity {

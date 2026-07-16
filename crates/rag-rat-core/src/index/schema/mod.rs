@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 71;
+pub const LATEST_SCHEMA_VERSION: u32 = 72;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -495,6 +495,14 @@ const MIGRATION_071_DESCRIPTION: &str =
      instead of full-scanning the edge table when matching unresolved edges by \
      target_qualified_name. Purely additive; CREATE INDEX IF NOT EXISTS, nothing pre-existing to \
      backfill";
+const MIGRATION_072_ID: &str = "072_content_streams_pending_refold";
+const MIGRATION_072_CHECKSUM: &str = "sha256:rag-rat-content-streams-pending-refold-v72";
+const MIGRATION_072_DESCRIPTION: &str =
+    "Add content_streams_pending_refold (issue #652): the deferred-refold work queue for the /3 \
+     content-ingest path. content_ingest no longer folds acceptance per entry (O(n^2) under the \
+     writer lock as a stream is built one candidate at a time); it enqueues the stream here and \
+     settle_pending_content_refolds folds each dirty stream once. Purely additive; CREATE ... IF \
+     NOT EXISTS, nothing pre-existing to backfill";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1082,6 +1090,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_071_CHECKSUM,
         description: MIGRATION_071_DESCRIPTION,
         apply: apply_edge_target_qname_index,
+    },
+    Migration {
+        id: MIGRATION_072_ID,
+        checksum: MIGRATION_072_CHECKSUM,
+        description: MIGRATION_072_DESCRIPTION,
+        apply: apply_content_streams_pending_refold,
     },
 ];
 

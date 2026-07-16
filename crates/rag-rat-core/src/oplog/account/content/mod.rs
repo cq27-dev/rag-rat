@@ -23,5 +23,7 @@ pub(in crate::oplog) use envelope::{
     sign_content_entry, verify_content_signed,
 };
 #[allow(unused_imports, reason = "C2 storage seam is frozen before C3 wiring lands")]
-pub(in crate::oplog) use storage::{ContentCapacityScope, ContentIngestOutcome, content_ingest};
+pub(in crate::oplog) use storage::{
+    ContentCapacityScope, ContentIngestOutcome, content_ingest, settle_pending_content_refolds,
+};
 pub(super) use storage::{promote_pre_verify_for_account, refold_streams_for_account};

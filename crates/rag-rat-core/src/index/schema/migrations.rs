@@ -1285,6 +1285,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_069_ID => Some(69),
             MIGRATION_070_ID => Some(70),
             MIGRATION_071_ID => Some(71),
+            MIGRATION_072_ID => Some(72),
             _ => None,
         })
         .max()
@@ -1365,6 +1366,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_069_ID
             | MIGRATION_070_ID
             | MIGRATION_071_ID
+            | MIGRATION_072_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1442,6 +1444,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_069_ID => migration.checksum != MIGRATION_069_CHECKSUM,
         MIGRATION_070_ID => migration.checksum != MIGRATION_070_CHECKSUM,
         MIGRATION_071_ID => migration.checksum != MIGRATION_071_CHECKSUM,
+        MIGRATION_072_ID => migration.checksum != MIGRATION_072_CHECKSUM,
         _ => false,
     }
 }
@@ -4540,6 +4543,24 @@ pub(crate) fn apply_content_projected_tables(conn: &Connection) -> rusqlite::Res
              spec_json     TEXT NOT NULL,
              resolved_json TEXT,
              PRIMARY KEY(stream_id, edge_key)
+         ) STRICT;",
+    )
+}
+
+/// V072 (issue #652): the deferred-refold work queue for the `/3` content-ingest path.
+/// `content_ingest` used to fold acceptance over the whole stream on EVERY ingested entry — an
+/// O(n^2) cost as an n-entry stream is built one candidate at a time under the writer lock, which
+/// an attacker amplifies by varying cited `auth_len` to defeat the per-refold freshness cache. It
+/// now records structural classification and enqueues the stream here instead; the settle seam
+/// (`settle_pending_content_refolds`) folds each dirty stream ONCE.
+/// INVARIANT: a `stream_id` is present iff it has ingested candidates not yet folded to their
+/// acceptance verdict — every successful refold (ingest-settle or account fold) deletes its row.
+/// Purely additive; `CREATE ... IF NOT EXISTS`, so a torn replay reconverges without a wrapping
+/// transaction; nothing pre-existing to backfill.
+pub(crate) fn apply_content_streams_pending_refold(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS content_streams_pending_refold(
+             stream_id BLOB PRIMARY KEY CHECK (length(stream_id) = 32)
          ) STRICT;",
     )
 }

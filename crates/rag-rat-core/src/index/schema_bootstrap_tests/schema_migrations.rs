@@ -2249,10 +2249,16 @@ fn migration_070_adds_the_content_projected_tables() {
 }
 
 #[test]
-fn migration_071_is_the_tip_and_indexes_edge_target_qname() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 71, "move this pin with the next schema migration");
+fn migration_071_indexes_edge_target_qname() {
+    // The absolute-tip pin moved to `migration_072_*` (V072 is the tip now); this drops to the
+    // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply",
+    );
 
     let index_on = |conn: &rusqlite::Connection| -> i64 {
         conn.query_row(
@@ -2288,6 +2294,82 @@ fn migration_071_is_the_tip_and_indexes_edge_target_qname() {
         )
         .unwrap();
     assert_eq!(v71_recorded, 1, "the forward migration records V071");
+}
+
+#[test]
+fn migration_072_is_the_tip_and_queues_pending_refold() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 72, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    // The deferred-refold work queue exists with just its stream_id primary key.
+    assert!(
+        conn_table_columns(&conn, "content_streams_pending_refold")
+            .contains(&"stream_id".to_string()),
+        "V072 gives content_streams_pending_refold its stream_id column",
+    );
+
+    // PRIMARY KEY(stream_id) is what dedups repeat enqueues of one stream into a single queued
+    // refold: a plain duplicate is refused, and the INSERT OR IGNORE the ingest path uses is a
+    // no-op rather than an error.
+    conn.execute("INSERT INTO content_streams_pending_refold(stream_id) VALUES (zeroblob(32))", [])
+        .expect("first enqueue inserts");
+    assert!(
+        conn.execute(
+            "INSERT INTO content_streams_pending_refold(stream_id) VALUES (zeroblob(32))",
+            [],
+        )
+        .is_err(),
+        "the stream_id primary key rejects a duplicate enqueue of one stream",
+    );
+    conn.execute(
+        "INSERT OR IGNORE INTO content_streams_pending_refold(stream_id) VALUES (zeroblob(32))",
+        [],
+    )
+    .expect("INSERT OR IGNORE dedups a repeat enqueue without erroring");
+
+    // CHECK(length(stream_id) = 32) rejects a non-32-byte stream_id — a stream id is a sha256, so a
+    // shorter/longer blob is corruption, matching every sibling 32-byte-blob column.
+    assert!(
+        conn.execute(
+            "INSERT INTO content_streams_pending_refold(stream_id) VALUES (zeroblob(31))",
+            [],
+        )
+        .is_err(),
+        "a 31-byte stream_id violates the length CHECK",
+    );
+
+    // Deferred-absence in ISOLATION: a bare DB lacks the table until the V072 applier runs, and a
+    // replay is an idempotent no-op (CREATE ... IF NOT EXISTS).
+    let isolated = rusqlite::Connection::open_in_memory().unwrap();
+    assert!(
+        !conn_table_exists(&isolated, "content_streams_pending_refold"),
+        "bare DB lacks content_streams_pending_refold before the isolated apply",
+    );
+    schema::apply_content_streams_pending_refold(&isolated).unwrap();
+    schema::apply_content_streams_pending_refold(&isolated).expect("replay is a no-op");
+    assert!(
+        conn_table_columns(&isolated, "content_streams_pending_refold")
+            .contains(&"stream_id".to_string()),
+        "the isolated applier recreates the table",
+    );
+
+    // A forward migrate over a ledger truncated below V072 replays the step and records V072.
+    truncate_schema_to(&conn, 71);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip",
+    );
+    let v72_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '072_content_streams_pending_refold'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v72_recorded, 1, "the forward migration records V072");
 }
 
 #[test]

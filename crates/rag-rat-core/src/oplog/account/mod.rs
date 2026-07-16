@@ -39,8 +39,8 @@ pub(crate) use bootstrap::local_account;
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub(in crate::oplog) use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, SignedContentEntry,
-    VerifiedContentEntry, content_ingest, decode_content_signed, sign_content_entry,
-    verify_content_signed,
+    VerifiedContentEntry, content_ingest, decode_content_signed, settle_pending_content_refolds,
+    sign_content_entry, verify_content_signed,
 };
 // The in-tx `/3` content-author seam + its genesis-detection reader (C3.4b-i, #663): #664
 // retargets the live memory path onto them, so they are plain re-exports.
