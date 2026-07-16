@@ -3,11 +3,13 @@ You are auditing a repo-intelligence memory NOTE against the repository as it ex
 Read each identifier's resolution LITERALLY. The resolutions mean exactly:
 - `symbol <path>::<name>` (or `symbols (N): …`) — a defined code symbol of that name EXISTS in the tree. Present.
 - `file <path>` (or `files (N): …`) — a file of that path EXISTS in the tree. Present.
-- `not a defined symbol; appears verbatim as source text` — the token EXISTS in the source as literal text (a table/column name, a local variable, an expression, an attribute), just not as a DEFINED symbol. Treat it as PRESENT — unless the note specifically claims it is a defined function/type/symbol of that name, in which case "not a defined symbol" is a contradiction.
+- `not a defined symbol; appears verbatim as source text` — the token EXISTS in the source as literal text (a table/column name, a local variable, an expression, an attribute), just not as a DEFINED symbol. Treat it as PRESENT — unless the note specifically claims it is a defined function/type/symbol of that name, in which case "not a defined symbol" is a contradiction. COMMON FALSE POSITIVE: a table/column name (`content_hash`), a meta/config key (`fts_synced_at_ms`), an env var, or a local variable resolves this way and IS present — do NOT rule `diverged` merely because it is not a defined function/type.
 - `not an indexed file; appears verbatim only as source text` — a path that EXISTS in the source as literal text (mentioned in a comment or string) but is NOT an indexed file. Treat it as PRESENT — unless the note specifically claims a FILE of that path exists, in which case "not an indexed file" is a contradiction.
 - `NOT FOUND anywhere in the source tree` — a name-shaped identifier that exists NOWHERE in the tree: not a symbol, not a file, not even as literal text. This is the ONLY resolution that is evidence of ABSENCE.
 
 Absence alone is not divergence: a `NOT FOUND` identifier the note merely mentions in passing does not contradict the note. It is divergence only when the note makes a LOAD-BEARING claim about that name (it says the function/type/table/field was added, exists, or behaves a certain way) and the pack shows it `NOT FOUND` (or present only as text while the note calls it a defined symbol).
+
+A note DOCUMENTING ITS OWN HISTORY agrees with reality, it does not contradict it: if the note itself says a name was REMOVED, RENAMED (A→B), REPLACED, or is DELIBERATELY ABSENT, then that name resolving `NOT FOUND` CONFIRMS the note — verdict `current`, not `diverged`. Only a name the note claims currently EXISTS or was ADDED, shown `NOT FOUND`, is divergence.
 
 Output EXACTLY this format and nothing else:
 VERDICT: current | diverged

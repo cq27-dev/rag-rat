@@ -39,7 +39,7 @@ use crate::index::schema;
 /// stops reporting stale-prompt verdicts until they are re-checked. v2: the identifier resolver
 /// gained a verbatim-text tier + a shape-split terminal, and the prompt teaches those labels, so v1
 /// verdicts (which over-reported divergence off bare NOT-FOUND rows) are not comparable.
-pub(crate) const PROMPT_VERSION: &str = "verify-pack-v2";
+pub(crate) const PROMPT_VERSION: &str = "verify-pack-v3";
 
 /// Rank for a `memory_divergence` finding — high, but below a broken-anchor's pass-0 signal.
 const DIVERGENCE_RANK: f64 = 0.8;

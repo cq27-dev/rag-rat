@@ -80,6 +80,9 @@ evals/memory-compaction/
     anchors.json         identifier-anchored code excerpts (anchor-context variants)
     drift-anchors.json   doctored anchors for the drift-detection variant
     verify-packs.json     mechanically-built evidence packs (verify-pack method), keyed id|root
+                          ⚠ STALE FORMAT (issue #695): frozen in the legacy `IDENTIFIER RESOLUTION`
+                          shape, predates the current `render_pack` output — regenerate before trusting
+                          verify_pack_test numbers
   harness/
     eval_app.py          Modal app: candidates, judge, HHEM, the v2 variants, verify + drift
     score.py             folds judge verdicts + HHEM + format checks into the round-1 scoreboard
@@ -120,7 +123,10 @@ modal run harness/eval_app.py::verify_test        # agentic grep/read method (th
 ```
 
 `verify_pack_test` reads the static `corpus/verify-packs.json` (evidence packs pre-built from the
-current + doctored trees), so it does not mount the repo. `verify_test` and `drift_test` mount the
+current + doctored trees), so it does not mount the repo. **Caveat:** that snapshot is frozen in the
+legacy `IDENTIFIER RESOLUTION` pack format and predates the current `render_pack` output (which emits
+`` `id` -> … `` rows and hides `mem_<hex>` cross-references); regenerate it against the current +
+doctored trees before trusting these numbers — see issue #695. `verify_test` and `drift_test` mount the
 live checkout at `/repo` and the doctored copy at `/repo-drift`, so **run
 `make-drift-tree.py` first** for those.
 
@@ -226,11 +232,11 @@ identifiers. The eval is the check for the ref classes the runtime deliberately 
 
 These prompts are LIVE in rag-rat, versioned so a change is traceable:
 
-- `dream/verdict.rs` — `PROMPT_VERSION = "verify-pack-v1"` (the evidence-pack verdict prompt).
+- `dream/verdict.rs` — `PROMPT_VERSION = "verify-pack-v3"` (the evidence-pack verdict prompt).
 - `dream/compact.rs` — `COMPACT_PROMPT_VERSION = "compact-v1"` (the self-containment compact prompt).
 
 The harness's `VERIFY_PACK_PROMPT` mirrors the shipped verdict prompt (`dream/verdict.rs`'s
-`VERDICT_PROMPT_HEAD` + the NOTE/PACK tail) at `PROMPT_VERSION = "verify-pack-v1"`. **Re-sync
+`VERDICT_PROMPT_HEAD` + the NOTE/PACK tail) at `PROMPT_VERSION = "verify-pack-v3"`. **Re-sync
 `VERIFY_PACK_PROMPT` whenever `PROMPT_VERSION` bumps**, or the gate stops exercising what ships.
 
 **Bumping either version string, or changing the dream model, means re-running this suite** —

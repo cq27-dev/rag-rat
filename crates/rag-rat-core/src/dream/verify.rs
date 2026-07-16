@@ -31,6 +31,13 @@ const NOT_FOUND: &str = "NOT FOUND anywhere in the source tree";
 /// The resolution for a code-shaped-but-unresolved span that is uninformative — a paraphrase,
 /// snippet, or flag whose non-match is a shape artifact, NEVER evidence of divergence.
 const UNRESOLVABLE: &str = "not a resolvable identifier (no symbol, file, or verbatim-text match)";
+/// The resolution for a `mem_<hex>` id that is a cross-reference to ANOTHER repo memory, not a code
+/// entity — uninformative (never NOT_FOUND, never source presence). Shared by the tier-2.5 arms.
+const MEM_XREF: &str = "a cross-reference to another repo memory (not a code entity)";
+/// The verbatim-text label for a present-but-not-a-defined-symbol span (a table/column name, a
+/// local, an expression). Shared by the general text tier and the ambiguous mem-id prefix arm so
+/// the label (and thus the churn-key string) can't drift between the two paths.
+const TEXT_PRESENT_SYMBOL: &str = "not a defined symbol; appears verbatim as source text";
 /// Context lines above/below an identifier hit in a bound-file excerpt window.
 const EXCERPT_RADIUS: i64 = 3;
 /// Upper bound on the total excerpt lines an evidence pack carries (keeps a single-turn verdict
@@ -185,6 +192,80 @@ impl ResolutionKind {
     fn is_present(self) -> bool {
         matches!(self, Self::Symbol | Self::File | Self::TextPresent)
     }
+}
+
+/// How a `mem_`-prefixed identifier resolves against the minted memory-id shape.
+///
+/// `memory_create` mints `mem_<hex-timestamp>_<hex-suffix>` (`query::memory::validate::memory_id`)
+/// or `mem_<hex>_<hex>` for a consolidated import (`index::consolidate`) — always TWO hex segments
+/// — and agents commonly cite the timestamp segment ALONE. The two forms are disambiguated
+/// differently downstream (see the tier-2.5 branch in [`resolve_identifier`]), so classification is
+/// three-way:
+/// - [`Full`](MemIdShape::Full): both segments present (`mem_<hex≥10>_<hex…>`). Decisive by shape —
+///   a coincidental identifier of this exact form is vanishingly unlikely — so it is a
+///   cross-reference without any record lookup, which keeps #678's DANGLING-reference property (a
+///   cite of a deleted memory is uninformative, never a code absence) independent of the memory
+///   table.
+/// - [`Prefix`](MemIdShape::Prefix): one long hex segment, no suffix (`mem_<hex≥10>`).
+///   Shape-AMBIGUOUS with a contiguous-hex code local, so shape alone cannot classify it — the
+///   caller disambiguates by record-confirmation, then source presence.
+/// - [`NotAnId`](MemIdShape::NotAnId): everything else. The first underscore-delimited segment must
+///   be a long (≥10) contiguous hex run — checking that segment, NOT the aggregate hex count across
+///   underscores, is what stops a segmented hex-word like `mem_dead_beef_ca` from being misread —
+///   and the whole span must be hex/underscore, so a real symbol like `mem_19f2ad6cf90_lookup` is
+///   rejected on its non-hex tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemIdShape {
+    NotAnId,
+    Full,
+    Prefix,
+}
+
+fn memory_id_shape(ident: &str) -> MemIdShape {
+    let Some(rest) = ident.strip_prefix("mem_") else {
+        return MemIdShape::NotAnId;
+    };
+    let first_segment = rest.split('_').next().unwrap_or(rest);
+    let shaped = first_segment.len() >= 10
+        && first_segment.chars().all(|c| c.is_ascii_hexdigit())
+        && rest.chars().all(|c| c.is_ascii_hexdigit() || c == '_');
+    match (shaped, rest.contains('_')) {
+        (false, _) => MemIdShape::NotAnId,
+        (true, true) => MemIdShape::Full,
+        (true, false) => MemIdShape::Prefix,
+    }
+}
+
+/// The union predicate — is `ident` memory-id-shaped at all (Full OR Prefix)? Used only by the
+/// excerpt filter in [`evidence_pack`], which must exclude BOTH forms from bound-file excerpt
+/// windows once they resolve `Unresolvable`: `identifier_windows` matches by plain substring, so a
+/// cross-ref left in the excerpt-ident list would window a source line and wrongly make a
+/// cross-ref-only note citable. (#678)
+fn is_memory_id_shaped(ident: &str) -> bool {
+    !matches!(memory_id_shape(ident), MemIdShape::NotAnId)
+}
+
+/// Does a repo memory in the active scope have this bare timestamp `prefix` as its whole id, or as
+/// the `<prefix>_<suffix>` timestamp segment of its id? Confirms a shape-ambiguous
+/// [`MemIdShape::Prefix`] is a real cross-reference (vs a coincidental contiguous-hex code local).
+/// Scoped exactly like the other `repo_memories` reads here. ALL statuses count — a cite of an
+/// obsolete/superseded memory is still a cross-ref. Confirmation can only UPGRADE a prefix to a
+/// cross-ref, so it can never turn one into a NOT_FOUND absence: #678's dangling-reference property
+/// does not depend on the memory table.
+fn memory_with_id_prefix_exists(conn: &Connection, prefix: &str) -> rusqlite::Result<bool> {
+    let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
+    let clause = schema::periphery_repo_scope_clause(&scope, "repo_memories");
+    // `substr(id, 1, len)` byte-prefix equality, NOT LIKE — `_` is a LIKE single-char wildcard.
+    // Input is ASCII hex, so SQLite's char-based `substr` is byte-equivalent.
+    let pat = format!("{prefix}_");
+    conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM repo_memories WHERE (id = ?1 OR substr(id, 1, ?2) = \
+             ?3){clause})"
+        ),
+        rusqlite::params![prefix, pat.len() as i64, pat],
+        |r| r.get(0),
+    )
 }
 
 /// One extracted identifier and where (if anywhere) it resolves in the whole-tree index.
@@ -453,7 +534,16 @@ pub fn evidence_pack(conn: &Connection, memory_id: &str) -> anyhow::Result<Evide
         let (resolution, kind) = resolve_identifier(conn, ident, &file_paths)?;
         resolutions.push(IdentifierResolution { identifier: ident.clone(), resolution, kind });
     }
-    let excerpts = bound_file_excerpts(conn, memory_id, &scope, &identifiers)?;
+    // A `mem_<hex>` cross-reference is never source evidence, so it must not window an excerpt
+    // either — else a note that merely mentions a memory id in its bound file stays citable via the
+    // excerpt, even though the id itself resolved Unresolvable above. Real hex-named symbols (which
+    // resolved as `Symbol`, not `Unresolvable`) are kept. (#678)
+    let excerpt_idents: Vec<String> = resolutions
+        .iter()
+        .filter(|r| !(r.kind == ResolutionKind::Unresolvable && is_memory_id_shaped(&r.identifier)))
+        .map(|r| r.identifier.clone())
+        .collect();
+    let excerpts = bound_file_excerpts(conn, memory_id, &scope, &excerpt_idents)?;
     Ok(EvidencePack { memory_id: memory_id.to_string(), identifiers: resolutions, excerpts })
 }
 
@@ -642,6 +732,40 @@ fn resolve_identifier(
             ));
         },
     }
+    // 2.5. MEMORY CROSS-REFERENCE — a `mem_<hex>` id is a cross-reference to ANOTHER repo memory,
+    // not      a code entity. Classified HERE — AFTER symbol/file (so a real symbol/file whose
+    // name      matches the shape, `fn mem_deadbeefdead`, wins) — and split by shape so an
+    // ambiguous prefix      can't strip source evidence from a coincidental code local:
+    //      - FULL form (`mem_<hex>_<hex>`): unambiguous, so a cross-ref regardless of source
+    //        presence or record existence — never NOT_FOUND (a dangling cite is not a code
+    //        absence), never source presence (a note citing a full id in a comment stays
+    //        `unverifiable`).
+    //      - PREFIX form (`mem_<hex>`): shape-ambiguous with a contiguous-hex local. Confirm
+    //        against the memory table first — a recorded memory's prefix is a cross-ref even when
+    //        the bare id also appears in indexed text (a doc citing it is not code evidence). An
+    //        UNRECORDED prefix defers to source: a verbatim token-boundary hit is a coincidental
+    //        code identifier whose `TextPresent` evidence must survive; a miss is a dangling
+    //        cross-ref, NEVER NOT_FOUND (the arm owns this terminal so a bare code-shaped prefix
+    //        can't fall through to `Absent`). (#678)
+    match memory_id_shape(ident) {
+        MemIdShape::Full => {
+            return Ok((MEM_XREF.to_string(), ResolutionKind::Unresolvable));
+        },
+        MemIdShape::Prefix => {
+            if memory_with_id_prefix_exists(conn, ident)? {
+                return Ok((MEM_XREF.to_string(), ResolutionKind::Unresolvable));
+            }
+            // Present at a token boundary → coincidental code identifier (keep its evidence); a
+            // miss or an indeterminate (`Capped`) scan → dangling cross-ref, never
+            // convict as `Absent`.
+            return Ok(match text_probe(conn, ident)? {
+                TextProbe::Present =>
+                    (TEXT_PRESENT_SYMBOL.to_string(), ResolutionKind::TextPresent),
+                _ => (MEM_XREF.to_string(), ResolutionKind::Unresolvable),
+            });
+        },
+        MemIdShape::NotAnId => {},
+    }
     // 3. VERBATIM TEXT — present in source but not a symbol/file (a DB table/column name, a local,
     //    a common expression). Present, so NOT a divergence — but "not a defined symbol" keeps the
     //    door open for a note claiming it is a live function. The resolution names NO files, so the
@@ -671,7 +795,7 @@ fn resolve_identifier(
             let label = if is_file_path_shaped(ident, file_paths) {
                 "not an indexed file; appears verbatim only as source text"
             } else {
-                "not a defined symbol; appears verbatim as source text"
+                TEXT_PRESENT_SYMBOL
             };
             return Ok((label.to_string(), ResolutionKind::TextPresent));
         },
@@ -1984,6 +2108,202 @@ mod tests {
     }
 
     #[test]
+    fn resolve_identifier_treats_memory_id_cross_references_as_non_code() {
+        // #678: a memory body that cross-references ANOTHER memory by id (`mem_<hex>_<hex>`, or the
+        // common shorthand PREFIX) is not a CODE entity. It resolves `Unresolvable` —
+        // uninformative, hidden from the pack — so it is NEITHER the NOT_FOUND
+        // code-divergence signal NOR source presence. The presence point matters: a note
+        // whose ONLY resolving token is a cross-ref has no code evidence, so it must stay
+        // `unverifiable`, not be promoted to the verdict model on the strength of another
+        // note existing.
+        let c = mem_db();
+        set_repo(&c, "r");
+        // The referenced memory exists here, but existence does not change the classification — a
+        // cross-ref is never code evidence, dangling or not.
+        seed_memory(
+            &c,
+            "mem_19f2ad6cf90_2feb75f29ff8",
+            "title",
+            "a cross-referenced decision",
+            "r",
+        );
+        let files = indexed_file_paths(&c).unwrap();
+        let resolve = |id: &str| resolve_identifier(&c, id, &files).unwrap();
+
+        for id in [
+            "mem_19f2ad6cf90_2feb75f29ff8",  // an existing memory, full id
+            "mem_19f2ad6cf90",               // the timestamp-prefix form agents usually cite
+            "mem_deadbeefdead_cafebabecafe", // a dangling reference
+        ] {
+            let (res, kind) = resolve(id);
+            assert_eq!(
+                kind,
+                ResolutionKind::Unresolvable,
+                "{id}: a cross-ref is uninformative: {res}"
+            );
+            assert!(!kind.is_present(), "{id}: a cross-ref is not source presence: {res}");
+            assert_ne!(res, NOT_FOUND, "{id}: a cross-ref is never the code-absence signal: {res}");
+        }
+    }
+
+    #[test]
+    fn resolve_identifier_prefers_a_real_symbol_over_the_memory_id_heuristic() {
+        // #678 review: `is_memory_id_shaped` is a SHAPE heuristic — a real code symbol whose name
+        // happens to be all-hex (`mem_deadbeefdead`) must still resolve as that SYMBOL, not be
+        // hidden as a memory cross-reference. Code resolution runs FIRST; the memory-ref heuristic
+        // only reclassifies a span that would otherwise be a genuine NOT_FOUND absence.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let fid = seed_file(&c, "src/m.rs", "fn mem_deadbeefdead() {}\n", "r");
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','mem_deadbeefdead','function',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, kind) = resolve_identifier(&c, "mem_deadbeefdead", &files).unwrap();
+        assert_eq!(kind, ResolutionKind::Symbol, "a real hex-named symbol resolves as code: {res}");
+    }
+
+    #[test]
+    fn resolve_identifier_treats_a_source_mentioned_memory_id_as_a_cross_ref_not_text() {
+        // #678 review: even when a `mem_<hex>` id appears VERBATIM in indexed source (a doc comment
+        // or a test fixture), it is still a cross-reference to another memory, not code evidence —
+        // so it classifies `Unresolvable`, NOT `TextPresent`. The memory-id check runs
+        // after symbol/file resolution (real symbols win) but BEFORE the verbatim-text
+        // probe.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(
+            &c,
+            "src/x.rs",
+            "// see mem_19f2ad6cf90_2feb75f29ff8 for the rationale\nfn f() {}\n",
+            "r",
+        );
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, kind) = resolve_identifier(&c, "mem_19f2ad6cf90_2feb75f29ff8", &files).unwrap();
+        assert_eq!(
+            kind,
+            ResolutionKind::Unresolvable,
+            "a source-mentioned mem-id is a cross-ref, not verbatim text: {res}"
+        );
+        assert!(!kind.is_present(), "a cross-ref is not source presence even in source: {res}");
+    }
+
+    #[test]
+    fn resolve_identifier_does_not_mistake_a_segmented_hex_word_for_a_memory_id() {
+        // #678 review: `is_memory_id_shaped` keys on the FIRST underscore-delimited segment being a
+        // long contiguous hex run (the minted `mem_<hex-timestamp>_<suffix>` shape), NOT the
+        // aggregate hex count across underscores. Otherwise an ordinary identifier built from short
+        // hex-word chunks — `mem_dead_beef_ca` (4+4+2 = 10 hex) — is misread as a memory cross-ref,
+        // and if it appears as source text its legitimate `TextPresent` evidence gets suppressed.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/y.rs", "let mem_dead_beef_ca = 1;\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+
+        // A segmented hex-word local is NOT a memory id: its verbatim source presence survives.
+        let (res, kind) = resolve_identifier(&c, "mem_dead_beef_ca", &files).unwrap();
+        assert_eq!(
+            kind,
+            ResolutionKind::TextPresent,
+            "a segmented hex word keeps its source presence: {res}"
+        );
+        assert!(kind.is_present(), "a segmented hex word is not suppressed as a cross-ref: {res}");
+
+        // A genuinely minted id (long first-segment hex run) is still classified as a cross-ref.
+        let (_, mem_kind) = resolve_identifier(&c, "mem_19f2ad6cf90_2feb75f29ff8", &files).unwrap();
+        assert_eq!(
+            mem_kind,
+            ResolutionKind::Unresolvable,
+            "a real mem-id (long first-segment hex run) still classifies as a cross-ref"
+        );
+    }
+
+    #[test]
+    fn memory_id_shape_splits_full_prefix_and_non_ids() {
+        use MemIdShape::{Full, NotAnId, Prefix};
+        // Full — two hex segments: both mint sites (`mem_{now:x}_{suffix}`, consolidate `13+12`),
+        // plus a trailing-underscore edge. Decisive by shape, no record lookup.
+        for id in
+            ["mem_19f2ad6cf90_2feb75f29ff8", "mem_deadbeefdead0_cafebabecafe", "mem_deadbeefdead_"]
+        {
+            assert_eq!(memory_id_shape(id), Full, "{id} is a full two-segment id");
+        }
+        // Prefix — one long hex segment, no suffix: the shorthand agents cite; ambiguous with a
+        // local.
+        for id in ["mem_19f2ad6cf90", "mem_deadbeefdead"] {
+            assert_eq!(memory_id_shape(id), Prefix, "{id} is a bare timestamp prefix");
+        }
+        // NotAnId — short first segment, non-hex tail, or no `mem_` prefix.
+        for id in ["mem_dead_beef_ca", "mem_19f2ad6cf90_lookup", "mem_copy", "memcpy", "other"] {
+            assert_eq!(memory_id_shape(id), NotAnId, "{id} is not a memory id");
+        }
+    }
+
+    #[test]
+    fn resolve_identifier_lets_a_coincidental_hex_local_keep_its_text_presence() {
+        // #678 review (Codex P2): a PREFIX-shaped token that is neither a defined symbol nor a
+        // recorded memory, but appears verbatim in source, is a coincidental code identifier — a
+        // memory-shaped LOCAL misses the symbol tier, so ONLY its source presence carries it. Its
+        // `TextPresent` evidence must survive, not be suppressed as a memory cross-reference.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/y.rs", "let mem_deadbeefdead = 1;\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, kind) = resolve_identifier(&c, "mem_deadbeefdead", &files).unwrap();
+        assert_eq!(
+            kind,
+            ResolutionKind::TextPresent,
+            "a coincidental hex local keeps its source presence: {res}"
+        );
+        assert!(
+            kind.is_present(),
+            "a coincidental hex local is not suppressed as a cross-ref: {res}"
+        );
+    }
+
+    #[test]
+    fn resolve_identifier_keeps_a_recorded_memorys_prefix_a_cross_ref_even_when_source_mentions_it()
+    {
+        // #678 review: a prefix that IS the timestamp of a RECORDED memory stays a cross-reference
+        // even when the bare prefix also appears verbatim in indexed text (an ADR/plan doc citing
+        // the id) — a cross-ref is never code evidence. Record-confirmation is what
+        // distinguishes this from a coincidental hex local (no matching memory), which
+        // keeps its text presence above.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "mem_19f2ad6cf90_2feb75f29ff8", "title", "a decision", "r");
+        seed_file(&c, "docs/adr.md", "// relates to mem_19f2ad6cf90\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, kind) = resolve_identifier(&c, "mem_19f2ad6cf90", &files).unwrap();
+        assert_eq!(
+            kind,
+            ResolutionKind::Unresolvable,
+            "a recorded memory's prefix is a cross-ref, not source text: {res}"
+        );
+        assert!(!kind.is_present(), "a cross-ref is not source presence: {res}");
+        assert_ne!(res, NOT_FOUND, "a cross-ref is never the code-absence signal: {res}");
+    }
+
+    #[test]
+    fn resolve_identifier_treats_a_dangling_memory_prefix_as_a_cross_ref_not_an_absence() {
+        // #678: a prefix matching NO recorded memory, appearing in source only as a SUBSTRING of a
+        // longer full id (not at a token boundary), is a dangling cross-reference — `Unresolvable`,
+        // and NEVER the NOT_FOUND code-absence signal (a bare code-shaped prefix would otherwise
+        // reach the `Absent` terminal). The Prefix arm owns this terminal so the property
+        // can't regress.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/z.rs", "// see mem_19f2ad6cf90_2feb75f29ff8\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, kind) = resolve_identifier(&c, "mem_19f2ad6cf90", &files).unwrap();
+        assert_eq!(kind, ResolutionKind::Unresolvable, "a dangling prefix is a cross-ref: {res}");
+        assert_ne!(res, NOT_FOUND, "a dangling prefix is never a code absence: {res}");
+    }
+
+    #[test]
     fn resolve_identifier_never_masks_a_deleted_qualified_method_via_a_namesake() {
         // A qualified call is NOT resolved by bare method name (which would match an unrelated
         // NAMESAKE and hide the method's deletion). A PRESENT qualified call resolves through the
@@ -2606,6 +2926,66 @@ mod tests {
             "the bound-file excerpt contains the identifier's line: {:?}",
             pack.excerpts
         );
+    }
+
+    #[test]
+    fn a_memory_id_in_a_bound_file_is_not_citable_source_evidence() {
+        // #678 review: a note whose only identifier is a `mem_<hex>` cross-ref must NOT become
+        // citable just because that id appears verbatim in its bound file. The mem-id is excluded
+        // from excerpt windowing (it is Unresolvable, never source evidence), so a cross-ref-only
+        // note does not leak to the verdict model via a `path:line:` excerpt.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(
+            &c,
+            "src/x.rs",
+            "// rationale: see mem_19f2ad6cf90_2feb75f29ff8\nfn f() {}\n",
+            "r",
+        );
+        // The note's ONLY identifier is the memory cross-reference.
+        seed_memory(&c, "m1", "t", "background: mem_19f2ad6cf90_2feb75f29ff8", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/x.rs','src/x.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        let pack = evidence_pack(&c, "m1").unwrap();
+        assert!(
+            pack.excerpts.is_empty(),
+            "a memory cross-ref must not window a bound-file excerpt: {:?}",
+            pack.excerpts
+        );
+        assert!(!pack.is_citable(), "a cross-ref-only note stays non-citable");
+    }
+
+    #[test]
+    fn a_coincidental_hex_local_is_citable_and_windows_an_excerpt() {
+        // #678 review (Codex P2): the mirror of the cross-ref case above — a note whose only
+        // identifier is a coincidental hex LOCAL (`mem_deadbeefdead`, a prefix-shaped token that is
+        // no recorded memory) present in its bound file IS real source evidence. It
+        // resolves `TextPresent`, so it is NOT excluded from excerpt windowing and the note
+        // stays citable — otherwise a genuinely-verifiable memory would be wrongly held
+        // back as `unverifiable`.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/x.rs", "let mem_deadbeefdead = compute();\nfn f() {}\n", "r");
+        seed_memory(&c, "m1", "t", "the guard reads mem_deadbeefdead each pass", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/x.rs','src/x.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        let pack = evidence_pack(&c, "m1").unwrap();
+        assert!(
+            pack.excerpts.iter().any(|e| e.text.contains("mem_deadbeefdead")),
+            "a coincidental hex local windows its bound-file excerpt: {:?}",
+            pack.excerpts
+        );
+        assert!(pack.is_citable(), "a note anchored by a real source token stays citable");
     }
 
     #[test]
