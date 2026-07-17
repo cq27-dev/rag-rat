@@ -268,6 +268,7 @@ fn reconcile_embed_path_reads_the_stamped_policy_column() {
     // would classify the fn chunk Embed and write it.
     let root = unique_temp_root();
     let db = poisoned_embed_fixture(&root);
+    ai::reset_policy_fromtext_calls();
     let report = db.reconcile(None, Some(8)).unwrap();
     assert_eq!(
         report.embeddings_written, 0,
@@ -275,25 +276,42 @@ fn reconcile_embed_path_reads_the_stamped_policy_column() {
          the embed path re-derived policy from text"
     );
     assert_eq!(db.current_embedding_count(HASH_MODEL_ID).unwrap(), 0);
+    // Directly: the embed path took the stamped column, never the FromText re-parse — the cost
+    // #725 removes. This is the counter half of the fast-path/fallback disagreement.
+    assert_eq!(
+        ai::policy_fromtext_calls(),
+        0,
+        "a certified-stamp embed path must not re-classify any candidate FromText"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn reconcile_embed_path_recomputes_on_a_stale_stamp() {
-    // A STALE stamp fails certification, so the embed path re-derives FromText (and the
-    // default-cap self-heal may rewrite the column first) — either way the poison is ignored and
-    // the Embed-classified chunk gets its embedding. Paired with
-    // `reconcile_embed_path_reads_the_stamped_policy_column`, the two outcomes DISAGREE on the
-    // same poisoned index — the proof the fast path is real rather than a no-op.
+fn stale_stamp_reconcile_heals_then_takes_the_fast_path() {
+    // The first reconcile after a classifier/version bump: the stamp is stale, so the self-heal
+    // recomputes + re-certifies the column ONCE up front. The embed loop must then re-derive its
+    // certification from the HEALED stamp and read the column — NOT re-parse every candidate
+    // FromText for the whole run (the regression Codex caught: `stamped_policy` captured before the
+    // heal stayed false). Prove it with the counter: zero FromText calls despite the stale start,
+    // and the stamp ends certified. (The poison is erased by the heal — the fn chunk classifies
+    // Embed from source — so it still embeds; the counter, not the output, is the fast-path proof.)
     let root = unique_temp_root();
     let db = poisoned_embed_fixture(&root);
     stale_the_stamp(&db);
+    ai::reset_policy_fromtext_calls();
     let report = db.reconcile(None, Some(8)).unwrap();
-    assert!(
-        report.embeddings_written >= 1,
-        "a stale stamp must fall back to the FromText recompute, which ignores the poisoned \
-         column: {report:?}"
+    assert_eq!(
+        ai::policy_fromtext_calls(),
+        0,
+        "after the heal re-certifies the stamp, the embed loop must read the column, not \
+         re-parse: {report:?}"
     );
+    assert_eq!(
+        policy_version(&db).as_deref(),
+        Some(ai::EMBEDDING_POLICY_VERSION),
+        "the stale-stamp reconcile heals and re-certifies"
+    );
+    assert!(report.embeddings_written >= 1, "the healed Embed chunk still embeds: {report:?}");
     let _ = fs::remove_dir_all(root);
 }
 
@@ -339,10 +357,13 @@ fn self_heal_refreshes_stale_priorities_under_an_unchanged_policy() {
 #[test]
 fn reconcile_embed_path_recomputes_at_a_non_default_cap() {
     // A CURRENT stamp at a NON-DEFAULT cap also fails certification (the column is stamped at the
-    // DEFAULT cap, and a different cap re-buckets SkipTooLarge) — the embed path recomputes and
-    // ignores the poison.
+    // DEFAULT cap, and a different cap re-buckets SkipTooLarge), and the self-heal is skipped at a
+    // non-default cap too — so the embed path genuinely re-derives FromText and ignores the poison.
+    // This is the fallback that must DISAGREE with the certified fast path: the FromText counter is
+    // positive here, zero in `reconcile_embed_path_reads_the_stamped_policy_column`.
     let root = unique_temp_root();
     let db = poisoned_embed_fixture(&root);
+    ai::reset_policy_fromtext_calls();
     let report = db
         .reconcile_with_options_progress(
             ai::ReconcileOptions {
@@ -356,6 +377,11 @@ fn reconcile_embed_path_recomputes_at_a_non_default_cap() {
     assert!(
         report.embeddings_written >= 1,
         "a non-default-cap reconcile must not trust the DEFAULT-cap column: {report:?}"
+    );
+    assert!(
+        ai::policy_fromtext_calls() > 0,
+        "the uncertified embed path must re-derive policy FromText (the fallback the fast path \
+         avoids)"
     );
     let _ = fs::remove_dir_all(root);
 }

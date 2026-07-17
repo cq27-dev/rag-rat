@@ -1,5 +1,26 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Counts embed-path FromText re-classifications ([`policy_for_job`]) since the last reset — the
+    /// tree-sitter re-parse the #530 stamped-column fast path exists to avoid. A test resets it,
+    /// runs a reconcile, and asserts 0 (fast path: read the stamped column) vs > 0 (fallback: the
+    /// FromText recompute). This is what lets the fast-path tests DISAGREE with the fallback instead
+    /// of passing via identical output.
+    pub(crate) static POLICY_FROMTEXT_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_policy_fromtext_calls() {
+    POLICY_FROMTEXT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn policy_fromtext_calls() -> usize {
+    POLICY_FROMTEXT_CALLS.with(std::cell::Cell::get)
+}
+
 /// Behavior version of the embedding-policy classifier. It certifies that a persisted
 /// `chunks.embedding_policy` value reflects the CURRENT classifier — the reconcile skip-summary
 /// reads the column via `GROUP BY` (the always-fast path, #530) only when a full rebuild has
@@ -154,6 +175,8 @@ pub(crate) fn policy_for_job(
     chunk: &CurrentChunk,
     max_embedding_chars: usize,
 ) -> EmbeddingPolicyDecision {
+    #[cfg(test)]
+    POLICY_FROMTEXT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     embedding_policy_for_chunk(
         Path::new(&chunk.path),
         &chunk.language,

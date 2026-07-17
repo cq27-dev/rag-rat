@@ -49,7 +49,9 @@ pub(crate) fn reconcile_with_options_progress(
     // The reconcile scan identity (model id/version/dim + char cap), built ONCE up front so the
     // ephemeral pending-work check inside `acquire_chunk_embedder` sizes candidates exactly like
     // the embed loop below (which reuses this same `scan`).
-    let scan = EmbeddingScan {
+    // `stamped_policy` is re-derived AFTER the self-heal below (a stale/absent stamp is repaired +
+    // re-certified there); this initial value only governs the pre-heal preflight estimate.
+    let mut scan = EmbeddingScan {
         model_id: &active_model_id,
         model_version: &model_version,
         dim: embedding_dim,
@@ -198,6 +200,11 @@ pub(crate) fn reconcile_with_options_progress(
     // now. (SkipEphemeral already returned above without paying it.) Self-heal the policy column
     // first so this summary and every later reconcile/plan take the fast GROUP BY path.
     policy_scan::maybe_heal_embedding_policy(conn, max_embedding_chars);
+    // The heal may have just repaired + re-certified the stamp (the stale/absent-stamp upgrade
+    // path). Re-derive certification NOW so the embed loop below reads the healed columns instead
+    // of re-parsing every candidate FromText for the whole run — the first post-upgrade reconcile
+    // is exactly the large-repo case this fast path targets (#725).
+    scan.stamped_policy = policy_scan::stamped_policy_certified(conn, max_embedding_chars)?;
     let skipped_by_policy = policy_scan::embedding_policy_skip_summary(conn, max_embedding_chars)?;
     let skipped_chunks = skipped_by_policy.values().sum();
     let mut report = ReconcileReport {
