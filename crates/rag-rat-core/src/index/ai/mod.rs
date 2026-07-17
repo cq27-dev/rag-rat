@@ -364,7 +364,8 @@ pub(crate) struct CurrentChunk {
     embedding_text_version: Option<String>,
     next_retry_after_ms: Option<i64>,
     /// The stamped index-time policy columns (`chunks.embedding_policy` / `embedding_priority`),
-    /// trusted as the policy source only under `EmbeddingScan::stamped_policy` (#530 certification).
+    /// trusted as the policy source only under `EmbeddingScan::stamped_policy` (#530
+    /// certification).
     embedding_policy: String,
     embedding_priority: i64,
     reason: ReconcileReason,
