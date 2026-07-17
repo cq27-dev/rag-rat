@@ -286,6 +286,10 @@ pub(crate) fn reconcile_with_options_progress(
         if options.force { "" } else { scan.model_id },
         options.changed_first,
     )?;
+    // Snapshot the scoped file metadata ONCE for the whole loop, alongside `candidate_ids`. The
+    // per-batch chunk query joins this indexed temp table instead of probing the live `UNION ALL`
+    // scope view per chunk row (which is O(files) each) — see `snapshot_reconcile_scope_files`.
+    snapshot_reconcile_scope_files(conn)?;
     // One dict decoder for the whole run: each `select_reconcile_batch` loads text for its batch
     // from the compressed `chunk_text` store (#77 Phase 2), and reusing this decoder keeps the dict
     // SELECT + dictionary prep to once per run rather than once per batch.
