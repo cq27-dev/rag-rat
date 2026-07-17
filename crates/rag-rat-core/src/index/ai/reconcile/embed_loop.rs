@@ -54,6 +54,7 @@ pub(crate) fn reconcile_with_options_progress(
         model_version: &model_version,
         dim: embedding_dim,
         max_embedding_chars,
+        stamped_policy: policy_scan::stamped_policy_certified(conn, max_embedding_chars)?,
     };
     let preflight_estimated_jobs = if batch_write::automatic_reconcile_can_skip_noop(conn, &options)
     {
@@ -1676,6 +1677,7 @@ mod freshness_version_tests {
             model_version: &version,
             dim,
             max_embedding_chars: 4000,
+            stamped_policy: false,
         };
         acquire_chunk_embedder(conn, None, &scan, &ReconcileOptions {
             provision_remote: false,

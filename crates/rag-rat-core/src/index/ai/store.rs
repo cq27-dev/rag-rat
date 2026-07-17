@@ -23,7 +23,7 @@ pub(crate) fn estimated_reconcile_job_calls() -> usize {
 /// the `chunks.text` column is gone, so the SELECT INNER JOINs `chunk_text`). The real `text` is
 /// filled in a post-loop via [`ChunkTextRow::resolve`] — decompress returns `anyhow::Result`, which
 /// can't cross this rusqlite closure (#77 Phase 2). The SELECT order is: 0-5 identity, 6-13
-/// embedding metadata, 14 blob, 15 raw_len, 16 dict_version.
+/// embedding metadata, 14 blob, 15 raw_len, 16 dict_version, 17-18 stamped policy columns.
 pub(crate) fn current_chunk_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<(CurrentChunk, ChunkTextRow)> {
@@ -43,6 +43,8 @@ pub(crate) fn current_chunk_row(
         input_hash: row.get(11)?,
         embedding_text_version: row.get(12)?,
         next_retry_after_ms: row.get(13)?,
+        embedding_policy: row.get(17)?,
+        embedding_priority: row.get(18)?,
         reason: ReconcileReason::Forced,
     };
     let text_row =
@@ -90,7 +92,9 @@ pub(crate) fn for_each_embedding_candidate(
                chunk_embeddings.next_retry_after_ms,
                chunk_text.blob,
                chunk_text.raw_len,
-               chunk_text.dict_version
+               chunk_text.dict_version,
+               chunks.embedding_policy,
+               chunks.embedding_priority
         FROM chunks
         JOIN files ON files.id = chunks.file_id
         LEFT JOIN chunk_embeddings
@@ -202,7 +206,8 @@ pub(crate) fn current_chunks_by_ids(
                chunk_embeddings.model_version, chunk_embeddings.embedding_dim,
                chunk_embeddings.input_hash, chunk_embeddings.embedding_text_version,
                chunk_embeddings.next_retry_after_ms,
-               chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version
+               chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version,
+               chunks.embedding_policy, chunks.embedding_priority
         FROM chunks
         JOIN files ON files.id = chunks.file_id
         LEFT JOIN chunk_embeddings
@@ -283,7 +288,7 @@ pub(crate) fn estimated_reconcile_jobs(
                     scan.dim,
                     scan.max_embedding_chars,
                 ))
-                && policy_for_job(&candidate, scan.max_embedding_chars).eligible;
+                && job_policy(&candidate, scan.max_embedding_chars, scan.stamped_policy).eligible;
             if eligible {
                 count = count.saturating_add(1);
             }
@@ -309,7 +314,7 @@ pub(crate) fn select_reconcile_batch(
     let candidates = current_chunks_by_ids(conn, model_id, ids, decoder)?;
     let mut jobs = Vec::new();
     for candidate in candidates {
-        let policy = policy_for_job(&candidate, scan.max_embedding_chars);
+        let policy = job_policy(&candidate, scan.max_embedding_chars, scan.stamped_policy);
         if !policy.eligible {
             continue;
         }

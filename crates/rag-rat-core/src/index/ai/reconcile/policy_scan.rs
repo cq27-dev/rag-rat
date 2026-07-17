@@ -135,23 +135,31 @@ pub(crate) fn embedding_policy_skip_summary(
     recompute_policy_skip_summary(conn, max_embedding_chars)
 }
 
+/// TRUE when the #530 stamps certify `chunks.embedding_policy` (+ `embedding_priority`) for this
+/// repo at `max_embedding_chars`: the CURRENT classifier stamped the column (version) AND at the
+/// cap the caller wants — a different cap re-buckets SkipTooLarge/truncation, which the
+/// default-stamped column can't reflect. Shared by the skip-summary fast path and the embed-path
+/// policy source ([`job_policy`](super::super::policy::job_policy)); every miss fails SAFE — the
+/// caller just recomputes from source.
+pub(crate) fn stamped_policy_certified(
+    conn: &Connection,
+    max_embedding_chars: usize,
+) -> anyhow::Result<bool> {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let version = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_VERSION_KEY)?;
+    let cap = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_CAP_KEY)?;
+    Ok(version.as_deref() == Some(EMBEDDING_POLICY_VERSION)
+        && cap.as_deref() == Some(max_embedding_chars.to_string().as_str()))
+}
+
 /// Read the per-policy counts straight from the persisted `chunks.embedding_policy` column, but
-/// ONLY when a full rebuild has stamped it current for this repo (`EMBEDDING_POLICY_VERSION`) at
-/// the requested cap. `None` — stamp absent/stale, or a different cap — tells the caller to
-/// recompute.
+/// ONLY when [`stamped_policy_certified`] holds. `None` — stamp absent/stale, or a different cap —
+/// tells the caller to recompute.
 fn policy_skip_summary_from_column(
     conn: &Connection,
     max_embedding_chars: usize,
 ) -> anyhow::Result<Option<BTreeMap<String, u64>>> {
-    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-    let version = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_VERSION_KEY)?;
-    let cap = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_CAP_KEY)?;
-    // Trust the column ONLY when the CURRENT classifier stamped it (version) AND at the cap the
-    // caller wants: a different cap re-buckets SkipTooLarge/truncation, which the
-    // default-stamped column can't reflect. Both gates fail SAFE — a miss just recomputes.
-    if version.as_deref() != Some(EMBEDDING_POLICY_VERSION)
-        || cap.as_deref() != Some(max_embedding_chars.to_string().as_str())
-    {
+    if !stamped_policy_certified(conn, max_embedding_chars)? {
         return Ok(None);
     }
     // BYTE-IDENTICAL FROM/JOIN to the recompute (scope view + chunk_text presence) so the counted

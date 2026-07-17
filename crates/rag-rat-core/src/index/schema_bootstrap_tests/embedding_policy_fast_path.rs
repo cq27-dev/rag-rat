@@ -233,6 +233,94 @@ fn incremental_edit_keeps_the_certified_column_fresh() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Shared setup for the embed-path policy-source tests (#725): a rebuild whose fn chunk classifies
+/// Embed, the deterministic hash embedder installed, and every Embed row poisoned to
+/// `SkipLowSignal` in the column. Whether a reconcile then embeds is exactly the question of which
+/// policy source it read: the column (obeys the poison → nothing embedded) or a FromText recompute
+/// (ignores it → the fn chunk is embedded).
+fn poisoned_embed_fixture(root: &std::path::Path) -> IndexDatabase {
+    rust_fixture(root);
+    let mut config = source_config(root.to_path_buf(), Language::Rust);
+    // Select the hash embedder explicitly: a fresh index adopts the CONFIGURED model (#394), and
+    // the default all-MiniLM would leave the reconcile Blocked before it reads any policy.
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
+    let poisoned = db
+        .storage
+        .connection()
+        .execute(
+            "UPDATE main.chunks SET embedding_policy = 'SkipLowSignal'
+             WHERE embedding_policy = 'Embed'",
+            [],
+        )
+        .unwrap();
+    assert!(poisoned >= 1, "the fixture must stamp at least one Embed chunk to poison");
+    db
+}
+
+#[test]
+fn reconcile_embed_path_reads_the_stamped_policy_column() {
+    // The embed path takes each candidate's policy from the CERTIFIED stamped column instead of
+    // re-deriving it FromText — the per-candidate tree-sitter re-parse that dominated large
+    // reconciles (#725). Under a current stamp at the default cap, the poisoned column must be
+    // OBEYED: zero embeddings written. Only the column read produces that outcome — a recompute
+    // would classify the fn chunk Embed and write it.
+    let root = unique_temp_root();
+    let db = poisoned_embed_fixture(&root);
+    let report = db.reconcile(None, Some(8)).unwrap();
+    assert_eq!(
+        report.embeddings_written, 0,
+        "a certified-stamp reconcile must serve the poisoned column; an embedding written means \
+         the embed path re-derived policy from text"
+    );
+    assert_eq!(db.current_embedding_count(HASH_MODEL_ID).unwrap(), 0);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reconcile_embed_path_recomputes_on_a_stale_stamp() {
+    // A STALE stamp fails certification, so the embed path re-derives FromText (and the
+    // default-cap self-heal may rewrite the column first) — either way the poison is ignored and
+    // the Embed-classified chunk gets its embedding. Paired with
+    // `reconcile_embed_path_reads_the_stamped_policy_column`, the two outcomes DISAGREE on the
+    // same poisoned index — the proof the fast path is real rather than a no-op.
+    let root = unique_temp_root();
+    let db = poisoned_embed_fixture(&root);
+    stale_the_stamp(&db);
+    let report = db.reconcile(None, Some(8)).unwrap();
+    assert!(
+        report.embeddings_written >= 1,
+        "a stale stamp must fall back to the FromText recompute, which ignores the poisoned \
+         column: {report:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reconcile_embed_path_recomputes_at_a_non_default_cap() {
+    // A CURRENT stamp at a NON-DEFAULT cap also fails certification (the column is stamped at the
+    // DEFAULT cap, and a different cap re-buckets SkipTooLarge) — the embed path recomputes and
+    // ignores the poison.
+    let root = unique_temp_root();
+    let db = poisoned_embed_fixture(&root);
+    let report = db
+        .reconcile_with_options_progress(
+            ai::ReconcileOptions {
+                batch_size: Some(8),
+                max_embedding_chars: ai::DEFAULT_MAX_EMBEDDING_CHARS + 1_000,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+    assert!(
+        report.embeddings_written >= 1,
+        "a non-default-cap reconcile must not trust the DEFAULT-cap column: {report:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn absent_stamp_takes_the_recompute_path() {
     // A never-stamped index (a pre-#530 DB, or one never fully rebuilt with this binary) has NO

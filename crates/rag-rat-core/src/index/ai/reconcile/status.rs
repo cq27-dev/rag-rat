@@ -57,6 +57,7 @@ pub(crate) fn pending_embedding_jobs_with_options(
         model_version: &model_version,
         dim,
         max_embedding_chars,
+        stamped_policy: super::policy_scan::stamped_policy_certified(conn, max_embedding_chars)?,
     };
     estimated_reconcile_jobs(conn, &scan, options)
 }
@@ -84,6 +85,7 @@ pub(crate) fn pending_embedding_jobs_with_available_incremental_embedder(
         model_version: &model_version,
         dim,
         max_embedding_chars,
+        stamped_policy: super::policy_scan::stamped_policy_certified(conn, max_embedding_chars)?,
     };
     let mut light_options = options.clone();
     light_options.provision_remote = false;

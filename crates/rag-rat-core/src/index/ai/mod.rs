@@ -363,6 +363,10 @@ pub(crate) struct CurrentChunk {
     input_hash: Option<String>,
     embedding_text_version: Option<String>,
     next_retry_after_ms: Option<i64>,
+    /// The stamped index-time policy columns (`chunks.embedding_policy` / `embedding_priority`),
+    /// trusted as the policy source only under `EmbeddingScan::stamped_policy` (#530 certification).
+    embedding_policy: String,
+    embedding_priority: i64,
     reason: ReconcileReason,
 }
 
@@ -428,6 +432,12 @@ pub(crate) struct EmbeddingScan<'a> {
     model_version: &'a str,
     dim: usize,
     max_embedding_chars: usize,
+    /// #530 certification (`stamped_policy_certified`), resolved ONCE per scan: when true, the
+    /// embed/estimate paths take each candidate's policy from the stamped
+    /// `chunks.embedding_policy`/`embedding_priority` columns instead of re-deriving it FromText —
+    /// which tree-sitter-parses every candidate and dominates large reconciles (#725). When false
+    /// (stale/absent stamp, or a non-default cap) they recompute exactly as before.
+    stamped_policy: bool,
 }
 
 pub(crate) struct EmbeddingInput {

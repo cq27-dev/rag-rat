@@ -166,6 +166,26 @@ pub(crate) fn policy_for_job(
     )
 }
 
+/// One embed-path candidate's policy. Under `stamped_policy` (#530: the stamps certify the column
+/// at this run's cap) the decision comes straight from the stamped
+/// `chunks.embedding_policy`/`embedding_priority` — the index-time FromSpan truth, no per-chunk
+/// tree-sitter re-parse (#725; `Embed` is the sole eligible policy). Otherwise re-derive FromText
+/// via [`policy_for_job`], the pre-certification behavior.
+pub(crate) fn job_policy(
+    chunk: &CurrentChunk,
+    max_embedding_chars: usize,
+    stamped_policy: bool,
+) -> EmbeddingPolicyDecision {
+    if stamped_policy {
+        return policy(
+            &chunk.embedding_policy,
+            chunk.embedding_priority,
+            chunk.embedding_policy == "Embed",
+        );
+    }
+    policy_for_job(chunk, max_embedding_chars)
+}
+
 /// Embedding budget order: source symbols (0) before docs (1) before tests (2).
 ///
 /// Test detection is the CANONICAL [`rag_rat_base::path_class::is_test_path`], not a local list.
