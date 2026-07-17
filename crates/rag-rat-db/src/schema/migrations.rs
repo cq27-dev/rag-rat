@@ -995,8 +995,15 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
         WHERE d.edge_kind_id NOT IN (
             SELECT id FROM name_strings WHERE value IN ('dispatch_construct', 'dispatch_handle')
         )
-        AND d.resolution_id NOT IN (
-            SELECT id FROM name_strings WHERE value = 'suppressed'
+        -- Suppressed resolver candidates (retained for inspection, never real edges) are hidden
+        -- with a SCALAR compare, not `NOT IN (SELECT ...)`: the membership form probes an
+        -- ephemeral list PER VIEW ROW (~19M instructions per warm query on the bench corpus —
+        -- the query_warm regression), while an uncorrelated scalar subquery is evaluated once
+        -- per statement and the per-row cost is one integer compare. `resolution_id` is NOT
+        -- NULL and ids are positive, so `<> -1` (the never-interned sentinel) keeps every row —
+        -- exactly `NOT IN (empty)`.
+        AND d.resolution_id <> COALESCE(
+            (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
         );
 
         -- Interning per column: `INSERT OR IGNORE` + `value NOT NULL` means a NULL string is

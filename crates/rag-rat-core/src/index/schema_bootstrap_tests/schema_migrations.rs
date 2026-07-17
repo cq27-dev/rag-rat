@@ -2055,8 +2055,8 @@ fn migration_068_hides_suppressed_edge_candidates() {
         )
         .unwrap();
     let v67_view = current_view.replace(
-        "\n        AND d.resolution_id NOT IN (\n            SELECT id FROM name_strings WHERE \
-         value = 'suppressed'\n        )",
+        "\n        AND d.resolution_id <> COALESCE(\n            (SELECT id FROM name_strings \
+         WHERE value = 'suppressed'), -1\n        )",
         "",
     );
     assert_ne!(v67_view, current_view, "fixture must remove the V068 public-edge filter");

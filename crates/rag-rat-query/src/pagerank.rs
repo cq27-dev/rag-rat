@@ -334,8 +334,8 @@ pub fn important_symbols(
          JOIN name_strings ek ON ek.id = d.edge_kind_id
          JOIN name_strings cf ON cf.id = d.confidence_id
          WHERE d.from_symbol_id IS NOT NULL
-           AND d.resolution_id NOT IN (
-               SELECT id FROM name_strings WHERE value = 'suppressed'
+           AND d.resolution_id <> COALESCE(
+               (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
            )
            -- Internal dispatch FACT rows (#200) are synthesis inputs, not real edges — they'd
            -- double-count (the handle fact duplicates the dispatcher's existing calls_name) and

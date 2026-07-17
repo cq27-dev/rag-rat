@@ -521,8 +521,8 @@ pub fn summary_counts(conn: &Connection) -> anyhow::Result<SummaryCounts> {
         "SELECT COUNT(*) FROM edges_data e
            JOIN main.files f ON f.id = e.source_file_id
           WHERE f.repo_id = ?1 AND f.generation = ?2
-            AND e.resolution_id NOT IN (
-                SELECT id FROM name_strings WHERE value = 'suppressed'
+            AND e.resolution_id <> COALESCE(
+                (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
             )",
         rusqlite::params![repo_id, generation],
         |row| row_u64(row, 0),
