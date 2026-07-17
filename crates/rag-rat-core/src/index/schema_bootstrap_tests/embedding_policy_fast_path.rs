@@ -298,6 +298,45 @@ fn reconcile_embed_path_recomputes_on_a_stale_stamp() {
 }
 
 #[test]
+fn self_heal_refreshes_stale_priorities_under_an_unchanged_policy() {
+    // The stamp certifies policy AND priority (the embed path trusts both, #725), and a classifier
+    // change can move priority while the policy name stays the same. A heal that rewrote only
+    // `embedding_policy` would re-certify stale priorities — so the heal must stage on either
+    // column differing and write both back. Poison the fn chunk's priority (policy untouched),
+    // stale the stamp, and let the default-cap reconcile self-heal: the priority must be restored
+    // and the stamp current again.
+    let root = unique_temp_root();
+    rust_fixture(&root);
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    let conn = db.storage.connection();
+    let poisoned = conn
+        .execute(
+            "UPDATE main.chunks SET embedding_priority = 7 WHERE embedding_policy = 'Embed'",
+            [],
+        )
+        .unwrap();
+    assert!(poisoned >= 1, "the fixture must have an Embed chunk whose priority can be poisoned");
+    stale_the_stamp(&db);
+
+    db.reconcile_with_options_progress(
+        ai::ReconcileOptions { batch_size: Some(8), ..Default::default() },
+        |_| {},
+    )
+    .unwrap();
+
+    let still_poisoned: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks WHERE embedding_priority = 7", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(still_poisoned, 0, "the heal must recompute priorities, not just policy names");
+    assert_eq!(
+        policy_version(&db).as_deref(),
+        Some(ai::EMBEDDING_POLICY_VERSION),
+        "the heal re-certifies after writing BOTH columns"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn reconcile_embed_path_recomputes_at_a_non_default_cap() {
     // A CURRENT stamp at a NON-DEFAULT cap also fails certification (the column is stamped at the
     // DEFAULT cap, and a different cap re-buckets SkipTooLarge) — the embed path recomputes and
