@@ -47,7 +47,18 @@ static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn temp_db_path() -> PathBuf {
     let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    env::temp_dir().join(format!("rag-rat-bench-{}-{n}.sqlite", std::process::id()))
+    let path = env::temp_dir().join(format!("rag-rat-bench-{}-{n}.sqlite", std::process::id()));
+    // Pids recycle (containers, long-lived hosts), and bench DBs are never cleaned up — a name
+    // collision would REBUILD INTO the stale DB, leaving a multi-generation index whose query cost
+    // silently differs from a fresh one (measured swings of ±25% on query_warm). Delete any
+    // leftover (plus WAL/SHM siblings) so every bench run indexes into a truly fresh database.
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(path.with_file_name(format!(
+            "{}{suffix}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )));
+    }
+    path
 }
 
 /// A Config indexing `subdir` of the corpus into a fresh temp DB.
