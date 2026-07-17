@@ -155,6 +155,12 @@ pub(crate) fn embedding_reconcile_plan(
     max_embedding_chars: usize,
 ) -> anyhow::Result<EmbeddingReconcilePlan> {
     let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
+    // The plan must classify candidates from the SAME source the reconcile embed loop will (#725):
+    // the #530-certified stamped column when it holds, else the FromText recompute. Otherwise a
+    // certified index whose FromSpan column and FromText recompute legitimately disagree (a chunk
+    // slicing a long comment/string) would make `--plan` preview eligibility/priority the actual
+    // reconcile won't act on. Resolved ONCE, like the embed loop's scan.
+    let stamped_policy = super::policy_scan::stamped_policy_certified(conn, max_embedding_chars)?;
     let mut missing_by_priority = BTreeMap::new();
     let mut current = 0_u64;
     let mut missing = 0_u64;
@@ -169,7 +175,7 @@ pub(crate) fn embedding_reconcile_plan(
     // over `embedding_job_candidates(None)`, so the counts are identical; only the peak memory
     // drops.
     for_each_embedding_candidate(conn, &model.model_id, model_version, dim, None, false, |job| {
-        let policy = policy_for_job(&job, max_embedding_chars);
+        let policy = job_policy(&job, max_embedding_chars, stamped_policy);
         if !policy.eligible {
             return Ok(());
         }

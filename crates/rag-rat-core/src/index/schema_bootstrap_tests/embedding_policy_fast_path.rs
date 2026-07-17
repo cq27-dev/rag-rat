@@ -316,6 +316,32 @@ fn stale_stamp_reconcile_heals_then_takes_the_fast_path() {
 }
 
 #[test]
+fn reconcile_plan_classifies_from_the_stamped_column_like_the_embed_path() {
+    // `reconcile --plan` must preview exactly what `reconcile` will do — so under a certified stamp
+    // it classifies candidates from the stamped column, not FromText (which can legitimately
+    // disagree on a chunk slicing a long comment/string). Poison every Embed chunk to SkipLowSignal
+    // under a current stamp: the plan must report zero eligible work (it read the column) and take
+    // no FromText re-parse, matching the embed path on the same index. A FromText recompute would
+    // classify the fn chunk Embed and count it missing.
+    let root = unique_temp_root();
+    let db = poisoned_embed_fixture(&root);
+    ai::reset_policy_fromtext_calls();
+    let plan = db.reconcile_plan().unwrap();
+    assert_eq!(
+        ai::policy_fromtext_calls(),
+        0,
+        "a certified-stamp plan must read the column, not re-classify FromText"
+    );
+    assert_eq!(
+        plan.embeddings.missing, 0,
+        "the plan reads the poisoned (SkipLowSignal) column, so nothing is eligible — matching \
+         the embed path: {:?}",
+        plan.embeddings
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn self_heal_refreshes_stale_priorities_under_an_unchanged_policy() {
     // The stamp certifies policy AND priority (the embed path trusts both, #725), and a classifier
     // change can move priority while the policy name stays the same. A heal that rewrote only
