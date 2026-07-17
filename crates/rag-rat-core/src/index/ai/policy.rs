@@ -1,5 +1,4 @@
 use super::*;
-use crate::index::parser;
 
 /// Behavior version of the embedding-policy classifier. It certifies that a persisted
 /// `chunks.embedding_policy` value reflects the CURRENT classifier — the reconcile skip-summary
@@ -169,19 +168,19 @@ pub(crate) fn policy_for_job(
 
 /// Embedding budget order: source symbols (0) before docs (1) before tests (2).
 ///
-/// Test detection is the CANONICAL [`parser::is_test_path`], not a local list. The local copy this
-/// replaced knew only lowercase `tests/`/`test/` segments and Rust/TS filename suffixes, so SwiftPM
-/// layouts (`Tests/AppTests/AppTests.swift` — capitalized directory, `*Tests` stem) read as
-/// production source and competed with it for the priority-0 budget, while the rest of the system
-/// (`staleness`, `repo_brief`, the graph's test-callsite filter, `symbols.is_test`) called the very
-/// same file a test. One predicate, one answer, every language.
+/// Test detection is the CANONICAL [`rag_rat_base::path_class::is_test_path`], not a local list.
+/// The local copy this replaced knew only lowercase `tests/`/`test/` segments and Rust/TS filename
+/// suffixes, so SwiftPM layouts (`Tests/AppTests/AppTests.swift` — capitalized directory, `*Tests`
+/// stem) read as production source and competed with it for the priority-0 budget, while the rest
+/// of the system (`staleness`, `repo_brief`, the graph's test-callsite filter, `symbols.is_test`)
+/// called the very same file a test. One predicate, one answer, every language.
 pub(crate) fn embedding_priority(
     path: &str,
     language: &str,
     chunk_kind: &str,
     symbol_path: Option<&str>,
 ) -> i64 {
-    let is_test = parser::is_test_path(path);
+    let is_test = rag_rat_base::path_class::is_test_path(path);
     if symbol_path.is_some() && matches!(chunk_kind, "code") && !is_test && language != "markdown" {
         return 0;
     }
@@ -394,10 +393,9 @@ mod low_signal_span_tests {
     use rag_rat_base::language::Language;
 
     use super::is_low_signal_span;
-    use crate::index::parser;
 
-    fn parsed(path: &str, language: Language, src: &str) -> parser::ParsedFile {
-        parser::parse_file(Path::new(path), language, src).expect("fixture parses")
+    fn parsed(path: &str, language: Language, src: &str) -> crate::index::parser::ParsedFile {
+        crate::index::parser::parse_file(Path::new(path), language, src).expect("fixture parses")
     }
 
     #[test]
@@ -480,7 +478,6 @@ mod policy_version_tests {
         DEFAULT_MAX_EMBEDDING_CHARS, EMBEDDING_POLICY_VERSION, LowSignalCheck, MIN_EMBEDDING_CHARS,
         embedding_policy_for_chunk,
     };
-    use crate::index::parser;
 
     fn record(sig: &mut String, label: &str, d: &super::EmbeddingPolicyDecision) {
         let _ = writeln!(sig, "{label}|{}|{}|{}", d.policy, d.priority, d.eligible);
@@ -614,9 +611,10 @@ mod policy_version_tests {
         //
         // ALSO the `embedding_priority` test-path branch, which nothing pinned before: every case
         // here carries a symbol and real (>= MIN) source text, so a non-skipped path records
-        // priority 0 (source) vs 2 (test) and the CANONICAL `parser::is_test_path` is under the
-        // hash. It has to be — a local test-path copy silently drifted from the canonical one and
-        // mis-ranked every SwiftPM `Tests/` file as production source, with no test to catch it.
+        // priority 0 (source) vs 2 (test) and the CANONICAL
+        // `rag_rat_base::path_class::is_test_path` is under the hash. It has to be — a
+        // local test-path copy silently drifted from the canonical one and mis-ranked every
+        // SwiftPM `Tests/` file as production source, with no test to catch it.
         // Cases run in their OWN language so the `FromText` low-signal re-parse sees code it can
         // actually parse.
         const RUST_SRC: &str = "fn real_function(input: i64) -> i64 {\n    let value = input * 2 \
@@ -740,8 +738,8 @@ mod policy_version_tests {
             ),
         ];
         for (label, path, language, plumbing, def) in span_cases {
-            let pf =
-                parser::parse_file(Path::new(path), *language, plumbing).expect("plumbing parses");
+            let pf = crate::index::parser::parse_file(Path::new(path), *language, plumbing)
+                .expect("plumbing parses");
             let d = embedding_policy_for_chunk(
                 Path::new(path),
                 &language.to_string(),
@@ -759,7 +757,8 @@ mod policy_version_tests {
             );
             record(&mut sig, &format!("span_plumbing_{label}"), &d);
 
-            let df = parser::parse_file(Path::new(path), *language, def).expect("def parses");
+            let df = crate::index::parser::parse_file(Path::new(path), *language, def)
+                .expect("def parses");
             let d = embedding_policy_for_chunk(
                 Path::new(path),
                 &language.to_string(),

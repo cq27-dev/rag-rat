@@ -176,7 +176,7 @@ impl IndexDatabase {
                     file.kind.as_str(),
                     prepared.sha256,
                     prepared.modified_at_ms,
-                    file_is_generated(file.kind, &path),
+                    rag_rat_base::path_class::file_is_generated(file.kind, &path),
                     now_ms(),
                     prepared.sha256,
                     file.commit_sha,

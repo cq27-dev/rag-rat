@@ -410,8 +410,8 @@ fn assert_edge(db: &IndexDatabase, from: &str, to: &str, edge_kind: &str, confid
 // ─── dir_tree tests ──────────────────────────────────────────────────────────
 
 /// Shared helper: build a dir-only `RepoMemoryBindTarget`.
-fn dir_bind_target(dir: Option<String>) -> crate::query::memory::RepoMemoryBindTarget {
-    crate::query::memory::RepoMemoryBindTarget {
+fn dir_bind_target(dir: Option<String>) -> rag_rat_query::memory::RepoMemoryBindTarget {
+    rag_rat_query::memory::RepoMemoryBindTarget {
         logical_symbol_id: None,
         symbol_id: None,
         chunk_id: None,
@@ -434,7 +434,7 @@ fn dir_bind_target(dir: Option<String>) -> crate::query::memory::RepoMemoryBindT
 
 /// Shared helper: create a minimal "dir" memory attached to the given directory path.
 fn create_dir_memory(db: &IndexDatabase, title: &str, dir: Option<String>) {
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: title.to_string(),
         body: format!("Memory for {dir:?}."),

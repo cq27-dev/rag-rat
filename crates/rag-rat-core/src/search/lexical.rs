@@ -5,10 +5,8 @@ use rag_rat_base::language::Language;
 use rag_rat_db::text_compression;
 use rag_rat_db::text_compression::ChunkTextRow;
 use rusqlite::{Connection, params};
-use serde::Serialize;
 
 use crate::index::ai;
-use crate::query::graph_meta::GraphEvidence;
 
 const BM25_WEIGHT: f64 = 0.45;
 const VECTOR_WEIGHT: f64 = 0.35;
@@ -44,48 +42,7 @@ const TEST_PENALTY: f64 = 0.8;
 /// the 90-day window `query::repo_brief::file_rows` uses for its churn CTE.
 const RECENT_WINDOW_SECS: i64 = 90 * 24 * 60 * 60;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SearchHit {
-    pub chunk_id: i64,
-    pub path: String,
-    #[serde(rename = "lang")]
-    pub language: String,
-    pub kind: String,
-    pub start_line: i64,
-    pub end_line: i64,
-    #[serde(rename = "ref")]
-    pub symbol_path: Option<String>,
-    pub score: f64,
-    /// Which retrieval modes found this hit: "lexical" (BM25 only), "vector" (embedding cosine
-    /// only), or "hybrid" (both). Always present, so an agent knows whether embeddings
-    /// contributed without passing explain=true (#41). "lexical" whenever no embedding model is
-    /// active.
-    pub retrieval_mode: String,
-    pub summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graph: Option<GraphEvidence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score_components: Option<ScoreComponents>,
-    /// LOCAL structural-load signal (scoped weighted fan-in) for the hit's symbol — the THIRD
-    /// importance scale, NOT PageRank. Attached by the search/`symbol_lookup` enrichment pass over
-    /// the symbol a hit resolves to (`chunks.symbol_path` → the active-scope symbol). `None` when
-    /// the hit has no symbol, the symbol has no in-edges in scope, or it wasn't enriched. See
-    /// `crate::query::load_bearing`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub importance: Option<crate::query::load_bearing::ImportanceEnrichment>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ScoreComponents {
-    pub bm25: f64,
-    pub vector: f64,
-    pub symbol: f64,
-    pub graph: f64,
-    pub git: f64,
-    pub papertrail: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vector_note: Option<String>,
-}
+pub use rag_rat_query::{ScoreComponents, SearchHit};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SearchOptions {
@@ -228,7 +185,7 @@ fn search_with_query_embedding(
     // One dict decoder shared by both candidate passes (#77 Phase 2): bm25 and vector each
     // decompress a batch of snippet text and run sequentially, so loading the dict versions once
     // here avoids the duplicate SELECT + dictionary prep the two passes used to do independently.
-    let dicts = crate::query::chunk_text_dicts(conn)?;
+    let dicts = rag_rat_query::chunk_text_dicts(conn)?;
     let mut decoder = text_compression::ChunkTextDecoder::new(&dicts);
 
     for (rank, hit) in
@@ -294,7 +251,7 @@ fn search_with_query_embedding(
                 if demotion.is_test {
                     penalty *= TEST_PENALTY;
                 }
-                finished.score = crate::query::round_score(finished.score * penalty);
+                finished.score = rag_rat_query::round_score(finished.score * penalty);
             }
             Ok(finished)
         })
@@ -315,7 +272,7 @@ impl RankedHit {
     }
 
     fn finish(mut self, explain: bool, vector_available: bool) -> SearchHit {
-        self.hit.score = crate::query::round_score(
+        self.hit.score = rag_rat_query::round_score(
             self.components.bm25
                 + self.components.vector
                 + self.components.symbol
@@ -1466,7 +1423,7 @@ mod tests {
             dim: 4,
             vector: vec![1.0, 0.0, 0.0, 0.0],
         };
-        let dicts = crate::query::chunk_text_dicts(&conn).unwrap();
+        let dicts = rag_rat_query::chunk_text_dicts(&conn).unwrap();
         let mut decoder = text_compression::ChunkTextDecoder::new(&dicts);
 
         // Full result (limit 3): descending similarity, ties by ASCENDING chunk_id, and the tie is

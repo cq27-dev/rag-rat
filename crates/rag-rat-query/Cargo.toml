@@ -1,0 +1,33 @@
+[package]
+name = "rag-rat-query"
+version.workspace = true
+description = "Read layer for the rag-rat workspace: graph/impact/symbol/tree queries, repo-memory reads and evidence resolution, pagerank, and orientation primitives."
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rag-rat-base.workspace = true
+rag-rat-papertrail.workspace = true
+rag-rat-db.workspace = true
+minicbor.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strum.workspace = true
+
+[dev-dependencies]
+# Cyclic dev-dependency (Cargo supports this): the read-layer tests seed fixtures through the
+# ENGINE's schema hooks and scope-view installer instead of duplicating them. PATH-ONLY (no
+# version) on purpose: cargo strips version-less path dev-deps from the published manifest, so
+# the registry never sees the cycle and lockstep publishing stays orderable (query before core).
+rag-rat-core = { path = "../rag-rat-core", default-features = false }
+tempfile.workspace = true

@@ -13,7 +13,7 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -28,7 +28,7 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
     let logical_symbol_id = symbol.logical_symbol_id.expect("logical symbol id");
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Treat cfg helper variants as one logical helper".to_string(),
             body: "Caller and impact analysis should use the logical symbol, not one cfg body \
@@ -39,7 +39,7 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
             source: Some("agent".to_string()),
             tags: vec!["cfg".to_string(), "graph".to_string()],
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(logical_symbol_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -76,7 +76,7 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
         .impact_surface_report_for_selected_symbol(
             &symbol,
             10,
-            &crate::query::impact::ImpactSurfaceOptions::default(),
+            &rag_rat_query::impact::ImpactSurfaceOptions::default(),
         )
         .unwrap();
     assert_eq!(impact.repo_memories.compact().unwrap().direct.len(), 1);
@@ -97,7 +97,7 @@ fn compact_repo_memory_view_projects_primary_binding_then_full_mode_round_trips(
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -112,7 +112,7 @@ fn compact_repo_memory_view_projects_primary_binding_then_full_mode_round_trips(
     let logical_symbol_id = symbol.logical_symbol_id.expect("logical symbol id");
     let full_body = "Runtime shutdown must be idempotent; second call is a no-op.".to_string();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Runtime shutdown must be idempotent".to_string(),
             body: full_body.clone(),
@@ -121,7 +121,7 @@ fn compact_repo_memory_view_projects_primary_binding_then_full_mode_round_trips(
             source: Some("agent".to_string()),
             tags: vec!["runtime".to_string()],
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(logical_symbol_id),
                 ..Default::default()
             },
@@ -133,7 +133,7 @@ fn compact_repo_memory_view_projects_primary_binding_then_full_mode_round_trips(
         .impact_surface_report_for_selected_symbol(
             &symbol,
             10,
-            &crate::query::impact::ImpactSurfaceOptions::default(),
+            &rag_rat_query::impact::ImpactSurfaceOptions::default(),
         )
         .unwrap();
     let compact = compact_report.repo_memories.compact().expect("compact by default");
@@ -157,7 +157,7 @@ fn compact_repo_memory_view_projects_primary_binding_then_full_mode_round_trips(
         .impact_surface_report_for_selected_symbol(
             &symbol,
             10,
-            &crate::query::impact::ImpactSurfaceOptions {
+            &rag_rat_query::impact::ImpactSurfaceOptions {
                 compact_memories: false,
                 ..Default::default()
             },
@@ -183,7 +183,7 @@ fn compact_repo_memory_view_separates_the_stale_lane() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -211,7 +211,7 @@ fn compact_repo_memory_view_separates_the_stale_lane() {
         )
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Risk".to_string(),
             title: "Anchor drifts when the chunk hash changes".to_string(),
             body: "Stale anchors belong in their own lane, away from current evidence.".to_string(),
@@ -220,7 +220,7 @@ fn compact_repo_memory_view_separates_the_stale_lane() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 chunk_id: Some(chunk_id),
                 ..Default::default()
             },
@@ -232,7 +232,7 @@ fn compact_repo_memory_view_separates_the_stale_lane() {
         .impact_surface_report_for_selected_symbol(
             &symbol,
             10,
-            &crate::query::impact::ImpactSurfaceOptions::default(),
+            &rag_rat_query::impact::ImpactSurfaceOptions::default(),
         )
         .unwrap();
     let before = before.repo_memories.compact().unwrap();
@@ -250,7 +250,7 @@ fn compact_repo_memory_view_separates_the_stale_lane() {
         .impact_surface_report_for_selected_symbol(
             &symbol,
             10,
-            &crate::query::impact::ImpactSurfaceOptions::default(),
+            &rag_rat_query::impact::ImpactSurfaceOptions::default(),
         )
         .unwrap();
     let after = after.repo_memories.compact().unwrap();
@@ -274,7 +274,7 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let selector = crate::query::symbol::SymbolSelector {
+    let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -285,7 +285,7 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
     };
     let symbol = db.select_symbol(&selector).unwrap().unwrap().expect("symbol");
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "keystone holds an invariant".to_string(),
             body: "This memory must survive a reindex and follow the symbol when it moves."
@@ -295,7 +295,7 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 symbol_id: Some(symbol.symbol_id),
                 logical_symbol_id: None,
                 chunk_id: None,
@@ -324,7 +324,7 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
 
     // Memory row survives the reindex (no cascade from deleted symbols).
     assert!(
-        crate::query::memory::memory_by_id(db.storage.connection(), &created.memory.memory_id,)
+        rag_rat_query::memory::memory_by_id(db.storage.connection(), &created.memory.memory_id,)
             .unwrap()
             .is_some(),
         "memory was lost to reindex",
@@ -350,7 +350,7 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -378,7 +378,7 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
         )
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Risk".to_string(),
             title: "Anchor must become stale when source hash changes".to_string(),
             body: "Validation should separate stale memories from current repo evidence."
@@ -388,7 +388,7 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
                 chunk_id: Some(chunk_id),
@@ -469,7 +469,7 @@ fn relocation_lands_on_the_kind_matching_twin_not_plan_order() {
     assert_ne!(struct_id, impl_id, "the fixture must produce both twins");
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Bound to the struct twin".to_string(),
             body: "Relocation must land back on the struct, not the impl block.".to_string(),
@@ -478,7 +478,7 @@ fn relocation_lands_on_the_kind_matching_twin_not_plan_order() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(struct_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -546,7 +546,7 @@ fn a_deleted_at_head_file_makes_a_bare_path_binding_gone() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Risk".to_string(),
             title: "Area note on a file that will be deleted".to_string(),
             body: "Must go gone with its file, not stay current behind the deleted marker."
@@ -556,7 +556,7 @@ fn a_deleted_at_head_file_makes_a_bare_path_binding_gone() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 path: Some("src/doomed.rs".to_string()),
                 ..Default::default()
             },
@@ -626,7 +626,7 @@ fn a_path_alive_only_in_another_scope_validates_pending_not_gone() {
     };
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Decision".to_string(),
             title: "Forward anchor to in-flight work".to_string(),
             body: "Absent here, alive on a branch — pending, never mark-obsolete bait.".to_string(),
@@ -635,7 +635,7 @@ fn a_path_alive_only_in_another_scope_validates_pending_not_gone() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 path: Some("src/inflight.rs".to_string()),
                 ..Default::default()
             },
@@ -729,7 +729,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let target = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -741,8 +741,8 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
         .unwrap()
         .unwrap()
         .expect("selected target");
-    let graph_options = crate::query::graph::GraphTraversalOptions {
-        resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+    let graph_options = rag_rat_query::graph::GraphTraversalOptions {
+        resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
         symbol_id: Some(target.symbol_id),
         logical_symbol_id: target.logical_symbol_id,
         ..Default::default()
@@ -752,7 +752,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
     let edge_id = callers.results[0].edge_id;
 
     let edge_memory = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Risk".to_string(),
             title: "caller_edge to target_edge must stay synchronous".to_string(),
             body: "This specific call path is used to prove edge-bound memories surface when \
@@ -763,7 +763,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
             source: Some("agent".to_string()),
             tags: vec!["edge".to_string()],
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
                 chunk_id: None,
@@ -791,8 +791,8 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
         .impact_surface_report_for_selected_symbol(
             &target,
             10,
-            &crate::query::impact::ImpactSurfaceOptions {
-                resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+            &rag_rat_query::impact::ImpactSurfaceOptions {
+                resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
                 ..Default::default()
             },
         )
@@ -804,7 +804,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
     assert_eq!(impact.completeness_and_caveats.memory_status.active, 1);
 
     let call_path_memory = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "TestExpectation".to_string(),
             title: "caller_edge path hash recall".to_string(),
             body: "Call-path memories are addressable by a deterministic edge sequence hash."
@@ -814,7 +814,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
             source: Some("agent".to_string()),
             tags: vec!["call-path".to_string()],
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
                 chunk_id: None,
@@ -861,7 +861,7 @@ fn memory_search_defers_the_body_under_the_summary_surface() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Invariant".to_string(),
         title: "surfaceprobe invariant".to_string(),
         body: "The surfaceprobe body is load-bearing and worth compacting.".to_string(),
@@ -870,7 +870,7 @@ fn memory_search_defers_the_body_under_the_summary_surface() {
         source: Some("agent".to_string()),
         tags: Vec::new(),
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             logical_symbol_id: None,
             symbol_id: None,
             chunk_id: None,
@@ -953,7 +953,7 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
     };
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Decision".to_string(),
             title: "why callee is invoked here".to_string(),
             body: "This call path is load-bearing.".to_string(),
@@ -962,7 +962,7 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
                 chunk_id: None,
@@ -1069,7 +1069,7 @@ fn impact_surface_surfaces_call_path_memory_when_path_crossed() {
     let caller_edge = edge_to("b"); // a -> b
     let callee_edge = edge_to("c"); // b -> c
 
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: "a -> b -> c is the hot path".to_string(),
         body: "Why this two-hop path matters.".to_string(),
@@ -1078,7 +1078,7 @@ fn impact_surface_surfaces_call_path_memory_when_path_crossed() {
         source: Some("agent".to_string()),
         tags: Vec::new(),
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             logical_symbol_id: None,
             symbol_id: None,
             chunk_id: None,
@@ -1101,7 +1101,7 @@ fn impact_surface_surfaces_call_path_memory_when_path_crossed() {
     .unwrap();
 
     let symbol_b = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: Some("src/lib.rs::b".to_string()),
@@ -1114,11 +1114,11 @@ fn impact_surface_surfaces_call_path_memory_when_path_crossed() {
         .unwrap()
         .expect("symbol b");
 
-    let report = crate::query::impact::impact_surface_report_for_symbol(
+    let report = rag_rat_query::impact::impact_surface_report_for_symbol(
         db.storage.connection(),
         &symbol_b,
         10,
-        &crate::query::impact::ImpactSurfaceOptions::default(),
+        &rag_rat_query::impact::ImpactSurfaceOptions::default(),
         |_hops| Ok(false),
     )
     .unwrap();
@@ -1151,7 +1151,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -1166,7 +1166,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
     assert!(symbol.path.contains("a.rs"), "initial path should be a.rs: {}", symbol.path);
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "target returns 42".to_string(),
             body: "This memory must follow target across a file move.".to_string(),
@@ -1175,7 +1175,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 symbol_id: Some(symbol.symbol_id),
                 logical_symbol_id: None,
                 chunk_id: None,
@@ -1210,7 +1210,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
     // The binding must now point at b.rs.
     let binding = &db
         .memory_for_symbol(
-            &db.select_symbol(&crate::query::symbol::SymbolSelector {
+            &db.select_symbol(&rag_rat_query::symbol::SymbolSelector {
                 logical_symbol_id: None,
                 symbol_id: None,
                 symbol_path: None,
@@ -1252,7 +1252,7 @@ fn memory_relocation_is_durable_across_a_second_reindex() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -1265,7 +1265,7 @@ fn memory_relocation_is_durable_across_a_second_reindex() {
         .unwrap()
         .expect("target in a.rs");
 
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: "target durable across reindex".to_string(),
         body: "After relocation the binding must stay stable on a second reindex.".to_string(),
@@ -1274,7 +1274,7 @@ fn memory_relocation_is_durable_across_a_second_reindex() {
         source: Some("agent".to_string()),
         tags: Vec::new(),
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             symbol_id: Some(symbol.symbol_id),
             logical_symbol_id: None,
             chunk_id: None,
@@ -1349,7 +1349,7 @@ fn relocation_persists_refreshed_symbol_and_logical_ids() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let select = |db: &IndexDatabase| {
-        db.select_symbol(&crate::query::symbol::SymbolSelector {
+        db.select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -1364,7 +1364,7 @@ fn relocation_persists_refreshed_symbol_and_logical_ids() {
     };
 
     let original = select(&db);
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: "ids refreshed on relocate".to_string(),
         body: "The persisted symbol_id/logical_symbol_id must follow the live symbol.".to_string(),
@@ -1373,7 +1373,7 @@ fn relocation_persists_refreshed_symbol_and_logical_ids() {
         source: Some("agent".to_string()),
         tags: Vec::new(),
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             symbol_id: Some(original.symbol_id),
             logical_symbol_id: None,
             chunk_id: None,
@@ -1431,7 +1431,7 @@ fn relocation_persists_refreshed_symbol_and_logical_ids() {
     );
     // The persisted id must actually resolve in the current generation.
     assert!(
-        crate::query::symbol::lookup_by_id(db.storage.connection(), persisted_symbol_id.unwrap())
+        rag_rat_query::symbol::lookup_by_id(db.storage.connection(), persisted_symbol_id.unwrap())
             .unwrap()
             .is_some(),
         "persisted symbol_id must resolve to a live symbol row"
@@ -1498,7 +1498,7 @@ fn memory_stays_gone_when_moved_symbol_body_changed() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -1511,7 +1511,7 @@ fn memory_stays_gone_when_moved_symbol_body_changed() {
         .unwrap()
         .expect("target in a.rs");
 
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Risk".to_string(),
         title: "target body changed guard".to_string(),
         body: "A hash-changed move must not silently relocate.".to_string(),
@@ -1520,7 +1520,7 @@ fn memory_stays_gone_when_moved_symbol_body_changed() {
         source: Some("agent".to_string()),
         tags: Vec::new(),
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             symbol_id: Some(symbol.symbol_id),
             logical_symbol_id: None,
             chunk_id: None,
@@ -1572,7 +1572,7 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
     // Bind to the a.rs instance specifically.
     let candidates = db
         .symbol_candidates(
-            &crate::query::symbol::SymbolSelector {
+            &rag_rat_query::symbol::SymbolSelector {
                 logical_symbol_id: None,
                 symbol_id: None,
                 symbol_path: None,
@@ -1591,7 +1591,7 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
         .expect("a.rs target candidate");
     let symbol_id = a_symbol.symbol_id;
 
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Invariant".to_string(),
         title: "target ambiguous guard".to_string(),
         body: "Two identical bodies must block silent relocation.".to_string(),
@@ -1600,7 +1600,7 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
         source: Some("agent".to_string()),
         tags: Vec::new(),
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             symbol_id: Some(symbol_id),
             logical_symbol_id: None,
             chunk_id: None,
@@ -1687,7 +1687,7 @@ fn memory_logical_binding_relocates_across_files() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -1702,7 +1702,7 @@ fn memory_logical_binding_relocates_across_files() {
     let logical_symbol_id = symbol.logical_symbol_id.expect("logical symbol id");
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "logical_target must follow logical binding".to_string(),
             body: "Logical-symbol binding must relocate via name+hash fallback.".to_string(),
@@ -1711,7 +1711,7 @@ fn memory_logical_binding_relocates_across_files() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(logical_symbol_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -1828,7 +1828,7 @@ fn memory_chunk_binding_relocates_by_hash() {
         .unwrap();
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "chunk_anchor_target must return 999".to_string(),
             body: "This chunk binding must survive a rowid change via content-hash relocation."
@@ -1838,7 +1838,7 @@ fn memory_chunk_binding_relocates_by_hash() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
                 chunk_id: Some(chunk_id),
@@ -1944,7 +1944,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
 
     // Bind a memory to rebind_src in a.rs.
     let src_symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -1958,7 +1958,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
         .expect("rebind_src symbol");
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "rebind test memory".to_string(),
             body: "This memory will be explicitly rebound to a new symbol.".to_string(),
@@ -1967,7 +1967,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 symbol_id: Some(src_symbol.symbol_id),
                 logical_symbol_id: None,
                 chunk_id: None,
@@ -1998,7 +1998,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
 
     // Locate rebind_dst in b.rs (the target of the explicit rebind).
     let dst_symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -2031,7 +2031,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
 
     // Perform the explicit rebind.
     let rebound = db
-        .memory_rebind(&memory_id, crate::query::memory::RepoMemoryBindTarget {
+        .memory_rebind(&memory_id, rag_rat_query::memory::RepoMemoryBindTarget {
             symbol_id: Some(dst_symbol.symbol_id),
             logical_symbol_id: None,
             chunk_id: None,
@@ -2098,7 +2098,7 @@ fn anchor_health_counts_tallies_persisted_statuses() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let sym = |name: &str| {
-        db.select_symbol(&crate::query::symbol::SymbolSelector {
+        db.select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -2114,7 +2114,7 @@ fn anchor_health_counts_tallies_persisted_statuses() {
     let alpha = sym("health_alpha");
     let beta = sym("health_beta");
 
-    let bind_target = |symbol_id| crate::query::memory::RepoMemoryBindTarget {
+    let bind_target = |symbol_id| rag_rat_query::memory::RepoMemoryBindTarget {
         symbol_id: Some(symbol_id),
         logical_symbol_id: None,
         chunk_id: None,
@@ -2134,7 +2134,7 @@ fn anchor_health_counts_tallies_persisted_statuses() {
         dir: None,
     };
 
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Invariant".to_string(),
         title: "health alpha invariant".to_string(),
         body: "Anchor health test — alpha binding.".to_string(),
@@ -2147,7 +2147,7 @@ fn anchor_health_counts_tallies_persisted_statuses() {
     })
     .unwrap();
 
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: "health beta decision".to_string(),
         body: "Anchor health test — beta binding.".to_string(),
@@ -2185,7 +2185,7 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let src_symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -2198,7 +2198,7 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
         .unwrap()
         .expect("doctor_src in a.rs");
 
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Invariant".to_string(),
         title: "doctor test memory".to_string(),
         body: "This memory is bound to a symbol that will become gone.".to_string(),
@@ -2207,7 +2207,7 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
         source: Some("agent".to_string()),
         tags: Vec::new(),
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             symbol_id: Some(src_symbol.symbol_id),
             logical_symbol_id: None,
             chunk_id: None,
@@ -2316,7 +2316,7 @@ fn memory_doctor_dedupes_cfg_split_candidates() {
 
     let original = db
         .symbol_candidates(
-            &crate::query::symbol::SymbolSelector {
+            &rag_rat_query::symbol::SymbolSelector {
                 logical_symbol_id: None,
                 symbol_id: None,
                 symbol_path: None,
@@ -2330,7 +2330,7 @@ fn memory_doctor_dedupes_cfg_split_candidates() {
         .unwrap()
         .candidates[0]
         .symbol_id;
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Invariant".to_string(),
         title: "cfg helper note".to_string(),
         body: "Bound to a helper that becomes a cfg-split pair in another file.".to_string(),
@@ -2339,7 +2339,7 @@ fn memory_doctor_dedupes_cfg_split_candidates() {
         source: Some("agent".to_string()),
         tags: Vec::new(),
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             symbol_id: Some(original),
             ..Default::default()
         },
@@ -2389,7 +2389,7 @@ fn symbol_path_selector_is_exact_not_substring() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let hit = db
-        .select_symbol_for_bind(&crate::query::symbol::SymbolSelector {
+        .select_symbol_for_bind(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: Some("src/lib.rs::spawn_blocking".to_string()),
@@ -2428,7 +2428,7 @@ fn select_symbol_for_bind_collapses_cfg_split_group() {
     // must disambiguate; select_symbol_for_bind must collapse to one member of the logical group.
     let qualified = db
         .symbol_candidates(
-            &crate::query::symbol::SymbolSelector {
+            &rag_rat_query::symbol::SymbolSelector {
                 logical_symbol_id: None,
                 symbol_id: None,
                 symbol_path: None,
@@ -2445,7 +2445,7 @@ fn select_symbol_for_bind_collapses_cfg_split_group() {
         .clone();
     let logical_id = db
         .symbol_candidates(
-            &crate::query::symbol::SymbolSelector {
+            &rag_rat_query::symbol::SymbolSelector {
                 logical_symbol_id: None,
                 symbol_id: None,
                 symbol_path: None,
@@ -2461,7 +2461,7 @@ fn select_symbol_for_bind_collapses_cfg_split_group() {
         .logical_symbol_id
         .expect("cfg twins share a logical id");
 
-    let selector = crate::query::symbol::SymbolSelector {
+    let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: Some(qualified.clone()),
@@ -2532,8 +2532,8 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let churn = db
-        .repo_brief(crate::query::repo_brief::RepoBriefOptions {
-            mode: crate::query::repo_brief::RepoBriefMode::Churn,
+        .repo_brief(rag_rat_query::repo_brief::RepoBriefOptions {
+            mode: rag_rat_query::repo_brief::RepoBriefMode::Churn,
             limit: 1,
             include_generated: false,
             include_memories: true,
@@ -2546,8 +2546,8 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
     assert!(churn.candidates[0].why.iter().any(|reason| reason.contains("churn")));
 
     let god_modules = db
-        .repo_brief(crate::query::repo_brief::RepoBriefOptions {
-            mode: crate::query::repo_brief::RepoBriefMode::GodModules,
+        .repo_brief(rag_rat_query::repo_brief::RepoBriefOptions {
+            mode: rag_rat_query::repo_brief::RepoBriefMode::GodModules,
             limit: 1,
             include_generated: false,
             include_memories: true,
@@ -2685,8 +2685,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
     // all honor `[memory] surface = "summary"` — the full body is deferred to `memory show`, the
     // compacted summary + verdict marker take its place, and the binding structure is preserved.
     use rag_rat_base::config::MemorySurface;
-
-    use crate::query::graph_meta::GraphMetaMode;
+    use rag_rat_query::graph_meta::GraphMetaMode;
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -2694,7 +2693,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let symbol = db
-        .select_symbol(&crate::query::symbol::SymbolSelector {
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: None,
@@ -2710,7 +2709,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
     let sym_title = "Target invariant";
     let sym_body = "The target function must keep its full documented invariant intact.";
     let sym_mem = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: sym_title.to_string(),
             body: sym_body.to_string(),
@@ -2719,7 +2718,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
             source: Some("agent".to_string()),
             tags: vec![],
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: symbol.logical_symbol_id,
                 ..Default::default()
             },
@@ -2729,7 +2728,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
 
     let path_title = "Path note";
     let path_body = "A note anchored to the file, not a symbol; its body is long enough to matter.";
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: path_title.to_string(),
         body: path_body.to_string(),
@@ -2738,7 +2737,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
         source: Some("agent".to_string()),
         tags: vec![],
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             path: Some("src/lib.rs".to_string()),
             ..Default::default()
         },
@@ -2759,9 +2758,9 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
             rusqlite::params![
                 id,
                 repo_id,
-                crate::dream::note_content_hash(title, body),
+                rag_rat_query::memory::evidence::note_content_hash(title, body),
                 summary,
-                crate::dream::COMPACT_PROMPT_VERSION
+                rag_rat_query::memory::evidence::COMPACT_PROMPT_VERSION
             ],
         )
         .unwrap();
@@ -2771,9 +2770,12 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
         .query_row("SELECT id FROM repo_memories WHERE title = ?1", [path_title], |r| r.get(0))
         .unwrap();
     seed_summary(&path_id, path_title, path_body, "File-level note gist.");
-    let inputs =
-        crate::dream::checked_inputs_hash(conn, &sym_mem.memory_id, &Some(repo_id.clone()))
-            .unwrap();
+    let inputs = rag_rat_query::memory::evidence::checked_inputs_hash(
+        conn,
+        &sym_mem.memory_id,
+        &Some(repo_id.clone()),
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
          checked_against_commit, checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
@@ -2781,9 +2783,9 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
         rusqlite::params![
             sym_mem.memory_id,
             repo_id,
-            crate::dream::note_content_hash(sym_title, sym_body),
+            rag_rat_query::memory::evidence::note_content_hash(sym_title, sym_body),
             inputs,
-            crate::dream::VERDICT_PROMPT_VERSION
+            rag_rat_query::memory::evidence::VERDICT_PROMPT_VERSION
         ],
     )
     .unwrap();
@@ -2855,7 +2857,7 @@ fn unanchored_node_is_created_listed_and_deduped() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let make = || crate::query::memory::RepoMemoryCreate {
+    let make = || rag_rat_query::memory::RepoMemoryCreate {
         // Only Task/Concept may be created UNANCHORED (#465); other kinds must anchor to code.
         kind: "Concept".to_string(),
         title: "Prefer the event log over polling".to_string(),
@@ -2865,7 +2867,7 @@ fn unanchored_node_is_created_listed_and_deduped() {
         source: Some("agent".to_string()),
         tags: vec![],
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget::default(), // empty → unanchored
+        bind: rag_rat_query::memory::RepoMemoryBindTarget::default(), // empty → unanchored
     };
 
     let created = db.memory_create(make()).unwrap();
@@ -2875,7 +2877,7 @@ fn unanchored_node_is_created_listed_and_deduped() {
     let conn = db.storage.connection();
 
     // Surfaces in the general list with blank binding columns (LEFT JOIN).
-    let all = crate::query::memory::list_memories(conn, None).unwrap();
+    let all = rag_rat_query::memory::list_memories(conn, None).unwrap();
     let summary = all
         .iter()
         .find(|s| s.memory_id == created.memory.memory_id)
@@ -2886,7 +2888,7 @@ fn unanchored_node_is_created_listed_and_deduped() {
 
     // A binding-kind filter excludes it (it has no binding kind).
     assert!(
-        crate::query::memory::list_memories(conn, Some("path")).unwrap().is_empty(),
+        rag_rat_query::memory::list_memories(conn, Some("path")).unwrap().is_empty(),
         "an unanchored node must not surface under a binding-kind filter"
     );
 
@@ -2913,7 +2915,7 @@ fn rebind_still_requires_a_binding_target() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Concept".to_string(),
             title: "an unanchored node".to_string(),
             body: "created without a binding".to_string(),
@@ -2922,14 +2924,14 @@ fn rebind_still_requires_a_binding_target() {
             source: Some("agent".to_string()),
             tags: vec![],
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget::default(),
+            bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
         })
         .unwrap();
 
     let err = db
         .memory_rebind(
             &created.memory.memory_id,
-            crate::query::memory::RepoMemoryBindTarget::default(),
+            rag_rat_query::memory::RepoMemoryBindTarget::default(),
         )
         .unwrap_err();
     assert!(
@@ -2954,7 +2956,7 @@ fn a_partial_binding_is_rejected_not_silently_unanchored() {
 
     // tracker+project but NO item_key — an incomplete anchor, not an unanchored node.
     let err = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Decision".to_string(),
             title: "partial tracker anchor".to_string(),
             body: "tracker+project without an item_key".to_string(),
@@ -2963,7 +2965,7 @@ fn a_partial_binding_is_rejected_not_silently_unanchored() {
             source: Some("agent".to_string()),
             tags: vec![],
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 tracker: Some("github".to_string()),
                 project: Some("o/r".to_string()),
                 ..Default::default()
@@ -2991,7 +2993,7 @@ fn a_polymorphic_node_stores_and_round_trips_its_payload() {
 
     // A `Task` node (a new #465 kind), unanchored, carrying a structured payload.
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Task".to_string(),
             title: "Wire the payload column".to_string(),
             body: "Track the polymorphic payload work.".to_string(),
@@ -3000,7 +3002,7 @@ fn a_polymorphic_node_stores_and_round_trips_its_payload() {
             source: Some("agent".to_string()),
             tags: vec![],
             payload_json: Some(r#"{"estimate":"1d","priority":2}"#.to_string()),
-            bind: crate::query::memory::RepoMemoryBindTarget::default(),
+            bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
         })
         .unwrap();
     assert!(!created.duplicate);
@@ -3018,7 +3020,7 @@ fn a_polymorphic_node_stores_and_round_trips_its_payload() {
 
     // Update just the payload; `None` on the other fields leaves them unchanged.
     let updated = db
-        .memory_update(crate::query::memory::RepoMemoryUpdate {
+        .memory_update(rag_rat_query::memory::RepoMemoryUpdate {
             memory_id: created.memory.memory_id.clone(),
             kind: None,
             title: None,
@@ -3034,7 +3036,7 @@ fn a_polymorphic_node_stores_and_round_trips_its_payload() {
 
     // A non-object payload (an array) is rejected.
     let err = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Concept".to_string(),
             title: "bad payload".to_string(),
             body: "an array is not a valid payload".to_string(),
@@ -3043,7 +3045,7 @@ fn a_polymorphic_node_stores_and_round_trips_its_payload() {
             source: Some("agent".to_string()),
             tags: vec![],
             payload_json: Some("[1,2,3]".to_string()),
-            bind: crate::query::memory::RepoMemoryBindTarget::default(),
+            bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
         })
         .unwrap_err();
     assert!(
@@ -3066,7 +3068,7 @@ fn payload_bearing_nodes_dedupe_on_payload_not_just_text() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let make = |payload: &str| crate::query::memory::RepoMemoryCreate {
+    let make = |payload: &str| rag_rat_query::memory::RepoMemoryCreate {
         kind: "Task".to_string(),
         title: "same title".to_string(),
         body: "same body".to_string(),
@@ -3075,7 +3077,7 @@ fn payload_bearing_nodes_dedupe_on_payload_not_just_text() {
         source: Some("agent".to_string()),
         tags: vec![],
         payload_json: Some(payload.to_string()),
-        bind: crate::query::memory::RepoMemoryBindTarget::default(),
+        bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
     };
 
     let a = db.memory_create(make(r#"{"priority":1}"#)).unwrap();
@@ -3105,7 +3107,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let unanchored = |kind: &str| crate::query::memory::RepoMemoryCreate {
+    let unanchored = |kind: &str| rag_rat_query::memory::RepoMemoryCreate {
         kind: kind.to_string(),
         title: "same text".to_string(),
         body: "same body".to_string(),
@@ -3114,7 +3116,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
         source: Some("agent".to_string()),
         tags: vec![],
         payload_json: Some(r#"{"p":1}"#.to_string()),
-        bind: crate::query::memory::RepoMemoryBindTarget::default(),
+        bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
     };
 
     // A Concept and a Task with identical text+payload are DISTINCT (dedup folds kind).
@@ -3131,7 +3133,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
     // A non-Task/Concept kind cannot be created UNANCHORED (no payload here, so the anchor gate is
     // what fires).
     let err = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Decision".to_string(),
             title: "unanchored decision".to_string(),
             body: "b".to_string(),
@@ -3140,7 +3142,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
             source: Some("agent".to_string()),
             tags: vec![],
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget::default(),
+            bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
         })
         .unwrap_err();
     assert!(
@@ -3149,7 +3151,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
     );
     // A payload is rejected on a non-polymorphic kind, even when ANCHORED to code.
     let perr = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "invariant with payload".to_string(),
             body: "b".to_string(),
@@ -3158,7 +3160,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
             source: Some("agent".to_string()),
             tags: vec![],
             payload_json: Some(r#"{"p":1}"#.to_string()),
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 path: Some("src/lib.rs".to_string()),
                 ..Default::default()
             },
@@ -3171,7 +3173,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
 
     // The invariant holds on UPDATE too: a zero-binding node cannot be retyped to a non-graph kind,
     // but retyping between graph-node kinds (Task -> Concept) is fine.
-    let retype = |kind: &str| crate::query::memory::RepoMemoryUpdate {
+    let retype = |kind: &str| rag_rat_query::memory::RepoMemoryUpdate {
         memory_id: task.memory.memory_id.clone(),
         kind: Some(kind.to_string()),
         title: None,
@@ -3195,7 +3197,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
     // Retyping an ANCHORED Task (carrying a payload) to a non-polymorphic kind is allowed (it has a
     // binding) and CLEARS the stranded payload rather than preserving it.
     let anchored = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Task".to_string(),
             title: "anchored task".to_string(),
             body: "b".to_string(),
@@ -3204,7 +3206,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
             source: Some("agent".to_string()),
             tags: vec![],
             payload_json: Some(r#"{"p":9}"#.to_string()),
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 path: Some("src/lib.rs".to_string()),
                 ..Default::default()
             },
@@ -3212,7 +3214,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
         .unwrap();
     assert_eq!(anchored.memory.payload_json.as_deref(), Some(r#"{"p":9}"#));
     let retyped = db
-        .memory_update(crate::query::memory::RepoMemoryUpdate {
+        .memory_update(rag_rat_query::memory::RepoMemoryUpdate {
             memory_id: anchored.memory.memory_id.clone(),
             kind: Some("Decision".to_string()),
             title: None,
@@ -3253,7 +3255,7 @@ fn dedup_and_unanchored_create_are_kind_aware() {
 /// rejected, and an edge into an ABSENT repo is stored `unresolved` (not an error).
 #[test]
 fn typed_edges_add_traverse_and_resolve() {
-    use crate::query::memory::EdgeTarget;
+    use rag_rat_query::memory::EdgeTarget;
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -3261,7 +3263,7 @@ fn typed_edges_add_traverse_and_resolve() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let task = |title: &str| crate::query::memory::RepoMemoryCreate {
+    let task = |title: &str| rag_rat_query::memory::RepoMemoryCreate {
         kind: "Task".to_string(),
         title: title.to_string(),
         body: "b".to_string(),
@@ -3270,7 +3272,7 @@ fn typed_edges_add_traverse_and_resolve() {
         source: Some("agent".to_string()),
         tags: vec![],
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget::default(),
+        bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
     };
     let a = db.memory_create(task("task A")).unwrap().memory.memory_id;
     let b = db.memory_create(task("task B")).unwrap().memory.memory_id;
@@ -3349,7 +3351,7 @@ fn typed_edges_add_traverse_and_resolve() {
     // EXPLICIT cross-repo whose id resolves to a DIFFERENT repo than named → rejected (`mem_absent`
     // lives in `some-other-repo`, not the named `wrong-repo`).
     let mismatch = db
-        .memory_edge_add(&a, "depends_on", crate::query::memory::EdgeTarget::Node {
+        .memory_edge_add(&a, "depends_on", rag_rat_query::memory::EdgeTarget::Node {
             repo_id: Some("wrong-repo".to_string()),
             node_id: "mem_absent".to_string(),
         })
@@ -3368,7 +3370,7 @@ fn typed_edges_add_traverse_and_resolve() {
         )
         .unwrap();
     let typo = db
-        .memory_edge_add(&a, "depends_on", crate::query::memory::EdgeTarget::Node {
+        .memory_edge_add(&a, "depends_on", rag_rat_query::memory::EdgeTarget::Node {
             repo_id: Some("some-other-repo".to_string()),
             node_id: "mem_ghost".to_string(),
         })
@@ -3427,7 +3429,7 @@ fn a_downgrade_to_gone_needs_two_consecutive_observations() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Risk".to_string(),
             title: "Anchored to a file a torn pass will misjudge".to_string(),
             body: "One gone observation arms the marker; only the second downgrades.".to_string(),
@@ -3436,7 +3438,7 @@ fn a_downgrade_to_gone_needs_two_consecutive_observations() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 path: Some("src/doomed.rs".to_string()),
                 ..Default::default()
             },
@@ -3500,7 +3502,7 @@ fn a_recovered_anchor_clears_the_pending_downgrade() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Risk".to_string(),
             title: "Anchored to a file that wobbles across contexts".to_string(),
             body: "A recovery between gone observations must disarm the downgrade.".to_string(),
@@ -3509,7 +3511,7 @@ fn a_recovered_anchor_clears_the_pending_downgrade() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 path: Some("src/wobbling.rs".to_string()),
                 ..Default::default()
             },
@@ -3591,7 +3593,7 @@ fn a_staged_generation_freezes_the_downgrade_rule() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Risk".to_string(),
             title: "Anchored while a rebuild is mid-flight".to_string(),
             body: "A torn window's gone observation must not move the downgrade rule.".to_string(),
@@ -3600,7 +3602,7 @@ fn a_staged_generation_freezes_the_downgrade_rule() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 path: Some("src/torn.rs".to_string()),
                 ..Default::default()
             },
@@ -3689,7 +3691,7 @@ fn key_derivation_drift_realigns_referenced_logical_bindings_at_rebuild() {
         })
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Anchored across derivation drift".to_string(),
             body: "The binding must follow the symbol through a logical-key version bump."
@@ -3699,7 +3701,7 @@ fn key_derivation_drift_realigns_referenced_logical_bindings_at_rebuild() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(real_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -3819,7 +3821,7 @@ fn a_current_logical_key_version_stamp_skips_the_drift_heal() {
         })
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Gated by the version stamp".to_string(),
             body: "No drift heal may run while the stamp is current.".to_string(),
@@ -3828,7 +3830,7 @@ fn a_current_logical_key_version_stamp_skips_the_drift_heal() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(real_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -3925,7 +3927,7 @@ fn drifted_overload_twins_stay_unmatched_for_the_ladder() {
     let mut memory_ids = Vec::new();
     for (i, twin) in twin_ids.iter().enumerate() {
         let created = db
-            .memory_create(crate::query::memory::RepoMemoryCreate {
+            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
                 kind: "Invariant".to_string(),
                 title: format!("Bound to drift twin {i}"),
                 body: "Ambiguous drift must not guess a twin.".to_string(),
@@ -3934,7 +3936,7 @@ fn drifted_overload_twins_stay_unmatched_for_the_ladder() {
                 source: Some("agent".to_string()),
                 tags: Vec::new(),
                 payload_json: None,
-                bind: crate::query::memory::RepoMemoryBindTarget {
+                bind: rag_rat_query::memory::RepoMemoryBindTarget {
                     logical_symbol_id: Some(*twin),
                     symbol_id: None,
                     chunk_id: None,
@@ -4039,7 +4041,7 @@ fn qualified_name_drift_realigns_via_signature_agreement() {
         )
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Anchored across qualified-name drift".to_string(),
             body: "Signature agreement must carry the realign when the qual drifted.".to_string(),
@@ -4048,7 +4050,7 @@ fn qualified_name_drift_realigns_via_signature_agreement() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(real_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -4183,7 +4185,7 @@ fn multiple_eligible_candidates_narrow_to_the_both_axes_winner() {
         .unwrap();
     assert_ne!(u32_id, u64_id, "the differing signatures must produce two logical symbols");
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Anchored to the u32 overload across drift".to_string(),
             body: "Both twins agree on qual; only the u32 twin agrees on both axes.".to_string(),
@@ -4192,7 +4194,7 @@ fn multiple_eligible_candidates_narrow_to_the_both_axes_winner() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(u32_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -4298,7 +4300,7 @@ fn kind_classification_drift_realigns_via_the_relaxed_pass() {
         )
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Anchored across kind drift".to_string(),
             body: "Qualified-name and signature agreement must carry a kind reclassification."
@@ -4308,7 +4310,7 @@ fn kind_classification_drift_realigns_via_the_relaxed_pass() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(real_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -4414,7 +4416,7 @@ fn an_old_id_occupied_by_another_symbol_still_realigns_by_evidence() {
     let alpha_id = id_of(&db, "alpha_occ");
     let beta_id = id_of(&db, "beta_occ");
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Anchored to alpha across an id swap".to_string(),
             body: "A surviving id occupied by beta must not capture alpha's binding.".to_string(),
@@ -4423,7 +4425,7 @@ fn an_old_id_occupied_by_another_symbol_still_realigns_by_evidence() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(alpha_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -4549,7 +4551,7 @@ fn a_merge_into_a_surviving_id_is_left_for_the_ladder_not_silently_healed() {
     let mut memory_ids = Vec::new();
     for (i, twin) in twin_ids.iter().enumerate() {
         let created = db
-            .memory_create(crate::query::memory::RepoMemoryCreate {
+            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
                 kind: "Invariant".to_string(),
                 title: format!("Bound to merge twin {i}"),
                 body: "A merge must not silently capture the vanished twin's reference."
@@ -4559,7 +4561,7 @@ fn a_merge_into_a_surviving_id_is_left_for_the_ladder_not_silently_healed() {
                 source: Some("agent".to_string()),
                 tags: Vec::new(),
                 payload_json: None,
-                bind: crate::query::memory::RepoMemoryBindTarget {
+                bind: rag_rat_query::memory::RepoMemoryBindTarget {
                     logical_symbol_id: Some(*twin),
                     symbol_id: None,
                     chunk_id: None,
@@ -4675,7 +4677,7 @@ fn disagreeing_member_signatures_yield_no_drift_evidence() {
         })
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Bound to the collapsed group".to_string(),
             body: "A split group's members disagree; the snapshot must carry no signature."
@@ -4685,7 +4687,7 @@ fn disagreeing_member_signatures_yield_no_drift_evidence() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(group_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -4770,7 +4772,7 @@ fn a_mixed_null_signature_group_yields_no_drift_evidence() {
         })
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Bound to the partially captured group".to_string(),
             body: "One member lost its signature capture; the group must carry no evidence."
@@ -4780,7 +4782,7 @@ fn a_mixed_null_signature_group_yields_no_drift_evidence() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(group_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -4867,7 +4869,7 @@ fn an_occupied_old_id_with_no_winner_is_vacated_for_the_ladder() {
     let alpha_id = id_of(&db, "vac_alpha");
     let beta_id = id_of(&db, "vac_beta");
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Anchored to alpha across an evidence-dead swap".to_string(),
             body: "An occupied id without evidence must be vacated, never silently captured."
@@ -4877,7 +4879,7 @@ fn an_occupied_old_id_with_no_winner_is_vacated_for_the_ladder() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(alpha_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -5017,7 +5019,7 @@ fn a_vacated_call_path_endpoint_is_nulled_not_sentineled() {
     // A parent memory (path-bound so it needs no logical symbol) plus a call-path row whose START
     // endpoint references cp_alpha — the durable reference the drift snapshot will pick up.
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Decision".to_string(),
             title: "Call-path memory with a drifting endpoint".to_string(),
             body: "Its start endpoint must vacate to NULL, not a bogus sentinel.".to_string(),
@@ -5026,7 +5028,7 @@ fn a_vacated_call_path_endpoint_is_nulled_not_sentineled() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 path: Some("src/lib.rs".to_string()),
                 ..Default::default()
             },
@@ -5167,7 +5169,7 @@ fn a_vanished_call_path_reference_with_no_winner_is_nulled() {
         .query_row("SELECT id FROM logical_symbols WHERE logical_name = 'cpv_fn'", [], |r| r.get(0))
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Decision".to_string(),
             title: "Call-path memory whose endpoint vanishes".to_string(),
             body: "A vanished no-winner endpoint must be NULLed, not left on a dead id."
@@ -5177,7 +5179,7 @@ fn a_vanished_call_path_reference_with_no_winner_is_nulled() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 path: Some("src/lib.rs".to_string()),
                 ..Default::default()
             },
@@ -5328,7 +5330,7 @@ fn a_refresh_collision_deletes_the_stale_duplicate_binding() {
         )
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Bound to dup_anchor under two derivations".to_string(),
             body: "The stale sibling binding must be dropped, not stranded mis-labelled."
@@ -5338,7 +5340,7 @@ fn a_refresh_collision_deletes_the_stale_duplicate_binding() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(real_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -5452,7 +5454,7 @@ fn vacating_an_occupied_id_does_not_undo_a_remap_landing_on_it() {
             r.get(0)
         })
         .unwrap();
-    let bind_target = |logical: i64| crate::query::memory::RepoMemoryBindTarget {
+    let bind_target = |logical: i64| rag_rat_query::memory::RepoMemoryBindTarget {
         logical_symbol_id: Some(logical),
         symbol_id: None,
         chunk_id: None,
@@ -5472,7 +5474,7 @@ fn vacating_an_occupied_id_does_not_undo_a_remap_landing_on_it() {
         dir: None,
     };
     let alpha_memory = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Realigns onto its occupied id".to_string(),
             body: "The vacate of the ghost must not wipe this freshly realigned binding."
@@ -5490,7 +5492,7 @@ fn vacating_an_occupied_id_does_not_undo_a_remap_landing_on_it() {
     // The ghost's memory rides the API too (a hand-rolled repo_memories row would fight the
     // full column contract); its binding is re-pointed at the occupied id below.
     let ghost_memory = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "The evidence-dead ghost".to_string(),
             body: "Occupies alpha's re-derived id with a foreign key.".to_string(),
@@ -5722,7 +5724,7 @@ fn an_in_place_winner_with_dead_snapshot_members_is_not_vacated() {
         })
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Anchored across a members-dead snapshot".to_string(),
             body: "An in-place evidence winner keeps its references; the vacate sweep must not \
@@ -5733,7 +5735,7 @@ fn an_in_place_winner_with_dead_snapshot_members_is_not_vacated() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(keeper_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -5872,7 +5874,7 @@ fn a_kind_drift_decoy_with_conflicting_evidence_falls_to_the_ladder() {
     );
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Anchored to the struct across a kind bump".to_string(),
             body: "The old-kind decoy must not inherit this binding by qualified name alone."
@@ -5882,7 +5884,7 @@ fn a_kind_drift_decoy_with_conflicting_evidence_falls_to_the_ladder() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(struct_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -5995,7 +5997,7 @@ fn the_drift_heal_leaves_no_transient_index_behind() {
         })
         .unwrap();
     // A referenced binding keeps the snapshot non-empty, so the heal actually builds the index.
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Invariant".to_string(),
         title: "Keeps the drift snapshot non-empty".to_string(),
         body: "The heal must build AND drop its transient candidate index.".to_string(),
@@ -6004,7 +6006,7 @@ fn the_drift_heal_leaves_no_transient_index_behind() {
         source: Some("agent".to_string()),
         tags: Vec::new(),
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             logical_symbol_id: Some(tidy_id),
             symbol_id: None,
             chunk_id: None,
@@ -6088,7 +6090,7 @@ fn a_partial_pass_heals_without_stamping_the_key_version() {
         })
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Healed by the partial pass".to_string(),
             body: "The incremental sweep realigns visible drift but must not stamp.".to_string(),
@@ -6097,7 +6099,7 @@ fn a_partial_pass_heals_without_stamping_the_key_version() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(part_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -6209,7 +6211,7 @@ fn a_drift_heal_refreshes_the_binding_discriminators() {
         })
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Discriminators refreshed by the heal".to_string(),
             body: "A realigned binding must carry current relocation evidence.".to_string(),
@@ -6218,7 +6220,7 @@ fn a_drift_heal_refreshes_the_binding_discriminators() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(disc_id),
                 symbol_id: None,
                 chunk_id: None,
@@ -6415,7 +6417,7 @@ fn drift_evidence_survives_the_partial_pass_that_edits_the_bound_file() {
         })
         .unwrap();
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "Survives the edit-and-heal pass".to_string(),
             body: "Evidence must be snapshotted before the pass replaces the file.".to_string(),
@@ -6424,7 +6426,7 @@ fn drift_evidence_survives_the_partial_pass_that_edits_the_bound_file() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(edit_id),
                 symbol_id: None,
                 chunk_id: None,

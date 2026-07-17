@@ -27,15 +27,7 @@ mod failure;
 mod findings;
 mod model;
 mod verdict;
-mod verify;
 
-// The phase-C model compaction pass: the `CompactPass` handle `dream_run_with_passes` consumes
-// (borrowed model + budget), reusing the same `VerdictModel` trait as the verdict pass.
-// The evidence-pack fingerprint + the two derived-row prompt versions, re-exported
-// crate-internally so the surfacing hydrator gates a stale verdict/summary on the SAME
-// identity the verify queue, divergence finder, and compaction queue use — a stale-evidence or
-// stale-prompt row is dropped consistently at every read seam, not just by the producer.
-pub(crate) use compact::COMPACT_PROMPT_VERSION;
 pub use compact::CompactPass;
 // Curated crate-facing surface (mod.rs is the index, not the junk drawer): the migration
 // ladder and `register_repo` adoption re-derive persisted finding ids after re-stamping
@@ -48,7 +40,6 @@ pub(crate) use findings::{rederive_finding_ids, review_dream_finding};
 pub use model::{HttpVerdictModel, VerdictModel, provision_verdict_model};
 use rusqlite::Connection;
 use serde::Serialize;
-pub(crate) use verdict::PROMPT_VERSION as VERDICT_PROMPT_VERSION;
 pub use verdict::VerdictPass;
 // Dream v2 pass-0 substrate: the churn-skip verification queue + the deterministic,
 // citation-checkable evidence pack. Public so the phase-B model verdict pass (and later the
@@ -66,7 +57,7 @@ pub use verify::{
 pub fn render_evidence_pack(conn: &Connection, memory_id: &str) -> anyhow::Result<String> {
     Ok(verdict::render_pack(&verify::evidence_pack(conn, memory_id)?))
 }
-pub(crate) use verify::{checked_inputs_hash, note_content_hash};
+pub(crate) use rag_rat_query::memory::evidence as verify;
 
 /// A finding as PRODUCED by a finding kind (`coverage_gap` / `stale_reference` /
 /// `memory_unverifiable` / `memory_divergence`) — the INPUT to [`findings::sync`], which derives
@@ -154,7 +145,7 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> anyhow::Result<DreamR
     // it never re-evaluated, silently dropping real worklist items until the next verify run.
     let mut resolve_kinds: Vec<&str> = findings::BASE_FINDING_KINDS.to_vec();
     if opts.verify {
-        findings.extend(verify::unverifiable_findings(conn)?);
+        findings.extend(findings::unverifiable_findings(conn)?);
         findings.extend(verdict::divergence_findings(conn)?);
         resolve_kinds.extend_from_slice(findings::VERIFY_FINDING_KINDS);
     }

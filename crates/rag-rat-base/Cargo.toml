@@ -12,6 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+minicbor.workspace = true
+unicode-normalization.workspace = true
 anyhow.workspace = true
 gix.workspace = true
 libc.workspace = true

@@ -1,7 +1,6 @@
+use rag_rat_query::memory::AnchorHealth;
+use rag_rat_query::tree::DirTree;
 use rusqlite::{Connection, params};
-
-use crate::index::AnchorHealth;
-use crate::query::tree::DirTree;
 
 /// How many active non-dir memory titles are fetched and rendered in the digest.
 /// Single source of truth for the display cap — the `(+N more)` overflow note is
@@ -74,7 +73,7 @@ pub fn orientation(
     crate::index::install_worktree_scope_view(conn, &repo_id, config_root, cwd)?;
 
     // Step 2: directory tree (reads scoped `files` view).
-    let tree = crate::query::tree::dir_tree(conn, &Default::default())?;
+    let tree = rag_rat_query::tree::dir_tree(conn, &Default::default())?;
 
     // Step 3: load-bearing files — Spine mode, top 5 by fan_in.
     let load_bearing = spine_load_bearing(conn, 5)?;
@@ -96,11 +95,11 @@ pub fn orientation(
     let indexed_head = git_status.indexed_head.unwrap_or_default();
 
     // Step 7: anchor health (read-only, no validation pass).
-    let anchor = crate::query::memory::anchor_health_counts(conn)?;
+    let anchor = rag_rat_query::memory::anchor_health_counts(conn)?;
 
     // Step 8: scoped non-generated file count + parser failures.
     let total_files = scoped_file_count(conn)?;
-    let parser_failures = crate::query::impact::parser_failure_count(conn)?;
+    let parser_failures = rag_rat_query::impact::parser_failure_count(conn)?;
 
     Ok(Orientation {
         tree,

@@ -9,7 +9,7 @@ use super::*;
 /// lazily heals a zero-hit, so a test that asserted a symbol's ABSENCE could self-heal it into
 /// existence and pass vacuously. Every assertion below checks a symbol that SHOULD be present.
 fn symbol_present(db: &IndexDatabase, name: &str) -> bool {
-    let selector = crate::query::symbol::SymbolSelector {
+    let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,

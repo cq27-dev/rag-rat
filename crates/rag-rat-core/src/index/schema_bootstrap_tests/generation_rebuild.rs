@@ -740,7 +740,7 @@ fn a_memory_written_mid_rebuild_survives_the_flip_intact() {
         )
         .unwrap();
     let created = writer
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "interleave_anchor returns 777".to_string(),
             body: "Written mid-rebuild through the lockless path; must survive the flip."
@@ -750,7 +750,7 @@ fn a_memory_written_mid_rebuild_survives_the_flip_intact() {
             source: Some("agent".to_string()),
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 chunk_id: Some(live_chunk_id),
                 ..Default::default()
             },
@@ -840,7 +840,7 @@ fn repo_brief_edge_count_is_generation_scoped() {
          {live_edges}) — the very over-count the predicate exists to exclude"
     );
 
-    let counts = crate::query::repo_brief::summary_counts(conn).unwrap();
+    let counts = rag_rat_query::repo_brief::summary_counts(conn).unwrap();
     assert_eq!(
         counts.graph_edges, live_edges as u64,
         "summary_counts.graph_edges counts exactly the live generation's edges"
@@ -1489,10 +1489,10 @@ fn graph_traversal_summary_counts_match_the_live_rows_during_a_dead_generation_w
         .unwrap();
     assert!(dead_callee > 0, "the second rebuild leaves a dead generation's `callee` behind");
 
-    let options = crate::query::graph::GraphTraversalOptions::default();
+    let options = rag_rat_query::graph::GraphTraversalOptions::default();
     let rows = db.find_callers("callee", 50).unwrap();
     let summary =
-        crate::query::graph::traversal_summary(conn, "callee", true, 50, &options, rows.len())
+        rag_rat_query::graph::traversal_summary(conn, "callee", true, 50, &options, rows.len())
             .unwrap();
     assert_eq!(rows.len(), 1, "exactly one LIVE caller of callee");
     assert_eq!(
@@ -1504,7 +1504,7 @@ fn graph_traversal_summary_counts_match_the_live_rows_during_a_dead_generation_w
     );
     assert!(!summary.truncated, "a live result that fits the limit must not be marked truncated");
     assert!(
-        crate::query::graph::unique_symbol_name(conn, "callee").unwrap(),
+        rag_rat_query::graph::unique_symbol_name(conn, "callee").unwrap(),
         "unique_symbol_name must count only the live generation (batch 6): a dead-generation \
          duplicate would read count == 2, disable the short-name fallback, and suppress a live hop"
     );

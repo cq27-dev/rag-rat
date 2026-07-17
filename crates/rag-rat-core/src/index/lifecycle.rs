@@ -721,9 +721,9 @@ pub(crate) struct ScopeContext {
 /// TEST-ONLY now: the raw-conn hook listeners resolve the repo id explicitly from their config and
 /// pass it into [`install_worktree_scope_view`], so only the graph tests (which seed rows under the
 /// sole/placeholder repo) reach this config-blind resolver. `IndexDatabase::set_context` likewise
-/// passes an explicit repo id (the multi-repo path).
-#[cfg(test)]
-pub(crate) fn install_scope_view(
+/// passes an explicit repo id (the multi-repo path). Not `#[cfg(test)]`: the read-layer crate's
+/// tests consume it through the dev-dependency, and the gate does not propagate cross-crate.
+pub fn install_scope_view(
     conn: &rusqlite::Connection,
     commit_sha: &str,
     worktree_id: &str,

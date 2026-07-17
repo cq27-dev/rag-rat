@@ -288,7 +288,7 @@ pub(crate) fn reconcile_with_options_progress(
     // One dict decoder for the whole run: each `select_reconcile_batch` loads text for its batch
     // from the compressed `chunk_text` store (#77 Phase 2), and reusing this decoder keeps the dict
     // SELECT + dictionary prep to once per run rather than once per batch.
-    let dicts = crate::query::chunk_text_dicts(conn)?;
+    let dicts = rag_rat_query::chunk_text_dicts(conn)?;
     let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
     let mut cursor = 0usize;
     let mut processed_ids: HashSet<i64> = HashSet::new();

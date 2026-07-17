@@ -18,6 +18,7 @@
 //! entry-envelope / stream-identity freezes that preceded it.
 
 use anyhow::Context;
+use rag_rat_query::memory::EdgeRelation;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +31,6 @@ use super::op::{
 };
 use super::project::{self, ProjectedEdge, ProjectedNode, ProjectedState};
 use super::stream::StreamId;
-use crate::query::memory::EdgeRelation;
 
 /// Bump when the fold's projectable set or LWW semantics change (a new op kind becomes `Known`, a
 /// register is added). A shadow projection stamped with an older version is re-folded on demand

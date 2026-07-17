@@ -148,8 +148,9 @@ pub(crate) fn project(entries: &[Entry]) -> ProjectedState {
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_query::memory::EdgeRelation;
+
     use super::*;
-    use crate::query::memory::EdgeRelation;
 
     fn device(byte: u8) -> super::super::op::DeviceFingerprint {
         super::super::op::DeviceFingerprint::from_bytes([byte; 32])

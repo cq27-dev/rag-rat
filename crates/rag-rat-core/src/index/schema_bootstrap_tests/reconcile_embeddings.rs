@@ -923,7 +923,7 @@ fn search_explain_reports_weighted_score_components() {
         + components.git
         + components.papertrail;
     // `score` is rounded to 4dp for display, so compare against the rounded component sum.
-    assert!((hits[0].score - crate::query::round_score(component_sum)).abs() < 1e-9);
+    assert!((hits[0].score - rag_rat_query::round_score(component_sum)).abs() < 1e-9);
     assert!(components.bm25 > 0.0);
     assert!(components.vector > 0.0);
     assert!(components.vector_note.is_none());
@@ -1147,7 +1147,7 @@ fn skip_summary_shared_parse_matches_per_chunk_text() {
 
     // Reference: the previous per-chunk FromText classification.
     let reference: BTreeMap<String, u64> = {
-        let dicts = crate::query::chunk_text_dicts(conn).unwrap();
+        let dicts = rag_rat_query::chunk_text_dicts(conn).unwrap();
         let mut decoder = ChunkTextDecoder::new(&dicts);
         let mut out = BTreeMap::new();
         let mut stmt = conn
@@ -1436,7 +1436,7 @@ fn reconcile_heals_an_op_log_ghost_in_an_idle_repo() {
     // Root the owner chain with a real authored memory — the realistic idle-repo precondition is a
     // repo that ALREADY has signed history when a ghost slips in (exercises the INCREMENTAL heal,
     // not genesis). Unanchored `Concept` per #465.
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Concept".to_string(),
         title: "seed concept".to_string(),
         body: "roots the owner chain".to_string(),
@@ -1445,7 +1445,7 @@ fn reconcile_heals_an_op_log_ghost_in_an_idle_repo() {
         source: Some("agent".to_string()),
         tags: vec![],
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget::default(),
+        bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
     })
     .unwrap();
 

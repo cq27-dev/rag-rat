@@ -290,3 +290,30 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod registry_tests {
+    use std::collections::HashSet;
+
+    use super::all_symbol_kinds;
+
+    /// The class tripwire (#635): EVERY symbol kind any language backend can emit must carry an
+    /// explicit rank. Driven off `languages::all_symbol_kinds()` — the backends' own declaration —
+    /// so registering a language with a new kind (a Swift `protocol`, a C++ `namespace`) reddens
+    /// HERE, at the point the ranking would silently dump it into the unknown bucket, instead of
+    /// shipping a lookup that sorts it below `impl`. Ranking is a downstream consumer of the
+    /// language registry; this is what keeps the two from drifting.
+    #[test]
+    fn symbol_kind_rank_covers_every_indexed_kind() {
+        let ranked: HashSet<&str> =
+            rag_rat_query::symbol::SYMBOL_KIND_RANK.iter().map(|(kind, _)| *kind).collect();
+        let unranked: Vec<&str> =
+            all_symbol_kinds().into_iter().filter(|kind| !ranked.contains(kind)).collect();
+        assert!(
+            unranked.is_empty(),
+            "symbol kinds emitted by a language backend but never ranked in \
+             rag_rat_query::symbol::SYMBOL_KIND_RANK (they would sort into the unknown bucket, \
+             below `impl`): {unranked:?}"
+        );
+    }
+}

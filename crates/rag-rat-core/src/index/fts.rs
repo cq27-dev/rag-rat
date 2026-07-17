@@ -61,7 +61,7 @@ impl IndexDatabase {
         // 'delete-all' is the FTS5 command to clear a contentless index (a bare DELETE is
         // unsupported; on an external-content table it also corrupts a desynced index — #51).
         conn.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('delete-all')", [])?;
-        let dicts = crate::query::chunk_text_dicts(conn)?;
+        let dicts = rag_rat_query::chunk_text_dicts(conn)?;
         let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
         // Collect (rowid, ChunkTextRow) first: decompress's anyhow::Result can't cross the rusqlite
         // closure, and the SELECT statement can't stay open while we INSERT into chunk_fts.
@@ -216,7 +216,7 @@ impl IndexDatabase {
             self.rebuild_fts()?;
             Vec::new()
         };
-        crate::query::memory::heal_repo_memory_fts(conn)?;
+        rag_rat_query::memory::heal_repo_memory_fts(conn)?;
         rag_rat_papertrail::rebuild_fts(conn)?;
         fence.commit()?;
         Ok(deferred)
@@ -275,7 +275,7 @@ impl IndexDatabase {
             }
         }
         if memory_corrupt {
-            crate::query::memory::heal_repo_memory_fts(conn)?;
+            rag_rat_query::memory::heal_repo_memory_fts(conn)?;
             outcome.healed.push("repo_memory_fts".to_string());
         }
         if papertrail_corrupt {

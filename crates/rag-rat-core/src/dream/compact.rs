@@ -20,17 +20,16 @@
 //! derived, regenerable data.
 
 use rag_rat_db::schema;
+/// The compaction prompt version, stamped into `memory_summaries.prompt_version`. Bump on any
+/// change to [`COMPACT_PROMPT_HEAD`] so a stale-prompt summary is distinguishable (and can be
+/// regenerated).
+pub(crate) use rag_rat_query::memory::evidence::COMPACT_PROMPT_VERSION;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::failure::{
     self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, RecordFailure,
 };
 use super::model::VerdictModel;
-
-/// The compaction prompt version, stamped into `memory_summaries.prompt_version`. Bump on any
-/// change to [`COMPACT_PROMPT_HEAD`] so a stale-prompt summary is distinguishable (and can be
-/// regenerated).
-pub(crate) const COMPACT_PROMPT_VERSION: &str = "compact-v1";
 
 /// The compaction-pass configuration handed to [`run_compact_pass`]: the model to ask and how many
 /// queued memories it may compact this run. Mirrors [`super::VerdictPass`] — a borrowed model + a
@@ -701,7 +700,8 @@ mod tests {
         let c = mem_db();
         set_repo(&c, "r");
         seed_memory(&c, "m1", "note", "a body worth compacting", "r");
-        let content_hash = crate::dream::note_content_hash("note", "a body worth compacting");
+        let content_hash =
+            rag_rat_query::memory::evidence::note_content_hash("note", "a body worth compacting");
         let stamp = FailureStamp {
             memory_id: "m1",
             repo_id: "r",
@@ -765,7 +765,10 @@ mod tests {
         assert_eq!(row.0, GOOD_SUMMARY);
         assert_eq!(row.1, "mock-verdict-model");
         assert_eq!(row.2, COMPACT_PROMPT_VERSION);
-        assert_eq!(row.3, crate::dream::note_content_hash("note", "a body worth compacting"));
+        assert_eq!(
+            row.3,
+            rag_rat_query::memory::evidence::note_content_hash("note", "a body worth compacting")
+        );
         assert_eq!(row.4, 7000);
     }
 
@@ -811,7 +814,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "steady state is one summary row per memory (old body pruned)");
         assert_eq!(
             rows[0].0,
-            crate::dream::note_content_hash("note", "edited body"),
+            rag_rat_query::memory::evidence::note_content_hash("note", "edited body"),
             "the row is the new note's"
         );
     }

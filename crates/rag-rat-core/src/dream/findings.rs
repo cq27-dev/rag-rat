@@ -5,13 +5,13 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rag_rat_query::pagerank::{self, ImportanceOptions};
 use regex::Regex;
 use rusqlite::Connection;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::DreamFinding;
-use crate::query::pagerank::{self, ImportanceOptions};
 
 /// Ranking pool `coverage_gap` pulls from [`pagerank::important_symbols`] before filtering out
 /// memory-covered / test-infra rows. Sized like the ranker's own `MAX_RESULTS` cap so a repo whose
@@ -1054,6 +1054,504 @@ mod tests {
             rag_rat_db::storage::is_busy(&anyhow::Error::new(err)),
             "an empty sync under a concurrently-held writer must fail busy — proving BEGIN \
              IMMEDIATE, not DEFERRED (which would do no writes and silently succeed)"
+        );
+    }
+}
+
+pub(super) fn unverifiable_findings(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
+    use rag_rat_db::schema;
+    use rag_rat_query::memory::evidence::{
+        any_identifier_resolves, extract_identifiers, indexed_file_paths, memory_has_any_binding,
+        memory_has_live_binding,
+    };
+
+    let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
+    let mem_clause = schema::periphery_repo_scope_clause(&scope, "repo_memories");
+    let file_paths = indexed_file_paths(conn)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, kind, title, body FROM repo_memories WHERE status = 'active'{mem_clause} \
+         ORDER BY id"
+    ))?;
+    let mems: Vec<(String, String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut out = Vec::new();
+    for (memory_id, kind, title, body) in mems {
+        // Intentional UNANCHORED node (#463/#465): a `Task`/`Concept` legitimately has no code
+        // anchor, so a zero-binding one is NOT "unverifiable". A zero-binding memory of any OTHER
+        // kind is an orphan (all should-be-anchored) and is still flagged below, as is any memory
+        // whose bindings all went `gone` (≥1 row, none live).
+        if rag_rat_query::memory::is_polymorphic_node_kind(&kind)
+            && !memory_has_any_binding(conn, &memory_id, &scope)?
+        {
+            continue;
+        }
+        if memory_has_live_binding(conn, &memory_id, &scope)? {
+            continue;
+        }
+        let identifiers = extract_identifiers(&title, &body);
+        if any_identifier_resolves(conn, &identifiers, &file_paths)? {
+            continue;
+        }
+        let named = if identifiers.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", identifiers.join(", "))
+        };
+        out.push(DreamFinding {
+            kind: "memory_unverifiable".into(),
+            subject: memory_id,
+            evidence: format!(
+                "no live binding and none of {} identifier(s) resolve in the index{named} [E0]",
+                identifiers.len(),
+            ),
+            rank: 0.9,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod evidence_dream_tests {
+    //! Dream-pass behavior over the evidence queue (moved with the read-layer split: these
+    //! exercise `model_work_pending` / queue terminal rows / findings, which live HERE, driven
+    //! through `rag_rat_query::memory::evidence`).
+    use rag_rat_query::memory::evidence::{
+        VerificationReason, checked_inputs_hash, evidence_pack, note_content_hash,
+        verification_queue,
+    };
+    use rusqlite::Connection;
+
+    use crate::dream::tests::{mem_db, set_repo};
+
+    fn content_hash(title: &str, body: &str) -> String {
+        note_content_hash(title, body)
+    }
+
+    /// Seed an active memory under the connection's active repo. Returns its id.
+    fn seed_memory(c: &Connection, id: &str, title: &str, body: &str, repo_id: &str) {
+        c.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
+             (?1,'Invariant',?2,?3,'high','active','agent',1,1,'agent','v1',?4)",
+            rusqlite::params![id, title, body, repo_id],
+        )
+        .unwrap();
+    }
+
+    /// Seed an active memory of an explicit `kind` (for the #465 Task/Concept cases).
+    fn seed_memory_kind(c: &Connection, id: &str, kind: &str, title: &str, body: &str, repo: &str) {
+        c.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
+             (?1,?2,?3,?4,'high','active','agent',1,1,'agent','v1',?5)",
+            rusqlite::params![id, kind, title, body, repo],
+        )
+        .unwrap();
+    }
+
+    /// Seed a file + one chunk carrying `text`, under `repo_id`. Returns the file id.
+    fn seed_file(c: &Connection, path: &str, text: &str, repo_id: &str) -> i64 {
+        c.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, repo_id, generation) VALUES \
+             (?1,'rust','source',?2,0,0,'','',?3,0)",
+            rusqlite::params![path, format!("sha-{path}"), repo_id],
+        )
+        .unwrap();
+        let file_id = c.last_insert_rowid();
+        let line_count = text.split('\n').count() as i64;
+        c.execute(
+            "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \
+             text_hash) VALUES (?1,'code',0,0,1,?2,'th')",
+            rusqlite::params![file_id, line_count],
+        )
+        .unwrap();
+        let chunk_id = c.last_insert_rowid();
+        rag_rat_db::chunk_text_store::seed_chunk_text(c, chunk_id, text).unwrap();
+        // Mirror production: the chunk is FTS-searchable, so `resolve_identifier`'s verbatim-text
+        // tier can narrow to it (`seed_chunk_text` alone populates only `chunk_text`).
+        c.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", rusqlite::params![
+            chunk_id, text
+        ])
+        .unwrap();
+        file_id
+    }
+
+    /// #465: dream-verify excuses an intentional unanchored node (a zero-binding `Task`/`Concept`)
+    /// from `memory_unverifiable`, but still flags a zero-binding ORPHAN of a should-be-anchored
+    /// kind and a memory whose bindings all went `gone`.
+    #[test]
+    fn unverifiable_excuses_unanchored_task_concept_but_flags_orphans() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        // Zero-binding Concept + Task — intentional unanchored nodes; must NOT be flagged.
+        seed_memory_kind(
+            &c,
+            "concept",
+            "Concept",
+            "event log over polling",
+            "prose, no anchor",
+            "r",
+        );
+        seed_memory_kind(&c, "task", "Task", "do the thing", "prose, no anchor", "r");
+        // Zero-binding Invariant — an orphan of a should-be-anchored kind; MUST be flagged.
+        seed_memory(&c, "orphan", "gone note", "refs `no_such_symbol_xyz`", "r");
+        // A gone-binding memory — broken; MUST be flagged.
+        seed_memory(&c, "broken", "another", "refs `also_missing_xyz`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, anchor_status, \
+             created_at_ms, repo_id) VALUES ('broken','symbol','old','gone',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let subjects: Vec<String> =
+            super::unverifiable_findings(&c).unwrap().into_iter().map(|f| f.subject).collect();
+        assert!(!subjects.iter().any(|s| s == "concept"), "unanchored Concept excused");
+        assert!(!subjects.iter().any(|s| s == "task"), "unanchored Task excused");
+        assert!(
+            subjects.iter().any(|s| s == "orphan"),
+            "a zero-binding orphan of a normal kind is still flagged"
+        );
+        assert!(subjects.iter().any(|s| s == "broken"), "an all-gone memory is still flagged");
+    }
+
+    #[test]
+    fn model_work_pending_is_citability_aware_for_verify() {
+        // The ephemeral zero-work guard. VERIFY counts only CITABLE entries — an uncitable
+        // prose-only / all-NOT_FOUND memory records a terminal row WITHOUT a model call, so
+        // it is zero model work and must NOT cold-start a paid box (PR #438 review).
+        // COMPACT counts the whole queue (every memory is summarized). Neither flag → never
+        // pending.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let opts = crate::dream::DreamOptions {
+            now_ms: 1,
+            limit: 10,
+            verify: true,
+            include_reviewed: false,
+        };
+        assert!(
+            !crate::dream::model_work_pending(&c, opts, 10, true, true, "mock-verdict-model")
+                .unwrap(),
+            "empty repo → no work"
+        );
+
+        // An UNCITABLE prose-only memory (no identifiers, no bindings): verify is NOT model work,
+        // but compaction WILL summarize it.
+        seed_memory(&c, "m1", "t", "a prose note with no identifiers", "r");
+        assert!(
+            !crate::dream::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model")
+                .unwrap(),
+            "an all-uncitable verify queue is NOT model work — never cold-start a box for it"
+        );
+        assert!(
+            crate::dream::model_work_pending(&c, opts, 10, false, true, "mock-verdict-model")
+                .unwrap(),
+            "the same memory IS compact-pending (compaction has no uncitable short-circuit)"
+        );
+
+        // A CITABLE memory whose identifier resolves to a real symbol → verify IS model work.
+        let fid = seed_file(&c, "src/x.rs", "fn f() {}\n", "r");
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','resolve_marker_token','function',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        seed_memory(&c, "m2", "t", "a note about `resolve_marker_token`", "r");
+        assert!(
+            crate::dream::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model")
+                .unwrap(),
+            "a citable never-checked memory is verify-pending"
+        );
+        assert!(
+            !crate::dream::model_work_pending(&c, opts, 0, true, false, "mock-verdict-model")
+                .unwrap(),
+            "budget zero stops before considering the citable verify entry"
+        );
+        let inputs = checked_inputs_hash(&c, "m2", &Some("r".to_string())).unwrap();
+        let content_hash = content_hash("t", "a note about `resolve_marker_token`");
+        let stamp = crate::dream::failure::FailureStamp {
+            memory_id: "m2",
+            repo_id: "r",
+            pass: crate::dream::failure::DreamModelPass::Verify,
+            content_hash: &content_hash,
+            checked_inputs_hash: Some(&inputs),
+            prompt_version: crate::dream::verdict::PROMPT_VERSION,
+            model_id: "mock-verdict-model",
+        };
+        let failed = crate::dream::failure::DreamModelFailure::new(
+            crate::dream::failure::DreamFailureReason::FabricatedEvidence,
+        );
+        crate::dream::failure::record_failure(&c, crate::dream::failure::RecordFailure {
+            stamp,
+            failure: &failed,
+            now_ms: 2,
+        })
+        .unwrap();
+        assert!(
+            !crate::dream::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model")
+                .unwrap(),
+            "a current deterministic failure is annotated work, not pending model work"
+        );
+
+        assert!(
+            !crate::dream::model_work_pending(&c, opts, 10, false, false, "mock-verdict-model")
+                .unwrap(),
+            "neither flag → never pending"
+        );
+    }
+
+    #[test]
+    fn queue_enqueues_anchor_gone_and_skips_a_verified_unchanged_memory() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a plain note", "r");
+        // A gone binding puts m1 in the doctor population → enqueued.
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, anchor_status, \
+             created_at_ms, repo_id) VALUES ('m1','symbol','foo','gone',0,'r')",
+            [],
+        )
+        .unwrap();
+        let q = verification_queue(&c, 1000, 10).unwrap();
+        assert_eq!(q.len(), 1, "the anchor-gone memory is enqueued");
+        assert_eq!(q[0].reason, VerificationReason::AnchorBroken);
+
+        // Record a matching reality row (as the verdict pass would) AND heal the anchor: now
+        // nothing is stale/gone and the body/inputs match → churn-skip on the second run.
+        c.execute(
+            "UPDATE repo_memory_bindings SET anchor_status = 'current' WHERE memory_id='m1'",
+            [],
+        )
+        .unwrap();
+        let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_inputs_hash, \
+             prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
+            rusqlite::params![
+                content_hash("t", "a plain note"),
+                inputs,
+                crate::dream::verdict::PROMPT_VERSION
+            ],
+        )
+        .unwrap();
+        let q = verification_queue(&c, 2000, 10).unwrap();
+        assert!(q.is_empty(), "a verified + unchanged memory is churn-skipped: {q:?}");
+    }
+
+    #[test]
+    fn queue_records_a_terminal_row_for_an_uncitable_memory_so_it_stops_re_queuing() {
+        // Regression (PR #428): a prose-only memory with no identifiers / excerpts yields
+        // an uncitable pack; the verdict pass must record a terminal (verdict-less) row so
+        // it churn-skips instead of consuming a budget slot forever.
+        use crate::dream::model::mock::MockVerdictModel;
+        use crate::dream::{VerdictPass, verdict};
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "note", "just prose, nothing to resolve", "r");
+        assert!(!evidence_pack(&c, "m1").unwrap().is_citable(), "the pack is uncitable");
+
+        // A model with NO queued responses panics if `complete` is called — proving the uncitable
+        // memory is handled deterministically and never reaches the model.
+        let model = MockVerdictModel::new(Vec::<String>::new());
+        verdict::run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 1000).unwrap();
+        assert_eq!(model.calls(), 0, "the uncitable memory never calls the model");
+        let (verdict_val, pv): (Option<String>, Option<String>) = c
+            .query_row(
+                "SELECT verdict, prompt_version FROM memory_reality WHERE memory_id='m1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(verdict_val, None, "the terminal row has no verdict");
+        assert_eq!(pv.as_deref(), Some(verdict::PROMPT_VERSION), "stamped with the current prompt");
+
+        // Second run: unchanged → churn-skipped (empty queue), so it never re-consumes budget.
+        assert!(
+            verification_queue(&c, 2000, 10).unwrap().is_empty(),
+            "the uncitable memory churn-skips after its terminal row"
+        );
+    }
+
+    #[test]
+    fn queue_skips_a_broken_anchor_with_matching_hashes_so_it_never_starves_never_checked() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        // m1: a GONE binding (broken anchor) BUT a stored reality row whose content_hash + inputs
+        // still match — the verdict stands, so it must churn-skip REGARDLESS of the broken anchor.
+        // The pre-fix bug re-enqueued a broken anchor every run at the top AnchorBroken rank,
+        // starving the never-checked memories below it. Anchor breakage is surfaced by `memory
+        // doctor` and the unverifiable/divergence findings, not by re-checking an unchanged note.
+        seed_memory(&c, "m1", "t", "a plain note", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, anchor_status, \
+             created_at_ms, repo_id) VALUES ('m1','symbol','foo','gone',0,'r')",
+            [],
+        )
+        .unwrap();
+        let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_inputs_hash, \
+             prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
+            rusqlite::params![
+                content_hash("t", "a plain note"),
+                inputs,
+                crate::dream::verdict::PROMPT_VERSION
+            ],
+        )
+        .unwrap();
+        // Two never-checked memories that must still get slots.
+        seed_memory(&c, "m2", "t", "never checked one", "r");
+        seed_memory(&c, "m3", "t", "never checked two", "r");
+
+        let q = verification_queue(&c, 1000, 10).unwrap();
+        let ids: Vec<&str> = q.iter().map(|e| e.memory_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"m1"),
+            "the unchanged broken-anchor memory is churn-skipped, not re-enqueued: {q:?}"
+        );
+        assert_eq!(ids, vec!["m2", "m3"], "the never-checked memories get slots (not starved)");
+        assert!(
+            q.iter().all(|e| e.reason == VerificationReason::NeverChecked),
+            "only never-checked reasons remain in the queue: {q:?}"
+        );
+    }
+
+    #[test]
+    fn queue_re_enqueues_on_body_edit_and_on_bound_file_sha_change() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn a() {}\n", "r");
+        seed_memory(&c, "m1", "t", "note about src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/lib.rs','src/lib.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_inputs_hash, \
+             prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
+            rusqlite::params![
+                content_hash("t", "note about src/lib.rs"),
+                inputs,
+                crate::dream::verdict::PROMPT_VERSION
+            ],
+        )
+        .unwrap();
+        assert!(
+            verification_queue(&c, 1, 10).unwrap().is_empty(),
+            "baseline: verified + unchanged"
+        );
+
+        // Body edit → content_hash mismatch re-enqueues.
+        c.execute("UPDATE repo_memories SET body = 'a rewritten note' WHERE id='m1'", []).unwrap();
+        let q = verification_queue(&c, 1, 10).unwrap();
+        assert_eq!(q.iter().map(|e| e.reason).collect::<Vec<_>>(), vec![
+            VerificationReason::ContentChanged
+        ]);
+
+        // Restore the body, change the bound file's sha → checked_inputs_hash mismatch re-enqueues.
+        c.execute("UPDATE repo_memories SET body = 'note about src/lib.rs' WHERE id='m1'", [])
+            .unwrap();
+        c.execute("UPDATE main.files SET sha256 = 'sha-CHANGED' WHERE path='src/lib.rs'", [])
+            .unwrap();
+        let q = verification_queue(&c, 1, 10).unwrap();
+        assert_eq!(q.iter().map(|e| e.reason).collect::<Vec<_>>(), vec![
+            VerificationReason::InputsChanged
+        ]);
+    }
+
+    #[test]
+    fn queue_re_enqueues_on_title_only_edit() {
+        // Regression (PR #428): the verdict prompt audits TITLE + body, so the
+        // content_hash covers the title — a title-only edit must re-queue even when the
+        // body is unchanged.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "original title", "a stable body", "r");
+        let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_inputs_hash, \
+             prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
+            rusqlite::params![
+                content_hash("original title", "a stable body"),
+                inputs,
+                crate::dream::verdict::PROMPT_VERSION
+            ],
+        )
+        .unwrap();
+        assert!(
+            verification_queue(&c, 1, 10).unwrap().is_empty(),
+            "baseline: verified + unchanged"
+        );
+
+        c.execute("UPDATE repo_memories SET title = 'a corrected title' WHERE id='m1'", [])
+            .unwrap();
+        let q = verification_queue(&c, 1, 10).unwrap();
+        assert_eq!(q.iter().map(|e| e.reason).collect::<Vec<_>>(), vec![
+            VerificationReason::ContentChanged
+        ]);
+    }
+    #[test]
+    fn a_note_citing_a_present_table_name_is_not_unverifiable() {
+        // The `memory_unverifiable` gate now counts verbatim-text presence as "resolves", so a
+        // binding-less note that names a real DB table (present only as source text) is NOT flagged
+        // unverifiable — while a note whose only identifier is genuinely absent still is.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/schema.rs", "conn.execute(\"CREATE TABLE commit_fts(id)\");\n", "r");
+        seed_memory(&c, "present", "t", "the `commit_fts` table stores the FTS mirror", "r");
+        seed_memory(&c, "absent", "t", "the `no_such_table_at_all` thing", "r");
+        let flagged: Vec<String> =
+            super::unverifiable_findings(&c).unwrap().into_iter().map(|f| f.subject).collect();
+        assert!(
+            !flagged.contains(&"present".to_string()),
+            "text-present note resolves: {flagged:?}"
+        );
+        assert!(
+            flagged.contains(&"absent".to_string()),
+            "absent-only note is unverifiable: {flagged:?}"
+        );
+    }
+
+    #[test]
+    fn unverifiable_when_no_live_binding_and_zero_identifiers_resolve() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        // m1: no binding, no resolvable identifier → unverifiable.
+        seed_memory(&c, "m1", "t", "a purely prose note with no code refs", "r");
+        // m2: no binding but a resolvable identifier → NOT unverifiable.
+        seed_file(&c, "src/lib.rs", "fn resolvable_thing() {}\n", "r");
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) SELECT id, \
+             'rust', 'resolvable_thing', 'function', 0, 0 FROM main.files WHERE path = \
+             'src/lib.rs'",
+            [],
+        )
+        .unwrap();
+        seed_memory(&c, "m2", "t", "refs `resolvable_thing`", "r");
+        // m3: a live binding → NOT unverifiable even with no resolvable identifier.
+        seed_memory(&c, "m3", "t", "prose", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, anchor_status, \
+             created_at_ms, repo_id) VALUES ('m3','symbol','foo','current',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let subjects: Vec<String> =
+            super::unverifiable_findings(&c).unwrap().into_iter().map(|f| f.subject).collect();
+        assert_eq!(
+            subjects,
+            vec!["m1".to_string()],
+            "only the truly unverifiable memory is flagged"
         );
     }
 }

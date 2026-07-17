@@ -132,28 +132,25 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
 // Each `memory rebind` target sets one anchor field and defaults the rest, so the call sites
 // below state only what differs.
 fn symbol_bind_target(
-    hit: &rag_rat_core::query::symbol::SymbolHit,
-) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
-    rag_rat_core::query::memory::RepoMemoryBindTarget {
+    hit: &rag_rat_query::symbol::SymbolHit,
+) -> rag_rat_query::memory::RepoMemoryBindTarget {
+    rag_rat_query::memory::RepoMemoryBindTarget {
         symbol_id: Some(hit.symbol_id),
         logical_symbol_id: hit.logical_symbol_id,
         ..Default::default()
     }
 }
 
-fn path_bind_target(path: String) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
-    rag_rat_core::query::memory::RepoMemoryBindTarget { path: Some(path), ..Default::default() }
+fn path_bind_target(path: String) -> rag_rat_query::memory::RepoMemoryBindTarget {
+    rag_rat_query::memory::RepoMemoryBindTarget { path: Some(path), ..Default::default() }
 }
 
-fn dir_bind_target(dir: String) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
-    rag_rat_core::query::memory::RepoMemoryBindTarget { dir: Some(dir), ..Default::default() }
+fn dir_bind_target(dir: String) -> rag_rat_query::memory::RepoMemoryBindTarget {
+    rag_rat_query::memory::RepoMemoryBindTarget { dir: Some(dir), ..Default::default() }
 }
 
-fn chunk_bind_target(chunk_id: i64) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
-    rag_rat_core::query::memory::RepoMemoryBindTarget {
-        chunk_id: Some(chunk_id),
-        ..Default::default()
-    }
+fn chunk_bind_target(chunk_id: i64) -> rag_rat_query::memory::RepoMemoryBindTarget {
+    rag_rat_query::memory::RepoMemoryBindTarget { chunk_id: Some(chunk_id), ..Default::default() }
 }
 
 pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
@@ -220,7 +217,7 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
         MemoryCommand::Rebind { memory_id, symbol, symbol_path, symbol_id, path, chunk, dir } => {
             let db = open_index(config)?;
             let bind = if symbol.is_some() || symbol_path.is_some() || symbol_id.is_some() {
-                let selector = rag_rat_core::query::symbol::SymbolSelector {
+                let selector = rag_rat_query::symbol::SymbolSelector {
                     logical_symbol_id: None,
                     symbol_id: *symbol_id,
                     symbol_path: symbol_path.clone(),

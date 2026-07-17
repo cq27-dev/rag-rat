@@ -4,11 +4,12 @@
 //! `git_file_changes` on a raw connection. The generated / existence filter and the dedup are
 //! READ-time (`coupled_files_for_path`), so the read-level and integration tests also seed `files`.
 
+use rag_rat_query::coupling::coupled_files_for_path;
 use rusqlite::{Connection, params};
 
 use super::*;
 use crate::index::change_coupling::{
-    COUPLING_WINDOW_COMMITS, coupled_files_for_path, ensure_coupling_fresh, recompute_couplings,
+    COUPLING_WINDOW_COMMITS, ensure_coupling_fresh, recompute_couplings,
 };
 
 /// The active repo id a fresh `schema::apply` connection resolves to (the legacy placeholder), used
@@ -713,7 +714,7 @@ fn impact_report_surfaces_and_gates_coupling_section() {
     add_commit(conn, &repo_id, "c3", 30, &["ext_a.rs", "ext_b.rs"]);
     add_commit(conn, &repo_id, "c4", 40, &["ext_c.rs", "ext_d.rs"]);
 
-    let selector = crate::query::symbol::SymbolSelector {
+    let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -729,7 +730,7 @@ fn impact_report_surfaces_and_gates_coupling_section() {
         .impact_surface_report_for_selected_symbol(
             &symbol,
             50,
-            &crate::query::impact::ImpactSurfaceOptions::default(),
+            &rag_rat_query::impact::ImpactSurfaceOptions::default(),
         )
         .unwrap();
     let coupled = &report.files_co_changed_with_symbol_path;
@@ -739,7 +740,7 @@ fn impact_report_surfaces_and_gates_coupling_section() {
 
     // include_git off: the section is empty (and no recompute is triggered on that path).
     let git_off =
-        crate::query::impact::ImpactSurfaceOptions { include_git: false, ..Default::default() };
+        rag_rat_query::impact::ImpactSurfaceOptions { include_git: false, ..Default::default() };
     let report_off = db.impact_surface_report_for_selected_symbol(&symbol, 50, &git_off).unwrap();
     assert!(
         report_off.files_co_changed_with_symbol_path.is_empty(),
@@ -786,7 +787,7 @@ fn dirty_co_changed_file_counts_toward_stale_files() {
     // Dirty the coupled file on disk AFTER indexing — its content hash now differs from the index.
     fs::write(root.join("src/helper.rs"), "pub fn helper_fn() { let _changed = 1; }\n").unwrap();
 
-    let selector = crate::query::symbol::SymbolSelector {
+    let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -800,7 +801,7 @@ fn dirty_co_changed_file_counts_toward_stale_files() {
         .impact_surface_report_for_selected_symbol(
             &symbol,
             50,
-            &crate::query::impact::ImpactSurfaceOptions::default(),
+            &rag_rat_query::impact::ImpactSurfaceOptions::default(),
         )
         .unwrap();
 

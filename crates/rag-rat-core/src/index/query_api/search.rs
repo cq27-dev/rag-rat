@@ -120,7 +120,7 @@ impl IndexDatabase {
 
     pub fn docs_for_selected_symbol(
         &self,
-        symbol: &crate::query::symbol::SymbolHit,
+        symbol: &rag_rat_query::symbol::SymbolHit,
         limit: u32,
     ) -> anyhow::Result<Vec<SearchHit>> {
         let mut hits = self.find_local_symbol_context_hits(symbol, limit)?;

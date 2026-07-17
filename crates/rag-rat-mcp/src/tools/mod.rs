@@ -13,14 +13,14 @@ use rag_rat_base::config::{Config, MemorySurface};
 use rag_rat_base::language::Language;
 use rag_rat_core::IndexDatabase;
 use rag_rat_core::query::clusters::RepoClustersOptions;
-use rag_rat_core::query::graph::{GraphResolutionMode, GraphTraversalOptions};
-use rag_rat_core::query::graph_meta::GraphMetaMode;
-use rag_rat_core::query::impact::ImpactSurfaceOptions;
-use rag_rat_core::query::memory::{RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryUpdate};
-use rag_rat_core::query::repo_brief::{RepoBriefMode, RepoBriefOptions};
-use rag_rat_core::query::symbol::SymbolSelector;
 use rag_rat_core::search::lexical::SearchOptions;
 use rag_rat_oracle::LibraryUsageOptions;
+use rag_rat_query::graph::{GraphResolutionMode, GraphTraversalOptions};
+use rag_rat_query::graph_meta::GraphMetaMode;
+use rag_rat_query::impact::ImpactSurfaceOptions;
+use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryUpdate};
+use rag_rat_query::repo_brief::{RepoBriefMode, RepoBriefOptions};
+use rag_rat_query::symbol::SymbolSelector;
 pub use requests::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -231,7 +231,7 @@ fn finalize_tool_result(config: &Config, name: &str, mut result: Value) -> anyho
     {
         obj.insert(
             "ranking_hint".to_string(),
-            serde_json::json!(rag_rat_core::query::pagerank::RANKING_HINT_AUTO_RUN),
+            serde_json::json!(rag_rat_query::pagerank::RANKING_HINT_AUTO_RUN),
         );
     }
     Ok(result)

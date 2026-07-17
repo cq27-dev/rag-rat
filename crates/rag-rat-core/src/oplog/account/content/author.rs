@@ -207,11 +207,11 @@ fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
 #[cfg(test)]
 mod tests {
     use rag_rat_db::schema;
+    use rag_rat_query::memory::EdgeRelation;
     use rusqlite::{Connection, TransactionBehavior};
 
     use super::*;
     use crate::oplog::op::{EdgeSpec, NodeContent, NodeId};
-    use crate::query::memory::EdgeRelation;
 
     const NOW: i64 = 1_700_000_000_000;
     const STREAM_A: [u8; 32] = [0x44; 32];

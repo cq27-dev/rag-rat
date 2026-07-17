@@ -80,7 +80,7 @@ fn memory_search_self_heals_fts_corruption() {
     fs::write(root.join("src/lib.rs"), "pub fn memoried_fn() {}\n").unwrap();
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: "corruption witness memory".to_string(),
         body: "Body of the corruption witness memory.".to_string(),
@@ -123,7 +123,7 @@ fn heal_index_probes_and_repairs_corrupt_fts() {
     fs::write(root.join("src/lib.rs"), "pub fn heal_probe_witness() {}\n").unwrap();
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: "heal probe memory".to_string(),
         body: "Body of the heal probe memory.".to_string(),

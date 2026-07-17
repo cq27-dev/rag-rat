@@ -111,7 +111,7 @@ pub(crate) fn for_each_embedding_candidate(
     );
     // One dict decoder for the whole stream (dict versions loaded once, reused per row). Loaded
     // BEFORE the candidate statement so no second query runs while that statement is mid-iteration.
-    let dicts = crate::query::chunk_text_dicts(conn)?;
+    let dicts = rag_rat_query::chunk_text_dicts(conn)?;
     let mut decoder = ChunkTextDecoder::new(&dicts);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(

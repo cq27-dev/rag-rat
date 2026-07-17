@@ -49,7 +49,7 @@ use common::{git, git_commit, unique_dir};
 use rag_rat_base::config::Config;
 use rag_rat_base::language::Language;
 use rag_rat_core::IndexDatabase;
-use rag_rat_core::query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
+use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
 
 /// A body with > `MIN_TOKENS` (20) normalized tokens so it fingerprints as a clone candidate and
 /// surfaces a real symbol row. Interpolates the fn name; the arithmetic is identical across names

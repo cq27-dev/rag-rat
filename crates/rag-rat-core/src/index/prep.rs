@@ -560,24 +560,25 @@ pub(crate) fn prepare_index_content_from_text(
     // codegen under a SOURCE target (`src/generated/*.rs`, `*.d.ts`) — those DO get symbols and
     // so used to get fingerprints. The arg is byte-identical to the `files.generated` INSERT
     // (file_index.rs), so the index skip and the read filter agree.
-    let symbol_fingerprints = if file_is_generated(kind, &path_string(relative_path)) {
-        Vec::new()
-    } else {
-        parsed
-            .as_ref()
-            .map(|p| {
-                let candidates: Vec<rag_rat_clones::FingerprintCandidate<'_>> = symbols
-                    .iter()
-                    .map(|s| rag_rat_clones::FingerprintCandidate {
-                        start_byte: s.start_byte,
-                        end_byte: s.end_byte,
-                        kind: &s.kind,
-                    })
-                    .collect();
-                clones::fingerprint_symbols(p.root(), text, language, &candidates)
-            })
-            .unwrap_or_default()
-    };
+    let symbol_fingerprints =
+        if rag_rat_base::path_class::file_is_generated(kind, &path_string(relative_path)) {
+            Vec::new()
+        } else {
+            parsed
+                .as_ref()
+                .map(|p| {
+                    let candidates: Vec<rag_rat_clones::FingerprintCandidate<'_>> = symbols
+                        .iter()
+                        .map(|s| rag_rat_clones::FingerprintCandidate {
+                            start_byte: s.start_byte,
+                            end_byte: s.end_byte,
+                            kind: &s.kind,
+                        })
+                        .collect();
+                    clones::fingerprint_symbols(p.root(), text, language, &candidates)
+                })
+                .unwrap_or_default()
+        };
 
     PreparedIndexContent {
         modified_at_ms,

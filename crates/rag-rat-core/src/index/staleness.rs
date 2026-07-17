@@ -30,7 +30,7 @@ impl IndexDatabase {
         pattern: &str,
         regex: &Regex,
         include_tests: bool,
-    ) -> anyhow::Result<Vec<crate::query::graph::TextOnlyHit>> {
+    ) -> anyhow::Result<Vec<rag_rat_query::graph::TextOnlyHit>> {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("cannot compare graph to text: source_root is missing from repo_meta");
         };
@@ -39,7 +39,7 @@ impl IndexDatabase {
             stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         let mut hits = Vec::new();
         for path in paths {
-            if !include_tests && crate::index::parser::is_test_path(&path) {
+            if !include_tests && rag_rat_base::path_class::is_test_path(&path) {
                 continue;
             }
             let full_path = root.join(&path);
@@ -48,7 +48,7 @@ impl IndexDatabase {
             };
             for (index, line) in text.lines().enumerate() {
                 if regex.is_match(line) {
-                    hits.push(crate::query::graph::TextOnlyHit {
+                    hits.push(rag_rat_query::graph::TextOnlyHit {
                         path: path.clone(),
                         line: i64::try_from(index + 1).unwrap_or(i64::MAX),
                         text: line.trim().to_string(),
@@ -121,7 +121,7 @@ impl IndexDatabase {
         // One dict decoder for the whole hit set: this loops `read_chunk` per hit, and the per-call
         // dict SELECT + dictionary prep is ~20x the decompress itself, so reusing it across the
         // batch keeps the healing-search check cheap (#77 Phase 2 read-path perf).
-        let dicts = crate::query::chunk_text_dicts(self.storage.connection())?;
+        let dicts = rag_rat_query::chunk_text_dicts(self.storage.connection())?;
         let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
         let mut stale = Vec::new();
         let mut seen = BTreeSet::new();
@@ -134,7 +134,7 @@ impl IndexDatabase {
                 stale.push(hit.path.clone());
                 continue;
             };
-            let chunk = crate::query::read_chunk_with(
+            let chunk = rag_rat_query::read_chunk_with(
                 self.storage.connection(),
                 hit.chunk_id,
                 &mut decoder,

@@ -151,7 +151,7 @@ fn oracle_run_from_scip_surfaces_compiler_tier() {
 
     // find_callers (reverse) surfaces the compiler tier on the matching edge.
     let callers = db
-        .find_callers_with_options("target", 50, &crate::query::graph::GraphTraversalOptions {
+        .find_callers_with_options("target", 50, &rag_rat_query::graph::GraphTraversalOptions {
             include_unresolved: true,
             ..Default::default()
         })
@@ -250,7 +250,7 @@ fn drifted_file_reverts_to_heuristic_display() {
         .unwrap();
 
     let callers = db
-        .find_callers_with_options("target", 50, &crate::query::graph::GraphTraversalOptions {
+        .find_callers_with_options("target", 50, &rag_rat_query::graph::GraphTraversalOptions {
             include_unresolved: true,
             ..Default::default()
         })
@@ -284,7 +284,7 @@ fn external_resolution_surfaces_resolved_external_label() {
     assert!(report.resolved_external >= 1, "expected resolved-external, got {report:?}");
 
     let callees = db
-        .trace_callees_with_options("caller", 50, &crate::query::graph::GraphTraversalOptions {
+        .trace_callees_with_options("caller", 50, &rag_rat_query::graph::GraphTraversalOptions {
             include_unresolved: true,
             ..Default::default()
         })
@@ -512,7 +512,7 @@ fn important_symbols_retargets_an_in_corpus_contradiction() {
     )
     .unwrap();
 
-    let score_of = |out: &[crate::query::pagerank::SymbolImportance], qn: &str| {
+    let score_of = |out: &[rag_rat_query::pagerank::SymbolImportance], qn: &str| {
         out.iter().find(|s| s.qualified_name == qn).map_or(0.0, |s| s.score)
     };
 
@@ -599,7 +599,7 @@ fn upgrade_hydrates_target_from_compiler_resolution() {
     assert!(report.upgraded >= 1, "expected an Upgrade, got {report:?}");
 
     let callees = db
-        .trace_callees_with_options("caller", 50, &crate::query::graph::GraphTraversalOptions {
+        .trace_callees_with_options("caller", 50, &rag_rat_query::graph::GraphTraversalOptions {
             include_unresolved: true,
             ..Default::default()
         })
@@ -694,7 +694,7 @@ fn compiler_upgrade_survives_heuristic_limit() {
     // limit = 1: heuristically the two Exact callers outrank the name-only one, so without the
     // overfetch+re-rank the compiler upgrade is dropped. With it, the compiler tier wins.
     let callers = db
-        .find_callers_with_options("pull", 1, &crate::query::graph::GraphTraversalOptions {
+        .find_callers_with_options("pull", 1, &rag_rat_query::graph::GraphTraversalOptions {
             include_unresolved: true,
             ..Default::default()
         })
@@ -785,12 +785,12 @@ fn resolved_external_label_extracts_package() {
 
 #[test]
 fn completeness_annotation_counts_externals_and_lists_packages() {
-    let mut summary = crate::query::graph::GraphTraversalSummary {
+    let mut summary = rag_rat_query::graph::GraphTraversalSummary {
         unresolved: 5,
         completeness_risk: "medium".to_string(),
         ..Default::default()
     };
-    let hop = |external: Option<&str>| crate::query::graph::GraphHop {
+    let hop = |external: Option<&str>| rag_rat_query::graph::GraphHop {
         edge_id: 0,
         from_symbol: None,
         to_symbol: None,
@@ -823,7 +823,7 @@ fn completeness_annotation_counts_externals_and_lists_packages() {
     );
 
     // No externals → the qualitative string is left untouched.
-    let mut bare = crate::query::graph::GraphTraversalSummary {
+    let mut bare = rag_rat_query::graph::GraphTraversalSummary {
         unresolved: 3,
         completeness_risk: "high".to_string(),
         ..Default::default()
@@ -872,7 +872,7 @@ fn git(root: &std::path::Path, args: &[&str]) {
 }
 
 /// Global (un-seeded) ranking — the common assertion shape: no explicit seed, no auto-diff.
-fn global_ranking(db: &IndexDatabase) -> Vec<crate::query::pagerank::SymbolImportance> {
+fn global_ranking(db: &IndexDatabase) -> Vec<rag_rat_query::pagerank::SymbolImportance> {
     db.important_symbols(ImportantSymbolsRequest {
         limit: 20,
         personalize: Vec::new(),
@@ -928,7 +928,7 @@ fn explicit_seed_resolves_names_and_skips_misses() {
         .unwrap();
     assert_eq!(result.mode.label(), "importance relative to your current changes");
     let seed = result.seed_source.expect("explicit seed reports provenance");
-    assert_eq!(seed.kind, crate::query::pagerank::SeedKind::Explicit);
+    assert_eq!(seed.kind, rag_rat_query::pagerank::SeedKind::Explicit);
     assert_eq!(seed.symbol_seed_count, 1, "only the real name seeded");
     assert_eq!(seed.skipped.no_symbols, 1, "the bogus name is skipped, not fatal");
     assert!(result.reason.is_none());
@@ -941,7 +941,7 @@ fn explicit_seed_resolves_names_and_skips_misses() {
         .connection()
         .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
         .unwrap();
-    let handle = crate::query::symbol::logical_for_symbol_id(db.storage.connection(), target_id)
+    let handle = rag_rat_query::symbol::logical_for_symbol_id(db.storage.connection(), target_id)
         .unwrap()
         .map(|logical| rag_rat_base::serde_big_id::format_sym_handle(logical.logical_symbol_id))
         .expect("the `target` symbol has a logical handle");
@@ -952,7 +952,7 @@ fn explicit_seed_resolves_names_and_skips_misses() {
             auto_seed_from_diff: false,
         })
         .unwrap();
-    assert_eq!(by_handle.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+    assert_eq!(by_handle.mode, rag_rat_query::pagerank::ImportanceMode::PersonalizedToChanges);
 
     // All-missing seed → global fall-through WITH a reason (never silent, never an error).
     let all_missing = db
@@ -962,7 +962,7 @@ fn explicit_seed_resolves_names_and_skips_misses() {
             auto_seed_from_diff: false,
         })
         .unwrap();
-    assert_eq!(all_missing.mode, crate::query::pagerank::ImportanceMode::Global);
+    assert_eq!(all_missing.mode, rag_rat_query::pagerank::ImportanceMode::Global);
     assert!(all_missing.reason.is_some(), "all-missing explicit seed reports why it's global");
     assert_eq!(all_missing.seed_source.unwrap().skipped.no_symbols, 2);
 
@@ -992,7 +992,7 @@ fn seed_resolving_only_to_isolated_symbols_is_labeled_global() {
         .unwrap();
     assert_eq!(
         result.mode,
-        crate::query::pagerank::ImportanceMode::Global,
+        rag_rat_query::pagerank::ImportanceMode::Global,
         "an isolated seed yields a global ranking, not a personalized one"
     );
     let seed = result.seed_source.expect("seed provenance is still reported");
@@ -1008,7 +1008,7 @@ fn seed_resolving_only_to_isolated_symbols_is_labeled_global() {
             auto_seed_from_diff: false,
         })
         .unwrap();
-    assert_eq!(connected.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+    assert_eq!(connected.mode, rag_rat_query::pagerank::ImportanceMode::PersonalizedToChanges);
     assert_eq!(connected.seed_source.unwrap().effective_seed_count, 1);
 
     let _ = fs::remove_dir_all(&root);
@@ -1031,7 +1031,7 @@ fn auto_seed_outside_a_git_worktree_falls_back_to_global() {
             auto_seed_from_diff: true,
         })
         .unwrap();
-    assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::Global);
+    assert_eq!(result.mode, rag_rat_query::pagerank::ImportanceMode::Global);
     assert!(!result.symbols.is_empty(), "the global ranking is still computed");
 
     let _ = fs::remove_dir_all(&root);
@@ -1071,9 +1071,9 @@ fn multi_match_name_seeds_all_in_scope_symbols() {
         })
         .unwrap();
     // PERSONALIZED, not global: the multi-match name resolved to multiple seeds.
-    assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+    assert_eq!(result.mode, rag_rat_query::pagerank::ImportanceMode::PersonalizedToChanges);
     let seed = result.seed_source.expect("reports provenance");
-    assert_eq!(seed.kind, crate::query::pagerank::SeedKind::Explicit);
+    assert_eq!(seed.kind, rag_rat_query::pagerank::SeedKind::Explicit);
     assert!(seed.symbol_seed_count >= 2, "all of the name's in-scope symbols are seeded: {seed:?}");
     assert_eq!(seed.skipped.no_symbols, 0, "a matched name is never counted as a miss");
     let _ = fs::remove_dir_all(&root);
@@ -1094,9 +1094,9 @@ fn auto_seed_from_diff_picks_changed_symbols() {
             auto_seed_from_diff: true,
         })
         .unwrap();
-    assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+    assert_eq!(result.mode, rag_rat_query::pagerank::ImportanceMode::PersonalizedToChanges);
     let seed = result.seed_source.expect("auto-seed reports provenance");
-    assert_eq!(seed.kind, crate::query::pagerank::SeedKind::GitDiff);
+    assert_eq!(seed.kind, rag_rat_query::pagerank::SeedKind::GitDiff);
     assert!(seed.indexed_paths >= 1, "the dirty indexed file counted: {seed:?}");
     assert!(seed.symbol_seed_count >= 1, "the changed file's symbol seeded: {seed:?}");
     let _ = fs::remove_dir_all(&root);
@@ -1126,7 +1126,7 @@ fn diff_without_symbols_falls_back_to_global_with_reason() {
             auto_seed_from_diff: true,
         })
         .unwrap();
-    assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::Global);
+    assert_eq!(result.mode, rag_rat_query::pagerank::ImportanceMode::Global);
     assert_eq!(result.reason.as_deref(), Some("no symbols found in current diff"));
     assert_eq!(result.diff_paths_with_symbols, Some(0));
     let seed = result.seed_source.expect("a fall-through still reports the diff it tried");
@@ -1225,7 +1225,7 @@ fn mcp_auto_seeds_but_cli_stays_global_on_a_nonempty_diff() {
         .unwrap();
     assert_eq!(
         mcp.mode,
-        crate::query::pagerank::ImportanceMode::PersonalizedToChanges,
+        rag_rat_query::pagerank::ImportanceMode::PersonalizedToChanges,
         "MCP no-personalize + non-empty diff ⇒ personalized"
     );
 
@@ -1239,7 +1239,7 @@ fn mcp_auto_seeds_but_cli_stays_global_on_a_nonempty_diff() {
         .unwrap();
     assert_eq!(
         cli.mode,
-        crate::query::pagerank::ImportanceMode::Global,
+        rag_rat_query::pagerank::ImportanceMode::Global,
         "CLI no-personalize ⇒ global, even with a non-empty diff"
     );
     assert!(cli.seed_source.is_none(), "CLI global carries no seed provenance");
@@ -1268,7 +1268,7 @@ fn find_callers_without_oracle_matches_heuristic_order() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // No oracle run at all: enrichment early-returns false, so no re-sort fires.
-    let opts = crate::query::graph::GraphTraversalOptions {
+    let opts = rag_rat_query::graph::GraphTraversalOptions {
         include_unresolved: true,
         ..Default::default()
     };
@@ -1278,7 +1278,7 @@ fn find_callers_without_oracle_matches_heuristic_order() {
     // The pre-oracle path: plain heuristic traversal at the SAME limit (what the oracle-aware
     // entry point must collapse to when there's nothing to enrich).
     let grouped = db.graph_options_with_logical_group(&opts).unwrap();
-    let heuristic = crate::query::graph::traverse_with_options(
+    let heuristic = rag_rat_query::graph::traverse_with_options(
         db.storage.connection(),
         "target",
         true,
@@ -1287,8 +1287,9 @@ fn find_callers_without_oracle_matches_heuristic_order() {
     )
     .unwrap();
 
-    let ids =
-        |hops: &[crate::query::graph::GraphHop]| hops.iter().map(|h| h.edge_id).collect::<Vec<_>>();
+    let ids = |hops: &[rag_rat_query::graph::GraphHop]| {
+        hops.iter().map(|h| h.edge_id).collect::<Vec<_>>()
+    };
     assert_eq!(
         ids(&via_oracle_path),
         ids(&heuristic),
@@ -1345,7 +1346,7 @@ fn oracle_surfaces_compiler_tier_on_a_real_git_checkout() {
     );
 
     let callees = db
-        .trace_callees_with_options("caller", 50, &crate::query::graph::GraphTraversalOptions {
+        .trace_callees_with_options("caller", 50, &rag_rat_query::graph::GraphTraversalOptions {
             include_unresolved: true,
             ..Default::default()
         })

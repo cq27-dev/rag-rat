@@ -3566,6 +3566,7 @@ dependencies = [
  "rag-rat-mcp",
  "rag-rat-oracle",
  "rag-rat-papertrail",
+ "rag-rat-query",
  "ratatui",
  "rusqlite",
  "serde",
@@ -3587,6 +3588,7 @@ dependencies = [
  "anyhow",
  "gix",
  "libc",
+ "minicbor",
  "path-slash",
  "serde",
  "serde_json",
@@ -3599,6 +3601,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -3645,6 +3648,7 @@ dependencies = [
  "rag-rat-llm",
  "rag-rat-oracle",
  "rag-rat-papertrail",
+ "rag-rat-query",
  "rayon",
  "regex",
  "reqwest",
@@ -3723,6 +3727,7 @@ dependencies = [
  "rag-rat-db",
  "rag-rat-oracle",
  "rag-rat-papertrail",
+ "rag-rat-query",
  "rmcp",
  "rusqlite",
  "schemars",
@@ -3768,6 +3773,25 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "rag-rat-query"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "minicbor",
+ "rag-rat-base",
+ "rag-rat-core",
+ "rag-rat-db",
+ "rag-rat-papertrail",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "strum",
+ "tempfile",
 ]
 
 [[package]]

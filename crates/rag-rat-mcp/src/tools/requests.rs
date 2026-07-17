@@ -870,8 +870,8 @@ fn edge_target_from_parts(
     node_repo_id: Option<&str>,
     github: (Option<&str>, Option<&str>, Option<i64>),
     node_field: &str,
-) -> anyhow::Result<rag_rat_core::query::memory::EdgeTarget> {
-    use rag_rat_core::query::memory::EdgeTarget;
+) -> anyhow::Result<rag_rat_query::memory::EdgeTarget> {
+    use rag_rat_query::memory::EdgeTarget;
     match (node_id, github) {
         (Some(node_id), (None, None, None)) => Ok(EdgeTarget::Node {
             repo_id: node_repo_id.map(str::to_string),
@@ -891,7 +891,7 @@ impl MemoryEdgeAddArgs {
         self.relation.as_str()
     }
 
-    pub(super) fn target(&self) -> anyhow::Result<rag_rat_core::query::memory::EdgeTarget> {
+    pub(super) fn target(&self) -> anyhow::Result<rag_rat_query::memory::EdgeTarget> {
         edge_target_from_parts(
             self.target_node_id.as_deref(),
             self.target_repo_id.as_deref(),
@@ -922,7 +922,7 @@ pub struct MemoryEdgesArgs {
 impl MemoryEdgesArgs {
     /// The reverse-traversal target for `direction=into` — a node id ignores its repo (the match is
     /// on the globally-unique anchor), or a full github ref.
-    pub(super) fn reverse_target(&self) -> anyhow::Result<rag_rat_core::query::memory::EdgeTarget> {
+    pub(super) fn reverse_target(&self) -> anyhow::Result<rag_rat_query::memory::EdgeTarget> {
         edge_target_from_parts(
             self.node_id.as_deref(),
             None,
@@ -1082,7 +1082,7 @@ mod tests {
 
     #[test]
     fn memory_edges_into_target_routes_node_and_github() {
-        use rag_rat_core::query::memory::EdgeTarget;
+        use rag_rat_query::memory::EdgeTarget;
 
         use super::{McpEdgeDirection, MemoryEdgesArgs};
         let into = |node_id, gh: Option<(&str, &str, i64)>| MemoryEdgesArgs {
@@ -1108,7 +1108,7 @@ mod tests {
 
     #[test]
     fn memory_edge_add_relation_and_target_mappings() {
-        use rag_rat_core::query::memory::EdgeTarget;
+        use rag_rat_query::memory::EdgeTarget;
 
         use super::{McpEdgeRelation, MemoryEdgeAddArgs};
         let add = |relation, node: Option<&str>, gh: Option<(&str, &str, i64)>| MemoryEdgeAddArgs {

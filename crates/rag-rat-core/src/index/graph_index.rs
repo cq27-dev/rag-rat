@@ -866,7 +866,7 @@ impl IndexDatabase {
     /// Rewrite every logical binding at `logical_symbol_id` to the relocation discriminators of
     /// the row it now points at (#493 review): `binding_id` = the live qualified name,
     /// `symbol_kind` = the logical row's kind, `signature_hash` = the sha256 of the unanimous
-    /// member signature — the same values [`crate::query::memory::resolve_logical_symbol_binding`]
+    /// member signature — the same values [`rag_rat_query::memory::resolve_logical_symbol_binding`]
     /// captures at bind time and the validate-time ladder writes on a relocation.
     ///
     /// `binding_id` is part of the `(memory_id, binding_kind, binding_id)` PK, so a rename can
@@ -970,7 +970,7 @@ impl IndexDatabase {
     pub(super) fn graph_coverage(
         &self,
         paths: BTreeSet<String>,
-    ) -> anyhow::Result<crate::query::graph::GraphCoverage> {
+    ) -> anyhow::Result<rag_rat_query::graph::GraphCoverage> {
         let indexed_files =
             self.storage
                 .connection()
@@ -990,7 +990,7 @@ impl IndexDatabase {
         let mut parser_coverage_for_paths = Vec::new();
         for path in paths {
             let Some(row) = self.graph_path_row(&path)? else {
-                parser_coverage_for_paths.push(crate::query::graph::GraphPathCoverage {
+                parser_coverage_for_paths.push(rag_rat_query::graph::GraphPathCoverage {
                     path,
                     language: "unknown".to_string(),
                     parser_status: "missing_from_index".to_string(),
@@ -1004,7 +1004,7 @@ impl IndexDatabase {
                 stale_files += 1;
             }
             let parser_failed = parser_failure_paths.iter().any(|failure| failure.path == path);
-            parser_coverage_for_paths.push(crate::query::graph::GraphPathCoverage {
+            parser_coverage_for_paths.push(rag_rat_query::graph::GraphPathCoverage {
                 path,
                 language: row.language,
                 parser_status: if parser_failed { "failed" } else { "ok" }.to_string(),
@@ -1020,7 +1020,7 @@ impl IndexDatabase {
                     .then_some(row.indexed_revision),
             });
         }
-        Ok(crate::query::graph::GraphCoverage {
+        Ok(rag_rat_query::graph::GraphCoverage {
             indexed_files: u64::try_from(indexed_files).unwrap_or(0),
             parser_failures,
             stale_files,

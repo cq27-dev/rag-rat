@@ -337,7 +337,7 @@ fn worktree_overlay_reads_do_not_heal_against_main() {
     // Leaves the connection in the overlay scope.
     db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
 
-    let selector = crate::query::symbol::SymbolSelector {
+    let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,

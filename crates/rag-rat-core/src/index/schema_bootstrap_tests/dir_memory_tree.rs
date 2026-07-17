@@ -10,7 +10,7 @@ fn dir_memory_binds_to_a_directory() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let created = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Decision".to_string(),
             title: "src holds the core library".to_string(),
             body: "All Rust source lives under src/.".to_string(),
@@ -19,7 +19,7 @@ fn dir_memory_binds_to_a_directory() {
             source: Some("agent".to_string()),
             tags: vec![],
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
                 chunk_id: None,
@@ -61,7 +61,7 @@ fn dir_memory_validation_current_and_gone() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // Helper: build a dir bind target with only `dir` set.
-    let dir_bind = |dir: Option<String>| crate::query::memory::RepoMemoryBindTarget {
+    let dir_bind = |dir: Option<String>| rag_rat_query::memory::RepoMemoryBindTarget {
         logical_symbol_id: None,
         symbol_id: None,
         chunk_id: None,
@@ -82,7 +82,7 @@ fn dir_memory_validation_current_and_gone() {
     };
 
     // Case 1: memory on a populated directory ("src") -> validates current.
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: "src dir is the library root".to_string(),
         body: "All source lives under src/.".to_string(),
@@ -97,7 +97,7 @@ fn dir_memory_validation_current_and_gone() {
 
     // Case 2: memory on a directory with no indexed files -> resolves gone at bind time, and
     // memory_validate leaves it gone.
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: "nonexistent dir has no files".to_string(),
         body: "This directory does not exist in the index.".to_string(),
@@ -111,7 +111,7 @@ fn dir_memory_validation_current_and_gone() {
     .unwrap();
 
     // Case 3: root memory (dir:"") -> current whenever any file is indexed.
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: "repo root anchors the whole index".to_string(),
         body: "The entire repo is indexed.".to_string(),
@@ -141,7 +141,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let dir_bind = |dir: Option<String>| crate::query::memory::RepoMemoryBindTarget {
+    let dir_bind = |dir: Option<String>| rag_rat_query::memory::RepoMemoryBindTarget {
         logical_symbol_id: None,
         symbol_id: None,
         chunk_id: None,
@@ -160,7 +160,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
         edge_path: None,
         dir,
     };
-    let path_bind = |path: String| crate::query::memory::RepoMemoryBindTarget {
+    let path_bind = |path: String| rag_rat_query::memory::RepoMemoryBindTarget {
         logical_symbol_id: None,
         symbol_id: None,
         chunk_id: None,
@@ -182,7 +182,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
 
     // Create a dir-scoped memory.
     let dir_result = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Decision".to_string(),
             title: "src is the library root".to_string(),
             body: "Core library lives under src/.".to_string(),
@@ -197,7 +197,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
 
     // Create a path-scoped memory.
     let path_result = db
-        .memory_create(crate::query::memory::RepoMemoryCreate {
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "lib.rs exports the public surface".to_string(),
             body: "All public symbols are re-exported from lib.rs.".to_string(),
@@ -213,7 +213,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
     let conn = db.storage.connection();
 
     // list_memories(None) returns both memories.
-    let all = crate::query::memory::list_memories(conn, None).unwrap();
+    let all = rag_rat_query::memory::list_memories(conn, None).unwrap();
     assert_eq!(all.len(), 2, "expected 2 summaries, got: {all:?}");
 
     // The dir memory is present with correct summary fields.
@@ -231,13 +231,13 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
     assert_eq!(path_summary.binding_id, "src/lib.rs");
 
     // list_memories(Some("dir")) returns only the dir-scoped memory.
-    let dir_only = crate::query::memory::list_memories(conn, Some("dir")).unwrap();
+    let dir_only = rag_rat_query::memory::list_memories(conn, Some("dir")).unwrap();
     assert_eq!(dir_only.len(), 1, "expected 1 dir-kind summary, got: {dir_only:?}");
     assert_eq!(dir_only[0].binding_kind, "dir");
     assert_eq!(dir_only[0].memory_id, dir_result.memory.memory_id);
 
     // list_memories(Some("path")) returns only the path-scoped memory.
-    let path_only = crate::query::memory::list_memories(conn, Some("path")).unwrap();
+    let path_only = rag_rat_query::memory::list_memories(conn, Some("path")).unwrap();
     assert_eq!(path_only.len(), 1, "expected 1 path-kind summary, got: {path_only:?}");
     assert_eq!(path_only[0].binding_kind, "path");
 
@@ -266,8 +266,8 @@ fn dir_tree_label_depth_flat_siblings() {
     let conn = db.storage.connection();
     install_scope(conn, &root);
 
-    let opts = crate::query::tree::TreeOpts::default();
-    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+    let opts = rag_rat_query::tree::TreeOpts::default();
+    let tree = rag_rat_query::tree::dir_tree(conn, &opts).unwrap();
 
     let find = |p: &str| {
         tree.nodes.iter().find(|n| n.path == p).unwrap_or_else(|| {
@@ -336,8 +336,8 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
     install_scope(conn, &root);
 
     // max_depth must be deep enough to reach depth 4 (src/pkg/inner/deep).
-    let opts = crate::query::tree::TreeOpts { max_depth: 5, min_files: 3, max_nodes: 25 };
-    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+    let opts = rag_rat_query::tree::TreeOpts { max_depth: 5, min_files: 3, max_nodes: 25 };
+    let tree = rag_rat_query::tree::dir_tree(conn, &opts).unwrap();
 
     // The chain src → pkg → inner collapses; the one visible node for the pkg subtree
     // anchors at `src/pkg` (or `src`) and spans through to `deep`.  What matters:
@@ -394,8 +394,8 @@ fn dir_tree_memory_only_dir_appears_without_min_files() {
     let conn = db.storage.connection();
     install_scope(conn, &root);
 
-    let opts = crate::query::tree::TreeOpts::default();
-    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+    let opts = rag_rat_query::tree::TreeOpts::default();
+    let tree = rag_rat_query::tree::dir_tree(conn, &opts).unwrap();
 
     let node_a = tree.nodes.iter().find(|n| n.path == "src/a").unwrap_or_else(|| {
         panic!(
@@ -447,8 +447,8 @@ fn dir_tree_excludes_generated_files_from_count() {
     let conn = db.storage.connection();
     install_scope(conn, &root);
 
-    let opts = crate::query::tree::TreeOpts::default();
-    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+    let opts = rag_rat_query::tree::TreeOpts::default();
+    let tree = rag_rat_query::tree::dir_tree(conn, &opts).unwrap();
 
     // src/gen must either be absent (did not qualify) or have file_count == 0.
     if let Some(gen_node) = tree.nodes.iter().find(|n| n.path == "src/gen") {
@@ -512,8 +512,8 @@ fn dir_tree_scope_excludes_other_worktree_files() {
     // Scope to the primary worktree only.
     install_scope(conn, &root);
 
-    let opts = crate::query::tree::TreeOpts::default();
-    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+    let opts = rag_rat_query::tree::TreeOpts::default();
+    let tree = rag_rat_query::tree::dir_tree(conn, &opts).unwrap();
 
     let node_a = tree.nodes.iter().find(|n| n.path == "src/a").unwrap_or_else(|| {
         panic!("src/a missing; nodes: {:?}", tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>())
@@ -569,8 +569,8 @@ fn dir_tree_truncates_at_max_nodes() {
     let conn = db.storage.connection();
     install_scope(conn, &root);
 
-    let opts = crate::query::tree::TreeOpts { max_depth: 2, min_files: 1, max_nodes: 3 };
-    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+    let opts = rag_rat_query::tree::TreeOpts { max_depth: 2, min_files: 1, max_nodes: 3 };
+    let tree = rag_rat_query::tree::dir_tree(conn, &opts).unwrap();
 
     assert!(tree.nodes.len() <= 3, "nodes.len()={} must be <= max_nodes=3", tree.nodes.len());
     assert!(tree.truncated > 0, "truncated must be >0 when nodes were dropped");
@@ -604,8 +604,8 @@ fn dir_tree_builds_annotated_layout() {
     let conn = db.storage.connection();
     install_scope(conn, &root);
 
-    let opts = crate::query::tree::TreeOpts::default(); // max_depth=6, min_files=3, max_nodes=30
-    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+    let opts = rag_rat_query::tree::TreeOpts::default(); // max_depth=6, min_files=3, max_nodes=30
+    let tree = rag_rat_query::tree::dir_tree(conn, &opts).unwrap();
 
     // Root memory must be present.
     assert_eq!(
@@ -662,7 +662,7 @@ fn dir_tree_builds_annotated_layout() {
     // Scoping invariant: re-installing the same scope view and re-querying must not change
     // counts (guards against the view accumulating duplicate rows on reinstall).
     install_scope(conn, &root);
-    let tree2 = crate::query::tree::dir_tree(conn, &opts).unwrap();
+    let tree2 = rag_rat_query::tree::dir_tree(conn, &opts).unwrap();
     let node_a2 = tree2.nodes.iter().find(|n| n.path == "src/a").unwrap();
     assert_eq!(node_a2.file_count, 3, "file_count changed after scope reinstall");
 
@@ -720,8 +720,8 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
     let conn = db.storage.connection();
     install_scope(conn, &root);
 
-    let opts = crate::query::tree::TreeOpts { max_depth: 6, min_files: 3, max_nodes: 30 };
-    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+    let opts = rag_rat_query::tree::TreeOpts { max_depth: 6, min_files: 3, max_nodes: 30 };
+    let tree = rag_rat_query::tree::dir_tree(conn, &opts).unwrap();
 
     let node_labels: Vec<(&str, &str, u8)> =
         tree.nodes.iter().map(|n| (n.path.as_str(), n.label.as_str(), n.depth)).collect();

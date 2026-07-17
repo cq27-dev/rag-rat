@@ -1,4 +1,3 @@
-pub(crate) mod canonical;
 pub mod dream;
 #[cfg(feature = "eval")]
 pub mod eval;
@@ -8,6 +7,7 @@ pub mod index;
 // SYNC-TRANSPORT half — `append` (receiving a foreign signed entry), the fork quarantine,
 // `AppendOutcome` — is still unconsumed (a later increment), so the module keeps
 // `allow(dead_code)`.
+pub(crate) mod memory_write;
 #[allow(dead_code)]
 pub(crate) mod oplog;
 pub mod output;
@@ -27,6 +27,6 @@ pub use output::{OutputFormat, render};
 pub fn memory_attention_count(database: &std::path::Path) -> u64 {
     rag_rat_db::storage::IndexConnection::open_read_only(database)
         .ok()
-        .and_then(|conn| query::memory::doctor_attention_count(conn.connection()).ok())
+        .and_then(|conn| rag_rat_query::memory::doctor_attention_count(conn.connection()).ok())
         .unwrap_or(0)
 }

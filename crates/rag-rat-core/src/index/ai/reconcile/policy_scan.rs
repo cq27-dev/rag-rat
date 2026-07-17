@@ -220,7 +220,7 @@ fn for_each_recomputed_chunk_policy(
     max_embedding_chars: usize,
     mut emit: impl FnMut(&ChunkForPolicy, EmbeddingPolicyDecision) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let dicts = crate::query::chunk_text_dicts(conn)?;
+    let dicts = rag_rat_query::chunk_text_dicts(conn)?;
     let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
     let mut stmt = conn.prepare(
         "

@@ -37,6 +37,7 @@ rusqlite.workspace = true
 # scip/protobuf stay direct deps: eval + query_api tests build SCIP fixtures in-process.
 protobuf.workspace = true
 rag-rat-oracle.workspace = true
+rag-rat-query.workspace = true
 reqwest.workspace = true
 scip.workspace = true
 serde.workspace = true
@@ -62,8 +63,8 @@ tree-sitter-python.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-swift.workspace = true
 tree-sitter-typescript.workspace = true
-minicbor = { version = "2.2.2", features = ["alloc"] }
-unicode-normalization = "0.1.25"
+minicbor.workspace = true
+unicode-normalization.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]

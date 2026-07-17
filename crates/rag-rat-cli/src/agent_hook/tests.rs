@@ -1,6 +1,6 @@
-use rag_rat_core::index::AnchorHealth;
 use rag_rat_core::query::orientation::Orientation;
-use rag_rat_core::query::tree::{DirTree, TreeNode};
+use rag_rat_query::memory::AnchorHealth;
+use rag_rat_query::tree::{DirTree, TreeNode};
 
 use super::*;
 

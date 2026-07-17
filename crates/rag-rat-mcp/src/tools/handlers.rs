@@ -659,7 +659,7 @@ pub(crate) fn memory_for_symbol_tool(
 fn important_symbols_tool(
     db: &IndexDatabase,
     args: ImportantSymbolsArgs,
-) -> anyhow::Result<rag_rat_core::query::pagerank::ImportantSymbolsResult> {
+) -> anyhow::Result<rag_rat_query::pagerank::ImportantSymbolsResult> {
     let meaningful: Vec<String> =
         args.personalize.into_iter().filter(|entry| !entry.trim().is_empty()).collect();
     let force_global = meaningful.len() == 1 && meaningful[0].eq_ignore_ascii_case("global");

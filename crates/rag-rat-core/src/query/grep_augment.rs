@@ -7,9 +7,9 @@
 
 use std::collections::HashSet;
 
+use rag_rat_query::{memory, symbol};
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::query::{memory, symbol};
 use crate::search::lexical;
 
 /// Hard cap on rendered context. Truncation drops whole items, never mid-item.
@@ -539,11 +539,11 @@ mod tests {
     use std::collections::HashSet;
 
     use rag_rat_db::schema;
+    use rag_rat_query::SearchHit;
+    use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
     use rusqlite::Connection;
 
     use super::*;
-    use crate::query::memory::{self, RepoMemoryBindTarget, RepoMemoryCreate};
-    use crate::search::lexical::SearchHit;
 
     fn lexical_hit(path: &str, start: i64, end: i64, score: f64) -> SearchHit {
         SearchHit {
@@ -674,7 +674,7 @@ mod tests {
             [],
         )
         .unwrap();
-        memory::create_memory(&conn, RepoMemoryCreate {
+        crate::memory_write::create_memory(&conn, RepoMemoryCreate {
             kind: "Invariant".to_string(),
             title: "One watcher per worktree".to_string(),
             body: "The election lock guarantees a single watcher; never bind without it."
@@ -755,13 +755,18 @@ mod tests {
             rusqlite::params![
                 id,
                 repo_id,
-                crate::dream::note_content_hash(title, body),
+                rag_rat_query::memory::evidence::note_content_hash(title, body),
                 "Election lock ensures exactly one watcher; bind only under it.",
-                crate::dream::COMPACT_PROMPT_VERSION
+                rag_rat_query::memory::evidence::COMPACT_PROMPT_VERSION
             ],
         )
         .unwrap();
-        let inputs = crate::dream::checked_inputs_hash(&conn, &id, &Some(repo_id.clone())).unwrap();
+        let inputs = rag_rat_query::memory::evidence::checked_inputs_hash(
+            &conn,
+            &id,
+            &Some(repo_id.clone()),
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
              checked_against_commit, checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
@@ -769,9 +774,9 @@ mod tests {
             rusqlite::params![
                 id,
                 repo_id,
-                crate::dream::note_content_hash(title, body),
+                rag_rat_query::memory::evidence::note_content_hash(title, body),
                 inputs,
-                crate::dream::VERDICT_PROMPT_VERSION
+                rag_rat_query::memory::evidence::VERDICT_PROMPT_VERSION
             ],
         )
         .unwrap();
@@ -999,7 +1004,7 @@ mod tests {
 
         let mut created_ids: Vec<String> = Vec::new();
         for title in &titles {
-            let result = memory::create_memory(&conn, RepoMemoryCreate {
+            let result = crate::memory_write::create_memory(&conn, RepoMemoryCreate {
                 kind: "Invariant".to_string(),
                 title: title.to_string(),
                 body: long_body.clone(),

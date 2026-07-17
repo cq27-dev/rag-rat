@@ -449,7 +449,7 @@ pub fn caller_three() -> i32 { load_bearing_hub() }
     // impact_surface neighbors: running impact on a CALLER surfaces the hub as a callee neighbor,
     // and the hub (three callers) carries the labeled load-bearing signal — the third importance
     // scale, never PageRank.
-    let caller_selector = crate::query::symbol::SymbolSelector {
+    let caller_selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -463,7 +463,7 @@ pub fn caller_three() -> i32 { load_bearing_hub() }
         .impact_surface_report_for_selected_symbol(
             &caller,
             50,
-            &crate::query::impact::ImpactSurfaceOptions::default(),
+            &rag_rat_query::impact::ImpactSurfaceOptions::default(),
         )
         .unwrap();
     let enriched_hub = report
@@ -549,7 +549,7 @@ pub fn qualified_caller_two() -> i32 { crate::helper::deep_helper() }
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let caller_selector = crate::query::symbol::SymbolSelector {
+    let caller_selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -564,7 +564,7 @@ pub fn qualified_caller_two() -> i32 { crate::helper::deep_helper() }
         .impact_surface_report_for_selected_symbol(
             &caller,
             50,
-            &crate::query::impact::ImpactSurfaceOptions::default(),
+            &rag_rat_query::impact::ImpactSurfaceOptions::default(),
         )
         .unwrap();
 
@@ -657,7 +657,7 @@ fn impact_report_flags_a_section_truncated_at_limit() {
     // Three repo memories bound to `hub` so the memory section is also over the limit — the
     // truncation report must cover it, not just the non-memory vectors (#146 review).
     for i in 0..3 {
-        db.memory_create(crate::query::memory::RepoMemoryCreate {
+        db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
             kind: "Decision".to_string(),
             title: format!("hub note {i}"),
             body: "why hub is load-bearing".to_string(),
@@ -666,7 +666,7 @@ fn impact_report_flags_a_section_truncated_at_limit() {
             source: Some("agent".to_string()),
             tags: vec![],
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget {
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
                 symbol_id: Some(hub.symbol_id),
                 ..Default::default()
             },
@@ -723,7 +723,7 @@ fn symbol_lookup_heals_stale_line_numbers_after_an_edit() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let selector = crate::query::symbol::SymbolSelector {
+    let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -771,7 +771,7 @@ fn symbol_lookup_heals_a_just_added_symbol_without_waiting_for_the_watcher() {
     // A brand-new file with a brand-new symbol — never indexed, not yet committed.
     fs::write(root.join("src/added.rs"), "pub fn brand_new_symbol() {}\n").unwrap();
 
-    let selector = crate::query::symbol::SymbolSelector {
+    let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -788,7 +788,7 @@ fn symbol_lookup_heals_a_just_added_symbol_without_waiting_for_the_watcher() {
     );
 
     // A genuine miss (a name that exists nowhere) returns empty — no heal resurrects it, no error.
-    let miss = crate::query::symbol::SymbolSelector {
+    let miss = rag_rat_query::symbol::SymbolSelector {
         symbol: Some("no_such_symbol_anywhere".to_string()),
         ..selector.clone()
     };
@@ -842,7 +842,7 @@ fn symbol_lookup_does_not_resurrect_a_deleted_symbol_after_heal() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let by_name = crate::query::symbol::SymbolSelector {
+    let by_name = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -884,7 +884,7 @@ fn symbol_lookup_by_id_keeps_pre_heal_candidate_flagged_stale() {
     let id = db.symbols("keep", Some(Language::Rust), 10).unwrap().remove(0).symbol_id;
     fs::write(root.join("src/lib.rs"), "// a\n// b\npub fn keep() {}\n").unwrap();
 
-    let by_id = crate::query::symbol::SymbolSelector {
+    let by_id = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: Some(id),
         symbol_path: None,

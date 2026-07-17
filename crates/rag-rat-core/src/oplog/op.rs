@@ -20,7 +20,7 @@
 //! its raw bytes RETAINED (never projected) so a binary upgrade can re-fold it (the layer-1 opaque
 //! seam, §5.4). Structurally-corrupt bytes are a hard error, distinct from the forward-compat seam.
 //!
-//! Closed-token reuse: the edge relation is `crate::query::memory::EdgeRelation` (the persisted
+//! Closed-token reuse: the edge relation is `rag_rat_query::memory::EdgeRelation` (the persisted
 //! `repo_node_edges.relation` set) and [`NodeStatus`] mirrors the validated memory-status set
 //! (`active`/`stale`/`obsolete`/`rejected`) — this module invents NO new status/relation tokens.
 //! `edge_key` is derived through the same `query::memory::edge_key` helper the live edge table
@@ -30,9 +30,9 @@
 use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
+use rag_rat_query::memory::{self, EdgeRelation};
 
 use super::cbor;
-use crate::query::memory::{self, EdgeRelation};
 
 /// Domain tag + version, the envelope's first element. Bump the version to evolve the wire format
 /// deliberately (an old binary then rejects the new domain rather than misreading it).

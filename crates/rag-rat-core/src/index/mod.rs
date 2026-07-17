@@ -62,10 +62,11 @@ pub fn migration_hooks() -> rag_rat_db::MigrationHooks {
 // Only tests reach `install_scope_view` directly now: non-test code resolves the repo id
 // explicitly (`resolve_scope_repo_id`) and passes it into `install_worktree_scope_view`, which
 // writes the scope itself rather than routing through the config-blind `active_repo_id`
-// fallback. Gate the re-export so the non-test build doesn't warn it unused.
-#[cfg(test)]
-pub(crate) use lifecycle::install_scope_view;
-pub use lifecycle::{GlobalStoreOverview, install_worktree_scope_view, resolve_scope_repo_id};
+// fallback. Re-exported un-gated: the read-layer crate's tests reach it through the
+// dev-dependency, and `#[cfg(test)]` does not propagate cross-crate.
+pub use lifecycle::{
+    GlobalStoreOverview, install_scope_view, install_worktree_scope_view, resolve_scope_repo_id,
+};
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
 pub use parser_failures::ParserFailure;
 pub(crate) use prep::*;
@@ -104,6 +105,8 @@ use rag_rat_db::schema;
 use rag_rat_db::storage::{IndexConnection, StorageStatus};
 use rag_rat_papertrail as papertrail;
 use rag_rat_papertrail::{Papertrail, PapertrailEvidence, PapertrailStatus, PapertrailSyncReport};
+use rag_rat_query::graph_meta::{self, GraphMetaMode};
+use rag_rat_query::memory::AnchorHealth;
 use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::{OptionalExtension, params};
@@ -119,7 +122,6 @@ use crate::index::git_history::{
     SymbolHistoryItem,
 };
 use crate::index::symbols::Symbol;
-use crate::query::graph_meta::{self, GraphMetaMode};
 use crate::search::lexical::SearchHit;
 
 #[derive(Debug)]
@@ -275,16 +277,6 @@ pub struct IndexStatus {
     pub anchor_health: AnchorHealth,
 }
 
-/// READ-only counts of active repo-memory bindings grouped by `anchor_status`.
-/// Computed by a single GROUP BY query; does not run `memory_validate` or write anything.
-#[derive(Debug, Default, Serialize)]
-pub struct AnchorHealth {
-    pub current: u64,
-    pub relocated: u64,
-    pub stale: u64,
-    pub gone: u64,
-}
-
 #[derive(Debug, Serialize)]
 pub struct HealIndexReport {
     pub checked_files: u64,
@@ -379,28 +371,6 @@ struct GraphPathRow {
     indexed_revision: String,
 }
 
-pub(crate) fn is_generated_path(path: &str) -> bool {
-    // Segment-based so a `generated` / `generated-web` directory is caught at ANY depth, INCLUDING
-    // the repo root (`generated/bindings.rs`) — `contains("/generated/")` needed a leading
-    // separator and silently missed root-level codegen dirs. Segment equality also avoids false
-    // positives like `pre-generated-data/` that a bare substring match would catch.
-    path.ends_with(".d.ts")
-        || path.ends_with("_bg.wasm.d.ts")
-        || path.split('/').any(|segment| segment == "generated" || segment == "generated-web")
-}
-
-/// Whether a file should be flagged `files.generated = 1` — the single notion of "generated" the
-/// query layer filters on (search, orientation, tree, clusters, and symbol search all default to
-/// `files.generated = 0`). A file is generated if its target is explicitly `kind = generated` OR
-/// its path matches the codegen heuristic ([`is_generated_path`] — `/generated/`, `.d.ts`, ubrn
-/// wasm-bindgen output). The path arm is what catches codegen that lives *under a source target*
-/// (e.g. ubrn FFI bindings in `packages/.../src/generated/`): those still get full symbols (symbol
-/// extraction is gated on `kind`, not this flag) so the graph keeps them, but they're filtered out
-/// of default search/lookup results instead of burying the hand-written source (#202).
-pub(crate) fn file_is_generated(kind: TargetKind, path: &str) -> bool {
-    matches!(kind, TargetKind::Generated) || is_generated_path(path)
-}
-
 #[derive(Debug)]
 struct IndexedFile {
     path: String,
@@ -444,7 +414,7 @@ pub(crate) mod poison_sibling;
 
 #[cfg(test)]
 mod generated_path_tests {
-    use super::is_generated_path;
+    use rag_rat_base::path_class::is_generated_path;
 
     #[test]
     fn generated_dirs_match_at_any_depth_including_root() {

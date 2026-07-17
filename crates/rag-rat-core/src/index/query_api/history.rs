@@ -279,7 +279,7 @@ impl IndexDatabase {
 
     pub fn papertrail_for_selected_symbol(
         &self,
-        symbol: &crate::query::symbol::SymbolHit,
+        symbol: &rag_rat_query::symbol::SymbolHit,
         limit: u32,
     ) -> anyhow::Result<Papertrail> {
         papertrail::papertrail_for_symbol(

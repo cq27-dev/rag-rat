@@ -1175,8 +1175,8 @@ mod tests {
         // The SCOPED production surface must NOT leak it: the fixture repo has no
         // papertrail_refs of its own, so its `src/lib.rs` candidate reports zero refs.
         let brief = db
-            .repo_brief(crate::query::repo_brief::RepoBriefOptions {
-                mode: crate::query::repo_brief::RepoBriefMode::Spine,
+            .repo_brief(rag_rat_query::repo_brief::RepoBriefOptions {
+                mode: rag_rat_query::repo_brief::RepoBriefMode::Spine,
                 limit: 50,
                 include_generated: true,
                 include_memories: false,

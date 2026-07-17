@@ -295,7 +295,7 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
     // a window edge REMOVAL (a phantom projected edge). Both fall under the same out-of-scope
     // class as raw out-of-band content divergence; they are content/tombstone divergence, not the
     // missing-NodeCreate bug #541 fixes, and the log is a shadow until phase D.
-    crate::query::memory::reconcile_owner_stream_for_repo(
+    crate::memory_write::reconcile_owner_stream_for_repo(
         target_conn,
         &repo_id,
         rag_rat_base::time::now_ms(),
@@ -968,8 +968,12 @@ fn copy_node_edges(
                 },
                 _ => (repo_id.to_string(), src_target_anchor.clone(), None, "current"),
             };
-        let key =
-            crate::query::memory::edge_key(source_node_id, &relation, &target_kind, &target_anchor);
+        let key = rag_rat_query::memory::edge_key(
+            source_node_id,
+            &relation,
+            &target_kind,
+            &target_anchor,
+        );
         let changed = tx.execute(
             "INSERT OR IGNORE INTO repo_node_edges(edge_key, repo_id, source_node_id, relation, \
              target_repo_id, target_kind, target_anchor, target_node_id, \
@@ -2133,7 +2137,7 @@ mod tests {
     /// setup.
     fn seeded_target_with_rooted_chain() -> Connection {
         let target = fresh_target();
-        crate::query::memory::create_memory(&target, crate::query::memory::RepoMemoryCreate {
+        crate::memory_write::create_memory(&target, rag_rat_query::memory::RepoMemoryCreate {
             kind: "Concept".to_string(),
             title: "seed".to_string(),
             body: "body".to_string(),
@@ -2142,7 +2146,7 @@ mod tests {
             source: None,
             tags: Vec::new(),
             payload_json: None,
-            bind: crate::query::memory::RepoMemoryBindTarget::default(),
+            bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
         })
         .unwrap();
         target
@@ -2195,7 +2199,7 @@ mod tests {
 
         // The call this task wires into `run`, immediately after `import_from_source` and before
         // the legacy-file rename.
-        crate::query::memory::reconcile_owner_stream_for_repo(
+        crate::memory_write::reconcile_owner_stream_for_repo(
             &target,
             "global-repo",
             rag_rat_base::time::now_ms(),
@@ -2211,7 +2215,7 @@ mod tests {
 
         // A follow-up `mark_obsolete` on the imported memory is NOT inert: it flips the projected
         // status (which requires the `NodeCreate` the reconcile just authored).
-        crate::query::memory::mark_obsolete(&target, "m1").unwrap();
+        crate::memory_write::mark_obsolete(&target, "m1").unwrap();
         let status: String = target
             .query_row("SELECT status FROM content_projected_nodes WHERE node_id = 'm1'", [], |r| {
                 r.get(0)

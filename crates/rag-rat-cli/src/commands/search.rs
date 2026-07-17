@@ -22,8 +22,8 @@ pub(crate) fn query(config: &Config, args: &QueryArgs) -> anyhow::Result<()> {
 
 pub(crate) fn brief(config: &Config, args: &BriefArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
-    let mode = rag_rat_core::query::repo_brief::RepoBriefMode::parse(args.mode.as_deref())?;
-    print_output(&db.repo_brief(rag_rat_core::query::repo_brief::RepoBriefOptions {
+    let mode = rag_rat_query::repo_brief::RepoBriefMode::parse(args.mode.as_deref())?;
+    print_output(&db.repo_brief(rag_rat_query::repo_brief::RepoBriefOptions {
         mode,
         limit: args.limit.unwrap_or(10),
         include_generated: args.include_generated,
@@ -61,11 +61,10 @@ pub(crate) fn important_symbols(
 /// (the core method, config-unaware, emits the manual `oracle run` variant). No-op when the hint is
 /// absent (a current oracle run exists) or auto_run is off.
 pub(crate) fn apply_auto_run_ranking_hint(
-    result: &mut rag_rat_core::query::pagerank::ImportantSymbolsResult,
+    result: &mut rag_rat_query::pagerank::ImportantSymbolsResult,
     config: &Config,
 ) {
     if config.oracle.auto_run && result.ranking_hint.is_some() {
-        result.ranking_hint =
-            Some(rag_rat_core::query::pagerank::RANKING_HINT_AUTO_RUN.to_string());
+        result.ranking_hint = Some(rag_rat_query::pagerank::RANKING_HINT_AUTO_RUN.to_string());
     }
 }

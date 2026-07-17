@@ -4,16 +4,19 @@
 use super::{annotate_completeness_with_externals, resolved_external_label, *};
 
 impl IndexDatabase {
-    pub fn ffi_surface(&self, limit: u32) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
-        crate::query::impact::ffi_surface(self.storage.connection(), limit)
+    pub fn ffi_surface(
+        &self,
+        limit: u32,
+    ) -> anyhow::Result<Vec<rag_rat_query::impact::ImpactItem>> {
+        rag_rat_query::impact::ffi_surface(self.storage.connection(), limit)
     }
 
     pub fn find_callers(
         &self,
         symbol: &str,
         limit: u32,
-    ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
-        crate::query::graph::traverse(self.storage.connection(), symbol, true, limit)
+    ) -> anyhow::Result<Vec<rag_rat_query::graph::GraphHop>> {
+        rag_rat_query::graph::traverse(self.storage.connection(), symbol, true, limit)
     }
 
     /// `check_library_usage` (#114): join the active checkout's `resolved-external` call sites to
@@ -37,8 +40,8 @@ impl IndexDatabase {
         &self,
         symbol: &str,
         limit: u32,
-        options: &crate::query::graph::GraphTraversalOptions,
-    ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
+        options: &rag_rat_query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<Vec<rag_rat_query::graph::GraphHop>> {
         let options = self.graph_options_with_logical_group(options)?;
         self.traverse_with_oracle(symbol, true, limit, &options)
     }
@@ -76,7 +79,7 @@ impl IndexDatabase {
     /// no oracle run).
     fn enrich_hops_with_oracle(
         &self,
-        hops: &mut [crate::query::graph::GraphHop],
+        hops: &mut [rag_rat_query::graph::GraphHop],
     ) -> anyhow::Result<bool> {
         if hops.is_empty() {
             return Ok(false);
@@ -166,10 +169,10 @@ impl IndexDatabase {
         symbol: &str,
         reverse: bool,
         limit: u32,
-        options: &crate::query::graph::GraphTraversalOptions,
-    ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
-        let overfetch = crate::query::graph::oracle_overfetch_limit(limit);
-        let mut hops = crate::query::graph::traverse_with_options(
+        options: &rag_rat_query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<Vec<rag_rat_query::graph::GraphHop>> {
+        let overfetch = rag_rat_query::graph::oracle_overfetch_limit(limit);
+        let mut hops = rag_rat_query::graph::traverse_with_options(
             self.storage.connection(),
             symbol,
             reverse,
@@ -187,7 +190,9 @@ impl IndexDatabase {
             // Stable sort by effective (post-enrichment) confidence so a `compiler` upgrade rises
             // above the heuristic `exact`/`syntactic` edges that out-ranked it in the SQL ORDER BY.
             // Stable keeps the heuristic order (the `match_tier` primary key) within a tier.
-            hops.sort_by_key(|hop| crate::query::graph::effective_confidence_rank(&hop.confidence));
+            hops.sort_by_key(|hop| {
+                rag_rat_query::graph::effective_confidence_rank(&hop.confidence)
+            });
         }
         hops.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         Ok(hops)
@@ -197,16 +202,16 @@ impl IndexDatabase {
         &self,
         symbol: &str,
         limit: u32,
-    ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
-        crate::query::graph::traverse(self.storage.connection(), symbol, false, limit)
+    ) -> anyhow::Result<Vec<rag_rat_query::graph::GraphHop>> {
+        rag_rat_query::graph::traverse(self.storage.connection(), symbol, false, limit)
     }
 
     pub fn trace_callees_with_options(
         &self,
         symbol: &str,
         limit: u32,
-        options: &crate::query::graph::GraphTraversalOptions,
-    ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
+        options: &rag_rat_query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<Vec<rag_rat_query::graph::GraphHop>> {
         let options = self.graph_options_with_logical_group(options)?;
         self.traverse_with_oracle(symbol, false, limit, &options)
     }
@@ -214,11 +219,11 @@ impl IndexDatabase {
     pub fn graph_traversal_report(
         &self,
         tool: &str,
-        symbol: &crate::query::symbol::SymbolHit,
+        symbol: &rag_rat_query::symbol::SymbolHit,
         reverse: bool,
         limit: u32,
-        options: &crate::query::graph::GraphTraversalOptions,
-    ) -> anyhow::Result<crate::query::graph::GraphTraversalReport> {
+        options: &rag_rat_query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<rag_rat_query::graph::GraphTraversalReport> {
         let options = self.graph_options_with_logical_group(options)?;
         // Overfetch + enrich + re-rank + truncate so a compiler-upgraded edge survives the limit
         // (#82 finding 4). `traversal_summary` below still describes the FULL matching population
@@ -226,7 +231,7 @@ impl IndexDatabase {
         // `results.len()` as the returned count stays correct.
         let results =
             self.traverse_with_oracle(&symbol.qualified_name, reverse, limit, &options)?;
-        let mut summary = crate::query::graph::traversal_summary(
+        let mut summary = rag_rat_query::graph::traversal_summary(
             self.storage.connection(),
             &symbol.qualified_name,
             reverse,
@@ -257,8 +262,8 @@ impl IndexDatabase {
                 summary.unresolved
             ));
         }
-        Ok(crate::query::graph::GraphTraversalReport {
-            query: crate::query::graph::GraphTraversalQuery {
+        Ok(rag_rat_query::graph::GraphTraversalReport {
+            query: rag_rat_query::graph::GraphTraversalQuery {
                 tool: tool.to_string(),
                 symbol_id: Some(symbol.symbol_id),
                 logical_symbol_id: options.logical_symbol_id,
@@ -275,15 +280,15 @@ impl IndexDatabase {
 
     pub fn compare_graph_to_text(
         &self,
-        symbol: &crate::query::symbol::SymbolHit,
+        symbol: &rag_rat_query::symbol::SymbolHit,
         pattern: &str,
         limit: u32,
-        options: &crate::query::graph::GraphTraversalOptions,
+        options: &rag_rat_query::graph::GraphTraversalOptions,
         include_tests: bool,
-    ) -> anyhow::Result<crate::query::graph::CompareGraphTextReport> {
+    ) -> anyhow::Result<rag_rat_query::graph::CompareGraphTextReport> {
         let regex = Regex::new(pattern)?;
         let options = self.graph_options_with_logical_group(options)?;
-        let mut graph_edges = crate::query::graph::traverse_with_options(
+        let mut graph_edges = rag_rat_query::graph::traverse_with_options(
             self.storage.connection(),
             &symbol.qualified_name,
             true,
@@ -294,7 +299,7 @@ impl IndexDatabase {
             graph_edges.retain(|edge| {
                 edge.callsite
                     .as_ref()
-                    .is_none_or(|callsite| !crate::index::parser::is_test_path(&callsite.path))
+                    .is_none_or(|callsite| !rag_rat_base::path_class::is_test_path(&callsite.path))
             });
         }
         let (logical_symbol, variants) =
@@ -334,7 +339,7 @@ impl IndexDatabase {
         let mut likely_parser_gaps = Vec::new();
         for hit in &text_hits {
             if let Some(edge) = graph_by_location.get(&(hit.path.clone(), hit.line)) {
-                matched_hits.push(crate::query::graph::MatchedGraphTextHit {
+                matched_hits.push(rag_rat_query::graph::MatchedGraphTextHit {
                     path: hit.path.clone(),
                     line: hit.line,
                     text: hit.text.clone(),
@@ -344,8 +349,12 @@ impl IndexDatabase {
                     resolution: edge.resolution.clone(),
                 });
             } else {
-                let gap_kind = classify_text_only_hit(&hit.path, &hit.text, &parser_failure_paths);
-                let text_only_hit = crate::query::graph::TextOnlyHit {
+                let gap_kind = rag_rat_query::text_compare::classify_text_only_hit(
+                    &hit.path,
+                    &hit.text,
+                    &parser_failure_paths,
+                );
+                let text_only_hit = rag_rat_query::graph::TextOnlyHit {
                     path: hit.path.clone(),
                     line: hit.line,
                     text: hit.text.clone(),
@@ -358,7 +367,7 @@ impl IndexDatabase {
                     .to_string(),
                     likely_gap: gap_kind.to_string(),
                 };
-                if is_likely_parser_gap_kind(gap_kind) {
+                if rag_rat_query::text_compare::is_likely_parser_gap_kind(gap_kind) {
                     likely_parser_gaps.push(text_only_hit.clone());
                 }
                 text_only_hits.push(text_only_hit);
@@ -375,7 +384,7 @@ impl IndexDatabase {
                 continue;
             }
             let current_line = self.read_current_line_text(&callsite.path, callsite.line)?;
-            let graph_only = crate::query::graph::GraphOnlyEdge {
+            let graph_only = rag_rat_query::graph::GraphOnlyEdge {
                 path: callsite.path.clone(),
                 line: callsite.line,
                 target: edge.target.clone(),
@@ -384,17 +393,23 @@ impl IndexDatabase {
                 resolution: edge.resolution.clone(),
                 evidence: edge.evidence.clone(),
                 reason: "graph edge exists but pattern did not match text".to_string(),
-                likely_reason: graph_only_reason(edge, current_line.as_deref()),
+                likely_reason: rag_rat_query::text_compare::graph_only_reason(
+                    edge,
+                    current_line.as_deref(),
+                ),
             };
-            if is_likely_false_positive_graph_only(edge, &graph_only) {
+            if rag_rat_query::text_compare::is_likely_false_positive_graph_only(edge, &graph_only) {
                 likely_false_positives.push(graph_only.clone());
             }
             graph_only_edges.push(graph_only);
         }
         let complete = likely_parser_gaps.is_empty() && likely_false_positives.is_empty();
-        let recommended_fallback =
-            recommended_graph_text_fallback(&likely_parser_gaps, &graph_only_edges);
-        let pattern_match_mode = compare_pattern_match_mode(pattern, &symbol.name);
+        let recommended_fallback = rag_rat_query::text_compare::recommended_graph_text_fallback(
+            &likely_parser_gaps,
+            &graph_only_edges,
+        );
+        let pattern_match_mode =
+            rag_rat_query::text_compare::compare_pattern_match_mode(pattern, &symbol.name);
         let mut warnings = Vec::new();
         if pattern_match_mode == "substring_identifier" {
             warnings.push(format!(
@@ -404,8 +419,8 @@ impl IndexDatabase {
             ));
         }
 
-        Ok(crate::query::graph::CompareGraphTextReport {
-            query: crate::query::graph::CompareGraphTextQuery {
+        Ok(rag_rat_query::graph::CompareGraphTextReport {
+            query: rag_rat_query::graph::CompareGraphTextQuery {
                 symbol_id: Some(symbol.symbol_id),
                 logical_symbol_id: options.logical_symbol_id,
                 symbol_path: symbol.qualified_name.clone(),
@@ -414,7 +429,7 @@ impl IndexDatabase {
             },
             logical_symbol,
             variants,
-            summary: crate::query::graph::CompareGraphTextSummary {
+            summary: rag_rat_query::graph::CompareGraphTextSummary {
                 graph_hits: u64::try_from(graph_edges.len()).unwrap_or(u64::MAX),
                 graph_edges: u64::try_from(graph_edges.len()).unwrap_or(u64::MAX),
                 text_hits: u64::try_from(text_hits.len()).unwrap_or(u64::MAX),
@@ -454,7 +469,7 @@ impl IndexDatabase {
     /// mutated; this is pure read-time diffing.
     pub fn compare_graph_to_scip(
         &self,
-    ) -> anyhow::Result<crate::query::graph::CompareGraphScipReport> {
+    ) -> anyhow::Result<rag_rat_query::graph::CompareGraphScipReport> {
         let conn = self.storage.connection();
         // Compare against EVERY backend with a run in this checkout, not just rust-analyzer (#176):
         // a mixed-language repo's contradictions span tools (a C edge under scip-clang, a Python
@@ -465,7 +480,7 @@ impl IndexDatabase {
             &self.active_commit_sha,
             &self.active_worktree_id,
         )?;
-        let mut summary = crate::query::graph::CompareGraphScipSummary::default();
+        let mut summary = rag_rat_query::graph::CompareGraphScipSummary::default();
         let mut contradictions = Vec::new();
         if runs.is_empty() {
             summary.no_oracle_data = true;
@@ -474,8 +489,8 @@ impl IndexDatabase {
                  verdicts before comparing"
                     .to_string(),
             );
-            return Ok(crate::query::graph::CompareGraphScipReport {
-                query: crate::query::graph::CompareGraphScipQuery {
+            return Ok(rag_rat_query::graph::CompareGraphScipReport {
+                query: rag_rat_query::graph::CompareGraphScipQuery {
                     tool: String::new(),
                     tool_version: None,
                     commit_sha: self.active_commit_sha.clone(),
@@ -498,10 +513,10 @@ impl IndexDatabase {
                 if comparison.kind != rag_rat_oracle::OracleResolutionKind::Contradict {
                     continue;
                 }
-                contradictions.push(crate::query::graph::GraphScipContradiction {
+                contradictions.push(rag_rat_query::graph::GraphScipContradiction {
                     edge_id: comparison.edge_id,
                     edge_kind: comparison.edge_kind,
-                    heuristic_confidence: crate::query::graph::normalize_confidence(
+                    heuristic_confidence: rag_rat_query::graph::normalize_confidence(
                         &comparison.heuristic_confidence,
                     )
                     .to_string(),
@@ -521,7 +536,7 @@ impl IndexDatabase {
                         .then(|| resolved_external_label(&comparison.scip_symbol))
                         .flatten(),
                     scip_symbol: comparison.scip_symbol,
-                    callsite: Some(crate::query::graph::Callsite {
+                    callsite: Some(rag_rat_query::graph::Callsite {
                         path: comparison.callsite_path,
                         line: comparison.callsite_line,
                         span: [comparison.callsite_line, comparison.callsite_line],
@@ -543,8 +558,8 @@ impl IndexDatabase {
             );
         }
         summary.contradictions = u64::try_from(contradictions.len()).unwrap_or(u64::MAX);
-        Ok(crate::query::graph::CompareGraphScipReport {
-            query: crate::query::graph::CompareGraphScipQuery {
+        Ok(rag_rat_query::graph::CompareGraphScipReport {
+            query: rag_rat_query::graph::CompareGraphScipQuery {
                 // The tools (and their versions) that contributed verdicts, joined — the report now
                 // spans every backend with a run, not a single hardcoded tool.
                 tool: runs.iter().map(|(tool, _)| tool.as_db_str()).collect::<Vec<_>>().join(","),
@@ -563,25 +578,25 @@ impl IndexDatabase {
         &self,
         logical_symbol_id: Option<i64>,
     ) -> anyhow::Result<(
-        Option<crate::query::graph::LogicalSymbol>,
-        Vec<crate::query::graph::LogicalSymbolVariant>,
+        Option<rag_rat_query::graph::LogicalSymbol>,
+        Vec<rag_rat_query::graph::LogicalSymbolVariant>,
     )> {
         let Some(logical_symbol_id) = logical_symbol_id else {
             return Ok((None, Vec::new()));
         };
-        let Some(logical) = crate::query::symbol::lookup_logical_by_id(
+        let Some(logical) = rag_rat_query::symbol::lookup_logical_by_id(
             self.storage.connection(),
             logical_symbol_id,
         )?
         else {
             return Ok((None, Vec::new()));
         };
-        let variants = crate::query::symbol::logical_members(
+        let variants = rag_rat_query::symbol::logical_members(
             self.storage.connection(),
             logical.logical_symbol_id,
         )?
         .into_iter()
-        .map(|member| crate::query::graph::LogicalSymbolVariant {
+        .map(|member| rag_rat_query::graph::LogicalSymbolVariant {
             symbol_id: member.symbol_id,
             cfg_expr: member.cfg_expr,
             signature_hash: member.signature_hash,
@@ -590,7 +605,7 @@ impl IndexDatabase {
         })
         .collect::<Vec<_>>();
         Ok((
-            Some(crate::query::graph::LogicalSymbol {
+            Some(rag_rat_query::graph::LogicalSymbol {
                 logical_symbol_id: logical.logical_symbol_id,
                 qualified_name: logical.qualified_name,
                 variant_count: logical.variant_count,
@@ -602,8 +617,8 @@ impl IndexDatabase {
 
     pub(super) fn graph_options_with_logical_group(
         &self,
-        options: &crate::query::graph::GraphTraversalOptions,
-    ) -> anyhow::Result<crate::query::graph::GraphTraversalOptions> {
+        options: &rag_rat_query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<rag_rat_query::graph::GraphTraversalOptions> {
         if options.logical_symbol_id.is_some() {
             return Ok(options.clone());
         }
@@ -611,7 +626,7 @@ impl IndexDatabase {
             return Ok(options.clone());
         };
         let Some(logical) =
-            crate::query::symbol::logical_for_symbol_id(self.storage.connection(), symbol_id)?
+            rag_rat_query::symbol::logical_for_symbol_id(self.storage.connection(), symbol_id)?
         else {
             return Ok(options.clone());
         };
@@ -622,7 +637,7 @@ impl IndexDatabase {
 
     pub(super) fn find_local_symbol_context_hits(
         &self,
-        symbol: &crate::query::symbol::SymbolHit,
+        symbol: &rag_rat_query::symbol::SymbolHit,
         limit: u32,
     ) -> anyhow::Result<Vec<SearchHit>> {
         // The text-mention fallback runs `chunk_fts MATCH` (#77) — you can't LIKE a compressed blob
@@ -631,7 +646,7 @@ impl IndexDatabase {
         self.ensure_fts_fresh()?;
         let conn = self.storage.connection();
         let name_like = format!("%{}%", symbol.name);
-        let fts = crate::query::impact::fts_phrase_query(&symbol.name);
+        let fts = rag_rat_query::impact::fts_phrase_query(&symbol.name);
         let text_clause = if fts.is_some() {
             "OR chunks.id IN (SELECT c2.id FROM chunks AS c2 JOIN chunk_fts ON chunk_fts.rowid = \
              c2.id WHERE chunk_fts MATCH ?4)"
@@ -699,11 +714,12 @@ impl IndexDatabase {
             },
         )?;
         let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        let dicts = crate::query::chunk_text_dicts(conn)?;
+        let dicts = rag_rat_query::chunk_text_dicts(conn)?;
         let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
         let mut hits = Vec::with_capacity(collected.len());
         for (mut hit, text_row) in collected {
-            hit.summary = bounded_summary(&text_row.resolve(&mut decoder)?);
+            hit.summary =
+                rag_rat_query::text_compare::bounded_summary(&text_row.resolve(&mut decoder)?);
             hits.push(hit);
         }
         Ok(hits)
@@ -713,14 +729,14 @@ impl IndexDatabase {
         &self,
         query: &str,
         limit: u32,
-    ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
+    ) -> anyhow::Result<Vec<rag_rat_query::impact::ImpactItem>> {
         // impact's chunk-mention evidence runs `chunk_fts MATCH` (#77 Phase 1), so the FTS index
         // must be fresh first — same precondition search enforces before its MATCH queries.
         // #582: the papertrail-rationale section also ranks github_fts — heal-and-retry.
         crate::index::retry_once_on_fts_corruption(
             || {
                 self.ensure_fts_fresh()?;
-                crate::query::impact::impact_surface(self.storage.connection(), query, limit)
+                rag_rat_query::impact::impact_surface(self.storage.connection(), query, limit)
             },
             || self.heal_corrupt_fts(),
         )
@@ -730,12 +746,12 @@ impl IndexDatabase {
         &self,
         query: &str,
         limit: u32,
-        resolution_mode: crate::query::graph::GraphResolutionMode,
-    ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
+        resolution_mode: rag_rat_query::graph::GraphResolutionMode,
+    ) -> anyhow::Result<Vec<rag_rat_query::impact::ImpactItem>> {
         crate::index::retry_once_on_fts_corruption(
             || {
                 self.ensure_fts_fresh()?;
-                crate::query::impact::impact_surface_with_options(
+                rag_rat_query::impact::impact_surface_with_options(
                     self.storage.connection(),
                     query,
                     limit,
@@ -748,14 +764,14 @@ impl IndexDatabase {
 
     pub fn impact_surface_for_selected_symbol(
         &self,
-        symbol: &crate::query::symbol::SymbolHit,
+        symbol: &rag_rat_query::symbol::SymbolHit,
         limit: u32,
-        resolution_mode: crate::query::graph::GraphResolutionMode,
-    ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
+        resolution_mode: rag_rat_query::graph::GraphResolutionMode,
+    ) -> anyhow::Result<Vec<rag_rat_query::impact::ImpactItem>> {
         crate::index::retry_once_on_fts_corruption(
             || {
                 self.ensure_fts_fresh()?;
-                crate::query::impact::impact_surface_for_symbol(
+                rag_rat_query::impact::impact_surface_for_symbol(
                     self.storage.connection(),
                     symbol,
                     limit,
@@ -768,10 +784,10 @@ impl IndexDatabase {
 
     pub fn impact_surface_report_for_selected_symbol(
         &self,
-        symbol: &crate::query::symbol::SymbolHit,
+        symbol: &rag_rat_query::symbol::SymbolHit,
         limit: u32,
-        options: &crate::query::impact::ImpactSurfaceOptions,
-    ) -> anyhow::Result<crate::query::impact::ImpactSurfaceReport> {
+        options: &rag_rat_query::impact::ImpactSurfaceOptions,
+    ) -> anyhow::Result<rag_rat_query::impact::ImpactSurfaceReport> {
         // Only the text sections (tests / docs / text-fallback) run `chunk_fts MATCH`; the report
         // builder's neighbors come from the graph, not FTS. So skip the FTS refresh when the caller
         // excludes every text section (e.g. MCP `include: ["git"]`) — no point rebuilding FTS for a
@@ -798,7 +814,7 @@ impl IndexDatabase {
         // heal-and-retry the report build on shadow corruption.
         let mut report = crate::index::retry_once_on_fts_corruption(
             || {
-                crate::query::impact::impact_surface_report_for_symbol(
+                rag_rat_query::impact::impact_surface_report_for_symbol(
                     self.storage.connection(),
                     symbol,
                     limit,

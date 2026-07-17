@@ -24,7 +24,7 @@ fn stale_generated_flags_are_rederived_on_open() {
         .connection()
         .execute("DELETE FROM index_meta WHERE key = ?1", [GENERATED_FLAGS_VERSION_KEY])
         .unwrap();
-    let by_name = crate::query::symbol::SymbolSelector {
+    let by_name = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -100,9 +100,9 @@ fn search_and_read_chunk_attach_bounded_graph_evidence() {
     // arithmetic expression as a direct caller of any same-named symbol. `operator_noise` only ever
     // "calls" `helper` through that poisoned edge, so its presence here is exactly the bug.
     for resolution_mode in [
-        crate::query::graph::GraphResolutionMode::Exact,
-        crate::query::graph::GraphResolutionMode::Syntactic,
-        crate::query::graph::GraphResolutionMode::Fuzzy,
+        rag_rat_query::graph::GraphResolutionMode::Exact,
+        rag_rat_query::graph::GraphResolutionMode::Syntactic,
+        rag_rat_query::graph::GraphResolutionMode::Fuzzy,
     ] {
         let items = db.impact_surface_with_options("helper", 20, resolution_mode).unwrap();
         // The graph lane records the edge kind in its evidence ("<kind> edge to <symbol>"), so an
@@ -161,16 +161,16 @@ fn graph_exact_mode_requires_verified_symbol_identity() {
     let caller = db.symbols("caller", Some(Language::Rust), 10).unwrap().remove(0);
 
     let bare_exact = db
-        .find_callers_with_options("helper", 10, &crate::query::graph::GraphTraversalOptions {
-            resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+        .find_callers_with_options("helper", 10, &rag_rat_query::graph::GraphTraversalOptions {
+            resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
             ..Default::default()
         })
         .unwrap();
     assert!(bare_exact.is_empty(), "bare exact lookup should not fall back: {bare_exact:?}");
 
     let exact_callers = db
-        .find_callers_with_options("helper", 10, &crate::query::graph::GraphTraversalOptions {
-            resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+        .find_callers_with_options("helper", 10, &rag_rat_query::graph::GraphTraversalOptions {
+            resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
             symbol_id: Some(helper.symbol_id),
             ..Default::default()
         })
@@ -185,8 +185,8 @@ fn graph_exact_mode_requires_verified_symbol_identity() {
     assert!(exact_callers.iter().all(|edge| edge.verified_target_symbol));
 
     let exact_callees = db
-        .trace_callees_with_options("caller", 10, &crate::query::graph::GraphTraversalOptions {
-            resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+        .trace_callees_with_options("caller", 10, &rag_rat_query::graph::GraphTraversalOptions {
+            resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
             symbol_id: Some(caller.symbol_id),
             ..Default::default()
         })
@@ -260,7 +260,7 @@ impl B {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let selector = crate::query::symbol::SymbolSelector {
+    let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -322,7 +322,7 @@ pub fn caller() {
     let db = IndexDatabase::rebuild(&config).unwrap();
     let lookup = db
         .symbol_candidates(
-            &crate::query::symbol::SymbolSelector {
+            &rag_rat_query::symbol::SymbolSelector {
                 logical_symbol_id: None,
                 symbol_id: None,
                 symbol_path: None,
@@ -342,8 +342,8 @@ pub fn caller() {
         .find_callers_with_options(
             "spawn_blocking",
             10,
-            &crate::query::graph::GraphTraversalOptions {
-                resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+            &rag_rat_query::graph::GraphTraversalOptions {
+                resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
                 symbol_id: Some(lookup.candidates[1].symbol_id),
                 ..Default::default()
             },
@@ -365,8 +365,8 @@ pub fn caller() {
             &lookup.candidates[0],
             true,
             10,
-            &crate::query::graph::GraphTraversalOptions {
-                resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+            &rag_rat_query::graph::GraphTraversalOptions {
+                resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
                 symbol_id: Some(lookup.candidates[0].symbol_id),
                 ..Default::default()
             },
@@ -392,7 +392,7 @@ pub fn caller() {
     let handle = rag_rat_base::serde_big_id::format_sym_handle(logical_symbol_id);
     let by_ref_handle = db
         .symbol_candidates(
-            &crate::query::symbol::SymbolSelector {
+            &rag_rat_query::symbol::SymbolSelector {
                 logical_symbol_id: None,
                 symbol_id: None,
                 symbol_path: Some(handle),
@@ -441,8 +441,8 @@ fn indexes_real_world_rust_graph_patterns() {
         "syntactic serve callers should avoid receiver/name fallback: {syntactic_callers:?}"
     );
     let callers = db
-        .find_callers_with_options("serve", 10, &crate::query::graph::GraphTraversalOptions {
-            resolution_mode: crate::query::graph::GraphResolutionMode::Fuzzy,
+        .find_callers_with_options("serve", 10, &rag_rat_query::graph::GraphTraversalOptions {
+            resolution_mode: rag_rat_query::graph::GraphResolutionMode::Fuzzy,
             ..Default::default()
         })
         .unwrap();
@@ -656,11 +656,11 @@ struct Runner: Worker<Service> {
         })
         .unwrap();
     for resolution_mode in [
-        crate::query::graph::GraphResolutionMode::Exact,
-        crate::query::graph::GraphResolutionMode::Syntactic,
+        rag_rat_query::graph::GraphResolutionMode::Exact,
+        rag_rat_query::graph::GraphResolutionMode::Syntactic,
     ] {
         let callees = db
-            .trace_callees_with_options("<+>", 20, &crate::query::graph::GraphTraversalOptions {
+            .trace_callees_with_options("<+>", 20, &rag_rat_query::graph::GraphTraversalOptions {
                 resolution_mode,
                 symbol_id: Some(operator_function_id),
                 ..Default::default()
@@ -863,7 +863,7 @@ fn indexes_real_world_typescript_graph_patterns() {
     assert_edge(&db, "Shell", "DefaultWidget", "references_type", "Syntactic");
     assert_edge(&db, "DefaultWidget", "WidgetProps", "references_type", "Syntactic");
     let callees = db
-        .trace_callees_with_options("Shell", 10, &crate::query::graph::GraphTraversalOptions {
+        .trace_callees_with_options("Shell", 10, &rag_rat_query::graph::GraphTraversalOptions {
             include_references: true,
             edge_kinds: None,
             ..Default::default()
@@ -1479,7 +1479,7 @@ fn impact_surface_collapses_file_matches_to_one_row_per_file() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let selector = crate::query::symbol::SymbolSelector {
+    let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -1493,7 +1493,7 @@ fn impact_surface_collapses_file_matches_to_one_row_per_file() {
         .impact_surface_report_for_selected_symbol(
             &symbol,
             50,
-            &crate::query::impact::ImpactSurfaceOptions::default(),
+            &rag_rat_query::impact::ImpactSurfaceOptions::default(),
         )
         .unwrap();
 
@@ -1746,7 +1746,7 @@ where
         .trace_callees_with_options(
             "spawn_blocking",
             20,
-            &crate::query::graph::GraphTraversalOptions {
+            &rag_rat_query::graph::GraphTraversalOptions {
                 include_references: true,
                 edge_kinds: None,
                 ..Default::default()
@@ -1762,7 +1762,7 @@ where
         .trace_callees_with_options(
             "spawn_blocking",
             20,
-            &crate::query::graph::GraphTraversalOptions {
+            &rag_rat_query::graph::GraphTraversalOptions {
                 include_unresolved: true,
                 ..Default::default()
             },
@@ -1819,7 +1819,7 @@ pub fn caller(input: Result<String, String>) -> String {
     );
 
     let expanded = db
-        .trace_callees_with_options("caller", 20, &crate::query::graph::GraphTraversalOptions {
+        .trace_callees_with_options("caller", 20, &rag_rat_query::graph::GraphTraversalOptions {
             include_unresolved: true,
             include_macros: true,
             include_common_methods: true,
@@ -1950,8 +1950,8 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
         .find(|symbol| symbol.qualified_name.contains("WatchProposalBuilder"))
         .expect("WatchProposalBuilder.build symbol");
     let callers = db
-        .find_callers_with_options("build", 20, &crate::query::graph::GraphTraversalOptions {
-            resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+        .find_callers_with_options("build", 20, &rag_rat_query::graph::GraphTraversalOptions {
+            resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
             symbol_id: Some(target.symbol_id),
             ..Default::default()
         })

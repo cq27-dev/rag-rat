@@ -392,7 +392,8 @@ impl IndexDatabase {
             "UPDATE main.files SET generated = ?2 WHERE id = ?1 AND generated != ?2",
         )?;
         for (id, path, kind) in rows {
-            let generated = kind == TargetKind::Generated.as_str() || is_generated_path(&path);
+            let generated = kind == TargetKind::Generated.as_str()
+                || rag_rat_base::path_class::is_generated_path(&path);
             update.execute(params![id, generated])?;
         }
         Ok(())

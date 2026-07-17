@@ -1011,7 +1011,7 @@ fn mcp_rewrites_ranking_hint_when_auto_run_enabled() {
     let auto = call_tool_for_config(&config, "important_symbols", json!({"limit": 5})).unwrap();
     assert_eq!(
         auto["ranking_hint"].as_str(),
-        Some(rag_rat_core::query::pagerank::RANKING_HINT_AUTO_RUN),
+        Some(rag_rat_query::pagerank::RANKING_HINT_AUTO_RUN),
         "auto_run must rewrite the heuristic nudge: {auto:?}"
     );
 
@@ -1020,7 +1020,7 @@ fn mcp_rewrites_ranking_hint_when_auto_run_enabled() {
     let manual = call_tool_for_config(&config, "important_symbols", json!({"limit": 5})).unwrap();
     assert_eq!(
         manual["ranking_hint"].as_str(),
-        Some(rag_rat_core::query::pagerank::RANKING_HINT_RUN_ORACLE),
+        Some(rag_rat_query::pagerank::RANKING_HINT_RUN_ORACLE),
     );
 
     let _ = std::fs::remove_dir_all(root);

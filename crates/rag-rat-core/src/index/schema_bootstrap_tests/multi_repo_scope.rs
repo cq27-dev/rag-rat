@@ -593,7 +593,7 @@ fn repo_brief_edges_are_scoped_to_the_active_repo() {
     );
 
     // The connection is scoped to repo A (as rebuild left it), so the brief counts repo A's edges.
-    let summary = crate::query::repo_brief::summary_counts(conn).unwrap();
+    let summary = rag_rat_query::repo_brief::summary_counts(conn).unwrap();
     assert_eq!(
         summary.graph_edges,
         u64::try_from(repo_a_edges).unwrap(),
@@ -907,9 +907,11 @@ fn papertrail_queries_never_surface_the_other_repo() {
 // `repo_registry.rs`; these tests pin the cross-repo SCOPING BEHAVIOR of the query sweeps.
 // ================================================================================================
 
-use crate::query::memory::{
-    RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryCreateResult, create_memory, memory_search,
+use rag_rat_query::memory::{
+    RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryCreateResult, memory_search,
 };
+
+use crate::memory_write::create_memory;
 
 const A5_REPO_A: &str = "a5-repo-a";
 const A5_REPO_B: &str = "a5-repo-b";
@@ -1187,9 +1189,9 @@ fn clone_token_df_recompute_excludes_a_sibling_repos_fingerprints() {
 /// sibling memory is left untouched.
 #[test]
 fn memory_by_id_read_and_mutations_refuse_a_sibling_repos_memory() {
-    use crate::query::memory::{
-        RepoMemoryUpdate, mark_obsolete, memory_by_id, rebind_memory, update_memory,
-    };
+    use rag_rat_query::memory::{RepoMemoryUpdate, memory_by_id};
+
+    use crate::memory_write::{mark_obsolete, rebind_memory, update_memory};
     let conn = a5_scoped_two_repo_conn();
 
     a5_set_active_repo(&conn, A5_REPO_A);
@@ -1240,7 +1242,7 @@ fn memory_by_id_read_and_mutations_refuse_a_sibling_repos_memory() {
 /// the binding-scoped sweeps while the parent memory stays in its repo.
 #[test]
 fn rebind_keeps_bindings_on_the_parent_memorys_repo() {
-    use crate::query::memory::rebind_memory;
+    use crate::memory_write::rebind_memory;
     let conn = a5_scoped_two_repo_conn();
     a5_set_active_repo(&conn, A5_REPO_A);
     let a = a5_create_memory(&conn, "rebind me", "body", "c-old");
@@ -1274,7 +1276,7 @@ fn rebind_keeps_bindings_on_the_parent_memorys_repo() {
 /// repo's re-resolution — turning a unique match ambiguous, or relocating onto the sibling symbol.
 #[test]
 fn resolve_moniker_ignores_a_sibling_repos_moniker_row() {
-    use crate::query::memory::{MonikerResolution, resolve_moniker};
+    use rag_rat_query::memory::{MonikerResolution, resolve_moniker};
     let conn = a5_scoped_two_repo_conn();
 
     // The same moniker string "M" under the same tool in BOTH repos, each with a live logical
@@ -1616,11 +1618,11 @@ fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
 /// scoped read must return each repo's OWN row.
 #[test]
 fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
-    use crate::query::memory::current_summary_and_verdict;
+    use rag_rat_query::memory::current_summary_and_verdict;
     let conn = a5_scoped_two_repo_conn();
     let title = "a shared note title";
     let body = "a body shared by both repos' notes";
-    let content_hash = crate::dream::note_content_hash(title, body);
+    let content_hash = rag_rat_query::memory::evidence::note_content_hash(title, body);
 
     // Same (memory_id, content_hash) under BOTH repos — distinct summary text + verdict per repo.
     for (repo, summary, verdict) in [
@@ -1630,15 +1632,23 @@ fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
         conn.execute(
             "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
              prompt_version, generated_at_ms) VALUES ('shared_mem', ?1, ?2, ?3, ?4, 0)",
-            rusqlite::params![repo, content_hash, summary, crate::dream::COMPACT_PROMPT_VERSION],
+            rusqlite::params![
+                repo,
+                content_hash,
+                summary,
+                rag_rat_query::memory::evidence::COMPACT_PROMPT_VERSION
+            ],
         )
         .unwrap();
         // Stamp the current evidence hash (empty value — `shared_mem` has no bindings/identifiers)
         // and the current verdict prompt version so the hydrator's stale gates show the marker; the
         // point of THIS test is repo scoping.
-        let inputs =
-            crate::dream::checked_inputs_hash(&conn, "shared_mem", &Some(repo.to_string()))
-                .unwrap();
+        let inputs = rag_rat_query::memory::evidence::checked_inputs_hash(
+            &conn,
+            "shared_mem",
+            &Some(repo.to_string()),
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
              checked_inputs_hash, prompt_version, checked_at_ms) VALUES ('shared_mem', ?1, ?2, \
@@ -1648,7 +1658,7 @@ fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
                 content_hash,
                 verdict,
                 inputs,
-                crate::dream::VERDICT_PROMPT_VERSION
+                rag_rat_query::memory::evidence::VERDICT_PROMPT_VERSION
             ],
         )
         .unwrap();
@@ -1685,7 +1695,7 @@ fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
 /// the repo INTO the hash strengthens that (phase B replication relies on it).
 #[test]
 fn memory_ids_fold_the_repo_so_same_millisecond_identical_content_cannot_collide() {
-    use crate::query::memory::memory_id;
+    use rag_rat_query::memory::memory_id;
     let input_hash = "0123456789abcdef0123456789abcdef";
     let a = memory_id(1_000, input_hash, &Some(A5_REPO_A.to_string()));
     let b = memory_id(1_000, input_hash, &Some(A5_REPO_B.to_string()));
@@ -1765,8 +1775,8 @@ fn memory_summary_readers_exclude_a_sibling_repos_memory() {
     // (a) repo_brief: the summary + per-path memory counts exclude the sibling.
     let brief = fx
         .db
-        .repo_brief(crate::query::repo_brief::RepoBriefOptions {
-            mode: crate::query::repo_brief::RepoBriefMode::Spine,
+        .repo_brief(rag_rat_query::repo_brief::RepoBriefOptions {
+            mode: rag_rat_query::repo_brief::RepoBriefMode::Spine,
             limit: 50,
             include_generated: true,
             include_memories: true,
@@ -1785,7 +1795,7 @@ fn memory_summary_readers_exclude_a_sibling_repos_memory() {
 
     // (b) tree: the root dir-memory title is not the sibling's.
     let tree =
-        crate::query::tree::dir_tree(conn, &crate::query::tree::TreeOpts::default()).unwrap();
+        rag_rat_query::tree::dir_tree(conn, &rag_rat_query::tree::TreeOpts::default()).unwrap();
     assert_ne!(
         tree.root_memory_title.as_deref(),
         Some("REPO B SECRET"),

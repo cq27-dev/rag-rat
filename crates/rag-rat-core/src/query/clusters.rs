@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use rag_rat_query::repo_brief::{
+    self, FileBriefRow, RepoBriefMemoryCounts, enrich_memory_counts, enrich_symbol_kinds,
+};
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -7,9 +10,6 @@ use serde::Serialize;
 // (`impact_surface`) so the transient (this file) and windowed/persisted (change_coupling)
 // consumers can't drift.
 use crate::index::change_coupling::MAX_COUPLING_COMMIT_FILES as MAX_COTOUCH_COMMIT_FILES;
-use crate::query::repo_brief::{
-    self, FileBriefRow, RepoBriefMemoryCounts, enrich_memory_counts, enrich_symbol_kinds,
-};
 
 const MAX_PATH_BUCKET_FILES: usize = 120;
 const MAX_CLUSTER_PATHS: usize = 8;
@@ -458,7 +458,7 @@ fn file_representative_score(row: &FileBriefRow) -> f64 {
 }
 
 fn cluster_score(metrics: &RepoClusterMetrics, avg_edge_score: f64) -> f64 {
-    super::round_score(capped(
+    rag_rat_query::round_score(capped(
         avg_edge_score * 0.35
             + capped(metrics.file_count as f64 / 12.0) * 0.12
             + capped((metrics.fan_in + metrics.fan_out) as f64 / 100.0) * 0.18

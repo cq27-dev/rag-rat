@@ -85,7 +85,7 @@ impl IndexDatabase {
     /// committed, so its authored write (a durable `IMMEDIATE` txn only when a ghost exists)
     /// never nests inside it.
     pub(crate) fn heal_memory_oplog_ghosts(&self) -> anyhow::Result<()> {
-        crate::query::memory::backfill_memory_oplog(
+        crate::memory_write::backfill_memory_oplog(
             self.storage.connection(),
             rag_rat_base::time::now_ms(),
         )

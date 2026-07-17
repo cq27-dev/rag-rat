@@ -565,9 +565,9 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
 
     // Round-trip through the production read paths: exact lookup (lookup_symbol_path) + logical
     // read.
-    let hit = crate::query::symbol::lookup_candidates(
+    let hit = rag_rat_query::symbol::lookup_candidates(
         &conn,
-        &crate::query::symbol::SymbolSelector {
+        &rag_rat_query::symbol::SymbolSelector {
             logical_symbol_id: None,
             symbol_id: None,
             symbol_path: Some(symbol_qn.to_string()),
@@ -584,7 +584,7 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
         Some(symbol_qn),
         "lookup_symbol_path resolves the interned qualified name"
     );
-    let logical = crate::query::symbol::lookup_logical_by_id(&conn, 7).unwrap().unwrap();
+    let logical = rag_rat_query::symbol::lookup_logical_by_id(&conn, 7).unwrap().unwrap();
     assert_eq!(logical.qualified_name, logical_qn, "logical read reconstructs the qname");
 }
 
@@ -939,7 +939,7 @@ fn orientation_composes_read_only() {
     create_dir_memory(&db, "root purpose", Some("".to_string()));
 
     // Non-dir memory bound to a specific path — should appear in active_memory_titles.
-    db.memory_create(crate::query::memory::RepoMemoryCreate {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
         kind: "Decision".to_string(),
         title: "path memory title".to_string(),
         body: "bound to src/a/x.rs".to_string(),
@@ -948,7 +948,7 @@ fn orientation_composes_read_only() {
         source: Some("agent".to_string()),
         tags: vec![],
         payload_json: None,
-        bind: crate::query::memory::RepoMemoryBindTarget {
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
             path: Some("src/a/x.rs".to_string()),
             logical_symbol_id: None,
             symbol_id: None,

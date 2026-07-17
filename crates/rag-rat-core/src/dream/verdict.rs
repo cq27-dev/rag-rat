@@ -21,6 +21,14 @@
 //!     proposes — #262's review flow decides, and nothing here mutates a memory's status.
 
 use rag_rat_db::schema;
+/// The verdict prompt version, stamped into `memory_reality.prompt_version`. Bump on any
+/// change to [`VERDICT_PROMPT_HEAD`] or the pack rendering so a stale-prompt verdict is
+/// distinguishable — a bump re-queues every prior verdict
+/// (`VerificationReason::PromptChanged`) and the finding surface stops reporting stale-prompt
+/// verdicts until they are re-checked. v2: the identifier resolver gained a verbatim-text
+/// tier plus a shape-split terminal, and the prompt teaches those labels, so v1 verdicts
+/// (which over-reported divergence off bare NOT-FOUND rows) are not comparable.
+pub(crate) use rag_rat_query::memory::evidence::VERDICT_PROMPT_VERSION as PROMPT_VERSION;
 use rusqlite::Connection;
 
 use super::DreamFinding;
@@ -32,14 +40,6 @@ use super::verify::{
     self, EvidencePack, IdentifierResolution, ResolutionKind, VerificationQueueEntry,
     evidence_pack, verification_queue,
 };
-
-/// The verdict prompt version, stamped into `memory_reality.prompt_version`. Bump on any change to
-/// [`VERDICT_PROMPT_HEAD`] or the pack rendering so a stale-prompt verdict is distinguishable — a
-/// bump re-queues every prior verdict (`VerificationReason::PromptChanged`) and the finding surface
-/// stops reporting stale-prompt verdicts until they are re-checked. v2: the identifier resolver
-/// gained a verbatim-text tier + a shape-split terminal, and the prompt teaches those labels, so v1
-/// verdicts (which over-reported divergence off bare NOT-FOUND rows) are not comparable.
-pub(crate) const PROMPT_VERSION: &str = "verify-pack-v3";
 
 /// Rank for a `memory_divergence` finding — high, but below a broken-anchor's pass-0 signal.
 const DIVERGENCE_RANK: f64 = 0.8;

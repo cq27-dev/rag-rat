@@ -6,6 +6,7 @@ members = [
   "crates/rag-rat-llm",
   "crates/rag-rat-oracle",
   "crates/rag-rat-papertrail",
+  "crates/rag-rat-query",
   "crates/rag-rat-cli",
   "crates/rag-rat-core",
   "crates/rag-rat-mcp",
@@ -40,6 +41,7 @@ rag-rat-db = { version = "0.19.0", path = "crates/rag-rat-db", default-features 
 rag-rat-llm = { version = "0.19.0", path = "crates/rag-rat-llm", default-features = false }
 rag-rat-oracle = { version = "0.19.0", path = "crates/rag-rat-oracle", default-features = false }
 rag-rat-papertrail = { version = "0.19.0", path = "crates/rag-rat-papertrail", default-features = false }
+rag-rat-query = { version = "0.19.0", path = "crates/rag-rat-query", default-features = false }
 rag-rat-core = { version = "0.19.0", path = "crates/rag-rat-core", default-features = false }
 rag-rat-mcp = { version = "0.19.0", path = "crates/rag-rat-mcp", default-features = false }
 anyhow = "1.0"
@@ -97,8 +99,10 @@ sha2 = "0.11"
 # size budget is explicitly waived for SCIP; do NOT feature-gate or hand-copy the proto.
 # `protobuf` is scip's own transitive dep, pulled in directly so we can call `Message::parse_*`
 # on the generated SCIP types; pinned to the version scip 0.8 generates against.
+minicbor = { version = "2.2.2", features = ["alloc"] }
 protobuf = "3.7"
 scip = "0.8.1"
+unicode-normalization = "0.1.25"
 # On-demand stack growth for the tree-sitter descent helpers. A hostile source file (a callee that
 # is thousands of nested parens, a thousands-deep generic type) parses within budget but recursing
 # its subtree to find a name/identifier would overflow the indexer's worker-thread stack; `stacker`

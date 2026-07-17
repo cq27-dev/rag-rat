@@ -1473,7 +1473,7 @@ fn symbol_search_excludes_generated_bindings_unless_opted_in() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let by_name = || crate::query::symbol::SymbolSelector {
+    let by_name = || rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: None,
         symbol_path: None,
@@ -1502,7 +1502,7 @@ fn symbol_search_excludes_generated_bindings_unless_opted_in() {
 
     // An explicit symbol_id pick of the generated symbol is honored regardless of the filter —
     // the exclusion only governs name/path *search*, not a deliberate selection.
-    let by_id = crate::query::symbol::SymbolSelector {
+    let by_id = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
         symbol_id: Some(generated.symbol_id),
         symbol_path: None,

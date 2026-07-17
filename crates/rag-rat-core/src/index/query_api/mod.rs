@@ -1,11 +1,12 @@
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::paths::path_string;
 use rag_rat_db::schema;
+use rag_rat_query::memory::AnchorHealth;
+use rag_rat_query::text_compare::*;
 use rusqlite::OptionalExtension;
 
 use super::*;
 use crate::index::staleness::Heal;
-use crate::query::text_compare::*;
 use crate::search::lexical::SearchOptions;
 
 mod ai_lifecycle;
@@ -85,7 +86,7 @@ impl IndexDatabase {
             git_history: self.git_history_status()?,
             papertrail: self.papertrail_status()?,
             llm: self.llm_status()?,
-            anchor_health: crate::query::memory::anchor_health_counts(self.storage.connection())
+            anchor_health: rag_rat_query::memory::anchor_health_counts(self.storage.connection())
                 .unwrap_or_default(),
         })
     }
@@ -93,7 +94,7 @@ impl IndexDatabase {
     /// Read-only count of active repo-memory bindings grouped by anchor_status.
     /// Does not run `memory_validate`; reads persisted anchor_status values only.
     pub fn memory_anchor_health(&self) -> anyhow::Result<AnchorHealth> {
-        crate::query::memory::anchor_health_counts(self.storage.connection())
+        rag_rat_query::memory::anchor_health_counts(self.storage.connection())
     }
 
     pub fn storage_status(&self) -> anyhow::Result<StorageStatus> {
@@ -147,19 +148,19 @@ impl IndexDatabase {
         name: &str,
         language: Option<Language>,
         limit: u32,
-    ) -> anyhow::Result<Vec<crate::query::symbol::SymbolHit>> {
+    ) -> anyhow::Result<Vec<rag_rat_query::symbol::SymbolHit>> {
         let mut hits =
-            crate::query::symbol::lookup(self.storage.connection(), name, language, limit)?;
+            rag_rat_query::symbol::lookup(self.storage.connection(), name, language, limit)?;
         self.enrich_symbol_hits_with_load_bearing(&mut hits)?;
         Ok(hits)
     }
 
     pub fn symbol_candidates(
         &self,
-        selector: &crate::query::symbol::SymbolSelector,
+        selector: &rag_rat_query::symbol::SymbolSelector,
         include_generated: bool,
-    ) -> anyhow::Result<crate::query::symbol::SymbolLookup> {
-        let mut lookup = crate::query::symbol::lookup_candidates(
+    ) -> anyhow::Result<rag_rat_query::symbol::SymbolLookup> {
+        let mut lookup = rag_rat_query::symbol::lookup_candidates(
             self.storage.connection(),
             selector,
             include_generated,
@@ -171,7 +172,7 @@ impl IndexDatabase {
             && selector_is_name_based(selector)
             && self.heal_changed_for_zero_hit()?
         {
-            lookup = crate::query::symbol::lookup_candidates(
+            lookup = rag_rat_query::symbol::lookup_candidates(
                 self.storage.connection(),
                 selector,
                 include_generated,
@@ -185,7 +186,7 @@ impl IndexDatabase {
         let stale = self.stale_source_paths(&paths)?;
         if !stale.is_empty() {
             self.heal_stale_paths(&stale)?; // NeedsReindex beyond the cap
-            let healed = crate::query::symbol::lookup_candidates(
+            let healed = rag_rat_query::symbol::lookup_candidates(
                 self.storage.connection(),
                 selector,
                 include_generated,
@@ -383,25 +384,31 @@ impl IndexDatabase {
 
     pub fn select_symbol(
         &self,
-        selector: &crate::query::symbol::SymbolSelector,
+        selector: &rag_rat_query::symbol::SymbolSelector,
     ) -> anyhow::Result<
-        Result<Option<crate::query::symbol::SymbolHit>, crate::query::symbol::SymbolDisambiguation>,
+        Result<
+            Option<rag_rat_query::symbol::SymbolHit>,
+            rag_rat_query::symbol::SymbolDisambiguation,
+        >,
     > {
-        crate::query::symbol::select_one(self.storage.connection(), selector)
+        rag_rat_query::symbol::select_one(self.storage.connection(), selector)
     }
 
     /// Resolve a selector to a single symbol for `memory rebind`, collapsing a cfg-split / overload
     /// group (all candidates sharing one logical symbol) to one member instead of disambiguating.
     pub fn select_symbol_for_bind(
         &self,
-        selector: &crate::query::symbol::SymbolSelector,
+        selector: &rag_rat_query::symbol::SymbolSelector,
     ) -> anyhow::Result<
-        Result<Option<crate::query::symbol::SymbolHit>, crate::query::symbol::SymbolDisambiguation>,
+        Result<
+            Option<rag_rat_query::symbol::SymbolHit>,
+            rag_rat_query::symbol::SymbolDisambiguation,
+        >,
     > {
-        crate::query::symbol::select_one_for_bind(self.storage.connection(), selector)
+        rag_rat_query::symbol::select_one_for_bind(self.storage.connection(), selector)
     }
 
-    pub fn read_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<crate::query::ReadChunk>> {
+    pub fn read_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<rag_rat_query::ReadChunk>> {
         // Internal/CLI/test entry — always the FULL memory bodies; the surface-aware path is the
         // MCP `read_chunk` tool, which calls `read_chunk_with_graph_and_memories` with the
         // config surface.
@@ -419,7 +426,7 @@ impl IndexDatabase {
         chunk_id: i64,
         graph_mode: GraphMetaMode,
         graph_limit: u32,
-    ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
+    ) -> anyhow::Result<Option<rag_rat_query::ReadChunk>> {
         // `include_memories = false`, so the surface never applies — pass `Full`.
         self.read_chunk_with_graph_and_memories(
             chunk_id,
@@ -437,7 +444,7 @@ impl IndexDatabase {
         graph_limit: u32,
         include_memories: bool,
         surface: rag_rat_base::config::MemorySurface,
-    ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
+    ) -> anyhow::Result<Option<rag_rat_query::ReadChunk>> {
         let Some(mut chunk) = self.read_chunk_current(chunk_id)? else {
             return Ok(None);
         };
@@ -456,8 +463,8 @@ impl IndexDatabase {
             chunk.memories = crate::index::retry_once_on_fts_corruption(
                 || {
                     let mut memories =
-                        crate::query::memory::memories_for_chunk(conn, chunk_id, 20)?;
-                    crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                        rag_rat_query::memory::memories_for_chunk(conn, chunk_id, 20)?;
+                    rag_rat_query::memory::apply_memory_surface(conn, &mut memories, surface)?;
                     Ok(memories)
                 },
                 || self.heal_corrupt_fts(),
@@ -469,8 +476,8 @@ impl IndexDatabase {
     pub(crate) fn read_chunk_current(
         &self,
         chunk_id: i64,
-    ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
-        let dicts = crate::query::chunk_text_dicts(self.storage.connection())?;
+    ) -> anyhow::Result<Option<rag_rat_query::ReadChunk>> {
+        let dicts = rag_rat_query::chunk_text_dicts(self.storage.connection())?;
         let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
         self.read_chunk_current_with(chunk_id, &mut decoder)
     }
@@ -481,9 +488,9 @@ impl IndexDatabase {
         &self,
         chunk_id: i64,
         decoder: &mut rag_rat_db::text_compression::ChunkTextDecoder,
-    ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
+    ) -> anyhow::Result<Option<rag_rat_query::ReadChunk>> {
         let Some(mut chunk) =
-            crate::query::read_chunk_with(self.storage.connection(), chunk_id, decoder)?
+            rag_rat_query::read_chunk_with(self.storage.connection(), chunk_id, decoder)?
         else {
             return Ok(None);
         };
@@ -539,7 +546,7 @@ impl IndexDatabase {
             AnchorStatus::Stale => {
                 self.heal_file(Path::new(&chunk.path))?;
                 self.sync_fts()?;
-                let healed = crate::query::read_chunk(self.storage.connection(), chunk_id)?;
+                let healed = rag_rat_query::read_chunk(self.storage.connection(), chunk_id)?;
                 match healed {
                     Some(chunk) => Ok(Some(chunk)),
                     None => anyhow::bail!(IndexError::StaleChunk { chunk_id, path: chunk.path }),
@@ -633,9 +640,9 @@ impl IndexDatabase {
 
     pub fn repo_brief(
         &self,
-        options: crate::query::repo_brief::RepoBriefOptions,
-    ) -> anyhow::Result<crate::query::repo_brief::RepoBrief> {
-        crate::query::repo_brief::repo_brief(self.storage.connection(), options)
+        options: rag_rat_query::repo_brief::RepoBriefOptions,
+    ) -> anyhow::Result<rag_rat_query::repo_brief::RepoBrief> {
+        rag_rat_query::repo_brief::repo_brief(self.storage.connection(), options)
     }
 
     pub fn repo_clusters(
@@ -650,7 +657,7 @@ impl IndexDatabase {
 /// id. Only name lookups get the #152 zero-hit heal: a miss on a `symbol_id`/`logical_symbol_id`
 /// isn't a "just added" symbol, just a stale or wrong id, so re-indexing the change set wouldn't
 /// recover it and would put a `git status` on every such miss.
-fn selector_is_name_based(selector: &crate::query::symbol::SymbolSelector) -> bool {
+fn selector_is_name_based(selector: &rag_rat_query::symbol::SymbolSelector) -> bool {
     // A `sym_<hex>` handle in the ref/symbol_path slot is id-based (#201), not a name — exclude
     // both a handle that RESOLVES and one that's merely handle-SHAPED but malformed (typo/bad
     // hex). Either way it must fail cheaply like `id`, never be misread as a name/path miss
@@ -682,8 +689,8 @@ fn resolved_external_label(scip_symbol: &str) -> Option<String> {
 /// counts only the displayed window and 7 the whole graph). The honest statement is the count over
 /// what was shown.
 fn annotate_completeness_with_externals(
-    summary: &mut crate::query::graph::GraphTraversalSummary,
-    hops: &[crate::query::graph::GraphHop],
+    summary: &mut rag_rat_query::graph::GraphTraversalSummary,
+    hops: &[rag_rat_query::graph::GraphHop],
 ) {
     let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut external_count = 0u64;
@@ -716,7 +723,7 @@ mod oracle_surfacing_tests;
 
 #[cfg(test)]
 mod name_based_tests {
-    use crate::query::symbol::SymbolSelector;
+    use rag_rat_query::symbol::SymbolSelector;
 
     fn selector(symbol: Option<&str>, symbol_path: Option<&str>) -> SymbolSelector {
         SymbolSelector {

@@ -449,7 +449,8 @@ fn make_symbol(
     let start_line = node.start_position().row + 1;
     let end_line = node.end_position().row + 1;
     let scope_path = scope_path(backend, node, text, &name);
-    let is_test = is_test_path(path) || backend.is_test_symbol(text, node, &scope_path, &name);
+    let is_test = rag_rat_base::path_class::is_test_path(path)
+        || backend.is_test_symbol(text, node, &scope_path, &name);
     ParsedSymbol {
         qualified_name: format!("{}::{name}", path.to_string_lossy().replace('\\', "/")),
         scope_path,
@@ -464,42 +465,6 @@ fn make_symbol(
         is_test,
         facts: backend.symbol_facts(text, node),
     }
-}
-
-/// The CANONICAL cross-language test-path detector (#294) — the one reused by the indexer (the
-/// `is_test` computation) AND the query layer (`staleness` test-file skip, `graph` test-callsite
-/// filter, `repo_brief` support-path down-weight). A test path is any of: a test directory segment
-/// (`tests`/`test`/`__tests__`/`__mocks__`/`spec`, case-insensitive), `conftest.py`, a `*.test.*` /
-/// `*.spec.*` filename, or a stem like `test`/`tests` / `test_*` / `*_test` / `*_tests` / `*Test` /
-/// `*Tests` / `*TestCase`. Takes `impl AsRef<Path>` so both `&Path` (parser) and `&str` (the query
-/// callers' stored path strings) pass directly.
-pub(crate) fn is_test_path(path: impl AsRef<Path>) -> bool {
-    let path = path.as_ref();
-    if path.components().filter_map(|component| component.as_os_str().to_str()).any(|segment| {
-        matches!(
-            segment.to_ascii_lowercase().as_str(),
-            "tests" | "test" | "__tests__" | "__test__" | "__mocks__" | "spec" | "specs"
-        )
-    }) {
-        return true;
-    }
-    let file = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
-    if file == "conftest.py" {
-        return true;
-    }
-    let lower = file.to_ascii_lowercase();
-    if lower.contains(".test.") || lower.contains(".spec.") {
-        return true;
-    }
-    let stem = file.split('.').next().unwrap_or(file);
-    stem == "test"
-        || stem == "tests"
-        || stem.starts_with("test_")
-        || stem.ends_with("_test")
-        || stem.ends_with("_tests")
-        || stem.ends_with("Test")
-        || stem.ends_with("Tests")
-        || stem.ends_with("TestCase")
 }
 
 pub(super) fn node_text(node: Node<'_>, text: &str) -> Option<String> {
@@ -664,7 +629,7 @@ mod is_test_detection {
 
     #[test]
     fn canonical_is_test_path_covers_the_union_of_conventions() {
-        use super::is_test_path;
+        use rag_rat_base::path_class::is_test_path;
         // Directory segments (case-insensitive), incl. repo_brief's `__mocks__`.
         for p in [
             "crates/x/tests/foo.rs",

@@ -12,8 +12,8 @@
 use std::collections::BTreeMap;
 
 use rag_rat_base::config::Config;
-use rag_rat_core::query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
-use rag_rat_core::query::symbol::SymbolSelector;
+use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
+use rag_rat_query::symbol::SymbolSelector;
 use serde::Deserialize;
 
 use crate::cli::DumpVerifyPacksArgs;

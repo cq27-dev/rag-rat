@@ -288,11 +288,11 @@ pub(crate) fn build_class(
 
     // Load-bearing factor: 1 + ln(1 + max_fan_in_score) over members. Fan-in proxy via
     // `scoped_weighted_fan_in` (heuristic-only, no oracle data at this call site).
-    let oracle = crate::query::load_bearing::OracleContext::none();
+    let oracle = rag_rat_query::load_bearing::OracleContext::none();
     let max_importance = component
         .iter()
         .filter_map(|&id| {
-            crate::query::load_bearing::scoped_weighted_fan_in(conn, id, &oracle)
+            rag_rat_query::load_bearing::scoped_weighted_fan_in(conn, id, &oracle)
                 .ok()
                 .flatten()
                 .map(|e| e.score)
