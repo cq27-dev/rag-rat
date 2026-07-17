@@ -46,6 +46,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
 
     let invalid = papertrail::block_on(papertrail::sync_issue::<MockGitHubClient>(
         db.storage.connection(),
+        std::path::Path::new("."),
         "not-a-ref",
         None,
         false,
@@ -57,6 +58,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
 
     let missing_client = papertrail::block_on(papertrail::sync_issue::<MockGitHubClient>(
         db.storage.connection(),
+        std::path::Path::new("."),
         "cq27-dev/rag-rat#42",
         None,
         false,
@@ -81,6 +83,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
 
     let live = papertrail::block_on(papertrail::sync_issue(
         db.storage.connection(),
+        std::path::Path::new("."),
         "cq27-dev/rag-rat#42",
         Some(&MockGitHubClient),
         false,
@@ -103,6 +106,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
     };
     let explicit_without_github_binding = papertrail::block_on(papertrail::sync_issue(
         db.storage.connection(),
+        std::path::Path::new("."),
         "cq27-dev/rag-rat#43",
         Some(&MockGitHubClient),
         false,
@@ -114,6 +118,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
 
     let offline = papertrail::block_on(papertrail::sync_issue::<MockGitHubClient>(
         db.storage.connection(),
+        std::path::Path::new("."),
         "cq27-dev/rag-rat#43",
         None,
         true,

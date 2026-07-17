@@ -47,6 +47,10 @@ pub(crate) struct GitHubClient {
     api_origin: String,
     core: Transport,
     search: Transport,
+    graphql: Transport,
+    /// Capability memo: set after a probe-shaped failure (404/400 from a GHE build without the
+    /// GraphQL endpoint) so a dead endpoint is not re-tried on every page of every sync.
+    graphql_unavailable: std::sync::atomic::AtomicBool,
 }
 
 impl GitHubClient {
@@ -76,7 +80,18 @@ impl GitHubClient {
                 token.as_deref(),
             )
         };
-        Ok(Self { api_origin, core: transport("core")?, search: transport("search")? })
+        Ok(Self {
+            api_origin,
+            core: transport("core")?,
+            search: transport("search")?,
+            // GraphQL is metered on its OWN points budget — a distinct governor lane so REST
+            // and GraphQL response headers can never corrupt each other's remaining-quota view.
+            graphql: transport("graphql")?,
+            // GitHub's GraphQL endpoint ALWAYS requires a token (unlike its public REST reads),
+            // so a token-less public binding has no attested supply — start the lane disabled
+            // rather than failing an unauthenticated GraphQL call on every sync.
+            graphql_unavailable: std::sync::atomic::AtomicBool::new(token.is_none()),
+        })
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -114,6 +129,97 @@ impl GitHubClient {
         Ok(url.into())
     }
 }
+
+impl GitHubClient {
+    /// The GraphQL endpoint for this binding's API origin: cloud `api.github.com` serves
+    /// `/graphql`; a GitHub Enterprise origin (`…/api/v3`) serves `…/api/graphql`.
+    fn graphql_endpoint(&self) -> String {
+        match self.api_origin.strip_suffix("/api/v3") {
+            Some(base) => format!("{base}/api/graphql"),
+            None => format!("{}/graphql", self.api_origin),
+        }
+    }
+
+    /// One GraphQL request through the dedicated lane. `Ok(None)` = capability unavailable
+    /// (memoized after a probe-shaped 400/404/410 — GHE builds without the endpoint).
+    async fn graphql_query(&self, query: &str, variables: Value) -> anyhow::Result<Option<Value>> {
+        use std::sync::atomic::Ordering;
+        if self.graphql_unavailable.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let body = serde_json::json!({ "query": query, "variables": variables });
+        let response =
+            self.graphql.post_json(&self.graphql_endpoint(), &github_headers(), &body).await?;
+        // 400/404/410 = no endpoint (GHE build without GraphQL); 401/403 = auth the lane can't
+        // satisfy (token lacks scope, or SSO not authorized). All are capability-unavailable:
+        // memoize and degrade to the text tier rather than retrying the impossible call.
+        if matches!(response.status, 400 | 401 | 403 | 404 | 410) {
+            self.graphql_unavailable.store(true, Ordering::Relaxed);
+            return Ok(None);
+        }
+        ensure_success(response.status, &response.body)?;
+        let value: Value = serde_json::from_str(&response.body)?;
+        if let Some(errors) = value.get("errors").and_then(Value::as_array)
+            && !errors.is_empty()
+        {
+            // GitHub GraphQL signals a primary/secondary rate limit as HTTP 200 + an errors
+            // payload of `type: RATE_LIMITED` (the transport's status-based limiter can't see
+            // it). Map it to a transport PAUSE so `run_binding_job` honors the reset time instead
+            // of recording the binding healthy with a stale watermark. `x-ratelimit-reset` is
+            // epoch seconds; without it there is no resume time, so fall through to a plain error.
+            let rate_limited = errors.iter().any(|error| {
+                error["type"].as_str() == Some("RATE_LIMITED")
+                    || error["message"]
+                        .as_str()
+                        .is_some_and(|message| message.to_ascii_lowercase().contains("rate limit"))
+            });
+            if rate_limited
+                && let Some(reset_ms) = response
+                    .headers
+                    .get("x-ratelimit-reset")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .map(|reset_s| reset_s.saturating_mul(1000))
+            {
+                return Err(anyhow::Error::new(transport::TransportError::Paused {
+                    resume_at_ms: reset_ms,
+                    reason: transport::PauseReason::RetryAfter,
+                }));
+            }
+            anyhow::bail!("GraphQL errors: {}", serde_json::to_string(errors)?);
+        }
+        Ok(Some(value["data"].clone()))
+    }
+}
+
+/// The two-phase attested-closers walk, encoded in the page cursor: `prs[:<after>]` then
+/// `issues[:<after>]`.
+fn attested_phase(cursor: Option<&str>) -> (&'static str, Option<String>) {
+    match cursor {
+        None | Some("prs") => ("prs", None),
+        Some("issues") => ("issues", None),
+        Some(other) => match other.split_once(':') {
+            Some(("prs", after)) => ("prs", Some(after.to_string())),
+            Some(("issues", after)) => ("issues", Some(after.to_string())),
+            _ => ("prs", None),
+        },
+    }
+}
+
+const ATTESTED_PRS_QUERY: &str =
+    "query($owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: \
+     $name) { pullRequests(states: [MERGED, CLOSED], first: 50, after: $after, orderBy: {field: \
+     UPDATED_AT, direction: DESC}) { pageInfo { hasNextPage endCursor } nodes { number updatedAt \
+     mergedAt mergeCommit { oid } closingIssuesReferences(first: 100) { pageInfo { hasNextPage } \
+     nodes { number repository { nameWithOwner } } } } } } }";
+
+const ATTESTED_ISSUES_QUERY: &str =
+    "query($owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: \
+     $name) { issues(states: [CLOSED], first: 50, after: $after, orderBy: {field: UPDATED_AT, \
+     direction: DESC}) { pageInfo { hasNextPage endCursor } nodes { number updatedAt stateReason \
+     timelineItems(itemTypes: [CLOSED_EVENT], last: 1) { nodes { ... on ClosedEvent { closer { \
+     __typename ... on Commit { oid } ... on PullRequest { number mergeCommit { oid } repository \
+     { nameWithOwner } } } } } } } } } }";
 
 impl PapertrailClient for GitHubClient {
     fn comment_streams(&self) -> &'static [&'static str] {
@@ -461,6 +567,204 @@ impl PapertrailClient for GitHubClient {
             not_modified: false,
         })
     }
+    /// Provider-attested closure walk (#702 stage 2), two phases per project:
+    /// merged/closed PRs (`closingIssuesReferences` + the ATTESTED merge commit) then closed
+    /// issues (`ClosedEvent.closer` — direct-by-commit and UI-linked PR closures the
+    /// description's text never carried). ~1 rate point per 100 PRs, on the dedicated lane.
+    async fn attested_closers_page(
+        &self,
+        project: &str,
+        cursor: Option<&str>,
+        since: Option<&str>,
+    ) -> anyhow::Result<Option<AttestedClosersPage>> {
+        validate_github_project(project)?;
+        let (owner, name) = project
+            .split_once('/')
+            .ok_or_else(|| anyhow::anyhow!("GitHub project is owner/repo"))?;
+        let (phase, after) = attested_phase(cursor);
+        let query = if phase == "prs" { ATTESTED_PRS_QUERY } else { ATTESTED_ISSUES_QUERY };
+        let variables = serde_json::json!({ "owner": owner, "name": name, "after": after });
+        let Some(data) = self.graphql_query(query, variables).await? else {
+            return Ok(None);
+        };
+        let connection =
+            &data["repository"][if phase == "prs" { "pullRequests" } else { "issues" }];
+        parse_attested_page(connection, phase, project, after.as_deref(), since).map(Some)
+    }
+}
+
+/// Parse ONE already-fetched GraphQL connection page into an [`AttestedClosersPage`]. Pure over
+/// the JSON — no transport — so the producer's evidence rules are unit-testable directly (the
+/// `PapertrailClient` stubs bypass this function entirely, so its bugs are invisible to them).
+fn parse_attested_page(
+    connection: &Value,
+    phase: &str,
+    project: &str,
+    after: Option<&str>,
+    since: Option<&str>,
+) -> anyhow::Result<AttestedClosersPage> {
+    let mut page = AttestedClosersPage::default();
+    let mut reached_watermark = false;
+    for node in connection["nodes"].as_array().into_iter().flatten() {
+        let number = node["number"].as_u64().unwrap_or_default().to_string();
+        let updated_at = node["updatedAt"].as_str().unwrap_or_default();
+        if let Some(since) = since
+            && !updated_at.is_empty()
+            && updated_at < since
+        {
+            reached_watermark = true;
+            break;
+        }
+        if page.frontier.is_none() && after.is_none() && !updated_at.is_empty() {
+            // First page of THIS phase: the phase's own frontier. The mirror keeps the
+            // conservative MINIMUM across phases, so neither stream can skip updates.
+            page.frontier = Some(updated_at.to_string());
+        }
+        if phase == "prs" {
+            // MERGED-only: a closed-UNMERGED PR closes nothing, yet GitHub still lists its
+            // `closingIssuesReferences` — minting an edge for it would assert a false closer
+            // (the same trap the text tier and the item store guard against). An unmerged PR is
+            // a pure no-op here: it never had a provider edge of ours to replace, either.
+            let Some(merged_at) = node["mergedAt"].as_str() else {
+                continue;
+            };
+            let _ = merged_at;
+            let merge_commit =
+                node.pointer("/mergeCommit/oid").and_then(Value::as_str).map(str::to_string);
+            // The PR phase CREATES keyword edges but does NOT reap: reaping is issue-keyed (see
+            // `replaced_issue_closers`), because a closer-keyed replace-set would clobber the
+            // issue-phase UI-linked rows this PR's `closingIssuesReferences` never lists.
+            // No silent caps: a PR closing >100 issues is pathological, but its tail must surface
+            // as an explicit gap, not vanish past an unpaginated nested connection.
+            if node.pointer("/closingIssuesReferences/pageInfo/hasNextPage")
+                == Some(&Value::Bool(true))
+            {
+                anyhow::bail!(
+                    "PR #{number} carries more than 100 closing references; the nested connection \
+                     is not paginated"
+                );
+            }
+            for closed in node
+                .pointer("/closingIssuesReferences/nodes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let issue_key = closed["number"].as_u64().unwrap_or_default().to_string();
+                let issue_project = closed
+                    .pointer("/repository/nameWithOwner")
+                    .and_then(Value::as_str)
+                    .unwrap_or(project);
+                // Cross-repository closures are SKIPPED: `closer_key` is same-project by the
+                // schema contract, so a bare PR number under the ISSUE's project would name an
+                // unrelated item. (A both-projects edge shape can lift this later.) GitHub repo
+                // names are CASE-INSENSITIVE: the binding may carry `owner/repo` while GraphQL
+                // returns the canonical `Owner/Repo`, so an exact compare would wrongly treat the
+                // repo's OWN issues as cross-repo and drop every edge — fold ASCII case.
+                if !issue_project.eq_ignore_ascii_case(project) {
+                    continue;
+                }
+                page.edges.push(ClosingEdge {
+                    project: project.to_string(),
+                    issue_kind: ItemKind::Issue,
+                    issue_key,
+                    closer_kind: CloserKind::ChangeRequest,
+                    closer_key: number.clone(),
+                    closer_commit: merge_commit.clone(),
+                    source: ClosingEdgeSource::Provider,
+                });
+            }
+            if let Some(sha) = merge_commit {
+                page.item_updates.push(AttestedItemUpdate {
+                    item_kind: ItemKind::ChangeRequest,
+                    item_key: number.clone(),
+                    resolution: None,
+                    merge_commit_sha: Some(sha),
+                });
+            }
+        } else {
+            if let Some(resolution) = parse::resolution_from_state_reason(
+                node["stateReason"]
+                    .as_str()
+                    .map(|reason| {
+                        // GraphQL enum tokens are UPPER_SNAKE; the REST mapper speaks lowercase.
+                        reason.to_ascii_lowercase()
+                    })
+                    .as_deref(),
+            ) {
+                page.item_updates.push(AttestedItemUpdate {
+                    item_kind: ItemKind::Issue,
+                    item_key: number.clone(),
+                    resolution: Some(resolution),
+                    merge_commit_sha: None,
+                });
+            }
+            page.replaced_issue_closers.push(number.clone());
+            let closer = node
+                .pointer("/timelineItems/nodes")
+                .and_then(Value::as_array)
+                .and_then(|nodes| nodes.last())
+                .map(|event| event["closer"].clone())
+                .unwrap_or(Value::Null);
+            match closer["__typename"].as_str() {
+                Some("Commit") =>
+                    if let Some(oid) = closer["oid"].as_str() {
+                        page.edges.push(ClosingEdge {
+                            project: project.to_string(),
+                            issue_kind: ItemKind::Issue,
+                            issue_key: number.clone(),
+                            closer_kind: CloserKind::Commit,
+                            closer_key: oid.to_string(),
+                            closer_commit: Some(oid.to_string()),
+                            source: ClosingEdgeSource::Provider,
+                        });
+                    },
+                Some("PullRequest") => {
+                    // Cross-repository PR closers are SKIPPED, symmetric to the PR phase:
+                    // `closer_key` is same-project, so a bare PR number under the ISSUE's project
+                    // would name an unrelated item. Case-insensitive like the PR phase — GitHub's
+                    // canonical `nameWithOwner` casing may differ from the binding's project.
+                    let closer_repo = closer
+                        .pointer("/repository/nameWithOwner")
+                        .and_then(Value::as_str)
+                        .unwrap_or(project);
+                    if let Some(pr) = closer["number"].as_u64()
+                        && closer_repo.eq_ignore_ascii_case(project)
+                    {
+                        page.edges.push(ClosingEdge {
+                            project: project.to_string(),
+                            issue_kind: ItemKind::Issue,
+                            issue_key: number.clone(),
+                            closer_kind: CloserKind::ChangeRequest,
+                            closer_key: pr.to_string(),
+                            // Preserve the attested merge commit for a UI-linked PR closure that
+                            // surfaces ONLY through ClosedEvent (no keyword-derived edge from the
+                            // PR phase) — GitHub exposes the closer PR's mergeCommit here.
+                            closer_commit: closer
+                                .pointer("/mergeCommit/oid")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            source: ClosingEdgeSource::Provider,
+                        });
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+    let has_next = connection.pointer("/pageInfo/hasNextPage").and_then(Value::as_bool)
+        == Some(true)
+        && !reached_watermark;
+    let end_cursor =
+        connection.pointer("/pageInfo/endCursor").and_then(Value::as_str).unwrap_or_default();
+    page.next = if has_next {
+        Some(format!("{phase}:{end_cursor}"))
+    } else if phase == "prs" {
+        Some("issues".to_string())
+    } else {
+        None
+    };
+    Ok(page)
 }
 
 fn github_headers() -> Vec<(&'static str, &'static str)> {
@@ -1172,4 +1476,215 @@ mod tests {
     }
 
     const INITIAL_BOUNDARY: &str = "2970-12-31T23:59:59Z";
+    // Direct producer tests over hand-built GraphQL JSON — the `PapertrailClient` stubs bypass
+    // `parse_attested_page`, so its evidence rules (merged gate, cross-repo skip, CR replace-set,
+    // truncation bail) are ONLY covered here.
+    fn prs_connection(nodes: Value) -> Value {
+        serde_json::json!({ "pageInfo": { "hasNextPage": false, "endCursor": "c" }, "nodes": nodes })
+    }
+
+    #[test]
+    fn attested_prs_merged_mint_edge_and_update() {
+        let conn = prs_connection(serde_json::json!([{
+            "number": 9, "updatedAt": "2026-01-05T00:00:00Z", "mergedAt": "2026-01-05T00:00:00Z",
+            "mergeCommit": { "oid": "abc123" },
+            "closingIssuesReferences": { "pageInfo": { "hasNextPage": false },
+                "nodes": [{ "number": 5, "repository": { "nameWithOwner": "o/r" } }] }
+        }]));
+        let page = parse_attested_page(&conn, "prs", "o/r", None, None).unwrap();
+        assert_eq!(page.edges.len(), 1);
+        assert_eq!(page.edges[0].issue_key, "5");
+        assert_eq!(page.edges[0].closer_key, "9");
+        assert_eq!(page.edges[0].closer_commit.as_deref(), Some("abc123"));
+        // The PR phase mints keyword edges but owns NO replace-set — reaping is issue-keyed.
+        assert!(page.replaced_issue_closers.is_empty(), "the PR phase never reaps");
+        assert_eq!(page.item_updates.len(), 1);
+    }
+
+    #[test]
+    fn attested_prs_closed_unmerged_mints_nothing() {
+        let conn = prs_connection(serde_json::json!([{
+            "number": 9, "updatedAt": "2026-01-05T00:00:00Z", "mergedAt": Value::Null,
+            "mergeCommit": Value::Null,
+            "closingIssuesReferences": { "pageInfo": { "hasNextPage": false },
+                "nodes": [{ "number": 5, "repository": { "nameWithOwner": "o/r" } }] }
+        }]));
+        let page = parse_attested_page(&conn, "prs", "o/r", None, None).unwrap();
+        assert!(page.edges.is_empty(), "a closed-unmerged PR closes nothing");
+        assert!(page.item_updates.is_empty());
+    }
+
+    #[test]
+    fn attested_prs_cross_repo_reference_is_skipped() {
+        let conn = prs_connection(serde_json::json!([{
+            "number": 9, "updatedAt": "2026-01-05T00:00:00Z", "mergedAt": "2026-01-05T00:00:00Z",
+            "mergeCommit": { "oid": "abc" },
+            "closingIssuesReferences": { "pageInfo": { "hasNextPage": false }, "nodes": [
+                { "number": 5, "repository": { "nameWithOwner": "o/other" } },
+                { "number": 7, "repository": { "nameWithOwner": "o/r" } }
+            ] }
+        }]));
+        let page = parse_attested_page(&conn, "prs", "o/r", None, None).unwrap();
+        assert_eq!(page.edges.len(), 1, "the cross-repo o/other#5 is skipped");
+        assert_eq!(page.edges[0].issue_key, "7");
+        assert_eq!(page.edges[0].project, "o/r");
+    }
+
+    #[test]
+    fn attested_prs_truncated_nested_connection_fails_loudly() {
+        let conn = prs_connection(serde_json::json!([{
+            "number": 9, "updatedAt": "2026-01-05T00:00:00Z", "mergedAt": "2026-01-05T00:00:00Z",
+            "mergeCommit": { "oid": "abc" },
+            "closingIssuesReferences": { "pageInfo": { "hasNextPage": true }, "nodes": [] }
+        }]));
+        let err = parse_attested_page(&conn, "prs", "o/r", None, None).unwrap_err();
+        assert!(err.to_string().contains("closing references"), "silent truncation must bail");
+    }
+
+    #[test]
+    fn attested_issues_commit_and_pr_closers_and_resolution() {
+        let conn = serde_json::json!({ "pageInfo": { "hasNextPage": false, "endCursor": "c" },
+            "nodes": [
+                { "number": 5, "updatedAt": "2026-01-05T00:00:00Z", "stateReason": "COMPLETED",
+                  "timelineItems": { "nodes": [{ "closer": { "__typename": "Commit", "oid": "sha1" } }] } },
+                { "number": 6, "updatedAt": "2026-01-04T00:00:00Z", "stateReason": "NOT_PLANNED",
+                  "timelineItems": { "nodes": [{ "closer": { "__typename": "PullRequest", "number": 11 } }] } }
+            ] });
+        let page = parse_attested_page(&conn, "issues", "o/r", None, None).unwrap();
+        assert_eq!(page.replaced_issue_closers, vec!["5".to_string(), "6".to_string()]);
+        let commit_edge = page.edges.iter().find(|e| e.issue_key == "5").unwrap();
+        assert_eq!(commit_edge.closer_kind, CloserKind::Commit);
+        assert_eq!(commit_edge.closer_key, "sha1");
+        let pr_edge = page.edges.iter().find(|e| e.issue_key == "6").unwrap();
+        assert_eq!(pr_edge.closer_kind, CloserKind::ChangeRequest);
+        assert_eq!(pr_edge.closer_key, "11");
+        assert_eq!(page.item_updates.iter().filter(|u| u.resolution.is_some()).count(), 2);
+    }
+
+    #[test]
+    fn attested_since_watermark_cuts_the_scan_and_advances_the_phase() {
+        let conn = prs_connection(serde_json::json!([
+            { "number": 9, "updatedAt": "2026-01-05T00:00:00Z", "mergedAt": "2026-01-05T00:00:00Z",
+              "mergeCommit": { "oid": "a" }, "closingIssuesReferences": { "pageInfo": { "hasNextPage": false }, "nodes": [] } },
+            { "number": 8, "updatedAt": "2026-01-01T00:00:00Z", "mergedAt": "2026-01-01T00:00:00Z",
+              "mergeCommit": { "oid": "b" }, "closingIssuesReferences": { "pageInfo": { "hasNextPage": false }, "nodes": [] } }
+        ]));
+        // Watermark cuts at the second (older) node; the phase still advances to issues.
+        let page =
+            parse_attested_page(&conn, "prs", "o/r", None, Some("2026-01-03T00:00:00Z")).unwrap();
+        // Only the fresh PR #9 is processed (its merge sha becomes an item update); #8 is cut
+        // before it is reached.
+        assert_eq!(page.item_updates.len(), 1, "only the fresh PR is processed past the watermark");
+        assert_eq!(page.item_updates[0].item_key, "9");
+        assert_eq!(page.next.as_deref(), Some("issues"), "watermark cut still advances the phase");
+    }
+    #[test]
+    fn attested_issue_cross_repo_pr_closer_is_skipped() {
+        let conn = serde_json::json!({ "pageInfo": { "hasNextPage": false, "endCursor": "c" },
+            "nodes": [{ "number": 5, "updatedAt": "2026-01-05T00:00:00Z", "stateReason": "COMPLETED",
+                "timelineItems": { "nodes": [{ "closer": { "__typename": "PullRequest", "number": 9,
+                    "repository": { "nameWithOwner": "other/repo" } } }] } }] });
+        let page = parse_attested_page(&conn, "issues", "o/r", None, None).unwrap();
+        assert!(
+            page.edges.is_empty(),
+            "a PR closer in another repo names a bare number under the wrong project — skip it",
+        );
+        // The issue is still replace-set (its whole provider closer set is refreshed regardless).
+        assert_eq!(page.replaced_issue_closers, vec!["5".to_string()]);
+    }
+
+    /// GitHub repo names are CASE-INSENSITIVE: a binding `o/r` whose GraphQL response echoes the
+    /// canonical `O/R` in `nameWithOwner` must still mint the SAME-repo edge in both phases — an
+    /// exact compare would drop every attested edge for a mis-cased binding.
+    #[test]
+    fn attested_same_repo_name_matches_case_insensitively_in_both_phases() {
+        let prs = prs_connection(serde_json::json!([{
+            "number": 9, "updatedAt": "2026-01-05T00:00:00Z", "mergedAt": "2026-01-05T00:00:00Z",
+            "mergeCommit": { "oid": "abc" },
+            "closingIssuesReferences": { "pageInfo": { "hasNextPage": false },
+                "nodes": [{ "number": 5, "repository": { "nameWithOwner": "O/R" } }] }
+        }]));
+        let pr_page = parse_attested_page(&prs, "prs", "o/r", None, None).unwrap();
+        assert_eq!(pr_page.edges.len(), 1, "canonical-cased same repo is not cross-repo");
+        assert_eq!(pr_page.edges[0].issue_key, "5");
+
+        let issues = serde_json::json!({ "pageInfo": { "hasNextPage": false, "endCursor": "c" },
+            "nodes": [{ "number": 5, "updatedAt": "2026-01-05T00:00:00Z", "stateReason": "COMPLETED",
+                "timelineItems": { "nodes": [{ "closer": { "__typename": "PullRequest", "number": 9,
+                    "repository": { "nameWithOwner": "O/R" } } }] } }] });
+        let issue_page = parse_attested_page(&issues, "issues", "o/r", None, None).unwrap();
+        assert_eq!(issue_page.edges.len(), 1, "the issue-phase PR closer is same-repo too");
+        assert_eq!(issue_page.edges[0].closer_key, "9");
+    }
+    #[test]
+    fn a_token_less_binding_has_no_attested_supply_and_never_calls_graphql() {
+        // GitHub's GraphQL always requires a token; a public token-less binding must degrade to
+        // the text tier at construction, not fail an unauthenticated call every sync. `base` is
+        // unreachable — reaching it (a real POST) would error, so `Ok(None)` proves the memo
+        // short-circuited before any request.
+        let registry = GovernorRegistry::default();
+        let client = GitHubClient::new(
+            &binding("http://127.0.0.1:1".to_string()),
+            &registry,
+            TransportOptions::default(),
+        )
+        .unwrap();
+        let page = block_on(client.attested_closers_page("o/r", None, None)).unwrap();
+        assert!(page.is_none(), "no token ⇒ no attested supply, no GraphQL call");
+    }
+    #[test]
+    fn attested_issue_pr_closer_carries_the_merge_commit() {
+        let conn = serde_json::json!({ "pageInfo": { "hasNextPage": false, "endCursor": "c" },
+            "nodes": [{ "number": 5, "updatedAt": "2026-01-05T00:00:00Z", "stateReason": "COMPLETED",
+                "timelineItems": { "nodes": [{ "closer": { "__typename": "PullRequest", "number": 9,
+                    "mergeCommit": { "oid": "sha9" },
+                    "repository": { "nameWithOwner": "o/r" } } }] } }] });
+        let page = parse_attested_page(&conn, "issues", "o/r", None, None).unwrap();
+        let edge = page.edges.iter().find(|e| e.issue_key == "5").unwrap();
+        assert_eq!(edge.closer_kind, CloserKind::ChangeRequest);
+        assert_eq!(edge.closer_key, "9");
+        assert_eq!(
+            edge.closer_commit.as_deref(),
+            Some("sha9"),
+            "UI-linked PR closer keeps its merge commit"
+        );
+    }
+
+    #[test]
+    fn a_graphql_200_rate_limit_becomes_a_transport_pause() {
+        // GitHub GraphQL signals a rate limit as HTTP 200 + errors[RATE_LIMITED] + reset header;
+        // it must surface as a PAUSE so the scheduler honors the reset, not a swallowed error.
+        let mut limited = StubResponse::ok(
+            r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#,
+        );
+        limited.headers.push(("x-ratelimit-reset".to_string(), "1900000000".to_string()));
+        let (base, handle) = spawn_script_stub(vec![limited]);
+        let mut tracker = binding(base);
+        tracker.auth =
+            Some(rag_rat_base::config::TrackerAuth::TokenCommand("printf token".to_string()));
+        let registry = GovernorRegistry::default();
+        let client = GitHubClient::new(&tracker, &registry, TransportOptions::default()).unwrap();
+        let error = block_on(client.attested_closers_page("o/r", None, None)).unwrap_err();
+        let paused = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<transport::TransportError>())
+            .and_then(|e| match e {
+                transport::TransportError::Paused { resume_at_ms, .. } => Some(*resume_at_ms),
+                _ => None,
+            });
+        assert_eq!(paused, Some(1_900_000_000_000), "the reset epoch becomes the resume time (ms)");
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+    #[test]
+    fn attested_queries_request_every_field_the_parser_reads() {
+        // GUARD against the silent query/parser drift that bit this lane twice: the parser reads
+        // these paths, so the query strings MUST fetch them, or an edit that reflows the query
+        // silently drops a field and the parser only ever sees `None`.
+        for field in ["mergeCommit", "closingIssuesReferences", "hasNextPage", "mergedAt"] {
+            assert!(ATTESTED_PRS_QUERY.contains(field), "PRs query must request `{field}`");
+        }
+        for field in ["mergeCommit", "stateReason", "ClosedEvent", "PullRequest", "Commit"] {
+            assert!(ATTESTED_ISSUES_QUERY.contains(field), "issues query must request `{field}`");
+        }
+    }
 }

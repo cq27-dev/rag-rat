@@ -58,6 +58,7 @@ pub async fn sync_mirror(
 /// annotation layer refreshes on manual sync).
 pub async fn sync_mirror_scheduled(
     conn: &Connection,
+    root: &Path,
     ctx: &PapertrailContext,
     request: AutosyncRequest,
 ) -> anyhow::Result<PapertrailSyncReport> {
@@ -95,6 +96,11 @@ pub async fn sync_mirror_scheduled(
         }
     }
     if jobs.is_empty() && errors.is_empty() {
+        // Nothing was due — but a scheduled hook fires AFTER an index maintenance pass, so the
+        // indexed history may have just changed. The commit-closer rederive is purely local (no
+        // network dispatch), so run it even on the no-work path or a stale text closer from a
+        // commit no longer in `git_commits` lingers until some later provider job happens to run.
+        sync::rederive_commit_closers(conn, root, ctx)?;
         // Nothing was due: report current status without stamping a sync that never ran.
         return Ok(PapertrailSyncReport {
             offline: false,
@@ -108,6 +114,9 @@ pub async fn sync_mirror_scheduled(
         });
     }
     let outcomes = run_binding_jobs(conn, jobs).await?;
+    // This scheduled run may be the FIRST to cache a target an earlier commit ref needs for its
+    // kind check — re-derive on the way out like every other entry.
+    sync::rederive_commit_closers(conn, root, ctx)?;
     assemble_mirror_report(conn, ctx, 0, outcomes, errors)
 }
 
@@ -138,7 +147,9 @@ struct BindingJob<'a> {
 /// The native client for one binding, dispatched by provider. An enum rather than a trait object
 /// because [`PapertrailClient`]'s `async fn` methods are not dyn-compatible; each arm delegates.
 enum ProviderClient {
-    Github(GitHubClient),
+    // Boxed: the GitHub client carries three transport lanes (~400 bytes) vs GitLab's one;
+    // boxing keeps the enum pointer-sized instead of every variant paying the largest's spread.
+    Github(Box<GitHubClient>),
     Gitlab(GitLabClient),
 }
 
@@ -149,7 +160,8 @@ impl ProviderClient {
         options: transport::TransportOptions,
     ) -> anyhow::Result<Self> {
         match binding.provider {
-            Tracker::Github => GitHubClient::new(binding, registry, options).map(Self::Github),
+            Tracker::Github =>
+                GitHubClient::new(binding, registry, options).map(Box::new).map(Self::Github),
             Tracker::Gitlab => GitLabClient::new(binding, registry, options).map(Self::Gitlab),
             other => anyhow::bail!("no native papertrail client for {} yet", other.as_db_str()),
         }
@@ -243,6 +255,20 @@ impl PapertrailClient for ProviderClient {
             Self::Gitlab(client) => client.freshness_probe(project, probe).await,
         }
     }
+    async fn attested_closers_page(
+        &self,
+        project: &str,
+        cursor: Option<&str>,
+        since: Option<&str>,
+    ) -> anyhow::Result<Option<AttestedClosersPage>> {
+        // Delegation is MANDATORY here: the enum wrapper otherwise swallows a provider's
+        // override behind the trait's `Ok(None)` default and the attested lane silently
+        // degrades to the text tier.
+        match self {
+            Self::Github(client) => client.attested_closers_page(project, cursor, since).await,
+            Self::Gitlab(client) => client.attested_closers_page(project, cursor, since).await,
+        }
+    }
 }
 
 /// What one dispatched binding produced: a resumable report, or the error entry to surface.
@@ -304,7 +330,8 @@ async fn run_binding_job(conn: &Connection, job: BindingJob<'_>) -> anyhow::Resu
             } else if let Some(resume_at_ms) = report.paused_until_ms {
                 record_pause(conn, job.binding, resume_at_ms)?;
             }
-            Ok(BindingOutcome { report: Some(report), error: None })
+            let error = attested_walk_error(job.binding, &report);
+            Ok(BindingOutcome { report: Some(report), error })
         },
         Err(error) => {
             let class = classify_mirror_failure(&error);
@@ -315,6 +342,22 @@ async fn run_binding_job(conn: &Connection, job: BindingJob<'_>) -> anyhow::Resu
             })
         },
     }
+}
+
+/// Surface a non-fatal attested-closers walk failure as a binding-level report error. The item
+/// mirror still landed and recorded success, but the enrichment walk's watermark did not advance,
+/// so the next sync retries it. WITHOUT surfacing, a persistent non-pause attested failure (a
+/// truncation bail, a mid-walk capability trip, a malformed 200) re-runs the doomed walk every tick
+/// with the binding recorded healthy and no operator signal. A pause is NOT surfaced here — it
+/// rides `paused_until_ms` and `record_pause`.
+fn attested_walk_error(
+    binding: &ResolvedTracker,
+    report: &MirrorBindingReport,
+) -> Option<PapertrailSyncError> {
+    report
+        .attested_error
+        .as_ref()
+        .map(|detail| binding_error(binding, "attested_walk_failed", detail.clone()))
 }
 
 fn binding_error(binding: &ResolvedTracker, status: &str, error: String) -> PapertrailSyncError {
@@ -404,7 +447,13 @@ fn completed_mirror_operation(
     let probe_only = report.probe_not_modified
         && report.stored_items == 0
         && report.stored_comments == 0
-        && report.pruned_items == 0;
+        && report.pruned_items == 0
+        // The attested-closers pass mutates `papertrail_closing_edges` / `papertrail_items` even
+        // when the item probe was not-modified (the first #702 run against an already-cached
+        // project). A run that stored provider edges (`attested_edges`), reaped a stale edge, or
+        // stamped a resolution / merge sha (`attested_writes`) is real mirror work, not a probe.
+        && report.attested_edges == 0
+        && report.attested_writes == 0;
     Some(if probe_only {
         SuccessfulOperation::Probe
     } else {
@@ -484,6 +533,7 @@ pub async fn sync_from_refs_with_progress<C: PapertrailClient>(
 }
 pub async fn sync_issue<C: PapertrailClient>(
     conn: &Connection,
+    root: &Path,
     issue_ref: &str,
     client: Option<&C>,
     offline: bool,
@@ -527,7 +577,11 @@ pub async fn sync_issue<C: PapertrailClient>(
         synced_items: sync.synced_items,
         bindings: Vec::new(),
         errors: sync.errors,
-        status: status(conn, ctx)?,
+        status: {
+            // The just-synced item may be the target an earlier commit ref's kind check needed.
+            sync::rederive_commit_closers(conn, root, ctx)?;
+            status(conn, ctx)?
+        },
     })
 }
 pub fn status(conn: &Connection, ctx: &PapertrailContext) -> anyhow::Result<PapertrailStatus> {
@@ -564,6 +618,7 @@ pub fn status(conn: &Connection, ctx: &PapertrailContext) -> anyhow::Result<Pape
                 full_walk_in_progress: health.continuation == MirrorContinuation::Full,
                 error_class,
                 error_detail,
+                attested_error: mirror::read_attested_error(conn, binding)?,
                 overdue,
                 failed,
             })
@@ -885,6 +940,9 @@ mod capability_tests {
             stored_items: 1,
             stored_comments: 0,
             pruned_items: 0,
+            attested_edges: 0,
+            attested_writes: 0,
+            attested_error: None,
             paused_until_ms: Some(42),
             pause_reason: Some("rate_limited".to_string()),
             completed_full_walk: false,
@@ -912,6 +970,9 @@ mod capability_tests {
             stored_items: 1,
             stored_comments: 0,
             pruned_items: 0,
+            attested_edges: 0,
+            attested_writes: 0,
+            attested_error: None,
             paused_until_ms: None,
             pause_reason: None,
             completed_full_walk: true,
@@ -931,6 +992,9 @@ mod capability_tests {
             stored_items: 0,
             stored_comments: 0,
             pruned_items: 0,
+            attested_edges: 0,
+            attested_writes: 0,
+            attested_error: None,
             paused_until_ms: None,
             pause_reason: None,
             completed_full_walk: false,
@@ -944,8 +1008,57 @@ mod capability_tests {
             completed_mirror_operation(&stored_comments, false),
             Some(SuccessfulOperation::IncrementalMirror)
         );
+        // Attested provider edges mutate papertrail_closing_edges even under a not-modified item
+        // probe — that is real mirror work, not a probe (#727 review).
+        let attested = MirrorBindingReport { attested_edges: 3, ..quiet.clone() };
+        assert_eq!(
+            completed_mirror_operation(&attested, false),
+            Some(SuccessfulOperation::IncrementalMirror)
+        );
+        // Non-insert attested mutations also count: a run that only reaped a stale replace-set edge
+        // or stamped a resolution / merge sha (attested_writes) moved content — not a probe.
+        let attested_writes = MirrorBindingReport { attested_writes: 2, ..quiet.clone() };
+        assert_eq!(
+            completed_mirror_operation(&attested_writes, false),
+            Some(SuccessfulOperation::IncrementalMirror)
+        );
         // An explicitly requested full walk is never downgraded by a quiet probe.
         assert_eq!(completed_mirror_operation(&quiet, true), Some(SuccessfulOperation::FullMirror));
+    }
+
+    #[test]
+    fn a_non_pause_attested_error_surfaces_as_a_binding_error_but_a_clean_walk_does_not() {
+        let binding = github(None);
+        let clean = MirrorBindingReport {
+            tracker: Tracker::Github,
+            project: "o/r".to_string(),
+            stored_items: 1,
+            stored_comments: 0,
+            pruned_items: 0,
+            attested_edges: 0,
+            attested_writes: 0,
+            attested_error: None,
+            paused_until_ms: None,
+            pause_reason: None,
+            completed_full_walk: false,
+            probe_not_modified: false,
+        };
+        assert!(
+            attested_walk_error(&binding, &clean).is_none(),
+            "a clean (or merely paused) walk surfaces no binding error",
+        );
+
+        let failed = MirrorBindingReport {
+            attested_error: Some(
+                "attested-closers walk ended early: capability unavailable mid-walk".to_string(),
+            ),
+            ..clean
+        };
+        let surfaced = attested_walk_error(&binding, &failed)
+            .expect("a non-pause attested failure surfaces as a binding error");
+        assert_eq!(surfaced.status, "attested_walk_failed");
+        assert_eq!(surfaced.project, "o/r");
+        assert!(surfaced.error.contains("capability unavailable"));
     }
 
     #[test]
@@ -1204,13 +1317,88 @@ mod scheduled_tests {
         for request in
             [AutosyncRequest::Evaluate, AutosyncRequest::Incremental, AutosyncRequest::Full]
         {
-            let report = block_on(sync_mirror_scheduled(&conn, &ctx, request)).unwrap();
+            let report =
+                block_on(sync_mirror_scheduled(&conn, Path::new("."), &ctx, request)).unwrap();
             assert!(report.bindings.is_empty(), "{request:?} must not dispatch");
             assert!(report.errors.is_empty());
             assert_eq!(report.synced_items, 0);
         }
         // The recent attempt is untouched — a skipped binding records nothing.
         assert_eq!(persisted(&conn, &binding).last_attempt_ms, Some(now - 1_000));
+        assert!(handle.join().unwrap().is_empty(), "no network request may be made");
+    }
+
+    /// A scheduled hook fires AFTER an index maintenance pass, so even when NOTHING is due the
+    /// no-work early return must still run the local commit-closer rederive — otherwise a stale
+    /// text/commit closer (its commit rebased/reloaded out of `git_commits`) lingers until some
+    /// later provider job happens to run. The rederive is surgical: it reaps only text/commit
+    /// edges and leaves provider edges intact (#727 review).
+    #[test]
+    fn a_no_work_scheduled_run_still_rederives_commit_closers() {
+        let conn = open_schema();
+        let (url, handle) = spawn_script_stub(Vec::new());
+        let binding = github_binding("o/r", &url);
+        let now = now_ms();
+        // A just-attempted binding is inside the minimum interval, so nothing dispatches — the
+        // no-work early-return path.
+        seed_health(&conn, &binding, &SeededHealth {
+            attempt: now - 1_000,
+            probe: now - 2 * HOUR_MS,
+            mirror: now - 2 * HOUR_MS,
+            full: now - 2 * HOUR_MS,
+        });
+
+        // A stale text/commit closer (no matching `git_commits` row / ref re-mints it) must be
+        // reaped; a provider edge for a different issue must survive the surgical rederive.
+        crate::store::store_closing_edge(&conn, Tracker::Github, &crate::ClosingEdge {
+            project: "o/r".to_string(),
+            issue_kind: ItemKind::Issue,
+            issue_key: "5".to_string(),
+            closer_kind: crate::CloserKind::Commit,
+            closer_key: "deadbeef".to_string(),
+            closer_commit: Some("deadbeef".to_string()),
+            source: crate::ClosingEdgeSource::Text,
+        })
+        .unwrap();
+        crate::store::store_closing_edge(&conn, Tracker::Github, &crate::ClosingEdge {
+            project: "o/r".to_string(),
+            issue_kind: ItemKind::Issue,
+            issue_key: "6".to_string(),
+            closer_kind: crate::CloserKind::Commit,
+            closer_key: "cafef00d".to_string(),
+            closer_commit: Some("cafef00d".to_string()),
+            source: crate::ClosingEdgeSource::Provider,
+        })
+        .unwrap();
+
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+        let report =
+            block_on(sync_mirror_scheduled(&conn, Path::new("."), &ctx, AutosyncRequest::Evaluate))
+                .unwrap();
+        assert!(report.bindings.is_empty(), "nothing was due");
+
+        let reaped = crate::store::closing_edges_for_item(
+            &conn,
+            Tracker::Github,
+            "o/r",
+            ItemKind::Issue,
+            "5",
+        )
+        .unwrap();
+        assert!(
+            reaped.is_empty(),
+            "the no-work path rederives, reaping the stale text/commit closer"
+        );
+        let kept = crate::store::closing_edges_for_item(
+            &conn,
+            Tracker::Github,
+            "o/r",
+            ItemKind::Issue,
+            "6",
+        )
+        .unwrap();
+        assert_eq!(kept.len(), 1, "the surgical rederive leaves the provider edge intact");
         assert!(handle.join().unwrap().is_empty(), "no network request may be made");
     }
 
@@ -1232,7 +1420,8 @@ mod scheduled_tests {
             PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
 
         let report =
-            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Evaluate)).unwrap();
+            block_on(sync_mirror_scheduled(&conn, Path::new("."), &ctx, AutosyncRequest::Evaluate))
+                .unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.bindings.len(), 1);
         assert!(report.bindings[0].probe_not_modified);
@@ -1262,7 +1451,8 @@ mod scheduled_tests {
             PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
 
         let report =
-            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Evaluate)).unwrap();
+            block_on(sync_mirror_scheduled(&conn, Path::new("."), &ctx, AutosyncRequest::Evaluate))
+                .unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.bindings.len(), 1);
         assert!(report.bindings[0].completed_full_walk, "the backstop runs a FULL walk");
@@ -1284,8 +1474,13 @@ mod scheduled_tests {
             ..PapertrailContext::default()
         };
 
-        let report =
-            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Incremental)).unwrap();
+        let report = block_on(sync_mirror_scheduled(
+            &conn,
+            Path::new("."),
+            &ctx,
+            AutosyncRequest::Incremental,
+        ))
+        .unwrap();
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].project, "a/one");
         assert_eq!(report.errors[0].status, "failed");
@@ -1317,7 +1512,9 @@ mod scheduled_tests {
         let ctx =
             PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
 
-        let report = block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Full)).unwrap();
+        let report =
+            block_on(sync_mirror_scheduled(&conn, Path::new("."), &ctx, AutosyncRequest::Full))
+                .unwrap();
         assert!(report.errors.is_empty(), "an automatic tick must not log the capability gap");
         assert!(report.bindings.is_empty());
         // No attempt is recorded either — the binding was never evaluated for dispatch.
@@ -1354,7 +1551,8 @@ mod scheduled_tests {
         };
 
         let report =
-            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Evaluate)).unwrap();
+            block_on(sync_mirror_scheduled(&conn, Path::new("."), &ctx, AutosyncRequest::Evaluate))
+                .unwrap();
         assert!(
             report.errors.is_empty(),
             "serial dispatch would gate-timeout: {:?}",
@@ -1389,8 +1587,13 @@ mod scheduled_tests {
         let binding = github_binding("o/r", &first_url);
         let ctx =
             PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
-        let report =
-            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Incremental)).unwrap();
+        let report = block_on(sync_mirror_scheduled(
+            &conn,
+            Path::new("."),
+            &ctx,
+            AutosyncRequest::Incremental,
+        ))
+        .unwrap();
         assert_eq!(report.errors.len(), 1, "the interruption surfaces as a binding error");
         let interrupted = persisted(&conn, &binding);
         // The first walk of a fresh binding is a FULL walk; its interruption must stay a Full
@@ -1399,8 +1602,13 @@ mod scheduled_tests {
         assert_eq!(first_handle.join().unwrap().len(), 4);
 
         // The minimum attempt interval gates the immediate retry...
-        let gated =
-            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Incremental)).unwrap();
+        let gated = block_on(sync_mirror_scheduled(
+            &conn,
+            Path::new("."),
+            &ctx,
+            AutosyncRequest::Incremental,
+        ))
+        .unwrap();
         assert!(gated.bindings.is_empty() && gated.errors.is_empty());
 
         // ...and once it elapses, the next dispatch resumes the descent from the persisted
@@ -1425,7 +1633,8 @@ mod scheduled_tests {
             ..PapertrailContext::default()
         };
         let report =
-            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Evaluate)).unwrap();
+            block_on(sync_mirror_scheduled(&conn, Path::new("."), &ctx, AutosyncRequest::Evaluate))
+                .unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.bindings.len(), 1);
         assert!(report.bindings[0].completed_full_walk, "the resumed descent completes the walk");
@@ -1475,8 +1684,13 @@ mod scheduled_tests {
         let ctx =
             PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
 
-        let report =
-            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Incremental)).unwrap();
+        let report = block_on(sync_mirror_scheduled(
+            &conn,
+            Path::new("."),
+            &ctx,
+            AutosyncRequest::Incremental,
+        ))
+        .unwrap();
         assert!(report.errors.is_empty(), "a pause is not a failure: {:?}", report.errors);
         assert_eq!(report.bindings.len(), 1);
         assert_eq!(report.bindings[0].paused_until_ms, Some(reset_epoch_s * 1000));
@@ -1493,7 +1707,8 @@ mod scheduled_tests {
         )
         .unwrap();
         for request in [AutosyncRequest::Evaluate, AutosyncRequest::Full] {
-            let gated = block_on(sync_mirror_scheduled(&conn, &ctx, request)).unwrap();
+            let gated =
+                block_on(sync_mirror_scheduled(&conn, Path::new("."), &ctx, request)).unwrap();
             assert!(
                 gated.bindings.is_empty() && gated.errors.is_empty(),
                 "{request:?} must stay gated by the retry horizon"
@@ -1543,7 +1758,8 @@ mod scheduled_tests {
             PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
 
         let report =
-            block_on(sync_mirror_scheduled(&conn, &ctx, AutosyncRequest::Evaluate)).unwrap();
+            block_on(sync_mirror_scheduled(&conn, Path::new("."), &ctx, AutosyncRequest::Evaluate))
+                .unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.bindings.len(), 1, "the filter change alone must dispatch");
         assert!(

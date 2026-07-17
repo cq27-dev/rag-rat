@@ -203,6 +203,28 @@ impl Transport {
         url: &str,
         extra_headers: &[(&str, &str)],
     ) -> Result<TransportResponse, TransportError> {
+        self.request(url, extra_headers, None).await
+    }
+
+    /// POST a JSON body through the SAME admission/pause/backoff machinery as [`Self::get`] —
+    /// the GraphQL lane's requests count against their own governor lane but share every
+    /// transport discipline (deadline, retry holds, secondary-limit standdown).
+    pub(crate) async fn post_json(
+        &self,
+        url: &str,
+        extra_headers: &[(&str, &str)],
+        body: &serde_json::Value,
+    ) -> Result<TransportResponse, TransportError> {
+        let body = serde_json::to_string(body).unwrap_or_default();
+        self.request(url, extra_headers, Some(body)).await
+    }
+
+    async fn request(
+        &self,
+        url: &str,
+        extra_headers: &[(&str, &str)],
+        json_body: Option<String>,
+    ) -> Result<TransportResponse, TransportError> {
         self.validate_url(url)?;
         let mut attempt: u32 = 0;
         loop {
@@ -222,7 +244,15 @@ impl Transport {
             if let Admission::PausedUntil { resume_at_ms, reason } = self.governor.admit(now) {
                 return Err(TransportError::Paused { resume_at_ms, reason });
             }
-            let mut request = self.client.get(url).timeout(self.request_timeout(now));
+            let mut request = match &json_body {
+                Some(body) => self
+                    .client
+                    .post(url)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body.clone()),
+                None => self.client.get(url),
+            }
+            .timeout(self.request_timeout(now));
             if let Some(auth_header) = &self.auth_header {
                 request = request.header(header::AUTHORIZATION, auth_header);
             }

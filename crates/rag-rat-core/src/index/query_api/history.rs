@@ -185,8 +185,17 @@ impl IndexDatabase {
         &self,
         request: papertrail::AutosyncRequest,
     ) -> anyhow::Result<PapertrailSyncReport> {
+        // The commit-closer rederive inspects the checkout's remotes; use the PROCESS-resolved
+        // active root (`storage.source_root()`, the reanchored `config.root` that memory
+        // validation also resolves against) — NOT the raw persisted `repo_meta("source_root")`,
+        // which goes stale under a shared DB across linked worktrees and would point the git
+        // inspection at another checkout. Bail when absent, matching the manual entry.
+        let Some(root) = self.storage.source_root() else {
+            anyhow::bail!("index has no source_root metadata; rebuild required");
+        };
         papertrail::block_on(papertrail::sync_mirror_scheduled(
             self.storage.connection(),
+            root,
             &self.papertrail,
             request,
         ))

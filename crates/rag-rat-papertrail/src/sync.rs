@@ -526,50 +526,61 @@ pub(crate) fn rederive_commit_closers(
         .map(|name| name.shorten().to_string())
         .unwrap_or_default();
     let eligible = default_branch_checkout_projects(root, &branch, &ctx.trackers);
-    let refs = {
-        let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT tracker, project, item_key, item_kind, ref_kind, source_commit, source_text \
-             FROM papertrail_refs WHERE repo_id = ?1 AND source_kind = 'commit' AND ref_kind = \
-             'closing'",
-        )?;
-        let rows = stmt.query_map([&repo_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?;
-        let mut refs = Vec::new();
-        for row in rows {
-            let (tracker, project, item_key, item_kind, ref_kind, source_commit, source_text) =
-                row?;
-            let Ok(tracker) = Tracker::from_db_str(&tracker) else { continue };
-            let item_kind = match item_kind.as_deref() {
-                Some(kind) => Some(ItemKind::from_db_str(kind).ok()).flatten(),
-                None => None,
-            };
-            refs.push(PapertrailRef {
-                tracker,
-                project,
-                item_key,
-                item_kind,
-                ref_kind,
-                source_kind: "commit".to_string(),
-                source_path: None,
-                source_commit,
-                source_text,
-            });
-        }
-        refs
-    };
+    let refs = current_commit_closing_refs(conn)?;
     store_text_closing_edges_from_commit_refs(conn, &refs, &eligible)
 }
 
+/// The stored closing COMMIT refs whose source commit STILL exists in the indexed history — the
+/// input to the commit-tier replace-set. Stored refs are the annotation layer and are never
+/// pruned, so this `git_commits` join keeps the derivation a pure function of CURRENT history (a
+/// rebased/reloaded-away commit's ref must not re-mint its closer). Extracted so the filter is
+/// unit-testable without a live checkout.
+pub(crate) fn current_commit_closing_refs(conn: &Connection) -> anyhow::Result<Vec<PapertrailRef>> {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    // STALENESS GUARD: stored refs are the annotation layer and are never pruned, so a
+    // rebased/reloaded-away commit's closing ref survives here — require the source commit to
+    // STILL exist in the indexed history, so the derivation is a pure function of CURRENT
+    // history (an automatic scheduled sync must not re-mint a `Fixes #5` edge from a commit no
+    // longer in `git_commits`).
+    let mut stmt = conn.prepare(
+        "SELECT r.tracker, r.project, r.item_key, r.item_kind, r.ref_kind, r.source_commit, \
+         r.source_text FROM papertrail_refs r WHERE r.repo_id = ?1 AND r.source_kind = 'commit' \
+         AND r.ref_kind = 'closing' AND EXISTS (SELECT 1 FROM git_commits g WHERE g.repo_id = \
+         r.repo_id AND g.hash = r.source_commit)",
+    )?;
+    let rows = stmt.query_map([&repo_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut refs = Vec::new();
+    for row in rows {
+        let (tracker, project, item_key, item_kind, ref_kind, source_commit, source_text) = row?;
+        let Ok(tracker) = Tracker::from_db_str(&tracker) else { continue };
+        let item_kind = match item_kind.as_deref() {
+            Some(kind) => ItemKind::from_db_str(kind).ok(),
+            None => None,
+        };
+        refs.push(PapertrailRef {
+            tracker,
+            project,
+            item_key,
+            item_kind,
+            ref_kind,
+            source_kind: "commit".to_string(),
+            source_path: None,
+            source_commit,
+            source_text,
+        });
+    }
+    Ok(refs)
+}
 /// The (provider, project) pairs for which the CURRENT checkout's HEAD is that remote's default
 /// branch — read locally from every remote's `HEAD` symref (`refs/remotes/<name>/HEAD`, set by
 /// clone / `git remote set-head`) and the remote URL's parsed project. Per-remote, NOT
@@ -607,6 +618,27 @@ fn default_branch_checkout_projects(
         if default != branch {
             continue;
         }
+        // Name equality is not enough: a local branch NAMED like the default can carry unpushed
+        // or divergent commits the provider has never seen on its default branch. The precise
+        // condition is ANCESTRY — every indexed commit must be default-branch-reachable, which
+        // holds exactly when HEAD is an ancestor-or-equal of the remote default tip. This
+        // ADMITS the common "behind a freshly-fetched tip" checkout (all its commits are on the
+        // default history), while still REJECTING an ahead/divergent local branch (whose unique
+        // commits the provider never saw on the default). Equality alone would false-negative
+        // the behind case and — via the unconditional text-closer replace below — wipe legit
+        // commit closers with nothing to re-derive offline.
+        let (Ok(head), Some(tip)) = (
+            repo.head_id(),
+            repo.find_reference(&target).ok().and_then(|mut r| r.peel_to_id().ok()),
+        ) else {
+            continue;
+        };
+        // HEAD is an ancestor-or-equal of the tip iff their merge base IS HEAD.
+        let head_reachable_from_tip = head == tip
+            || repo.merge_base(head, tip).ok().is_some_and(|base| base.detach() == head.detach());
+        if !head_reachable_from_tip {
+            continue;
+        }
         let key = format!("remote.{remote}.url");
         let Some(url) = repo.config_snapshot().string(key.as_str()).map(|url| url.to_string())
         else {
@@ -626,6 +658,9 @@ fn default_branch_checkout_projects(
                             .trim_start_matches("http://")
                             .split('/')
                             .next()
+                            // `parts.host` is port-stripped by the remote-URL parser; normalize
+                            // the configured authority the same way before comparing.
+                            .and_then(|authority| authority.split(':').next())
                             .is_some_and(|host| host.eq_ignore_ascii_case(&parts.host))
                     })
                 })
@@ -695,12 +730,16 @@ pub(crate) fn store_text_closing_edges_from_commit_refs(
         }
         // AFFIRMATIVE target verification: on shared-numbering providers a kind-less `#123`
         // can be a pull request, and closing keywords do nothing for PR targets — mint only
-        // when the cached mirror confirms the target IS an issue. (Un-mirrored targets stay
-        // annotations; the provider lane attests them.)
+        // when the cached mirror confirms the target IS an issue that is NOT open. The
+        // not-open clause is load-bearing: `store_item` voids a reopened issue's closing edges,
+        // but this rederive runs at sync END, so without it a reopened issue whose closing
+        // commit is still in history would have its text-tier closer re-minted every sync.
+        // (Un-mirrored targets stay annotations; the provider lane attests them.)
         let cached_kind: Option<String> = conn
             .query_row(
                 "SELECT item_kind FROM papertrail_items WHERE repo_id = ?1 AND tracker = ?2 AND \
-                 project = ?3 AND item_key = ?4 AND item_kind = 'issue'",
+                 project = ?3 AND item_key = ?4 AND item_kind = 'issue' AND state_normalized != \
+                 'open'",
                 params![
                     repo_id,
                     reference.tracker.as_db_str(),
@@ -711,6 +750,23 @@ pub(crate) fn store_text_closing_edges_from_commit_refs(
             )
             .optional()?;
         if cached_kind.as_deref() != Some(ItemKind::Issue.as_db_str()) {
+            continue;
+        }
+        // Defer to the provider tier. The text tier is the FALLBACK for issues the provider lane
+        // attested nothing for. If a provider closer already exists for this issue — the
+        // authoritative ClosedEvent set it, possibly to a DIFFERENT closer after a reopen+reclose
+        // the mirror caught — re-minting an old default-branch `Fixes #N` commit would strand a
+        // stale text edge beside the current provider one on EVERY sync (rederive is not
+        // watermarked). When the commit genuinely is the closer, the issue phase already stored it
+        // as a provider row (same sha), so skipping the text copy is harmless.
+        let has_provider_closer: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM papertrail_closing_edges WHERE repo_id = ?1 AND tracker \
+             = ?2 AND project = ?3 AND issue_kind = 'issue' AND issue_key = ?4 AND source = \
+             'provider')",
+            params![repo_id, reference.tracker.as_db_str(), reference.project, reference.item_key],
+            |row| row.get(0),
+        )?;
+        if has_provider_closer {
             continue;
         }
         let Some(commit) = reference.source_commit.as_deref() else {
@@ -761,12 +817,14 @@ mod mining_tests {
 
     /// Cache the TARGET as a mirrored issue — the strict kind check mints only for targets the
     /// mirror confirms are issues.
+    /// Cache the target as a CLOSED mirrored issue — the state a commit-closed issue is actually
+    /// in, and what the affirmative kind+not-open check the commit-closer mint requires.
     fn cache_issue(conn: &Connection, key: &str) {
         conn.execute(
             "INSERT OR IGNORE INTO papertrail_items(tracker, project, item_kind, item_key, url, \
              state, title, body, synced_at_ms, repo_id, state_normalized) VALUES ('github', \
-             'o/r', 'issue', ?1, 'u', 'open', 't', 'b', 1, (SELECT COALESCE((SELECT repo_id FROM \
-             repos LIMIT 1), '__unassigned__')), 'open')",
+             'o/r', 'issue', ?1, 'u', 'closed', 't', 'b', 1, (SELECT COALESCE((SELECT repo_id \
+             FROM repos LIMIT 1), '__unassigned__')), 'closed')",
             [key],
         )
         .unwrap();
@@ -1212,5 +1270,122 @@ mod mining_tests {
                 .unwrap()
                 .is_empty(),
         );
+    }
+    #[test]
+    fn rederive_does_not_resurrect_a_reopened_issues_commit_closer() {
+        // store_item voids a reopened issue's closing edges, but rederive runs at sync END and
+        // re-derives from every default-branch closing commit ref. Without the not-open clause
+        // on the cached-issue check, a reopened issue whose closing commit is still in history
+        // gets its text-tier closer re-minted every sync.
+        let conn = conn();
+        // Cache #5 as an OPEN issue (reopened).
+        let mut reopened = change_request("5", "b");
+        reopened.item_kind = ItemKind::Issue;
+        reopened.state = "open".into();
+        reopened.merged_at = None;
+        reopened.merge_commit_sha = None;
+        crate::store::store_item(&conn, Tracker::Github, &reopened).unwrap();
+        let reference = PapertrailRef {
+            tracker: Tracker::Github,
+            project: "o/r".into(),
+            item_key: "5".into(),
+            item_kind: Some(ItemKind::Issue),
+            ref_kind: "closing".into(),
+            source_kind: "commit".into(),
+            source_path: None,
+            source_commit: Some("abc".into()),
+            source_text: "fixes #5".into(),
+        };
+        store_text_closing_edges_from_commit_refs(
+            &conn,
+            &[reference],
+            &std::collections::BTreeSet::from([(Tracker::Github, "o/r".to_string())]),
+        )
+        .unwrap();
+        assert!(
+            closing_edges_for_item(&conn, Tracker::Github, "o/r", ItemKind::Issue, "5")
+                .unwrap()
+                .is_empty(),
+            "a reopened (open) issue's commit closer is not re-minted",
+        );
+    }
+
+    #[test]
+    fn rederive_defers_to_an_existing_provider_closer() {
+        // The text tier is the FALLBACK for issues the provider lane attested nothing for. When #5
+        // already carries a provider closer (its authoritative ClosedEvent — here PR 9, possibly
+        // moved there after a reopen+reclose the mirror caught), an old default-branch `Fixes #5`
+        // commit must NOT be re-minted as a stale text edge beside it on every sync.
+        let conn = conn();
+        let mut closed = change_request("5", "b");
+        closed.item_kind = ItemKind::Issue;
+        closed.state = "closed".into();
+        closed.merged_at = None;
+        closed.merge_commit_sha = None;
+        crate::store::store_item(&conn, Tracker::Github, &closed).unwrap();
+        crate::store::store_closing_edge(&conn, Tracker::Github, &crate::ClosingEdge {
+            project: "o/r".into(),
+            issue_kind: ItemKind::Issue,
+            issue_key: "5".into(),
+            closer_kind: crate::CloserKind::ChangeRequest,
+            closer_key: "9".into(),
+            closer_commit: None,
+            source: crate::ClosingEdgeSource::Provider,
+        })
+        .unwrap();
+        let reference = PapertrailRef {
+            tracker: Tracker::Github,
+            project: "o/r".into(),
+            item_key: "5".into(),
+            item_kind: Some(ItemKind::Issue),
+            ref_kind: "closing".into(),
+            source_kind: "commit".into(),
+            source_path: None,
+            source_commit: Some("abc".into()),
+            source_text: "fixes #5".into(),
+        };
+        store_text_closing_edges_from_commit_refs(
+            &conn,
+            &[reference],
+            &std::collections::BTreeSet::from([(Tracker::Github, "o/r".to_string())]),
+        )
+        .unwrap();
+        let edges =
+            closing_edges_for_item(&conn, Tracker::Github, "o/r", ItemKind::Issue, "5").unwrap();
+        assert_eq!(edges.len(), 1, "no stale text closer is minted beside the provider one");
+        assert_eq!(edges[0].source, crate::ClosingEdgeSource::Provider);
+        assert_eq!(edges[0].closer_key, "9");
+    }
+
+    #[test]
+    fn current_commit_closing_refs_excludes_commits_gone_from_history() {
+        let conn = conn();
+        // Seed a real git_commits row so the FK/EXISTS join has a live commit…
+        conn.execute(
+            "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s, \
+             committed_at_s, subject, body, repo_id) VALUES ('live', 'a', 'a@x', 0, 0, 's', 'b', \
+             (SELECT COALESCE((SELECT repo_id FROM repos LIMIT 1), '__unassigned__')))",
+            [],
+        )
+        .unwrap();
+        let repo_id: String = conn
+            .query_row(
+                "SELECT COALESCE((SELECT repo_id FROM repos LIMIT 1), '__unassigned__')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for (key, commit) in [("5", "live"), ("6", "gone")] {
+            conn.execute(
+                "INSERT INTO papertrail_refs(tracker, project, item_key, item_kind, ref_kind, \
+                 source_kind, source_commit, source_text, discovered_at_ms, repo_id) VALUES \
+                 ('github', 'o/r', ?1, 'issue', 'closing', 'commit', ?2, 'fixes', 0, ?3)",
+                rusqlite::params![key, commit, repo_id],
+            )
+            .unwrap();
+        }
+        let refs = current_commit_closing_refs(&conn).unwrap();
+        let keys: Vec<&str> = refs.iter().map(|r| r.item_key.as_str()).collect();
+        assert_eq!(keys, vec!["5"], "only the ref whose commit is still in git_commits survives");
     }
 }

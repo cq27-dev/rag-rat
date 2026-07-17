@@ -220,6 +220,13 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Remove an `index_meta` key (the global-scope companion to [`delete_repo_meta`]). Idempotent:
+/// deleting an absent key is a no-op.
+pub fn delete_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM index_meta WHERE key = ?1", [key])?;
+    Ok(())
+}
+
 pub fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
     Ok(conn
         .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))

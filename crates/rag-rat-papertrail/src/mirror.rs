@@ -121,6 +121,16 @@ pub struct MirrorBindingReport {
     /// this classifies the run as a successful PROBE — advancing probe freshness only, never the
     /// mirror or full-walk timestamps.
     pub probe_not_modified: bool,
+    /// Provider-attested closing edges stored by the attested-closers walk (#702 stage 2).
+    pub attested_edges: usize,
+    /// Rows the attested-closers walk MUTATED besides fresh edge inserts (counted separately in
+    /// `attested_edges`): per-closer replace-set DELETEs and item resolution / merge-sha UPDATEs.
+    /// A run that only reaped a stale edge or stamped a resolution moved content — this keeps such
+    /// a run from being misclassified as a probe when the item feed was not-modified.
+    pub attested_writes: usize,
+    /// The attested walk's failure, when it had one — EXPLICIT but non-fatal: the mirror data
+    /// this run landed is kept, the watermark does not advance, and the next sync retries.
+    pub attested_error: Option<String>,
 }
 
 pub(crate) async fn mirror_binding<C: PapertrailClient>(
@@ -176,6 +186,9 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
         stored_items: 0,
         stored_comments: 0,
         pruned_items: 0,
+        attested_edges: 0,
+        attested_writes: 0,
+        attested_error: None,
         paused_until_ms: None,
         pause_reason: None,
         completed_full_walk: false,
@@ -183,6 +196,10 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
     };
     if filter_changed {
         report.pruned_items += prune_unmatched(conn, binding)?;
+        // A widened filter caches newly-in-scope closed issues; a full-rewalk already ran the
+        // same clear above. (Narrowing is handled by edge deletion on prune, but clearing here
+        // covers both directions uniformly.) See `clear_attested_watermark` for the invariant.
+        clear_attested_watermark(conn, binding)?;
         save_cursor(conn, binding, &cursor, false)?;
     }
 
@@ -190,6 +207,30 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
         mirror_binding_inner(conn, binding, trackers, client, &mut cursor, &mut report).await;
     match result {
         Ok(()) => {
+            // Stage 2 (#702): the attested-closers walk runs after the item/comment walk so its
+            // per-item outcome updates land on freshly-cached rows. Its failure is non-fatal —
+            // the walk is an enrichment over data the mirror already landed and its watermark
+            // stays put — BUT a rate-limit/pass-budget PAUSE must still surface as a pause, or
+            // `run_binding_job` records the binding healthy and clears retry state while the
+            // attested watermark is stale. Propagate the resume time; fold any other error into
+            // the explicit non-fatal `attested_error`.
+            if let Err(error) = sync_attested_closers(conn, binding, client, &mut report).await {
+                match pause(&error) {
+                    Some((resume_at_ms, reason)) => {
+                        report.paused_until_ms = Some(resume_at_ms);
+                        report.pause_reason = Some(reason.as_str().to_string());
+                    },
+                    None => report.attested_error = Some(error.to_string()),
+                }
+            }
+            // Persist the attested-walk health for the durable status snapshot: a HARD failure is
+            // stored, a clean completion clears it. A pause (retry clock already set) leaves the
+            // prior state untouched.
+            if let Some(detail) = &report.attested_error {
+                set_attested_error(conn, binding, detail)?;
+            } else if report.paused_until_ms.is_none() {
+                clear_attested_error(conn, binding)?;
+            }
             report.completed_full_walk = cursor.backfill_done
                 && (!had_completed_backfill
                     || starting_full_rewalk
@@ -884,6 +925,9 @@ fn reset_for_full_rewalk(
     cursor.backfill_processed_keys.clear();
     cursor.full_rewalk = true;
     reset_full_seen(conn, binding)?;
+    // A full rewalk re-caches every closed issue; clear the attested watermark so their
+    // provider closers get re-fetched from the top (the twin of the filter-change reset).
+    clear_attested_watermark(conn, binding)?;
     save_cursor(conn, binding, cursor, false)
 }
 
@@ -947,6 +991,227 @@ fn replace_tags(
                 repo_id
             ],
         )?;
+    }
+    Ok(())
+}
+
+/// A per-binding `index_meta` key for the attested-closers lane. `kind` is a stable machine token
+/// (`since` — the walk watermark; `error` — the last hard failure detail). Repo-scoped so a
+/// consolidated multi-repo DB keeps each binding's lane state separate.
+fn attested_meta_key(
+    binding: &ResolvedTracker,
+    conn: &Connection,
+    kind: &str,
+) -> anyhow::Result<String> {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    Ok(format!(
+        "papertrail_attested_closers_{kind}:{repo_id}:{}:{}",
+        binding.provider.as_db_str(),
+        binding.project
+    ))
+}
+
+/// The `index_meta` key for a binding's attested-closers watermark — shared by the walk (read/
+/// stamp) and the reset seams so they can never drift.
+fn attested_since_key(binding: &ResolvedTracker, conn: &Connection) -> anyhow::Result<String> {
+    attested_meta_key(binding, conn, "since")
+}
+
+/// Persist a HARD attested-walk failure so it stays visible in `papertrail_sync_status`. This is
+/// SEPARATE from the item-mirror health (`error_class`/`error_detail`, owned by `record_success` /
+/// `record_failure`): the item walk can succeed — clearing its own error state and advancing
+/// freshness — while the enrichment walk fails every tick with a stale watermark. Without this the
+/// failure is invisible in the durable status snapshot. Detail is length-capped and stripped of
+/// control chars. A pause is NOT persisted here (it rides the retry clock); a clean walk clears it.
+pub(crate) fn set_attested_error(
+    conn: &Connection,
+    binding: &ResolvedTracker,
+    detail: &str,
+) -> anyhow::Result<()> {
+    let key = attested_meta_key(binding, conn, "error")?;
+    let sanitized: String =
+        detail.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).take(512).collect();
+    rag_rat_db::meta::set_meta(conn, &key, sanitized.trim())
+}
+
+/// Clear a binding's persisted attested-walk failure — a clean completed attested walk.
+pub(crate) fn clear_attested_error(
+    conn: &Connection,
+    binding: &ResolvedTracker,
+) -> anyhow::Result<()> {
+    let key = attested_meta_key(binding, conn, "error")?;
+    rag_rat_db::meta::delete_meta(conn, &key)
+}
+
+/// Read a binding's persisted attested-walk failure, for the status snapshot.
+pub(crate) fn read_attested_error(
+    conn: &Connection,
+    binding: &ResolvedTracker,
+) -> anyhow::Result<Option<String>> {
+    let key = attested_meta_key(binding, conn, "error")?;
+    rag_rat_db::meta::read_meta(conn, &key)
+}
+
+/// Clear a binding's attested-closers `since` watermark. The INVARIANT: EVERY seam that forces a
+/// full item re-walk (a WIDENED filter, or a full rewalk) must call this. Such a re-walk re-caches
+/// closed issues whose provider-attested closers may PREDATE the stored `since`; a reused watermark
+/// would stop the attested walk before revisiting them, so those issues would silently never regain
+/// their provider edges. Clearing forces the next attested walk to re-scan from the top — its
+/// upserts and per-closer replace-sets make the redo idempotent. Two seams reset the item backfill
+/// (`filter_changed` and `reset_for_full_rewalk`); both route through here rather than each
+/// inlining the delete, so a third reset seam can't forget it.
+fn clear_attested_watermark(conn: &Connection, binding: &ResolvedTracker) -> anyhow::Result<()> {
+    let key = attested_since_key(binding, conn)?;
+    rag_rat_db::meta::delete_meta(conn, &key)
+}
+
+/// The provider-attested closers walk (#702 stage 2): pages `attested_closers_page` until the
+/// walk completes or falls behind the last completed walk's watermark, storing every attested
+/// edge (the upsert's trust ladder upgrades text-tier rows in place) and applying per-item
+/// outcome updates to CACHED rows. The watermark advances ONLY on a COMPLETED walk — an
+/// interrupted run redoes from the top next time (idempotent upserts, no cursor sub-state).
+async fn sync_attested_closers<C: PapertrailClient>(
+    conn: &Connection,
+    binding: &ResolvedTracker,
+    client: &C,
+    report: &mut MirrorBindingReport,
+) -> anyhow::Result<()> {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let key = attested_since_key(binding, conn)?;
+    let since = rag_rat_db::meta::read_meta(conn, &key)?;
+    let mut cursor: Option<String> = None;
+    let mut frontier: Option<String> = None;
+    let mut pages_seen = 0usize;
+    loop {
+        let Some(page) = client
+            .attested_closers_page(&binding.project, cursor.as_deref(), since.as_deref())
+            .await?
+        else {
+            // `None` on the FIRST page = no attested supply (provider without one, or the
+            // capability probe failed on the opening call): the text tier is the only local
+            // evidence and stage-2 storage is a clean no-op. `None` AFTER pages were stored is a
+            // mid-walk capability trip (a transient probe-shaped failure): the walk is PARTIAL,
+            // so surface it — the watermark stays put and the next sync redoes from the top.
+            if pages_seen > 0 {
+                report.attested_error = Some(
+                    "attested-closers walk ended early: capability unavailable mid-walk".into(),
+                );
+            }
+            return Ok(());
+        };
+        pages_seen += 1;
+        if let Some(page_frontier) = &page.frontier {
+            // Conservative MINIMUM across phases (ISO timestamps compare lexicographically):
+            // neither stream's later updates can be skipped by the other's newer frontier.
+            frontier = match frontier.take() {
+                Some(existing) if existing <= *page_frontier => Some(existing),
+                _ => Some(page_frontier.clone()),
+            };
+        }
+        let tx = conn.unchecked_transaction()?;
+        // ISSUE-KEYED REPLACE-SET: an issue has exactly one authoritative closer (its last
+        // ClosedEvent), so re-reading it lets the walk reap EVERY provider closer edge targeting
+        // it — any kind — before the current closer is reinserted below. A stale or changed
+        // closer (reopened-then-reclosed by a different PR/commit) dies with the refresh. Reaping
+        // is deliberately NOT closer-keyed (per-PR): a PR closes many issues, so deleting a PR's
+        // outgoing edges would clobber UI-linked rows created from another issue's ClosedEvent
+        // that the PR's `closingIssuesReferences` never lists. The PR phase only CREATES keyword
+        // edges (idempotent upserts); it never reaps.
+        for issue_key in &page.replaced_issue_closers {
+            report.attested_writes += tx.execute(
+                "DELETE FROM papertrail_closing_edges WHERE repo_id = ?1 AND tracker = ?2 AND \
+                 project = ?3 AND source = 'provider' AND issue_key = ?4",
+                params![repo_id, binding.provider.as_db_str(), binding.project, issue_key],
+            )?;
+        }
+        for edge in &page.edges {
+            // Store an attested edge ONLY when its target issue is a cached item that is NOT
+            // open. Cached ⇒ the item passed this binding's tag filter (the item walk prunes
+            // out-of-scope items), so a `tags = ["bug"]` binding never records closures for
+            // untracked issues. Not-open ⇒ no closure evidence for a reopened issue (the API
+            // may still list a merged PR's `closingIssuesReferences` for an issue that was
+            // reopened). An un-mirrored or reopened target is skipped; a later closed+in-scope
+            // walk records it. (`edge.project` is the issue's project — same-project after the
+            // cross-repo skips, i.e. `binding.project`.)
+            let target_closed = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM papertrail_items WHERE repo_id = ?1 AND tracker = ?2 \
+                 AND project = ?3 AND item_kind = 'issue' AND item_key = ?4 AND state_normalized \
+                 != 'open')",
+                params![repo_id, binding.provider.as_db_str(), edge.project, edge.issue_key],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !target_closed {
+                continue;
+            }
+            // Defer to the issue's ONE authoritative closer: never store an edge that CONFLICTS
+            // with a provider closer already recorded for this issue (a different closer). The
+            // issue phase reaps all of a re-read issue's provider edges earlier in THIS tx, so its
+            // own fresh closer never conflicts; the PR phase does NOT reap, so without this a PR
+            // edited after the watermark would resurrect `#5←#9` once #5's ClosedEvent had already
+            // moved its closer elsewhere (and #5 sits below the watermark, never re-read). The
+            // same-closer case is not a conflict, so an idempotent re-store still passes.
+            let conflicting_closer = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM papertrail_closing_edges WHERE repo_id = ?1 AND \
+                 tracker = ?2 AND project = ?3 AND issue_kind = ?4 AND issue_key = ?5 AND source \
+                 = 'provider' AND NOT (closer_kind = ?6 AND closer_key = ?7))",
+                params![
+                    repo_id,
+                    binding.provider.as_db_str(),
+                    edge.project,
+                    edge.issue_kind.as_db_str(),
+                    edge.issue_key,
+                    edge.closer_kind.as_db_str(),
+                    edge.closer_key,
+                ],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if conflicting_closer {
+                continue;
+            }
+            store_closing_edge(&tx, binding.provider, edge)?;
+            report.attested_edges += 1;
+        }
+        for update in &page.item_updates {
+            if let Some(resolution) = update.resolution {
+                report.attested_writes += tx.execute(
+                    "UPDATE papertrail_items SET resolution = ?6 WHERE repo_id = ?1 AND tracker = \
+                     ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
+                    params![
+                        repo_id,
+                        binding.provider.as_db_str(),
+                        binding.project,
+                        update.item_kind.as_db_str(),
+                        update.item_key,
+                        resolution.as_db_str(),
+                    ],
+                )?;
+            }
+            if let Some(sha) = &update.merge_commit_sha {
+                // The merged-only invariant, enforced in SQL: an attested sha lands only on rows
+                // the store already normalized as merged.
+                report.attested_writes += tx.execute(
+                    "UPDATE papertrail_items SET merge_commit_sha = ?6 WHERE repo_id = ?1 AND \
+                     tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5 AND \
+                     state_normalized = 'merged'",
+                    params![
+                        repo_id,
+                        binding.provider.as_db_str(),
+                        binding.project,
+                        update.item_kind.as_db_str(),
+                        update.item_key,
+                        sha,
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    if let Some(frontier) = frontier {
+        rag_rat_db::meta::set_meta(conn, &key, &frontier)?;
     }
     Ok(())
 }
@@ -1057,6 +1322,18 @@ fn delete_item(
          item_kind=?4 AND item_key=?5",
         params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key],
     )?;
+    // An issue leaving the cache (pruned out of scope, or deleted) takes its closing edges with
+    // it — of BOTH tiers. The attested walk stores an edge only for a cached issue, so the cache
+    // is the source of truth: no cached issue ⇒ no closing edges targeting it. Without this, a
+    // narrowed tag filter prunes the issue row but strands its provider closer, and the attested
+    // watermark won't revisit the closer to clean it (#727 review).
+    if kind == ItemKind::Issue {
+        conn.execute(
+            "DELETE FROM papertrail_closing_edges WHERE repo_id=?1 AND tracker=?2 AND project=?3 \
+             AND issue_kind=?4 AND issue_key=?5",
+            params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key],
+        )?;
+    }
     Ok(conn.execute(
         "DELETE FROM papertrail_items WHERE repo_id=?1 AND tracker=?2 AND project=?3 AND \
          item_kind=?4 AND item_key=?5",
@@ -1312,6 +1589,9 @@ mod tests {
 
     struct ScriptClient {
         comment_streams: &'static [&'static str],
+        attested: RefCell<VecDeque<Option<AttestedClosersPage>>>,
+        attested_pause: std::cell::Cell<bool>,
+        attested_hard_error: std::cell::Cell<bool>,
         pages: RefCell<VecDeque<anyhow::Result<ItemsPage>>>,
         probes: RefCell<VecDeque<FreshnessResult>>,
         item_comments: RefCell<VecDeque<anyhow::Result<Vec<PapertrailComment>>>>,
@@ -1327,6 +1607,9 @@ mod tests {
         fn new(pages: Vec<anyhow::Result<ItemsPage>>) -> Self {
             Self {
                 comment_streams: &["default"],
+                attested: RefCell::new(VecDeque::new()),
+                attested_pause: std::cell::Cell::new(false),
+                attested_hard_error: std::cell::Cell::new(false),
                 pages: RefCell::new(pages.into()),
                 probes: RefCell::new(VecDeque::new()),
                 item_comments: RefCell::new(VecDeque::new()),
@@ -1458,6 +1741,24 @@ mod tests {
                 not_modified: true,
             }))
         }
+
+        async fn attested_closers_page(
+            &self,
+            _project: &str,
+            _cursor: Option<&str>,
+            _since: Option<&str>,
+        ) -> anyhow::Result<Option<AttestedClosersPage>> {
+            if self.attested_pause.get() {
+                return Err(anyhow::Error::new(TransportError::Paused {
+                    resume_at_ms: 999_000,
+                    reason: PauseReason::RetryAfter,
+                }));
+            }
+            if self.attested_hard_error.get() {
+                anyhow::bail!("attested walk boom");
+            }
+            Ok(self.attested.borrow_mut().pop_front().unwrap_or(None))
+        }
     }
 
     #[test]
@@ -1533,11 +1834,26 @@ mod tests {
             stored_items: 0,
             stored_comments: 0,
             pruned_items: 0,
+            attested_edges: 0,
+            attested_writes: 0,
+            attested_error: None,
             paused_until_ms: None,
             pause_reason: None,
             completed_full_walk: false,
             probe_not_modified: false,
         }
+    }
+
+    /// Cache a CLOSED in-scope issue so the attested-edge cached-closed gate admits its edges.
+    fn cache_closed_issue(conn: &Connection, key: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO papertrail_items(tracker, project, item_kind, item_key, url, \
+             state, title, body, synced_at_ms, repo_id, state_normalized) VALUES ('github', \
+             'o/r', 'issue', ?1, 'u', 'closed', 't', 'b', 1, (SELECT COALESCE((SELECT repo_id \
+             FROM repos LIMIT 1), '__unassigned__')), 'closed')",
+            [key],
+        )
+        .unwrap();
     }
 
     fn db() -> Connection {
@@ -1610,6 +1926,72 @@ mod tests {
         let requests = quiet.item_page_requests.borrow();
         assert_eq!(requests.len(), 1, "the owed replay must run despite the quiet probe");
         assert!(requests[0].updated_since.is_some(), "the replay is a delta scan");
+    }
+
+    /// A filter change must RESET the attested-closers watermark: a widened filter caches
+    /// newly-in-scope closed issues whose PRs/issues predate the stored `since`, and a reused
+    /// watermark would stop the attested walk before ever visiting them. An unchanged filter must
+    /// leave the watermark intact so the incremental walk stays incremental (#727 review).
+    #[test]
+    fn a_filter_change_resets_the_attested_watermark_but_a_stable_filter_keeps_it() {
+        let conn = db();
+        let binding = binding(&[]);
+        let key = attested_since_key(&binding, &conn).unwrap();
+
+        // Persist a cursor whose stored fingerprint will NOT match the binding's, forcing the
+        // next sync onto the filter-changed path.
+        let mut cursor = load_cursor(&conn, &binding).unwrap();
+        cursor.filter_fingerprint = "stale-fingerprint".to_string();
+        save_cursor(&conn, &binding, &cursor, false).unwrap();
+        rag_rat_db::meta::set_meta(&conn, &key, "2020-01-01T00:00:00Z").unwrap();
+
+        let changed = ScriptClient::new(vec![page(Vec::new()), page(Vec::new())])
+            .with_repo_comments(Vec::new());
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &changed, false))
+            .unwrap();
+        assert!(
+            rag_rat_db::meta::read_meta(&conn, &key).unwrap().is_none(),
+            "the widened-filter path clears the attested watermark",
+        );
+
+        // The prior run stored the binding's own fingerprint, so a repeat sync sees no change:
+        // the freshly re-seeded watermark must survive.
+        rag_rat_db::meta::set_meta(&conn, &key, "2021-01-01T00:00:00Z").unwrap();
+        let stable = ScriptClient::new(vec![page(Vec::new()), page(Vec::new())])
+            .with_probe(FreshnessResult { latest: None, etag: None, not_modified: true })
+            .with_repo_comments(Vec::new());
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &stable, false))
+            .unwrap();
+        assert_eq!(
+            rag_rat_db::meta::read_meta(&conn, &key).unwrap().as_deref(),
+            Some("2021-01-01T00:00:00Z"),
+            "a stable filter leaves the attested watermark untouched",
+        );
+    }
+
+    /// A FULL rewalk re-caches every closed issue, so it must clear the attested watermark for the
+    /// same reason a widened filter does — otherwise the attested walk reads a stale `since` and
+    /// silently never re-fetches provider closers for issues whose closer predates it. This is the
+    /// full-rewalk seam in isolation: the filter is unchanged, so ONLY `reset_for_full_rewalk` can
+    /// do the clearing.
+    #[test]
+    fn a_full_rewalk_clears_the_attested_watermark_even_with_an_unchanged_filter() {
+        let conn = db();
+        let binding = binding(&[]);
+        let key = attested_since_key(&binding, &conn).unwrap();
+        rag_rat_db::meta::set_meta(&conn, &key, "2026-01-01T00:00:00Z").unwrap();
+
+        // full=true on a fresh cursor ⇒ starting_full_rewalk; tags=[] matches the stored empty
+        // fingerprint ⇒ filter_changed=false, so the filter-change clear cannot fire.
+        let full = ScriptClient::new(vec![page(Vec::new()), page(Vec::new())])
+            .with_repo_comments(Vec::new());
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &full, true))
+            .unwrap();
+
+        assert!(
+            rag_rat_db::meta::read_meta(&conn, &key).unwrap().is_none(),
+            "reset_for_full_rewalk must clear the attested watermark",
+        );
     }
 
     /// A comments page whose entries all map to no comment (GitLab events on commit/snippet
@@ -3045,5 +3427,472 @@ mod tests {
                 .unwrap();
         assert!(report.pruned_items >= 1);
         assert!(keys(&conn).is_empty());
+    }
+    #[test]
+    fn attested_closers_walk_stores_upgrades_and_watermarks() {
+        let conn = db();
+        let binding = binding(&[]);
+        // A pre-existing TEXT-tier edge for the same pair: the provider walk must upgrade it.
+        crate::store::store_closing_edge(&conn, Tracker::Github, &crate::ClosingEdge {
+            project: "o/r".into(),
+            issue_kind: ItemKind::Issue,
+            issue_key: "5".into(),
+            closer_kind: crate::CloserKind::ChangeRequest,
+            closer_key: "9".into(),
+            closer_commit: None,
+            source: crate::ClosingEdgeSource::Text,
+        })
+        .unwrap();
+        cache_closed_issue(&conn, "5");
+        let client = ScriptClient::new(vec![page(Vec::new())]);
+        client.attested.borrow_mut().push_back(Some(AttestedClosersPage {
+            edges: vec![crate::ClosingEdge {
+                project: "o/r".into(),
+                issue_kind: ItemKind::Issue,
+                issue_key: "5".into(),
+                closer_kind: crate::CloserKind::ChangeRequest,
+                closer_key: "9".into(),
+                closer_commit: Some("abc123".into()),
+                source: crate::ClosingEdgeSource::Provider,
+            }],
+            item_updates: Vec::new(),
+            replaced_issue_closers: Vec::new(),
+            next: Some("issues".into()),
+            frontier: Some("2026-01-05T00:00:00Z".into()),
+        }));
+        client.attested.borrow_mut().push_back(Some(AttestedClosersPage::default()));
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &client,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(report.attested_edges, 1);
+        let edges = crate::store::closing_edges_for_item(
+            &conn,
+            Tracker::Github,
+            "o/r",
+            ItemKind::Issue,
+            "5",
+        )
+        .unwrap();
+        assert_eq!(edges.len(), 1, "text and provider tiers converge on the pair");
+        assert_eq!(edges[0].source, crate::ClosingEdgeSource::Provider);
+        assert_eq!(edges[0].closer_commit.as_deref(), Some("abc123"));
+        // The COMPLETED walk stamped its watermark.
+        let repo_id = rag_rat_db::schema::active_repo_id(&conn).unwrap();
+        let since = rag_rat_db::meta::read_meta(
+            &conn,
+            &format!("papertrail_attested_closers_since:{repo_id}:github:o/r"),
+        )
+        .unwrap();
+        assert_eq!(since.as_deref(), Some("2026-01-05T00:00:00Z"));
+    }
+
+    #[test]
+    fn attested_item_updates_touch_only_cached_merged_rows() {
+        let conn = db();
+        let binding = binding(&[]);
+        // A cached CLOSED-UNMERGED change request: the attested sha must NOT land on it.
+        let mut unmerged = item("9", "2026-01-01T00:00:00Z", "t", &[]);
+        unmerged.item_kind = ItemKind::ChangeRequest;
+        unmerged.state = "closed".into();
+        crate::store::store_item(&conn, Tracker::Github, &unmerged).unwrap();
+        let client = ScriptClient::new(vec![page(Vec::new())]);
+        client.attested.borrow_mut().push_back(Some(AttestedClosersPage {
+            edges: Vec::new(),
+            item_updates: vec![crate::AttestedItemUpdate {
+                item_kind: ItemKind::ChangeRequest,
+                item_key: "9".into(),
+                resolution: None,
+                merge_commit_sha: Some("attested".into()),
+            }],
+            replaced_issue_closers: Vec::new(),
+            next: None,
+            frontier: None,
+        }));
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &client, false))
+            .unwrap();
+        let sha: Option<String> = conn
+            .query_row(
+                "SELECT merge_commit_sha FROM papertrail_items WHERE item_key = '9'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sha, None, "merged-only invariant holds against attested updates too");
+    }
+    #[test]
+    fn issue_keyed_replace_set_drops_a_re_read_issues_stale_closer_of_any_kind() {
+        let conn = db();
+        let binding = binding(&[]);
+        cache_closed_issue(&conn, "5");
+        // Issue 5's PREVIOUS provider closer was commit `old`; this walk re-reads issue 5 and its
+        // ClosedEvent now names PR 9. The issue-keyed replace-set reaps EVERY provider closer for
+        // issue 5 (the commit included), so the stale commit closer dies and only the fresh PR
+        // closer remains — reaping is keyed by the issue, not by any one closer.
+        crate::store::store_closing_edge(&conn, Tracker::Github, &crate::ClosingEdge {
+            project: "o/r".into(),
+            issue_kind: ItemKind::Issue,
+            issue_key: "5".into(),
+            closer_kind: crate::CloserKind::Commit,
+            closer_key: "old".into(),
+            closer_commit: Some("old".into()),
+            source: crate::ClosingEdgeSource::Provider,
+        })
+        .unwrap();
+        let client = ScriptClient::new(vec![page(Vec::new())]);
+        client.attested.borrow_mut().push_back(Some(AttestedClosersPage {
+            edges: vec![crate::ClosingEdge {
+                project: "o/r".into(),
+                issue_kind: ItemKind::Issue,
+                issue_key: "5".into(),
+                closer_kind: crate::CloserKind::ChangeRequest,
+                closer_key: "9".into(),
+                closer_commit: None,
+                source: crate::ClosingEdgeSource::Provider,
+            }],
+            item_updates: Vec::new(),
+            replaced_issue_closers: vec!["5".into()],
+            next: None,
+            frontier: None,
+        }));
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &client, false))
+            .unwrap();
+        let edges = crate::store::closing_edges_for_item(
+            &conn,
+            Tracker::Github,
+            "o/r",
+            ItemKind::Issue,
+            "5",
+        )
+        .unwrap();
+        assert_eq!(edges.len(), 1, "the stale commit closer died with the refresh");
+        assert_eq!(edges[0].closer_kind, crate::CloserKind::ChangeRequest);
+        assert_eq!(edges[0].closer_key, "9", "only the fresh authoritative closer remains");
+    }
+
+    /// The reported hazard the issue-keyed model fixes: a UI-linked closure (issue 5 <- PR 9 from
+    /// ClosedEvent, NOT in PR 9's `closingIssuesReferences`) must SURVIVE a later PR-phase re-read
+    /// of PR 9. Under the old closer-keyed replace-set, re-reading PR 9 deleted every
+    /// `change_request` edge with closer 9 — including the issue-phase UI-linked row 5<-9, which
+    /// the PR phase never re-provides — and issue 5 (older than the watermark) was never revisited
+    /// to restore it, silently dropping attested closure evidence.
+    #[test]
+    fn a_pr_phase_re_read_does_not_clobber_an_issue_phase_ui_linked_edge() {
+        let conn = db();
+        let binding = binding(&[]);
+        cache_closed_issue(&conn, "5");
+        // Prior walk stored the UI-linked edge 5<-9 from issue 5's ClosedEvent.
+        crate::store::store_closing_edge(&conn, Tracker::Github, &crate::ClosingEdge {
+            project: "o/r".into(),
+            issue_kind: ItemKind::Issue,
+            issue_key: "5".into(),
+            closer_kind: crate::CloserKind::ChangeRequest,
+            closer_key: "9".into(),
+            closer_commit: Some("mergesha".into()),
+            source: crate::ClosingEdgeSource::Provider,
+        })
+        .unwrap();
+        // This incremental walk re-reads PR 9 in the PR phase (it edited after the watermark), but
+        // PR 9's closingIssuesReferences does NOT list issue 5 (the closure was UI-linked). Issue 5
+        // is older than the watermark, so the issue phase does NOT revisit it:
+        // `replaced_issue_closers` is empty and there are no fresh edges.
+        let client = ScriptClient::new(vec![page(Vec::new())]);
+        client.attested.borrow_mut().push_back(Some(AttestedClosersPage {
+            edges: Vec::new(),
+            item_updates: Vec::new(),
+            replaced_issue_closers: Vec::new(),
+            next: None,
+            frontier: None,
+        }));
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &client, false))
+            .unwrap();
+        let edges = crate::store::closing_edges_for_item(
+            &conn,
+            Tracker::Github,
+            "o/r",
+            ItemKind::Issue,
+            "5",
+        )
+        .unwrap();
+        assert_eq!(edges.len(), 1, "the UI-linked edge survives a PR-phase re-read of its closer");
+        assert_eq!(edges[0].closer_key, "9");
+    }
+
+    /// The PR phase must not RESURRECT a stale closer: if issue 5's authoritative provider closer
+    /// is already PR 7 (its ClosedEvent moved there after a reopen+reclose) and PR 9 — edited after
+    /// the watermark — still lists #5 in `closingIssuesReferences` while #5 sits below the
+    /// watermark (never re-read this walk, so no reap), storing `5<-9` would leave two
+    /// conflicting provider closers. The conflicting-closer gate suppresses it; the same-closer
+    /// idempotent case still passes.
+    #[test]
+    fn the_pr_phase_does_not_resurrect_a_closer_that_conflicts_with_the_authoritative_one() {
+        let conn = db();
+        let binding = binding(&[]);
+        cache_closed_issue(&conn, "5");
+        crate::store::store_closing_edge(&conn, Tracker::Github, &crate::ClosingEdge {
+            project: "o/r".into(),
+            issue_kind: ItemKind::Issue,
+            issue_key: "5".into(),
+            closer_kind: crate::CloserKind::ChangeRequest,
+            closer_key: "7".into(),
+            closer_commit: None,
+            source: crate::ClosingEdgeSource::Provider,
+        })
+        .unwrap();
+        // PR-phase page (no reap: replaced_issue_closers empty) re-adding the stale 5<-9.
+        let client = ScriptClient::new(vec![page(Vec::new())]);
+        client.attested.borrow_mut().push_back(Some(AttestedClosersPage {
+            edges: vec![crate::ClosingEdge {
+                project: "o/r".into(),
+                issue_kind: ItemKind::Issue,
+                issue_key: "5".into(),
+                closer_kind: crate::CloserKind::ChangeRequest,
+                closer_key: "9".into(),
+                closer_commit: None,
+                source: crate::ClosingEdgeSource::Provider,
+            }],
+            item_updates: Vec::new(),
+            replaced_issue_closers: Vec::new(),
+            next: None,
+            frontier: None,
+        }));
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &client, false))
+            .unwrap();
+        let edges = crate::store::closing_edges_for_item(
+            &conn,
+            Tracker::Github,
+            "o/r",
+            ItemKind::Issue,
+            "5",
+        )
+        .unwrap();
+        assert_eq!(edges.len(), 1, "the stale conflicting closer is not resurrected");
+        assert_eq!(edges[0].closer_key, "7", "only the authoritative closer remains");
+    }
+
+    #[test]
+    fn min_frontier_across_phases_cannot_skip_the_older_stream() {
+        let conn = db();
+        let binding = binding(&[]);
+        let client = ScriptClient::new(vec![page(Vec::new())]);
+        // PR phase frontier is NEWER than the issue phase's — the stored watermark must be the
+        // conservative minimum so the next walk cannot skip issue updates in between.
+        client.attested.borrow_mut().push_back(Some(AttestedClosersPage {
+            frontier: Some("2026-01-09T00:00:00Z".into()),
+            next: Some("issues".into()),
+            ..Default::default()
+        }));
+        client.attested.borrow_mut().push_back(Some(AttestedClosersPage {
+            frontier: Some("2026-01-03T00:00:00Z".into()),
+            ..Default::default()
+        }));
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &client, false))
+            .unwrap();
+        let repo_id = rag_rat_db::schema::active_repo_id(&conn).unwrap();
+        let since = rag_rat_db::meta::read_meta(
+            &conn,
+            &format!("papertrail_attested_closers_since:{repo_id}:github:o/r"),
+        )
+        .unwrap();
+        assert_eq!(since.as_deref(), Some("2026-01-03T00:00:00Z"));
+    }
+    #[test]
+    fn a_mid_walk_capability_trip_surfaces_a_partial_signal() {
+        let conn = db();
+        let binding = binding(&[]);
+        let client = ScriptClient::new(vec![page(Vec::new())]);
+        // First page stores work and advances to the issues phase; the SECOND call returns
+        // `None` (a mid-walk capability trip), so the walk is partial.
+        client.attested.borrow_mut().push_back(Some(AttestedClosersPage {
+            next: Some("issues".into()),
+            frontier: Some("2026-01-05T00:00:00Z".into()),
+            ..Default::default()
+        }));
+        client.attested.borrow_mut().push_back(None);
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &client,
+            false,
+        ))
+        .unwrap();
+        assert!(
+            report.attested_error.is_some(),
+            "a mid-walk trip is reported, not folded into a clean no-supply result",
+        );
+        // The watermark did NOT advance: the partial walk redoes from the top next pass.
+        let repo_id = rag_rat_db::schema::active_repo_id(&conn).unwrap();
+        assert!(
+            rag_rat_db::meta::read_meta(
+                &conn,
+                &format!("papertrail_attested_closers_since:{repo_id}:github:o/r"),
+            )
+            .unwrap()
+            .is_none(),
+        );
+    }
+
+    #[test]
+    fn no_attested_supply_is_a_clean_no_op() {
+        let conn = db();
+        let binding = binding(&[]);
+        let client = ScriptClient::new(vec![page(Vec::new())]);
+        // FIRST page is `None` — the provider has no GraphQL supply.
+        client.attested.borrow_mut().push_back(None);
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &client,
+            false,
+        ))
+        .unwrap();
+        assert!(report.attested_error.is_none(), "no supply is clean, not an error");
+        assert_eq!(report.attested_edges, 0);
+    }
+    #[test]
+    fn attested_edge_for_an_uncached_or_open_target_is_skipped() {
+        let conn = db();
+        let binding = binding(&[]);
+        // #5 is NOT cached (out of scope / not mirrored); #6 is cached but OPEN (reopened).
+        conn.execute(
+            "INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, \
+             title, body, synced_at_ms, repo_id, state_normalized) VALUES ('github', 'o/r', \
+             'issue', '6', 'u', 'open', 't', 'b', 1, '__unassigned__', 'open')",
+            [],
+        )
+        .unwrap();
+        let client = ScriptClient::new(vec![page(Vec::new())]);
+        client.attested.borrow_mut().push_back(Some(AttestedClosersPage {
+            edges: vec![
+                crate::ClosingEdge {
+                    project: "o/r".into(),
+                    issue_kind: ItemKind::Issue,
+                    issue_key: "5".into(),
+                    closer_kind: crate::CloserKind::Commit,
+                    closer_key: "a".into(),
+                    closer_commit: Some("a".into()),
+                    source: crate::ClosingEdgeSource::Provider,
+                },
+                crate::ClosingEdge {
+                    project: "o/r".into(),
+                    issue_kind: ItemKind::Issue,
+                    issue_key: "6".into(),
+                    closer_kind: crate::CloserKind::Commit,
+                    closer_key: "b".into(),
+                    closer_commit: Some("b".into()),
+                    source: crate::ClosingEdgeSource::Provider,
+                },
+            ],
+            ..Default::default()
+        }));
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &client,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(report.attested_edges, 0, "neither an uncached nor an open target gets an edge");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM papertrail_closing_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn an_attested_pause_propagates_the_resume_time_not_a_generic_error() {
+        let conn = db();
+        let binding = binding(&[]);
+        let client = ScriptClient::new(vec![page(Vec::new())]);
+        client.attested_pause.set(true);
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &client,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            report.paused_until_ms,
+            Some(999_000),
+            "the scheduler must honor the resume time"
+        );
+        assert!(report.attested_error.is_none(), "a pause is a pause, not a swallowed error");
+    }
+
+    /// A HARD (non-pause) attested-walk failure must be PERSISTED so `papertrail_sync_status` shows
+    /// it — the item mirror records success and clears its own error state, so without a separate
+    /// persisted signal a doomed enrichment walk re-runs every tick looking healthy. A later clean
+    /// attested walk clears it.
+    #[test]
+    fn a_hard_attested_failure_is_persisted_then_cleared_by_a_clean_walk() {
+        let conn = db();
+        let binding = binding(&[]);
+
+        let failing = ScriptClient::new(vec![page(Vec::new())]).with_repo_comments(Vec::new());
+        failing.attested_hard_error.set(true);
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &failing,
+            false,
+        ))
+        .unwrap();
+        assert!(report.attested_error.is_some(), "the hard error is surfaced on the report");
+        assert!(report.paused_until_ms.is_none(), "a hard error is not a pause");
+        assert_eq!(
+            read_attested_error(&conn, &binding).unwrap().as_deref(),
+            Some("attested walk boom"),
+            "the failure is persisted for the durable status snapshot",
+        );
+
+        // A subsequent clean attested walk (no supply, no error) clears the persisted failure.
+        let clean = ScriptClient::new(vec![page(Vec::new())]).with_repo_comments(Vec::new());
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &clean, false))
+            .unwrap();
+        assert!(
+            read_attested_error(&conn, &binding).unwrap().is_none(),
+            "a clean attested walk clears the persisted failure",
+        );
+    }
+
+    #[test]
+    fn pruning_an_out_of_scope_issue_takes_its_provider_closing_edges() {
+        let conn = db();
+        // A tag-scoped binding; the item walk stores a `docs`-labelled issue #5, then a filter
+        // narrowed to `bug` prunes it — its provider closing edge must go too.
+        cache_closed_issue(&conn, "5");
+        crate::store::store_closing_edge(&conn, Tracker::Github, &crate::ClosingEdge {
+            project: "o/r".into(),
+            issue_kind: ItemKind::Issue,
+            issue_key: "5".into(),
+            closer_kind: crate::CloserKind::Commit,
+            closer_key: "abc".into(),
+            closer_commit: Some("abc".into()),
+            source: crate::ClosingEdgeSource::Provider,
+        })
+        .unwrap();
+        delete_item_for_tests(&conn, &binding(&["bug"]), ItemKind::Issue, "5").unwrap();
+        assert!(
+            crate::store::closing_edges_for_item(
+                &conn,
+                Tracker::Github,
+                "o/r",
+                ItemKind::Issue,
+                "5"
+            )
+            .unwrap()
+            .is_empty(),
+            "a pruned issue's closing edges leave with it",
+        );
     }
 }

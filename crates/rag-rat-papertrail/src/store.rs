@@ -20,9 +20,9 @@ use super::*;
 pub fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result<()> {
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     // `idx_papertrail_refs_unique` leads with `repo_id`, so a conflict is always THIS repo
-    // re-discovering its OWN ref — keep the first-sighting row untouched (`DO NOTHING` preserves
-    // the original `discovered_at_ms`/`ref_kind`). A sibling repo referencing the same item gets
-    // its own distinct row rather than conflicting.
+    // re-discovering its OWN ref. The upsert PROMOTES `ref_kind` to the strongest claim (see the
+    // SQL comment) and preserves the first-sighting `discovered_at_ms`; a sibling repo
+    // referencing the same item gets its own distinct row rather than conflicting.
     conn.execute(
         "
         INSERT INTO papertrail_refs(
@@ -31,7 +31,17 @@ pub fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ON CONFLICT(repo_id, tracker, project, COALESCE(item_kind, ''), item_key, source_kind, \
-         COALESCE(source_path, ''), COALESCE(source_commit, ''), source_text) DO NOTHING
+         COALESCE(source_path, ''), COALESCE(source_commit, ''), source_text) DO UPDATE SET
+            -- PROMOTE to the strongest claim, never demote: a re-discovery that now classifies
+            -- the same source as closing (new keyword, second mention in one body) upgrades the
+            -- row in place — an upgraded binary re-classifies old 'unknown' rows on its next
+            -- discovery pass with no migration. `discovered_at_ms` keeps the first sighting.
+            ref_kind = CASE WHEN
+                CASE excluded.ref_kind WHEN 'closing' THEN 0 WHEN 'reverts' THEN 1 WHEN \
+         'reference' THEN 2 ELSE 3 END
+                < CASE ref_kind WHEN 'closing' THEN 0 WHEN 'reverts' THEN 1 WHEN 'reference' THEN \
+         2 ELSE 3 END
+            THEN excluded.ref_kind ELSE ref_kind END
         ",
         params![
             reference.tracker.as_db_str(),
@@ -110,6 +120,22 @@ pub fn store_item(
             repo_id,
         ],
     )?;
+    // A REOPENED item has no closure: storing an item back in the open state voids every
+    // closing edge recorded for it (both tiers — the closed-issues walk can never see an open
+    // issue again, so this store-time rule is the only seam that observes the reopen).
+    if NormalizedState::derive(&item.state, item.merged_at.as_deref()) == NormalizedState::Open {
+        conn.execute(
+            "DELETE FROM papertrail_closing_edges WHERE repo_id = ?1 AND tracker = ?2 AND project \
+             = ?3 AND issue_kind = ?4 AND issue_key = ?5",
+            params![
+                repo_id,
+                tracker.as_db_str(),
+                item.project,
+                item.item_kind.as_db_str(),
+                item.item_key
+            ],
+        )?;
+    }
     conn.execute(
         "DELETE FROM papertrail_fts
          WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4
@@ -742,5 +768,53 @@ mod fts_mirror_tests {
         let edges =
             closing_edges_for_item(&conn, Tracker::Github, "o/r", ItemKind::Issue, "5").unwrap();
         assert_eq!(edges[0].closer_commit.as_deref(), Some("attested-sha-2"));
+    }
+    #[test]
+    fn store_ref_promotes_to_the_strongest_claim_and_never_demotes() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let make = |kind: &str| crate::PapertrailRef {
+            tracker: Tracker::Github,
+            project: "o/r".into(),
+            item_key: "5".into(),
+            item_kind: None,
+            ref_kind: kind.into(),
+            source_kind: "commit".into(),
+            source_path: None,
+            source_commit: Some("abc".into()),
+            source_text: "fixes #5".into(),
+        };
+        // An old row classified before a keyword existed…
+        store_ref(&conn, &make("unknown")).unwrap();
+        // …is PROMOTED by re-discovery under the stronger classification (no migration needed:
+        // commit discovery re-parses every sync)…
+        store_ref(&conn, &make("closing")).unwrap();
+        let kind: String =
+            conn.query_row("SELECT ref_kind FROM papertrail_refs", [], |r| r.get(0)).unwrap();
+        assert_eq!(kind, "closing");
+        // …and a later weaker sighting never demotes it.
+        store_ref(&conn, &make("reference")).unwrap();
+        let kind: String =
+            conn.query_row("SELECT ref_kind FROM papertrail_refs", [], |r| r.get(0)).unwrap();
+        assert_eq!(kind, "closing");
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM papertrail_refs", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "one row per identity throughout");
+    }
+    #[test]
+    fn storing_a_reopened_item_voids_its_closing_edges() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
+        store_closing_edge(&conn, Tracker::Github, &edge("5", CloserKind::Commit, "abc")).unwrap();
+        let mut reopened = item(ItemKind::Issue, "5", "t", "b");
+        reopened.state = "open".into();
+        store_item(&conn, Tracker::Github, &reopened).unwrap();
+        assert!(
+            closing_edges_for_item(&conn, Tracker::Github, "o/r", ItemKind::Issue, "5")
+                .unwrap()
+                .is_empty(),
+            "an open item has no closure evidence — the store-time rule is the only seam that \
+             observes a reopen",
+        );
     }
 }

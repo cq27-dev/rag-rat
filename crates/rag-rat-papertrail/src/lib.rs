@@ -144,6 +144,11 @@ pub struct PapertrailBindingStatus {
     pub full_walk_in_progress: bool,
     pub error_class: Option<PapertrailErrorClass>,
     pub error_detail: Option<String>,
+    /// The last HARD attested-closers walk failure, if any — the provider-closer ENRICHMENT lane
+    /// (#702 stage 2). Independent of `error_class`/`failed`: the item mirror can be healthy while
+    /// this lane fails every tick with a stalled watermark. `None` once a clean attested walk
+    /// runs.
+    pub attested_error: Option<String>,
     pub overdue: bool,
     pub failed: bool,
 }
@@ -454,6 +459,36 @@ impl ClosingEdgeSource {
     }
 }
 
+/// One page of PROVIDER-ATTESTED closure data (#702 stage 2): closing edges the tracker itself
+/// asserts (GraphQL closing references, closed-event closers) plus per-item outcome updates.
+#[derive(Debug, Clone, Default)]
+pub struct AttestedClosersPage {
+    pub edges: Vec<ClosingEdge>,
+    pub item_updates: Vec<AttestedItemUpdate>,
+    /// Issues whose ClosedEvent closer was re-read this page. Reaping is ISSUE-KEYED: an issue has
+    /// exactly ONE authoritative closer (its last ClosedEvent), so re-reading it lets the walk
+    /// replace EVERY provider closer edge targeting it (commit AND change-request), then reinsert
+    /// the current closer. This is why there is no closer-keyed (per-PR) replace-set: a PR closes
+    /// many issues, so reaping the PR's outgoing edges would clobber UI-linked rows the PR phase
+    /// (`closingIssuesReferences`) never sees — those live only on the issue's ClosedEvent.
+    pub replaced_issue_closers: Vec<String>,
+    /// Opaque continuation for the NEXT page; `None` when the walk is complete.
+    pub next: Option<String>,
+    /// The newest `updated_at` seen on the FIRST page — the next walk's `since` watermark once
+    /// this walk completes.
+    pub frontier: Option<String>,
+}
+
+/// A provider-attested outcome update for a CACHED item (never creates rows).
+#[derive(Debug, Clone)]
+pub struct AttestedItemUpdate {
+    pub item_kind: ItemKind,
+    pub item_key: String,
+    pub resolution: Option<ItemResolution>,
+    /// INVARIANT: applied only to items the store already normalized as merged.
+    pub merge_commit_sha: Option<String>,
+}
+
 /// One issue↔closer edge (`papertrail_closing_edges`). First-class — NOT a `papertrail_refs`
 /// row: the ref layer's identity coalesces on `source_text` and its contract is
 /// annotation-only, while a closing edge's identity is the (issue, closer) pair and its trust
@@ -689,6 +724,18 @@ pub trait PapertrailClient {
         project: &str,
         probe: &FreshnessProbe,
     ) -> anyhow::Result<FreshnessResult>;
+    /// One page of provider-attested closure data for `project`, `Ok(None)` when this provider
+    /// has no attested supply (or its capability probe failed — e.g. a GHE build without the
+    /// GraphQL endpoint). `cursor` is the previous page's `next`; `since` is the completed-walk
+    /// watermark — implementations stop paging once nodes fall behind it.
+    async fn attested_closers_page(
+        &self,
+        _project: &str,
+        _cursor: Option<&str>,
+        _since: Option<&str>,
+    ) -> anyhow::Result<Option<AttestedClosersPage>> {
+        Ok(None)
+    }
 }
 
 /// Drive a papertrail future to completion from the synchronous call paths (CLI, maintenance).
