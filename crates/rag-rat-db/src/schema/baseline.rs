@@ -480,6 +480,9 @@ pub fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     // re-runs the baseline) can never resurrect the dropped legacy cache. The V009/V041/V044/V045
     // github migrations in the ladder each no-op when the legacy tables are absent.
     create_papertrail_tables(conn)?;
+    // V073 (#702): the distillation substrate — closing edges + item/comment outcome columns.
+    // Additive over the V060 shape; the baseline converges to the current schema directly.
+    migrations::apply_papertrail_distill_substrate(conn)?;
     apply_symbol_facts(conn)?;
     apply_repo_memories(conn)?;
     apply_repo_memory_call_paths(conn)?;

@@ -16,9 +16,10 @@ pub use migrations::{
     apply_memory_model_failures_table, apply_memory_verification_tables, apply_move_per_repo_meta,
     apply_oplog_device_identity, apply_oplog_device_x25519, apply_oplog_local_account,
     apply_oplog_storage, apply_oplog_stream_scoping, apply_oracle_tables,
-    apply_papertrail_binding_health, apply_papertrail_mirror_resume_state,
-    apply_papertrail_provider_neutral_schema, apply_repo_id_core_scoping,
-    apply_repo_id_periphery_scoping, apply_repos_registry, apply_scip_moniker_anchors,
+    apply_papertrail_binding_health, apply_papertrail_distill_substrate,
+    apply_papertrail_mirror_resume_state, apply_papertrail_provider_neutral_schema,
+    apply_repo_id_core_scoping, apply_repo_id_periphery_scoping, apply_repos_registry,
+    apply_scip_moniker_anchors,
 };
 pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_exists};
 // `multiple_real_repos` lost its V042-era seam-guard callers (real `repo_id` predicates
@@ -39,7 +40,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 72;
+pub const LATEST_SCHEMA_VERSION: u32 = 73;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -523,6 +524,15 @@ const MIGRATION_072_DESCRIPTION: &str =
      writer lock as a stream is built one candidate at a time); it enqueues the stream here and \
      settle_pending_content_refolds folds each dirty stream once. Purely additive; CREATE ... IF \
      NOT EXISTS, nothing pre-existing to backfill";
+
+const MIGRATION_073_ID: &str = "073_papertrail_distill_substrate";
+const MIGRATION_073_CHECKSUM: &str = "sha256:rag-rat-papertrail-distill-substrate-v73";
+const MIGRATION_073_DESCRIPTION: &str =
+    "Add papertrail_closing_edges (issue #702): first-class provider-attested issue<->closer \
+     edges for the distillation substrate, plus papertrail_items closed_at / resolution / \
+     merge_commit_sha (merged-only) / state_normalized (backfilled) / author facets and \
+     papertrail_comments author facets. Additive; CREATE IF NOT EXISTS + add_column_if_missing + \
+     an idempotent state_normalized backfill";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1146,6 +1156,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_072_CHECKSUM,
         description: MIGRATION_072_DESCRIPTION,
         apply: MigrationFn::Plain(apply_content_streams_pending_refold),
+    },
+    Migration {
+        id: MIGRATION_073_ID,
+        checksum: MIGRATION_073_CHECKSUM,
+        description: MIGRATION_073_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_papertrail_distill_substrate),
     },
 ];
 

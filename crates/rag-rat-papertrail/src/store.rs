@@ -63,13 +63,19 @@ pub fn store_item(
     conn.execute(
         "
         INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, title, \
-         body, author, created_at, updated_at, merged_at, synced_at_ms, repo_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         body, author, created_at, updated_at, merged_at, closed_at, resolution, \
+         merge_commit_sha, state_normalized, author_kind, author_association, synced_at_ms, \
+         repo_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
+         ?19, ?20)
         ON CONFLICT(repo_id, tracker, project, item_kind, item_key) DO UPDATE SET
             url = excluded.url, state = excluded.state, title = excluded.title,
             body = excluded.body, author = excluded.author, created_at = excluded.created_at,
             updated_at = excluded.updated_at, merged_at = excluded.merged_at,
-            synced_at_ms = excluded.synced_at_ms
+            closed_at = excluded.closed_at, resolution = excluded.resolution,
+            merge_commit_sha = excluded.merge_commit_sha,
+            state_normalized = excluded.state_normalized, author_kind = excluded.author_kind,
+            author_association = excluded.author_association, synced_at_ms = excluded.synced_at_ms
         ",
         params![
             tracker.as_db_str(),
@@ -84,6 +90,22 @@ pub fn store_item(
             item.created_at,
             item.updated_at,
             item.merged_at,
+            item.closed_at,
+            item.resolution.map(ItemResolution::as_db_str),
+            // The merged-only invariant enforced at the COMMON writer, not just per provider: a
+            // client handing over a closed-unmerged change request with a populated sha (GitHub's
+            // ephemeral test-merge commit) must not record it as a merge outcome.
+            item.merge_commit_sha.as_deref().filter(|_| {
+                item.item_kind == ItemKind::ChangeRequest
+                    && NormalizedState::derive(&item.state, item.merged_at.as_deref())
+                        == NormalizedState::Merged
+            }),
+            // Derived here, not provider-supplied: the store owns the normalization rule so every
+            // provider's rows agree (see NormalizedState::derive for the GitLab merged-state
+            // trap).
+            NormalizedState::derive(&item.state, item.merged_at.as_deref()).as_db_str(),
+            item.author_kind,
+            item.author_association,
             now_ms(),
             repo_id,
         ],
@@ -129,11 +151,13 @@ pub fn store_comment(
     conn.execute(
         "
         INSERT INTO papertrail_comments(tracker, project, item_kind, item_key, comment_id, url, \
-         body, author, created_at, updated_at, review_state, anchor_path, synced_at_ms, repo_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         body, author, author_kind, author_association, created_at, updated_at, review_state, \
+         anchor_path, synced_at_ms, repo_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(repo_id, tracker, project, comment_id) DO UPDATE SET
             item_kind = excluded.item_kind, item_key = excluded.item_key, url = excluded.url,
-            body = excluded.body, author = excluded.author, created_at = excluded.created_at,
+            body = excluded.body, author = excluded.author, author_kind = excluded.author_kind,
+            author_association = excluded.author_association, created_at = excluded.created_at,
             updated_at = excluded.updated_at, review_state = excluded.review_state,
             anchor_path = excluded.anchor_path, synced_at_ms = excluded.synced_at_ms
         ",
@@ -146,6 +170,8 @@ pub fn store_comment(
             comment.url,
             comment.body,
             comment.author,
+            comment.author_kind,
+            comment.author_association,
             comment.created_at,
             comment.updated_at,
             comment.review_state,
@@ -175,6 +201,100 @@ pub fn store_comment(
         repo_id: &repo_id,
     })?;
     Ok(())
+}
+
+/// Store one issue↔closer edge. Upsert semantics encode the trust ladder:
+/// - the natural key is the (issue, closer) PAIR, so both discovery tiers converge on ONE row;
+/// - a `provider` row is NEVER downgraded back to `text` — re-mining the same edge from text after
+///   the provider attested it keeps the attested tier;
+/// - `closer_commit` only ever gains information (`COALESCE` keeps an existing sha when the
+///   re-discovering tier has none).
+pub fn store_closing_edge(
+    conn: &Connection,
+    tracker: Tracker,
+    edge: &ClosingEdge,
+) -> anyhow::Result<()> {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    conn.execute(
+        "
+        INSERT INTO papertrail_closing_edges(tracker, project, issue_kind, issue_key, closer_kind, \
+         closer_key, closer_commit, source, synced_at_ms, repo_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(repo_id, tracker, project, issue_kind, issue_key, closer_kind, closer_key)
+        DO UPDATE SET
+            -- Trust ladder for the commit: fill a gap from any tier, but only the PROVIDER tier
+            -- may replace an existing sha — a text re-mine must never overwrite attested data.
+            closer_commit = CASE
+                WHEN closer_commit IS NULL THEN excluded.closer_commit
+                WHEN excluded.source = 'provider' THEN COALESCE(excluded.closer_commit, \
+         closer_commit)
+                ELSE closer_commit
+            END,
+            source = CASE WHEN source = 'provider' THEN 'provider' ELSE excluded.source END,
+            synced_at_ms = excluded.synced_at_ms
+        ",
+        params![
+            tracker.as_db_str(),
+            edge.project,
+            edge.issue_kind.as_db_str(),
+            edge.issue_key,
+            edge.closer_kind.as_db_str(),
+            edge.closer_key,
+            edge.closer_commit,
+            edge.source.as_db_str(),
+            now_ms(),
+            repo_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The closers recorded for one issue, `provider` rows first (then by closer identity for a
+/// deterministic order). Scoped to the active repo — the natural key leads with `repo_id`, so a
+/// sibling repo's edges for the same `o/r#5` never leak into this read.
+pub fn closing_edges_for_item(
+    conn: &Connection,
+    tracker: Tracker,
+    project: &str,
+    issue_kind: ItemKind,
+    issue_key: &str,
+) -> anyhow::Result<Vec<ClosingEdge>> {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let mut stmt = conn.prepare(
+        "
+        SELECT issue_kind, issue_key, closer_kind, closer_key, closer_commit, source
+        FROM papertrail_closing_edges
+        WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND issue_kind = ?4 AND issue_key = ?5
+        ORDER BY CASE source WHEN 'provider' THEN 0 ELSE 1 END, closer_kind, closer_key
+        ",
+    )?;
+    let rows = stmt.query_map(
+        params![repo_id, tracker.as_db_str(), project, issue_kind.as_db_str(), issue_key],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        },
+    )?;
+    let mut edges = Vec::new();
+    for row in rows {
+        let (issue_kind, issue_key, closer_kind, closer_key, closer_commit, source) = row?;
+        edges.push(ClosingEdge {
+            project: project.to_string(),
+            issue_kind: ItemKind::from_db_str(&issue_kind)?,
+            issue_key,
+            closer_kind: CloserKind::from_db_str(&closer_kind)?,
+            closer_key,
+            closer_commit,
+            source: ClosingEdgeSource::from_db_str(&source)?,
+        });
+    }
+    Ok(edges)
 }
 
 /// WHOLE-TABLE rebuild of the `papertrail_fts` mirror from the base tables — the full re-walk /
@@ -290,6 +410,11 @@ mod fts_mirror_tests {
             created_at: None,
             updated_at: None,
             merged_at: None,
+            closed_at: None,
+            resolution: None,
+            merge_commit_sha: None,
+            author_kind: None,
+            author_association: None,
             tags: Vec::new(),
         }
     }
@@ -303,6 +428,8 @@ mod fts_mirror_tests {
             url: Some(format!("http://comment/{id}")),
             body: body.into(),
             author: None,
+            author_kind: None,
+            author_association: None,
             created_at: None,
             updated_at: None,
             review_state: None,
@@ -482,5 +609,138 @@ mod fts_mirror_tests {
             rows.map(Result::unwrap).collect()
         };
         assert_eq!(own, vec!["replaced body".to_string()], "re-store replaced its own row");
+    }
+    fn edge(issue_key: &str, closer_kind: CloserKind, closer_key: &str) -> ClosingEdge {
+        ClosingEdge {
+            project: "o/r".into(),
+            issue_kind: ItemKind::Issue,
+            issue_key: issue_key.into(),
+            closer_kind,
+            closer_key: closer_key.into(),
+            closer_commit: None,
+            source: ClosingEdgeSource::Text,
+        }
+    }
+
+    #[test]
+    fn closing_edge_upsert_converges_the_pair_and_never_downgrades_provider() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
+
+        // Text tier discovers the pair first, commit unknown.
+        store_closing_edge(&conn, Tracker::Github, &edge("5", CloserKind::ChangeRequest, "9"))
+            .unwrap();
+        // The provider tier attests the SAME pair with the merge commit: one row, upgraded.
+        let mut attested = edge("5", CloserKind::ChangeRequest, "9");
+        attested.source = ClosingEdgeSource::Provider;
+        attested.closer_commit = Some("abc123".into());
+        store_closing_edge(&conn, Tracker::Github, &attested).unwrap();
+        let edges =
+            closing_edges_for_item(&conn, Tracker::Github, "o/r", ItemKind::Issue, "5").unwrap();
+        assert_eq!(edges.len(), 1, "both tiers converge on one (issue, closer) row");
+        assert_eq!(edges[0].source, ClosingEdgeSource::Provider);
+        assert_eq!(edges[0].closer_commit.as_deref(), Some("abc123"));
+
+        // Re-mining the text tier afterwards neither downgrades the tier nor erases the commit.
+        store_closing_edge(&conn, Tracker::Github, &edge("5", CloserKind::ChangeRequest, "9"))
+            .unwrap();
+        let edges =
+            closing_edges_for_item(&conn, Tracker::Github, "o/r", ItemKind::Issue, "5").unwrap();
+        assert_eq!(edges[0].source, ClosingEdgeSource::Provider, "provider tier is sticky");
+        assert_eq!(
+            edges[0].closer_commit.as_deref(),
+            Some("abc123"),
+            "COALESCE keeps the known commit when the re-discovering tier has none",
+        );
+
+        // A different closer for the same issue is a distinct edge.
+        store_closing_edge(&conn, Tracker::Github, &edge("5", CloserKind::Commit, "deadbeef"))
+            .unwrap();
+        let edges =
+            closing_edges_for_item(&conn, Tracker::Github, "o/r", ItemKind::Issue, "5").unwrap();
+        assert_eq!(edges.len(), 2);
+        assert_eq!(
+            edges[0].source,
+            ClosingEdgeSource::Provider,
+            "provider rows order first for consumers",
+        );
+    }
+
+    #[test]
+    fn closing_edge_reads_are_scoped_to_the_active_repo() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
+        store_closing_edge(&conn, Tracker::Github, &edge("5", CloserKind::Commit, "abc")).unwrap();
+        // The poison sibling: the SAME external pair recorded under another repo's scope.
+        conn.execute(
+            "INSERT INTO papertrail_closing_edges(tracker, project, issue_kind, issue_key, \
+             closer_kind, closer_key, source, synced_at_ms, repo_id) VALUES ('github', 'o/r', \
+             'issue', '5', 'commit', 'poison', 'provider', 1, 'sibling')",
+            [],
+        )
+        .unwrap();
+        let edges =
+            closing_edges_for_item(&conn, Tracker::Github, "o/r", ItemKind::Issue, "5").unwrap();
+        assert_eq!(edges.len(), 1, "the sibling repo's edge for the same o/r#5 never leaks");
+        assert_eq!(edges[0].closer_key, "abc");
+    }
+
+    #[test]
+    fn store_item_derives_state_normalized_and_persists_the_outcome_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let mut merged = item(ItemKind::ChangeRequest, "9", "t", "b");
+        merged.state = "closed".into();
+        merged.merged_at = Some("2026-01-03T00:00:00Z".into());
+        merged.closed_at = Some("2026-01-03T00:00:00Z".into());
+        merged.resolution = Some(ItemResolution::Completed);
+        merged.merge_commit_sha = Some("abc123".into());
+        store_item(&conn, Tracker::Github, &merged).unwrap();
+        let (normalized, resolution, sha): (String, String, String) = conn
+            .query_row(
+                "SELECT state_normalized, resolution, merge_commit_sha FROM papertrail_items \
+                 WHERE item_key = '9'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(normalized, "merged", "GitHub closed+merged_at normalizes to merged");
+        assert_eq!(resolution, "completed");
+        assert_eq!(sha, "abc123");
+
+        // GitLab's raw state='merged' normalizes identically — the trap the column exists for.
+        let mut gitlab_merged = item(ItemKind::ChangeRequest, "10", "t", "b");
+        gitlab_merged.state = "merged".into();
+        store_item(&conn, Tracker::Gitlab, &gitlab_merged).unwrap();
+        let normalized: String = conn
+            .query_row(
+                "SELECT state_normalized FROM papertrail_items WHERE item_key = '10'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normalized, "merged");
+    }
+    #[test]
+    fn a_text_remine_never_overwrites_an_attested_closer_commit() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let mut attested = edge("5", CloserKind::ChangeRequest, "9");
+        attested.source = ClosingEdgeSource::Provider;
+        attested.closer_commit = Some("attested-sha".into());
+        store_closing_edge(&conn, Tracker::Github, &attested).unwrap();
+        // The text tier re-mines the pair with a DIFFERENT (lower-trust) commit.
+        let mut text = edge("5", CloserKind::ChangeRequest, "9");
+        text.closer_commit = Some("text-sha".into());
+        store_closing_edge(&conn, Tracker::Github, &text).unwrap();
+        let edges =
+            closing_edges_for_item(&conn, Tracker::Github, "o/r", ItemKind::Issue, "5").unwrap();
+        assert_eq!(edges[0].closer_commit.as_deref(), Some("attested-sha"));
+        // A newer PROVIDER attestation may replace it.
+        attested.closer_commit = Some("attested-sha-2".into());
+        store_closing_edge(&conn, Tracker::Github, &attested).unwrap();
+        let edges =
+            closing_edges_for_item(&conn, Tracker::Github, "o/r", ItemKind::Issue, "5").unwrap();
+        assert_eq!(edges[0].closer_commit.as_deref(), Some("attested-sha-2"));
     }
 }

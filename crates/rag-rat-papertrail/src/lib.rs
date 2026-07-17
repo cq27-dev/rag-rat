@@ -303,6 +303,175 @@ impl ItemKind {
     }
 }
 
+/// Provider-NEUTRAL outcome of a closed item (`papertrail_items.resolution`). GitHub's
+/// `state_reason` maps in (`completed` / `not_planned` / `duplicate`); Jira's resolution field
+/// maps in richer (its `Duplicate` / `Won't Do` map to the same tokens); GitLab has no
+/// first-class resolution and stays `unknown`. `superseded` has no GitHub source today — it is
+/// reserved for providers that attest it and for the distill layer's supersession chains.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ItemResolution {
+    Completed,
+    NotPlanned,
+    Duplicate,
+    Superseded,
+    Unknown,
+}
+
+impl ItemResolution {
+    /// The exact persisted token (`papertrail_items.resolution`).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown item resolution token `{value}`"))
+    }
+}
+
+/// Cross-provider lifecycle state (`papertrail_items.state_normalized`). THE TRAP this exists
+/// for: GitLab merged MRs carry raw `state = 'merged'` while GitHub merged PRs carry
+/// `state = 'closed'` + `merged_at` — a consumer filtering raw `WHERE state = 'closed'`
+/// silently drops every merged GitLab MR. Consumers filter on this column, never on raw state.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizedState {
+    Open,
+    Closed,
+    Merged,
+}
+
+impl NormalizedState {
+    /// Derive from the provider-truthful pair: a raw `merged` state (GitLab) or a recorded
+    /// `merged_at` (GitHub) wins over raw `closed`; anything else non-closed is open. The same
+    /// rule the V073 backfill applies to pre-existing rows.
+    pub fn derive(state: &str, merged_at: Option<&str>) -> Self {
+        if state == "merged" || merged_at.is_some() {
+            Self::Merged
+        } else if state == "closed" {
+            Self::Closed
+        } else {
+            Self::Open
+        }
+    }
+
+    /// The exact persisted token (`papertrail_items.state_normalized`).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown normalized state token `{value}`"))
+    }
+}
+
+/// What closed an issue (`papertrail_closing_edges.closer_kind`): a change request (its key in
+/// the same project) or a direct commit (the full sha).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum CloserKind {
+    ChangeRequest,
+    Commit,
+}
+
+impl CloserKind {
+    /// The exact persisted token (`papertrail_closing_edges.closer_kind`).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown closer kind token `{value}`"))
+    }
+}
+
+/// Trust tier of a closing edge (`papertrail_closing_edges.source`): `provider` rows are
+/// attested by the tracker's own closing data; `text` rows are mined from commit/item/comment
+/// text. The store upsert never downgrades `provider` back to `text`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ClosingEdgeSource {
+    Provider,
+    Text,
+}
+
+impl ClosingEdgeSource {
+    /// The exact persisted token (`papertrail_closing_edges.source`).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown closing-edge source token `{value}`"))
+    }
+}
+
+/// One issue↔closer edge (`papertrail_closing_edges`). First-class — NOT a `papertrail_refs`
+/// row: the ref layer's identity coalesces on `source_text` and its contract is
+/// annotation-only, while a closing edge's identity is the (issue, closer) pair and its trust
+/// tier rides the `source` attribute.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosingEdge {
+    pub project: String,
+    pub issue_kind: ItemKind,
+    pub issue_key: String,
+    pub closer_kind: CloserKind,
+    /// The closer item's key (`closer_kind = change_request`) or the full commit sha
+    /// (`closer_kind = commit`).
+    pub closer_key: String,
+    /// The closing/merge commit sha when known (a change request closer's merge commit).
+    pub closer_commit: Option<String>,
+    pub source: ClosingEdgeSource,
+}
+
 /// One tracker item (issue or change request), normalized across providers. `item_key` is a
 /// string because provider keys are not uniformly numeric (Jira: `PROJ-123`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +489,24 @@ pub struct PapertrailItem {
     pub updated_at: Option<String>,
     /// Change requests only; `None` for issues and unmerged change requests.
     pub merged_at: Option<String>,
+    /// When the item closed — the temporal axis for supersession ordering (`created_at` is
+    /// NOT it).
+    #[serde(default)]
+    pub closed_at: Option<String>,
+    /// Provider-neutral outcome; `None` when the provider attests nothing (open items, GitLab).
+    #[serde(default)]
+    pub resolution: Option<ItemResolution>,
+    /// INVARIANT: `Some` ONLY for merged change requests. GitHub returns a non-null
+    /// `merge_commit_sha` for closed-UNMERGED PRs too (its ephemeral test-merge commit,
+    /// possibly on no branch); providers must gate on the merged state, never on the field's
+    /// presence.
+    #[serde(default)]
+    pub merge_commit_sha: Option<String>,
+    /// Thread-shape facets, already in the parsed payloads (`user.type`, `author_association`).
+    #[serde(default)]
+    pub author_kind: Option<String>,
+    #[serde(default)]
+    pub author_association: Option<String>,
     /// Provider facets used by the binding's client-side OR filter (GitHub labels today).
     pub tags: Vec<String>,
 }
@@ -342,6 +529,11 @@ pub struct PapertrailComment {
     pub author: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    /// Thread-shape facets (`user.type: "Bot"` etc.), already in the parsed payloads.
+    #[serde(default)]
+    pub author_kind: Option<String>,
+    #[serde(default)]
+    pub author_association: Option<String>,
     /// `Some` marks a review event (approval / changes requested / review summary).
     pub review_state: Option<String>,
     /// `Some` marks a file-anchored comment; the value is the repo-relative path.
@@ -706,5 +898,57 @@ pub(crate) fn test_hooks() -> rag_rat_db::MigrationHooks {
     rag_rat_db::MigrationHooks {
         rebuild_papertrail_fts: crate::rebuild_fts,
         ..rag_rat_db::MigrationHooks::noop()
+    }
+}
+
+#[cfg(test)]
+mod distill_substrate_tests {
+    use super::*;
+
+    #[test]
+    fn distill_substrate_db_tokens_are_stable_and_round_trip() {
+        // These tokens are SCHEMA (persisted in papertrail_items / papertrail_closing_edges);
+        // a rename or reorder must not silently repoint stored rows.
+        for (resolution, token) in [
+            (ItemResolution::Completed, "completed"),
+            (ItemResolution::NotPlanned, "not_planned"),
+            (ItemResolution::Duplicate, "duplicate"),
+            (ItemResolution::Superseded, "superseded"),
+            (ItemResolution::Unknown, "unknown"),
+        ] {
+            assert_eq!(resolution.as_db_str(), token);
+            assert_eq!(ItemResolution::from_db_str(token).unwrap(), resolution);
+        }
+        for (state, token) in [
+            (NormalizedState::Open, "open"),
+            (NormalizedState::Closed, "closed"),
+            (NormalizedState::Merged, "merged"),
+        ] {
+            assert_eq!(state.as_db_str(), token);
+            assert_eq!(NormalizedState::from_db_str(token).unwrap(), state);
+        }
+        for (kind, token) in
+            [(CloserKind::ChangeRequest, "change_request"), (CloserKind::Commit, "commit")]
+        {
+            assert_eq!(kind.as_db_str(), token);
+            assert_eq!(CloserKind::from_db_str(token).unwrap(), kind);
+        }
+        for (source, token) in
+            [(ClosingEdgeSource::Provider, "provider"), (ClosingEdgeSource::Text, "text")]
+        {
+            assert_eq!(source.as_db_str(), token);
+            assert_eq!(ClosingEdgeSource::from_db_str(token).unwrap(), source);
+        }
+        assert!(ItemResolution::from_db_str("wontfix").is_err(), "outside the closed set");
+    }
+
+    #[test]
+    fn normalized_state_derivation_covers_the_provider_shapes() {
+        // GitHub merged PR: closed + merged_at. GitLab merged MR: raw state 'merged'.
+        assert_eq!(NormalizedState::derive("closed", Some("2026-01-03")), NormalizedState::Merged);
+        assert_eq!(NormalizedState::derive("merged", None), NormalizedState::Merged);
+        assert_eq!(NormalizedState::derive("closed", None), NormalizedState::Closed);
+        assert_eq!(NormalizedState::derive("open", None), NormalizedState::Open);
+        assert_eq!(NormalizedState::derive("opened", None), NormalizedState::Open);
     }
 }

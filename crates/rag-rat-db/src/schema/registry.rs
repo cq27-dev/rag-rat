@@ -51,6 +51,10 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
     "papertrail_sync_cursor",
     "papertrail_item_tags",
     "papertrail_fts",
+    // V073 (#702): the provider-attested closing-edge substrate — direct `repo_id` in the
+    // natural key from birth, so a LocalOnly→Portable adoption re-points its rows with the
+    // rest of the papertrail family.
+    "papertrail_closing_edges",
     // V056 (#566) derived change-coupling table: standalone, direct `repo_id`, no FK children, so
     // a LocalOnly→Portable adoption re-points its rows here (moving them together with the
     // `git_coupling_stamp` repo_meta so the derived table stays consistent + fresh), and the

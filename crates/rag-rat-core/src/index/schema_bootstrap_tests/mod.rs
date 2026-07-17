@@ -587,6 +587,11 @@ impl MockGitHubClient {
             created_at: Some("2026-01-01T00:00:00Z".to_string()),
             updated_at: Some("2026-01-02T00:00:00Z".to_string()),
             merged_at: None,
+            closed_at: None,
+            resolution: None,
+            merge_commit_sha: None,
+            author_kind: None,
+            author_association: None,
             tags: Vec::new(),
         }
     }
@@ -600,6 +605,8 @@ impl MockGitHubClient {
             url: Some(format!("https://github.com/{project}/issues/{key}#comment-{id}")),
             body: body.to_string(),
             author: Some("octo".to_string()),
+            author_kind: None,
+            author_association: None,
             created_at: Some("2026-01-01T01:00:00Z".to_string()),
             updated_at: Some("2026-01-01T01:00:00Z".to_string()),
             review_state: None,
@@ -611,11 +618,15 @@ impl MockGitHubClient {
             papertrail::PapertrailComment {
                 url: None,
                 author: Some("reviewer".to_string()),
+                author_kind: None,
+                author_association: None,
                 review_state: Some("COMMENTED".to_string()),
                 ..comment("4202", "Risk: live crawling during search would be surprising.")
             },
             papertrail::PapertrailComment {
                 author: Some("reviewer".to_string()),
+                author_kind: None,
+                author_association: None,
                 anchor_path: Some("docs/search.md".to_string()),
                 ..comment("4203", "No longer use obsolete duckdb rationale.")
             },

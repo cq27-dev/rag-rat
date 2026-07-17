@@ -126,6 +126,7 @@ pub struct MirrorBindingReport {
 pub(crate) async fn mirror_binding<C: PapertrailClient>(
     conn: &Connection,
     binding: &ResolvedTracker,
+    trackers: &[ResolvedTracker],
     client: &C,
     full: bool,
 ) -> anyhow::Result<MirrorBindingReport> {
@@ -185,7 +186,8 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
         save_cursor(conn, binding, &cursor, false)?;
     }
 
-    let result = mirror_binding_inner(conn, binding, client, &mut cursor, &mut report).await;
+    let result =
+        mirror_binding_inner(conn, binding, trackers, client, &mut cursor, &mut report).await;
     match result {
         Ok(()) => {
             report.completed_full_walk = cursor.backfill_done
@@ -208,6 +210,7 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
 async fn mirror_binding_inner<C: PapertrailClient>(
     conn: &Connection,
     binding: &ResolvedTracker,
+    trackers: &[ResolvedTracker],
     client: &C,
     cursor: &mut MirrorCursor,
     report: &mut MirrorBindingReport,
@@ -219,7 +222,7 @@ async fn mirror_binding_inner<C: PapertrailClient>(
         if cursor.item_delta_in_progress {
             cursor.item_delta_scan_since.get_or_insert_with(|| overlap_timestamp(high));
             save_cursor(conn, binding, cursor, false)?;
-            sync_item_delta(conn, binding, client, cursor, report).await?;
+            sync_item_delta(conn, binding, trackers, client, cursor, report).await?;
         } else {
             let probe = client
                 .freshness_probe(&binding.project, &FreshnessProbe {
@@ -239,13 +242,13 @@ async fn mirror_binding_inner<C: PapertrailClient>(
                 cursor.item_delta_scan_since = Some(overlap_timestamp(high));
                 cursor.item_delta_high_mark_at = probe.latest;
                 save_cursor(conn, binding, cursor, false)?;
-                sync_item_delta(conn, binding, client, cursor, report).await?;
+                sync_item_delta(conn, binding, trackers, client, cursor, report).await?;
             } else {
                 report.probe_not_modified = true;
                 save_cursor(conn, binding, cursor, false)?;
             }
         }
-        sync_comment_delta(conn, binding, client, cursor, report).await?;
+        sync_comment_delta(conn, binding, trackers, client, cursor, report).await?;
     }
 
     while !cursor.backfill_done {
@@ -274,6 +277,7 @@ async fn mirror_binding_inner<C: PapertrailClient>(
         store_item_page_resumably(
             conn,
             binding,
+            trackers,
             client,
             &page.items,
             PageLane::Backfill,
@@ -301,7 +305,7 @@ async fn mirror_binding_inner<C: PapertrailClient>(
         save_cursor(conn, binding, cursor, false)?;
     }
     if previous_high.is_none() || cursor.full_rewalk {
-        sync_comment_delta(conn, binding, client, cursor, report).await?;
+        sync_comment_delta(conn, binding, trackers, client, cursor, report).await?;
     }
     if cursor.full_rewalk {
         let tx = conn.unchecked_transaction()?;
@@ -317,6 +321,7 @@ async fn mirror_binding_inner<C: PapertrailClient>(
 async fn sync_item_delta<C: PapertrailClient>(
     conn: &Connection,
     binding: &ResolvedTracker,
+    trackers: &[ResolvedTracker],
     client: &C,
     cursor: &mut MirrorCursor,
     report: &mut MirrorBindingReport,
@@ -364,6 +369,7 @@ async fn sync_item_delta<C: PapertrailClient>(
         store_item_page_resumably(
             conn,
             binding,
+            trackers,
             client,
             &page.items,
             PageLane::Delta,
@@ -394,6 +400,7 @@ async fn sync_item_delta<C: PapertrailClient>(
 async fn sync_comment_delta<C: PapertrailClient>(
     conn: &Connection,
     binding: &ResolvedTracker,
+    trackers: &[ResolvedTracker],
     client: &C,
     cursor: &mut MirrorCursor,
     report: &mut MirrorBindingReport,
@@ -442,7 +449,7 @@ async fn sync_comment_delta<C: PapertrailClient>(
             } else {
                 None
             };
-            store_repo_comments(conn, binding, &page.comments, report)?;
+            store_repo_comments(conn, binding, trackers, &page.comments, report)?;
             let state = cursor.comment_stream_cursors.get_mut(*stream).expect("stream inserted");
             if let Some(first_page_high) = first_page_high {
                 // As with item deltas, a mutable continuation proves no more than the first
@@ -480,9 +487,13 @@ enum PageLane {
     Backfill,
 }
 
+// One over the lint cap: the resumable walk threads (binding, trackers, cursor, report) through
+// every stage, and bundling two of them into a one-off struct here would just rename the train.
+#[allow(clippy::too_many_arguments)]
 async fn store_item_page_resumably<C: PapertrailClient>(
     conn: &Connection,
     binding: &ResolvedTracker,
+    trackers: &[ResolvedTracker],
     client: &C,
     items: &[PapertrailItem],
     lane: PageLane,
@@ -498,7 +509,7 @@ async fn store_item_page_resumably<C: PapertrailClient>(
                 let mut item = item.clone();
                 client.enrich_item(&mut item).await?;
                 if binding.tracks(item.tags.iter().map(String::as_str)) {
-                    begin_item_thread(conn, binding, &item, lane, cursor, report)?;
+                    begin_item_thread(conn, binding, trackers, &item, lane, cursor, report)?;
                 } else {
                     report.pruned_items +=
                         usize::from(delete_item(conn, binding, item.item_kind, &item.item_key)?);
@@ -509,7 +520,7 @@ async fn store_item_page_resumably<C: PapertrailClient>(
             }
         }
         if cursor.item_thread_cursor.is_some() {
-            resume_item_thread(conn, binding, client, cursor, report).await?;
+            resume_item_thread(conn, binding, trackers, client, cursor, report).await?;
         }
     }
     for item in items {
@@ -524,8 +535,8 @@ async fn store_item_page_resumably<C: PapertrailClient>(
         let mut item = item.clone();
         client.enrich_item(&mut item).await?;
         if binding.tracks(item.tags.iter().map(String::as_str)) {
-            begin_item_thread(conn, binding, &item, lane, cursor, report)?;
-            resume_item_thread(conn, binding, client, cursor, report).await?;
+            begin_item_thread(conn, binding, trackers, &item, lane, cursor, report)?;
+            resume_item_thread(conn, binding, trackers, client, cursor, report).await?;
         } else {
             report.pruned_items +=
                 usize::from(delete_item(conn, binding, item.item_kind, &item.item_key)?);
@@ -547,6 +558,7 @@ fn processed_item(item: &PapertrailItem) -> ProcessedItem {
 fn begin_item_thread(
     conn: &Connection,
     binding: &ResolvedTracker,
+    trackers: &[ResolvedTracker],
     item: &PapertrailItem,
     lane: PageLane,
     cursor: &mut MirrorCursor,
@@ -554,6 +566,9 @@ fn begin_item_thread(
 ) -> anyhow::Result<()> {
     let tx = conn.unchecked_transaction()?;
     store_item(&tx, binding.provider, item)?;
+    // #702: the item's own text is mined in the same transaction — refs (`source_kind='item'`)
+    // and, for a change request with closing keywords, the text-tier closing edge.
+    sync::mine_item_refs(&tx, binding.provider, trackers, item)?;
     replace_tags(&tx, binding, item)?;
     if cursor.full_rewalk {
         mark_full_seen(&tx, binding, item)?;
@@ -576,6 +591,7 @@ fn begin_item_thread(
 async fn resume_item_thread<C: PapertrailClient>(
     conn: &Connection,
     binding: &ResolvedTracker,
+    trackers: &[ResolvedTracker],
     client: &C,
     cursor: &mut MirrorCursor,
     report: &mut MirrorBindingReport,
@@ -659,6 +675,7 @@ async fn resume_item_thread<C: PapertrailClient>(
         let tx = conn.unchecked_transaction()?;
         for comment in &page.comments {
             store_comment(&tx, binding.provider, comment)?;
+            sync::mine_comment_refs(&tx, binding.provider, trackers, comment)?;
         }
         save_cursor(&tx, binding, cursor, false)?;
         tx.commit()?;
@@ -975,6 +992,22 @@ fn prune_unmatched(conn: &Connection, binding: &ResolvedTracker) -> anyhow::Resu
     Ok(pruned)
 }
 
+/// Test-only surface over [`delete_item`] for the sibling module's prune-cleanup tests.
+#[cfg(test)]
+pub(crate) fn delete_item_for_tests(
+    conn: &Connection,
+    binding: &ResolvedTracker,
+    kind: ItemKind,
+    key: &str,
+) -> anyhow::Result<bool> {
+    delete_item(conn, binding, kind, key)
+}
+
+/// Escape `LIKE` wildcards in an identity segment (paired with `ESCAPE '\\'`).
+fn like_escape(segment: &str) -> String {
+    segment.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 fn delete_item(
     conn: &Connection,
     binding: &ResolvedTracker,
@@ -994,6 +1027,31 @@ fn delete_item(
          item_kind=?4 AND item_key=?5",
         params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key],
     )?;
+    // #702: mined evidence dies with its source. The mined identities are constructible in SQL
+    // (item: `project:kind:key`; comment: that + `:comment_id` — a prefix match), so the pruned
+    // item's own mined refs AND every pruned comment's mined refs go in one pass; a pruned
+    // change request also drops the text-tier closing edges it minted (provider-attested edges
+    // outlive their text sources by design).
+    conn.execute(
+        "DELETE FROM papertrail_refs WHERE repo_id=?1 AND source_kind='item' AND source_text = ?2 \
+         || ':' || ?3 || ':' || ?4 || ':' || ?5",
+        params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key],
+    )?;
+    // `_`/`%` are LIKE wildcards and provider project strings can contain `_` — escape the
+    // identity so `foo_bar/repo` never matches `fooxbar/repo`'s mined comment rows.
+    let like_prefix = format!(
+        "{}:{}:{}:{}:%",
+        like_escape(binding.provider.as_db_str()),
+        like_escape(&binding.project),
+        like_escape(kind.as_db_str()),
+        like_escape(key)
+    );
+    conn.execute(
+        "DELETE FROM papertrail_refs WHERE repo_id=?1 AND source_kind='comment' AND source_text \
+         LIKE ?2 ESCAPE '\\'",
+        params![repo_id, like_prefix],
+    )?;
+
     conn.execute(
         "DELETE FROM papertrail_item_tags WHERE repo_id=?1 AND tracker=?2 AND project=?3 AND \
          item_kind=?4 AND item_key=?5",
@@ -1032,6 +1090,20 @@ fn prune_unseen_item_comments(
         conn.execute(
             "DELETE FROM papertrail_fts WHERE repo_id=?1 AND tracker=?2 AND project=?3 AND
              item_kind=?4 AND item_key=?5 AND comment_id=?6 AND doc_kind='comment'",
+            params![
+                repo_id,
+                binding.provider.as_db_str(),
+                binding.project,
+                kind.as_db_str(),
+                key,
+                comment_id,
+            ],
+        )?;
+        // #702: a pruned comment takes its mined refs with it (exact identity — the source will
+        // never be re-mined to replace the set once its row is gone).
+        conn.execute(
+            "DELETE FROM papertrail_refs WHERE repo_id=?1 AND source_kind='comment' AND \
+             source_text = ?2 || ':' || ?3 || ':' || ?4 || ':' || ?5 || ':' || ?6",
             params![
                 repo_id,
                 binding.provider.as_db_str(),
@@ -1080,6 +1152,7 @@ fn prune_missing(conn: &Connection, binding: &ResolvedTracker) -> anyhow::Result
 fn store_repo_comments(
     conn: &Connection,
     binding: &ResolvedTracker,
+    trackers: &[ResolvedTracker],
     comments: &[PapertrailComment],
     report: &mut MirrorBindingReport,
 ) -> anyhow::Result<()> {
@@ -1117,10 +1190,12 @@ fn store_repo_comments(
         let Some(kind) = kind else { continue };
         if kind == comment.item_kind.as_db_str() {
             store_comment(&tx, binding.provider, comment)?;
+            sync::mine_comment_refs(&tx, binding.provider, trackers, comment)?;
         } else {
             let mut comment = comment.clone();
             comment.item_kind = ItemKind::from_db_str(&kind)?;
             store_comment(&tx, binding.provider, &comment)?;
+            sync::mine_comment_refs(&tx, binding.provider, trackers, &comment)?;
         }
         report.stored_comments += 1;
     }
@@ -1420,6 +1495,11 @@ mod tests {
             created_at: None,
             updated_at: Some(updated_at.to_string()),
             merged_at: None,
+            closed_at: None,
+            resolution: None,
+            merge_commit_sha: None,
+            author_kind: None,
+            author_association: None,
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
         }
     }
@@ -1437,6 +1517,8 @@ mod tests {
             url: None,
             body: "comment".to_string(),
             author: None,
+            author_kind: None,
+            author_association: None,
             created_at: Some(updated_at.to_string()),
             updated_at: Some(updated_at.to_string()),
             review_state: None,
@@ -1502,7 +1584,14 @@ mod tests {
             Ok(ItemsPage { items: Vec::new(), next: None, backfill_boundary: None }),
         ])
         .with_repo_comments(Vec::new());
-        block_on(mirror_binding(&conn, &binding, &first_walk, false)).unwrap();
+        block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &first_walk,
+            false,
+        ))
+        .unwrap();
 
         let mut cursor = load_cursor(&conn, &binding).unwrap();
         cursor.item_delta_replay_required = true;
@@ -1515,7 +1604,8 @@ mod tests {
         })])
         .with_probe(FreshnessResult { latest: None, etag: None, not_modified: true })
         .with_repo_comments(Vec::new());
-        block_on(mirror_binding(&conn, &binding, &quiet, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &quiet, false))
+            .unwrap();
 
         let requests = quiet.item_page_requests.borrow();
         assert_eq!(requests.len(), 1, "the owed replay must run despite the quiet probe");
@@ -1538,7 +1628,14 @@ mod tests {
             Ok(ItemsPage { items: Vec::new(), next: None, backfill_boundary: None }),
         ])
         .with_repo_comments(Vec::new());
-        block_on(mirror_binding(&conn, &binding, &first_walk, false)).unwrap();
+        block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &first_walk,
+            false,
+        ))
+        .unwrap();
 
         let quiet = ScriptClient::new(vec![])
             .with_probe(FreshnessResult { latest: None, etag: None, not_modified: true })
@@ -1547,7 +1644,8 @@ mod tests {
                 next: None,
                 frontier: Some("2026-02-01T00:00:00Z".to_string()),
             })]);
-        block_on(mirror_binding(&conn, &binding, &quiet, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &quiet, false))
+            .unwrap();
 
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert_eq!(
@@ -1573,7 +1671,14 @@ mod tests {
             Ok(ItemsPage { items: Vec::new(), next: None, backfill_boundary: None }),
         ])
         .with_repo_comments(Vec::new());
-        block_on(mirror_binding(&conn, &binding, &first_walk, false)).unwrap();
+        block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &first_walk,
+            false,
+        ))
+        .unwrap();
 
         let quiet = ScriptClient::new(vec![])
             .with_probe(FreshnessResult { latest: None, etag: None, not_modified: true })
@@ -1592,7 +1697,8 @@ mod tests {
                     frontier: Some("2026-02-01T20:00:00Z".to_string()),
                 }),
             ]);
-        block_on(mirror_binding(&conn, &binding, &quiet, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &quiet, false))
+            .unwrap();
 
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert_eq!(
@@ -1621,7 +1727,14 @@ mod tests {
         change_note.item_kind = ItemKind::ChangeRequest;
         let mut issue_note = comment("7", "note:10", "2026-01-04T00:00:00Z");
         issue_note.project = "g/r".to_string();
-        store_repo_comments(&conn, &binding, &[change_note, issue_note], &mut report).unwrap();
+        store_repo_comments(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &[change_note, issue_note],
+            &mut report,
+        )
+        .unwrap();
 
         let rows: Vec<(String, String)> = {
             let mut stmt = conn
@@ -1662,7 +1775,14 @@ mod tests {
         let mut change_note = comment("1", "note:2", "2026-01-04T00:00:00Z");
         change_note.project = "g/r".to_string();
         change_note.item_kind = ItemKind::ChangeRequest;
-        store_repo_comments(&conn, &binding, &[issue_note, change_note], &mut report).unwrap();
+        store_repo_comments(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &[issue_note, change_note],
+            &mut report,
+        )
+        .unwrap();
 
         let kinds: Vec<(String, String)> = {
             let mut stmt = conn
@@ -1697,6 +1817,7 @@ mod tests {
         store_repo_comments(
             &conn,
             &binding,
+            std::slice::from_ref(&binding),
             &[comment("7", "c1", "2026-01-04T00:00:00Z")],
             &mut report,
         )
@@ -1726,7 +1847,14 @@ mod tests {
             ]),
             Err(paused),
         ]);
-        let report = block_on(mirror_binding(&conn, &binding, &first, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &first,
+            false,
+        ))
+        .unwrap();
         assert_eq!(report.paused_until_ms, Some(42));
         assert_eq!(keys(&conn), vec!["2", "3"]);
 
@@ -1734,7 +1862,8 @@ mod tests {
             page(vec![item("1", "2026-01-01T00:00:00Z", "one", &[])]),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &binding, &second, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &second, false))
+            .unwrap();
         assert_eq!(keys(&conn), vec!["1", "2", "3"]);
         let distinct: i64 = conn
             .query_row("SELECT COUNT(DISTINCT item_key) FROM papertrail_items", [], |row| {
@@ -1760,13 +1889,21 @@ mod tests {
                     reason: PauseReason::PassBudget,
                 })),
             ]);
-        let report = block_on(mirror_binding(&conn, &binding, &first, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &first,
+            false,
+        ))
+        .unwrap();
         assert_eq!(report.paused_until_ms, Some(42));
         assert_eq!(keys(&conn), vec!["1", "2"]);
 
         let resumed = ScriptClient::new(vec![page(same_page), page(Vec::new())])
             .with_item_comments(vec![comment("1", "one-comment", "2026-01-01T01:00:00Z")]);
-        block_on(mirror_binding(&conn, &binding, &resumed, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &resumed, false))
+            .unwrap();
         assert_eq!(resumed.item_comment_requests.borrow().as_slice(), ["1"]);
         assert_eq!(keys(&conn), vec!["1", "2"]);
     }
@@ -1793,7 +1930,14 @@ mod tests {
                     reason: PauseReason::PassBudget,
                 })),
             ]);
-        let report = block_on(mirror_binding(&conn, &binding, &first, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &first,
+            false,
+        ))
+        .unwrap();
         assert_eq!(report.paused_until_ms, Some(42));
         assert_eq!(report.stored_comments, 1);
         let cursor = load_cursor(&conn, &binding).unwrap();
@@ -1831,7 +1975,8 @@ mod tests {
                     frontier: None,
                 }),
             ]);
-        block_on(mirror_binding(&conn, &binding, &resumed, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &resumed, false))
+            .unwrap();
         let requests = resumed.item_comment_page_requests.borrow();
         assert_eq!(requests[0].page_token, None);
         assert_eq!(requests[1].page_token.as_deref(), Some("thread-page-2"));
@@ -1869,7 +2014,14 @@ mod tests {
                 reason: PauseReason::QuotaReserve,
             })),
         ]);
-        let report = block_on(mirror_binding(&conn, &binding, &first, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &first,
+            false,
+        ))
+        .unwrap();
         assert_eq!(report.paused_until_ms, Some(42));
         assert_eq!(keys(&conn), vec!["2"]);
         assert_eq!(
@@ -1884,7 +2036,8 @@ mod tests {
             page(vec![item("1", "2026-01-02T00:00:00Z", "one", &[])]),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &binding, &resumed, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &resumed, false))
+            .unwrap();
         let request = &resumed.item_page_requests.borrow()[0];
         assert_eq!(request.page_token.as_deref(), Some("tie-page-2"));
         assert_eq!(request.provider_state.as_deref(), Some("opaque-tie-state"));
@@ -1903,7 +2056,8 @@ mod tests {
             }),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &binding, &client, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &client, false))
+            .unwrap();
 
         let requests = client.item_page_requests.borrow();
         assert_eq!(requests.len(), 2);
@@ -1925,7 +2079,8 @@ mod tests {
                 reason: PauseReason::PassBudget,
             })),
         ]);
-        block_on(mirror_binding(&conn, &binding, &first, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &first, false))
+            .unwrap();
 
         let changed_page = vec![
             item("2", "2026-01-03T00:00:00Z", "new", &[]),
@@ -1936,7 +2091,8 @@ mod tests {
                 Ok(Vec::new()),
                 Ok(vec![comment("2", "new-comment", "2026-01-03T01:00:00Z")]),
             ]);
-        block_on(mirror_binding(&conn, &binding, &resumed, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &resumed, false))
+            .unwrap();
 
         assert_eq!(resumed.item_comment_requests.borrow().as_slice(), ["1", "2"]);
         let title: String = conn
@@ -1965,7 +2121,14 @@ mod tests {
                     resume_at_ms: 42,
                     reason: PauseReason::PassBudget,
                 }))]);
-        let report = block_on(mirror_binding(&conn, &binding, &first, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &first,
+            false,
+        ))
+        .unwrap();
         assert_eq!(report.paused_until_ms, Some(42));
         assert_eq!(keys(&conn), vec!["1"]);
 
@@ -1973,7 +2136,14 @@ mod tests {
             page(vec![item("1", "2026-01-02T00:00:00Z", "changed", &["feature"])]),
             page(Vec::new()),
         ]);
-        let report = block_on(mirror_binding(&conn, &binding, &resumed, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &resumed,
+            false,
+        ))
+        .unwrap();
         assert_eq!(report.pruned_items, 1);
         assert!(keys(&conn).is_empty());
         assert!(resumed.item_comment_requests.borrow().is_empty());
@@ -1987,6 +2157,7 @@ mod tests {
         block_on(mirror_binding(
             &conn,
             &binding,
+            std::slice::from_ref(&binding),
             &ScriptClient::new(vec![page(Vec::new())]),
             false,
         ))
@@ -2002,7 +2173,8 @@ mod tests {
                     etag: Some("v1".to_string()),
                     not_modified: false,
                 });
-        block_on(mirror_binding(&conn, &binding, &later, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &later, false))
+            .unwrap();
         assert_eq!(keys(&conn), vec!["1"]);
         assert_eq!(
             later.item_page_requests.borrow()[0].updated_since.as_deref(),
@@ -2021,7 +2193,8 @@ mod tests {
                 reason: PauseReason::PassBudget,
             })),
         ]);
-        block_on(mirror_binding(&conn, &binding, &first, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &first, false))
+            .unwrap();
         let second = ScriptClient::new(vec![
             page(vec![item("2", "2026-01-04T00:00:00Z", "updated", &[])]),
             page(Vec::new()),
@@ -2032,7 +2205,8 @@ mod tests {
             etag: Some("v2".to_string()),
             not_modified: false,
         });
-        block_on(mirror_binding(&conn, &binding, &second, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &second, false))
+            .unwrap();
         let title: String = conn
             .query_row("SELECT title FROM papertrail_items WHERE item_key='2'", [], |row| {
                 row.get(0)
@@ -2049,7 +2223,8 @@ mod tests {
             page(vec![item("1", "2026-01-02T00:00:00Z", "old", &[])]),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let tied = ScriptClient::new(vec![page(vec![item(
             "2",
@@ -2062,7 +2237,8 @@ mod tests {
             etag: Some("changed".to_string()),
             not_modified: false,
         });
-        block_on(mirror_binding(&conn, &binding, &tied, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &tied, false))
+            .unwrap();
         assert_eq!(keys(&conn), vec!["1", "2"]);
         assert_eq!(
             load_cursor(&conn, &binding).unwrap().high_mark_at.as_deref(),
@@ -2078,7 +2254,8 @@ mod tests {
             page(vec![item("1", "2026-01-01T00:00:00Z", "one", &[])]),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let next = PageCursor {
             updated_since: Some("2025-12-31T23:59:59Z".to_string()),
@@ -2101,7 +2278,14 @@ mod tests {
             etag: Some("v2".to_string()),
             not_modified: false,
         });
-        let report = block_on(mirror_binding(&conn, &binding, &paused, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &paused,
+            false,
+        ))
+        .unwrap();
         assert_eq!(report.paused_until_ms, Some(42));
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert!(cursor.item_delta_in_progress);
@@ -2109,7 +2293,8 @@ mod tests {
 
         let resumed =
             ScriptClient::new(vec![page(vec![item("3", "2026-01-03T00:00:00Z", "three", &[])])]);
-        block_on(mirror_binding(&conn, &binding, &resumed, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &resumed, false))
+            .unwrap();
         assert_eq!(
             resumed.item_page_requests.borrow()[0].page_token.as_deref(),
             Some("delta-page-2")
@@ -2129,7 +2314,8 @@ mod tests {
             page(vec![item("1", "2026-01-01T00:00:00Z", "one", &[])]),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let next =
             PageCursor { page_token: Some("delta-page-2".to_string()), ..Default::default() };
@@ -2146,7 +2332,8 @@ mod tests {
             etag: Some("v2".to_string()),
             not_modified: false,
         });
-        block_on(mirror_binding(&conn, &binding, &delta, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &delta, false))
+            .unwrap();
 
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert_eq!(cursor.high_mark_at.as_deref(), Some("2026-01-02T00:00:00Z"));
@@ -2164,7 +2351,8 @@ mod tests {
             etag: Some("v2".to_string()),
             not_modified: false,
         });
-        block_on(mirror_binding(&conn, &binding, &replay, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &replay, false))
+            .unwrap();
         assert_eq!(keys(&conn), vec!["1", "2", "3", "4"]);
     }
 
@@ -2176,14 +2364,16 @@ mod tests {
             page(vec![item("1", "2026-01-01T00:00:00Z", "one", &[])]),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let raced = ScriptClient::new(vec![page(Vec::new())]).with_probe(FreshnessResult {
             latest: Some("2026-01-05T00:00:00Z".to_string()),
             etag: Some("v2".to_string()),
             not_modified: false,
         });
-        block_on(mirror_binding(&conn, &binding, &raced, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &raced, false))
+            .unwrap();
 
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert_eq!(cursor.high_mark_at.as_deref(), Some("2026-01-01T00:00:00Z"));
@@ -2198,7 +2388,8 @@ mod tests {
             page(vec![item("1", "2026-01-01T00:00:00Z", "one", &[])]),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let tied_page = || {
             Ok(ItemsPage {
@@ -2216,7 +2407,8 @@ mod tests {
                 etag: Some("v2".to_string()),
                 not_modified: false,
             });
-        block_on(mirror_binding(&conn, &binding, &first, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &first, false))
+            .unwrap();
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert!(cursor.item_delta_replay_required);
         assert!(cursor.probe_etag.is_none());
@@ -2227,7 +2419,8 @@ mod tests {
                 etag: Some("v2".to_string()),
                 not_modified: false,
             });
-        block_on(mirror_binding(&conn, &binding, &replay, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &replay, false))
+            .unwrap();
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert!(!cursor.item_delta_replay_required);
         assert_eq!(cursor.probe_etag.as_deref(), Some("v2"));
@@ -2241,7 +2434,7 @@ mod tests {
             page(vec![item("1", "2026-01-02T00:00:00Z", "bug", &["bug"])]),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &bug, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &bug, std::slice::from_ref(&bug), &initial, false)).unwrap();
         assert_eq!(keys(&conn), vec!["1"]);
 
         let docs = binding(&["docs"]);
@@ -2249,7 +2442,9 @@ mod tests {
             page(vec![item("2", "2026-01-03T00:00:00Z", "docs", &["docs"])]),
             page(Vec::new()),
         ]);
-        let report = block_on(mirror_binding(&conn, &docs, &changed, false)).unwrap();
+        let report =
+            block_on(mirror_binding(&conn, &docs, std::slice::from_ref(&docs), &changed, false))
+                .unwrap();
         assert_eq!(report.pruned_items, 1);
         assert!(report.completed_full_walk);
         assert_eq!(keys(&conn), vec!["2"]);
@@ -2267,7 +2462,14 @@ mod tests {
             page(vec![item("1", "2026-01-01T00:00:00Z", "healed", &[])]),
             page(Vec::new()),
         ]);
-        let report = block_on(mirror_binding(&conn, &binding, &client, true)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &client,
+            true,
+        ))
+        .unwrap();
         let title: String = conn
             .query_row("SELECT title FROM papertrail_items WHERE item_key='1'", [], |row| {
                 row.get(0)
@@ -2293,13 +2495,27 @@ mod tests {
                 reason: PauseReason::PassBudget,
             })),
         ]);
-        let report = block_on(mirror_binding(&conn, &binding, &paused, true)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &paused,
+            true,
+        ))
+        .unwrap();
         assert_eq!(report.paused_until_ms, Some(42));
         assert!(load_cursor(&conn, &binding).unwrap().full_rewalk);
         assert_eq!(keys(&conn), vec!["1", "2"]);
 
         let resumed = ScriptClient::new(vec![page(Vec::new())]);
-        let report = block_on(mirror_binding(&conn, &binding, &resumed, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &resumed,
+            false,
+        ))
+        .unwrap();
         assert!(report.completed_full_walk);
         assert_eq!(report.pruned_items, 1);
         assert!(!load_cursor(&conn, &binding).unwrap().full_rewalk);
@@ -2336,7 +2552,14 @@ mod tests {
         let conn = db();
         let binding = binding(&[]);
         let client = ScriptClient::new(vec![Err(anyhow::anyhow!("provider failed"))]);
-        let error = block_on(mirror_binding(&conn, &binding, &client, false)).unwrap_err();
+        let error = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &client,
+            false,
+        ))
+        .unwrap_err();
         assert_eq!(error.to_string(), "provider failed");
         assert!(pause(&error).is_none());
 
@@ -2353,7 +2576,8 @@ mod tests {
             page(Vec::new()),
         ])
         .with_item_comments(vec![comment("1", "old", "2026-01-01T01:00:00Z")]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let failed =
             ScriptClient::new(vec![page(vec![item("1", "2026-01-02T00:00:00Z", "updated", &[])])])
@@ -2363,7 +2587,14 @@ mod tests {
                     not_modified: false,
                 })
                 .with_item_comment_results(vec![Err(anyhow::anyhow!("comment fetch failed"))]);
-        let error = block_on(mirror_binding(&conn, &binding, &failed, false)).unwrap_err();
+        let error = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &failed,
+            false,
+        ))
+        .unwrap_err();
         assert_eq!(error.to_string(), "comment fetch failed");
         let comments: Vec<String> = conn
             .prepare("SELECT comment_id FROM papertrail_comments ORDER BY comment_id")
@@ -2383,7 +2614,8 @@ mod tests {
             page(vec![item("1", "2026-01-01T00:00:00Z", "initial", &[])]),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let unchanged = PageCursor {
             updated_since: Some("2025-12-31T23:59:59Z".to_string()),
@@ -2399,7 +2631,14 @@ mod tests {
             etag: Some("v2".to_string()),
             not_modified: false,
         });
-        let error = block_on(mirror_binding(&conn, &binding, &invalid, false)).unwrap_err();
+        let error = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &invalid,
+            false,
+        ))
+        .unwrap_err();
         assert!(error.to_string().contains("did not advance"));
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert_eq!(cursor.item_delta_page_token, None);
@@ -2415,7 +2654,8 @@ mod tests {
             page(vec![item("1", "2026-01-01T00:00:00Z", "initial", &[])]),
             page(Vec::new()),
         ]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let invalid = ScriptClient::new(Vec::new())
             .with_probe(FreshnessResult {
@@ -2432,7 +2672,14 @@ mod tests {
                 }),
                 frontier: None,
             })]);
-        let error = block_on(mirror_binding(&conn, &binding, &invalid, false)).unwrap_err();
+        let error = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &invalid,
+            false,
+        ))
+        .unwrap_err();
         assert!(error.to_string().contains("crossed"));
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM papertrail_comments", [], |row| row
@@ -2454,7 +2701,8 @@ mod tests {
             page(Vec::new()),
         ])
         .with_item_comments(vec![comment("1", "initial", "2026-01-01T01:00:00Z")]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let continuation = PageCursor {
             updated_since: Some("2026-01-01T00:00:00Z".to_string()),
@@ -2479,7 +2727,14 @@ mod tests {
             comment("1", "repo", "2026-01-03T00:00:00Z"),
             comment("404", "orphan", "2026-01-04T00:00:00Z"),
         ]);
-        let report = block_on(mirror_binding(&conn, &binding, &delta, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &delta,
+            false,
+        ))
+        .unwrap();
         assert_eq!(report.stored_items, 1);
         assert_eq!(report.stored_comments, 2);
         let comments: i64 = conn
@@ -2505,7 +2760,8 @@ mod tests {
             page(Vec::new()),
         ])
         .with_repo_comments(vec![comment("1", "seed", "2026-01-01T00:00:00Z")]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let next = PageCursor { page_token: Some("page-2".to_string()), ..PageCursor::default() };
         let paused = ScriptClient::new(Vec::new())
@@ -2525,7 +2781,14 @@ mod tests {
                     reason: PauseReason::PassBudget,
                 })),
             ]);
-        let report = block_on(mirror_binding(&conn, &binding, &paused, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &paused,
+            false,
+        ))
+        .unwrap();
         assert_eq!(report.paused_until_ms, Some(42));
         let cursor = load_cursor(&conn, &binding).unwrap();
         let stream = &cursor.comment_stream_cursors["default"];
@@ -2540,7 +2803,8 @@ mod tests {
                 not_modified: true,
             })
             .with_repo_comments(vec![comment("1", "second", "2026-01-02T00:00:00Z")]);
-        block_on(mirror_binding(&conn, &binding, &resumed, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &resumed, false))
+            .unwrap();
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert!(cursor.comment_stream_cursors["default"].page_token.is_none());
         assert_eq!(cursor.comment_high_mark_at.as_deref(), Some("2026-01-03T00:00:00Z"));
@@ -2559,7 +2823,8 @@ mod tests {
             page(Vec::new()),
         ])
         .with_repo_comments(vec![comment("1", "seed", "2026-01-01T00:00:00Z")]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let next =
             PageCursor { page_token: Some("comments-page-2".to_string()), ..Default::default() };
@@ -2581,7 +2846,8 @@ mod tests {
                     frontier: None,
                 }),
             ]);
-        block_on(mirror_binding(&conn, &binding, &delta, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &delta, false))
+            .unwrap();
 
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert_eq!(
@@ -2599,7 +2865,8 @@ mod tests {
             page(Vec::new()),
         ])
         .with_item_comments(vec![comment("1", "seed", "2026-01-01T01:00:00Z")]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let missing =
             ScriptClient::new(vec![page(vec![item("1", "2026-01-02T00:00:00Z", "updated", &[])])])
@@ -2609,7 +2876,14 @@ mod tests {
                     not_modified: false,
                 })
                 .with_item_comment_results(vec![Err(PapertrailClientError::ItemNotFound.into())]);
-        let report = block_on(mirror_binding(&conn, &binding, &missing, false)).unwrap();
+        let report = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &missing,
+            false,
+        ))
+        .unwrap();
 
         assert_eq!(report.pruned_items, 0);
         assert_eq!(keys(&conn), vec!["1"]);
@@ -2627,7 +2901,8 @@ mod tests {
             page(Vec::new()),
         ])
         .with_repo_comments(vec![comment("1", "first", "2026-01-02T00:00:00Z")]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let next =
             PageCursor { page_token: Some("comments-page-2".to_string()), ..Default::default() };
@@ -2641,7 +2916,8 @@ mod tests {
                 Ok(CommentsPage { comments: Vec::new(), next: Some(next), frontier: None }),
                 Ok(CommentsPage { comments: Vec::new(), next: None, frontier: None }),
             ]);
-        block_on(mirror_binding(&conn, &binding, &delta, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &delta, false))
+            .unwrap();
         let requests = delta.repo_comment_requests.borrow();
         assert_eq!(requests[0].updated_since.as_deref(), Some("2026-01-01T23:59:59Z"));
         assert_eq!(requests[1].updated_since, requests[0].updated_since);
@@ -2668,7 +2944,8 @@ mod tests {
                 frontier: None,
             }),
         ]);
-        block_on(mirror_binding(&conn, &binding, &initial, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &initial, false))
+            .unwrap();
 
         let cursor = load_cursor(&conn, &binding).unwrap();
         assert_eq!(
@@ -2698,7 +2975,8 @@ mod tests {
                 }),
                 Ok(CommentsPage { comments: Vec::new(), next: None, frontier: None }),
             ]);
-        block_on(mirror_binding(&conn, &binding, &next, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &next, false))
+            .unwrap();
         let requests = next.repo_comment_requests.borrow();
         assert_eq!(requests[0].stream.as_deref(), Some("issue_comments"));
         assert_eq!(requests[0].updated_since.as_deref(), Some("2025-12-31T23:59:59Z"));
@@ -2715,7 +2993,8 @@ mod tests {
             page(Vec::new()),
         ])
         .with_item_comments(vec![comment("1", "thread", "2026-02-01T00:00:00Z")]);
-        block_on(mirror_binding(&conn, &binding, &client, false)).unwrap();
+        block_on(mirror_binding(&conn, &binding, std::slice::from_ref(&binding), &client, false))
+            .unwrap();
         assert_eq!(client.repo_comment_requests.borrow()[0].updated_since, None);
         assert_eq!(load_cursor(&conn, &binding).unwrap().comment_high_mark_at, None);
     }
@@ -2761,7 +3040,9 @@ mod tests {
             page(vec![item("1", "2026-01-02T00:00:00Z", "still docs", &["docs"])]),
             page(Vec::new()),
         ]);
-        let report = block_on(mirror_binding(&conn, &bugs, &client, false)).unwrap();
+        let report =
+            block_on(mirror_binding(&conn, &bugs, std::slice::from_ref(&bugs), &client, false))
+                .unwrap();
         assert!(report.pruned_items >= 1);
         assert!(keys(&conn).is_empty());
     }

@@ -3065,6 +3065,11 @@ fn a_syncing_repo_is_isolated_from_stranded_placeholder_papertrail_rows() {
             created_at: None,
             updated_at: None,
             merged_at: None,
+            closed_at: None,
+            resolution: None,
+            merge_commit_sha: None,
+            author_kind: None,
+            author_association: None,
             tags: Vec::new(),
         },
     )

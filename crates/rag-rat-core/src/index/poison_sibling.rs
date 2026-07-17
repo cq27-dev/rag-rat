@@ -36,13 +36,13 @@
 //! `logical_symbols`, `docs`, `parser_failures`, `git_commits`, `git_file_changes` (plus
 //! `chunks`/`symbols`/`edges_data` TRANSITIVELY via `files.id` and `logical_symbol_members` via
 //! `logical_symbols.id`) — the provider-neutral papertrail tables (`papertrail_refs`,
-//! `papertrail_items`, `papertrail_comments`, `papertrail_sync_cursor`, `papertrail_item_tags`,
-//! V060) plus the `papertrail_fts` mirror — AND the V042 periphery tables that each gained
-//! their OWN `repo_id`: `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`,
-//! `logical_symbol_monikers` (now direct, no longer only transitive), `oracle_runs`, `edge_oracle`,
-//! `clone_graph_generations`, `clone_token_df`, `clone_refinements`, `dream_findings`, and
-//! `reconcile_attempts` (with `repo_memory_tags` scoped transitively through `repo_memories`) — AND
-//! the dream-verification siblings `memory_reality` / `memory_summaries` /
+//! `papertrail_items`, `papertrail_comments`, `papertrail_closing_edges`, `papertrail_sync_cursor`,
+//! `papertrail_item_tags`, V060) plus the `papertrail_fts` mirror — AND the V042 periphery tables
+//! that each gained their OWN `repo_id`: `repo_memories`, `repo_memory_bindings`,
+//! `repo_memory_fts`, `logical_symbol_monikers` (now direct, no longer only transitive),
+//! `oracle_runs`, `edge_oracle`, `clone_graph_generations`, `clone_token_df`, `clone_refinements`,
+//! `dream_findings`, and `reconcile_attempts` (with `repo_memory_tags` scoped transitively through
+//! `repo_memories`) — AND the dream-verification siblings `memory_reality` / `memory_summaries` /
 //! `memory_model_failures`, each of which carries its own `repo_id` — AND the typed-edge set
 //! `repo_node_edges` (V049), owner-scoped by `repo_id`.
 //! [`seed_sibling`] seeds a tripwire row into every one of those. Nothing repo-scoped is left
@@ -353,6 +353,14 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
             format!("{POISON_PREFIX}reftext"),
             POISON_REPO_ID
         ],
+    )?;
+    // V073 (#702): a sibling closing edge for the SAME external pair — an unscoped closing-edge
+    // read would adopt the sibling's attested closer.
+    conn.execute(
+        "INSERT OR IGNORE INTO papertrail_closing_edges(tracker, project, issue_kind, issue_key, \
+         closer_kind, closer_key, source, synced_at_ms, repo_id)
+         VALUES ('github', ?1, 'issue', ?2, 'commit', ?3, 'provider', 0, ?4)",
+        params![POISON_PROJECT, POISON_ITEM_KEY, format!("{POISON_PREFIX}sha"), POISON_REPO_ID],
     )?;
     conn.execute(
         "INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, title, \
@@ -875,6 +883,13 @@ fn sibling_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'static str, Str
             ),
         ),
         // papertrail (V060): each base table + the fts mirror pinned by the sentinel item key.
+        (
+            "papertrail_closing_edges",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND issue_key = '{POISON_ITEM_KEY}' AND closer_key \
+                 = '{POISON_PREFIX}sha'"
+            ),
+        ),
         (
             "papertrail_refs",
             format!("repo_id = '{POISON_REPO_ID}' AND item_key = '{POISON_ITEM_KEY}'"),

@@ -790,7 +790,14 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
 
-        let error = block_on(mirror_binding(&conn, &binding, &client, false)).unwrap_err();
+        let error = block_on(mirror_binding(
+            &conn,
+            &binding,
+            std::slice::from_ref(&binding),
+            &client,
+            false,
+        ))
+        .unwrap_err();
         assert!(error.to_string().contains("GitHub HTTP 403"));
         let stored: i64 =
             conn.query_row("SELECT COUNT(*) FROM papertrail_items", [], |row| row.get(0)).unwrap();

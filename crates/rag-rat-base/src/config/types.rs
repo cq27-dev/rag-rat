@@ -69,6 +69,8 @@ pub struct TrackerConfig {
     Copy,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     serde::Serialize,
     serde::Deserialize,
     strum::EnumString,

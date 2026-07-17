@@ -157,6 +157,7 @@ fn rationale_lookup_keeps_self_contained_github_refs_without_a_binding() {
     papertrail::block_on(papertrail::sync_refs(
         db.storage.connection(),
         &MockGitHubClient,
+        &[],
         std::iter::once(&reference),
         &mut |_| {},
     ))
@@ -918,6 +919,8 @@ fn both_repos_keep_a_shared_items_comments_across_syncs() {
                 url: Some("http://c".into()),
                 body: body.into(),
                 author: None,
+                author_kind: None,
+                author_association: None,
                 created_at: None,
                 updated_at: None,
                 review_state: None,

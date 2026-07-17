@@ -629,6 +629,33 @@ fn item_from_gitlab_value(
         created_at: value["created_at"].as_str().map(str::to_string),
         updated_at: value["updated_at"].as_str().map(str::to_string),
         merged_at: value["merged_at"].as_str().map(str::to_string),
+        // GitLab merged MRs can carry merged_at with a NULL closed_at — the merge IS the
+        // close, so the ordering axis falls back to it.
+        closed_at: value["closed_at"]
+            .as_str()
+            .or_else(|| {
+                (value["state"].as_str() == Some("merged"))
+                    .then(|| value["merged_at"].as_str())
+                    .flatten()
+            })
+            .map(str::to_string),
+        // GitLab attests no first-class resolution on its REST payloads; the column's NULL means
+        // "provider attested nothing", which is exactly the GitLab posture (issue #702).
+        resolution: None,
+        // THE VERIFIED TRAP (GitHub) applies here as policy: only a merged MR records its merge
+        // commit. GitLab marks merges with raw state = 'merged'; squash merges put the real sha
+        // in squash_commit_sha, plain merges in merge_commit_sha.
+        merge_commit_sha: if value["state"].as_str() == Some("merged") {
+            value["squash_commit_sha"]
+                .as_str()
+                .or_else(|| value["merge_commit_sha"].as_str())
+                .map(str::to_string)
+        } else {
+            None
+        },
+        // GitLab notes carry no author "type"/association facets on these payloads.
+        author_kind: None,
+        author_association: None,
         // GitLab labels are plain strings (GitHub's are objects).
         tags: value["labels"]
             .as_array()
@@ -672,6 +699,8 @@ fn comment_from_note_value(
         url: None,
         body: body.to_string(),
         author: value["author"]["username"].as_str().map(str::to_string),
+        author_kind: None,
+        author_association: None,
         created_at: value["created_at"].as_str().map(str::to_string),
         updated_at: value["updated_at"].as_str().map(str::to_string),
         review_state: review_state.map(str::to_string),

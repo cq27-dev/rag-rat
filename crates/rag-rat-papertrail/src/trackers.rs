@@ -161,7 +161,7 @@ fn remote_base_url(parts: &GitRemoteParts, provider: Tracker) -> Option<String> 
         .then(|| parts.base_url.clone().unwrap_or_else(|| format!("https://{}", parts.host)))
 }
 
-fn detect_provider(host: &str) -> Option<Tracker> {
+pub(crate) fn detect_provider(host: &str) -> Option<Tracker> {
     if host == "github.com" {
         Some(Tracker::Github)
     } else if host.contains("gitlab.") {
@@ -189,7 +189,7 @@ fn cloud_host(provider: Tracker) -> Option<&'static str> {
 /// Project path for `provider` from parsed remote parts. GitHub and Bitbucket Cloud projects are
 /// exactly `owner/repo`; Bitbucket Data Center clone URLs add a `/scm/` prefix. GitLab keeps the
 /// full (possibly subgroup-nested) namespace path.
-fn remote_url_project(parts: &GitRemoteParts, provider: Tracker) -> Option<String> {
+pub(crate) fn remote_url_project(parts: &GitRemoteParts, provider: Tracker) -> Option<String> {
     match provider {
         Tracker::Github => (parts.segments.len() == 2).then(|| parts.segments.join("/")),
         Tracker::Bitbucket => match parts.segments.as_slice() {

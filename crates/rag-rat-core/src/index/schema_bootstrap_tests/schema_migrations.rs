@@ -2305,8 +2305,7 @@ fn migration_071_indexes_edge_target_qname() {
 }
 
 #[test]
-fn migration_072_is_the_tip_and_queues_pending_refold() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 72, "move this pin with the next schema migration");
+fn migration_072_queues_pending_refold() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
@@ -2569,4 +2568,115 @@ fn forward_migration_records_migration_provenance() {
         .optional()
         .unwrap();
     assert_eq!(to.as_deref(), Some(schema::LATEST_SCHEMA_VERSION.to_string().as_str()));
+}
+
+#[test]
+fn migration_073_is_the_tip_and_builds_the_distill_substrate() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 73, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    // The closing-edge table exists with the full column set, repo_id included from birth.
+    let cols = conn_table_columns(&conn, "papertrail_closing_edges");
+    for col in [
+        "tracker",
+        "project",
+        "issue_kind",
+        "issue_key",
+        "closer_kind",
+        "closer_key",
+        "closer_commit",
+        "source",
+        "synced_at_ms",
+        "repo_id",
+    ] {
+        assert!(cols.contains(&col.to_string()), "V073 closing-edge column `{col}` exists");
+    }
+    // The natural key is the (issue, closer) PAIR — `source` is an attribute, so the same edge
+    // discovered by the text tier and then the provider tier converges to one row instead of two.
+    conn.execute(
+        "INSERT INTO papertrail_closing_edges(tracker, project, issue_kind, issue_key, \
+         closer_kind, closer_key, source, synced_at_ms, repo_id) VALUES ('github', 'o/r', \
+         'issue', '5', 'change_request', '9', 'text', 1, 'r')",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO papertrail_closing_edges(tracker, project, issue_kind, issue_key, \
+             closer_kind, closer_key, source, synced_at_ms, repo_id) VALUES ('github', 'o/r', \
+             'issue', '5', 'change_request', '9', 'provider', 2, 'r')",
+            [],
+        )
+        .is_err(),
+        "the natural key rejects a second row for the same (issue, closer) pair",
+    );
+    // A DIFFERENT closer for the same issue is a distinct edge (an issue can be closed by a
+    // change request AND referenced by the closing commit).
+    conn.execute(
+        "INSERT INTO papertrail_closing_edges(tracker, project, issue_kind, issue_key, \
+         closer_kind, closer_key, source, synced_at_ms, repo_id) VALUES ('github', 'o/r', \
+         'issue', '5', 'commit', 'abc123', 'text', 1, 'r')",
+        [],
+    )
+    .unwrap();
+
+    // The item outcome columns exist on items; the author facets on comments too.
+    let item_cols = conn_table_columns(&conn, "papertrail_items");
+    for col in [
+        "closed_at",
+        "resolution",
+        "merge_commit_sha",
+        "state_normalized",
+        "author_kind",
+        "author_association",
+    ] {
+        assert!(item_cols.contains(&col.to_string()), "V073 item column `{col}` exists");
+    }
+    let comment_cols = conn_table_columns(&conn, "papertrail_comments");
+    for col in ["author_kind", "author_association"] {
+        assert!(comment_cols.contains(&col.to_string()), "V073 comment column `{col}` exists");
+    }
+}
+
+#[test]
+fn migration_073_backfills_state_normalized_from_the_provider_truthful_pair() {
+    // The trap this column exists for: GitLab merged MRs carry state='merged', GitHub merged PRs
+    // carry state='closed' + merged_at — a consumer filtering raw `WHERE state='closed'` silently
+    // drops every merged GitLab MR. The backfill derives the normalized value for pre-V073 rows;
+    // rerunning it is a no-op for already-stamped rows (idempotent replay).
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let insert = |key: &str, state: &str, merged_at: Option<&str>| {
+        conn.execute(
+            "INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, \
+             title, body, merged_at, synced_at_ms, repo_id, state_normalized) VALUES ('github', \
+             'o/r', 'change_request', ?1, 'u', ?2, 't', 'b', ?3, 1, 'r', '')",
+            rusqlite::params![key, state, merged_at],
+        )
+        .unwrap();
+    };
+    insert("1", "closed", Some("2026-01-03T00:00:00Z")); // GitHub merged PR
+    insert("2", "merged", None); // GitLab merged MR
+    insert("3", "closed", None); // closed unmerged
+    insert("4", "open", None);
+    rag_rat_db::schema::apply_papertrail_distill_substrate(&conn).unwrap();
+    let normalized = |key: &str| -> String {
+        conn.query_row(
+            "SELECT state_normalized FROM papertrail_items WHERE item_key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(normalized("1"), "merged", "merged_at wins over raw closed state");
+    assert_eq!(normalized("2"), "merged", "GitLab's state='merged' normalizes to merged");
+    assert_eq!(normalized("3"), "closed");
+    assert_eq!(normalized("4"), "open");
+    // Idempotent: a stamped row is untouched by a replay (the WHERE '' predicate skips it).
+    conn.execute("UPDATE papertrail_items SET state_normalized = 'closed' WHERE item_key = '4'", [
+    ])
+    .unwrap();
+    rag_rat_db::schema::apply_papertrail_distill_substrate(&conn).unwrap();
+    assert_eq!(normalized("4"), "closed", "replay does not re-derive a stamped row");
 }

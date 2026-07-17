@@ -14,6 +14,8 @@ pub async fn sync_mirror(
 ) -> anyhow::Result<PapertrailSyncReport> {
     ensure_unique_mirror_bindings(&ctx.trackers)?;
     let refs = discover_and_store_refs(conn, root, ctx)?;
+    // One-time (versioned): rows cached before store-time mining existed get their text mined.
+    sync::backfill_mined_refs(conn, &ctx.trackers)?;
     let registry = transport::GovernorRegistry::default();
     let mut errors = Vec::new();
     let mut jobs = Vec::new();
@@ -32,6 +34,7 @@ pub async fn sync_mirror(
         if let Some(job) = prepare_binding_job(
             conn,
             binding,
+            &ctx.trackers,
             &registry,
             &ctx.transport_options,
             full,
@@ -41,6 +44,9 @@ pub async fn sync_mirror(
         }
     }
     let outcomes = run_binding_jobs(conn, jobs).await?;
+    // Targets were just cached by the mirror walk: re-derive the commit-tier text closers so a
+    // FIRST sync's `Fixes #5` gets its edge once #5's kind is verifiable (idempotent replace set).
+    sync::rederive_commit_closers(conn, root, ctx)?;
     assemble_mirror_report(conn, ctx, refs.len(), outcomes, errors)
 }
 
@@ -55,6 +61,9 @@ pub async fn sync_mirror_scheduled(
     ctx: &PapertrailContext,
     request: AutosyncRequest,
 ) -> anyhow::Result<PapertrailSyncReport> {
+    // Versioned mined-evidence backfill: EVERY sync entry converges pre-mining caches — the
+    // scheduled lane and the single-issue lane must not strand rows the manual lanes would heal.
+    sync::backfill_mined_refs(conn, &ctx.trackers)?;
     ensure_unique_mirror_bindings(&ctx.trackers)?;
     let repo_id = schema::active_repo_id(conn)?;
     let registry = transport::GovernorRegistry::default();
@@ -76,6 +85,7 @@ pub async fn sync_mirror_scheduled(
         if let Some(job) = prepare_binding_job(
             conn,
             binding,
+            &ctx.trackers,
             &registry,
             &ctx.transport_options,
             full,
@@ -118,6 +128,9 @@ fn scheduled_walk_depth(decision: ScheduleDecision, request: AutosyncRequest) ->
 /// walk depth decided. Skipped and provider-client-pending bindings never become jobs.
 struct BindingJob<'a> {
     binding: &'a ResolvedTracker,
+    /// The FULL configured tracker set — mining parses item/comment text against every
+    /// configured grammar, not just the source binding's (a GitHub body can say "Fixes JIRA-1").
+    trackers: &'a [ResolvedTracker],
     client: ProviderClient,
     full: bool,
 }
@@ -244,13 +257,14 @@ struct BindingOutcome {
 fn prepare_binding_job<'a>(
     conn: &Connection,
     binding: &'a ResolvedTracker,
+    trackers: &'a [ResolvedTracker],
     registry: &transport::GovernorRegistry,
     options: &transport::TransportOptions,
     full: bool,
     errors: &mut Vec<PapertrailSyncError>,
 ) -> anyhow::Result<Option<BindingJob<'a>>> {
     match ProviderClient::new(binding, registry, options.clone()) {
-        Ok(client) => Ok(Some(BindingJob { binding, client, full })),
+        Ok(client) => Ok(Some(BindingJob { binding, trackers, client, full })),
         Err(error) => {
             let persisted_detail = authentication_failure_detail(binding, &error);
             record_failure(
@@ -283,7 +297,7 @@ async fn run_binding_jobs(
 }
 
 async fn run_binding_job(conn: &Connection, job: BindingJob<'_>) -> anyhow::Result<BindingOutcome> {
-    match mirror_binding(conn, job.binding, &job.client, job.full).await {
+    match mirror_binding(conn, job.binding, job.trackers, &job.client, job.full).await {
         Ok(report) => {
             if let Some(operation) = completed_mirror_operation(&report, job.full) {
                 record_success(conn, job.binding, operation, now_ms())?;
@@ -431,6 +445,8 @@ pub async fn sync_from_refs_with_progress<C: PapertrailClient>(
     mut progress: impl FnMut(PapertrailSyncProgress),
 ) -> anyhow::Result<PapertrailSyncReport> {
     let refs = discover_and_store_refs(conn, root, ctx)?;
+    // One-time (versioned): rows cached before store-time mining existed get their text mined.
+    sync::backfill_mined_refs(conn, &ctx.trackers)?;
     let sync = if offline {
         SyncRefsReport::default()
     } else {
@@ -441,6 +457,7 @@ pub async fn sync_from_refs_with_progress<C: PapertrailClient>(
         sync_refs(
             conn,
             client,
+            &ctx.trackers,
             refs.iter()
                 .filter(|reference| discovered_ref_uses_legacy_github_client(ctx, reference)),
             &mut progress,
@@ -457,7 +474,12 @@ pub async fn sync_from_refs_with_progress<C: PapertrailClient>(
         synced_items: sync.synced_items,
         bindings: Vec::new(),
         errors: sync.errors,
-        status: status(conn, ctx)?,
+        status: {
+            // Referenced targets were just cached: re-derive the commit-tier closers (see the
+            // mirror entry) before assembling the status snapshot.
+            sync::rederive_commit_closers(conn, root, ctx)?;
+            status(conn, ctx)?
+        },
     })
 }
 pub async fn sync_issue<C: PapertrailClient>(
@@ -467,6 +489,9 @@ pub async fn sync_issue<C: PapertrailClient>(
     offline: bool,
     ctx: &PapertrailContext,
 ) -> anyhow::Result<PapertrailSyncReport> {
+    // Versioned mined-evidence backfill: EVERY sync entry converges pre-mining caches — the
+    // scheduled lane and the single-issue lane must not strand rows the manual lanes would heal.
+    sync::backfill_mined_refs(conn, &ctx.trackers)?;
     let parsed = parse_issue_ref(issue_ref, ctx.default_repo())
         .ok_or_else(|| anyhow::anyhow!("invalid tracker item reference `{issue_ref}`"))?;
     let project = parsed.project.clone();
@@ -480,6 +505,7 @@ pub async fn sync_issue<C: PapertrailClient>(
         sync_refs(
             conn,
             client,
+            &ctx.trackers,
             // `parse_issue_ref` is the explicit legacy GitHub command grammar. Its routing must
             // not depend on which discovery bindings happen to be configured for this repo.
             refs.iter().filter(|reference| {

@@ -1286,6 +1286,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_070_ID => Some(70),
             MIGRATION_071_ID => Some(71),
             MIGRATION_072_ID => Some(72),
+            MIGRATION_073_ID => Some(73),
             _ => None,
         })
         .max()
@@ -1367,6 +1368,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_070_ID
             | MIGRATION_071_ID
             | MIGRATION_072_ID
+            | MIGRATION_073_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1445,6 +1447,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_070_ID => migration.checksum != MIGRATION_070_CHECKSUM,
         MIGRATION_071_ID => migration.checksum != MIGRATION_071_CHECKSUM,
         MIGRATION_072_ID => migration.checksum != MIGRATION_072_CHECKSUM,
+        MIGRATION_073_ID => migration.checksum != MIGRATION_073_CHECKSUM,
         _ => false,
     }
 }
@@ -5075,6 +5078,92 @@ pub(crate) fn rebuild_files_table_for_commit_scopes(conn: &Connection) -> rusqli
         ALTER TABLE files_new RENAME TO files;
 
         PRAGMA foreign_keys = ON;
+        ",
+    )
+}
+
+/// V073 (issue #702): the provider-attested closing-edge substrate for issue distillation.
+/// `papertrail_closing_edges` is a FIRST-CLASS issue↔closer edge table, deliberately NOT more
+/// `papertrail_refs` rows: refs are an annotation layer whose unique index coalesces on
+/// `source_text`, while a closing edge's identity is the (issue, closer) PAIR and its trust
+/// semantics differ by `source` — `provider` rows are attested by the tracker's own data
+/// (GraphQL closing references, closed-event closers), `text` rows are mined from
+/// commit/item/comment text and remain the degradation tier.
+/// INVARIANT: `source` is an attribute, not part of the natural key — the same (issue, closer)
+/// pair discovered by both tiers converges to ONE row, and a `provider` row is never downgraded
+/// back to `text` (the store upsert enforces the precedence).
+/// The new `papertrail_items` columns are all fillable from payloads the mirror already parses
+/// (zero extra API calls):
+///  - `closed_at` — the temporal axis for supersession ordering (`created_at` is NOT it);
+///  - `resolution` — the provider-NEUTRAL outcome enum (`completed | not_planned | duplicate |
+///    superseded | unknown`); GitHub `state_reason` maps in, Jira's resolution field maps in
+///    richer, GitLab is mostly `unknown`;
+///  - `merge_commit_sha` — INVARIANT: stored ONLY for merged change requests. GitHub returns a
+///    non-null `merge_commit_sha` for closed-UNMERGED PRs too (its ephemeral test-merge commit,
+///    possibly on no branch); the store write path must gate on `merged_at`/merged state, never
+///    trust the field's presence;
+///  - `state_normalized` — `open | closed | merged`. GitLab merged MRs carry `state='merged'`, so a
+///    plain `WHERE state='closed'` silently drops every merged GitLab MR; consumers filter on THIS
+///    column, never on raw `state`. Backfilled below from the provider-truthful pair (`state`,
+///    `merged_at`); new rows are stamped at store time.
+///  - `author_kind` / `author_association` (items AND comments) — thread-shape facets (`user.type:
+///    "Bot"`, `OWNER`/`MEMBER`/…), already in the parsed payloads.
+///
+/// Additive only: `CREATE TABLE IF NOT EXISTS` + `add_column_if_missing` + an idempotent
+/// backfill UPDATE, so a torn replay reconverges without a wrapping transaction.
+pub fn apply_papertrail_distill_substrate(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS papertrail_closing_edges(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL,
+            project TEXT NOT NULL,
+            issue_kind TEXT NOT NULL,
+            issue_key TEXT NOT NULL,
+            -- 'change_request' | 'commit' (ClosingEdgeCloserKind::as_db_str)
+            closer_kind TEXT NOT NULL,
+            -- change_request: the closer item's key in the same project; commit: the full sha.
+            closer_key TEXT NOT NULL,
+            -- The closing/merge commit sha when known (a change_request closer's merge commit).
+            closer_commit TEXT,
+            -- 'provider' | 'text' (ClosingEdgeSource::as_db_str). Attribute, NOT key: the store
+            -- upsert converges both tiers onto one row and never downgrades provider -> text.
+            source TEXT NOT NULL,
+            synced_at_ms INTEGER NOT NULL,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_closing_edges_natural_key
+            ON papertrail_closing_edges(repo_id, tracker, project, issue_kind, issue_key, \
+         closer_kind, closer_key);
+        CREATE INDEX IF NOT EXISTS idx_papertrail_closing_edges_closer
+            ON papertrail_closing_edges(repo_id, tracker, project, closer_kind, closer_key);
+        ",
+    )?;
+    add_column_if_missing(conn, "papertrail_items", "closed_at", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_items", "resolution", "TEXT")?;
+    // INVARIANT: non-null ONLY for merged change requests — see the migration doc above.
+    add_column_if_missing(conn, "papertrail_items", "merge_commit_sha", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "papertrail_items",
+        "state_normalized",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(conn, "papertrail_items", "author_kind", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_items", "author_association", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_comments", "author_kind", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_comments", "author_association", "TEXT")?;
+    // Backfill the normalized state for pre-existing rows from the provider-truthful pair:
+    // 'merged' state (GitLab MRs) or a recorded merged_at (GitHub PRs) wins over raw 'closed';
+    // anything else non-closed is 'open'. Idempotent: the predicate re-derives the same value.
+    conn.execute_batch(
+        "
+        UPDATE papertrail_items SET state_normalized = CASE
+            WHEN state = 'merged' OR merged_at IS NOT NULL THEN 'merged'
+            WHEN state = 'closed' THEN 'closed'
+            ELSE 'open'
+        END
+        WHERE state_normalized = '';
         ",
     )
 }
