@@ -2571,10 +2571,16 @@ fn forward_migration_records_migration_provenance() {
 }
 
 #[test]
-fn migration_073_is_the_tip_and_builds_the_distill_substrate() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 73, "move this pin with the next schema migration");
+fn migration_073_builds_the_distill_substrate() {
+    // The absolute-tip pin moved to `migration_074_*` (V074 is the tip now); this drops to the
+    // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply",
+    );
 
     // The closing-edge table exists with the full column set, repo_id included from birth.
     let cols = conn_table_columns(&conn, "papertrail_closing_edges");
@@ -2679,4 +2685,74 @@ fn migration_073_backfills_state_normalized_from_the_provider_truthful_pair() {
     .unwrap();
     rag_rat_db::schema::apply_papertrail_distill_substrate(&conn).unwrap();
     assert_eq!(normalized("4"), "closed", "replay does not re-derive a stamped row");
+}
+
+#[test]
+fn migration_074_is_the_tip_and_refreshes_the_edges_view() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 74, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    // A DB that migrated through V068-V073 carries the ORIGINAL view text (per-row
+    // `NOT IN (SELECT ...)` suppressed-edge probe). Simulate it: swap the scalar clause back to
+    // the old form, truncate the ledger to V073, and seed one suppressed candidate.
+    let current_view: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'edges'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let old_view = current_view.replace(
+        "AND d.resolution_id <> COALESCE(\n            (SELECT id FROM name_strings WHERE value = \
+         'suppressed'), -1\n        )",
+        "AND d.resolution_id NOT IN (\n            SELECT id FROM name_strings WHERE value = \
+         'suppressed'\n        )",
+    );
+    assert_ne!(old_view, current_view, "fixture must reconstruct the pre-V074 clause");
+    conn.execute(
+        "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id) VALUES ('App.swift', 'swift', 'source', 'sha', 0, 0, 'head', '')",
+        [],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence) \
+         VALUES (?1, 'Observable', 'uses_macro', 'NameOnly', 'suppressed', '@Observable')",
+        [file_id],
+    )
+    .unwrap();
+    truncate_schema_to(&conn, 73);
+    conn.execute_batch("DROP VIEW edges;").unwrap();
+    conn.execute_batch(&old_view).unwrap();
+
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
+    let refreshed_view: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'edges'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        refreshed_view.contains("<> COALESCE"),
+        "V074 re-installs the scalar suppressed-edge clause: {refreshed_view}"
+    );
+    // Semantics preserved across the refresh: the suppressed candidate stays in edges_data for
+    // the resolver but never surfaces through the compatibility view.
+    let raw_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edges_data", [], |row| row.get(0)).unwrap();
+    let visible_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap();
+    assert_eq!(raw_count, 1, "suppressed candidates remain available to the resolver");
+    assert_eq!(visible_count, 0, "suppressed candidates stay out of query-layer reads");
+    let v74_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '074_edges_view_scalar_suppression'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v74_recorded, 1, "the forward migration records V074");
 }

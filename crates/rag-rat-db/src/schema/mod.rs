@@ -40,7 +40,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 73;
+pub const LATEST_SCHEMA_VERSION: u32 = 74;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -533,6 +533,13 @@ const MIGRATION_073_DESCRIPTION: &str =
      merge_commit_sha (merged-only) / state_normalized (backfilled) / author facets and \
      papertrail_comments author facets. Additive; CREATE IF NOT EXISTS + add_column_if_missing + \
      an idempotent state_normalized backfill";
+const MIGRATION_074_ID: &str = "074_edges_view_scalar_suppression";
+const MIGRATION_074_CHECKSUM: &str = "sha256:rag-rat-edges-view-scalar-suppression-v74";
+const MIGRATION_074_DESCRIPTION: &str =
+    "Re-install the edges compatibility view so the V068 suppressed-edge exclusion is a scalar \
+     compare instead of a per-row NOT IN membership probe (the query_warm regression: the probe \
+     taxed every per-hit graph-evidence query). Pure view DDL refresh via ensure_edges_view; no \
+     data change";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1162,6 +1169,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_073_CHECKSUM,
         description: MIGRATION_073_DESCRIPTION,
         apply: MigrationFn::Plain(apply_papertrail_distill_substrate),
+    },
+    Migration {
+        id: MIGRATION_074_ID,
+        checksum: MIGRATION_074_CHECKSUM,
+        description: MIGRATION_074_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_edges_view_scalar_suppression),
     },
 ];
 
