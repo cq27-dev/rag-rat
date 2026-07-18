@@ -168,6 +168,20 @@ fn extract_edited_paths_ignores_non_edit_tools_and_missing_paths() {
     assert!(extract_edited_paths(&input).is_empty());
 }
 
+#[test]
+fn paths_to_reindex_defers_to_the_watcher_except_for_manifests() {
+    let src = PathBuf::from("/repo/src/lib.rs");
+    let manifest = PathBuf::from("/repo/Cargo.toml");
+    let paths = vec![src.clone(), manifest.clone()];
+
+    // No watcher: the hook reindexes everything.
+    assert_eq!(paths_to_reindex(false, &paths), paths);
+
+    // Watcher live: source edits defer to the watcher, but a manifest it never sees does not.
+    assert_eq!(paths_to_reindex(true, &paths), vec![manifest]);
+    assert!(paths_to_reindex(true, &[src]).is_empty(), "a lone source edit fully defers");
+}
+
 // ─── format_digest ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]

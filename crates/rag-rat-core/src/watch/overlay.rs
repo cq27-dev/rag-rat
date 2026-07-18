@@ -358,6 +358,14 @@ pub(crate) struct WorktreePartition {
 /// non-git trees and paths already under the base checkout — is a base path. The linked roots are
 /// the [`crate::index::live_worktree_contexts`] spellings (canonicalized, base excluded), so the
 /// base pass and the overlay refresh key on the exact same identities the rest of the engine uses.
+/// Whether `path` is a package manifest (`Cargo.toml`) — a file the scoped reindex refreshes the
+/// package map for (see [`reindex_paths`]'s manifest handling), but that the file watcher's event
+/// filter (configured targets + `.gitignore`) never fires on. The PostToolUse edit hook uses this
+/// to still reindex a manifest edit when a watcher is live — the watcher would silently miss it.
+pub fn is_manifest_path(path: &Path) -> bool {
+    path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml"))
+}
+
 pub(crate) fn partition_paths_by_worktree(config: &Config, paths: &[PathBuf]) -> WorktreePartition {
     let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
     let base = enclosing_worktree_id(&config.root);
@@ -371,7 +379,7 @@ pub(crate) fn partition_paths_by_worktree(config: &Config, paths: &[PathBuf]) ->
     for path in paths {
         match enclosing_linked_root(path, &linked) {
             Some(root) => {
-                if path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+                if is_manifest_path(path) {
                     partition.manifest_roots.insert(root.clone());
                 }
                 partition.linked_roots.insert(root);

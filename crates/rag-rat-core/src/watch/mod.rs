@@ -31,7 +31,9 @@ pub(crate) use event_loop::{EventLoop, flush_watch_placement_failures, shutdown_
 pub(crate) use overlay::{
     OverlayBasisAction, overlay_basis_action, overlay_needs_embed, partition_paths_by_worktree,
 };
-pub use overlay::{OverlayScope, ReconcileBudget, refresh_worktree_overlays, reindex_paths};
+pub use overlay::{
+    OverlayScope, ReconcileBudget, is_manifest_path, refresh_worktree_overlays, reindex_paths,
+};
 #[cfg(test)]
 pub(crate) use papertrail::{PapertrailClock, PapertrailScheduler, papertrail_tick_interval};
 pub use pass::{CLONE_GRAPH_QUIET_MS, maintenance_pass, maintenance_pass_or_skip};

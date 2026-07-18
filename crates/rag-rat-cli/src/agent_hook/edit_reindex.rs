@@ -73,10 +73,11 @@ impl FlightPayload for PathSet {
 }
 
 /// `rag-rat edit-reindex` entry: discover the repo config from the (inherited) session cwd and run
-/// the coalesced scoped reindex. `None` config ⇒ not a rag-rat repo ⇒ silent no-op, exactly like
-/// the hook that spawned this.
+/// the coalesced scoped reindex. Uses GOVERNING discovery (the same as the hook that spawned this),
+/// so a linked-worktree edit with no branch-local config resolves the main config and routes
+/// through the overlay. `None` config ⇒ not a rag-rat repo ⇒ silent no-op.
 pub fn run(cwd: &Path, paths: &[PathBuf]) -> anyhow::Result<()> {
-    let Some(config) = super::find_config(cwd) else { return Ok(()) };
+    let Some(config) = super::find_governing_config(cwd) else { return Ok(()) };
     run_with_config(&config, paths)
 }
 

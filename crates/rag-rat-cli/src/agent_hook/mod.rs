@@ -432,24 +432,23 @@ fn posttooluse(input: &HookInput) -> anyhow::Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
+    // Governing discovery (not bare `find_config`): a linked-worktree edit with no branch-local
+    // config must still resolve the main config so `reindex_paths` routes it through the overlay.
+    let Some(config) = find_governing_config(Path::new(&input.cwd)) else { return Ok(()) };
     // The scoped `index --paths` mode requires an existing base index (#659/#427) — with no DB
     // there is nothing to reconcile into yet; the first `rag-rat index` builds it. (Do NOT
     // open/create it.)
     if !config.database.is_file() {
         return Ok(());
     }
-    // Watcher-live ⇒ no-op: a live MCP watcher for this worktree receives the SAME inotify event
-    // and schedules a debounced pass, so reindexing here would just double the work. Mirrors
-    // the maintenance watcher-state deferral — and is what lets this trigger skip socket
-    // delegation entirely (the only listener that would matter is already handling the edit).
-    if watcher_state(&config).0 {
+    let to_reindex = paths_to_reindex(watcher_state(&config).0, &paths);
+    if to_reindex.is_empty() {
         return Ok(());
     }
-    // No listener ⇒ the hook does the job itself, but DETACHED: a fresh `rag-rat` process is
-    // seconds of fixed overhead, so it must not run inline. The child coalesces burst edits via
-    // the #660 single-flight and takes the write lock with a timeout (never blocking).
-    spawn_detached_reindex(&input.cwd, &paths);
+    // The hook does the job itself, DETACHED: a fresh `rag-rat` process is seconds of fixed
+    // overhead, so it must not run inline. The child coalesces burst edits via the #660
+    // single-flight and takes the write lock with a timeout (never blocking).
+    spawn_detached_reindex(&input.cwd, &to_reindex);
     Ok(())
 }
 
@@ -468,6 +467,19 @@ fn extract_edited_paths(input: &HookInput) -> Vec<PathBuf> {
             .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+/// Which of the edited paths this hook must reindex, given whether a watcher is live. No watcher ⇒
+/// the hook covers everything. A live watcher covers the SOURCE edits (it gets the same inotify
+/// event and schedules a debounced pass), so nothing needs the hook — EXCEPT manifests
+/// (`Cargo.toml`): the watcher's event filter fires only for configured targets + `.gitignore`,
+/// never a manifest, yet the scoped pass refreshes the package map for one, so the watcher would
+/// silently miss it. Pure so the watcher-deferral decision is unit-tested without a live watcher.
+fn paths_to_reindex(watcher_live: bool, paths: &[PathBuf]) -> Vec<PathBuf> {
+    if !watcher_live {
+        return paths.to_vec();
+    }
+    paths.iter().filter(|path| rag_rat_core::watch::is_manifest_path(path)).cloned().collect()
 }
 
 /// Spawn `rag-rat edit-reindex --cwd <cwd> --paths <paths…>` fully detached and return without
@@ -850,10 +862,26 @@ pub fn format_digest(o: &Orientation, live: bool, enabled: bool) -> String {
 
 /// Walk up from the hook's cwd to the nearest rag-rat.toml and load it. `None` ⇒ not a rag-rat repo
 /// ⇒ silent no-op (what makes `--global` install safe). Shares the upward-walk primitive with
-/// `Config::load`'s discovery seam ([`rag_rat_base::config::nearest_config_at_or_above`]).
+/// `Config::load`'s discovery seam ([`rag_rat_base::config::nearest_config_at_or_above`]). Used by
+/// the READ paths (SessionStart / grep-augment / clone-check): cheaper than governing discovery,
+/// and a linked worktree with no branch-local config merely loses context there (not an incorrect
+/// index). The edit-reindex path instead uses [`find_governing_config`].
 fn find_config(start: &Path) -> Option<Config> {
     rag_rat_base::config::nearest_config_at_or_above(start)
         .and_then(|path| Config::load(&path).ok())
+}
+
+/// Resolve the GOVERNING config for the edit hook's cwd and load it, falling back to the MAIN
+/// worktree's config for a linked worktree with no branch-local `rag-rat.toml` (the documented
+/// main-governed setup) — the same governing discovery the CLI's own entry uses. Unlike
+/// [`find_config`], the edit-reindex path MUST resolve this: bare `nearest_config_at_or_above`
+/// stops at the linked worktree root and returns `None` there, so the hook would exit before
+/// reindexing a linked-checkout edit and leave that worktree stale. `Config::load`'s seam then
+/// re-anchors root to main and `reindex_paths` routes the edit through the overlay.
+/// `discover_config_path` returns a path even when none exists; `Config::load` then fails → `None`,
+/// preserving the no-config no-op.
+fn find_governing_config(start: &Path) -> Option<Config> {
+    Config::load(rag_rat_base::config::discover_config_path(start)).ok()
 }
 
 /// Outer Option: did the listener answer at all (None ⇒ fall back). Inner Option: did it
