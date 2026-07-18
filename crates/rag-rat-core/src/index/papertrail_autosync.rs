@@ -9,11 +9,9 @@
 //! a short synchronous transaction serialized by SQLite itself. Ordinary index maintenance and
 //! this flight therefore proceed independently.
 
-use std::fs;
-use std::path::{Path, PathBuf};
-
 use rag_rat_base::config::Config;
 use rag_rat_base::locks::{self, FileLock};
+use rag_rat_base::single_flight::{FlightOutcome, SingleFlight, Step};
 use rag_rat_papertrail::{AutosyncRequest, PapertrailContext, PapertrailSyncReport};
 
 use crate::index::IndexDatabase;
@@ -49,32 +47,33 @@ pub fn run(config: &Config, request: AutosyncRequest) -> anyhow::Result<Autosync
     // database creates the (empty) file first and only then refuses on the missing schema, and
     // that artifact defeats every later `database.exists()` "build the index first" hint. A
     // repo with no store at all is trivially not indexed — but the accepted signal is queued
-    // (see the NotIndexed drain arm) so a first index pass racing this trigger cannot lose it.
+    // (the first post-index trigger absorbs it) so a first index pass racing this trigger can't
+    // lose it.
     if !config.database.exists() {
         let lock_repo = locks::write_lock_repo_id(config);
-        PendingMarker::new(&config.database, &lock_repo).lock()?.merge(request)?;
+        flight(config, &lock_repo).queue(request)?;
         return Ok(AutosyncOutcome::NotIndexed);
     }
     // Identity re-key retry: when a pass discovers its flight lock was keyed from a
-    // since-upgraded identity, the stranded request (max-merged with anything consumed from the
-    // old-key marker) is carried to fresh keys and re-run — an `Incremental` change signal is
-    // not re-derivable from persisted cursor state, so it must not be dropped. Transitions are
-    // one-time per repo; the cap only bounds pathological churn.
+    // since-upgraded identity, the stranded request (absorbed from the old-key marker) is carried
+    // to fresh keys and re-run — an `Incremental` change signal is not re-derivable from persisted
+    // cursor state, so it must not be dropped. Transitions are one-time per repo; the cap only
+    // bounds pathological churn.
     let mut request = request;
     for _ in 0..3 {
         let lock_repo = locks::write_lock_repo_id(config);
-        let lock_path = locks::papertrail_lock_path(&config.database, &lock_repo);
-        let pending = PendingMarker::new(&config.database, &lock_repo);
-        let Some(flight) = acquire_or_coalesce(&lock_path, &pending, request)? else {
-            return Ok(AutosyncOutcome::Coalesced);
-        };
-        match drain(config, &lock_repo, &pending, flight, Some(request))? {
-            Drained::NotIndexed => return Ok(AutosyncOutcome::NotIndexed),
-            Drained::Ran(Some(report)) => return Ok(AutosyncOutcome::Ran(report)),
-            // Defensive: unreachable with `initial = Some` (the first pass reports, defers,
+        match flight(config, &lock_repo)
+            .run(request, |queued| run_pass(config, &lock_repo, *queued))?
+        {
+            FlightOutcome::Coalesced => return Ok(AutosyncOutcome::Coalesced),
+            FlightOutcome::Ran(Some(report)) => return Ok(AutosyncOutcome::Ran(report)),
+            // Defensive: unreachable with a non-`None` initial (the first pass reports, defers,
             // re-keys, or errors before the drain can exit empty-handed).
-            Drained::Ran(None) => return Ok(AutosyncOutcome::Coalesced),
-            Drained::Rekeyed(stranded) => request = stranded,
+            FlightOutcome::Ran(None) => return Ok(AutosyncOutcome::Coalesced),
+            // `StopRequeue` (NotIndexed) left the signal in the marker for a future trigger.
+            FlightOutcome::Stopped(None) => return Ok(AutosyncOutcome::NotIndexed),
+            // `StopCarry` (Rekeyed) handed the stranded request (+ absorbed marker) back to re-key.
+            FlightOutcome::Stopped(Some(stranded)) => request = stranded,
         }
     }
     // Pathological identity churn: preserve the signal where fresh-keyed triggers will find it,
@@ -86,16 +85,53 @@ pub fn run(config: &Config, request: AutosyncRequest) -> anyhow::Result<Autosync
     )
 }
 
+/// This repo's papertrail single-flight coordinator, keyed to `lock_repo` (the currently-resolved
+/// identity). Rebuilt per attempt: the identity can upgrade mid-flight (a shallow clone resolving
+/// its portable id), which re-keys every flight path.
+fn flight(config: &Config, lock_repo: &str) -> SingleFlight<AutosyncRequest> {
+    SingleFlight::new(
+        locks::papertrail_lock_path(&config.database, lock_repo),
+        locks::papertrail_pending_path(&config.database, lock_repo),
+        locks::papertrail_marker_lock_path(&config.database, lock_repo),
+    )
+}
+
+/// One scheduled flight pass under the held flight lock, mapped to a single-flight [`Step`]:
+/// - the repo's identity key went stale since the lock was taken → `StopCarry` (a fresh-keyed
+///   flight is now possible; re-key and retry rather than mirror twice over one cursor);
+/// - the repo is not indexed yet → `StopRequeue` (automatic sync serves indexed repos only; leave
+///   the accepted signal for the first post-index trigger — the deliberate marker-without-a-runner
+///   exception);
+/// - otherwise the scheduled pass runs → `Ran`.
+fn run_pass(
+    config: &Config,
+    lock_repo: &str,
+    request: AutosyncRequest,
+) -> anyhow::Result<Step<Box<PapertrailSyncReport>>> {
+    let db = IndexDatabase::open_config(config)?;
+    // Identity re-key guard on EVERY pass at the latest pre-walk moment: the flight lock was keyed
+    // from the identity resolved at entry, and both the wait for the slot and `open_config`'s own
+    // git reads take real time. A fresh resolution here is exactly what a future trigger keys its
+    // lock from, so a mismatch means a concurrent fresh-keyed flight is possible.
+    if locks::write_lock_repo_id(config) != lock_repo {
+        return Ok(Step::StopCarry);
+    }
+    // `open_config` registers read-only (it never creates an index), so on a shared database this
+    // repo can be registered yet never indexed; the #427 "an index pass ran here" signal separates
+    // the two.
+    if !rag_rat_db::schema::is_root_already_indexed_conn(db.storage.connection(), config)? {
+        return Ok(Step::StopRequeue);
+    }
+    Ok(Step::Ran(Box::new(db.papertrail_sync_scheduled(request)?)))
+}
+
 /// Best-effort: queue a request stranded by an identity re-key into the CURRENT identity's
 /// pending marker, where fresh-keyed triggers absorb it. The marker sits until the next trigger
 /// (the watcher deadline bounds the wait) — the same bounded staleness every error-path marker
 /// accepts.
 fn preserve_for_fresh_key(config: &Config, request: AutosyncRequest) {
     let lock_repo = locks::write_lock_repo_id(config);
-    let pending = PendingMarker::new(&config.database, &lock_repo);
-    if let Ok(guard) = pending.lock() {
-        let _ = guard.merge(request);
-    }
+    let _ = flight(config, &lock_repo).queue(request);
 }
 
 /// The explicit `papertrail sync` command: unconditional manual semantics (every binding
@@ -117,7 +153,7 @@ pub fn run_manual(
         config.database.exists(),
         "no index at this path yet; build one with `rag-rat index` or `rag-rat index --full`"
     );
-    // The same identity re-key guard as `run_flight`, with manual semantics: the identity can
+    // The same identity re-key guard as `run_pass`, with manual semantics: the identity can
     // move between resolving the lock key and the post-open re-check (the wait for the flight
     // slot and `open_config`'s own git reads take real time, and the open can itself upgrade
     // the identity). An automatic runner steps aside; an explicit command instead RE-KEYS and
@@ -125,17 +161,16 @@ pub fn run_manual(
     // transition is one-time per repo — the cap only bounds pathological churn.
     for _ in 0..3 {
         let lock_repo = locks::write_lock_repo_id(config);
-        let lock_path = locks::papertrail_lock_path(&config.database, &lock_repo);
-        let pending = PendingMarker::new(&config.database, &lock_repo);
-        // No marker lock is held while blocking here (a contender holding the marker lock must
-        // never block on the flight lock — see [`MarkerGuard`]); the runner's exit handoff
-        // releases the flight lock only with an empty marker, so this wait ends at a clean
+        let sf = flight(config, &lock_repo);
+        // No marker lock is held while blocking here (a contender holding the marker lock only
+        // TRY-acquires the flight lock — see the single-flight lock ordering); the runner's exit
+        // handoff releases the flight lock only with an empty marker, so this wait ends at a clean
         // boundary.
-        let flight = match FileLock::try_acquire(&lock_path)? {
-            Some(flight) => flight,
+        let flight_lock = match FileLock::try_acquire(sf.flight_lock_path())? {
+            Some(flight_lock) => flight_lock,
             None => {
                 on_wait();
-                FileLock::acquire_blocking(&lock_path)?
+                FileLock::acquire_blocking(sf.flight_lock_path())?
             },
         };
         let db = IndexDatabase::open_config(config)?;
@@ -143,21 +178,23 @@ pub fn run_manual(
             // Never mirror under a stale-keyed flight lock: a trigger resolving the upgraded
             // identity keys a DIFFERENT lock and could run concurrently over the same cursor.
             // A follow-up that coalesced into the OLD-key marker while this runner held the
-            // stale lock is unreachable for fresh-keyed triggers — carry it forward (the
-            // automatic path's `Rekeyed` carry, manual flavor) before releasing.
+            // stale lock is unreachable for fresh-keyed triggers — carry it forward before
+            // releasing.
             drop(db);
-            if let Some(stranded) = pending.lock()?.take()? {
+            if let Some(stranded) = sf.take()? {
                 preserve_for_fresh_key(config, stranded);
             }
-            drop(flight);
+            drop(flight_lock);
             continue;
         }
         let manual_report = db.papertrail_sync(full)?;
         drop(db);
-        // Triggers that coalesced behind the manual pass still get their follow-up (and the
-        // exit handoff) before the flight lock releases. A follow-up stranded by an identity
+        // Triggers that coalesced behind the manual pass still get their (scheduled) follow-up and
+        // the exit handoff before the flight lock releases. A follow-up stranded by an identity
         // transition mid-drain is queued for fresh-keyed triggers instead of dropped.
-        if let Drained::Rekeyed(stranded) = drain(config, &lock_repo, &pending, flight, None)? {
+        if let FlightOutcome::Stopped(Some(stranded)) =
+            sf.drain(flight_lock, None, |queued| run_pass(config, &lock_repo, *queued))?
+        {
             preserve_for_fresh_key(config, stranded);
         }
         return Ok(manual_report);
@@ -168,201 +205,11 @@ pub fn run_manual(
     )
 }
 
-/// Take the flight lock, or coalesce `request` into the pending marker — atomically under the
-/// marker lock, so a request only ever lands in the marker while some runner is still obligated
-/// to check it (one half of the exit handoff in [`drain`]).
-fn acquire_or_coalesce(
-    lock_path: &Path,
-    pending: &PendingMarker,
-    request: AutosyncRequest,
-) -> anyhow::Result<Option<FileLock>> {
-    let guard = pending.lock()?;
-    match FileLock::try_acquire(lock_path)? {
-        Some(flight) => Ok(Some(flight)),
-        None => {
-            guard.merge(request)?;
-            Ok(None)
-        },
-    }
-}
-
-enum Drained {
-    Ran(Option<Box<PapertrailSyncReport>>),
-    NotIndexed,
-    /// The flight lock's key no longer matches the resolved identity; the stranded request
-    /// (max-merged with anything consumed from the old-key marker) must be carried to fresh
-    /// keys by the caller.
-    Rekeyed(AutosyncRequest),
-}
-
-/// Drive scheduled passes while holding the flight lock: `initial` first (when given), then any
-/// follow-ups coalesced into the marker mid-pass, until the EXIT HANDOFF — absorbing the marker
-/// and releasing the flight lock under ONE marker-lock hold — finds nothing queued. A
-/// contender's merge-and-try-acquire section ([`acquire_or_coalesce`]) is serialized either
-/// before that hold (its request is seen here and earns the follow-up) or after the flight lock
-/// is already free (its own try-acquire wins and IT becomes the runner); checking without the
-/// lock, or releasing the flight lock outside it, reopens the window where a coalesced request
-/// is written into the void and never runs.
-fn drain(
-    config: &Config,
-    lock_repo: &str,
-    pending: &PendingMarker,
-    flight: FileLock,
-    initial: Option<AutosyncRequest>,
-) -> anyhow::Result<Drained> {
-    let mut flight = Some(flight);
-    let mut next = initial;
-    let mut last_report = None;
-    loop {
-        {
-            let guard = pending.lock()?;
-            match (guard.take()?, next.take()) {
-                (Some(queued), current) =>
-                    next = Some(current.map_or(queued, |request| request.max(queued))),
-                (None, Some(current)) => next = Some(current),
-                (None, None) => {
-                    // The exit handoff: release under the same hold that observed the empty
-                    // marker.
-                    drop(flight.take());
-                    return Ok(Drained::Ran(last_report));
-                },
-            }
-        }
-        let request = next.take().expect("the loop is only entered with a request");
-        match run_flight(config, lock_repo, request) {
-            Ok(FlightPass::Report(report)) => last_report = Some(report),
-            Ok(FlightPass::NotIndexed) => {
-                // Nothing can run until the first index pass — but the accepted signal must
-                // not drop: a hook can lose the maintenance lock to a manual run that is
-                // CREATING the first index and will never fire papertrail itself. Queue the
-                // request instead. This is the one deliberate "marker without an obligated
-                // runner" exception to the exit-handoff rule: the first post-index trigger
-                // absorbs it, and on a never-indexed repo it is an inert one-word file.
-                let guard = pending.lock()?;
-                guard.merge(request)?;
-                drop(flight.take());
-                return Ok(Drained::NotIndexed);
-            },
-            Ok(FlightPass::Rekeyed) => {
-                // The identity this open resolved no longer matches the held lock's key (a
-                // shallow clone upgrading to its portable id mid-flight). Triggers arriving
-                // under the NEW identity key their own flight lock, so mirroring under the
-                // stale key would run two concurrent flights over one cursor — stop here. The
-                // old-key marker is unreachable for new-key triggers: fold it into the
-                // stranded request the caller re-keys and retries with.
-                let guard = pending.lock()?;
-                let queued = guard.take()?;
-                drop(flight.take());
-                drop(guard);
-                let stranded = queued.map_or(request, |carried| request.max(carried));
-                return Ok(Drained::Rekeyed(stranded));
-            },
-            Err(error) => {
-                // Best-effort retry signal: a failing marker write must not shadow the flight
-                // error the caller is about to log.
-                if let Ok(guard) = pending.lock() {
-                    let _ = guard.merge(request);
-                }
-                return Err(error);
-            },
-        }
-    }
-}
-
-enum FlightPass {
-    Report(Box<PapertrailSyncReport>),
-    NotIndexed,
-    Rekeyed,
-}
-
-fn run_flight(
-    config: &Config,
-    lock_repo: &str,
-    request: AutosyncRequest,
-) -> anyhow::Result<FlightPass> {
-    let db = IndexDatabase::open_config(config)?;
-    // Identity re-key guard, on EVERY pass (the first included) at the latest pre-walk moment:
-    // the flight lock was keyed from the identity resolved at entry, and both the wait for this
-    // slot and `open_config`'s own git reads take real time. A fresh resolution here is exactly
-    // what a future trigger would key its lock from, so a mismatch means a concurrent
-    // fresh-keyed flight is possible and this runner must not start the walk.
-    if locks::write_lock_repo_id(config) != lock_repo {
-        return Ok(FlightPass::Rekeyed);
-    }
-    // Automatic sync serves already-INDEXED repos only. `open_config` registers read-only (it
-    // never creates an index), so on a shared database this repo can be registered yet never
-    // indexed; the #427 "an index pass ran here" signal (a recorded root, or the source_root
-    // meta an identity-less root gets) is what separates the two.
-    if !rag_rat_db::schema::is_root_already_indexed_conn(db.storage.connection(), config)? {
-        return Ok(FlightPass::NotIndexed);
-    }
-    Ok(FlightPass::Report(Box::new(db.papertrail_sync_scheduled(request)?)))
-}
-
-/// The pending-marker pair: the marker file carrying the strongest coalesced request, and the
-/// lock serializing every access to it. All reads and writes flow through a held [`MarkerGuard`]
-/// so no path can touch the file outside the lock — without it, two coalescing contenders can
-/// interleave their max-merge (a weaker request overwrites a queued `full`), and a runner's exit
-/// check can miss a marker written just before its flight lock releases. Distinct from the
-/// flight lock, which the runner holds for the whole network-bound run; this one is held for
-/// microseconds per section, so contenders never wait on a flight.
-struct PendingMarker {
-    path: PathBuf,
-    update_lock: PathBuf,
-}
-
-impl PendingMarker {
-    fn new(database: &Path, repo_id: &str) -> Self {
-        Self {
-            path: locks::papertrail_pending_path(database, repo_id),
-            update_lock: locks::papertrail_marker_lock_path(database, repo_id),
-        }
-    }
-
-    fn lock(&self) -> anyhow::Result<MarkerGuard<'_>> {
-        Ok(MarkerGuard { marker: self, _update: FileLock::acquire_blocking(&self.update_lock)? })
-    }
-}
-
-/// One held marker-lock section. Lock ordering: a runner holding the FLIGHT lock may block on
-/// this lock; a contender holding this lock only ever TRY-acquires the flight lock — the
-/// non-blocking edge is what makes the pair deadlock-free.
-struct MarkerGuard<'a> {
-    marker: &'a PendingMarker,
-    _update: FileLock,
-}
-
-impl MarkerGuard<'_> {
-    /// Record `request` into the marker, max-merged with whatever is already queued there.
-    fn merge(&self, request: AutosyncRequest) -> anyhow::Result<()> {
-        let merged = match fs::read_to_string(&self.marker.path) {
-            Ok(existing) => request.max(AutosyncRequest::from_marker_str(&existing)),
-            Err(_) => request,
-        };
-        fs::write(&self.marker.path, merged.as_marker_str())?;
-        Ok(())
-    }
-
-    /// Consume the marker. A request merged concurrently is either absorbed into the returned
-    /// value or lands after the removal and survives for the next check.
-    fn take(&self) -> anyhow::Result<Option<AutosyncRequest>> {
-        let Ok(content) = fs::read_to_string(&self.marker.path) else {
-            return Ok(None);
-        };
-        let _ = fs::remove_file(&self.marker.path);
-        Ok(Some(AutosyncRequest::from_marker_str(&content)))
-    }
-
-    /// Test-only visibility into the marker's presence; production paths decide through
-    /// [`Self::take`] so the decision and the consumption share one hold.
-    #[cfg(test)]
-    fn is_set(&self) -> bool {
-        self.marker.path.exists()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -383,52 +230,39 @@ mod tests {
         assert_eq!(AutosyncRequest::from_marker_str(""), AutosyncRequest::Evaluate);
     }
 
-    #[test]
-    fn pending_marker_merges_max_wins_and_is_consumed_once() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let marker = PendingMarker::new(&tmp.path().join("locks/index.sqlite"), "repo");
-
-        marker.lock().unwrap().merge(AutosyncRequest::Full).unwrap();
-        // A later, weaker trigger must not weaken the queued full walk.
-        marker.lock().unwrap().merge(AutosyncRequest::Incremental).unwrap();
-        assert_eq!(fs::read_to_string(&marker.path).unwrap(), "full");
-
-        assert_eq!(marker.lock().unwrap().take().unwrap(), Some(AutosyncRequest::Full));
-        assert!(!marker.lock().unwrap().is_set());
-        assert_eq!(marker.lock().unwrap().take().unwrap(), None);
-
-        // And the upgrade direction: a stronger trigger replaces a weaker queued one.
-        marker.lock().unwrap().merge(AutosyncRequest::Evaluate).unwrap();
-        marker.lock().unwrap().merge(AutosyncRequest::Incremental).unwrap();
-        assert_eq!(marker.lock().unwrap().take().unwrap(), Some(AutosyncRequest::Incremental));
-    }
-
+    /// The `AutosyncRequest` payload's max-wins merge holds under cross-"process" filesystem
+    /// contention. Threads share no state but the marker files (the exact shape of concurrent hook
+    /// invocations): one queues a FULL walk while weaker contenders storm the marker. The generic's
+    /// marker lock makes every read-modify-write atomic, so the surviving marker must be `full` no
+    /// matter the interleaving. (The generic's own tests cover the coalescing mechanism; this pins
+    /// the domain payload's merge direction end-to-end.)
     #[test]
     fn concurrent_marker_merges_never_lose_the_strongest_request() {
-        // Race many cross-"process" contenders (threads sharing no state but the filesystem, the
-        // exact shape of concurrent hook invocations): one queues a FULL walk while weaker
-        // contenders storm the marker. The update lock makes every read-modify-write atomic, so
-        // the surviving marker must be `full` no matter the interleaving.
         let tmp = tempfile::TempDir::new().unwrap();
         let database = tmp.path().join("locks/index.sqlite");
+        let single_flight = || {
+            SingleFlight::<AutosyncRequest>::new(
+                locks::papertrail_lock_path(&database, "repo"),
+                locks::papertrail_pending_path(&database, "repo"),
+                locks::papertrail_marker_lock_path(&database, "repo"),
+            )
+        };
         std::thread::scope(|scope| {
             for contender in 0..8 {
-                let database = database.clone();
+                let sf = single_flight();
                 scope.spawn(move || {
-                    let marker = PendingMarker::new(&database, "repo");
                     let request = if contender == 3 {
                         AutosyncRequest::Full
                     } else {
                         AutosyncRequest::Incremental
                     };
                     for _ in 0..50 {
-                        marker.lock().unwrap().merge(request).unwrap();
+                        sf.queue(request).unwrap();
                     }
                 });
             }
         });
-        let marker = PendingMarker::new(&database, "repo");
-        assert_eq!(marker.lock().unwrap().take().unwrap(), Some(AutosyncRequest::Full));
+        assert_eq!(single_flight().take().unwrap(), Some(AutosyncRequest::Full));
     }
 
     /// The exit handoff under contention: any trigger accepted as `Coalesced` must eventually be
@@ -744,11 +578,7 @@ mod tests {
         // A request queued before the manual pass rides its drain: the manual walk covers it
         // (the follow-up evaluation lands inside the attempt interval and settles to a skip).
         let lock_repo = locks::write_lock_repo_id(&config);
-        PendingMarker::new(&config.database, &lock_repo)
-            .lock()
-            .unwrap()
-            .merge(AutosyncRequest::Incremental)
-            .unwrap();
+        flight(&config, &lock_repo).queue(AutosyncRequest::Incremental).unwrap();
 
         let report = run_manual(&config, false, || panic!("the lock is free; no wait")).unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -786,18 +616,20 @@ mod tests {
         // the OLD identity, while the config now resolves to a different id.
         let stale_repo = "stale-pre-upgrade-id";
         assert_ne!(locks::write_lock_repo_id(&config), stale_repo);
-        let stale_lock_path = locks::papertrail_lock_path(&config.database, stale_repo);
-        let flight = FileLock::try_acquire(&stale_lock_path).unwrap().unwrap();
-        let pending = PendingMarker::new(&config.database, stale_repo);
-        pending.lock().unwrap().merge(AutosyncRequest::Full).unwrap();
+        let sf = flight(&config, stale_repo);
+        let stale_lock_path = sf.flight_lock_path().to_path_buf();
+        let flight_lock = FileLock::try_acquire(&stale_lock_path).unwrap().unwrap();
+        sf.queue(AutosyncRequest::Full).unwrap();
 
-        let drained =
-            drain(&config, stale_repo, &pending, flight, Some(AutosyncRequest::Incremental))
-                .unwrap();
+        let drained = sf
+            .drain(flight_lock, Some(AutosyncRequest::Incremental), |queued| {
+                run_pass(&config, stale_repo, *queued)
+            })
+            .unwrap();
         // The stranded request carries the strongest of the trigger and the old-key marker, so
         // the caller's re-key retry loses nothing.
         assert!(
-            matches!(drained, Drained::Rekeyed(AutosyncRequest::Full)),
+            matches!(drained, FlightOutcome::Stopped(Some(AutosyncRequest::Full))),
             "no pass may run under the stale key"
         );
         // No mirror work happened, the stranded old-key marker was consumed, and the stale

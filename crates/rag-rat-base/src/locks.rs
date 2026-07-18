@@ -286,6 +286,16 @@ pub fn maintenance_pending_path(database: &Path, repo_id: &str) -> PathBuf {
     lock_dir(database).join(format!("rag-rat-maintenance-{}.pending", lock_discriminator(repo_id)))
 }
 
+/// Serializes every read-modify-write of the maintenance pending marker, pairing with
+/// [`maintenance_pending_path`] under the shared [`crate::single_flight`] coordinator (#660). The
+/// pre-#660 empty-file marker used only touch/remove/exists and needed no lock; the generic
+/// coordinator serializes the marker so its exit handoff can release the flight lock under the same
+/// hold that observed an empty marker (closing the mid-pass-trigger race the empty-file loop had).
+pub fn maintenance_marker_lock_path(database: &Path, repo_id: &str) -> PathBuf {
+    lock_dir(database)
+        .join(format!("rag-rat-maintenance-{}.pending.lock", lock_discriminator(repo_id)))
+}
+
 /// Per-DB, PER-REPO papertrail auto-sync flight lock (#592), held for one whole coalesced
 /// papertrail run so at most ONE mirror flight per repository is in the air across every trigger
 /// source — watcher timer ticks, git-hook maintenance, other processes. Separate from

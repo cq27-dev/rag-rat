@@ -141,6 +141,20 @@ impl AutosyncRequest {
     }
 }
 
+/// Coalesce papertrail flights through the shared single-flight primitive (#660): the marker
+/// carries the STRONGEST queued request so a full walk is never weakened by a later incremental.
+impl rag_rat_base::single_flight::FlightPayload for AutosyncRequest {
+    fn merge(self, other: Self) -> Self {
+        self.max(other)
+    }
+    fn encode(&self) -> Vec<u8> {
+        self.as_marker_str().as_bytes().to_vec()
+    }
+    fn decode(encoded: &[u8]) -> Self {
+        Self::from_marker_str(&String::from_utf8_lossy(encoded))
+    }
+}
+
 pub(crate) fn record_attempt(
     conn: &Connection,
     binding: &ResolvedTracker,

@@ -112,11 +112,12 @@ impl IndexDatabase {
 
     /// Whether `branch_targets` (a linked overlay's config targets) MAY differ from the config the
     /// base scope was indexed with — the cheap gate for the per-file target-identity drift scan
-    /// ([`Self::base_scope_target_drift`]). The base scope's discovery marker embeds its target
-    /// fingerprint; when it equals the branch's, no file can re-language, so the O(base-files) scan
-    /// is skipped — the common no-divergent-branch-config case that would otherwise re-scan every
-    /// base file on every overlay refresh × worktree, undoing the #577 event-scoping win.
-    /// Conservatively returns `true` when the marker is absent (a match can't be proven).
+    /// ([`Self::overlay_target_config_reconcile`]). The base scope's discovery marker embeds its
+    /// target fingerprint; when it equals the branch's, no file can re-language, so the
+    /// O(base-files) scan is skipped — the common no-divergent-branch-config case that would
+    /// otherwise re-scan every base file on every overlay refresh × worktree, undoing the #577
+    /// event-scoping win. Conservatively returns `true` when the marker is absent (a match
+    /// can't be proven).
     pub(super) fn overlay_targets_may_drift(
         &self,
         branch_targets: &[ResolvedTarget],

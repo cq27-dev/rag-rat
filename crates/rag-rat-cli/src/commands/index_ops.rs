@@ -2,7 +2,6 @@
 //! changed / worktree-overlay build + watch), `reconcile` (embedding backfill, plan, vector
 //! re-encode), `maintenance` (the git-hook pass, coalesced), `doctor` (health snapshot), and the
 //! `run_watch` / `run_maintenance_pass` helpers they drive.
-use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
@@ -397,12 +396,19 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // and runs once more to cover a change that arrived mid-pass. The pass still takes the write
     // lock internally, so serialization with the watcher is unchanged.
     let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
-    let pending = rag_rat_base::locks::maintenance_pending_path(&config.database, &lock_repo);
-    let lock_path = rag_rat_base::locks::maintenance_lock_path(&config.database, &lock_repo);
-    let mut report;
-    {
-        let Some(_maint) = rag_rat_base::locks::FileLock::try_acquire(&lock_path)? else {
-            let _ = fs::File::create(&pending);
+    // #267 coalescing on the shared single-flight primitive (#660): the runner drains any triggers
+    // that coalesce mid-pass and releases the flight lock (via the exit handoff) BEFORE this call
+    // returns — so the papertrail trigger below runs UNLOCKED, as before (a network-bound mirror
+    // flight must not make concurrent git triggers coalesce-skip their ordinary index passes).
+    let flight = rag_rat_base::single_flight::SingleFlight::<()>::new(
+        rag_rat_base::locks::maintenance_lock_path(&config.database, &lock_repo),
+        rag_rat_base::locks::maintenance_pending_path(&config.database, &lock_repo),
+        rag_rat_base::locks::maintenance_marker_lock_path(&config.database, &lock_repo),
+    );
+    let mut report = match flight.run((), |()| {
+        Ok(rag_rat_base::single_flight::Step::Ran(run_maintenance_pass(config, args, &trigger)?))
+    })? {
+        rag_rat_base::single_flight::FlightOutcome::Coalesced => {
             let mut skip_report = serde_json::json!({
                 "trigger": trigger,
                 "status": "skipped",
@@ -418,20 +424,15 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
                 skip_report["papertrail"] = papertrail_hook_trigger(config);
             }
             return print_output(&skip_report);
-        };
-        loop {
-            // This pass covers the current state, so clear any prior rerun request first; a
-            // trigger that fires after this point re-sets it and earns the rerun below.
-            let _ = fs::remove_file(&pending);
-            report = run_maintenance_pass(config, args, &trigger)?;
-            if !pending.exists() {
-                break;
-            }
-        }
-        // The maintenance coordination lock is released HERE, before the papertrail trigger: a
-        // network-bound mirror flight must not make concurrent git triggers coalesce-skip their
-        // ordinary index passes.
-    }
+        },
+        rag_rat_base::single_flight::FlightOutcome::Ran(Some(report)) => report,
+        // `run` was given an initial payload, so it runs at least one pass; maintenance never stops
+        // the flight (its run_fn only ever returns `Ran`).
+        rag_rat_base::single_flight::FlightOutcome::Ran(None)
+        | rag_rat_base::single_flight::FlightOutcome::Stopped(_) => {
+            unreachable!("maintenance runs at least one pass and never stops the flight")
+        },
+    };
     let papertrail = if hook_trigger {
         papertrail_hook_trigger(config)
     } else {
