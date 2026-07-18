@@ -56,6 +56,13 @@ pub const COOKBOOK_INPUT_ENV: &str = "RAG_RAT_COOKBOOK_INPUT";
 /// + pulling a model can take a couple of minutes; 5 minutes is a generous ceiling.
 const PROVISION_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The gap between the RECIPE's own provisioning budget ([`CookbookInput::provision_timeout_s`])
+/// and the Rust-side handshake deadline: the input builders set the recipe budget this far UNDER
+/// the deadline so the recipe times out (clean provider-side teardown) BEFORE the Rust SIGKILL
+/// backstop fires. One source of truth so the builders' `- margin` and `provision`'s `+ margin`
+/// never drift.
+pub(crate) const PROVISION_TEARDOWN_MARGIN_SECS: u64 = 20;
+
 /// How long to wait after SIGTERM before escalating to SIGKILL during teardown. Unix-only: the
 /// SIGTERM→SIGKILL escalation (`teardown_group`, the signal handler, `abort_active_provisioning`)
 /// is all `#[cfg(unix)]`, so on Windows this const is dead (`-D dead-code` in CI).
@@ -283,10 +290,7 @@ impl CookbookProvisioner {
     /// `cookbook` resolution: a `.mjs`/`.js` path → `node <path>`; a `.ts` path → `npx tsx <path>`;
     /// anything else → `npx -y <cookbook>` (an npm package spec).
     pub fn provision(cookbook: &str, input: &CookbookInput) -> anyhow::Result<ProvisionedBox> {
-        // Backend-aware handshake deadline (vLLM's huge image needs longer than ollama/infinity);
-        // fall back to the default if `input.backend` is somehow unrecognized.
-        let timeout = RemoteBackend::from_db_str(input.backend)
-            .map_or(PROVISION_TIMEOUT, RemoteBackend::provision_timeout);
+        let timeout = provision_deadline(input);
         Self::provision_with_command(cookbook_command(cookbook), cookbook, input, timeout)
     }
 
@@ -521,6 +525,20 @@ impl CookbookProvisioner {
 /// Build the `CookbookInput` (the env-passed provisioning request) from an ephemeral remote config.
 /// Split out from `provision_and_build` so the config→input mapping — notably that the configured
 /// `backend`, `gpu`, and `num_ctx` are forwarded — is unit-testable without spawning a real recipe.
+/// The Rust-side handshake deadline for [`CookbookProvisioner::provision`]. The floor is
+/// backend-aware (vLLM's huge image needs longer than ollama/infinity; the default covers an
+/// unrecognized backend). A larger `provision_timeout_s` (the distill 30B box, whose weight pull
+/// exceeds the vLLM default) EXTENDS the deadline past that floor — we add back the teardown margin
+/// the input builder subtracted, so the recipe budget still expires ~20s first (clean provider
+/// teardown before the Rust SIGKILL backstop). The override can only lengthen the deadline, never
+/// starve a box below its backend floor.
+fn provision_deadline(input: &CookbookInput) -> Duration {
+    let backend_floor = RemoteBackend::from_db_str(input.backend)
+        .map_or(PROVISION_TIMEOUT, RemoteBackend::provision_timeout);
+    Duration::from_secs(input.provision_timeout_s + PROVISION_TEARDOWN_MARGIN_SECS)
+        .max(backend_floor)
+}
+
 fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
     CookbookInput {
         model: remote.model.trim().to_string(),
@@ -534,7 +552,11 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
         // Give the recipe a provisioning budget just under the Rust hard ceiling (backend-aware:
         // vLLM's large image needs longer), so ITS budget runs out first (clean provider-side
         // teardown) before the Rust SIGKILL backstop fires.
-        provision_timeout_s: remote.backend.provision_timeout().as_secs().saturating_sub(20),
+        provision_timeout_s: remote
+            .backend
+            .provision_timeout()
+            .as_secs()
+            .saturating_sub(PROVISION_TEARDOWN_MARGIN_SECS),
         // The configured GPU (provider-specific; validated by the provider at provision time). The
         // recipe picks its own default when `None`. Config validation guarantees `gpu` is only set
         // in ephemeral mode, which is the only mode reaching this function.
@@ -1232,6 +1254,32 @@ mod tests {
             num_ctx: None,
             server_concurrency: 32,
         }
+    }
+
+    #[test]
+    fn provision_deadline_extends_for_a_larger_override_but_floors_at_the_backend_default() {
+        // No override baseline: an ollama box (recipe budget 280 = 300 - margin) gets exactly the
+        // backend floor, so the recipe still expires the margin before this deadline.
+        assert_eq!(provision_deadline(&input()), Duration::from_secs(300));
+
+        // The distill 30B case: a `provision_timeout_s` recipe budget of 1480 (= 1500 - margin)
+        // must EXTEND the Rust deadline to 1500s — otherwise the box is SIGKILLed at the vLLM
+        // default (900s) long before the 30B weights finish pulling.
+        let big = CookbookInput {
+            backend: "vllm",
+            provision_timeout_s: 1500 - PROVISION_TEARDOWN_MARGIN_SECS,
+            ..input()
+        };
+        assert_eq!(provision_deadline(&big), Duration::from_secs(1500));
+        // The recipe budget stays the margin under the Rust deadline (recipe tears down first).
+        assert_eq!(
+            provision_deadline(&big).as_secs() - big.provision_timeout_s,
+            PROVISION_TEARDOWN_MARGIN_SECS,
+        );
+
+        // A too-small override cannot starve a box below its backend floor (vLLM = 900s).
+        let tiny = CookbookInput { backend: "vllm", provision_timeout_s: 10, ..input() };
+        assert_eq!(provision_deadline(&tiny), RemoteBackend::Vllm.provision_timeout());
     }
 
     #[test]

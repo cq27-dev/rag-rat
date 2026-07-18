@@ -259,6 +259,13 @@ impl Config {
         {
             llm.dream.remote.cookbook = Some(resolved);
         }
+        // Same relative-cookbook resolution for the distill remote (#704) — it rides the same
+        // `RemoteDreamConfig` and hands its recipe to `node`/`npx` too.
+        if let Some(cookbook) = llm.distill.remote.cookbook.as_ref()
+            && let Some(resolved) = config::resolve_relative_cookbook_path(cookbook, &config_dir)
+        {
+            llm.distill.remote.cookbook = Some(resolved);
+        }
         let watch = raw.watch.into();
         let version_check = raw.version_check.into();
         let oracle = raw.oracle.into();

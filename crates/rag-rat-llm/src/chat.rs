@@ -312,7 +312,10 @@ fn chat_cookbook_input(remote: &RemoteDreamConfig) -> crate::CookbookInput {
         backend: remote.backend.as_db_str(),
         capability: "chat",
         request_timeout_s: remote.request_timeout_s,
-        provision_timeout_s: remote.backend.provision_timeout().as_secs().saturating_sub(20),
+        provision_timeout_s: remote
+            .resolved_provision_timeout()
+            .as_secs()
+            .saturating_sub(crate::cookbook::PROVISION_TEARDOWN_MARGIN_SECS),
         gpu: remote.gpu.clone(),
         num_ctx: None,
         server_concurrency: 1,
@@ -527,5 +530,21 @@ mod http_tests {
             input.provision_timeout_s,
             RemoteBackend::Vllm.provision_timeout().as_secs() - 20
         );
+    }
+
+    #[test]
+    fn chat_cookbook_input_honors_the_provision_timeout_override() {
+        // A `provision_timeout_s` override (the distill 30B-box knob) flows into the cookbook boot
+        // budget instead of the backend default, minus the same safety margin.
+        let remote = RemoteDreamConfig {
+            backend: RemoteBackend::Vllm,
+            endpoint: None,
+            cookbook: Some("@rag-rat/cookbook modal".to_string()),
+            model: "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8".to_string(),
+            provision_timeout_s: Some(1500),
+            ..RemoteDreamConfig::default()
+        };
+        let input = chat_cookbook_input(&remote);
+        assert_eq!(input.provision_timeout_s, 1500 - 20, "override wins over the backend default");
     }
 }

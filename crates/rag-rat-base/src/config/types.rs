@@ -340,6 +340,7 @@ impl Default for LogConfig {
 pub struct LlmConfig {
     pub embedding: EmbeddingConfig,
     pub dream: DreamLlmConfig,
+    pub distill: DistillLlmConfig,
 }
 
 /// Dream-mode model pass (`[llm.dream]`) — rag-rat's first generative-model dependency (#122),
@@ -358,6 +359,23 @@ pub struct DreamLlmConfig {
     pub enabled: bool,
     /// Which chat server serves the dream turns (connect XOR ephemeral). Absent
     /// `[llm.dream.remote]` → [`RemoteDreamConfig::default`] (a local-Ollama connect).
+    pub remote: RemoteDreamConfig,
+}
+
+/// Distill LLM pass (`[llm.distill]`, #704) — the model half of issue distillation, filling the
+/// distilled-record store's model columns. Same shape as [`DreamLlmConfig`]: an `enabled` gate plus
+/// a [`RemoteDreamConfig`] chat-serving block (connect XOR ephemeral), default OFF so the
+/// extraction layer stays 100% deterministic unless the operator opts in. Rides
+/// [`RemoteDreamConfig`] rather than a bespoke type — the distill pass is another single-turn chat
+/// consumer; the only difference from dream is a typically larger model (hence the
+/// `provision_timeout_s` override on the remote block, for a 30B-class weight pull).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DistillLlmConfig {
+    /// Run the distill model pass at all (default false — opt in explicitly). When false, the
+    /// deterministic extraction still runs; only the model columns stay unfilled.
+    pub enabled: bool,
+    /// Which chat server serves the distill turns (connect XOR ephemeral). Absent
+    /// `[llm.distill.remote]` → [`RemoteDreamConfig::default`] (a local-Ollama connect).
     pub remote: RemoteDreamConfig,
 }
 
@@ -784,6 +802,13 @@ pub struct RemoteDreamConfig {
     /// Per-request HTTP timeout, in seconds. A dense evidence pack against a remote model can take
     /// a while, so the default is generous.
     pub request_timeout_s: u64,
+    /// EPHEMERAL-only: override the box's boot/provision budget, in seconds. `None` → the backend
+    /// default ([`RemoteBackend::provision_timeout`]). A large model (30B-class) re-downloads its
+    /// weights from HuggingFace at cold start and can exceed the vLLM default (~15 min) — the
+    /// distill pass sets this higher (~25 min) so provisioning does not time out before the
+    /// weights land. Meaningless for a connect `endpoint` (no box is provisioned); simply
+    /// unused there.
+    pub provision_timeout_s: Option<u64>,
 }
 
 impl Default for RemoteDreamConfig {
@@ -798,6 +823,7 @@ impl Default for RemoteDreamConfig {
             gpu: None,
             auth_env: None,
             request_timeout_s: 300,
+            provision_timeout_s: None,
         }
     }
 }
@@ -809,9 +835,18 @@ impl RemoteDreamConfig {
         self.endpoint.is_some()
     }
 
-    /// EPHEMERAL mode: provision an on-demand box via `cookbook` for the dream pass.
+    /// EPHEMERAL mode: provision an on-demand box via `cookbook` for the pass.
     pub fn is_ephemeral(&self) -> bool {
         self.cookbook.is_some()
+    }
+
+    /// The box boot/provision budget: the configured `provision_timeout_s` override, else the
+    /// backend default ([`RemoteBackend::provision_timeout`]). The provisioning driver subtracts
+    /// its own safety margin from this before handing it to the recipe.
+    pub fn resolved_provision_timeout(&self) -> Duration {
+        self.provision_timeout_s
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| self.backend.provision_timeout())
     }
 }
 

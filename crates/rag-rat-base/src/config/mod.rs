@@ -36,11 +36,8 @@ pub enum ConfigError {
          `all-minilm`)"
     )]
     RemoteEmbeddingMissingModel,
-    #[error(
-        "[llm.embedding.remote] `backend` must be one of `ollama`, `infinity`, or `vllm` (got \
-         `{0}`)"
-    )]
-    RemoteBackendUnknown(String),
+    #[error("{section} `backend` must be one of `ollama`, `infinity`, or `vllm` (got `{got}`)")]
+    RemoteBackendUnknown { section: &'static str, got: String },
     #[error(
         "[llm.embedding.remote] `backend = \"{backend}\"` with an ephemeral `cookbook` requires \
          an explicit `query_endpoint` — queries embed against a LOCAL server after the box is \
@@ -65,11 +62,10 @@ pub enum ConfigError {
     )]
     RemoteGpuRequiresCookbook,
     #[error(
-        "[llm.embedding.remote] `gpu` is set but empty — give it a provider-specific value (a \
-         Modal GPU class like `A10G`, or a RunPod `gpuTypeId`), or remove the key to use the \
-         recipe default"
+        "{section} `gpu` is set but empty — give it a provider-specific value (a Modal GPU class \
+         like `A10G`, or a RunPod `gpuTypeId`), or remove the key to use the recipe default"
     )]
-    RemoteGpuEmpty,
+    RemoteGpuEmpty { section: &'static str },
     #[error(
         "[llm.embedding.remote] `num_ctx` must be greater than zero when set — remove it to use \
          Ollama's default context, or set a positive context window such as 4096"
@@ -88,32 +84,43 @@ pub enum ConfigError {
     )]
     RemoteEmbeddingNonTransformerModel(String),
     #[error(
-        "[llm.dream.remote] requires a non-empty `model` (the server-side chat model name — an \
-         ollama model like `qwen3:8b`, or the HuggingFace id vLLM was launched with, e.g. \
+        "{section} requires a non-empty `model` (the server-side chat model name — an ollama \
+         model like `qwen3:8b`, or the HuggingFace id vLLM was launched with, e.g. \
          `Qwen/Qwen3-4B-Instruct-2507`)"
     )]
-    DreamRemoteMissingModel,
+    DreamRemoteMissingModel { section: &'static str },
     #[error(
-        "[llm.dream.remote] `backend = \"{0}\"` cannot serve chat completions — dream needs a \
+        "{section} `backend = \"{backend}\"` cannot serve chat completions — a chat model needs a \
          chat-capable backend (`ollama` or `vllm`); `infinity` is embed-only. Switch the backend, \
-         or point the dream model at an ollama/vLLM server"
+         or point it at an ollama/vLLM server"
     )]
-    DreamBackendCannotServeChat(String),
+    DreamBackendCannotServeChat { section: &'static str, backend: String },
     #[error(
-        "[llm.dream.remote] requires EXACTLY ONE of `endpoint` (connect to a running chat server) \
-         or `cookbook` (provision an ephemeral box) — set neither both nor zero"
+        "{section} requires EXACTLY ONE of `endpoint` (connect to a running chat server) or \
+         `cookbook` (provision an ephemeral box) — set neither both nor zero"
     )]
-    DreamRemoteModeAmbiguous,
+    DreamRemoteModeAmbiguous { section: &'static str },
     #[error(
-        "[llm.dream.remote] `endpoint` must not embed credentials in the URL (no \
-         `user:pass@host`) — put any token in an env var and name it via `auth_env` instead"
+        "{section} `endpoint` must not embed credentials in the URL (no `user:pass@host`) — put \
+         any token in an env var and name it via `auth_env` instead"
     )]
-    DreamRemoteEndpointHasCredentials,
+    DreamRemoteEndpointHasCredentials { section: &'static str },
     #[error(
-        "[llm.dream.remote] `gpu` applies only to ephemeral `cookbook` provisioning, not a \
-         connect `endpoint` — remove `gpu`, or switch the remote block to a `cookbook` recipe"
+        "{section} `gpu` applies only to ephemeral `cookbook` provisioning, not a connect \
+         `endpoint` — remove `gpu`, or switch the remote block to a `cookbook` recipe"
     )]
-    DreamRemoteGpuRequiresCookbook,
+    DreamRemoteGpuRequiresCookbook { section: &'static str },
+    #[error(
+        "{section} `provision_timeout_s = {got}` is below the `{backend}` backend's {floor}s \
+         provisioning floor — the override may only LENGTHEN the boot budget (e.g. a large model \
+         whose weight pull exceeds the default), never shorten it below what a cold start needs"
+    )]
+    DreamRemoteProvisionTimeoutBelowFloor {
+        section: &'static str,
+        backend: &'static str,
+        got: u64,
+        floor: u64,
+    },
     #[error(
         "the `[local_ai]` table was renamed to `[llm]` (#317). Update your rag-rat.toml: rename \
          `[local_ai.embedding]` → `[llm.embedding]` (and any `[local_ai.embedding.remote]` / \
@@ -181,8 +188,8 @@ pub(crate) use raw::{RawConfig, RawTarget, resolve_relative_cookbook_path};
 #[cfg(test)]
 pub(crate) use raw::{RawMemory, RawOracle, RawSearch, RawVersionCheck, RawWatch};
 pub use types::{
-    Config, DEFAULT_QUERY_ENDPOINT, DreamLlmConfig, EmbeddingBackend, EmbeddingConfig,
-    EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,
+    Config, DEFAULT_QUERY_ENDPOINT, DistillLlmConfig, DreamLlmConfig, EmbeddingBackend,
+    EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,
     MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, PapertrailConfig,
     RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget, SearchConfig,
     TargetKind, Tracker, TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig,

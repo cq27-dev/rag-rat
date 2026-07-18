@@ -1676,7 +1676,7 @@ fn remote_embedding_empty_gpu_is_rejected() {
         .unwrap();
         let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
-            matches!(err, ConfigError::RemoteGpuEmpty),
+            matches!(err, ConfigError::RemoteGpuEmpty { .. }),
             "gpu={value} → RemoteGpuEmpty, got {err:?}",
         );
     }
@@ -2042,7 +2042,10 @@ fn remote_backend_parses_defaults_to_ollama_and_rejects_unknown() {
     assert_eq!(parse(r#"backend = "VLLM""#).unwrap().backend, RemoteBackend::Vllm);
     // Unknown → a clear config error naming the bad value.
     let err = parse(r#"backend = "tgi""#).unwrap_err();
-    assert!(matches!(&err, ConfigError::RemoteBackendUnknown(v) if v == "tgi"), "got {err:?}");
+    assert!(
+        matches!(&err, ConfigError::RemoteBackendUnknown { got, .. } if got == "tgi"),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -2289,8 +2292,211 @@ fn dream_remote_connect_happy_path_applies_defaults() {
         gpu: None,
         auth_env: Some("OLLAMA_TOKEN".to_string()),
         request_timeout_s: 60,
+        provision_timeout_s: None,
     });
     assert!(dream.remote.is_connect() && !dream.remote.is_ephemeral());
+}
+
+#[test]
+fn distill_absent_defaults_to_off_and_local_ollama_connect() {
+    // No `[llm.distill]` → disabled, with the same local-Ollama CONNECT default dream carries
+    // (the distill pass rides `RemoteDreamConfig`).
+    let raw: RawConfig = toml::from_str(
+        r#"
+            [index]
+            root = "."
+            "#,
+    )
+    .unwrap();
+    let distill = LlmConfig::try_from(raw.llm).unwrap().distill;
+    assert!(!distill.enabled, "the distill model pass is OFF by default");
+    assert_eq!(distill.remote, RemoteDreamConfig::default());
+    assert!(distill.remote.is_connect() && !distill.remote.is_ephemeral());
+}
+
+#[test]
+fn distill_and_dream_are_independent_gates() {
+    // Enabling one pass must not enable the other — they are separate `[llm.*]` blocks.
+    let raw: RawConfig = toml::from_str(
+        r#"
+            [index]
+            root = "."
+
+            [llm.distill]
+            enabled = true
+            "#,
+    )
+    .unwrap();
+    let llm = LlmConfig::try_from(raw.llm).unwrap();
+    assert!(llm.distill.enabled, "[llm.distill] enabled = true opts in");
+    assert!(!llm.dream.enabled, "distill's gate does not enable dream");
+}
+
+#[test]
+fn distill_remote_ephemeral_parses_and_honors_the_provision_timeout_override() {
+    // The distill default model is a 30B-class box whose weight pull can exceed the vLLM default
+    // boot budget, so `[llm.distill.remote]` carries a `provision_timeout_s` override.
+    let raw: RawConfig = toml::from_str(
+        r#"
+            [index]
+            root = "."
+
+            [llm.distill]
+            enabled = true
+
+            [llm.distill.remote]
+            backend = "vllm"
+            cookbook = "@rag-rat/cookbook modal"
+            model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+            gpu = "L40S"
+            provision_timeout_s = 1500
+            "#,
+    )
+    .unwrap();
+    let remote = LlmConfig::try_from(raw.llm).unwrap().distill.remote;
+    assert!(remote.is_ephemeral() && !remote.is_connect());
+    assert_eq!(remote.backend, RemoteBackend::Vllm);
+    assert_eq!(remote.model, "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8");
+    assert_eq!(remote.gpu.as_deref(), Some("L40S"));
+    assert_eq!(remote.provision_timeout_s, Some(1500));
+    // The override wins over the backend default (vLLM = 900s).
+    assert_eq!(remote.resolved_provision_timeout(), std::time::Duration::from_secs(1500));
+}
+
+#[test]
+fn distill_provision_timeout_below_the_backend_floor_is_rejected() {
+    // An ephemeral override may only LENGTHEN the boot budget — a value under the vLLM floor (900s)
+    // would starve the recipe, so it is rejected at parse time, naming the distill section.
+    let raw: RawConfig = toml::from_str(
+        r#"
+            [index]
+            root = "."
+
+            [llm.distill.remote]
+            backend = "vllm"
+            cookbook = "@rag-rat/cookbook modal"
+            model = "Qwen/Qwen3-8B"
+            provision_timeout_s = 60
+            "#,
+    )
+    .unwrap();
+    let err = LlmConfig::try_from(raw.llm).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ConfigError::DreamRemoteProvisionTimeoutBelowFloor { section, got: 60, floor: 900, .. }
+                if *section == "[llm.distill.remote]"
+        ),
+        "too-small override → below-floor error naming the distill section, got {err:?}",
+    );
+}
+
+#[test]
+fn distill_provision_timeout_override_is_ignored_in_connect_mode() {
+    // Connect mode provisions nothing, so a small `provision_timeout_s` is simply unused, not
+    // rejected — the floor check applies to ephemeral provisioning only.
+    let raw: RawConfig = toml::from_str(
+        r#"
+            [index]
+            root = "."
+
+            [llm.distill.remote]
+            backend = "ollama"
+            endpoint = "http://localhost:11434"
+            model = "qwen3:8b"
+            provision_timeout_s = 5
+            "#,
+    )
+    .unwrap();
+    let remote = LlmConfig::try_from(raw.llm).unwrap().distill.remote;
+    assert_eq!(remote.provision_timeout_s, Some(5), "connect mode keeps the value, unused");
+}
+
+#[test]
+fn the_shared_backend_and_gpu_errors_name_the_distill_section() {
+    // `RemoteBackendUnknown` / `RemoteGpuEmpty` are shared with the embedding parser; a distill
+    // misconfig must still name `[llm.distill.remote]`, not the embedding block.
+    let unknown_backend: RawConfig = toml::from_str(
+        r#"
+            [index]
+            root = "."
+
+            [llm.distill.remote]
+            backend = "tgi"
+            endpoint = "http://localhost:8080"
+            model = "some-model"
+            "#,
+    )
+    .unwrap();
+    let err = LlmConfig::try_from(unknown_backend.llm).unwrap_err().to_string();
+    assert!(err.contains("[llm.distill.remote]"), "unknown-backend names the distill block: {err}");
+    assert!(!err.contains("[llm.embedding.remote]"), "not the embedding block: {err}");
+
+    let empty_gpu: RawConfig = toml::from_str(
+        r#"
+            [index]
+            root = "."
+
+            [llm.distill.remote]
+            backend = "vllm"
+            cookbook = "@rag-rat/cookbook modal"
+            model = "some-model"
+            gpu = "   "
+            "#,
+    )
+    .unwrap();
+    let err = LlmConfig::try_from(empty_gpu.llm).unwrap_err().to_string();
+    assert!(err.contains("[llm.distill.remote]"), "empty-gpu names the distill block: {err}");
+}
+
+#[test]
+fn resolved_provision_timeout_falls_back_to_the_backend_default() {
+    // No override → the backend's own provision ceiling (vLLM = 900s here).
+    let remote = RemoteDreamConfig {
+        backend: RemoteBackend::Vllm,
+        endpoint: None,
+        cookbook: Some("@rag-rat/cookbook modal".to_string()),
+        model: "Qwen/Qwen3-8B".to_string(),
+        provision_timeout_s: None,
+        ..RemoteDreamConfig::default()
+    };
+    assert_eq!(remote.resolved_provision_timeout(), RemoteBackend::Vllm.provision_timeout());
+}
+
+#[test]
+fn a_bad_distill_remote_error_names_the_distill_section_not_dream() {
+    // The shared `RemoteDreamConfig` validation is section-aware: a `[llm.distill.remote]`
+    // misconfig must point at THAT block, never the `[llm.dream.remote]` the same parser serves
+    // for dream.
+    let distill_bad: RawConfig = toml::from_str(
+        r#"
+            [index]
+            root = "."
+
+            [llm.distill.remote]
+            endpoint = "http://localhost:11434"
+            model = ""
+            "#,
+    )
+    .unwrap();
+    let err = LlmConfig::try_from(distill_bad.llm).unwrap_err().to_string();
+    assert!(err.contains("[llm.distill.remote]"), "distill error names its own section: {err}");
+    assert!(!err.contains("[llm.dream.remote]"), "and not dream's: {err}");
+
+    // Symmetry: the dream block still names `[llm.dream.remote]`.
+    let dream_bad: RawConfig = toml::from_str(
+        r#"
+            [index]
+            root = "."
+
+            [llm.dream.remote]
+            endpoint = "http://localhost:11434"
+            model = ""
+            "#,
+    )
+    .unwrap();
+    let err = LlmConfig::try_from(dream_bad.llm).unwrap_err().to_string();
+    assert!(err.contains("[llm.dream.remote]"), "dream error names its own section: {err}");
 }
 
 #[test]
@@ -2339,7 +2545,7 @@ fn dream_remote_requires_a_non_empty_model() {
         .unwrap();
         let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
-            matches!(err, ConfigError::DreamRemoteMissingModel),
+            matches!(err, ConfigError::DreamRemoteMissingModel { .. }),
             "model={model_line:?} → DreamRemoteMissingModel, got {err:?}",
         );
     }
@@ -2362,7 +2568,7 @@ fn dream_remote_infinity_backend_cannot_serve_chat() {
     .unwrap();
     let err = LlmConfig::try_from(raw.llm).unwrap_err();
     assert!(
-        matches!(&err, ConfigError::DreamBackendCannotServeChat(b) if b.as_str() == "infinity"),
+        matches!(&err, ConfigError::DreamBackendCannotServeChat { backend, .. } if backend == "infinity"),
         "infinity → DreamBackendCannotServeChat, got {err:?}",
     );
 }
@@ -2391,7 +2597,7 @@ fn dream_remote_requires_exactly_one_of_endpoint_or_cookbook() {
         let raw: RawConfig = toml::from_str(toml_str).unwrap();
         let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
-            matches!(err, ConfigError::DreamRemoteModeAmbiguous),
+            matches!(err, ConfigError::DreamRemoteModeAmbiguous { .. }),
             "{label} endpoint/cookbook → DreamRemoteModeAmbiguous, got {err:?}",
         );
     }
@@ -2415,7 +2621,7 @@ fn dream_remote_gpu_with_connect_endpoint_is_rejected() {
     .unwrap();
     let err = LlmConfig::try_from(raw.llm).unwrap_err();
     assert!(
-        matches!(err, ConfigError::DreamRemoteGpuRequiresCookbook),
+        matches!(err, ConfigError::DreamRemoteGpuRequiresCookbook { .. }),
         "gpu + endpoint → DreamRemoteGpuRequiresCookbook, got {err:?}",
     );
 }
@@ -2438,7 +2644,7 @@ fn dream_remote_empty_gpu_is_rejected() {
         .unwrap();
         let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
-            matches!(err, ConfigError::RemoteGpuEmpty),
+            matches!(err, ConfigError::RemoteGpuEmpty { .. }),
             "gpu={value} → RemoteGpuEmpty, got {err:?}",
         );
     }
@@ -2459,7 +2665,7 @@ fn dream_remote_endpoint_with_credentials_is_rejected() {
     .unwrap();
     let err = LlmConfig::try_from(raw.llm).unwrap_err();
     assert!(
-        matches!(err, ConfigError::DreamRemoteEndpointHasCredentials),
+        matches!(err, ConfigError::DreamRemoteEndpointHasCredentials { .. }),
         "endpoint with userinfo → DreamRemoteEndpointHasCredentials, got {err:?}",
     );
 }
@@ -2480,7 +2686,7 @@ fn dream_remote_unknown_backend_is_rejected() {
     .unwrap();
     let err = LlmConfig::try_from(raw.llm).unwrap_err();
     assert!(
-        matches!(&err, ConfigError::RemoteBackendUnknown(b) if b.as_str() == "tgi"),
+        matches!(&err, ConfigError::RemoteBackendUnknown { got, .. } if got == "tgi"),
         "unknown backend → RemoteBackendUnknown, got {err:?}",
     );
 }
