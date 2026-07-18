@@ -23,9 +23,10 @@ mod cut;
 mod envelope;
 mod fold;
 mod id;
-// C4.1 content-key crypto primitives (#607). They land ahead of their consumers — C4.3 (`key_wrap`
-// authoring) and C5 (content sealing) — so nothing in a non-test build references them yet.
-#[allow(dead_code, reason = "C4.1 primitives precede their C4.3/C5 consumers (#607)")]
+// C4.1 content-key crypto primitives (#607). C4.3a (`secrets::author`) consumes the seal/unwrap +
+// key-id path; the remaining primitives (deterministic `from_seed` / seed-injected seal) are still
+// test-only or await C5 content sealing, so the module keeps the dead-code allowance.
+#[allow(dead_code, reason = "some C4.1 primitives still precede their C5 consumers (#607)")]
 mod keywrap;
 mod limits;
 mod ops;
@@ -59,6 +60,8 @@ pub use fold::{
 };
 pub use id::AccountId;
 pub use ops::{DeviceCut, DeviceRole, GrantRole};
+// The in-tx content-key mint + owner-gated `StreamKeyWrap` author seam (C4.3a, #607).
+pub use secrets::mint_and_author_stream_key_wrap_in_tx;
 pub use storage::{
     CapacityScope, IngestOutcome, account_ingest, auth_len_freshness,
     backfill_authority_projection, grant_effective_for_device, owner_control_authority,

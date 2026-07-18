@@ -19,12 +19,12 @@
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use super::AuthorityQuery;
 use super::bootstrap::{self, LocalAccountRef};
 use super::envelope::{AccountEntryHeader, VerifiedAccountEntry, sign_account_entry};
 use super::id::AccountId;
 use super::ops::{self, AccountOp};
 use super::storage::{self, CandidateInsert};
+use super::{AuthorityQuery, fold};
 use crate::identity::LocalDevice;
 use crate::local_device;
 use crate::op::DeviceFingerprint;
@@ -141,9 +141,11 @@ fn author_account_op_in_tx(
     let fingerprint = device.fingerprint();
     // Chain from the control-log tail. Post-genesis the tail is never empty (the genesis is seq 0);
     // an empty chain here means the caller skipped the mint, which is a programming error.
-    let (tail_seq, tail_hash) = account_chain_tail(tx, account_id, fingerprint)?.context(
-        "cannot author a non-genesis account op on an empty control chain (mint the genesis first)",
-    )?;
+    let (tail_seq, tail_hash) = account_chain_tail(tx, account_id, fingerprint, fold::CONTROL_LOG)?
+        .context(
+            "cannot author a non-genesis account op on an empty control chain (mint the genesis \
+             first)",
+        )?;
     let seq = tail_seq
         .checked_add(1)
         .context("account control chain tail is at u64::MAX seq; cannot extend")?;
@@ -195,22 +197,30 @@ fn author_account_op_in_tx(
     Ok(verified.entry_hash)
 }
 
-/// The local account's control-chain tail for `device_fingerprint`: its highest-`seq`
-/// `(account, log 0, device)` entry as `(seq, entry_hash)`, or `None` for an empty chain (which
-/// should not happen post-genesis, but the caller handles it). Unlike `/3` content, an
-/// `account_entries.seq` is a plain numeric INTEGER, so `ORDER BY seq DESC` is a numeric comparison
-/// (NOT a fixed-width big-endian blob compare).
-fn account_chain_tail(
+/// One `(account, log_id, device)` chain's tail: its highest-`seq` entry as `(seq, entry_hash)`, or
+/// `None` for an empty chain. The empty case is the CALLER's to interpret: on the CONTROL log a
+/// non-genesis author treats it as a programming error (the genesis is always seq 0), while on the
+/// SECRETS log (which has no genesis) it is the legitimate first-wrap case (seq 0, no predecessor).
+/// `log_id`-parameterized because the secrets chain is `(account, device)`-scoped across ALL
+/// streams (never per-stream), so C4.3a reads its dense seq from the shared `log = 1` tail via this
+/// same reader. Unlike `/3` content, an `account_entries.seq` is a plain numeric INTEGER, so `ORDER
+/// BY seq DESC` is a numeric comparison (NOT a fixed-width big-endian blob compare).
+pub(super) fn account_chain_tail(
     tx: &Transaction<'_>,
     account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
+    log_id: u8,
 ) -> anyhow::Result<Option<(u64, EntryHash)>> {
     let row: Option<(i64, Vec<u8>)> = tx
         .query_row(
             "SELECT seq, entry_hash FROM account_entries
-             WHERE account_id = ?1 AND log_id = 0 AND device_fingerprint = ?2
+             WHERE account_id = ?1 AND log_id = ?2 AND device_fingerprint = ?3
              ORDER BY seq DESC LIMIT 1",
-            params![account_id.to_bytes().as_slice(), device_fingerprint.to_bytes().as_slice(),],
+            params![
+                account_id.to_bytes().as_slice(),
+                log_id,
+                device_fingerprint.to_bytes().as_slice(),
+            ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;

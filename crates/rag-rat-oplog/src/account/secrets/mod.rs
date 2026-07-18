@@ -5,15 +5,21 @@
 //! ops ride as the opaque `payload` bstr; the fold ([`super::fold`]) is CONTROL-only, so secrets
 //! entries are CONSUMERS of the authority projection (like `/3` content), classified here by a
 //! content-style acceptance loop over the log-generic candidate primitives. C4.2b ships
-//! `StreamKeyWrap` ACCEPTANCE only — content-key minting + wrap AUTHORING + the `key_id` adoption
-//! cross-check are C4.3.
+//! C4.2b shipped `StreamKeyWrap` ACCEPTANCE; C4.3a ([`author`]) adds the owner-side content-key
+//! mint + wrap AUTHORING (verify-accepted-or-rollback). The `key_id` adoption cross-check, the
+//! derived sealing-key projection, and `sync enable` are C4.3b.
 
 mod acceptance;
+mod author;
 mod candidate;
 mod ops;
 mod storage;
 
-// The ingest-time structural validation twin (mirrors the control-plaintext arm) and the refold
-// pass wired into `refold_in_tx`.
+// The in-tx content-key mint + `StreamKeyWrap` author seam (C4.3a): re-exported up through
+// `account` and the crate root for the `sync enable` caller (C4.3b) to reach (`pub` here so
+// `account::mod` can re-export it — the private `mod secrets` keeps it crate-scoped regardless).
+pub use author::mint_and_author_stream_key_wrap_in_tx;
+// The ingest-time structural validation twin (mirrors the control-plaintext arm) and the
+// refold pass wired into `refold_in_tx`.
 pub(in crate::account) use ops::validate_storable_secrets_payload;
 pub(in crate::account) use storage::refold_secrets_log;

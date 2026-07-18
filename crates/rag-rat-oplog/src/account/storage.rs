@@ -18,7 +18,7 @@ use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::{AccountId, content, fold, secrets};
 use crate::cbor;
-use crate::device::DevicePublic;
+use crate::device::{DevicePublic, DeviceX25519Public};
 use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
 
@@ -830,6 +830,34 @@ pub fn account_effective_count(conn: &Connection, account_id: AccountId) -> anyh
     Ok(effective_count.map(u64::try_from).transpose()?.unwrap_or_default())
 }
 
+/// The `owner_id` of the device's CURRENTLY-LIVE owner incarnation — the `entry_hash` of the still
+/// -open genesis / `OwnerPromote` that put it in the owner role — or `None` when the device holds
+/// no open owner incarnation. A REVERSE lookup by device, distinct from
+/// [`owner_incarnation_effective`] (which self-opens a Deferred txn and VALIDATES a known
+/// `owner_id`); this reads whatever snapshot `conn` is already in, so the in-tx author seam calls
+/// it with its own `tx`. Normally exactly one open incarnation exists per device; `ORDER BY
+/// effective_at DESC, owner_id` keeps the pick deterministic if more than one ever coexisted. The
+/// `StreamKeyWrap` author cites this as `authority_ref`: for the founder it resolves to the genesis
+/// hash (a founder's `owner_id` IS its genesis), but a demoted-then-repromoted or non-founder owner
+/// gets its CURRENT incarnation, so a hard-coded genesis would cite a CLOSED incarnation and roll
+/// every mint back.
+pub(in crate::account) fn effective_owner_incarnation_for_device(
+    conn: &Connection,
+    account_id: AccountId,
+    device_fingerprint: DeviceFingerprint,
+) -> anyhow::Result<Option<EntryHash>> {
+    let owner_id: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT owner_id FROM account_owner_incarnations
+             WHERE account_id = ?1 AND device_fingerprint = ?2 AND closed_at IS NULL
+             ORDER BY effective_at DESC, owner_id LIMIT 1",
+            params![account_id.to_bytes().as_slice(), device_fingerprint.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    owner_id.map(|bytes| fixed(&bytes)).transpose()
+}
+
 fn missing_reference<T>(
     conn: &Connection,
     account_id: AccountId,
@@ -1435,6 +1463,113 @@ fn add_self_pubkey(
     }
 }
 
+/// The `(fingerprint, x25519_pubkey)` recipients a fresh `StreamKeyWrap` seals to: every
+/// ROSTER-EFFECTIVE device (`account_roster_history.closed_at IS NULL`), each keyed to the x25519
+/// of the EXACT accepted enrollment that put it on the roster. Unlike [`stored_device_pubkeys`] —
+/// which is fold-independent and returns REMOVED devices too — this reads the fold-projected
+/// effective set, so a fresh key is NEVER sealed to a removed device (that would re-grant read
+/// access and defeat rotation-on-removal, C4.4). Every effective role is a recipient (Member AND
+/// Owner): the roster gate is read access, not authoring authority. Acceptors do NOT re-derive the
+/// recipient set, so sealing to only effective devices is a local-honesty obligation of the
+/// authoring owner.
+///
+/// The recipient x25519 is bound to the enrollment via `roster_ref` — the enrolling entry's own
+/// `entry_hash` (fold `roster_refs.insert(hash, RosterFact)`: a genesis roster row → the genesis
+/// hash, a DeviceAdd roster row → that DeviceAdd's entry hash). Resolving the key from THAT single
+/// entry, never by collecting x25519 by fingerprint across all candidates, is what stops a
+/// rejected/forked sibling `DeviceAdd` (same fingerprint, attacker-chosen x25519, a DIFFERENT
+/// entry_hash) from shadowing the effective device's real key — a member could otherwise be sealed
+/// a key it can't decrypt.
+pub(super) fn list_effective_roster_x25519_pubkeys(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Vec<(DeviceFingerprint, DeviceX25519Public)>> {
+    // The effective set + the enrolling entry each device's key must come from. DISTINCT because
+    // one device can (in principle) key more than one `roster_ref` row.
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT device_fingerprint, roster_ref FROM account_roster_history
+         WHERE account_id = ?1 AND closed_at IS NULL
+         ORDER BY device_fingerprint",
+    )?;
+    let rows = stmt
+        .query_map([account_id.to_bytes().as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (fp, roster_ref) in rows {
+        let fingerprint = DeviceFingerprint::from_bytes(fixed(&fp)?);
+        let roster_ref: EntryHash = fixed(&roster_ref)?;
+        out.push((fingerprint, enrollment_x25519(conn, account_id, &roster_ref, fingerprint)?));
+    }
+    Ok(out)
+}
+
+/// The x25519 key the ONE accepted enrollment entry at `roster_ref` certifies for `fingerprint`
+/// (genesis → its founder / header device; DeviceAdd → the ADDED device), routed through the
+/// small-order / identity blocklist. Bound to that exact `entry_hash`, so a rejected/forked sibling
+/// enrollment for the same fingerprint is never consulted. Fails LOUD on a corrupt projection — a
+/// missing/undecodable enrollment, one that certifies no valid x25519, or one whose certified
+/// device disagrees with its roster row — rather than dropping the recipient (a dropped recipient
+/// silently loses read access; a wrong key breaks the member's decryption).
+fn enrollment_x25519(
+    conn: &Connection,
+    account_id: AccountId,
+    roster_ref: &EntryHash,
+    fingerprint: DeviceFingerprint,
+) -> anyhow::Result<DeviceX25519Public> {
+    let signed_bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT signed_bytes FROM account_entries WHERE account_id = ?1 AND entry_hash = ?2",
+            params![account_id.to_bytes().as_slice(), roster_ref.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "roster-effective device names an enrollment entry absent from account_entries \
+                 (corrupt projection)",
+            )
+        })?;
+    let signed = envelope::decode_account_signed(&signed_bytes)
+        .map_err(|err| anyhow::anyhow!("effective enrollment entry does not decode: {err}"))?;
+    let (certified_fp, pubkey) = enrollment_certified_x25519(&signed.header, &signed.payload)
+        .ok_or_else(|| {
+            anyhow::anyhow!("effective enrollment entry certifies no valid x25519 key")
+        })?;
+    // The enrollment must certify the very device its roster row names, or the projection and the
+    // signed op disagree — a corrupt state, not a recipient to seal to under the wrong key.
+    anyhow::ensure!(
+        certified_fp == fingerprint,
+        "effective enrollment entry certifies a different device than its roster row",
+    );
+    Ok(pubkey)
+}
+
+/// The `(fingerprint, x25519_pubkey)` a single genesis / DeviceAdd enrollment certifies: a genesis
+/// certifies its founder (the header device); a DeviceAdd certifies the ADDED device (the payload's
+/// derived fingerprint). The key is routed through [`DeviceX25519Public::from_bytes`] (the
+/// small-order / identity blocklist). `None` for any other op, a non-current-control-plaintext
+/// header, or an invalid key.
+fn enrollment_certified_x25519(
+    header: &AccountEntryHeader,
+    payload: &[u8],
+) -> Option<(DeviceFingerprint, DeviceX25519Public)> {
+    if !is_current_control_plaintext(header) {
+        return None;
+    }
+    let DecodedAccountOp::Known(op) = ops::decode(header.entry_type, payload).ok()? else {
+        return None;
+    };
+    match op {
+        AccountOp::AccountGenesis { x25519_pubkey, .. } =>
+            Some((header.device_fingerprint, DeviceX25519Public::from_bytes(&x25519_pubkey).ok()?)),
+        AccountOp::DeviceAdd { device_fingerprint, x25519_pubkey, .. } =>
+            Some((device_fingerprint, DeviceX25519Public::from_bytes(&x25519_pubkey).ok()?)),
+        _ => None,
+    }
+}
+
 fn insert_pre_verify(
     conn: &Connection,
     entry_hash: &[u8; 32],
@@ -1712,6 +1847,59 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
+    }
+
+    #[test]
+    fn effective_owner_incarnation_resolves_the_open_incarnation_not_a_closed_one() {
+        // Reverse lookup by device: a device can hold a CLOSED prior incarnation and an OPEN
+        // current one (demote-then-repromote). The StreamKeyWrap author cites the OPEN
+        // owner_id as authority_ref — returning the closed one would cite an ineffective
+        // incarnation and roll the mint back. The closed row here has the LATER
+        // effective_at, so a query missing the `closed_at IS NULL` filter would wrongly
+        // return it: the test bites that omission.
+        let conn = db();
+        let account = AccountId::from_bytes([0xa1; 32]);
+        let device = DeviceFingerprint::from_bytes([0xd2; 32]);
+        let open_owner = [0x22u8; 32];
+        let closed_owner = [0x11u8; 32];
+        conn.execute(
+            "INSERT INTO account_owner_incarnations(
+                 owner_id, account_id, device_fingerprint, effective_at, closed_at)
+             VALUES (?1, ?2, ?3, ?4, NULL)",
+            params![
+                open_owner.as_slice(),
+                account.to_bytes().as_slice(),
+                device.to_bytes().as_slice(),
+                10_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_owner_incarnations(
+                 owner_id, account_id, device_fingerprint, effective_at, closed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                closed_owner.as_slice(),
+                account.to_bytes().as_slice(),
+                device.to_bytes().as_slice(),
+                30_i64, // LATER than the open one — a missing closed_at filter would pick this
+                40_i64,
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            effective_owner_incarnation_for_device(&conn, account, device).unwrap(),
+            Some(open_owner),
+            "resolves the OPEN incarnation, never the closed prior one",
+        );
+        // A device with no open incarnation resolves None.
+        let stranger = DeviceFingerprint::from_bytes([0xee; 32]);
+        assert_eq!(
+            effective_owner_incarnation_for_device(&conn, account, stranger).unwrap(),
+            None,
+            "a device with no open owner incarnation resolves None",
+        );
     }
 
     struct Dev {
