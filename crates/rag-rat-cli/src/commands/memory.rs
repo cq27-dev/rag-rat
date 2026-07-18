@@ -105,7 +105,7 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
                 args.compact,
                 remote.model.trim(),
             )? {
-                let (m, provisioned) = rag_rat_dream::provision_verdict_model(remote)?;
+                let (m, provisioned) = rag_rat_llm::chat::provision_chat_model(remote)?;
                 _provisioned = Some(provisioned);
                 Some(m)
             } else {
@@ -116,7 +116,7 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
                 None
             }
         } else {
-            Some(rag_rat_dream::HttpVerdictModel::from_config(remote)?)
+            Some(rag_rat_llm::chat::HttpChatModel::from_config(remote)?)
         }
     } else {
         None

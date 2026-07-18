@@ -20,6 +20,7 @@
 //! derived, regenerable data.
 
 use rag_rat_db::schema;
+use rag_rat_llm::chat::ChatModel;
 /// The compaction prompt version, stamped into `memory_summaries.prompt_version`. Bump on any
 /// change to [`COMPACT_PROMPT_HEAD`] so a stale-prompt summary is distinguishable (and can be
 /// regenerated).
@@ -29,14 +30,13 @@ use rusqlite::{Connection, OptionalExtension};
 use super::failure::{
     self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, RecordFailure,
 };
-use super::model::VerdictModel;
 
 /// The compaction-pass configuration handed to [`run_compact_pass`]: the model to ask and how many
 /// queued memories it may compact this run. Mirrors [`super::VerdictPass`] — a borrowed model + a
 /// budget — so it carries a lifetime and stays out of the `Copy` [`super::DreamOptions`]. It reuses
-/// the SAME [`VerdictModel`] trait (both passes are single-turn temperature-0 completions).
+/// the SAME [`ChatModel`] trait (both passes are single-turn temperature-0 completions).
 pub struct CompactPass<'a> {
-    pub model: &'a dyn VerdictModel,
+    pub model: &'a dyn ChatModel,
     pub budget: usize,
 }
 
@@ -205,7 +205,7 @@ pub(super) fn compaction_pending(
 /// unchecked summary would surface a wrong 3-line claim as if authoritative.
 fn obtain_summary(
     conn: &Connection,
-    model: &dyn VerdictModel,
+    model: &dyn ChatModel,
     prompt: &str,
 ) -> rusqlite::Result<Result<String, DreamModelFailure>> {
     for attempt in 1..=2 {
@@ -543,9 +543,9 @@ pub(super) mod guards {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::mock::MockVerdictModel;
     use super::super::tests::{mem_db, set_repo};
     use super::*;
+    use crate::mock_chat::MockChatModel;
 
     fn seed_memory(c: &Connection, id: &str, title: &str, body: &str, repo_id: &str) {
         c.execute(
@@ -629,7 +629,7 @@ mod tests {
         set_repo(&c, "r");
         seed_memory(&c, "m1", "note", "a body worth compacting", "r");
         // First completion is malformed (one sentence → guard rejects); the retry is well-formed.
-        let model = MockVerdictModel::new(["just one sentence", GOOD_SUMMARY]);
+        let model = MockChatModel::new(["just one sentence", GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 5000).unwrap();
         assert_eq!(model.calls(), 2, "one guard failure triggers exactly one retry");
         let rows = summary_rows(&c, "m1");
@@ -643,7 +643,7 @@ mod tests {
         set_repo(&c, "r");
         seed_memory(&c, "m1", "note", "a body worth compacting", "r");
         // Both completions are malformed (one sentence each) → rejected twice → nothing stored.
-        let model = MockVerdictModel::new(["one sentence only", "still one sentence"]);
+        let model = MockChatModel::new(["one sentence only", "still one sentence"]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 5000).unwrap();
         assert_eq!(model.calls(), 2, "retried exactly once");
         assert!(
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(model.calls(), 2, "the current deterministic failure suppresses another retry");
 
         c.execute("UPDATE repo_memories SET body='edited body' WHERE id='m1'", []).unwrap();
-        let good = MockVerdictModel::new([GOOD_SUMMARY]);
+        let good = MockChatModel::new([GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &good, budget: 10 }, 7000).unwrap();
         assert_eq!(good.calls(), 1, "a content change invalidates the failure row");
         assert_eq!(summary_rows(&c, "m1").len(), 1, "the changed memory can be summarized");
@@ -683,13 +683,13 @@ mod tests {
         let c = mem_db();
         set_repo(&c, "r");
         seed_memory(&c, "m1", "note", "a body worth compacting", "r");
-        let model = MockVerdictModel::new([GOOD_SUMMARY]);
+        let model = MockChatModel::new([GOOD_SUMMARY]);
 
         run_compact_pass(&c, CompactPass { model: &model, budget: 0 }, 1000).unwrap();
 
         assert_eq!(model.calls(), 0, "budget zero stops before the first model turn");
         assert!(
-            !compaction_pending(&c, 0, "mock-verdict-model").unwrap(),
+            !compaction_pending(&c, 0, "mock-chat-model").unwrap(),
             "budget zero is no pending model work"
         );
         assert!(summary_rows(&c, "m1").is_empty(), "no summary is written at budget zero");
@@ -709,13 +709,13 @@ mod tests {
             content_hash: &content_hash,
             checked_inputs_hash: None,
             prompt_version: COMPACT_PROMPT_VERSION,
-            model_id: "mock-verdict-model",
+            model_id: "mock-chat-model",
         };
         let failure = DreamModelFailure::new(DreamFailureReason::SummaryGuardRejected);
         failure::record_failure(&c, RecordFailure { stamp, failure: &failure, now_ms: 1 }).unwrap();
 
         assert!(
-            !compaction_pending(&c, 10, "mock-verdict-model").unwrap(),
+            !compaction_pending(&c, 10, "mock-chat-model").unwrap(),
             "a current deterministic compact failure means the memory is already annotated"
         );
     }
@@ -725,7 +725,7 @@ mod tests {
         let c = mem_db();
         set_repo(&c, "r");
         seed_memory(&c, "m1", "note", "a body worth compacting", "r");
-        let model = MockVerdictModel::new(Vec::<String>::new());
+        let model = MockChatModel::new(Vec::<String>::new());
 
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
 
@@ -740,7 +740,7 @@ mod tests {
         assert_eq!(reason, DreamFailureReason::ModelCallFailed.as_db_str());
         assert!(detail.contains("no responses"), "the transient model error is stored for audit");
         assert!(
-            compaction_pending(&c, 10, "mock-verdict-model").unwrap(),
+            compaction_pending(&c, 10, "mock-chat-model").unwrap(),
             "model-call failures remain retryable work"
         );
     }
@@ -752,7 +752,7 @@ mod tests {
         let c = mem_db();
         set_repo(&c, "r");
         seed_memory(&c, "m1", "note", "a body worth compacting", "r");
-        let model = MockVerdictModel::new([GOOD_SUMMARY]);
+        let model = MockChatModel::new([GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 7000).unwrap();
         let row: (String, String, String, String, i64) = c
             .query_row(
@@ -763,7 +763,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row.0, GOOD_SUMMARY);
-        assert_eq!(row.1, "mock-verdict-model");
+        assert_eq!(row.1, "mock-chat-model");
         assert_eq!(row.2, COMPACT_PROMPT_VERSION);
         assert_eq!(
             row.3,
@@ -779,7 +779,7 @@ mod tests {
         let c = mem_db();
         set_repo(&c, "r");
         seed_memory(&c, "m1", "original title", "a stable body", "r");
-        let model = MockVerdictModel::new([GOOD_SUMMARY, GOOD_SUMMARY]);
+        let model = MockChatModel::new([GOOD_SUMMARY, GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
         assert_eq!(model.calls(), 1, "the un-summarized memory is compacted once");
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 2000).unwrap();
@@ -796,7 +796,7 @@ mod tests {
         let c = mem_db();
         set_repo(&c, "r");
         seed_memory(&c, "m1", "note", "original body", "r");
-        let model = MockVerdictModel::new([GOOD_SUMMARY, GOOD_SUMMARY]);
+        let model = MockChatModel::new([GOOD_SUMMARY, GOOD_SUMMARY]);
 
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
         assert_eq!(model.calls(), 1, "the un-summarized memory is compacted once");
@@ -831,7 +831,7 @@ mod tests {
             .unwrap()
         };
         let before = snap(&c);
-        let model = MockVerdictModel::new([GOOD_SUMMARY]);
+        let model = MockChatModel::new([GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
         assert_eq!(before, snap(&c), "the compaction pass leaves repo_memories byte-identical");
         // ...but it DID write a summary into the sibling table.
@@ -878,7 +878,7 @@ mod tests {
             "the compaction queue is scoped to the active repo"
         );
 
-        let model = MockVerdictModel::new([GOOD_SUMMARY]);
+        let model = MockChatModel::new([GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
 
         // The summary is written under r1 for m1, and NOTHING is written under r2 / for m2.

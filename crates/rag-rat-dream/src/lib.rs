@@ -25,7 +25,8 @@
 mod compact;
 mod failure;
 mod findings;
-mod model;
+#[cfg(test)]
+mod mock_chat;
 mod verdict;
 
 pub use compact::CompactPass;
@@ -34,10 +35,9 @@ pub use compact::CompactPass;
 // `repo_id`.
 pub use findings::{ReviewVerdict, ReviewedFinding};
 pub use findings::{rederive_finding_ids, review_dream_finding};
-// The phase-B model verdict pass: the out-of-process verdict-model trait + its HTTP client
-// (the CLI builds one from `[llm.dream.remote]`) and the `VerdictPass` handle
-// `dream_run_with_passes` consumes.
-pub use model::{HttpVerdictModel, VerdictModel, provision_verdict_model};
+// The single-turn chat client the verdict/compact passes consume lives in `rag-rat-llm`
+// (`rag_rat_llm::chat`): the CLI builds one from `[llm.dream.remote]` and hands the borrowed
+// `&dyn ChatModel` to `VerdictPass` / `CompactPass`.
 use rusqlite::Connection;
 use serde::Serialize;
 pub use verdict::VerdictPass;

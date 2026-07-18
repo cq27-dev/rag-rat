@@ -2,7 +2,7 @@
 //!
 //! The deterministic pass-0 substrate (`verify`) builds the churn-skip [`verification_queue`] and a
 //! citation-checkable [`evidence_pack`]; this module renders that pack into a single-turn prompt,
-//! asks a [`VerdictModel`] for a `current | diverged` verdict, guards against fabricated citations,
+//! asks a [`ChatModel`] for a `current | diverged` verdict, guards against fabricated citations,
 //! and records the accepted verdict into `memory_reality` — NEVER touching a `repo_memories` row.
 //!
 //! Two surfaces the rest of dream consumes:
@@ -21,6 +21,7 @@
 //!     proposes — #262's review flow decides, and nothing here mutates a memory's status.
 
 use rag_rat_db::schema;
+use rag_rat_llm::chat::ChatModel;
 /// The verdict prompt version, stamped into `memory_reality.prompt_version`. Bump on any
 /// change to [`VERDICT_PROMPT_HEAD`] or the pack rendering so a stale-prompt verdict is
 /// distinguishable — a bump re-queues every prior verdict
@@ -35,7 +36,6 @@ use super::DreamFinding;
 use super::failure::{
     self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, RecordFailure,
 };
-use super::model::VerdictModel;
 use super::verify::{
     self, EvidencePack, IdentifierResolution, ResolutionKind, VerificationQueueEntry,
     evidence_pack, verification_queue,
@@ -48,7 +48,7 @@ const DIVERGENCE_RANK: f64 = 0.8;
 /// queued memories it may check this run (the budget the queue is capped at). Separate from
 /// [`DreamOptions`] because it carries a borrow (the model) — `DreamOptions` stays `Copy`.
 pub struct VerdictPass<'a> {
-    pub model: &'a dyn VerdictModel,
+    pub model: &'a dyn ChatModel,
     pub budget: usize,
 }
 
@@ -234,7 +234,7 @@ pub(super) fn run_verdict_pass(
 /// stray `unverifiable` completion is discarded WITHOUT a retry (it is not a citation fault — pass
 /// 0 owns unverifiable). Small models measurably fabricate evidence, so this guard is load-bearing.
 fn obtain_verdict(
-    model: &dyn VerdictModel,
+    model: &dyn ChatModel,
     prompt: &str,
     pack_text: &str,
 ) -> Result<AcceptedVerdict, DreamModelFailure> {
@@ -700,9 +700,9 @@ fn compact_evidence(evidence_json: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::mock::MockVerdictModel;
     use super::super::tests::{mem_db, set_repo};
     use super::*;
+    use crate::mock_chat::MockChatModel;
 
     fn seed_memory(c: &Connection, id: &str, title: &str, body: &str, repo_id: &str) {
         c.execute(
@@ -923,7 +923,7 @@ mod tests {
         let pack = "IDENTIFIERS:\n- `real_symbol` -> symbol src/lib.rs::real_symbol\n";
         // First completion fabricates; the retry cites a real line → accepted.
         let model =
-            MockVerdictModel::new([current_citing("ghost_symbol"), current_citing("real_symbol")]);
+            MockChatModel::new([current_citing("ghost_symbol"), current_citing("real_symbol")]);
         let accepted = obtain_verdict(&model, "prompt", pack).expect("bad-then-good is accepted");
         assert_eq!(accepted.verdict, Verdict::Current);
         assert_eq!(model.calls(), 2, "one fabrication triggers exactly one retry");
@@ -932,7 +932,7 @@ mod tests {
     #[test]
     fn obtain_verdict_discards_after_two_fabrications() {
         let pack = "IDENTIFIERS:\n- `real_symbol` -> symbol src/lib.rs::real_symbol\n";
-        let model = MockVerdictModel::new([current_citing("ghost_a"), current_citing("ghost_b")]);
+        let model = MockChatModel::new([current_citing("ghost_a"), current_citing("ghost_b")]);
         let err = obtain_verdict(&model, "prompt", pack).expect_err("two fabrications fail");
         assert_eq!(err.reason, DreamFailureReason::FabricatedEvidence);
         assert_eq!(model.calls(), 2, "retried exactly once");
@@ -941,7 +941,7 @@ mod tests {
     #[test]
     fn obtain_verdict_records_model_call_failure() {
         let pack = "IDENTIFIERS:\n- `real_symbol` -> symbol src/lib.rs::real_symbol\n";
-        let model = MockVerdictModel::new(Vec::<String>::new());
+        let model = MockChatModel::new(Vec::<String>::new());
 
         let err = obtain_verdict(&model, "prompt", pack).expect_err("model error fails");
 
@@ -957,7 +957,7 @@ mod tests {
     fn obtain_verdict_discards_malformed_without_retry() {
         let pack = "IDENTIFIERS:\n- `real_symbol` -> symbol src/lib.rs::real_symbol\n";
         let model =
-            MockVerdictModel::new(["not a verdict".to_string(), current_citing("real_symbol")]);
+            MockChatModel::new(["not a verdict".to_string(), current_citing("real_symbol")]);
 
         let err = obtain_verdict(&model, "prompt", pack).expect_err("malformed verdict fails");
 
@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn verdict_pass_upserts_memory_reality_with_all_stamps() {
         let c = seeded_verifiable_repo();
-        let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
+        let model = MockChatModel::new([diverged_citing("resolvable_thing")]);
         run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 5000).unwrap();
 
         let row: (String, String, String, String, String, i64) = c
@@ -1038,7 +1038,7 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, "diverged");
         assert_eq!(row.1, "note_ahead");
-        assert_eq!(row.2, "mock-verdict-model");
+        assert_eq!(row.2, "mock-chat-model");
         assert_eq!(row.3, PROMPT_VERSION);
         assert_eq!(row.4, verify::note_content_hash("note", "describes `resolvable_thing`"));
         assert_eq!(row.5, 5000);
@@ -1049,7 +1049,7 @@ mod tests {
         let c = seeded_verifiable_repo();
         seed_symbol_file(&c, "src/other.rs", "second_thing", "r");
         seed_memory(&c, "m2", "note", "describes `second_thing`", "r");
-        let model = MockVerdictModel::new([
+        let model = MockChatModel::new([
             current_citing("resolvable_thing"),
             current_citing("second_thing"),
         ]);
@@ -1065,7 +1065,7 @@ mod tests {
     #[test]
     fn failed_verdict_completion_records_failure_row() {
         let c = seeded_verifiable_repo();
-        let model = MockVerdictModel::new(["not a verdict"]);
+        let model = MockChatModel::new(["not a verdict"]);
 
         run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 5000).unwrap();
 
@@ -1086,7 +1086,7 @@ mod tests {
     fn second_run_churn_skips_and_body_edit_re_invokes() {
         let c = seeded_verifiable_repo();
         // Two responses queued; a churn-skipped second run must consume only the first.
-        let model = MockVerdictModel::new([
+        let model = MockChatModel::new([
             current_citing("resolvable_thing"),
             current_citing("resolvable_thing"),
         ]);
@@ -1124,13 +1124,13 @@ mod tests {
             content_hash: &content_hash,
             checked_inputs_hash: Some(&inputs),
             prompt_version: PROMPT_VERSION,
-            model_id: "mock-verdict-model",
+            model_id: "mock-chat-model",
         };
         let failed = DreamModelFailure::new(DreamFailureReason::FabricatedEvidence);
         failure::record_failure(&c, RecordFailure { stamp, failure: &failed, now_ms: 1000 })
             .unwrap();
 
-        let model = MockVerdictModel::new([current_citing("resolvable_thing")]);
+        let model = MockChatModel::new([current_citing("resolvable_thing")]);
         run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 2000).unwrap();
         assert_eq!(model.calls(), 0, "a current deterministic failure row suppresses the retry");
 
@@ -1166,7 +1166,7 @@ mod tests {
         use super::super::{DreamOptions, dream_run_with_passes};
 
         let c = seeded_verifiable_repo();
-        let model = MockVerdictModel::new([
+        let model = MockChatModel::new([
             diverged_citing("resolvable_thing"), // run 1: opens the divergence finding
             current_citing("resolvable_thing"),  // run 3 (after body edit): flips to current
         ]);
@@ -1228,7 +1228,7 @@ mod tests {
         use super::super::{DreamOptions, dream_run, dream_run_with_passes};
 
         let c = seeded_verifiable_repo();
-        let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
+        let model = MockChatModel::new([diverged_citing("resolvable_thing")]);
         let verify_opts =
             DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
         let r1 = dream_run_with_passes(
@@ -1270,7 +1270,7 @@ mod tests {
         use super::super::{DreamOptions, dream_run, dream_run_with_passes};
 
         let c = seeded_verifiable_repo();
-        let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
+        let model = MockChatModel::new([diverged_citing("resolvable_thing")]);
         let verify_opts =
             DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
         dream_run_with_passes(
@@ -1321,7 +1321,7 @@ mod tests {
         use super::super::{DreamOptions, dream_run, dream_run_with_passes};
 
         let c = seeded_verifiable_repo();
-        let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
+        let model = MockChatModel::new([diverged_citing("resolvable_thing")]);
         dream_run_with_passes(
             &c,
             DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false },
@@ -1374,7 +1374,7 @@ mod tests {
             .unwrap()
         };
         let before = snap(&c);
-        let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
+        let model = MockChatModel::new([diverged_citing("resolvable_thing")]);
         let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
         dream_run_with_passes(&c, opts, Some(VerdictPass { model: &model, budget: 10 }), None)
             .unwrap();
@@ -1399,7 +1399,7 @@ mod tests {
         set_repo(&c, "r1");
         seed_symbol_file(&c, "src/a.rs", "thing_one", "r1");
         seed_memory(&c, "m1", "note", "describes `thing_one`", "r1");
-        let model_r1 = MockVerdictModel::new([diverged_citing("thing_one")]);
+        let model_r1 = MockChatModel::new([diverged_citing("thing_one")]);
         run_verdict_pass(&c, VerdictPass { model: &model_r1, budget: 10 }, 1000).unwrap();
 
         // The reality row is stamped with r1.
@@ -1413,7 +1413,7 @@ mod tests {
         set_repo(&c, "r2");
         seed_symbol_file(&c, "src/b.rs", "thing_two", "r2");
         seed_memory(&c, "m2", "note", "describes `thing_two`", "r2");
-        let model_r2 = MockVerdictModel::new([current_citing("thing_two")]);
+        let model_r2 = MockChatModel::new([current_citing("thing_two")]);
         let opts = DreamOptions { now_ms: 2000, limit: 10, verify: true, include_reviewed: false };
         let r2 = dream_run_with_passes(
             &c,

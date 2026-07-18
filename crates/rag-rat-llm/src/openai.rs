@@ -470,8 +470,9 @@ pub fn resolve_auth_header(
 
 /// Whether the endpoint's host is loopback (`127.0.0.1`, `localhost`, `::1`). Loopback endpoints
 /// bypass the ambient HTTP proxy; everything else inherits it. Parses the host out of the URL by
-/// stripping the scheme then the path/port, tolerating a bracketed IPv6 literal.
-fn endpoint_is_loopback(endpoint: &str) -> bool {
+/// stripping the scheme then the path/port, tolerating a bracketed IPv6 literal. Shared with the
+/// chat client (`chat.rs`) so both HTTP paths classify loopback identically.
+pub(crate) fn endpoint_is_loopback(endpoint: &str) -> bool {
     let after_scheme = endpoint.split_once("://").map_or(endpoint, |(_, rest)| rest);
     let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
     // Strip userinfo (`user:pass@host`) if present.

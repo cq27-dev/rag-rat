@@ -3,6 +3,7 @@
 //! cookbook box provisioning contract, and provision-time throughput tuning. No index coupling:
 //! the engine's selection glue decides WHICH provider runs; this crate knows how to run it.
 
+pub mod chat;
 pub mod providers;
 pub mod throughput_tune;
 

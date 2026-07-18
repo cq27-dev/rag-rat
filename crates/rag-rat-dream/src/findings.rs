@@ -1230,7 +1230,7 @@ mod evidence_dream_tests {
         let opts =
             crate::DreamOptions { now_ms: 1, limit: 10, verify: true, include_reviewed: false };
         assert!(
-            !crate::model_work_pending(&c, opts, 10, true, true, "mock-verdict-model").unwrap(),
+            !crate::model_work_pending(&c, opts, 10, true, true, "mock-chat-model").unwrap(),
             "empty repo → no work"
         );
 
@@ -1238,11 +1238,11 @@ mod evidence_dream_tests {
         // but compaction WILL summarize it.
         seed_memory(&c, "m1", "t", "a prose note with no identifiers", "r");
         assert!(
-            !crate::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model").unwrap(),
+            !crate::model_work_pending(&c, opts, 10, true, false, "mock-chat-model").unwrap(),
             "an all-uncitable verify queue is NOT model work — never cold-start a box for it"
         );
         assert!(
-            crate::model_work_pending(&c, opts, 10, false, true, "mock-verdict-model").unwrap(),
+            crate::model_work_pending(&c, opts, 10, false, true, "mock-chat-model").unwrap(),
             "the same memory IS compact-pending (compaction has no uncitable short-circuit)"
         );
 
@@ -1256,11 +1256,11 @@ mod evidence_dream_tests {
         .unwrap();
         seed_memory(&c, "m2", "t", "a note about `resolve_marker_token`", "r");
         assert!(
-            crate::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model").unwrap(),
+            crate::model_work_pending(&c, opts, 10, true, false, "mock-chat-model").unwrap(),
             "a citable never-checked memory is verify-pending"
         );
         assert!(
-            !crate::model_work_pending(&c, opts, 0, true, false, "mock-verdict-model").unwrap(),
+            !crate::model_work_pending(&c, opts, 0, true, false, "mock-chat-model").unwrap(),
             "budget zero stops before considering the citable verify entry"
         );
         let inputs = checked_inputs_hash(&c, "m2", &Some("r".to_string())).unwrap();
@@ -1272,7 +1272,7 @@ mod evidence_dream_tests {
             content_hash: &content_hash,
             checked_inputs_hash: Some(&inputs),
             prompt_version: crate::verdict::PROMPT_VERSION,
-            model_id: "mock-verdict-model",
+            model_id: "mock-chat-model",
         };
         let failed = crate::failure::DreamModelFailure::new(
             crate::failure::DreamFailureReason::FabricatedEvidence,
@@ -1284,12 +1284,12 @@ mod evidence_dream_tests {
         })
         .unwrap();
         assert!(
-            !crate::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model").unwrap(),
+            !crate::model_work_pending(&c, opts, 10, true, false, "mock-chat-model").unwrap(),
             "a current deterministic failure is annotated work, not pending model work"
         );
 
         assert!(
-            !crate::model_work_pending(&c, opts, 10, false, false, "mock-verdict-model").unwrap(),
+            !crate::model_work_pending(&c, opts, 10, false, false, "mock-chat-model").unwrap(),
             "neither flag → never pending"
         );
     }
@@ -1337,7 +1337,7 @@ mod evidence_dream_tests {
         // Regression (PR #428): a prose-only memory with no identifiers / excerpts yields
         // an uncitable pack; the verdict pass must record a terminal (verdict-less) row so
         // it churn-skips instead of consuming a budget slot forever.
-        use crate::model::mock::MockVerdictModel;
+        use crate::mock_chat::MockChatModel;
         use crate::{VerdictPass, verdict};
         let c = mem_db();
         set_repo(&c, "r");
@@ -1346,7 +1346,7 @@ mod evidence_dream_tests {
 
         // A model with NO queued responses panics if `complete` is called — proving the uncitable
         // memory is handled deterministically and never reaches the model.
-        let model = MockVerdictModel::new(Vec::<String>::new());
+        let model = MockChatModel::new(Vec::<String>::new());
         verdict::run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 1000).unwrap();
         assert_eq!(model.calls(), 0, "the uncitable memory never calls the model");
         let (verdict_val, pv): (Option<String>, Option<String>) = c
