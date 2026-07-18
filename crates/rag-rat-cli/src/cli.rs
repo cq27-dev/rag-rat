@@ -55,6 +55,12 @@ pub(crate) enum Command {
     /// Report schema, storage, discovery, targets, and index health as JSON.
     Doctor(DoctorArgs),
 
+    /// Cross-repo inventory of the consolidated global store: every registered repo with its index
+    /// freshness, worktree overlays, memory / papertrail / content counts, and the whole-file
+    /// health rollup. Read-only; complements `doctor` (one repo, deep). Pass the global `--json`
+    /// for the structured form.
+    Status,
+
     /// Search the index (lexical + semantic).
     Query(QueryArgs),
 

@@ -74,9 +74,10 @@ pub use query_api::{
     CLONE_DELTA_MAX_FILES, CandidateCloneClass, CloneCheckInput, CloneCompleteness,
     CloneDeltaReport, CloneEdgeReport, CloneEligibility, CloneFingerprintHealth,
     CloneIneligibilityReason, CloneMember, CloneSymbolSelector, ClonesForSymbolResult,
-    DatabaseFileHealth, FindClonesOptions, FindClonesResult, GcReport, ImportantSymbolsRequest,
-    OracleShaSnapshots, RoiFactors, SearchRequest, TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES,
-    WalCheckpointReport,
+    DatabaseFileHealth, FindClonesOptions, FindClonesResult, GcReport, GlobalFtsStatus,
+    GlobalStatus, ImportantSymbolsRequest, MemoryCounts, MemoryKindCounts, OracleShaSnapshots,
+    PapertrailCursor, RepoContent, RepoFreshness, RepoPapertrail, RepoStatus, RoiFactors,
+    SearchRequest, TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay,
 };
 pub use schema::RegisteredRepo;
 pub(crate) use util::*;

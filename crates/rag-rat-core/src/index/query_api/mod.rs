@@ -14,6 +14,7 @@ mod clones;
 mod db_file_health;
 mod dream;
 mod gc;
+mod global_status;
 mod graph;
 mod history;
 mod importance;
@@ -37,6 +38,10 @@ pub use clones::{
 pub(crate) use clones::{MAX_MEMBERS, MEMBER_VALUE_CAP};
 pub use db_file_health::{DatabaseFileHealth, WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport};
 pub use gc::GcReport;
+pub use global_status::{
+    GlobalFtsStatus, GlobalStatus, MemoryCounts, MemoryKindCounts, PapertrailCursor, RepoContent,
+    RepoFreshness, RepoPapertrail, RepoStatus, WorktreeOverlay,
+};
 pub use importance::ImportantSymbolsRequest;
 pub use oracle_runs::OracleShaSnapshots;
 pub use search::SearchRequest;

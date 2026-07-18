@@ -89,6 +89,10 @@ fn main() -> anyhow::Result<()> {
         Cmd::EditReindex(args) => return agent_hook::edit_reindex::run(&args.cwd, &args.paths),
         Cmd::Mcp => return run_mcp(cli.config.as_deref(), cli.json),
         Cmd::Doctor(args) => return run_doctor(args, cli.config.as_deref()),
+        // `status` is a cross-repo view of the consolidated global store, so — like `doctor` — it
+        // tolerates config absence: outside a rag-rat repo it still reports the machine-global
+        // store.
+        Cmd::Status => return run_status(cli.config.as_deref()),
         _ => {},
     }
 
@@ -103,8 +107,12 @@ fn main() -> anyhow::Result<()> {
     let _log = rag_rat_base::logging::init_logging(&config, log_role(&cli.command));
 
     match cli.command {
-        Cmd::Init(_) | Cmd::AgentHook | Cmd::EditReindex(_) | Cmd::Mcp | Cmd::Doctor(_) =>
-            unreachable!("handled before the config load above"),
+        Cmd::Init(_)
+        | Cmd::AgentHook
+        | Cmd::EditReindex(_)
+        | Cmd::Mcp
+        | Cmd::Doctor(_)
+        | Cmd::Status => unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
         Cmd::Query(args) => query(&config, &args)?,
         Cmd::Brief(args) => brief(&config, &args)?,
@@ -455,6 +463,28 @@ fn run_doctor(args: &DoctorArgs, explicit: Option<&str>) -> anyhow::Result<()> {
             rag_rat_base::config::discover_config_path(Path::new(".")).display()
         ),
     }
+}
+
+/// Run `status`, tolerating the ABSENCE of a config. `status` is a cross-repo inventory of the
+/// consolidated store, so it targets the STORE, not one repo: prefer the discovered config's
+/// `database` (a consolidated repo's index path IS the global store), and fall back to the
+/// machine-global store path when there is no `rag-rat.toml` at or above the cwd — "no local
+/// config" is not "no data", the same posture as config-less `doctor`. Only when this platform
+/// resolves no data dir at all does it fall back to the friendly "run rag-rat init" hint.
+fn run_status(explicit: Option<&str>) -> anyhow::Result<()> {
+    let database = match discover_config_optional(explicit)? {
+        Some(config) => config.database,
+        None => match rag_rat_base::data_dir::global_database_path() {
+            Some(database) => database,
+            None => anyhow::bail!(
+                "No rag-rat config found at `{}`, and this platform has no data directory for a \
+                 machine-global store.\nRun `rag-rat init` to create a config, or pass --config \
+                 <path>.",
+                rag_rat_base::config::discover_config_path(Path::new(".")).display()
+            ),
+        },
+    };
+    status(&database)
 }
 
 /// Map the invoked subcommand to a debug-log [`Role`](rag_rat_base::logging::Role) (drives the log

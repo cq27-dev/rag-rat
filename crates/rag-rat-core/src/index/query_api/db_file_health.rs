@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use rusqlite::Connection;
 use serde::Serialize;
 
 use super::*;
@@ -194,48 +195,82 @@ impl IndexDatabase {
         freelist_warn_fraction: f64,
         freelist_warn_min_pages: i64,
     ) -> anyhow::Result<DatabaseFileHealth> {
-        let conn = self.storage.connection();
-        let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-        let freelist_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
-        let main_bytes =
-            std::fs::metadata(self.storage.database_path()).map(|meta| meta.len()).unwrap_or(0);
-        let wal_bytes = wal_bytes(self.storage.database_path());
-        let freelist_fraction =
-            if page_count > 0 { freelist_pages as f64 / page_count as f64 } else { 0.0 };
-        let wal_oversized = wal_bytes > wal_warn_bytes;
-        let freelist_excessive =
-            freelist_pages >= freelist_warn_min_pages && freelist_fraction > freelist_warn_fraction;
-        let note = match (wal_oversized, freelist_excessive) {
-            (false, false) => None,
-            (wal, freelist) => {
-                let mut parts = Vec::new();
-                if wal {
-                    parts.push(
-                        "the -wal sidecar is oversized — a quiet watcher pass truncates it, or \
-                         long-lived readers are starving checkpoints",
-                    );
-                }
-                if freelist {
-                    parts.push(
-                        "dead space is excessive — reclaim it with `rag-rat doctor --vacuum` (a \
-                         one-off VACUUM that rewrites the file; best run while agents/watchers \
-                         are quiet)",
-                    );
-                }
-                Some(parts.join("; "))
-            },
-        };
-        Ok(DatabaseFileHealth {
-            main_bytes,
-            wal_bytes,
-            page_count,
-            freelist_pages,
-            freelist_fraction,
-            wal_oversized,
-            freelist_excessive,
-            note,
-        })
+        compute_database_file_health(
+            self.storage.connection(),
+            self.storage.database_path(),
+            wal_warn_bytes,
+            freelist_warn_fraction,
+            freelist_warn_min_pages,
+        )
     }
+}
+
+/// [`IndexDatabase::database_file_health`] against a bare connection + path, at the default
+/// thresholds — for the config-less, DB-level readers that open a read-only connection without an
+/// [`IndexDatabase`] scope (`rag-rat status`). Same computation as the method; one canonical
+/// reader keeps the flags and the VACUUM note from drifting.
+pub(super) fn database_file_health_from_conn(
+    conn: &Connection,
+    database_path: &Path,
+) -> anyhow::Result<DatabaseFileHealth> {
+    compute_database_file_health(
+        conn,
+        database_path,
+        WAL_WARN_BYTES,
+        FREELIST_WARN_FRACTION,
+        FREELIST_WARN_MIN_PAGES,
+    )
+}
+
+/// The shared size/dead-space computation behind both [`IndexDatabase::database_file_health_at`]
+/// and [`database_file_health_from_conn`]. Read-only: `PRAGMA page_count` / `freelist_count` plus a
+/// `stat` of the main file and the `-wal` sidecar.
+fn compute_database_file_health(
+    conn: &Connection,
+    database_path: &Path,
+    wal_warn_bytes: u64,
+    freelist_warn_fraction: f64,
+    freelist_warn_min_pages: i64,
+) -> anyhow::Result<DatabaseFileHealth> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let freelist_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    let main_bytes = std::fs::metadata(database_path).map(|meta| meta.len()).unwrap_or(0);
+    let wal_bytes = wal_bytes(database_path);
+    let freelist_fraction =
+        if page_count > 0 { freelist_pages as f64 / page_count as f64 } else { 0.0 };
+    let wal_oversized = wal_bytes > wal_warn_bytes;
+    let freelist_excessive =
+        freelist_pages >= freelist_warn_min_pages && freelist_fraction > freelist_warn_fraction;
+    let note = match (wal_oversized, freelist_excessive) {
+        (false, false) => None,
+        (wal, freelist) => {
+            let mut parts = Vec::new();
+            if wal {
+                parts.push(
+                    "the -wal sidecar is oversized — a quiet watcher pass truncates it, or \
+                     long-lived readers are starving checkpoints",
+                );
+            }
+            if freelist {
+                parts.push(
+                    "dead space is excessive — reclaim it with `rag-rat doctor --vacuum` (a \
+                     one-off VACUUM that rewrites the file; best run while agents/watchers are \
+                     quiet)",
+                );
+            }
+            Some(parts.join("; "))
+        },
+    };
+    Ok(DatabaseFileHealth {
+        main_bytes,
+        wal_bytes,
+        page_count,
+        freelist_pages,
+        freelist_fraction,
+        wal_oversized,
+        freelist_excessive,
+        note,
+    })
 }
 
 /// Size of the `-wal` sidecar, 0 when absent. SQLite derives the sidecar name by appending

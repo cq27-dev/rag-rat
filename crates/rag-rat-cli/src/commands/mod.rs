@@ -18,6 +18,7 @@ mod models;
 mod oracle;
 mod runtime_env;
 mod search;
+mod status;
 
 pub(crate) use clones::{clones, clones_for};
 pub(crate) use config_info::{dump_config, version_check};
@@ -35,3 +36,4 @@ pub(crate) use models::{benchmark_embedding, eval};
 pub(crate) use oracle::{oracle, with_oracle_write_lock};
 pub(crate) use runtime_env::apply_embedding_runtime_env;
 pub(crate) use search::{brief, clusters, important_symbols, query};
+pub(crate) use status::status;
