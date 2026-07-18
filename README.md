@@ -4,6 +4,7 @@
 [![codecov](https://codecov.io/gh/cq27-dev/rag-rat/branch/main/graph/badge.svg)](https://codecov.io/gh/cq27-dev/rag-rat)
 [![crates.io](https://img.shields.io/crates/v/rag-rat.svg)](https://crates.io/crates/rag-rat)
 [![benchmarks](https://img.shields.io/badge/benchmarks-bencher-orange)](https://bencher.dev/perf/rag-rat/plots)
+[![site](https://img.shields.io/badge/site-rag--rat.cq27.dev-2563eb)](https://rag-rat.cq27.dev)
 
 **What a repository knows about itself.** `rag-rat` is a local repo-intelligence index and MCP server
 for coding agents. It keeps source files read-only, writes only its own SQLite database, and answers
