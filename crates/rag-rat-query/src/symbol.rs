@@ -231,6 +231,26 @@ pub fn lookup_by_id(conn: &Connection, symbol_id: i64) -> anyhow::Result<Option<
     Ok(hit)
 }
 
+/// Symbol ids DEFINED in `path`, in source order, capped at `limit`. Scoped to the active checkout
+/// via the `files` view. The read-augmentation hook ranks these by caller fan-in to surface the
+/// load-bearing symbols in a file being opened; source order + the cap bound the candidate set so a
+/// large file can't make the per-symbol count sweep unbounded (a symbol past the cap is simply not
+/// considered — a hint, not an authority).
+pub fn symbol_ids_in_file(conn: &Connection, path: &str, limit: u32) -> anyhow::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT symbols.id
+         FROM symbols
+         JOIN files ON files.id = symbols.file_id
+         WHERE files.path = ?1
+         ORDER BY symbols.start_byte ASC
+         LIMIT ?2",
+    )?;
+    let ids = stmt
+        .query_map(params![path, i64::from(limit)], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
 fn candidates_for_selector(
     conn: &Connection,
     selector: &SymbolSelector,

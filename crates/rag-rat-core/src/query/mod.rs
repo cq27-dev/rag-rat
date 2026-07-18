@@ -6,3 +6,4 @@
 pub mod clusters;
 pub mod grep_augment;
 pub mod orientation;
+pub mod read_augment;

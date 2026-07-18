@@ -15,7 +15,7 @@ use crate::search::lexical;
 /// Hard cap on rendered context. Truncation drops whole items, never mid-item.
 pub const MAX_CONTEXT_CHARS: usize = 1500;
 const MAX_SYMBOLS: u32 = 3;
-const MAX_MEMORIES: u32 = 4;
+pub(crate) const MAX_MEMORIES: u32 = 4;
 const MAX_LEXICAL_HITS: u32 = 3;
 /// Lexical hits below this fraction of the best hit's score are dropped as low-relevance noise.
 const LEXICAL_RELATIVE_FLOOR: f64 = 0.6;
@@ -344,25 +344,47 @@ struct SymbolItem {
     key: String,
 }
 
-/// A single renderable item in a section, with optional bookkeeping IDs.
-struct RenderItem {
-    line: String,
-    memory_id: Option<String>,
-    symbol_key: Option<String>,
+/// A single renderable item in a section, with optional bookkeeping IDs. Shared with `read_augment`
+/// via [`pack_sections`].
+pub(crate) struct RenderItem {
+    pub(crate) line: String,
+    pub(crate) memory_id: Option<String>,
+    pub(crate) symbol_key: Option<String>,
 }
 
 /// A section is a header line + a list of items. Header is only committed when at least one
-/// item fits; the caller's ID is only appended to the output IDs when the item's line lands.
-struct Section {
-    header: String,
-    items: Vec<RenderItem>,
+/// item fits; the caller's ID is only appended to the output IDs when the item's line lands. Shared
+/// with `read_augment` via [`pack_sections`].
+pub(crate) struct Section {
+    pub(crate) header: String,
+    pub(crate) items: Vec<RenderItem>,
     /// An optional closing/footer line (not associated with an ID).
-    footer: Option<String>,
+    pub(crate) footer: Option<String>,
+}
+
+/// Build the shared memory `RenderItem` (`- [Kind | status] title — gist verdict (rag-rat:
+/// memory_search)`), so grep- and read-augment render bound memories identically. The gist is the
+/// dream summary under `surface = "summary"`, else the clamped body; both empty → title-only.
+pub(crate) fn memory_render_item(m: memory::RepoMemory) -> RenderItem {
+    let gist = match &m.summary {
+        Some(summary) => summary.clone(),
+        None => clamp_body(&m.body),
+    };
+    let gist_part = if gist.is_empty() { String::new() } else { format!(" — {gist}") };
+    let verdict_part = m.verdict.as_deref().map(|v| format!(" {v}")).unwrap_or_default();
+    RenderItem {
+        line: format!(
+            "- [{} | {}] {}{}{} (rag-rat: memory_search)",
+            m.kind, m.status, m.title, gist_part, verdict_part,
+        ),
+        memory_id: Some(m.memory_id),
+        symbol_key: None,
+    }
 }
 
 /// Collapse all whitespace runs (including newlines) to single spaces and truncate to
 /// `MAX_MEMORY_BODY_CHARS`, appending `…` when truncated.
-fn clamp_body(body: &str) -> String {
+pub(crate) fn clamp_body(body: &str) -> String {
     let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
     // Compare char count (not byte length) so multibyte bodies don't get `…` with nothing removed.
     if collapsed.chars().count() <= MAX_MEMORY_BODY_CHARS {
@@ -385,29 +407,7 @@ fn render(
     let mut sections: Vec<Section> = Vec::new();
 
     if !memories.is_empty() {
-        let items = memories
-            .into_iter()
-            .map(|m| {
-                // The gist: the summary under `surface = "summary"`, else the clamped body. Both
-                // empty (a summary-surface memory with no summary) → title-only, no `— …`.
-                let gist = match &m.summary {
-                    Some(summary) => summary.clone(),
-                    None => clamp_body(&m.body),
-                };
-                let gist_part =
-                    if gist.is_empty() { String::new() } else { format!(" — {gist}") };
-                let verdict_part =
-                    m.verdict.as_deref().map(|v| format!(" {v}")).unwrap_or_default();
-                RenderItem {
-                    line: format!(
-                        "- [{} | {}] {}{}{} (rag-rat: memory_search)",
-                        m.kind, m.status, m.title, gist_part, verdict_part,
-                    ),
-                    memory_id: Some(m.memory_id),
-                    symbol_key: None,
-                }
-            })
-            .collect();
+        let items = memories.into_iter().map(memory_render_item).collect();
         sections.push(Section {
             header: "**Repo memories bound to this code:**".to_string(),
             items,
@@ -439,7 +439,15 @@ fn render(
         });
     }
 
-    let mut context = String::from("rag-rat index context for this search:\n");
+    pack_sections("rag-rat index context for this search:", sections)
+}
+
+/// Pack `sections` under `intro` into a char-budget-bounded digest (whole-item truncation against
+/// [`MAX_CONTEXT_CHARS`]; a section header is committed only with its first fitting item; an item's
+/// bookkeeping id is recorded only when its line lands). Shared by grep- and read-augment so both
+/// obey the same budget and dedup-bookkeeping rules.
+pub(crate) fn pack_sections(intro: &str, sections: Vec<Section>) -> GrepAugment {
+    let mut context = format!("{intro}\n");
     let mut memory_ids: Vec<String> = Vec::new();
     let mut symbol_keys: Vec<String> = Vec::new();
 
@@ -494,7 +502,10 @@ fn render(
 
 /// Caller/callee edge counts. Callers resolve by `to_symbol_id` or qualified-name match;
 /// callees are edges leaving any of the symbol's concrete rows.
-fn edge_counts(conn: &Connection, hit: &symbol::SymbolHit) -> anyhow::Result<(i64, i64)> {
+pub(crate) fn edge_counts(
+    conn: &Connection,
+    hit: &symbol::SymbolHit,
+) -> anyhow::Result<(i64, i64)> {
     // GENERATION-SCOPED via the `files` view (batch 6, count-scoping class; `compose` installs the
     // worktree scope view before calling in). The `to_symbol_id = ?1` arm keys on a LIVE rowid, but
     // the interned-name arm matches callers purely by NAME and so double-counts dead-generation
@@ -522,7 +533,10 @@ fn edge_counts(conn: &Connection, hit: &symbol::SymbolHit) -> anyhow::Result<(i6
 /// Start line for a symbol hit (line spans live on chunks).
 /// Returns `None` when no matching chunk is found; callers render `{path}` without `:{line}`
 /// rather than a confidently-wrong `:1`.
-fn line_for_symbol(conn: &Connection, hit: &symbol::SymbolHit) -> anyhow::Result<Option<i64>> {
+pub(crate) fn line_for_symbol(
+    conn: &Connection,
+    hit: &symbol::SymbolHit,
+) -> anyhow::Result<Option<i64>> {
     conn.query_row(
         "SELECT start_line FROM chunks
          WHERE file_id = ?1 AND start_byte <= ?2 AND end_byte >= ?2

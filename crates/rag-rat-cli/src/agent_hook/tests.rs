@@ -133,6 +133,31 @@ fn extract_search_ignores_other_tools() {
     assert!(extract_search(&input).is_none());
 }
 
+// ─── Read-augmentation path resolution (#756) ───────────────────────────────
+
+#[test]
+fn worktree_rel_path_relativizes_an_in_worktree_file_with_slashes() {
+    // Relativized against the SESSION worktree root — for a linked worktree that is NOT the
+    // main-anchored config.root, so a file under the linked root still resolves (#756).
+    assert_eq!(
+        worktree_rel_path(
+            "/repo/.wt/branch-x/crates/rag-rat-core/src/lib.rs",
+            Path::new("/repo/.wt/branch-x"),
+        )
+        .as_deref(),
+        Some("crates/rag-rat-core/src/lib.rs"),
+    );
+}
+
+#[test]
+fn worktree_rel_path_is_none_outside_the_worktree() {
+    // A file outside the worktree root has nothing indexed to augment it with.
+    assert!(
+        worktree_rel_path("/etc/hosts", Path::new("/repo")).is_none(),
+        "outside the worktree → None",
+    );
+}
+
 // ─── PostToolUse edited-path extraction (#661) ──────────────────────────────
 
 #[test]

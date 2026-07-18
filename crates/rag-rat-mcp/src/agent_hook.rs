@@ -7,16 +7,23 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// One grep-augment query from a hook client. Unknown fields are ignored (forward compat);
-/// unknown `v`/`kind` get a null-context reply rather than an error.
+/// One augmentation query from a hook client. `kind` selects the lane: `"grep_augment"` uses
+/// `pattern` (+ `search_path`), `"read_augment"` uses `path` (#756). Unknown fields are ignored
+/// (forward compat); unknown `v`/`kind` get a null-context reply rather than an error.
 #[derive(Debug, Deserialize)]
 pub struct HookRequest {
     pub v: u32,
     pub kind: String,
     pub session_id: String,
+    /// The grep pattern (`grep_augment` only). Defaulted so a `read_augment` request without it
+    /// still deserializes.
+    #[serde(default)]
     pub pattern: String,
     #[serde(default)]
     pub search_path: Option<String>,
+    /// The root-relative file path being read (`read_augment` only).
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default)]
     pub source: String,
     /// The session's working directory, so the listener scopes the augmentation to that worktree's
@@ -29,6 +36,13 @@ pub struct HookRequest {
 pub struct HookResponse {
     pub v: u32,
     pub context: Option<String>,
+    /// The request `kind` this listener actually HANDLED, echoed so a newer client can tell a
+    /// genuine "nothing new to inject" (`context: null`, `kind: Some(...)`) from an OLDER listener
+    /// that didn't understand the kind and fell through to the null catch-all (`kind: None`). The
+    /// latter must trigger the client's direct fallback instead of silently disabling the feature
+    /// across a hot upgrade (#756 review). Absent on the unknown-kind / malformed reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[cfg(unix)]
@@ -218,7 +232,10 @@ mod listener {
             }, // propagate real I/O errors as before
         }
         let reply = match serde_json::from_str::<HookRequest>(&line) {
-            Ok(req) if req.v == PROTOCOL_VERSION && req.kind == "grep_augment" => {
+            Ok(req)
+                if req.v == PROTOCOL_VERSION
+                    && matches!(req.kind.as_str(), "grep_augment" | "read_augment") =>
+            {
                 let filter = {
                     let state = sessions.entry(req.session_id.clone()).or_default();
                     state.last_used = Some(Instant::now());
@@ -234,8 +251,13 @@ mod listener {
                 // prior lack of ANY scope install: compose queries the `files` view, so without
                 // this it read raw, unscoped rows.
                 let cwd = req.cwd.clone().map(PathBuf::from).unwrap_or_else(|| config_root.clone());
+                let kind = req.kind.clone();
+                // Echoed on the reply so a newer client can distinguish "handled, nothing new" from
+                // an older listener's unknown-kind null (#756 review).
+                let handled_kind = req.kind.clone();
                 let pattern = req.pattern.clone();
                 let search_path = req.search_path.clone();
+                let read_path = req.path.clone();
                 // rusqlite is sync; one short read off the runtime threads.
                 let composed = tokio::task::spawn_blocking(move || {
                     let conn = IndexConnection::open_read_only(&database)?;
@@ -255,13 +277,25 @@ mod listener {
                         &config_root,
                         &cwd,
                     )?;
-                    grep_augment::compose(
-                        conn.connection(),
-                        &pattern,
-                        search_path.as_deref(),
-                        &filter,
-                        memory_surface,
-                    )
+                    match kind.as_str() {
+                        // read_augment with no path resolves to nothing to inject.
+                        "read_augment" => match read_path.as_deref() {
+                            Some(path) => rag_rat_core::query::read_augment::compose(
+                                conn.connection(),
+                                path,
+                                &filter,
+                                memory_surface,
+                            ),
+                            None => Ok(None),
+                        },
+                        _ => grep_augment::compose(
+                            conn.connection(),
+                            &pattern,
+                            search_path.as_deref(),
+                            &filter,
+                            memory_surface,
+                        ),
+                    }
                 })
                 .await?;
                 let composed = super::degrade_when_fts_corrupt(composed, || {
@@ -274,13 +308,23 @@ mod listener {
                         let state = sessions.entry(req.session_id).or_default();
                         state.filter.memory_ids.extend(out.memory_ids.iter().cloned());
                         state.filter.symbol_keys.extend(out.symbol_keys.iter().cloned());
-                        HookResponse { v: PROTOCOL_VERSION, context: Some(out.context) }
+                        HookResponse {
+                            v: PROTOCOL_VERSION,
+                            context: Some(out.context),
+                            kind: Some(handled_kind),
+                        }
                     },
-                    None => HookResponse { v: PROTOCOL_VERSION, context: None },
+                    None => HookResponse {
+                        v: PROTOCOL_VERSION,
+                        context: None,
+                        kind: Some(handled_kind),
+                    },
                 }
             },
-            // Unknown v/kind or malformed JSON: answer null-context, never error back.
-            _ => HookResponse { v: PROTOCOL_VERSION, context: None },
+            // Unknown v/kind or malformed JSON: answer null-context with NO handled `kind`, never
+            // error back. The absent `kind` tells a newer client this listener didn't handle the
+            // request so it should fall back (#756 review).
+            _ => HookResponse { v: PROTOCOL_VERSION, context: None, kind: None },
         };
         let mut payload = serde_json::to_string(&reply)?;
         payload.push('\n');
@@ -345,6 +389,16 @@ mod listener_tests {
                 [],
             )
             .unwrap();
+        // One caller of frobnicate (symbol id 1), so it ranks as load-bearing for the read-augment
+        // lane. Harmless to the grep test, which only asserts the symbol name is present.
+        rw.connection()
+            .execute(
+                "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,
+                                   target_qualified_name, edge_kind, confidence)
+                 VALUES (1, NULL, 1, 'frobnicate', 'lib::frobnicate', 'calls_name', 'exact')",
+                [],
+            )
+            .unwrap();
         // No rebuild_fts here: external-content FTS5 rebuilds corrupt when out of sync with
         // direct seeding, and the symbol lane needs no FTS rows.
         config
@@ -386,6 +440,48 @@ mod listener_tests {
         );
         let bad = request(&socket, serde_json::json!({"v": 99, "kind": "nope"})).await;
         assert!(bad["context"].is_null(), "unknown version answered, not errored");
+        assert!(
+            bad.get("kind").map(|k| k.is_null()).unwrap_or(true),
+            "an unhandled request echoes NO kind, so a newer client falls back (#756): {bad}",
+        );
+    }
+
+    /// #756: a `read_augment` request for a file surfaces its load-bearing symbols (here
+    /// `frobnicate`, which has a caller), and dedups per session like grep-augment does.
+    #[tokio::test]
+    async fn listener_serves_read_augment_and_dedupes_per_session() {
+        let config = test_config();
+        let _listener = spawn_listener(config.clone());
+        let socket = socket_path_for(&config);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !socket.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let req = |sid: &str| {
+            serde_json::json!({"v": 1, "kind": "read_augment", "session_id": sid,
+                               "path": "src/lib.rs"})
+        };
+        let first = request(&socket, req("r1")).await;
+        assert!(
+            first["context"].as_str().unwrap().contains("lib::frobnicate"),
+            "read-augment surfaces the file's load-bearing symbol: {first}",
+        );
+        assert_eq!(
+            first["kind"], "read_augment",
+            "the reply echoes the handled kind so a newer client trusts it (#756): {first}",
+        );
+        let second = request(&socket, req("r1")).await;
+        assert!(second["context"].is_null(), "same session deduped");
+        assert_eq!(
+            second["kind"], "read_augment",
+            "a genuine dedup-null still echoes the kind, so the client does NOT spuriously fall \
+             back",
+        );
+        let other = request(&socket, req("r2")).await;
+        assert!(
+            other["context"].as_str().unwrap().contains("lib::frobnicate"),
+            "a fresh session is not deduped",
+        );
     }
 
     #[tokio::test]
@@ -525,7 +621,15 @@ mod tests {
 
     #[test]
     fn response_serializes_null_context_explicitly() {
-        let resp = HookResponse { v: 1, context: None };
+        // An unhandled reply (no kind) serializes without the field — the wire shape older clients
+        // parse is unchanged; the `kind` echo is purely additive.
+        let resp = HookResponse { v: 1, context: None, kind: None };
         assert_eq!(serde_json::to_string(&resp).unwrap(), r#"{"v":1,"context":null}"#);
+        // A handled reply carries the echoed kind.
+        let handled = HookResponse { v: 1, context: None, kind: Some("read_augment".to_string()) };
+        assert_eq!(
+            serde_json::to_string(&handled).unwrap(),
+            r#"{"v":1,"context":null,"kind":"read_augment"}"#,
+        );
     }
 }

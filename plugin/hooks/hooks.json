@@ -8,6 +8,12 @@
         ]
       },
       {
+        "matcher": "Read",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install agent-hook", "timeout": 10 }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install agent-hook", "timeout": 10 }
