@@ -135,15 +135,251 @@ fn reindex_paths_routes_a_linked_worktree_path_to_its_overlay_not_the_base() {
         "only the base-checkout path is a base path — the linked path must NOT fall through to \
          the base pass (which would drop it)",
     );
-    assert_eq!(
-        partition.linked_roots.len(),
-        1,
-        "the linked path routes to exactly its checkout overlay",
-    );
-    let root = partition.linked_roots.iter().next().unwrap();
+    assert_eq!(partition.linked.len(), 1, "the linked path routes to exactly its checkout overlay",);
+    let (root, root_paths) = partition.linked.iter().next().unwrap();
     assert!(
         linked.canonicalize().is_ok_and(|canonical| *root == canonical),
         "the routed root is the canonical linked checkout: {root:?}",
+    );
+    assert_eq!(
+        root_paths,
+        &vec![linked.join("src/a.rs")],
+        "the checkout's supplied paths are bucketed under it for a path-scoped overlay pass (#679)",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// #679: a linked-worktree `index --paths` reconciles EXACTLY the supplied path's overlay row — a
+/// single-file edit does NOT pull in the OTHER in-flight changes in the same worktree (path-scoped,
+/// mirroring the base `Paths` semantics on the linked route). Row-count assertions only: no
+/// `symbol_present`, which lazily heals a zero-hit and would mask the b.rs absence.
+#[test]
+fn reindex_paths_scopes_a_linked_edit_to_just_the_supplied_path() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_base() {}\n").unwrap();
+    fs::write(main.join("src/b.rs"), "pub fn b_base() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let _ = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // BOTH files are dirty in the linked checkout, but only a.rs is supplied.
+    fs::write(linked.join("src/a.rs"), "pub fn a_branch() {}\n").unwrap();
+    fs::write(linked.join("src/b.rs"), "pub fn b_branch() {}\n").unwrap();
+
+    crate::watch::reindex_paths(&config, &[linked.join("src/a.rs")], |_| {}).unwrap();
+
+    assert_eq!(
+        overlay_rows(&config, "src/a.rs"),
+        1,
+        "the supplied linked path gets its overlay row (its edit is reflected)",
+    );
+    assert_eq!(
+        overlay_rows(&config, "src/b.rs"),
+        0,
+        "the OTHER in-flight linked edit is NOT pulled in — the pass is path-scoped (#679)",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// #679: a DELETED supplied linked path tombstones exactly that path's overlay row (shadowing the
+/// base row), still without touching the other in-flight change.
+#[test]
+fn reindex_paths_tombstones_only_the_supplied_deleted_linked_path() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_base() {}\n").unwrap();
+    fs::write(main.join("src/b.rs"), "pub fn b_base() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let _ = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::remove_file(linked.join("src/a.rs")).unwrap(); // delete the supplied path
+    fs::write(linked.join("src/b.rs"), "pub fn b_branch() {}\n").unwrap(); // other dirty edit, not supplied
+
+    crate::watch::reindex_paths(&config, &[linked.join("src/a.rs")], |_| {}).unwrap();
+
+    assert_eq!(
+        deleted_overlay_rows(&config, "src/a.rs"),
+        1,
+        "the deleted supplied path is tombstoned in the overlay (shadows the base row)",
+    );
+    assert_eq!(
+        overlay_rows(&config, "src/b.rs"),
+        0,
+        "the other in-flight linked edit is untouched — still path-scoped (#679)",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// #679 review: a supplied linked path the branch `.gitignore` IGNORES must not be indexed into the
+/// overlay — the path-scoped route honors the linked checkout's ignore rules, exactly like the base
+/// walker and the whole-delta overlay (else `index --paths` could create an overlay row for a file
+/// discovery would never index).
+#[test]
+fn reindex_paths_does_not_index_an_ignored_linked_path() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_base() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let _ = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // The branch ignores `gen.rs`; the file sits in a target dir but is gitignored.
+    fs::write(linked.join(".gitignore"), "gen.rs\n").unwrap();
+    fs::write(linked.join("src/gen.rs"), "pub fn generated() {}\n").unwrap();
+
+    crate::watch::reindex_paths(&config, &[linked.join("src/gen.rs")], |_| {}).unwrap();
+
+    assert_eq!(
+        overlay_rows(&config, "src/gen.rs"),
+        0,
+        "an ignored linked path is not indexed into the overlay (#679 review)",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// #679 review: a supplied linked path that CROSSES A SYMLINK (the leaf is a symlink) must not be
+/// indexed — the walker skips symlink entries, so indexing one would write an overlay row under a
+/// spelling a full/discover pass never produces (and could read content outside the checkout).
+#[cfg(unix)]
+#[test]
+fn reindex_paths_does_not_index_a_symlinked_linked_path() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_base() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let _ = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/real.rs"), "pub fn real_target() {}\n").unwrap();
+    std::os::unix::fs::symlink(linked.join("src/real.rs"), linked.join("src/link.rs")).unwrap();
+
+    crate::watch::reindex_paths(&config, &[linked.join("src/link.rs")], |_| {}).unwrap();
+
+    assert_eq!(
+        overlay_rows(&config, "src/link.rs"),
+        0,
+        "a symlink-crossing linked path is not indexed into the overlay (#679 review)",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// #679 review: a BRANCH-ONLY file (absent from base) that was overlay-indexed and is then deleted
+/// must have its stale overlay row REMOVED by a path-scoped pass — there is no base row to shadow
+/// (so a tombstone is wrong) and this pass skips the global prune, so it must remove the row per
+/// supplied path or the dead row + its symbols would linger indefinitely.
+#[test]
+fn reindex_paths_removes_a_stale_branch_only_overlay_row() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_base() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let _ = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // A branch-only file (never in base), overlay-indexed by a scoped pass.
+    fs::write(linked.join("src/only.rs"), "pub fn only_branch() {}\n").unwrap();
+    crate::watch::reindex_paths(&config, &[linked.join("src/only.rs")], |_| {}).unwrap();
+    assert_eq!(overlay_rows(&config, "src/only.rs"), 1, "the branch-only file is overlay-indexed");
+
+    // Delete it and reindex the SAME path — the stale overlay row must be removed, not tombstoned.
+    fs::remove_file(linked.join("src/only.rs")).unwrap();
+    crate::watch::reindex_paths(&config, &[linked.join("src/only.rs")], |_| {}).unwrap();
+    assert_eq!(
+        overlay_rows(&config, "src/only.rs"),
+        0,
+        "the stale branch-only overlay row is removed"
+    );
+    assert_eq!(
+        deleted_overlay_rows(&config, "src/only.rs"),
+        0,
+        "and NOT tombstoned — there is no base row to shadow (#679 review)",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// #679 review: a supplied linked `rag-rat.toml` edit routes to the WHOLE-delta overlay pass (not
+/// the path-scoped one), so a branch target-config change is reconciled immediately — a file the
+/// branch now targets (but the base never indexed) appears in the overlay. The path-scoped route
+/// alone would no-op on the config file (not a source target) and leave the drift for a later
+/// sweep.
+#[test]
+fn reindex_paths_reconciles_target_drift_on_a_linked_config_edit() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::create_dir_all(main.join("extra")).unwrap();
+    fs::write(main.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+    fs::write(main.join("extra/tool.rs"), "pub fn tool_marker() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    // Base config targets ONLY `src`, so extra/tool.rs is never base-indexed.
+    let base_config = source_config_dirs(main.clone(), Language::Rust, &["src"]);
+    let _ = IndexDatabase::rebuild(&base_config).unwrap();
+    assert_eq!(overlay_rows(&base_config, "extra/tool.rs"), 0, "extra/ is not a base target");
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // The branch edits its config to ADD `extra` as a target (read on-disk by the overlay pass).
+    fs::write(
+        linked.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\", \"extra\"]\n",
+    )
+    .unwrap();
+
+    // Supply the CONFIG file — must route to the whole-delta drift reconcile, not the path-scoped
+    // route (which would no-op on rag-rat.toml).
+    crate::watch::reindex_paths(&base_config, &[linked.join("rag-rat.toml")], |_| {}).unwrap();
+
+    assert!(
+        overlay_rows(&base_config, "extra/tool.rs") >= 1,
+        "a branch config edit that re-targets extra/ is reconciled in the overlay (#679 review)",
     );
 
     let _ = fs::remove_dir_all(&main);
@@ -218,7 +454,7 @@ fn reindex_paths_routes_a_deleted_linked_path_whose_parent_dir_is_also_gone() {
         "the deleted linked path must not fall through to the base pass"
     );
     assert_eq!(
-        partition.linked_roots.len(),
+        partition.linked.len(),
         1,
         "it routes to the linked overlay via the surviving ancestor",
     );
@@ -237,6 +473,17 @@ fn file_rows(config: &Config, path: &str, commit_sha_pred: &str) -> i64 {
         |row| row.get::<_, i64>(0),
     )
     .unwrap()
+}
+
+/// Count non-deleted OVERLAY rows (`worktree_id != ''`) for `path` — a linked worktree's overlay
+/// scope. Zero ⇒ the base row shows through (the path was not shadowed).
+fn overlay_rows(config: &Config, path: &str) -> i64 {
+    file_rows(config, path, "worktree_id != '' AND kind != 'deleted'")
+}
+
+/// Count OVERLAY tombstone rows (`worktree_id != ''`, `kind = 'deleted'`) for `path`.
+fn deleted_overlay_rows(config: &Config, path: &str) -> i64 {
+    file_rows(config, path, "worktree_id != '' AND kind = 'deleted'")
 }
 
 #[test]

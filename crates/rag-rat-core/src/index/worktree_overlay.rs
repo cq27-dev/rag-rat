@@ -523,22 +523,7 @@ impl IndexDatabase {
             // worktree writes nothing (idle-safety, like the readable sha-skip).
             let mut tombstoned = 0;
             for path in &delta.tombstones {
-                let exists: bool = self.storage.connection().query_row(
-                    // Direct `main.files` probe → explicit `repo_id` (A3) + `generation` (A6)
-                    // predicates: only a tombstone at THIS connection's live generation suppresses
-                    // the write — a superseded generation's copy does not hide the path.
-                    "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
-                     commit_sha = '' AND worktree_id = ?3 AND kind = 'deleted' AND generation = \
-                     ?4)",
-                    params![
-                        self.active_repo_id,
-                        path_string(path),
-                        worktree_id,
-                        self.active_generation
-                    ],
-                    |row| row.get(0),
-                )?;
-                if !exists {
+                if !self.overlay_tombstone_exists(path, &worktree_id)? {
                     self.write_tombstone_in_scope(path, &worktree_id)?;
                     tombstoned += 1;
                 }
@@ -581,6 +566,213 @@ impl IndexDatabase {
             pruned,
             status_complete: delta.status_complete,
         })
+    }
+
+    /// Index EXACTLY the supplied `paths` of a linked worktree as overlay rows — the PATH-SCOPED
+    /// twin of [`Self::index_worktree_overlay`] (#679), so a linked-worktree `index --paths`
+    /// (the edit hook) refreshes just those paths' overlay rows instead of the checkout's WHOLE
+    /// base↔branch delta. Mirrors the base `IndexMode::Paths` exact-path semantics on the
+    /// linked route: a single-file edit no longer pulls in unrelated in-flight changes
+    /// elsewhere in the same worktree, and pays no full tree-diff / status walk.
+    ///
+    /// Each supplied path is categorized against the LINKED checkout + branch config: present +
+    /// target-matching → readable (indexed with the branch identity; the identity-skip in
+    /// [`Self::index_explicit_paths_from_root`] keeps an unchanged file write-free); absent, OR
+    /// present but no longer targeted by the branch config, while the BASE scope still has a live
+    /// row → tombstone (shadow that base row); nothing to shadow otherwise.
+    ///
+    /// Does NOT prune (a partial path set is not authoritative over the whole overlay — pruning
+    /// would delete valid rows for the paths it didn't inspect) and reports `status_complete =
+    /// false`, so the caller ([`crate::watch::reindex_paths`]) clears the overlay basis and the
+    /// next full sweep reconciles anything else in the worktree. The supplied-manifest
+    /// package-map refresh stays the caller's job (via `refresh_worktree_overlay_packages`),
+    /// exactly as on the whole-delta route. No-op (empty `worktree_id`) when `linked_path` is
+    /// not a valid linked sibling. Leaves the connection scoped to the overlay.
+    pub fn index_worktree_overlay_paths<F>(
+        &mut self,
+        config: &Config,
+        linked_path: &Path,
+        paths: &[PathBuf],
+        progress: &mut F,
+    ) -> anyhow::Result<WorktreeOverlayReport>
+    where
+        F: FnMut(IndexProgress),
+    {
+        let Some((base_sha, worktree_id, source_root)) =
+            resolve_overlay_scope(config, linked_path)?
+        else {
+            return Ok(WorktreeOverlayReport::default());
+        };
+        self.set_context(&base_sha, &worktree_id)?;
+        // Classify each supplied path with the SAME symlink-safe, ignore-aware guards the base
+        // `IndexMode::Paths` walker applies (#659), since a supplied path may be arbitrary (a
+        // crafted `..`-escape, a symlink-crossing spelling, or an ignored file) — reuse the
+        // shared primitives (`lexically_normalized_within_root` / `resolves_within_root` /
+        // `path_crosses_symlink`) rather than a naive `is_file()`, so this route can't
+        // drift from the base one. `ignore` is the LINKED checkout's matcher (a branch
+        // `.gitignore` governs the overlay's indexable set), recompiled per call so a
+        // branch ignore edit takes effect immediately.
+        let canonical_source = source_root.canonicalize().unwrap_or_else(|_| source_root.clone());
+        let ignore =
+            ignore_rules::IgnoreMatcher::compile(&source_root, &config.target_directories());
+        // Present + indexable = a regular, in-root, non-symlink-crossed, NON-ignored file the
+        // branch config targets — the base walker's exact set. A closure so the same check
+        // RE-VALIDATES a removal inside the transaction (below), where the write lock is
+        // held.
+        let is_present_indexable = |rel: &Path, full: &Path| {
+            resolves_within_root(full, &canonical_source)
+                && !path_crosses_symlink(&source_root, rel)
+                && full.is_file()
+                && !ignore.is_ignored(full, false)
+                && target_for_path(config, rel).is_some()
+        };
+        let mut readable = Vec::new();
+        let mut tombstones = Vec::new();
+        let mut removal_candidates = Vec::new();
+        for path in paths {
+            // Rebase to the config-root-relative key (the spelling every overlay row + target match
+            // uses), retrying against the CANONICAL source root for a symlinked spelling; then
+            // reject a `..`-escape. A path not under the source root is dropped
+            // (defensive).
+            let raw = match path.strip_prefix(&source_root) {
+                Ok(rel) => rel.to_path_buf(),
+                Err(_) => {
+                    let Some(rel) = canonicalize_nearest_ancestor(path).and_then(|canonical| {
+                        canonical.strip_prefix(&canonical_source).ok().map(Path::to_path_buf)
+                    }) else {
+                        continue;
+                    };
+                    rel
+                },
+            };
+            let Some(rel) = lexically_normalized_within_root(&raw) else { continue };
+            let full = source_root.join(&rel);
+            if is_present_indexable(&rel, &full) {
+                readable.push(rel);
+            } else if self.base_scope_has_path(&base_sha, &rel)? {
+                // Non-indexable (delete / ignored-now / de-targeted / symlink-replaced) but the
+                // base still has a row → shadow it with a tombstone (mirrors the whole-delta
+                // overlay). Carry `full` so the write RE-VALIDATES under the write lock, like
+                // removals.
+                tombstones.push((rel, full));
+            } else {
+                // Non-indexable AND no base row to shadow: a BRANCH-ONLY file. If it was overlay-
+                // indexed, its stale row must be REMOVED (the whole-delta prune does this; a
+                // path-scoped pass skips the prune). Deferred to the transaction, where existence +
+                // non-indexability are RE-VALIDATED under the write lock (#679 review).
+                removal_candidates.push((rel, full));
+            }
+        }
+        let scope = FileScope::worktree(worktree_id.clone());
+        // ONE transaction (see `index_worktree_overlay` for the rationale): index the readable set,
+        // write tombstones, then the gated logical-symbol/edge/FTS refresh. BEGIN IMMEDIATE up
+        // front; ROLLBACK on any error.
+        self.storage.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> anyhow::Result<(usize, usize, usize)> {
+            let indexed = self.index_explicit_paths_from_root(
+                config,
+                &source_root,
+                &readable,
+                &scope,
+                progress,
+            )?;
+            let mut tombstoned = 0;
+            for (rel, full) in &tombstones {
+                // RE-VALIDATE under the write lock (like removals): if the file was recreated /
+                // became indexable after classification, do NOT write a tombstone that would hide
+                // the now-valid content — `BEGIN IMMEDIATE` freezes DB writers, not
+                // the filesystem. The next full sweep reconciles the recreated file
+                // (#679 review).
+                if !is_present_indexable(rel, full)
+                    && !self.overlay_tombstone_exists(rel, &worktree_id)?
+                {
+                    self.write_tombstone_in_scope(rel, &worktree_id)?;
+                    tombstoned += 1;
+                }
+            }
+            // Targeted removal of stale branch-only overlay rows — the per-path equivalent of the
+            // whole-delta prune this scoped pass skips. RE-VALIDATED here under the write lock
+            // (BEGIN IMMEDIATE froze other writers): only remove a still-non-indexable path whose
+            // overlay row still exists, so a concurrent heal that re-indexed the path (it
+            // reappeared) between classification and now can't have its fresh row
+            // deleted (#679 review).
+            let mut pruned = 0;
+            for (rel, full) in &removal_candidates {
+                if !is_present_indexable(rel, full)
+                    && self.overlay_source_row_exists(rel, &worktree_id)?
+                {
+                    self.remove_file_in_scope(rel, "", &worktree_id)?;
+                    pruned += 1;
+                }
+            }
+            // No global prune: a partial path set is not authoritative over the whole overlay. The
+            // supplied-manifest package refresh is the caller's job, so `manifest_changed = false`.
+            self.finalize_overlay_refresh(
+                &source_root,
+                &worktree_id,
+                indexed,
+                tombstoned,
+                pruned,
+                false,
+            )?;
+            Ok((indexed, tombstoned, pruned))
+        })();
+        let (indexed, tombstoned, pruned) = match result {
+            Ok(counts) => {
+                self.storage.execute_batch("COMMIT")?;
+                counts
+            },
+            Err(err) => {
+                let _ = self.storage.execute_batch("ROLLBACK");
+                return Err(err);
+            },
+        };
+        Ok(WorktreeOverlayReport {
+            worktree_id,
+            indexed,
+            tombstoned,
+            pruned,
+            // A path-scoped pass never fully reconciles the overlay — signal incomplete so the
+            // caller clears the basis and the next full sweep reconciles the rest
+            // (#679).
+            status_complete: false,
+        })
+    }
+
+    /// Whether a live (non-deleted) OVERLAY source row for `path` exists in `worktree_id`'s scope —
+    /// the gate for removing a now-non-indexable BRANCH-ONLY overlay row that has no base row to
+    /// shadow (#679). Distinct from [`Self::base_scope_has_path`] (which probes the base scope).
+    fn overlay_source_row_exists(&self, path: &Path, worktree_id: &str) -> anyhow::Result<bool> {
+        Ok(self.storage.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
+             commit_sha = '' AND worktree_id = ?3 AND kind != 'deleted' AND generation = ?4)",
+            params![self.active_repo_id, path_string(path), worktree_id, self.active_generation],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Whether a live-generation tombstone for `path` already exists in `worktree_id`'s overlay
+    /// scope — the idle-safe guard before writing one, so a re-run on a static worktree writes
+    /// nothing. A direct `main.files` probe with explicit `repo_id` (A3) + `generation` (A6)
+    /// predicates: only a tombstone at THIS connection's live generation suppresses the write.
+    fn overlay_tombstone_exists(&self, path: &Path, worktree_id: &str) -> anyhow::Result<bool> {
+        Ok(self.storage.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
+             commit_sha = '' AND worktree_id = ?3 AND kind = 'deleted' AND generation = ?4)",
+            params![self.active_repo_id, path_string(path), worktree_id, self.active_generation],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Whether the BASE scope has a live (non-deleted) row for `path` at `base_sha` — the gate for
+    /// shadowing a base row with an overlay tombstone (there is nothing to shadow otherwise).
+    fn base_scope_has_path(&self, base_sha: &str, path: &Path) -> anyhow::Result<bool> {
+        Ok(self.storage.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
+             commit_sha = ?3 AND worktree_id = '' AND kind != 'deleted' AND generation = ?4)",
+            params![self.active_repo_id, path_string(path), base_sha, self.active_generation],
+            |row| row.get(0),
+        )?)
     }
 
     /// Refresh JUST the linked overlay's package/import scope (and re-resolve its edges against the

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -304,22 +304,41 @@ where
     let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
     let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
 
-    let WorktreePartition { base_paths, linked_roots, manifest_roots } =
+    let WorktreePartition { base_paths, linked, manifest_roots } =
         partition_paths_by_worktree(config, paths);
     // Always run the base pass: it opens the db (returned for status + the overlay refresh) and
     // enforces #427. With no base paths it is a no-op scoped pass over an empty change set.
     let mut db = IndexDatabase::index_paths_with_progress(config, &base_paths, &mut progress)?;
-    for checkout in &linked_roots {
-        // Index each touched checkout's overlay with the LINKED branch's OWN targets (a branch that
-        // adds/narrows targets must be indexed by its own config). `?` PROPAGATES a failure — the
-        // caller (an edit hook) must be able to tell the reindex did not land and retry.
+    for (checkout, checkout_paths) in &linked {
+        // Index EXACTLY the supplied paths of each touched checkout's overlay (#679), with the
+        // LINKED branch's OWN targets (a branch that adds/narrows targets must be indexed
+        // by its own config). Path-scoped, not the whole base↔branch delta: a single-file
+        // linked edit no longer pulls in unrelated in-flight changes in the same worktree —
+        // the base `Paths` exact-path semantics on the linked route. `?` PROPAGATES a
+        // failure — the caller (an edit hook) must be able to tell the reindex did not land
+        // and retry.
+        //
+        // EXCEPT a branch `rag-rat.toml` edit: a config change can re-language / add / drop targets
+        // across the WHOLE overlay (not just the supplied file, which is not itself a source
+        // target), so it is inherently NOT path-scopable — run the whole-delta pass, which includes
+        // the target-fingerprint-gated `overlay_target_config_reconcile` (#679 review). Config
+        // edits are rare, so paying the full tree-diff there is fine.
         let overlay_config = config.for_linked_worktree_overlay(checkout);
-        let report = db.index_worktree_overlay(&overlay_config, checkout, &mut progress)?;
-        // A PARTIAL status read (`status_complete = false`) may have missed the supplied
-        // uncommitted edit, yet returns Ok — so, like the watcher, CLEAR this worktree's overlay
-        // basis so a later scoped pass re-refreshes it instead of skipping on a still-matching
-        // basis. Otherwise `index --paths` would report success while leaving the branch stale
-        // (#659 review).
+        let touches_config = checkout_paths.iter().any(|path| is_config_path(path));
+        let report = if touches_config {
+            db.index_worktree_overlay(&overlay_config, checkout, &mut progress)?
+        } else {
+            db.index_worktree_overlay_paths(
+                &overlay_config,
+                checkout,
+                checkout_paths,
+                &mut progress,
+            )?
+        };
+        // A path-scoped pass is never a complete overlay refresh (`status_complete = false`), so —
+        // like the watcher on a partial read — CLEAR this worktree's overlay basis so the next full
+        // sweep re-refreshes anything else in the branch instead of skipping on a still-matching
+        // basis (#659/#679).
         if !report.status_complete && !report.worktree_id.is_empty() {
             let _ = db.clear_worktree_overlay_basis(&report.worktree_id);
         }
@@ -331,22 +350,37 @@ where
             db.refresh_worktree_overlay_packages(&overlay_config, checkout)?;
         }
     }
-    // `index_worktree_overlay` / the manifest refresh leave the connection scoped to the LAST
-    // overlay; restore the base scope so the returned db reads base-scoped status.
-    if !linked_roots.is_empty() {
+    // The overlay passes / the manifest refresh leave the connection scoped to the LAST overlay;
+    // restore the base scope so the returned db reads base-scoped status.
+    if !linked.is_empty() {
         let (base_sha, base_id) = crate::index::resolve_git_context(&config.root);
         db.set_context(&base_sha, &base_id)?;
     }
     Ok(db)
 }
 
+/// Whether `path` is a package manifest (`Cargo.toml`) — a file the scoped reindex refreshes the
+/// package map for (see [`reindex_paths`]'s manifest handling), but that the file watcher's event
+/// filter (configured targets + `.gitignore`) never fires on. The PostToolUse edit hook uses this
+/// to still reindex a manifest edit when a watcher is live — the watcher would silently miss it.
+pub fn is_manifest_path(path: &Path) -> bool {
+    path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml"))
+}
+
+/// Whether `path` is a `rag-rat.toml` config file. A branch config edit can re-language / add /
+/// drop targets across the whole overlay, so `reindex_paths` routes it to the WHOLE-delta overlay
+/// pass (which runs the target-drift reconcile) rather than the path-scoped one (#679).
+fn is_config_path(path: &Path) -> bool {
+    path.file_name() == Some(std::ffi::OsStr::new("rag-rat.toml"))
+}
+
 /// Candidate paths split by which checkout owns them (see [`partition_paths_by_worktree`]).
 pub(crate) struct WorktreePartition {
     /// Paths under the base checkout (and non-git trees) — the scoped base pass reconciles these.
     pub(crate) base_paths: Vec<PathBuf>,
-    /// Live linked-worktree checkout roots any supplied path lives under — each gets an overlay
-    /// pass.
-    pub(crate) linked_roots: BTreeSet<PathBuf>,
+    /// Live linked-worktree checkout root → the supplied paths under it. Each root gets a
+    /// PATH-SCOPED overlay pass over exactly its paths (#679), not the whole checkout delta.
+    pub(crate) linked: BTreeMap<PathBuf, Vec<PathBuf>>,
     /// Linked checkout roots that had a supplied `Cargo.toml`. Their overlay package map must be
     /// refreshed even for a CLEAN/committed manifest — the overlay's own signal is status-derived
     /// (dirty-only), so this carries the base flow's supplied-manifest signal to the linked route.
@@ -358,14 +392,7 @@ pub(crate) struct WorktreePartition {
 /// non-git trees and paths already under the base checkout — is a base path. The linked roots are
 /// the [`crate::index::live_worktree_contexts`] spellings (canonicalized, base excluded), so the
 /// base pass and the overlay refresh key on the exact same identities the rest of the engine uses.
-/// Whether `path` is a package manifest (`Cargo.toml`) — a file the scoped reindex refreshes the
-/// package map for (see [`reindex_paths`]'s manifest handling), but that the file watcher's event
-/// filter (configured targets + `.gitignore`) never fires on. The PostToolUse edit hook uses this
-/// to still reindex a manifest edit when a watcher is live — the watcher would silently miss it.
-pub fn is_manifest_path(path: &Path) -> bool {
-    path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml"))
-}
-
+/// Each linked path is bucketed under its root so the overlay pass reconciles exactly those paths.
 pub(crate) fn partition_paths_by_worktree(config: &Config, paths: &[PathBuf]) -> WorktreePartition {
     let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
     let base = enclosing_worktree_id(&config.root);
@@ -373,7 +400,7 @@ pub(crate) fn partition_paths_by_worktree(config: &Config, paths: &[PathBuf]) ->
         worktrees.into_iter().filter(|w| *w != base).map(PathBuf::from).collect();
     let mut partition = WorktreePartition {
         base_paths: Vec::new(),
-        linked_roots: BTreeSet::new(),
+        linked: BTreeMap::new(),
         manifest_roots: BTreeSet::new(),
     };
     for path in paths {
@@ -382,7 +409,7 @@ pub(crate) fn partition_paths_by_worktree(config: &Config, paths: &[PathBuf]) ->
                 if is_manifest_path(path) {
                     partition.manifest_roots.insert(root.clone());
                 }
-                partition.linked_roots.insert(root);
+                partition.linked.entry(root).or_default().push(path.clone());
             },
             None => partition.base_paths.push(path.clone()),
         }

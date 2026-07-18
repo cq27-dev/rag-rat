@@ -254,11 +254,7 @@ pub(crate) fn explicit_index_files_and_changes(
         // a symlinked component; a missing leaf simply isn't a symlink. `relative` is
         // lexically normalized (Normal components only), so walking it from the root
         // reconstructs the real ancestor chain (#659 review).
-        let mut probe = config.root.clone();
-        let crosses_symlink = relative.components().any(|component| {
-            probe.push(component);
-            probe.symlink_metadata().is_ok_and(|meta| meta.file_type().is_symlink())
-        });
+        let crosses_symlink = path_crosses_symlink(&config.root, &relative);
         // A path that ESCAPES the root, CROSSES a symlink, or is not a regular file is NOT
         // indexable; an existing indexed row for one (a regular file since replaced by a
         // symlink, in- or out-of-repo) still falls through to the deletion branch below and
@@ -322,7 +318,7 @@ pub(crate) fn explicit_index_files_and_changes(
 /// produce the CANONICAL RELATIVE SPELLING used for target/dirty/persistence so `src/../src/a.rs`
 /// collapses to `src/a.rs` and `src/../outside.rs` to `outside.rs` (then dropped by the target
 /// filter).
-fn lexically_normalized_within_root(relative: &Path) -> Option<PathBuf> {
+pub(crate) fn lexically_normalized_within_root(relative: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for component in relative.components() {
         match component {
@@ -341,9 +337,23 @@ fn lexically_normalized_within_root(relative: &Path) -> Option<PathBuf> {
 /// Whether `full_path` stays under `canonical_root` after resolving `..` and symlinks. Rejects both
 /// `..`-escapes and in-repo-symlink escapes; the lexical prefix check alone would accept both.
 /// Rejects a path where nothing on the chain resolves (containment unverifiable).
-fn resolves_within_root(full_path: &Path, canonical_root: &Path) -> bool {
+pub(crate) fn resolves_within_root(full_path: &Path, canonical_root: &Path) -> bool {
     canonicalize_nearest_ancestor(full_path)
         .is_some_and(|canonical| canonical.starts_with(canonical_root))
+}
+
+/// Whether walking `relative` (a lexically-normalized, root-relative path) from `root` crosses a
+/// SYMLINK at any component — the leaf (`src/link.rs`) OR an ancestor directory (`src/link/a.rs`).
+/// `symlink_metadata` per ancestor does NOT follow, so it catches a symlinked component. A supplied
+/// path that crosses a symlink is not indexable: it would write an index row under a spelling the
+/// full/discover walker (which skips symlink entries) never produces. Shared by the base explicit
+/// flow and the linked path-scoped overlay so both reject the same symlink spellings (#659/#679).
+pub(crate) fn path_crosses_symlink(root: &Path, relative: &Path) -> bool {
+    let mut probe = root.to_path_buf();
+    relative.components().any(|component| {
+        probe.push(component);
+        probe.symlink_metadata().is_ok_and(|meta| meta.file_type().is_symlink())
+    })
 }
 
 /// Canonicalize `path` by canonicalizing its nearest EXISTING ancestor (the file — or even its
