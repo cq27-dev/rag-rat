@@ -133,6 +133,41 @@ fn extract_search_ignores_other_tools() {
     assert!(extract_search(&input).is_none());
 }
 
+// ─── PostToolUse edited-path extraction (#661) ──────────────────────────────
+
+#[test]
+fn extract_edited_paths_pulls_file_path_from_the_edit_tools() {
+    for tool in ["Write", "Edit", "MultiEdit"] {
+        let json = format!(
+            r#"{{"hook_event_name":"PostToolUse","tool_name":"{tool}",
+                "tool_input":{{"file_path":"/repo/src/lib.rs"}}}}"#,
+        );
+        let input: HookInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            extract_edited_paths(&input),
+            vec![PathBuf::from("/repo/src/lib.rs")],
+            "{tool} edited path",
+        );
+    }
+}
+
+#[test]
+fn extract_edited_paths_ignores_non_edit_tools_and_missing_paths() {
+    // A non-edit tool yields nothing — including `apply_patch`, deliberately unscoped (#661).
+    for tool in ["Read", "Grep", "Bash", "apply_patch"] {
+        let json = format!(
+            r#"{{"hook_event_name":"PostToolUse","tool_name":"{tool}",
+                "tool_input":{{"file_path":"/repo/x.rs"}}}}"#,
+        );
+        let input: HookInput = serde_json::from_str(&json).unwrap();
+        assert!(extract_edited_paths(&input).is_empty(), "{tool} must not trigger a reindex");
+    }
+    // An edit tool with no file_path (malformed payload) is a silent no-op, not a panic.
+    let json = r#"{"hook_event_name":"PostToolUse","tool_name":"Write","tool_input":{}}"#;
+    let input: HookInput = serde_json::from_str(json).unwrap();
+    assert!(extract_edited_paths(&input).is_empty());
+}
+
 // ─── format_digest ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]

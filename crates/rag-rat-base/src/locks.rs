@@ -327,6 +327,34 @@ pub fn papertrail_marker_lock_path(database: &Path, repo_id: &str) -> PathBuf {
         .join(format!("rag-rat-papertrail-{}.pending.lock", lock_discriminator(repo_id)))
 }
 
+/// Per-DB, PER-REPO edit-driven reindex flight lock (#661), held by the one detached
+/// `rag-rat edit-reindex` runner for its whole scoped pass so a burst of PostToolUse edit hooks
+/// coalesces into a single scoped reindex instead of N serialized multi-second processes. Keyed by
+/// `repo_id` (A6) like [`write_lock_path`]. Separate from [`maintenance_lock_path`] and the write
+/// lock — it only serializes the edit-hook runners; the scoped pass still takes the write lock
+/// (with a timeout, never blocking) internally.
+pub fn edit_reindex_lock_path(database: &Path, repo_id: &str) -> PathBuf {
+    lock_dir(database).join(format!("rag-rat-edit-reindex-{}.lock", lock_discriminator(repo_id)))
+}
+
+/// Marker into which a coalesced edit-reindex trigger merges its edited path(s), pairing with
+/// [`edit_reindex_lock_path`] under the shared [`crate::single_flight`] coordinator (#660/#661).
+/// The CONTENT is the newline-joined UNION of edited paths, merged set-union so a runner covers
+/// every path queued while it was mid-pass. Every read-modify-write runs under
+/// [`edit_reindex_marker_lock_path`].
+pub fn edit_reindex_pending_path(database: &Path, repo_id: &str) -> PathBuf {
+    lock_dir(database).join(format!("rag-rat-edit-reindex-{}.pending", lock_discriminator(repo_id)))
+}
+
+/// Serializes every read-modify-write of the edit-reindex pending marker, pairing with
+/// [`edit_reindex_pending_path`]. Distinct from [`edit_reindex_lock_path`] — the RUNNER holds that
+/// one for the whole scoped pass, while this lock is held only for the microseconds of one marker
+/// update (runner and contenders alike), so contenders never wait on the pass.
+pub fn edit_reindex_marker_lock_path(database: &Path, repo_id: &str) -> PathBuf {
+    lock_dir(database)
+        .join(format!("rag-rat-edit-reindex-{}.pending.lock", lock_discriminator(repo_id)))
+}
+
 /// Order two repo ids by the CANONICAL LOCK ORDER (see the module doc): lexicographic on the
 /// sanitized discriminator, i.e. the order of the lock FILE NAMES themselves. Multi-lock
 /// acquirers sort with this before acquiring. Ties (same discriminator — same repo) are the

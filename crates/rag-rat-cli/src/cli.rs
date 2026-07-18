@@ -43,6 +43,12 @@ pub(crate) enum Command {
     #[command(hide = true)]
     AgentHook,
 
+    /// Internal: the detached edit-driven reindex runner (#661), spawned by the PostToolUse edit
+    /// hook. Coalesces a burst of edits via the single-flight and runs one scoped structural
+    /// reindex of the supplied paths. Not for direct use — the hook backgrounds it.
+    #[command(hide = true)]
+    EditReindex(EditReindexArgs),
+
     /// Index the repository (default: changed files only).
     Index(IndexArgs),
 
@@ -180,6 +186,17 @@ pub(crate) struct IndexArgs {
     /// registering the repo with empty content instead of erroring. Default: refuse (#427).
     #[arg(long)]
     pub allow_empty: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct EditReindexArgs {
+    /// The edited absolute path(s) to reconcile (the PostToolUse hook supplies these).
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    pub paths: Vec<std::path::PathBuf>,
+    /// The session working directory to discover the repo config from (the hook's `cwd`, so a
+    /// linked-worktree edit resolves the same config the hook gated on).
+    #[arg(long, value_name = "DIR")]
+    pub cwd: std::path::PathBuf,
 }
 
 #[derive(Debug, Args)]

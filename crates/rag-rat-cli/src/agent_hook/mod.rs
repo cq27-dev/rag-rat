@@ -1,9 +1,14 @@
-//! `rag-rat agent-hook`: the coding-agent hook client (PreToolUse + SessionStart). Harness-neutral
-//! — Claude Code, Codex, and Cursor all use the same `hook_event_name` / `tool_name` / `tool_input`
-//! input and the same `hookSpecificOutput.additionalContext` output, so one entrypoint serves all.
+//! `rag-rat agent-hook`: the coding-agent hook client (PreToolUse + PostToolUse + SessionStart).
+//! Harness-neutral — Claude Code, Codex, and Cursor all use the same `hook_event_name` /
+//! `tool_name` / `tool_input` input and the same `hookSpecificOutput.additionalContext` output, so
+//! one entrypoint serves all.
 //!
 //! Reads the hook JSON from stdin and branches on `hook_event_name`:
 //! - `"SessionStart"`: injects a read-only repo orientation digest into the model context.
+//! - `"PostToolUse"`: after an edit tool completes, triggers a scoped reindex of the edited path(s)
+//!   in a DETACHED child (`edit_reindex`), watcher-aware — see [`posttooluse`]. Scoped to Claude
+//!   Code, whose PostToolUse carries the edited `file_path` (Codex's `apply_patch` PostToolUse
+//!   fires before the write lands, and Cursor's payload is unpinned, so neither is wired — #661).
 //! - PreToolUse (anything else, or absent): grep-augmentation on `Grep`/`Bash` (asks the elected
 //!   listener or falls back to a direct read-only query), and the write-time clone check on the
 //!   edit tools — `Write`/`Edit`/`MultiEdit` (Claude) and `apply_patch` (Codex/Cursor, whose V4A
@@ -12,10 +17,8 @@
 //! Exit 0 on every path — the hook must never block a tool call or session start.
 
 use std::io::Read as _;
-use std::path::Path;
-// PathBuf (socket_path) and Duration (SOCKET_BUDGET) back the unix-only listener path.
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+// Duration (SOCKET_BUDGET) backs the unix-only listener path.
 #[cfg(unix)]
 use std::time::Duration;
 
@@ -27,6 +30,8 @@ use rag_rat_core::query::grep_augment;
 use rag_rat_core::query::orientation::Orientation;
 use rag_rat_db::storage::IndexConnection;
 use serde::Deserialize;
+
+pub(crate) mod edit_reindex;
 
 /// Skip the write-time clone check above this many fingerprinted functions — but ONLY in the RAM
 /// FALLBACK mode, which builds an in-RAM inverted index over all of them (O(functions)) and so
@@ -296,6 +301,7 @@ fn run_inner() -> anyhow::Result<()> {
     let input: HookInput = serde_json::from_str(&raw).unwrap_or_default();
     match input.hook_event_name.as_deref() {
         Some("SessionStart") => session_start(&input),
+        Some("PostToolUse") => posttooluse(&input),
         _ => pretooluse(&input),
     }
 }
@@ -415,6 +421,112 @@ fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// PostToolUse path (#661): after an edit tool completes, trigger a scoped reindex of the edited
+/// path(s) so an agent-driven repo stays fresh without the FS watcher — precise, watch-free,
+/// cross-OS. Watcher-aware and detached; exits 0 on every path so it never blocks or fails the
+/// agent's tool call.
+fn posttooluse(input: &HookInput) -> anyhow::Result<()> {
+    let paths = extract_edited_paths(input);
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
+    // The scoped `index --paths` mode requires an existing base index (#659/#427) — with no DB
+    // there is nothing to reconcile into yet; the first `rag-rat index` builds it. (Do NOT
+    // open/create it.)
+    if !config.database.is_file() {
+        return Ok(());
+    }
+    // Watcher-live ⇒ no-op: a live MCP watcher for this worktree receives the SAME inotify event
+    // and schedules a debounced pass, so reindexing here would just double the work. Mirrors
+    // the maintenance watcher-state deferral — and is what lets this trigger skip socket
+    // delegation entirely (the only listener that would matter is already handling the edit).
+    if watcher_state(&config).0 {
+        return Ok(());
+    }
+    // No listener ⇒ the hook does the job itself, but DETACHED: a fresh `rag-rat` process is
+    // seconds of fixed overhead, so it must not run inline. The child coalesces burst edits via
+    // the #660 single-flight and takes the write lock with a timeout (never blocking).
+    spawn_detached_reindex(&input.cwd, &paths);
+    Ok(())
+}
+
+/// The edited absolute path(s) to reindex, from a PostToolUse edit-tool payload. `Write` / `Edit` /
+/// `MultiEdit` (Claude Code) all carry a single `tool_input.file_path` (MultiEdit batches edits to
+/// ONE file). Any other tool — including `apply_patch`, whose Codex PostToolUse fires before the
+/// write lands — yields nothing, so the trigger stays scoped to the harness that delivers a usable
+/// post-edit event (#661).
+fn extract_edited_paths(input: &HookInput) -> Vec<PathBuf> {
+    match input.tool_name.as_str() {
+        "Write" | "Edit" | "MultiEdit" => input
+            .tool_input
+            .get("file_path")
+            .and_then(|value| value.as_str())
+            .map(|path| vec![PathBuf::from(path)])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Spawn `rag-rat edit-reindex --cwd <cwd> --paths <paths…>` fully detached and return without
+/// waiting, so the agent's synchronous tool call is never blocked. The child's stdio goes to null
+/// so the harness's captured pipe gets EOF the moment this hook exits (otherwise the harness would
+/// wait on the child's inherited stdout). Detaching so the child OUTLIVES the hook's process tree
+/// is platform-specific: on unix `setsid` moves it into its own session; on Windows creation flags
+/// detach it from the console and, where the launching Job Object permits, break it out of a
+/// kill-on-close job. Best-effort — a spawn failure is swallowed (the next edit / periodic
+/// reconcile catches up).
+fn spawn_detached_reindex(cwd: &str, paths: &[PathBuf]) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("edit-reindex")
+        .arg("--cwd")
+        .arg(cwd)
+        .arg("--paths")
+        .args(paths)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: the pre_exec closure calls only `setsid`, which is async-signal-safe and touches
+        // no inherited allocator/lock state — it just detaches the child into a new session.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        // Fire and forget: the setsid'd child is reparented to init when this hook exits.
+        let _ = command.spawn();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // Nulled stdio + a dropped handle do NOT detach on Windows: the child stays attached to the
+        // hook's console and, if the harness launched the hook inside a kill-on-close Job Object,
+        // dies when that job closes. DETACHED_PROCESS + CREATE_NO_WINDOW drop the console;
+        // CREATE_BREAKAWAY_FROM_JOB escapes the job — but CreateProcess REFUSES it when the job
+        // forbids breakaway, so fall back to console-detached-but-in-job (most harness jobs are not
+        // kill-on-close) rather than not spawning at all.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+        if command.spawn().is_err() {
+            command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+            let _ = command.spawn();
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = command.spawn();
+    }
 }
 
 /// The write-time clone-check size guard, factored out for testing. Skip the check ONLY when the

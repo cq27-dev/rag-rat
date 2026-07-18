@@ -83,6 +83,10 @@ fn main() -> anyhow::Result<()> {
     match &cli.command {
         Cmd::Init(args) => return init::run(args, cli.config.as_deref().unwrap_or("rag-rat.toml")),
         Cmd::AgentHook => return agent_hook::run(),
+        // The detached edit-reindex runner discovers its own config from the hook's cwd (a
+        // not-a-rag-rat-repo cwd is a silent no-op), so it tolerates config absence like
+        // agent-hook.
+        Cmd::EditReindex(args) => return agent_hook::edit_reindex::run(&args.cwd, &args.paths),
         Cmd::Mcp => return run_mcp(cli.config.as_deref(), cli.json),
         Cmd::Doctor(args) => return run_doctor(args, cli.config.as_deref()),
         _ => {},
@@ -99,7 +103,7 @@ fn main() -> anyhow::Result<()> {
     let _log = rag_rat_base::logging::init_logging(&config, log_role(&cli.command));
 
     match cli.command {
-        Cmd::Init(_) | Cmd::AgentHook | Cmd::Mcp | Cmd::Doctor(_) =>
+        Cmd::Init(_) | Cmd::AgentHook | Cmd::EditReindex(_) | Cmd::Mcp | Cmd::Doctor(_) =>
             unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
         Cmd::Query(args) => query(&config, &args)?,

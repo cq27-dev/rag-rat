@@ -62,6 +62,31 @@ fn non_search_tool_means_silent_exit_zero() {
     assert!(stdout.is_empty());
 }
 
+/// #661: a PostToolUse edit with a config but no built index must no-op silently AND must not
+/// create the index (the non-creating DB-absent gate — a stray empty DB would defeat later
+/// `database.exists()` hints).
+#[test]
+fn posttooluse_without_an_index_is_silent_and_non_creating() {
+    let dir = std::env::temp_dir().join(format!("ragrat-hook-post-noindex-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
+    )
+    .unwrap();
+    let input = serde_json::json!({
+        "session_id": "s1", "cwd": dir, "hook_event_name": "PostToolUse",
+        "tool_name": "Write", "tool_input": {"file_path": dir.join("src/new.rs")}
+    });
+    let (stdout, status) = run_hook(&input.to_string(), &dir);
+    assert!(status.success(), "PostToolUse must exit 0 even with no index");
+    assert!(stdout.is_empty(), "PostToolUse prints nothing, got: {stdout}");
+    assert!(!dir.join(".rag-rat/index.sqlite").is_file(), "the hook must not create the index");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Full path: a live `rag-rat mcp` elects the hook listener, the `agent-hook` client reaches it
 /// over the Unix socket and gets the indexed symbol, a repeat in the same session is deduped to
 /// nothing, a fresh session sees it again, and once the server dies the client falls back to a
@@ -270,6 +295,76 @@ fn assert_symbol_indexed(config: &rag_rat_base::config::Config, symbol: &str) {
         .query_row("SELECT COUNT(*) FROM symbols WHERE name = ?1", [symbol], |row| row.get(0))
         .unwrap();
     assert!(count > 0, "index must contain the `{symbol}` symbol or the e2e is vacuous");
+}
+
+#[cfg(unix)]
+fn symbol_indexed(config: &rag_rat_base::config::Config, symbol: &str) -> bool {
+    use rag_rat_db::storage::IndexConnection;
+    let Ok(conn) = IndexConnection::open_read_only(&config.database) else { return false };
+    let count: i64 = conn
+        .connection()
+        .query_row("SELECT COUNT(*) FROM symbols WHERE name = ?1", [symbol], |row| row.get(0))
+        .unwrap_or(0);
+    count > 0
+}
+
+#[cfg(unix)]
+fn wait_for_symbol(config: &rag_rat_base::config::Config, symbol: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if symbol_indexed(config, symbol) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("edited symbol `{symbol}` not indexed within {timeout:?}");
+}
+
+/// #661: the `edit-reindex` runner reconciles exactly the edited file — a deterministic check of the
+/// scoped pass (run to completion, no detach) so the edit provably lands (new symbol in, old out).
+#[cfg(unix)]
+#[test]
+fn edit_reindex_reconciles_the_edited_file() {
+    let repo = TestRepo::indexed_with_symbol();
+    fs::write(repo.root.join("src/lib.rs"), "pub fn added_after_edit_qrs() {}\n").unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_rag-rat"))
+        .arg("edit-reindex")
+        .arg("--cwd")
+        .arg(&repo.root)
+        .arg("--paths")
+        .arg(repo.root.join("src/lib.rs"))
+        .current_dir(&repo.root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(
+        symbol_indexed(&repo.config, "added_after_edit_qrs"),
+        "the edit's new symbol is indexed"
+    );
+    assert!(!symbol_indexed(&repo.config, "frobnicate_xyz"), "the replaced symbol is gone");
+    repo.cleanup();
+}
+
+/// #661 end-to-end: a PostToolUse edit hook returns immediately (exit 0, silent) and backgrounds a
+/// DETACHED scoped reindex that eventually lands the edit. No watcher is live, so the hook does the
+/// job itself.
+#[cfg(unix)]
+#[test]
+fn posttooluse_backgrounds_a_scoped_reindex() {
+    let repo = TestRepo::indexed_with_symbol();
+    fs::write(repo.root.join("src/lib.rs"), "pub fn added_via_hook_tuv() {}\n").unwrap();
+    let input = serde_json::json!({
+        "session_id": "s-post", "cwd": repo.root, "hook_event_name": "PostToolUse",
+        "tool_name": "Edit", "tool_input": {"file_path": repo.root.join("src/lib.rs")}
+    });
+    let (stdout, status) = run_hook(&input.to_string(), &repo.root);
+    assert!(status.success(), "the hook must exit 0");
+    assert!(stdout.is_empty(), "PostToolUse prints nothing, got: {stdout}");
+    // The reindex runs in a detached child; poll until the edit lands.
+    wait_for_symbol(&repo.config, "added_via_hook_tuv", Duration::from_secs(30));
+    repo.cleanup();
 }
 
 #[cfg(unix)]
