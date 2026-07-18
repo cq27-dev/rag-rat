@@ -180,6 +180,12 @@ fn rebase_root_swaps_the_worktree_top_and_preserves_the_index_subdir() {
         rebase_root(Path::new("/main/crates"), Path::new("/main"), Path::new("/linked")),
         Path::new("/linked/crates"),
     );
+    // Config nested below the git root (`/main/project/rag-rat.toml`) + `[index] root = "src"`, in
+    // a linked worktree: the WHOLE suffix (`project/src`) is preserved once, no double-count.
+    assert_eq!(
+        rebase_root(Path::new("/main/project/src"), Path::new("/main"), Path::new("/linked")),
+        Path::new("/linked/project/src"),
+    );
     // config_root not under main_top (unexpected topology): unchanged, never a wrong prefix.
     assert_eq!(
         rebase_root(Path::new("/elsewhere"), Path::new("/main"), Path::new("/linked")),

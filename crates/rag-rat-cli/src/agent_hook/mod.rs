@@ -435,28 +435,31 @@ fn read_augment_hook(input: &HookInput) -> anyhow::Result<()> {
 }
 
 /// The absolute directory that indexed `files.path` are relative to, IN THE SESSION'S checkout.
-/// `config.root` is main-anchored (`Config::load`, #219) and already folds in `[index] root`, so
-/// rebase it: swap its MAIN-worktree-top prefix for the SESSION worktree top (the dir holding the
-/// nearest `rag-rat.toml` at/above cwd). This resolves BOTH a linked-worktree read (main→linked
-/// top) and an `[index] root = "<subdir>"` layout — the subdir survives the rebase (#756 review).
-/// Falls back to `config.root` when either worktree top can't be discovered.
+/// `config.root` is main-anchored (`Config::load`, #219) and already folds in the config's position
+/// under the git root plus `[index] root`.
+///
+/// - In the MAIN worktree (or when no main resolves) `config.root` already IS the session's indexed
+///   root — return it, so `[index] root` and a git-root-nested config are both honored as-is.
+/// - In a LINKED worktree, rebase `config.root` from the MAIN git-worktree root onto the SESSION
+///   git-worktree root. BOTH anchors are git WORKDIR roots (git topology, NOT `rag-rat.toml`
+///   directories), so the whole config-relative suffix — a nested config dir AND `[index] root` —
+///   is preserved exactly once, and a branch-only-config linked worktree (whose main has no config)
+///   still resolves (#756 review).
 fn session_indexed_root(config: &Config, cwd: &str) -> PathBuf {
-    let toml_dir = |p: &Path| {
-        rag_rat_base::config::nearest_config_at_or_above(p)
-            .and_then(|toml| toml.parent().map(Path::to_path_buf))
-    };
-    // `main_top` governs `config.root` (its own toml sits at the main worktree top); `session_top`
-    // is where the session actually is. `config.root = main_top / [index].root`.
-    match (toml_dir(&config.root), toml_dir(Path::new(cwd))) {
-        (Some(main_top), Some(session_top)) => rebase_root(&config.root, &main_top, &session_top),
-        _ => config.root.clone(),
+    let cwd = Path::new(cwd);
+    match rag_rat_base::config::linked_worktree_main_root(cwd) {
+        Some(main_git_root) => match rag_rat_base::config::worktree_root(cwd) {
+            Some(session_git_root) => rebase_root(&config.root, &main_git_root, &session_git_root),
+            None => config.root.clone(),
+        },
+        None => config.root.clone(),
     }
 }
 
-/// Rebase `config_root` from `main_top` onto `session_top`, preserving the `[index] root` subdir
-/// (the part of `config_root` below `main_top`). Pure, so the linked-worktree + subdir-root matrix
-/// is unit-tested without a filesystem. Returns `config_root` unchanged when it isn't under
-/// `main_top` (an unexpected topology — never guess a wrong prefix).
+/// Rebase `config_root` from `main_top` onto `session_top`, preserving the whole suffix below
+/// `main_top` (a git-root-nested config dir AND `[index] root`). Pure, so the linked-worktree ×
+/// nested-config × subdir-root matrix is unit-tested without a filesystem. Returns `config_root`
+/// unchanged when it isn't under `main_top` (an unexpected topology — never guess a wrong prefix).
 fn rebase_root(config_root: &Path, main_top: &Path, session_top: &Path) -> PathBuf {
     match config_root.strip_prefix(main_top) {
         Ok(subdir) => session_top.join(subdir),

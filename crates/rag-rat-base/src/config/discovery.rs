@@ -98,6 +98,16 @@ pub fn linked_worktree_main_root(root: &Path) -> Option<PathBuf> {
     (main != workdir).then_some(main)
 }
 
+/// The git WORKDIR root (checkout top) containing `path`, canonicalized — `None` for a non-git
+/// `path`. The SESSION-side counterpart to [`linked_worktree_main_root`] (which returns the MAIN
+/// checkout's top): both are needed to rebase a main-anchored `config.root` onto the checkout a
+/// session is actually in. Canonicalized so it compares equal to the other topology roots.
+pub fn worktree_root(path: &Path) -> Option<PathBuf> {
+    let repo = crate::repo_discover::discover_repo(path).ok()?;
+    let workdir = repo.workdir()?;
+    Some(workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf()))
+}
+
 pub(crate) fn main_worktree_root(root: &Path) -> Option<PathBuf> {
     let repo = crate::repo_discover::discover_repo(root).ok()?;
     let common_dir = repo.common_dir().canonicalize().ok()?;
