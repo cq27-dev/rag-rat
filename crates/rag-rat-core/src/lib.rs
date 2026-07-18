@@ -1,3 +1,4 @@
+pub mod distill;
 #[cfg(feature = "eval")]
 pub mod eval;
 pub mod fleet;

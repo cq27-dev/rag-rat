@@ -7,6 +7,7 @@
 mod clones;
 mod config_info;
 mod consolidate;
+mod distill;
 #[cfg(feature = "eval")]
 mod dump_verify_packs;
 mod format;
@@ -21,6 +22,7 @@ mod search;
 pub(crate) use clones::{clones, clones_for};
 pub(crate) use config_info::{dump_config, version_check};
 pub(crate) use consolidate::consolidate;
+pub(crate) use distill::distill;
 #[cfg(feature = "eval")]
 pub(crate) use dump_verify_packs::dump_verify_packs;
 pub(crate) use format::{output_format, set_output_format};

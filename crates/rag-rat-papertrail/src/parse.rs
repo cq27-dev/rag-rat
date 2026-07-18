@@ -455,17 +455,19 @@ pub(crate) fn ref_kind_for(provider: Tracker, previous: &str) -> String {
     base
 }
 
+/// The full documented GitHub closing-keyword set, singular forms included ("Fix #5").
+/// DELIBERATELY the intersection semantics: GitLab additionally honors the gerunds
+/// ("Closing"/"Fixing"/"Resolving") and the Implement family — but this shared classifier feeds
+/// COMMIT-tier closer minting for BOTH hosts, and GitHub honors none of those, so widening here
+/// would mint false GitHub closers. Provider-specific keyword sets can ride the provider lane when
+/// it needs them. Exposed so the distill layer's closing-keyword status floor (#703) matches the
+/// exact set the closer-minting tier uses, rather than re-listing (and drifting from) it.
+pub const CLOSING_KEYWORDS: &[&str] =
+    &["fix", "fixes", "fixed", "close", "closes", "closed", "resolve", "resolves", "resolved"];
+
 pub(crate) fn ref_kind(previous: &str) -> String {
     let previous = previous.to_ascii_lowercase();
-    // The full documented GitHub closing-keyword set, singular forms included ("Fix #5").
-    // DELIBERATELY the intersection semantics: GitLab additionally honors the gerunds
-    // ("Closing"/"Fixing"/"Resolving") and the Implement family — but this shared classifier
-    // feeds COMMIT-tier closer minting for both hosts, and GitHub honors none of those, so
-    // widening here would mint false GitHub closers. Provider-specific keyword sets can ride
-    // the provider lane when it needs them.
-    if ["fix", "fixes", "fixed", "close", "closes", "closed", "resolve", "resolves", "resolved"]
-        .contains(&previous.as_str())
-    {
+    if CLOSING_KEYWORDS.contains(&previous.as_str()) {
         "closing".to_string()
     } else if ["reverts", "reverted"].contains(&previous.as_str()) {
         // "Reverts owner/repo#N" — the body GitHub writes into every revert PR: a free PR↔PR

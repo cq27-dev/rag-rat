@@ -90,6 +90,11 @@ libc = "0.2"
 # actual path SEPARATOR — so a literal backslash in a Unix filename is preserved. Used where a path
 # becomes a string for a non-filesystem consumer (a `node`/`npx` command arg, a TOML value).
 path-slash = "0.2"
+# CommonMark parser for distill unit segmentation (#703): `OffsetIter` yields each event with its
+# source byte range, so comment/body text splits into quotable units whose byte spans stay exact for
+# mechanical quote materialization. `default-features = false` drops the unused HTML renderer; only
+# the pull parser + `Options` are used. No `getrandom`/`simd` features.
+pulldown-cmark = { version = "0.13", default-features = false }
 # Async HTTP for the papertrail provider clients (#589). rustls (no system OpenSSL), no default
 # features — the transport is driven on the papertrail module's private runtime at the sync
 # boundary, so nothing else in the tree grows an async dependency.

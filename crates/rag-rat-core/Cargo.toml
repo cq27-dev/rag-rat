@@ -32,6 +32,7 @@ httpdate.workspace = true
 ignore = "0.4.26"
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }
 notify = "8.2.0"
+pulldown-cmark.workspace = true
 rayon.workspace = true
 regex.workspace = true
 rusqlite.workspace = true

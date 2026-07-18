@@ -86,6 +86,11 @@ pub(crate) enum Command {
     /// Tracker papertrail sync.
     Papertrail(PapertrailArgs),
 
+    /// Deterministic distillation of tracker threads into records (#703). Model-free: builds the
+    /// skeleton records + fixing-commit / coalesce / anchor substrate and the work queue; the LLM
+    /// pass that fills root-cause/decision/outcome runs separately.
+    Distill(DistillArgs),
+
     /// Install / uninstall / inspect git hooks and Claude Code hooks.
     Hooks(HooksArgs),
 
@@ -665,6 +670,19 @@ pub(crate) enum PapertrailCommand {
         #[arg(long)]
         full: bool,
     },
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DistillArgs {
+    #[command(subcommand)]
+    pub command: DistillCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum DistillCommand {
+    /// Run the deterministic extraction pass over the mirror: skeleton records, fixing commits,
+    /// coalesced edges, anchor candidates, and the distill queue (model columns left for #704).
+    Extract,
 }
 
 #[derive(Debug, Args)]

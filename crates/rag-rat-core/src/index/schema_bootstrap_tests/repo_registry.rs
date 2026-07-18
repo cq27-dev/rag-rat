@@ -199,6 +199,37 @@ fn register_repo_adopts_the_placeholder() {
     assert_eq!(root, "/src/myrepo");
 }
 
+/// Adoption re-points the distilled-record store (#703): a `papertrail_distill` row seeded under
+/// the `__unassigned__` placeholder must carry the real repo id after registration, or the record
+/// would strand under the retired id and vanish from the active scope.
+#[test]
+fn register_repo_repoints_distill_rows_from_the_placeholder() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    conn.execute(
+        "INSERT INTO papertrail_distill
+             (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+              fix_edge_source, thread_shape, distilled_at_ms, repo_id)
+         VALUES ('github','o/r','issue','5','h',1,'provider','investigation',1,?1)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
+
+    register_repo(
+        &conn,
+        &identity("repo-abc", "myrepo"),
+        Path::new("/src/myrepo"),
+        123,
+        &crate::index::migration_hooks(),
+    )
+    .expect("register");
+
+    let repo_id: String = conn
+        .query_row("SELECT repo_id FROM papertrail_distill WHERE item_key='5'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(repo_id, "repo-abc", "the distill row is re-pointed to the adopted repo id");
+}
+
 /// Re-applying the full schema AFTER adoption must NOT resurrect the `__unassigned__` placeholder.
 /// `schema::apply` re-runs every additive migration (this is the exact path
 /// `IndexDatabase::rebuild` takes via `create_or_migrate` on an already-migrated DB), so the V038

@@ -1325,6 +1325,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_074_ID => Some(74),
             MIGRATION_075_ID => Some(75),
             MIGRATION_076_ID => Some(76),
+            MIGRATION_077_ID => Some(77),
             _ => None,
         })
         .max()
@@ -1410,6 +1411,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_074_ID
             | MIGRATION_075_ID
             | MIGRATION_076_ID
+            | MIGRATION_077_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1492,6 +1494,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_074_ID => migration.checksum != MIGRATION_074_CHECKSUM,
         MIGRATION_075_ID => migration.checksum != MIGRATION_075_CHECKSUM,
         MIGRATION_076_ID => migration.checksum != MIGRATION_076_CHECKSUM,
+        MIGRATION_077_ID => migration.checksum != MIGRATION_077_CHECKSUM,
         _ => false,
     }
 }
@@ -5237,6 +5240,179 @@ pub fn apply_papertrail_distill_substrate(conn: &Connection) -> rusqlite::Result
             ELSE 'open'
         END
         WHERE state_normalized = '';
+        ",
+    )
+}
+
+/// V077 — the distillation RECORD STORE (issue #703): the derived, regenerable
+/// `papertrail_distill` table plus its junction children, thread-keyed edges, work queue, and
+/// run-stats. Consumes the V073 substrate; produced by the #704 LLM pass.
+///
+/// DESIGN INVARIANTS (locked here because these are the costliest columns to change post-landing):
+/// - **Findings-not-facts.** Records are DERIVED and regenerable, never written into trusted
+///   memories. Regeneration identity is `(distill_input_hash, pipeline_version)`; the record row is
+///   replaced in place on its natural key `(repo_id, tracker, project, item_kind, item_key)`.
+/// - **Confidence is provenance FACETS, never a fused label** (a fused high/med/low label does not
+///   discriminate accuracy — measured). Any display label is computed in the read layer.
+/// - **Edges key to the THREAD, not the record row** (`papertrail_distill_edges`), so LWW body
+///   edits / regeneration replace the record while supersession/coalesce/promotion edges survive.
+/// - **Mechanical status floors kept raw** (`revert_override`, `closing_keyword_floor`, and the
+///   `fix_edge_source='none'` no-fix-edge floor); the EFFECTIVE status is computed read-layer with
+///   precedence revert > closing-keyword > no-fix-edge > `outcome_status_model`. Fixing commits are
+///   mechanical (`papertrail_distill_record_commits`), NEVER LLM-emitted.
+/// - **No CSV-in-TEXT**: alternatives / commits / anchors / evidence are junction tables.
+/// - **Anchors born as `sym_<hex>` bindings** (relocation-compatible) with EXACT file paths; no
+///   basename fallback. `epistemic_status_*` makes proposed-not-landed / projected representable.
+///
+/// Additive: CREATE ... IF NOT EXISTS; nothing pre-existing to backfill.
+pub fn apply_distill_record_store(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS papertrail_distill(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL,
+            project TEXT NOT NULL,
+            -- the coalesced work-unit thread; the ISSUE side when an issue<->PR pair is coalesced.
+            item_kind TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            -- regeneration identity: the row is replaced on the natural key when either changes.
+            distill_input_hash TEXT NOT NULL,
+            pipeline_version INTEGER NOT NULL,
+            root_issue TEXT,
+            -- NULL is an HONEST null (no failure, or none established) — not missing data.
+            root_cause TEXT,
+            -- free-text detail in v1; the induced-taxonomy FK is deferred (#705 non-goal).
+            root_cause_class TEXT,
+            decision_chosen TEXT,
+            outcome_summary TEXT,
+            -- MODEL-emitted status (OutcomeStatus::as_db_str). The EFFECTIVE status is computed in
+            -- the read layer: revert_override > closing_keyword_floor > no-fix-edge > this.
+            outcome_status_model TEXT,
+            -- event-factuality (EpistemicStatus): \
+         asserted_landed|projected|proposed_not_landed|superseded.
+            epistemic_status_decision TEXT,
+            epistemic_status_outcome TEXT,
+            -- provenance FACETS (NOT a fused confidence label).
+            fix_edge_source TEXT NOT NULL,               -- FixEdgeSource: provider|text|none
+            quotes_materialized INTEGER NOT NULL DEFAULT 0,
+            anchors_qualified_count INTEGER NOT NULL DEFAULT 0,
+            thread_shape TEXT NOT NULL,                  -- ThreadShape: \
+         investigation|review_stream|thin
+            outcome_claim_verified INTEGER NOT NULL DEFAULT 0,
+            decision_provenance_verified INTEGER NOT NULL DEFAULT 0,
+            -- raw status-floor inputs (precedence applied in the read layer, never here).
+            revert_override INTEGER NOT NULL DEFAULT 0,
+            closing_keyword_floor TEXT,
+            distilled_at_ms INTEGER NOT NULL,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_distill_natural_key
+            ON papertrail_distill(repo_id, tracker, project, item_kind, item_key);
+
+        -- Evidence units: byte-span SELECTIONS with SNAPSHOTTED provenance + a MATERIALIZED quote
+        -- (raw spans dangle under the mirror's per-row LWW body edits).
+        CREATE TABLE IF NOT EXISTS papertrail_distill_evidence(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL, project TEXT NOT NULL,
+            item_kind TEXT NOT NULL, item_key TEXT NOT NULL,
+            field TEXT NOT NULL,                 -- record field supported: \
+         root_cause|decision|outcome
+            source_kind TEXT NOT NULL,           -- 'item' | 'comment'
+            source_id TEXT NOT NULL,
+            byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL,
+            quote TEXT NOT NULL,
+            author TEXT, author_kind TEXT, author_association TEXT,
+            unit_created_at_ms INTEGER,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_papertrail_distill_evidence_thread
+            ON papertrail_distill_evidence(repo_id, tracker, project, item_kind, item_key);
+
+        -- Anchors: index-validated SELECTIONS, born as sym_<hex> bindings; EXACT file paths only.
+        CREATE TABLE IF NOT EXISTS papertrail_distill_anchors(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL, project TEXT NOT NULL,
+            item_kind TEXT NOT NULL, item_key TEXT NOT NULL,
+            anchor_kind TEXT NOT NULL,           -- AnchorKind: \
+         symbol|file|schema_object|crate|config_key
+            logical_symbol_id TEXT,              -- sym_<hex> when anchor_kind='symbol' AND \
+         resolved
+            file_path TEXT,
+            name TEXT NOT NULL,
+            resolved INTEGER NOT NULL DEFAULT 0,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_papertrail_distill_anchors_thread
+            ON papertrail_distill_anchors(repo_id, tracker, project, item_kind, item_key);
+        CREATE INDEX IF NOT EXISTS idx_papertrail_distill_anchors_symbol
+            ON papertrail_distill_anchors(repo_id, logical_symbol_id);
+
+        -- Rejected alternatives (junction; ordinal-stable, no CSV).
+        CREATE TABLE IF NOT EXISTS papertrail_distill_alternatives(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL, project TEXT NOT NULL,
+            item_kind TEXT NOT NULL, item_key TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            alternative TEXT NOT NULL, reason TEXT,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_distill_alternatives_key
+            ON papertrail_distill_alternatives(repo_id, tracker, project, item_kind, item_key, \
+         ordinal);
+
+        -- Fixing commits: MECHANICAL, from the closing edge; outcome.commits is never LLM-emitted.
+        CREATE TABLE IF NOT EXISTS papertrail_distill_record_commits(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL, project TEXT NOT NULL,
+            item_kind TEXT NOT NULL, item_key TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_distill_record_commits_key
+            ON papertrail_distill_record_commits(repo_id, tracker, project, item_kind, item_key, \
+         commit_sha);
+
+        -- Thread-keyed edges: survive record regeneration.
+        CREATE TABLE IF NOT EXISTS papertrail_distill_edges(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL, project TEXT NOT NULL,
+            src_item_kind TEXT NOT NULL, src_item_key TEXT NOT NULL,
+            dst_item_kind TEXT NOT NULL, dst_item_key TEXT NOT NULL,
+            edge_kind TEXT NOT NULL,             -- DistillEdgeKind: coalesced|supersedes|promoted
+            created_at_ms INTEGER NOT NULL,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_distill_edges_key
+            ON papertrail_distill_edges(repo_id, tracker, project, src_item_kind, src_item_key,
+                                        dst_item_kind, dst_item_key, edge_kind);
+
+        -- Work queue: enqueued at mirror sync (cheap SQL), DRAINED only by the dream-lane pass.
+        CREATE TABLE IF NOT EXISTS papertrail_distill_queue(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL, project TEXT NOT NULL,
+            item_kind TEXT NOT NULL, item_key TEXT NOT NULL,
+            enqueued_at_ms INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            raw_reply TEXT,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_distill_queue_key
+            ON papertrail_distill_queue(repo_id, tracker, project, item_kind, item_key);
+
+        -- Per-run stats: the #704 verification bar (output-ladder rung + gate counters).
+        CREATE TABLE IF NOT EXISTS papertrail_distill_runs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at_ms INTEGER NOT NULL,
+            threads INTEGER NOT NULL DEFAULT 0,
+            rung_guided INTEGER NOT NULL DEFAULT 0,
+            rung_serde INTEGER NOT NULL DEFAULT 0,
+            rung_unguided INTEGER NOT NULL DEFAULT 0,
+            rung_tolerant INTEGER NOT NULL DEFAULT 0,
+            failed INTEGER NOT NULL DEFAULT 0,
+            stats_json TEXT,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
         ",
     )
 }

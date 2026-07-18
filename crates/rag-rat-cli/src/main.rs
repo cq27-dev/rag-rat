@@ -115,6 +115,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Memory(args) => memory(&config, &args)?,
         Cmd::Dream(args) => dream(&config, &args)?,
         Cmd::Papertrail(args) => papertrail(&config, &args)?,
+        Cmd::Distill(args) => distill(&config, &args)?,
         Cmd::Hooks(args) => hooks(&config, &args)?,
         Cmd::Maintenance(args) => maintenance(&config, &args)?,
         Cmd::Models(args) => models(&config, &args)?,

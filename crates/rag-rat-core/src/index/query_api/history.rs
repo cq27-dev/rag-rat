@@ -171,12 +171,14 @@ impl IndexDatabase {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("index has no source_root metadata; rebuild required");
         };
-        papertrail::block_on(papertrail::sync_mirror(
+        let report = papertrail::block_on(papertrail::sync_mirror(
             self.storage.connection(),
             root,
             full,
             &self.papertrail,
-        ))
+        ))?;
+        self.distill_enqueue_after_sync();
+        Ok(report)
     }
 
     /// Mirror only the bindings the scheduling policy says are due (the automatic watcher / hook
@@ -193,12 +195,39 @@ impl IndexDatabase {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("index has no source_root metadata; rebuild required");
         };
-        papertrail::block_on(papertrail::sync_mirror_scheduled(
+        let report = papertrail::block_on(papertrail::sync_mirror_scheduled(
             self.storage.connection(),
             root,
             &self.papertrail,
             request,
-        ))
+        ))?;
+        self.distill_enqueue_after_sync();
+        Ok(report)
+    }
+
+    /// Enqueue newly eligible threads into the distill work-list after a mirror pass. Cheap SQL
+    /// that RIDES sync; the expensive extraction + LLM DRAIN is the #704 dream-lane pass and
+    /// never runs here. Best-effort: a distill-enqueue failure must not fail the mirror sync
+    /// that succeeded, so it is logged and swallowed (the next sync re-enqueues; nothing is
+    /// lost).
+    fn distill_enqueue_after_sync(&self) {
+        if let Err(err) = crate::distill::enqueue_eligible(self.storage.connection()) {
+            tracing::warn!("distill enqueue after papertrail sync failed: {err:#}");
+        }
+    }
+
+    /// Run the deterministic distill extraction over the mirror (#703): skeleton records +
+    /// fixing-commit / coalesce / anchor junctions + queue entries, with the model columns left
+    /// NULL for the #704 pass to fill. Model-free and idempotent.
+    pub fn distill_extract(&self) -> anyhow::Result<crate::distill::ExtractReport> {
+        // The source root lets anchor mining fall back to a live gix first-parent diff for merge
+        // commits (the history index stores no `git_file_changes` rows for real merges). `None` (a
+        // bare/copied index) simply skips that fallback.
+        crate::distill::extract(
+            self.storage.connection(),
+            self.storage.source_root(),
+            &Default::default(),
+        )
     }
 
     pub fn papertrail_issue_search(

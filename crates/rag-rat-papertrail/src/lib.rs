@@ -5,6 +5,7 @@
 //! callers and query-surface integration.
 
 mod api;
+mod distill;
 mod evidence;
 mod github;
 mod gitlab;
@@ -21,6 +22,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub use api::{sync_from_refs, sync_from_refs_with_progress, *};
+pub use distill::{
+    AnchorKind, DistillEdgeKind, EpistemicStatus, FixEdgeSource, OutcomeStatus, ThreadShape,
+};
 pub use evidence::{refs, *};
 pub(crate) use github::*;
 pub(crate) use gitlab::*;

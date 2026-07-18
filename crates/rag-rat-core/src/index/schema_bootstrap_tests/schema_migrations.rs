@@ -2693,7 +2693,7 @@ fn migration_073_backfills_state_normalized_from_the_provider_truthful_pair() {
 
 #[test]
 fn migration_074_refreshes_the_edges_view() {
-    // The absolute-tip pin moved to `migration_075_*` (V075 is the tip now); this drops to the
+    // The absolute-tip pin moved to `migration_076_*` (V076 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
@@ -2873,7 +2873,6 @@ fn migration_075_materializes_edge_visibility() {
 
 #[test]
 fn migration_076_adds_sync_security_events() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 76, "move this pin with the next schema migration");
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
@@ -2910,4 +2909,98 @@ fn migration_076_adds_sync_security_events() {
         )
         .unwrap();
     assert_eq!(v76_recorded, 1, "the forward migration records V076");
+}
+
+#[test]
+fn migration_077_is_the_tip_and_builds_the_distill_record_store() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 77, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply",
+    );
+
+    // The record row carries the derived-facet columns + the raw status floors; repo_id from birth.
+    let cols = conn_table_columns(&conn, "papertrail_distill");
+    for col in [
+        "tracker",
+        "project",
+        "item_kind",
+        "item_key",
+        "distill_input_hash",
+        "pipeline_version",
+        "root_issue",
+        "root_cause",
+        "root_cause_class",
+        "decision_chosen",
+        "outcome_summary",
+        "outcome_status_model",
+        "epistemic_status_decision",
+        "epistemic_status_outcome",
+        "fix_edge_source",
+        "quotes_materialized",
+        "anchors_qualified_count",
+        "thread_shape",
+        "outcome_claim_verified",
+        "decision_provenance_verified",
+        "revert_override",
+        "closing_keyword_floor",
+        "distilled_at_ms",
+        "repo_id",
+    ] {
+        assert!(cols.contains(&col.to_string()), "V077 distill column `{col}` exists");
+    }
+
+    // The record is keyed to the coalesced work-unit thread: one row per
+    // (repo_id, tracker, project, item_kind, item_key). A regenerated body replaces in place.
+    conn.execute(
+        "INSERT INTO papertrail_distill(tracker, project, item_kind, item_key, \
+         distill_input_hash, pipeline_version, fix_edge_source, thread_shape, distilled_at_ms, \
+         repo_id) VALUES ('github', 'o/r', 'issue', '5', 'h1', 1, 'provider', 'investigation', 1, \
+         'r')",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO papertrail_distill(tracker, project, item_kind, item_key, \
+             distill_input_hash, pipeline_version, fix_edge_source, thread_shape, \
+             distilled_at_ms, repo_id) VALUES ('github', 'o/r', 'issue', '5', 'h2', 2, 'text', \
+             'thin', 2, 'r')",
+            [],
+        )
+        .is_err(),
+        "the natural key holds one record per coalesced thread",
+    );
+
+    // The junction/companion tables all land in the same migration.
+    for table in [
+        "papertrail_distill_evidence",
+        "papertrail_distill_anchors",
+        "papertrail_distill_alternatives",
+        "papertrail_distill_record_commits",
+        "papertrail_distill_edges",
+        "papertrail_distill_queue",
+        "papertrail_distill_runs",
+    ] {
+        let present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "V077 companion table `{table}` exists");
+    }
+
+    let v77_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '077_distill_record_store'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v77_recorded, 1, "the forward migration records V077");
 }

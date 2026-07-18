@@ -55,6 +55,18 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
     // natural key from birth, so a LocalOnly→Portable adoption re-points its rows with the
     // rest of the papertrail family.
     "papertrail_closing_edges",
+    // V076 (#703): the distilled-record store — record row + junction children + work queue +
+    // run stats, all with direct `repo_id` in their keys from birth (no FK children between them),
+    // so a LocalOnly→Portable adoption re-points every one with the papertrail family. Omitting
+    // any would strand its rows under the retired id, invisible through the active scope.
+    "papertrail_distill",
+    "papertrail_distill_evidence",
+    "papertrail_distill_anchors",
+    "papertrail_distill_alternatives",
+    "papertrail_distill_record_commits",
+    "papertrail_distill_edges",
+    "papertrail_distill_queue",
+    "papertrail_distill_runs",
     // V056 (#566) derived change-coupling table: standalone, direct `repo_id`, no FK children, so
     // a LocalOnly→Portable adoption re-points its rows here (moving them together with the
     // `git_coupling_stamp` repo_meta so the derived table stays consistent + fresh), and the
