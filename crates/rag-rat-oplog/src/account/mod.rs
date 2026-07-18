@@ -63,11 +63,13 @@ pub use id::AccountId;
 // payload C5's seal path consumes; `KeyId` is the selection identity (#607).
 pub use keywrap::{ContentKey, KeyId};
 pub use ops::{DeviceCut, DeviceRole, GrantRole};
-// The in-tx content-key mint + owner-gated `StreamKeyWrap` author seam (C4.3a) plus the C4.3b
-// READ side — derive-on-read sealing-key selection + the key_id adoption cross-check (#607).
+// The in-tx content-key mint + owner-gated `StreamKeyWrap` author seam (C4.3a), the C4.3b READ
+// side (derive-on-read sealing-key selection + the key_id adoption cross-check), and the C4.4
+// lazy rotation-on-removal entry points (#607).
 pub use secrets::{
-    SealingKeyOutcome, SelectedWrap, current_sealing_key, mint_and_author_stream_key_wrap_in_tx,
-    select_current_sealing_wrap,
+    RotationOutcome, SealingKeyOutcome, SelectedWrap, current_sealing_key,
+    ensure_stream_key_current_in_tx, mint_and_author_stream_key_wrap_in_tx,
+    rotate_stream_key_in_tx, select_current_sealing_wrap, stream_key_rotation_needed,
 };
 pub use storage::{
     CapacityScope, IngestOutcome, account_ingest, auth_len_freshness,

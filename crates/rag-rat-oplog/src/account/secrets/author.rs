@@ -8,6 +8,15 @@
 //! nothing consumes the key for content SEALING yet (that is C5), and the `key_id` adoption
 //! cross-check + the derived sealing-key projection + `sync enable` are C4.3b.
 //!
+//! C4.4 (#607) adds LAZY rotation on device removal: [`rotate_stream_key_in_tx`] mints a fresh key
+//! at a HIGHER epoch re-sealed only to the remaining effective devices — rotation is exactly a mint
+//! whose SOLE delta from the initial one is the epoch, so it reuses
+//! [`author_stream_key_wrap_in_tx`] unchanged. [`ensure_stream_key_current_in_tx`] is the lazy
+//! trigger the seal path calls: it rotates only when a removed device still holds the current key,
+//! and returns a typed [`RotationOutcome`] (never an error) so a MEMBER device — which cannot
+//! author a rotation but may legitimately seal — does not roll its seal txn back. Nothing calls the
+//! C4.4 entry points yet (machinery one slice ahead of its consumer).
+//!
 //! Three load-bearing invariants the fold alone does NOT enforce:
 //!
 //! - **The secrets chain is `(account, device)`-scoped across ALL streams, never per-stream.**
@@ -64,6 +73,108 @@ pub fn mint_and_author_stream_key_wrap_in_tx(
 ) -> anyhow::Result<EntryHash> {
     let key = ContentKey::generate()?;
     author_stream_key_wrap_in_tx(tx, stream_id, &key, INITIAL_KEY_EPOCH, now_ms)
+}
+
+/// The outcome of [`ensure_stream_key_current_in_tx`]. Every variant is a NON-error signal: `Err`
+/// from the ensure/rotate path is reserved for infra/DB failures, never a policy outcome (a member
+/// legitimately can't rotate, and that must not roll back a seal txn).
+#[derive(Debug)]
+pub enum RotationOutcome {
+    /// Rotation was needed and this (owner) device authored a fresh higher-epoch `StreamKeyWrap`.
+    Rotated(EntryHash),
+    /// No rotation needed — every recipient of the current wrap is still roster-effective (or the
+    /// stream has no current wrap at all, so there is nothing to rotate).
+    Current,
+    /// Rotation IS needed but this device holds no live owner incarnation, so it cannot author one.
+    /// A member device still seals under the CURRENT key — roster membership is READ access, not
+    /// authoring authority — so the caller must proceed with the seal, NOT fail it. (An additive
+    /// `CatchUp` arm belongs here when new-device catch-up ships.)
+    StaleButNotOwner,
+}
+
+/// Rotate `stream_id`'s content key: mint a FRESH key at `current_max_accepted_epoch + 1` and
+/// author it sealed to the roster-EFFECTIVE devices, WITHIN the caller's transaction
+/// (verify-accepted-or- rollback). Returns the authored entry hash. Neither opens nor commits the
+/// txn.
+///
+/// Rotation is a mint whose ONLY delta from the initial one is the epoch: recipients (which now
+/// EXCLUDE the removed device), the owner-only `authority_ref`, the self-unwrap round-trip, and
+/// verify-accepted all carry from [`author_stream_key_wrap_in_tx`] unchanged. It does NOT cite the
+/// triggering `DeviceRemove` — lazy rotation is local policy, not a chained authority act.
+///
+/// Errors if the stream has NO prior accepted wrap (nothing to rotate; the seal path mints an
+/// initial key via `current_sealing_key` → `NoCurrentKey` instead), or if the local device is not a
+/// current owner (the inherited owner-only gate bails). [`ensure_stream_key_current_in_tx`] never
+/// reaches either error — it returns `Current`/`StaleButNotOwner` first.
+pub fn rotate_stream_key_in_tx(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    now_ms: i64,
+) -> anyhow::Result<EntryHash> {
+    let account_id = bootstrap::local_account_ref(tx)?
+        .context(
+            "cannot rotate a StreamKeyWrap before the store's local account is minted (call \
+             local_account first)",
+        )?
+        .account_id;
+
+    // Epoch = accepted_max + 1 over EFFECTIVE ACCEPTED wraps only. `select_current_sealing_wrap`
+    // reads `accepted = 1` rows, so condemned wraps never feed the max — this is deliberate: taking
+    // the max over condemned wraps would let a removed owner author epoch `u64::MAX` (→ condemned)
+    // and DoS every future rotation by forcing the overflow error below.
+    let current = super::sealing::select_current_sealing_wrap(tx, account_id, stream_id)?.context(
+        "cannot rotate a stream with no prior accepted StreamKeyWrap (nothing to rotate)",
+    )?;
+    // `checked_add`: ERROR at `u64::MAX`, never wrap. A wrap-to-0 would silently lose the max-epoch
+    // selection and regress sealing to an old key — a confidentiality footgun. Re-stamping a
+    // numeric epoch that a condemned wrap once used is fine and deliberate (the condemned wrap
+    // is gone from the accepted set); we add NO high-water mark (sticky local state would
+    // diverge derive-on-read).
+    let next_epoch = current
+        .key_epoch
+        .checked_add(1)
+        .context("stream key epoch is at u64::MAX; cannot rotate")?;
+
+    let key = ContentKey::generate()?;
+    author_stream_key_wrap_in_tx(tx, stream_id, &key, next_epoch, now_ms)
+}
+
+/// The lazy rotation trigger the seal path (and a future CLI) calls before sealing `stream_id`:
+/// rotate the content key IF a removed device still holds the current key, otherwise noop. Returns
+/// a typed [`RotationOutcome`], never an error for a policy reason.
+///
+/// The rotation-NEEDED test ([`super::sealing::stream_key_rotation_needed`]) is device-independent
+/// (current-wrap recipients vs the roster). The owner gate is checked HERE, BEFORE calling
+/// [`rotate_stream_key_in_tx`]: a non-owner would make `rotate` bail (→ `Err` → the caller's seal
+/// txn rolls back), which a member's legitimate seal must not suffer — so a member sees
+/// `StaleButNotOwner` and seals under the current key instead.
+pub fn ensure_stream_key_current_in_tx(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    now_ms: i64,
+) -> anyhow::Result<RotationOutcome> {
+    let account_id = bootstrap::local_account_ref(tx)?
+        .context(
+            "cannot ensure a stream key is current before the store's local account is minted",
+        )?
+        .account_id;
+
+    if !super::sealing::stream_key_rotation_needed(tx, account_id, stream_id)? {
+        return Ok(RotationOutcome::Current);
+    }
+
+    // Rotation is needed — but only a current owner can author one. Gate on the live owner
+    // incarnation (exactly what `rotate` → `author_stream_key_wrap_in_tx` would require) so a
+    // member returns `StaleButNotOwner` rather than triggering a rollback-inducing `bail!` in
+    // `rotate`.
+    let device = local_device(tx, now_ms)?;
+    if storage::effective_owner_incarnation_for_device(tx, account_id, device.fingerprint())?
+        .is_none()
+    {
+        return Ok(RotationOutcome::StaleButNotOwner);
+    }
+
+    Ok(RotationOutcome::Rotated(rotate_stream_key_in_tx(tx, stream_id, now_ms)?))
 }
 
 /// The mint core with the content key and epoch injected, so a test can pin the key
@@ -240,6 +351,7 @@ mod tests {
     use crate::account::secrets::ops::{
         DecodedSecretsOp, decode, entry_type as secrets_entry_type,
     };
+    use crate::account::{select_current_sealing_wrap, stream_key_rotation_needed};
     use crate::device::DeviceX25519Secret;
 
     const NOW: i64 = 1_700_000_000_000;
@@ -592,6 +704,311 @@ mod tests {
             )
             .unwrap();
         assert_eq!(secrets_rows, 0, "the rolled-back mint stored no secrets entry");
+    }
+
+    // ── C4.4: lazy rotation on device removal ──
+
+    #[test]
+    fn removing_a_recipient_makes_rotation_needed_and_rotate_reseals_to_survivors() {
+        // The primary behavioral path, THROUGH THE REAL MINT SEAM (a hand-rolled wrap that omits
+        // self would mask that the predicate's soundness rests on wrap-to-self): mint to the full
+        // roster, remove a device, and rotate to a fresh higher-epoch key held only by the
+        // survivors — the removed device can no longer unwrap.
+        let conn = db();
+        let (account, stream) = account_with_owned_stream(&conn, "repo-x");
+        let member_x = DeviceX25519Secret::from_seed(&[0x5c; 32]);
+        let member = add_member_device(&conn, account, &member_x);
+
+        let mint = mint_committed(&conn, stream);
+        assert_eq!(stored_wrap(&conn, &mint).wraps.len(), 2, "founder + member are recipients");
+        assert!(
+            !stream_key_rotation_needed(&conn, account, stream).unwrap(),
+            "no rotation needed while every current-wrap recipient is effective",
+        );
+
+        // Remove the member: its wrap for the current key is now held by a non-effective device.
+        author_control_op(&conn, account, &AccountOp::DeviceRemove {
+            device_fingerprint: member,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        });
+        assert!(
+            stream_key_rotation_needed(&conn, account, stream).unwrap(),
+            "a removed recipient of the current wrap triggers rotation",
+        );
+
+        // Rotate → a fresh key at epoch 1 sealed ONLY to the surviving founder.
+        let rotated = rotate_committed(&conn, stream);
+        assert_eq!(
+            status(&conn, &rotated),
+            Some(("accepted".to_string(), None)),
+            "the rotation wrap folds accepted",
+        );
+        let rot_wrap = stored_wrap(&conn, &rotated);
+        assert_eq!(rot_wrap.key_epoch, 1, "rotation stamps accepted_max + 1");
+        let device = local_device(&conn, NOW).unwrap();
+        assert_eq!(rot_wrap.wraps.len(), 1, "only the surviving founder is a recipient");
+        assert_eq!(rot_wrap.wraps[0].recipient_fp, device.fingerprint(), "sealed to the founder");
+        assert!(
+            !rot_wrap.wraps.iter().any(|w| w.recipient_fp == member),
+            "the removed member gets no wrap for the fresh key (it cannot unwrap the rotated key)",
+        );
+
+        // The C4.3b selection now returns epoch 1, and rotation is no longer needed (the current
+        // epoch-1 wrap names only effective devices — the stale epoch-0 wrap is not the selection).
+        let selected = select_current_sealing_wrap(&conn, account, stream).unwrap().unwrap();
+        assert_eq!(selected.key_epoch, 1, "the selection advances to the rotated epoch");
+        assert!(
+            !stream_key_rotation_needed(&conn, account, stream).unwrap(),
+            "after rotation the current wrap is held only by effective devices",
+        );
+    }
+
+    #[test]
+    fn ensure_rotates_for_an_owner_then_reports_current() {
+        // The lazy trigger end-to-end: an owner sees Current before a removal, Rotated after, and
+        // Current again once the fresh key is in place (idempotent).
+        let conn = db();
+        let (account, stream) = account_with_owned_stream(&conn, "repo-x");
+        let member_x = DeviceX25519Secret::from_seed(&[0x5c; 32]);
+        let member = add_member_device(&conn, account, &member_x);
+        mint_committed(&conn, stream);
+
+        assert!(
+            matches!(ensure_committed(&conn, stream), RotationOutcome::Current),
+            "nothing to rotate while every recipient is effective",
+        );
+
+        author_control_op(&conn, account, &AccountOp::DeviceRemove {
+            device_fingerprint: member,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        });
+
+        let RotationOutcome::Rotated(rotated) = ensure_committed(&conn, stream) else {
+            panic!("an owner with a stale current-wrap recipient rotates");
+        };
+        assert_eq!(stored_wrap(&conn, &rotated).key_epoch, 1, "ensure rotated to epoch 1");
+        assert_eq!(status(&conn, &rotated), Some(("accepted".to_string(), None)));
+
+        assert!(
+            matches!(ensure_committed(&conn, stream), RotationOutcome::Current),
+            "a second ensure is a noop — the current wrap is fresh",
+        );
+    }
+
+    #[test]
+    fn rotating_a_stream_with_no_prior_wrap_errors() {
+        // Q6: rotate with no prior accepted wrap is an ERROR (not treat-as-mint, not no-op).
+        // `ensure` never reaches it — no wrap ⇒ predicate false ⇒ Current — but the raw
+        // entry point guards.
+        let conn = db();
+        let (_account, stream) = account_with_owned_stream(&conn, "repo-x");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = rotate_stream_key_in_tx(&tx, stream, NOW).unwrap_err();
+        drop(tx);
+        assert!(
+            err.to_string().contains("no prior accepted"),
+            "rotation with no prior wrap errors: {err}",
+        );
+    }
+
+    #[test]
+    fn rotation_errors_at_u64_max_epoch_instead_of_wrapping() {
+        // S3: `checked_add` the epoch; ERROR at u64::MAX, never wrap. A wrap-to-0 would silently
+        // lose the max-epoch selection and regress sealing to an old key. Drive an accepted
+        // wrap to the ceiling via the private core (the evaluator reads no key_epoch, so it
+        // folds accepted).
+        let conn = db();
+        let (_account, stream) = account_with_owned_stream(&conn, "repo-x");
+        let key = ContentKey::from_seed(&[0x9e; 32]);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_stream_key_wrap_in_tx(&tx, stream, &key, u64::MAX, NOW).expect("author at u64::MAX");
+        tx.commit().unwrap();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = rotate_stream_key_in_tx(&tx, stream, NOW).unwrap_err();
+        drop(tx);
+        assert!(
+            err.to_string().contains("u64::MAX"),
+            "rotation refuses to overflow the epoch: {err}",
+        );
+    }
+
+    #[test]
+    fn a_member_device_with_rotation_needed_is_stale_but_not_owner() {
+        // B1: a device that is NOT a current owner cannot author a rotation, but must NOT error or
+        // roll back — a member legitimately seals under the current key. The local device founds
+        // the account, mints, then a SECOND owner demotes it to a plain member; a
+        // still-removed recipient keeps rotation needed, so `ensure` must return
+        // StaleButNotOwner (not Err, not Rotated).
+        let conn = db();
+        let (account, stream) = account_with_owned_stream(&conn, "repo-x");
+
+        // A second owner whose secret we control, so it can author the founder's demotion.
+        let owner_b_ed = crate::device::DeviceSecret::from_seed(&[0x2b; 32]);
+        let owner_b_x = DeviceX25519Secret::from_seed(&[0xb2; 32]);
+        let owner_id_b = author_control_op(&conn, account, &AccountOp::DeviceAdd {
+            device_fingerprint: owner_b_ed.public().fingerprint(),
+            ed25519_pubkey: owner_b_ed.public().to_bytes(),
+            x25519_pubkey: owner_b_x.public().to_bytes(),
+            role: DeviceRole::Owner,
+            label: None,
+        });
+
+        // A member that will be removed to make rotation needed.
+        let m_ed = crate::device::DeviceSecret::from_seed(&[0x3d; 32]);
+        let m_x = DeviceX25519Secret::from_seed(&[0xd3; 32]);
+        let m_fp = m_ed.public().fingerprint();
+        author_control_op(&conn, account, &AccountOp::DeviceAdd {
+            device_fingerprint: m_fp,
+            ed25519_pubkey: m_ed.public().to_bytes(),
+            x25519_pubkey: m_x.public().to_bytes(),
+            role: DeviceRole::Member,
+            label: None,
+        });
+
+        // Mint via the real seam while the founder is still an owner → seals to all three.
+        let mint = mint_committed(&conn, stream);
+        assert_eq!(stored_wrap(&conn, &mint).wraps.len(), 3, "founder + owner_b + member sealed");
+
+        // The founder (still owner) removes the member → rotation needed.
+        author_control_op(&conn, account, &AccountOp::DeviceRemove {
+            device_fingerprint: m_fp,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        });
+        assert!(
+            stream_key_rotation_needed(&conn, account, stream).unwrap(),
+            "the removed member is still a recipient of the current wrap",
+        );
+
+        // owner_b demotes the founder, preserving the founder's whole history via cuts at its chain
+        // tails (the mint stays accepted; only the owner ROLE closes).
+        let founder = local_device(&conn, NOW).unwrap();
+        let founder_owner_id =
+            storage::effective_owner_incarnation_for_device(&conn, account, founder.fingerprint())
+                .unwrap()
+                .expect("the founder is an owner before the demotion");
+        let ctrl_tail = chain_tail(&conn, account, founder.fingerprint(), CONTROL_LOG)
+            .expect("the founder has a control chain");
+        let secrets_tail = chain_tail(&conn, account, founder.fingerprint(), SECRETS_LOG)
+            .expect("the founder authored the mint on its secrets chain");
+        author_control_op_as(&conn, account, &owner_b_ed, owner_id_b, &AccountOp::OwnerDemote {
+            device_fingerprint: founder.fingerprint(),
+            owner_id: founder_owner_id,
+            control_cut: Cut::At { seq: ctrl_tail.0, hash: ctrl_tail.1 },
+            secrets_cut: Cut::At { seq: secrets_tail.0, hash: secrets_tail.1 },
+            reason: "demote".to_string(),
+        });
+
+        // The founder is now a plain member: still a recipient (can seal), but not an owner.
+        assert!(
+            storage::effective_owner_incarnation_for_device(&conn, account, founder.fingerprint())
+                .unwrap()
+                .is_none(),
+            "the founder holds no live owner incarnation after the demotion",
+        );
+        assert!(
+            stream_key_rotation_needed(&conn, account, stream).unwrap(),
+            "rotation is still needed after the demotion (the mint survives, the member is gone)",
+        );
+        assert!(
+            matches!(ensure_committed(&conn, stream), RotationOutcome::StaleButNotOwner),
+            "a member that finds rotation needed is StaleButNotOwner — no rotate, no error",
+        );
+
+        // StaleButNotOwner authored nothing: only the original mint is on the secrets log.
+        let secrets_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE log_id = ?1 AND accepted = 1",
+                [SECRETS_LOG],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(secrets_rows, 1, "StaleButNotOwner does not author a rotation");
+    }
+
+    /// Rotate the stream key in its own IMMEDIATE txn and commit — the shape a live caller uses.
+    fn rotate_committed(conn: &Connection, stream: StreamId) -> EntryHash {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let hash = rotate_stream_key_in_tx(&tx, stream, NOW).expect("rotate");
+        tx.commit().unwrap();
+        hash
+    }
+
+    /// Run the lazy rotation trigger in its own IMMEDIATE txn and commit.
+    fn ensure_committed(conn: &Connection, stream: StreamId) -> RotationOutcome {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let outcome = ensure_stream_key_current_in_tx(&tx, stream, NOW).expect("ensure");
+        tx.commit().unwrap();
+        outcome
+    }
+
+    /// The (seq, hash) tail of a device's `(account, device, log)` chain — used to place tight
+    /// cuts.
+    fn chain_tail(
+        conn: &Connection,
+        account: AccountId,
+        fp: crate::op::DeviceFingerprint,
+        log: u8,
+    ) -> Option<(u64, EntryHash)> {
+        let tx = conn.unchecked_transaction().unwrap();
+        authoring::account_chain_tail(&tx, account, fp, log).unwrap()
+    }
+
+    /// Author + refold a control op signed by an ARBITRARY device (not just the founder), citing
+    /// `authority_ref`, on that device's own dense control chain. The non-founder counterpart of
+    /// [`author_control_op`].
+    fn author_control_op_as(
+        conn: &Connection,
+        account: AccountId,
+        signer: &crate::device::DeviceSecret,
+        authority_ref: EntryHash,
+        op: &AccountOp,
+    ) -> EntryHash {
+        use crate::account::ops as control_ops;
+
+        let signer_fp = signer.public().fingerprint();
+        let LocalAccountRef { genesis_hash, .. } =
+            bootstrap::local_account_ref(conn).unwrap().unwrap();
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let (seq, prev_hash) =
+            match authoring::account_chain_tail(&tx, account, signer_fp, CONTROL_LOG).unwrap() {
+                Some((tail_seq, tail_hash)) => (tail_seq + 1, Some(tail_hash)),
+                None => (0, None),
+            };
+        let header = AccountEntryHeader {
+            account_id: account,
+            log_id: CONTROL_LOG,
+            device_fingerprint: signer_fp,
+            seq,
+            prev_hash,
+            parent_ref: Some(genesis_hash),
+            entry_type: control_ops::entry_type_of(op),
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: storage::account_effective_count(&tx, account).unwrap(),
+            key_id: None,
+            authority_ref: Some(authority_ref),
+        };
+        let payload = control_ops::encode(op).unwrap();
+        let signed = sign_account_entry(signer, &header, &payload).unwrap();
+        let verified = VerifiedAccountEntry {
+            header: signed.header,
+            payload: signed.payload,
+            entry_hash: signed.entry_hash,
+        };
+        storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
+        storage::refold_in_tx(&tx, account).unwrap();
+        tx.commit().unwrap();
+        verified.entry_hash
     }
 
     /// Author a control op under the founder (the local device) citing its own genesis incarnation,

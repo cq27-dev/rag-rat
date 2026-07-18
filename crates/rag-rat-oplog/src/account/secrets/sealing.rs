@@ -16,7 +16,7 @@
 use rusqlite::{Connection, params};
 
 use super::super::keywrap::{self, ContentKey, KeyId, WrapContext};
-use super::super::{AccountId, envelope, fold};
+use super::super::{AccountId, envelope, fold, storage};
 use super::ops::{self, DecodedSecretsOp, StreamKeyWrap};
 use super::security_event::{self, SyncSecurityEvent, SyncSecurityEventKind};
 use crate::identity::LocalDevice;
@@ -69,6 +69,48 @@ pub fn select_current_sealing_wrap(
     stream_id: StreamId,
 ) -> anyhow::Result<Option<SelectedWrap>> {
     Ok(select_from_wraps(&list_accepted_stream_key_wraps(conn, account_id, stream_id)?))
+}
+
+/// Whether `stream_id`'s content key must be ROTATED (sync phase C4.4, #607): TRUE iff some
+/// recipient of the CURRENT sealing wrap is no longer roster-effective — i.e. a removed device
+/// still holds a wrap for the key this stream seals under right now. DEVICE-INDEPENDENT (it
+/// compares the wrap's recipients against the roster, never the local device), so every peer
+/// computes the same answer; the owner-only authoring gate lives in
+/// [`super::ensure_stream_key_current_in_tx`], not here.
+///
+/// Unions recipients across ALL accepted sibling ops at the SELECTED `(epoch, key_id)`, not just
+/// the tiebreak-winner op: same-`(epoch, key_id)` fan-out siblings can each name a different
+/// recipient subset (the C4.3b BLOCKER-1 class), so a removed device named only by a non-winner
+/// sibling must still trigger. Keying on `(epoch, key_id)` mirrors [`current_sealing_key`]'s
+/// my-wrap lookup.
+///
+/// SOUND ONLY because of wrap-to-self: the predicate sees a wrap's RECIPIENTS, never its author, so
+/// a removed minting owner is caught only because it sealed to itself and thus appears as a
+/// recipient of its own surviving wraps. ONE-DIRECTIONAL: a newly-effective device that is ABSENT
+/// from the current wrap does NOT trigger (that is deferred new-device catch-up, not rotation).
+///
+/// `false` when the stream has no accepted wrap (nothing to rotate — the seal path mints an initial
+/// key instead). A contested account needs no special case: the fold keeps contested wraps out of
+/// `accepted`, so the selection is simply empty.
+pub fn stream_key_rotation_needed(
+    conn: &Connection,
+    account_id: AccountId,
+    stream_id: StreamId,
+) -> anyhow::Result<bool> {
+    let wraps = list_accepted_stream_key_wraps(conn, account_id, stream_id)?;
+    let Some(selected) = select_from_wraps(&wraps) else {
+        return Ok(false);
+    };
+    let effective = storage::list_effective_roster_fingerprints(conn, account_id)?;
+    let stale_recipient = wraps
+        .iter()
+        .filter(|w| {
+            w.wrap.key_epoch == selected.key_epoch
+                && KeyId::from_bytes(w.wrap.key_id) == selected.key_id
+        })
+        .flat_map(|w| w.wrap.wraps.iter())
+        .any(|entry| !effective.contains(&entry.recipient_fp));
+    Ok(stale_recipient)
 }
 
 /// Resolve the content key THIS device would seal `stream_id` under right now, running the C4.3b
@@ -245,8 +287,13 @@ mod tests {
     use rag_rat_db::schema;
     use rusqlite::Connection;
 
-    use super::super::ops::{StreamKeyWrap, WrapEntry, entry_type as secrets_entry_type};
-    use super::{SealingKeyOutcome, current_sealing_key, select_current_sealing_wrap};
+    use super::super::ops::{
+        DecodedSecretsOp, StreamKeyWrap, WrapEntry, decode, entry_type as secrets_entry_type,
+    };
+    use super::{
+        SealingKeyOutcome, current_sealing_key, select_current_sealing_wrap,
+        stream_key_rotation_needed,
+    };
     use crate::account::cut::Cut;
     use crate::account::envelope::{AccountEntryHeader, sign_account_entry};
     use crate::account::id::account_id_from_genesis_payload;
@@ -913,5 +960,228 @@ mod tests {
             current_sealing_key(&conn, account, stream_id, &device, NOW).unwrap(),
             SealingKeyOutcome::NoCurrentKey
         ));
+    }
+
+    // ── C4.4: the rotation-needed predicate ──
+
+    /// Decode the stored `StreamKeyWrap` op for one entry hash.
+    fn stored_wrap_by_hash(conn: &Connection, hash: [u8; 32]) -> StreamKeyWrap {
+        let signed_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT signed_bytes FROM account_entries WHERE entry_hash = ?1",
+                [hash.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let signed = crate::account::envelope::decode_account_signed(&signed_bytes).unwrap();
+        match decode(signed.header.entry_type, &signed.payload).unwrap() {
+            DecodedSecretsOp::Known(wrap) => wrap,
+            _ => panic!("stored entry is a known StreamKeyWrap"),
+        }
+    }
+
+    #[test]
+    fn rotation_needed_unions_recipients_across_fanout_siblings() {
+        // S1: the predicate unions recipients across ALL accepted sibling ops at the selected
+        // (epoch, key_id), not just the tiebreak-winner op. Two epoch-0 siblings share ONE key_id,
+        // each naming a DIFFERENT member; removing the member named ONLY by the LOSER op must still
+        // trigger — a winner-only predicate would miss it.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account, genesis_bytes, genesis_hash) = genesis(&founder);
+        ingest(&conn, &genesis_bytes);
+        let (stream_id, own) = stream_own(account);
+        let (own_bytes, own_hash) =
+            control_op(account, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        ingest(&conn, &own_bytes);
+
+        let m1 = Dev::new(4);
+        let m2 = Dev::new(5);
+        let (add1_bytes, add1) = control_op(
+            account,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(genesis_hash),
+            &device_add(&m1, DeviceRole::Member),
+        );
+        ingest(&conn, &add1_bytes);
+        let (add2_bytes, add2) = control_op(
+            account,
+            &founder,
+            3,
+            Some(add1),
+            Some(genesis_hash),
+            &device_add(&m2, DeviceRole::Member),
+        );
+        ingest(&conn, &add2_bytes);
+
+        // Two ops share ONE key (⇒ one key_id) at epoch 0 — a fan-out across ops (SET, never LWW);
+        // each names a different member.
+        let key = ContentKey::from_seed(&[0x40; 32]);
+        let m1_x = DeviceX25519Public::from_bytes(&m1.x).unwrap();
+        let m2_x = DeviceX25519Public::from_bytes(&m2.x).unwrap();
+        let (w1_bytes, h1) = wrap_entry(
+            account,
+            &founder,
+            0,
+            None,
+            Some(genesis_hash),
+            &honest_wrap(account, stream_id, m1.fp, &m1_x, &key, 0),
+        );
+        ingest(&conn, &w1_bytes);
+        let (w2_bytes, h2) = wrap_entry(
+            account,
+            &founder,
+            1,
+            Some(h1),
+            Some(genesis_hash),
+            &honest_wrap(account, stream_id, m2.fp, &m2_x, &key, 0),
+        );
+        ingest(&conn, &w2_bytes);
+
+        // The winner op is min entry_hash; remove the member named by the LOSER op so the winner
+        // names only a still-effective member.
+        let (winner_hash, loser_member) = if h1 < h2 { (h1, &m2) } else { (h2, &m1) };
+        let remove = AccountOp::DeviceRemove {
+            device_fingerprint: loser_member.fp,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        };
+        let (rem_bytes, _) =
+            control_op(account, &founder, 4, Some(add2), Some(genesis_hash), &remove);
+        ingest(&conn, &rem_bytes);
+
+        assert!(
+            stream_key_rotation_needed(&conn, account, stream_id).unwrap(),
+            "a removed recipient named only by a non-winner sibling still triggers rotation",
+        );
+        // Prove the UNION is doing the work: the winning op does NOT name the removed member.
+        let winner = stored_wrap_by_hash(&conn, winner_hash);
+        assert!(
+            !winner.wraps.iter().any(|w| w.recipient_fp == loser_member.fp),
+            "the tiebreak-winner op names only the still-effective member",
+        );
+    }
+
+    #[test]
+    fn a_current_wrap_with_only_effective_recipients_needs_no_rotation() {
+        // The negative case + ONE-DIRECTIONAL: a wrap whose recipients are all still effective is
+        // not stale, and a newly-added member ABSENT from the wrap is deferred catch-up,
+        // never a rotation trigger. Built inline so the StreamOwn tail hash is in hand to
+        // chain the later DeviceAdd.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account, genesis_bytes, genesis_hash) = genesis(&founder);
+        ingest(&conn, &genesis_bytes);
+        let (stream_id, own) = stream_own(account);
+        let (own_bytes, own_hash) =
+            control_op(account, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        ingest(&conn, &own_bytes);
+
+        // A wrap sealed to the founder only (an effective device).
+        let founder_x = DeviceX25519Public::from_bytes(&founder.x).unwrap();
+        let key = ContentKey::from_seed(&[0x41; 32]);
+        let (bytes, _) = wrap_entry(
+            account,
+            &founder,
+            0,
+            None,
+            Some(genesis_hash),
+            &honest_wrap(account, stream_id, founder.fp, &founder_x, &key, 0),
+        );
+        ingest(&conn, &bytes);
+        assert!(
+            !stream_key_rotation_needed(&conn, account, stream_id).unwrap(),
+            "the sole recipient is effective — no rotation needed",
+        );
+
+        // A newly-added member is absent from the existing wrap; deferred catch-up, NOT rotation.
+        let newcomer = Dev::new(7);
+        let (add_bytes, _) = control_op(
+            account,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(genesis_hash),
+            &device_add(&newcomer, DeviceRole::Member),
+        );
+        ingest(&conn, &add_bytes);
+        assert!(
+            !stream_key_rotation_needed(&conn, account, stream_id).unwrap(),
+            "a newly-effective device absent from the wrap does NOT trigger rotation \
+             (one-directional)",
+        );
+    }
+
+    #[test]
+    fn concurrent_epoch_one_rotations_both_accept_and_select_deterministically() {
+        // Two owners independently rotate epoch 0 → epoch 1 with DIFFERENT fresh keys. Both epoch-1
+        // wraps accept (SET, never LWW); the selection converges on the min-entry_hash op — the
+        // loser wrap is harmless. This is the shape two concurrent
+        // `rotate_stream_key_in_tx` calls produce.
+        let conn = db();
+        let (account, founder, owner_b, owner_id_b, stream_id, _own_hash, genesis_hash) =
+            account_with_second_owner(&conn);
+        let device = local_device(&conn, NOW).unwrap();
+        let fp = device.fingerprint();
+        let x = device.x25519_public();
+
+        // Baseline epoch-0 wrap by the founder.
+        let key0 = ContentKey::from_seed(&[0x50; 32]);
+        let (w0_bytes, w0) = wrap_entry(
+            account,
+            &founder,
+            0,
+            None,
+            Some(genesis_hash),
+            &honest_wrap(account, stream_id, fp, &x, &key0, 0),
+        );
+        ingest(&conn, &w0_bytes);
+
+        // Two epoch-1 rotations, one per owner, different fresh keys.
+        let key1_founder = ContentKey::from_seed(&[0x51; 32]);
+        let key1_owner_b = ContentKey::from_seed(&[0x52; 32]);
+        let (wf_bytes, wf) = wrap_entry(
+            account,
+            &founder,
+            1,
+            Some(w0),
+            Some(genesis_hash),
+            &honest_wrap(account, stream_id, fp, &x, &key1_founder, 1),
+        );
+        ingest(&conn, &wf_bytes);
+        let (wb_bytes, wb) = wrap_entry(
+            account,
+            &owner_b,
+            0,
+            None,
+            Some(owner_id_b),
+            &honest_wrap(account, stream_id, fp, &x, &key1_owner_b, 1),
+        );
+        ingest(&conn, &wb_bytes);
+
+        // Both epoch-1 wraps accepted; selection = epoch 1, tiebreak min entry_hash.
+        let selected =
+            select_current_sealing_wrap(&conn, account, stream_id).unwrap().expect("a current key");
+        assert_eq!(selected.key_epoch, 1, "the max accepted epoch is the rotated one");
+        assert_eq!(
+            selected.minting_entry_hash,
+            wf.min(wb),
+            "min entry_hash tiebreaks the two concurrent rotations",
+        );
+
+        // The recovered key is the winning op's key — deterministic across peers.
+        let winner_key = if wf < wb { &key1_founder } else { &key1_owner_b };
+        let recovered =
+            expect_ready(current_sealing_key(&conn, account, stream_id, &device, NOW).unwrap());
+        assert_eq!(
+            recovered.as_slice(),
+            winner_key.as_slice(),
+            "seals under the deterministic winner",
+        );
+        assert_eq!(security_event_count(&conn), 0, "honest concurrent rotations record no events");
     }
 }

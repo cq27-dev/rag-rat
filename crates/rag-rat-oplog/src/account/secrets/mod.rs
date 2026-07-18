@@ -17,10 +17,14 @@ mod sealing;
 mod security_event;
 mod storage;
 
-// The in-tx content-key mint + `StreamKeyWrap` author seam (C4.3a): re-exported up through
-// `account` and the crate root for the `sync enable` caller (C4.3b) to reach (`pub` here so
-// `account::mod` can re-export it — the private `mod secrets` keeps it crate-scoped regardless).
-pub use author::mint_and_author_stream_key_wrap_in_tx;
+// The in-tx content-key mint + `StreamKeyWrap` author seam (C4.3a) + the C4.4 lazy rotation entry
+// points (`rotate_stream_key_in_tx` / `ensure_stream_key_current_in_tx` / `RotationOutcome`):
+// re-exported up through `account` and the crate root for the seal path (C5) to reach (`pub` here
+// so `account::mod` can re-export it — the private `mod secrets` keeps it crate-scoped regardless).
+pub use author::{
+    RotationOutcome, ensure_stream_key_current_in_tx, mint_and_author_stream_key_wrap_in_tx,
+    rotate_stream_key_in_tx,
+};
 // The ingest-time structural validation twin (mirrors the control-plaintext arm) and the
 // refold pass wired into `refold_in_tx`.
 pub(in crate::account) use ops::validate_storable_secrets_payload;
@@ -30,5 +34,6 @@ pub(in crate::account) use ops::validate_storable_secrets_payload;
 // slice ahead of its consumer).
 pub use sealing::{
     SealingKeyOutcome, SelectedWrap, current_sealing_key, select_current_sealing_wrap,
+    stream_key_rotation_needed,
 };
 pub(in crate::account) use storage::refold_secrets_log;

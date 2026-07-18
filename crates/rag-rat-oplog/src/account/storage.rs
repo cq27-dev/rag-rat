@@ -1505,6 +1505,28 @@ pub(super) fn list_effective_roster_x25519_pubkeys(
     Ok(out)
 }
 
+/// The FINGERPRINTS of every roster-effective device on `account_id` — the cheap counterpart to
+/// [`list_effective_roster_x25519_pubkeys`] for a per-seal boolean (the C4.4 rotation-needed
+/// predicate in `secrets::sealing`). `DISTINCT` because one device can key more than one open
+/// `roster_ref` row. Unlike the x25519 reader it decodes NO enrollment (no `signed_bytes` fetch, no
+/// small-order blocklist) and does NOT fail loud on a corrupt projection: the predicate only asks
+/// "is this fingerprint still effective?", so the per-recipient enrollment cross-checks are dead
+/// weight here.
+pub(super) fn list_effective_roster_fingerprints(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Vec<DeviceFingerprint>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT device_fingerprint FROM account_roster_history
+         WHERE account_id = ?1 AND closed_at IS NULL
+         ORDER BY device_fingerprint",
+    )?;
+    let rows = stmt
+        .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(|fp| Ok(DeviceFingerprint::from_bytes(fixed(&fp)?))).collect()
+}
+
 /// The x25519 key the ONE accepted enrollment entry at `roster_ref` certifies for `fingerprint`
 /// (genesis → its founder / header device; DeviceAdd → the ADDED device), routed through the
 /// small-order / identity blocklist. Bound to that exact `entry_hash`, so a rejected/forked sibling
