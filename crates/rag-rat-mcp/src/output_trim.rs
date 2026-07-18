@@ -38,17 +38,29 @@ pub(crate) struct AgentSeen {
 }
 
 impl AgentSeen {
-    /// Record `key` as surfaced NOW; return whether it was ALREADY surfaced within the TTL (so the
-    /// caller elides it). Prunes expired entries opportunistically once over the cap.
-    fn seen_then_touch(&self, key: &str) -> bool {
+    /// Whether `key` was surfaced in full within the TTL, so the caller should ELIDE it now.
+    fn should_suppress(&self, key: &str) -> bool {
+        self.should_suppress_at(key, Instant::now())
+    }
+
+    /// As [`Self::should_suppress`], with the clock injected for tests. On a HIT (surfaced within
+    /// the TTL) returns `true` and leaves the recorded surface time UNTOUCHED — so the window
+    /// measures time between FULL surfaces, not between encounters. Without that, an item seen
+    /// at least once per TTL would slide its own window forward and be suppressed forever (#753
+    /// review). On a MISS (first sighting, or the window elapsed since the last surface)
+    /// records `now` and returns `false`, so the caller shows it and the next window starts
+    /// here.
+    fn should_suppress_at(&self, key: &str, now: Instant) -> bool {
         // Recover from a poisoned lock rather than panic — trimming is best-effort meta, never a
         // reason to fail a tool call.
         let mut map = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
-        let now = Instant::now();
-        let recent = map.get(key).is_some_and(|seen| now.duration_since(*seen) < SEEN_TTL);
+        if map.get(key).is_some_and(|surfaced| now.duration_since(*surfaced) < SEEN_TTL) {
+            return true;
+        }
+        // We're about to SHOW it → stamp this surface (and only here, so repeats don't slide it).
         map.insert(key.to_string(), now);
         if map.len() > SEEN_CAP {
-            map.retain(|_, seen| now.duration_since(*seen) < SEEN_TTL);
+            map.retain(|_, surfaced| now.duration_since(*surfaced) < SEEN_TTL);
             // Still over cap after dropping expired (a burst of fresh keys): shed arbitrary entries
             // to hold the bound. A shed key just re-surfaces once more later — harmless.
             while map.len() > SEEN_CAP {
@@ -56,7 +68,7 @@ impl AgentSeen {
                 map.remove(&key);
             }
         }
-        recent
+        false
     }
 }
 
@@ -70,7 +82,7 @@ pub(crate) fn trim_result(value: &mut Value, seen: &AgentSeen) {
     // (#753 review) — a plain id key would stub the detail the agent explicitly asked for.
     if let Some((id, title)) = memory_identity(value) {
         let key = format!("{id}:{:016x}", content_fingerprint(value));
-        if seen.seen_then_touch(&key) {
+        if seen.should_suppress(&key) {
             *value = stub(&id, &title);
         }
         return;
@@ -146,14 +158,14 @@ fn throttle_static_caveats(map: &mut Map<String, Value>, seen: &AgentSeen) {
     // `caveats: [String]` (impact_surface): drop static entries seen recently, keep the rest.
     if let Some(Value::Array(caveats)) = map.get_mut("caveats") {
         caveats.retain(|caveat| match caveat.as_str() {
-            Some(text) if is_static_caveat(text) => !seen.seen_then_touch(text),
+            Some(text) if is_static_caveat(text) => !seen.should_suppress(text),
             _ => true,
         });
     }
     // `completeness_note: String` (graph tools): drop when it's the static note and seen recently.
     if let Some(Value::String(note)) = map.get("completeness_note")
         && is_static_caveat(note)
-        && seen.seen_then_touch(note)
+        && seen.should_suppress(note)
     {
         map.remove("completeness_note");
     }
@@ -228,6 +240,32 @@ mod tests {
         trim_result(&mut again, &seen);
         assert!(again["memories"][0]["body"].is_null(), "an identical re-surface is stubbed");
         assert!(again["memories"][0]["elided"].is_string());
+    }
+
+    #[test]
+    fn suppression_window_measures_between_full_surfaces_not_encounters() {
+        let seen = AgentSeen::default();
+        let t0 = Instant::now();
+        // First surface shows and stamps t0.
+        assert!(!seen.should_suppress_at("k", t0), "first surface shows");
+        // Repeated encounters inside the window are suppressed — and must NOT slide the window.
+        assert!(seen.should_suppress_at("k", t0 + SEEN_TTL / 2), "within window → suppressed");
+        assert!(
+            seen.should_suppress_at("k", t0 + SEEN_TTL - Duration::from_secs(1)),
+            "still within the original window → suppressed",
+        );
+        // Just past the window measured from the FIRST surface (the encounters above did not reset
+        // it) → shows again, contrary to a sliding window that would suppress forever (#753
+        // review).
+        assert!(
+            !seen.should_suppress_at("k", t0 + SEEN_TTL + Duration::from_secs(1)),
+            "window elapsed since the last full surface → shows again",
+        );
+        // That fresh surface re-stamps, so the next encounter is suppressed once more.
+        assert!(
+            seen.should_suppress_at("k", t0 + SEEN_TTL + Duration::from_secs(2)),
+            "the fresh surface starts a new window",
+        );
     }
 
     #[test]
