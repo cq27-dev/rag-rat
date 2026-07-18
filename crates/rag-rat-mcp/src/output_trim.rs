@@ -3,9 +3,12 @@
 //! throttles below live in-process (a TTL seen-set, like `agent_hook`'s session dedup).
 //!
 //! Three trims, applied to every non-`memory_*` tool result before rendering:
-//! - DRIVE-BY MEMORY DEDUP: a repo memory riding ALONG a result this agent already saw is replaced
-//!   with a tiny stub — the agent still learns it's relevant here and can `memory_show` it, without
-//!   re-reading the body. (Explicit `memory_*` tools are never trimmed — the agent asked.)
+//! - DRIVE-BY MEMORY DEDUP: a repo memory riding ALONG a result whose exact content this agent
+//!   already saw is replaced with a tiny stub — the agent still learns it's relevant here and can
+//!   `memory_show` it, without re-reading the body. Keyed by CONTENT, not just id, so a later,
+//!   richer view (e.g. `impact_surface full_memories:true` after a compact `symbol_lookup`) is
+//!   shown in full rather than stubbed down. (Explicit `memory_*` tools are never trimmed — the
+//!   agent asked.)
 //! - STATIC CAVEAT THROTTLE: the always-identical disclaimers (`GRAPH_SYNTACTIC_CAVEAT`,
 //!   `NO_STATIC_CALLERS_NOTE`) are elided after the agent has seen them within the window; dynamic
 //!   caveats (truncation, gap counts) always pass.
@@ -60,10 +63,14 @@ impl AgentSeen {
 /// Trim a tool-result payload in place: dedup drive-by memories, throttle static caveats, and drop
 /// redundant per-edge flags. Idempotent on payloads that carry none of these.
 pub(crate) fn trim_result(value: &mut Value, seen: &AgentSeen) {
-    // A memory object → replace with a tiny stub if recently seen; never descend into it (its
-    // bindings carry `memory_id` but no `title`, and a full unseen memory must stay intact).
+    // A memory object → replace with a tiny stub if this EXACT content was already surfaced; never
+    // descend into it (its bindings carry `memory_id` but no `title`, and a full unseen memory must
+    // stay intact). The seen-key folds in a fingerprint of the whole object, so a richer view of a
+    // memory whose compact header was already shown gets a fresh key and passes through in full
+    // (#753 review) — a plain id key would stub the detail the agent explicitly asked for.
     if let Some((id, title)) = memory_identity(value) {
-        if seen.seen_then_touch(&id) {
+        let key = format!("{id}:{:016x}", content_fingerprint(value));
+        if seen.seen_then_touch(&key) {
             *value = stub(&id, &title);
         }
         return;
@@ -87,6 +94,19 @@ fn memory_identity(value: &Value) -> Option<(String, String)> {
     let id = obj.get("memory_id")?.as_str()?;
     let title = obj.get("title")?.as_str()?;
     (!id.is_empty() && !title.is_empty()).then(|| (id.to_string(), title.to_string()))
+}
+
+/// A process-stable fingerprint of a memory object's SURFACED content, so the dedup key
+/// distinguishes views of the same memory (a compact header vs the full body+bindings serialize
+/// differently). In-process only — `DefaultHasher` is deterministic within this run, which is all
+/// the per-session seen-set needs; the value is never persisted or compared across processes.
+fn content_fingerprint(value: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Serde serializes an object's keys in a stable order, so the same view hashes identically
+    // across calls while a richer view hashes differently.
+    serde_json::to_string(value).unwrap_or_default().hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The tiny replacement for a re-surfaced memory: enough to recognize it and fetch detail, none of
@@ -173,6 +193,41 @@ mod tests {
         assert_eq!(again["memories"][0]["title"], "t-m1", "stub keeps the title");
         assert!(again["memories"][0]["elided"].is_string(), "stub explains how to fetch detail");
         assert!(again["memories"][1]["body"].is_string(), "a NEW memory is still full");
+    }
+
+    #[test]
+    fn a_richer_view_of_a_seen_memory_is_shown_not_stubbed() {
+        let seen = AgentSeen::default();
+        // A compact drive-by header (symbol_lookup / default impact_surface): no body/bindings.
+        let compact =
+            || json!({"memory_id": "m1", "kind": "Invariant", "title": "t", "confidence": "high"});
+        // The full view (impact_surface `full_memories: true`, or a `memory_*` shape): adds the
+        // body.
+        let full = || {
+            json!({
+                "memory_id": "m1", "kind": "Invariant", "title": "t", "confidence": "high",
+                "body": "the full prose", "bindings": [{"memory_id": "m1", "path": "src/x.rs"}]
+            })
+        };
+
+        let mut header = json!({ "memories": [compact()] });
+        trim_result(&mut header, &seen);
+        assert_eq!(header["memories"][0]["title"], "t", "the compact header surfaces first");
+
+        // A FULLER view of the SAME memory must still surface in full, not be stubbed down to the
+        // header the agent already saw (#753 review).
+        let mut richer = json!({ "memories": [full()] });
+        trim_result(&mut richer, &seen);
+        assert_eq!(
+            richer["memories"][0]["body"], "the full prose",
+            "a richer view of a seen memory is shown, not stubbed",
+        );
+
+        // The IDENTICAL full view a second time IS stubbed (same content already surfaced).
+        let mut again = json!({ "memories": [full()] });
+        trim_result(&mut again, &seen);
+        assert!(again["memories"][0]["body"].is_null(), "an identical re-surface is stubbed");
+        assert!(again["memories"][0]["elided"].is_string());
     }
 
     #[test]
