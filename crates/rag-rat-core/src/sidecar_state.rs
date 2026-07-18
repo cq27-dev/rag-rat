@@ -8,6 +8,7 @@
 //! processes (one per session) updating DIFFERENT sections don't clobber each other; on contention
 //! the write is skipped rather than waited on (see [`update`]).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rag_rat_base::locks::FileLock;
@@ -19,16 +20,21 @@ use crate::version_check::CachedVersion;
 /// partial write) still deserializes; unknown fields are ignored by serde's default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SidecarState {
-    /// The last crates.io version-check result (was `version-check.json`).
+    /// The last crates.io version-check result (was `version-check.json`). A singleton — the
+    /// latest version of the rag-rat BINARY is machine-global, not per-repo, so a shared
+    /// global DB caches it once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_check: Option<CachedVersion>,
-    /// The stale-memory rebind-nudge throttle (#752): when the fleet last showed the nudge.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_nudge: Option<MemoryNudgeState>,
+    /// The stale-memory rebind-nudge throttle (#752), keyed by `repo_id`. On a shared global DB
+    /// many repos resolve to this one file, but the stale-anchor COUNT is repo-scoped — so the
+    /// throttle must be too, or repo A's tool call would consume the slot and mute repo B's
+    /// warning (#753 review). A `BTreeMap` for stable serialization.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub memory_nudge: BTreeMap<String, MemoryNudgeState>,
 }
 
-/// Throttle state for the stale-anchor rebind nudge (#752): the fleet shows it at most once per
-/// window (a memory `create`/`update` forces it regardless), so it never rides every tool call.
+/// Throttle state for the stale-anchor rebind nudge (#752): a repo shows it at most once per window
+/// (a memory `create`/`update` forces it regardless), so it never rides every tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryNudgeState {
     pub last_shown_at_ms: i64,
@@ -61,7 +67,7 @@ pub fn read(database: &Path) -> SidecarState {
     let version_check = std::fs::read_to_string(legacy_version_cache_path(database))
         .ok()
         .and_then(|text| serde_json::from_str::<CachedVersion>(&text).ok());
-    SidecarState { version_check, memory_nudge: None }
+    SidecarState { version_check, memory_nudge: BTreeMap::new() }
 }
 
 /// Read-modify-write the sidecar state under the file lock, so a concurrent MCP process updating a
@@ -98,20 +104,29 @@ pub fn write_version_cache(database: &Path, cached: &CachedVersion) {
     let _ = update(database, |state| state.version_check = Some(cached.clone()));
 }
 
-/// Claim the rebind-nudge slot: return whether the nudge should show NOW and, if so, record it as
-/// shown (atomically under the lock, so concurrent processes don't both show). It shows when
-/// `force` (a memory create/update just ran) OR the throttle window has elapsed since the last
-/// show.
-pub fn take_memory_nudge_slot(database: &Path, now_ms: i64, ttl_ms: i64, force: bool) -> bool {
+/// Claim `repo_id`'s rebind-nudge slot: return whether the nudge should show NOW and, if so, record
+/// it as shown for that repo (atomically under the lock, so concurrent processes don't both show).
+/// It shows when `force` (a memory create/update just ran) OR the throttle window has elapsed since
+/// this repo's last show. Keyed by `repo_id` so repos sharing a global DB throttle independently.
+pub fn take_memory_nudge_slot(
+    database: &Path,
+    repo_id: &str,
+    now_ms: i64,
+    ttl_ms: i64,
+    force: bool,
+) -> bool {
     // On lock contention the slot can't be claimed atomically, so default to NOT showing: fewer
     // tokens (the goal of #752) and the next call re-evaluates.
     update(database, |state| {
         let elapsed = state
             .memory_nudge
+            .get(repo_id)
             .is_none_or(|nudge| now_ms.saturating_sub(nudge.last_shown_at_ms) >= ttl_ms);
         let show = force || elapsed;
         if show {
-            state.memory_nudge = Some(MemoryNudgeState { last_shown_at_ms: now_ms });
+            state
+                .memory_nudge
+                .insert(repo_id.to_string(), MemoryNudgeState { last_shown_at_ms: now_ms });
         }
         show
     })
@@ -130,23 +145,47 @@ mod tests {
     }
 
     const TTL: i64 = 30 * 60 * 1000;
+    const REPO: &str = "repoA";
 
     #[test]
     fn nudge_slot_throttles_to_the_window_but_forces_on_demand() {
         let db = temp_db("nudge");
         // First ever show: nothing recorded → the window has "elapsed", so it shows and records.
-        assert!(take_memory_nudge_slot(&db, 1_000, TTL, false), "first show");
+        assert!(take_memory_nudge_slot(&db, REPO, 1_000, TTL, false), "first show");
         // Within the window, non-forced: throttled.
         assert!(
-            !take_memory_nudge_slot(&db, 1_000 + TTL - 1, TTL, false),
+            !take_memory_nudge_slot(&db, REPO, 1_000 + TTL - 1, TTL, false),
             "throttled inside window"
         );
         // Force (a memory create/update) shows regardless AND resets the window.
-        assert!(take_memory_nudge_slot(&db, 1_000 + TTL - 1, TTL, true), "forced show");
+        assert!(take_memory_nudge_slot(&db, REPO, 1_000 + TTL - 1, TTL, true), "forced show");
         // Now the reset window throttles again just after the forced show.
-        assert!(!take_memory_nudge_slot(&db, 1_000 + TTL, TTL, false), "reset window throttles");
+        assert!(
+            !take_memory_nudge_slot(&db, REPO, 1_000 + TTL, TTL, false),
+            "reset window throttles"
+        );
         // Once the full window elapses from the last show, it shows again.
-        assert!(take_memory_nudge_slot(&db, 1_000 + 2 * TTL, TTL, false), "window elapsed → show");
+        assert!(
+            take_memory_nudge_slot(&db, REPO, 1_000 + 2 * TTL, TTL, false),
+            "window elapsed → show"
+        );
+        let _ = std::fs::remove_dir_all(db.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn repos_sharing_one_db_throttle_independently() {
+        let db = temp_db("multi-repo");
+        // repoA claims its slot and is then throttled inside the window.
+        assert!(take_memory_nudge_slot(&db, "repoA", 1_000, TTL, false), "repoA first show");
+        assert!(
+            !take_memory_nudge_slot(&db, "repoA", 1_500, TTL, false),
+            "repoA throttled inside window"
+        );
+        // repoB (same shared DB) has its OWN window — it must still show, not inherit repoA's slot.
+        assert!(
+            take_memory_nudge_slot(&db, "repoB", 1_500, TTL, false),
+            "repoB shows despite repoA having claimed its own slot",
+        );
         let _ = std::fs::remove_dir_all(db.parent().unwrap().parent().unwrap());
     }
 
@@ -158,10 +197,10 @@ mod tests {
             checked_at_ms: 7,
         });
         // Claiming the nudge slot must PRESERVE the version-check section (RMW, not overwrite).
-        assert!(take_memory_nudge_slot(&db, 5_000, TTL, false));
+        assert!(take_memory_nudge_slot(&db, REPO, 5_000, TTL, false));
         let state = read(&db);
         assert_eq!(state.version_check.unwrap().latest_version, "9.9.9");
-        assert_eq!(state.memory_nudge.unwrap().last_shown_at_ms, 5_000);
+        assert_eq!(state.memory_nudge.get(REPO).unwrap().last_shown_at_ms, 5_000);
         let _ = std::fs::remove_dir_all(db.parent().unwrap().parent().unwrap());
     }
 }

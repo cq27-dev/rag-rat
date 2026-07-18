@@ -162,11 +162,15 @@ impl RagRatService {
             return None;
         }
         // A memory create/update forces the nudge (and resets the window); everything else is gated
-        // on the shared throttle. The slot is claimed atomically — a `false` return means either
-        // throttled or another session just claimed it, so this call stays silent.
+        // on the throttle. The slot is claimed atomically — a `false` return means throttled or
+        // another session just claimed it, so this call stays silent. Keyed by `repo_id` (the same
+        // identity the per-repo write lock uses) so repos sharing a global DB don't mute each other
+        // (#753 review); resolving it here, gated behind `n > 0`, keeps it off the common path.
         let force = matches!(tool, "memory_create" | "memory_update");
+        let repo_id = rag_rat_base::locks::write_lock_repo_id(config);
         if !rag_rat_core::sidecar_state::take_memory_nudge_slot(
             &config.database,
+            &repo_id,
             rag_rat_base::time::now_ms(),
             NUDGE_TTL_MS,
             force,
