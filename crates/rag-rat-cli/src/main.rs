@@ -150,6 +150,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::DumpVerifyPacks(args) => dump_verify_packs(&config, &args)?,
         Cmd::Oracle(args) => oracle(&config, &args)?,
         Cmd::Consolidate => consolidate(&config)?,
+        Cmd::Rm(args) => rm(&config, &args)?,
         Cmd::DumpConfig => dump_config(&config)?,
         Cmd::VersionCheck => version_check(&config)?,
     }

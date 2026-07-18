@@ -321,8 +321,46 @@ pub(crate) fn setup_index(config: &Config) -> anyhow::Result<IndexDatabase> {
     if migration.state != rag_rat_db::schema::SchemaState::Compatible {
         anyhow::bail!("{}", migration.message);
     }
+    // #767: init is the deliberate re-add a `rag-rat rm` removal tombstone allows — lift it before
+    // the config-bearing index open below calls `register_repo`, which refuses a tombstoned repo.
+    clear_removal_tombstone(config)?;
     eprintln!("init: indexing discovered files");
     IndexDatabase::index_discover_with_progress(config, render_index_progress)
+}
+
+/// Lift any `rag-rat rm` removal tombstone for the repo `init` is (re-)initializing, so the ensuing
+/// `register_repo` is allowed. An unresolvable identity is a no-op (a never-removed fresh init has
+/// no tombstone and no derivable id to clear). But once the identity resolves, an open / clear
+/// FAILURE is PROPAGATED, not swallowed: otherwise init would proceed to `register_repo`, be
+/// refused for the still-tombstoned repo, and print the confusing "run `rag-rat init`" remedy while
+/// the user is already running init. Surfacing the clear failure lets them retry once the store is
+/// quiet.
+fn clear_removal_tombstone(config: &Config) -> anyhow::Result<()> {
+    let Ok(identity) = rag_rat_base::repo_identity::resolve_repo_identity(
+        &config.root,
+        config.repo_id_override.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    // Clear UNDER the repo write lock so it SERIALIZES with a concurrent `rag-rat rm`: without the
+    // lock, init could lift the tombstone in the window between rm's committed purge and rm's lock
+    // release, and the ensuing index register would repopulate the just-removed repo after rm
+    // reported success. rm holds this lock across its whole purge→deconfigure→VACUUM sequence, so
+    // the clear waits for rm to fully finish before lifting the marker.
+    let Some(_lock) = rag_rat_base::locks::WriteLock::acquire_timeout(
+        &config.database,
+        &identity.repo_id,
+        std::time::Duration::from_secs(30),
+    )?
+    else {
+        anyhow::bail!(
+            "timed out waiting for the repo write lock to lift the `rag-rat rm` removal tombstone \
+             — a removal or index pass is running; retry `rag-rat init` once it finishes"
+        );
+    };
+    let storage = rag_rat_db::storage::IndexConnection::open(&config.database)?;
+    rag_rat_db::schema::clear_repo_removed(storage.connection(), &identity.repo_id)?;
+    Ok(())
 }
 pub(crate) fn setup_model_and_reconcile(
     config: &Config,

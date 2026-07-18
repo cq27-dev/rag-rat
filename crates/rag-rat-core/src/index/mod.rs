@@ -11,6 +11,7 @@ pub mod symbols;
 pub mod walker;
 
 pub mod consolidate;
+pub mod remove;
 
 mod adoption_hints;
 pub(crate) mod change_coupling;
@@ -74,10 +75,11 @@ pub use query_api::{
     CLONE_DELTA_MAX_FILES, CandidateCloneClass, CloneCheckInput, CloneCompleteness,
     CloneDeltaReport, CloneEdgeReport, CloneEligibility, CloneFingerprintHealth,
     CloneIneligibilityReason, CloneMember, CloneSymbolSelector, ClonesForSymbolResult,
-    DatabaseFileHealth, FindClonesOptions, FindClonesResult, GcReport, GlobalFtsStatus,
-    GlobalStatus, ImportantSymbolsRequest, MemoryCounts, MemoryKindCounts, OracleShaSnapshots,
-    PapertrailCursor, RepoContent, RepoFreshness, RepoPapertrail, RepoStatus, RoiFactors,
-    SearchRequest, TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay,
+    DatabaseFileHealth, FindClonesOptions, FindClonesResult, FreelistReclaim,
+    FreelistReclaimReport, GcReport, GlobalFtsStatus, GlobalStatus, ImportantSymbolsRequest,
+    MemoryCounts, MemoryKindCounts, OracleShaSnapshots, PapertrailCursor, RepoContent,
+    RepoFreshness, RepoPapertrail, RepoStatus, RoiFactors, SearchRequest, TextCloneMatch,
+    WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay, reclaim_freelist_at,
 };
 pub use schema::RegisteredRepo;
 pub(crate) use util::*;

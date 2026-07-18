@@ -36,7 +36,10 @@ pub use clones::{
 };
 #[cfg(test)]
 pub(crate) use clones::{MAX_MEMBERS, MEMBER_VALUE_CAP};
-pub use db_file_health::{DatabaseFileHealth, WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport};
+pub use db_file_health::{
+    DatabaseFileHealth, FreelistReclaim, FreelistReclaimReport, WAL_CHECKPOINT_MIN_BYTES,
+    WalCheckpointReport, reclaim_freelist_at,
+};
 pub use gc::GcReport;
 pub use global_status::{
     GlobalFtsStatus, GlobalStatus, MemoryCounts, MemoryKindCounts, PapertrailCursor, RepoContent,

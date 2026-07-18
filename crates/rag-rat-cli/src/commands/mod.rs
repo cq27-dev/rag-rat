@@ -16,6 +16,7 @@ mod index_ops;
 mod memory;
 mod models;
 mod oracle;
+mod remove;
 mod runtime_env;
 mod search;
 mod status;
@@ -34,6 +35,7 @@ pub(crate) use models::models;
 #[cfg(feature = "eval")]
 pub(crate) use models::{benchmark_embedding, eval};
 pub(crate) use oracle::{oracle, with_oracle_write_lock};
+pub(crate) use remove::rm;
 pub(crate) use runtime_env::apply_embedding_runtime_env;
 pub(crate) use search::{brief, clusters, important_symbols, query};
 pub(crate) use status::status;

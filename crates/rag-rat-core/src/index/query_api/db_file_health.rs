@@ -117,65 +117,12 @@ impl IndexDatabase {
     /// operator to quiesce agents and retry. An explicit operator action (`doctor --vacuum`),
     /// never automatic: it can rewrite hundreds of MB.
     pub fn reclaim_freelist(&self) -> anyhow::Result<FreelistReclaimReport> {
-        let path = self.storage.database_path().to_path_buf();
-        let _lock =
-            rag_rat_base::locks::WriteLock::acquire_schema_timeout(&path, VACUUM_LOCK_TIMEOUT)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "timed out waiting for the schema lock to VACUUM the database — another \
-                         rag-rat writer is active; stop agents/watchers and retry"
-                    )
-                })?;
-        // Snapshot under the lock so `before` can't drift against a concurrent writer.
-        let before = self.database_file_health()?;
-        // VACUUM on a FRESH bare connection, not `self`: a scoped `IndexDatabase` installs a
-        // `temp.files` TEMP VIEW (`install_scope_view`), and VACUUM rejects a connection carrying a
-        // temp view ("views may not be indexed"). A pragma'd bare open matches the manual
-        // `sqlite3 <db> VACUUM` remedy and rewrites the same file; `self` sees the compacted result
-        // on its next read.
-        let vacuum_conn = rag_rat_db::storage::IndexConnection::open(&path)?;
-        // A concurrent writer (any repo's watcher/index, or a reader holding a txn) makes VACUUM
-        // fail busy — the schema lock doesn't hold those off. Turn a raw SQLITE_BUSY into an
-        // actionable refusal (no corruption, just retry once quiet).
-        if let Err(err) = vacuum_conn.connection().execute_batch("VACUUM") {
-            let err = anyhow::Error::from(err);
-            return Err(if rag_rat_db::storage::is_busy(&err) {
-                anyhow::anyhow!(
-                    "VACUUM could not get exclusive access to the database — a rag-rat writer (a \
-                     watcher/index for any repo, or an active reader) is running. Stop \
-                     agents/watchers/MCP servers and re-run `rag-rat doctor --vacuum`."
-                )
-            } else {
-                err.context("VACUUM failed")
-            });
+        // `doctor --vacuum` surfaces a busy refusal as an error (quiesce and retry) — the behavior
+        // before the outcome split. Only the removal purge treats a busy VACUUM as a benign skip.
+        match reclaim_freelist_at(self.storage.database_path())? {
+            FreelistReclaim::Reclaimed(report) => Ok(report),
+            FreelistReclaim::BusySkipped(message) => Err(anyhow::anyhow!("{message}")),
         }
-        // VACUUM may RENUMBER git_commits' rowids — it has no explicit INTEGER PRIMARY KEY (keyed
-        // by `hash` / `(repo_id, hash)`), and SQLite documents that VACUUM can change
-        // rowids for such tables. That desyncs the external-content `commit_fts`
-        // (content='git_commits', content_rowid='rowid'), so `commit_search` would return
-        // wrong/missing commits. Rebuild it against the post-VACUUM rowids. It is the ONLY
-        // at-risk FTS: `chunk_fts` is contentless and `github_fts`/`repo_memory_fts` are
-        // standalone (not rowid-linked).
-        rag_rat_db::schema::rebuild_commit_fts(vacuum_conn.connection())?;
-        // In WAL mode VACUUM's compaction lands in the `-wal`; fold it back and truncate the
-        // sidecar so the main file physically shrinks (and doesn't just move dead space to the
-        // WAL). The checkpoint returns (busy, log, checkpointed): busy = 1 means a reader
-        // pinned frames and the truncate could not complete — surface it (`wal_truncated`)
-        // rather than swallow it, or `doctor --vacuum` would report success while the file
-        // never shrank on disk.
-        let busy =
-            vacuum_conn
-                .connection()
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0))?;
-        drop(vacuum_conn);
-        let after = self.database_file_health()?;
-        Ok(FreelistReclaimReport {
-            main_bytes_before: before.main_bytes,
-            main_bytes_after: after.main_bytes,
-            freelist_pages_before: before.freelist_pages,
-            freelist_pages_after: after.freelist_pages,
-            wal_truncated: busy == 0,
-        })
     }
 
     /// Size and dead-space facts about the database file, with warning flags at the default
@@ -271,6 +218,109 @@ fn compute_database_file_health(
         freelist_excessive,
         note,
     })
+}
+
+/// The result of a [`reclaim_freelist_at`] attempt. `BusySkipped` is the ONE benign failure a
+/// best-effort caller may swallow: VACUUM could not acquire exclusive access and — VACUUM being
+/// transactional — mutated NOTHING, so the file is exactly as it was. EVERY other failure is a hard
+/// `Err`, including a post-VACUUM `commit_fts` rebuild / checkpoint error: those run AFTER VACUUM
+/// may have renumbered `git_commits`' rowids, so swallowing one would leave the shared commit FTS
+/// desynced while the caller reports success.
+pub enum FreelistReclaim {
+    /// VACUUM ran and the file was rewritten; the report carries the before/after figures.
+    Reclaimed(FreelistReclaimReport),
+    /// VACUUM could not get exclusive access (a writer/reader held the file busy) and changed
+    /// nothing — safe to skip and retry later. Carries the operator-facing reason.
+    BusySkipped(String),
+}
+
+/// Reclaim dead space in the database file by running `VACUUM`, path-based — the core of
+/// [`IndexDatabase::reclaim_freelist`], also called by the repo-removal purge (which cannot hold a
+/// scoped `IndexDatabase` for a repo it may have just de-registered). Takes the GLOBAL schema lock
+/// (serializing against migrations and other VACUUMs), VACUUMs on a FRESH bare connection,
+/// re-derives the external-content `commit_fts`, and folds the WAL back. See
+/// [`IndexDatabase::reclaim_freelist`] for the concurrency contract (it relies on SQLite's own file
+/// locking and refuses busy). A busy refusal returns [`FreelistReclaim::BusySkipped`] (nothing
+/// mutated); a failure AFTER a committed VACUUM propagates as `Err` (the index must not be left
+/// half-repaired under a clean-looking result).
+pub fn reclaim_freelist_at(database: &Path) -> anyhow::Result<FreelistReclaim> {
+    let Some(_lock) =
+        rag_rat_base::locks::WriteLock::acquire_schema_timeout(database, VACUUM_LOCK_TIMEOUT)?
+    else {
+        // A schema-lock timeout means another whole-file rewriter (a VACUUM or a migration) holds
+        // it — the SAME "a writer is busy, retry later" condition as a busy VACUUM, and one where
+        // VACUUM likewise mutated NOTHING. Downgrade it to `BusySkipped` (symmetric with the
+        // busy-VACUUM case below) so a best-effort caller (the removal purge) reports
+        // `vacuum_skipped` instead of a hard failure over an already-committed removal.
+        return Ok(FreelistReclaim::BusySkipped(
+            "VACUUM could not acquire the schema lock — another whole-file rewriter (a VACUUM or \
+             migration) is active; stop agents/watchers/MCP servers and re-run `rag-rat doctor \
+             --vacuum`."
+                .to_string(),
+        ));
+    };
+    // VACUUM on a FRESH bare connection: a scoped `IndexDatabase` installs a `temp.files` TEMP VIEW
+    // (`install_scope_view`), and VACUUM rejects a connection carrying a temp view ("views may not
+    // be indexed"). A pragma'd bare open matches the manual `sqlite3 <db> VACUUM` remedy and
+    // rewrites the same file. The same connection reads the before/after freelist snapshot, so the
+    // `before` read is under the schema lock and cannot drift against a concurrent writer.
+    let vacuum_conn = rag_rat_db::storage::IndexConnection::open(database)?;
+    let (main_bytes_before, freelist_pages_before) = freelist_snapshot(&vacuum_conn, database)?;
+    // A concurrent writer (any repo's watcher/index, or a reader holding a txn) makes VACUUM
+    // fail busy — the schema lock doesn't hold those off. Turn a raw SQLITE_BUSY into an
+    // actionable refusal (no corruption, just retry once quiet).
+    if let Err(err) = vacuum_conn.connection().execute_batch("VACUUM") {
+        let err = anyhow::Error::from(err);
+        // A busy refusal is the ONLY skippable failure: VACUUM is transactional, so a failed START
+        // mutated nothing and the file is unchanged. Everything below runs AFTER a committed
+        // VACUUM, so any failure there must propagate, not downgrade to a benign skip.
+        if rag_rat_db::storage::is_busy(&err) {
+            return Ok(FreelistReclaim::BusySkipped(
+                "VACUUM could not get exclusive access to the database — a rag-rat writer (a \
+                 watcher/index for any repo, or an active reader) is running. Stop \
+                 agents/watchers/MCP servers and re-run `rag-rat doctor --vacuum`."
+                    .to_string(),
+            ));
+        }
+        return Err(err.context("VACUUM failed"));
+    }
+    // VACUUM may RENUMBER git_commits' rowids — it has no explicit INTEGER PRIMARY KEY (keyed
+    // by `hash` / `(repo_id, hash)`), and SQLite documents that VACUUM can change rowids for such
+    // tables. That desyncs the external-content `commit_fts` (content='git_commits',
+    // content_rowid='rowid'), so `commit_search` would return wrong/missing commits. Rebuild it
+    // against the post-VACUUM rowids. It is the ONLY at-risk FTS: `chunk_fts` is contentless and
+    // `papertrail_fts`/`repo_memory_fts` are standalone (not rowid-linked).
+    rag_rat_db::schema::rebuild_commit_fts(vacuum_conn.connection())?;
+    // In WAL mode VACUUM's compaction lands in the `-wal`; fold it back and truncate the sidecar so
+    // the main file physically shrinks (and doesn't just move dead space to the WAL). The
+    // checkpoint returns (busy, log, checkpointed): busy = 1 means a reader pinned frames and
+    // the truncate could not complete — surface it (`wal_truncated`) rather than swallow it, or
+    // a caller would report success while the file never shrank on disk.
+    let busy =
+        vacuum_conn
+            .connection()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0))?;
+    let (main_bytes_after, freelist_pages_after) = freelist_snapshot(&vacuum_conn, database)?;
+    drop(vacuum_conn);
+    Ok(FreelistReclaim::Reclaimed(FreelistReclaimReport {
+        main_bytes_before,
+        main_bytes_after,
+        freelist_pages_before,
+        freelist_pages_after,
+        wal_truncated: busy == 0,
+    }))
+}
+
+/// `(main_bytes, freelist_pages)` for the file — the two figures a VACUUM before/after report
+/// needs. `main_bytes` is the on-disk size; `freelist_pages` is `PRAGMA freelist_count`.
+fn freelist_snapshot(
+    conn: &rag_rat_db::storage::IndexConnection,
+    database: &Path,
+) -> anyhow::Result<(u64, i64)> {
+    let freelist_pages: i64 =
+        conn.connection().query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    let main_bytes = std::fs::metadata(database).map(|meta| meta.len()).unwrap_or(0);
+    Ok((main_bytes, freelist_pages))
 }
 
 /// Size of the `-wal` sidecar, 0 when absent. SQLite derives the sidecar name by appending

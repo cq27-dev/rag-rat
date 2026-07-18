@@ -136,12 +136,31 @@ pub(crate) enum Command {
     /// the legacy `.rag-rat/index.sqlite` so the repo uses the global store from then on.
     Consolidate,
 
+    /// Remove a repo from the consolidated global index: purge all of its rows, then delete its
+    /// `rag-rat.toml` and uninstall its git hooks. Returning the repo needs `rag-rat init`.
+    Rm(RmArgs),
+
     /// Print the resolved configuration as JSON.
     DumpConfig,
 
     /// Check crates.io for a newer published rag-rat, refresh the cache, and print current vs
     /// latest.
     VersionCheck,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RmArgs {
+    /// The repo to remove, by path: `.`, a relative path, or an absolute path. Resolved to a
+    /// registered repo by identity → recorded root → sole; an exact recorded-root match also
+    /// resolves a repo whose working tree was deleted or moved.
+    #[arg(value_name = "PATH", default_value = ".")]
+    pub path: PathBuf,
+    /// Skip the confirmation prompt (non-interactive).
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Preview what would be deleted (per-table row counts) and exit without changing anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

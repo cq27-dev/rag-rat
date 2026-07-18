@@ -245,6 +245,11 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
     let target_storage = IndexConnection::open(&target)?;
     let target_conn = target_storage.connection();
 
+    // #767: consolidate is a DELIBERATE re-add, like `init` — lift any `rag-rat rm` removal
+    // tombstone for this repo first, or `register_repo` below would refuse the import with a "run
+    // init" remedy that does not fit consolidate. Under the target lock already held.
+    schema::clear_repo_removed(target_conn, &identity.repo_id)?;
+
     // Register (or adopt/extend) this repo in the global DB. The returned id is what every imported
     // row is stamped with — the legacy DB's own `repo_id` (placeholder or otherwise) is discarded.
     // Consolidation IMPORTS an indexed repo, so `register_repo` records the working-tree root

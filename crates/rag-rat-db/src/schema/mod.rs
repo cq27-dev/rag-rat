@@ -1,5 +1,6 @@
 mod baseline;
 mod migrations;
+mod purge;
 mod registry;
 // The schema surface the engine crates consume (everything else stays crate-internal):
 pub use baseline::{apply_baseline, rebuild_commit_fts};
@@ -22,6 +23,7 @@ pub use migrations::{
     apply_repo_id_periphery_scoping, apply_repos_registry, apply_scip_moniker_anchors,
 };
 pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_exists};
+pub use purge::{RepoRowCounts, count_repo_rows, purge_repo_rows, repo_scoped_table_names};
 // `multiple_real_repos` lost its V042-era seam-guard callers (real `repo_id` predicates
 // superseded them, A5), but A7's bare-open fail-fast made it production again: a config-less
 // `IndexDatabase::open` refuses a multi-repo DB rather than silently scoping to the
@@ -29,10 +31,11 @@ pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_
 pub use registry::multiple_real_repos;
 pub use registry::{
     CONNECTION_CONTEXT_GENERATION_KEY, CONNECTION_CONTEXT_REPO_KEY, LIVE_FILES_GENERATION_META_KEY,
-    RegisteredRepo, active_generation, active_repo_id, connection_context_value,
-    earliest_recorded_root, is_root_already_indexed_conn, live_files_generation,
-    periphery_repo_scope, periphery_repo_scope_clause, register_repo, register_repo_read_only,
-    registered_repos, repo_has_recorded_root, repo_id_is_registered, repo_indexed_at_this_root,
+    RegisteredRepo, active_generation, active_repo_id, clear_repo_removed,
+    connection_context_value, earliest_recorded_root, is_repo_removed,
+    is_root_already_indexed_conn, live_files_generation, mark_repo_removed, periphery_repo_scope,
+    periphery_repo_scope_clause, register_repo, register_repo_read_only, registered_repos,
+    repo_has_recorded_root, repo_id_is_registered, repo_indexed_at_this_root,
     resolve_config_repo_id, scope_context_repo_id, sole_repo_id,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
