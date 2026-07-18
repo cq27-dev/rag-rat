@@ -291,7 +291,7 @@ mod tests {
         DecodedSecretsOp, StreamKeyWrap, WrapEntry, decode, entry_type as secrets_entry_type,
     };
     use super::{
-        SealingKeyOutcome, current_sealing_key, select_current_sealing_wrap,
+        SealingKeyOutcome, SelectedWrap, current_sealing_key, select_current_sealing_wrap,
         stream_key_rotation_needed,
     };
     use crate::account::cut::Cut;
@@ -1230,5 +1230,197 @@ mod tests {
             "seals under the deterministic winner",
         );
         assert_eq!(security_event_count(&conn), 0, "honest concurrent rotations record no events");
+    }
+
+    // ── Convergence: derive-on-read selection is a total order, independent of ingest order ──
+
+    /// The persisted single-row local-device identity, as opaque column bytes. Copying it verbatim
+    /// makes two fresh stores share ONE device (`local_device` mints from OS entropy, so a plain
+    /// re-mint would give each store a different key and no shared wrap could open in both).
+    struct IdentityRow {
+        seed: Vec<u8>,
+        public_key: Vec<u8>,
+        fingerprint: Vec<u8>,
+        created_at_ms: i64,
+        x25519_secret: Vec<u8>,
+        x25519_public: Vec<u8>,
+    }
+
+    fn read_identity_row(conn: &Connection) -> IdentityRow {
+        conn.query_row(
+            "SELECT seed, public_key, fingerprint, created_at_ms, x25519_secret, x25519_public
+             FROM oplog_device_identity WHERE id = 0",
+            [],
+            |row| {
+                Ok(IdentityRow {
+                    seed: row.get(0)?,
+                    public_key: row.get(1)?,
+                    fingerprint: row.get(2)?,
+                    created_at_ms: row.get(3)?,
+                    x25519_secret: row.get(4)?,
+                    x25519_public: row.get(5)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    fn write_identity_row(conn: &Connection, row: &IdentityRow) {
+        conn.execute(
+            "INSERT INTO oplog_device_identity(
+                 id, seed, public_key, fingerprint, created_at_ms, x25519_secret, x25519_public)
+             VALUES(0, ?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                row.seed.as_slice(),
+                row.public_key.as_slice(),
+                row.fingerprint.as_slice(),
+                row.created_at_ms,
+                row.x25519_secret.as_slice(),
+                row.x25519_public.as_slice(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn selection_converges_across_ingest_orders() {
+        // `select_current_sealing_wrap` / `current_sealing_key` are DERIVE-ON-READ over the
+        // accepted wrap set: MAX key_epoch, tiebreak MIN entry_hash — a TOTAL order. The
+        // accepted set itself is order-independent (the fold + fixpoint pre-verify
+        // promotion converge regardless of arrival order), so the selection must be
+        // byte-identical no matter what order the entries were ingested. Build ONE entry
+        // byte-set that exercises both tricky cases at once — two concurrent epoch-1 wraps
+        // with DIFFERENT key_ids (the min-entry_hash tiebreak decides) AND
+        // an S-1 retro-condemn that drops the epoch-2 max so selection must fall back to epoch 1 —
+        // then replay that SAME set in natural and reversed order into fresh stores. A regression
+        // to an ingest-order-dependent (non-total) selection would make the two stores
+        // diverge here.
+
+        // One deterministic local device, shared byte-for-byte across the two stores, so a wrap
+        // sealed to it opens in either. Its keys also address the wraps built below.
+        let (device_row, recipient_fp, recipient_x) = {
+            let seed_store = db();
+            let device = local_device(&seed_store, NOW).unwrap();
+            (read_identity_row(&seed_store), device.fingerprint(), device.x25519_public())
+        };
+
+        // Build the entry set ONCE — the random ephemeral inside each wrap is then fixed into the
+        // bytes and replayed identically into both stores.
+        let founder = Dev::new(1);
+        let (account, genesis_bytes, genesis_hash) = genesis(&founder);
+        let owner_b = Dev::new(2);
+        let (add_bytes, owner_id_b) = control_op(
+            account,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&owner_b, DeviceRole::Owner),
+        );
+        let (stream_id, own) = stream_own(account);
+        let (own_bytes, own_hash) =
+            control_op(account, &founder, 2, Some(owner_id_b), Some(genesis_hash), &own);
+
+        let key1_founder = ContentKey::from_seed(&[0x51; 32]);
+        let key1_owner_b = ContentKey::from_seed(&[0x52; 32]);
+        let key2 = ContentKey::from_seed(&[0x53; 32]);
+        assert_ne!(
+            key1_founder.key_id(),
+            key1_owner_b.key_id(),
+            "the two concurrent epoch-1 mints have distinct key_ids",
+        );
+
+        // Two concurrent epoch-1 wraps (founder + owner_b), both naming the local device.
+        let (wf_bytes, wf) = wrap_entry(
+            account,
+            &founder,
+            0,
+            None,
+            Some(genesis_hash),
+            &honest_wrap(account, stream_id, recipient_fp, &recipient_x, &key1_founder, 1),
+        );
+        let (wb0_bytes, wb0) = wrap_entry(
+            account,
+            &owner_b,
+            0,
+            None,
+            Some(owner_id_b),
+            &honest_wrap(account, stream_id, recipient_fp, &recipient_x, &key1_owner_b, 1),
+        );
+        // owner_b's epoch-2 wrap (seq 1) — the eventual max epoch that gets retro-condemned.
+        let (wb1_bytes, _wb1) = wrap_entry(
+            account,
+            &owner_b,
+            1,
+            Some(wb0),
+            Some(owner_id_b),
+            &honest_wrap(account, stream_id, recipient_fp, &recipient_x, &key2, 2),
+        );
+        // Demote owner_b with a secrets cut at seq 0: its epoch-1 wrap (seq 0) survives, its
+        // epoch-2 wrap (seq 1) is retro-condemned — dropping the max accepted epoch from 2
+        // back to 1.
+        let demote = AccountOp::OwnerDemote {
+            device_fingerprint: owner_b.fp,
+            owner_id: owner_id_b,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::At { seq: 0, hash: wb0 },
+            reason: "demote".to_string(),
+        };
+        let (demote_bytes, _) =
+            control_op(account, &founder, 3, Some(own_hash), Some(genesis_hash), &demote);
+
+        let entries =
+            [genesis_bytes, add_bytes, own_bytes, wf_bytes, wb0_bytes, wb1_bytes, demote_bytes];
+
+        // The deterministic expected outcome: epoch 1, tiebreak = min entry_hash of the two epoch-1
+        // wraps, recovering that op's key.
+        let (winner_hash, winner_key) =
+            if wf < wb0 { (wf, &key1_founder) } else { (wb0, &key1_owner_b) };
+
+        let fold_and_select = |order: &[&Vec<u8>]| -> (SelectedWrap, Vec<u8>) {
+            let conn = db();
+            write_identity_row(&conn, &device_row);
+            let device = local_device(&conn, NOW).unwrap();
+            for bytes in order {
+                account_ingest(&conn, bytes, NOW).unwrap();
+            }
+            let selected = select_current_sealing_wrap(&conn, account, stream_id)
+                .unwrap()
+                .expect("a current key");
+            let key =
+                expect_ready(current_sealing_key(&conn, account, stream_id, &device, NOW).unwrap());
+            (selected, key.as_slice().to_vec())
+        };
+
+        let natural: Vec<&Vec<u8>> = entries.iter().collect();
+        let reversed: Vec<&Vec<u8>> = entries.iter().rev().collect();
+        let (sel_natural, key_natural) = fold_and_select(&natural);
+        let (sel_reversed, key_reversed) = fold_and_select(&reversed);
+
+        // Both ingest orders converge on the identical selection…
+        assert_eq!(
+            sel_natural, sel_reversed,
+            "the derive-on-read selection is identical regardless of ingest order",
+        );
+        assert_eq!(sel_natural.key_epoch, 1, "the epoch-2 wrap was condemned; epoch 1 is the max");
+        assert_eq!(
+            sel_natural.minting_entry_hash, winner_hash,
+            "min entry_hash tiebreaks the two concurrent epoch-1 wraps",
+        );
+        assert_eq!(
+            sel_natural.key_id,
+            winner_key.key_id(),
+            "the selected key_id is the tiebreak winner's",
+        );
+        // …and recover the identical content key, matching the deterministic winner.
+        assert_eq!(
+            key_natural, key_reversed,
+            "the recovered content key is identical across orders"
+        );
+        assert_eq!(
+            key_natural.as_slice(),
+            winner_key.as_slice(),
+            "the recovered key is the tiebreak winner's",
+        );
     }
 }

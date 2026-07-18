@@ -571,4 +571,34 @@ mod tests {
         let bad_ctx = WrapContext { recipient_pub: wrong, ..ctx() };
         assert!(seal_content_key(&key, &bad_ctx, &recipient_pub()).is_err());
     }
+
+    #[test]
+    fn repeated_seal_of_the_same_key_uses_a_fresh_ephemeral_and_nonce() {
+        // The wire carries NO nonce; security rests on a FRESH ephemeral X25519 per seal → a fresh
+        // HKDF PRK → a fresh (wrap_key, nonce). Seal the SAME (key, ctx, recipient) twice through
+        // the real OS-CSPRNG `seal_content_key` (not `seal_with_ephemeral`) and require the two
+        // wraps to differ in BOTH the ephemeral pubkey and the ciphertext. A regression to a
+        // deterministic ephemeral would reuse (wrap_key, nonce) across seals — a classic
+        // (key, nonce)-reuse AEAD break that keystream-XORs two plaintexts — yet would still pass
+        // the seed-fixed golden test `sealed_key_wrap_wire_is_golden_pinned`, so this is the only
+        // guard on freshness.
+        let key = ContentKey::from_seed(&CONTENT_KEY_SEED);
+        let first = seal_content_key(&key, &ctx(), &recipient_pub()).unwrap();
+        let second = seal_content_key(&key, &ctx(), &recipient_pub()).unwrap();
+
+        assert_ne!(
+            first.ephemeral_pubkey, second.ephemeral_pubkey,
+            "each seal must sample a fresh ephemeral X25519 key",
+        );
+        assert_ne!(
+            first.ciphertext, second.ciphertext,
+            "a fresh ephemeral must yield a fresh (wrap_key, nonce), so the ciphertext must differ",
+        );
+
+        // Freshness must not cost recoverability: both wraps still open to the original key.
+        let recovered_first = unwrap_content_key(&first, &recipient_secret(), &ctx()).unwrap();
+        let recovered_second = unwrap_content_key(&second, &recipient_secret(), &ctx()).unwrap();
+        assert_eq!(recovered_first.as_slice(), key.as_slice());
+        assert_eq!(recovered_second.as_slice(), key.as_slice());
+    }
 }

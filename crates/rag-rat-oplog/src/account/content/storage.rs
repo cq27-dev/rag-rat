@@ -1857,6 +1857,72 @@ mod tests {
     }
 
     #[test]
+    fn content_pre_verify_author_cap_protects_other_authors_below_global_cap() {
+        // The per-author pre-verify cap must stop ONE claimed author from evicting ANOTHER author's
+        // parked rows while the global queue (PRE_VERIFY_GLOBAL_MAX) still has headroom. Park one
+        // older row under author B, then flood author A with PRE_VERIFY_PER_AUTHOR_MAX + 1 rows at
+        // strictly newer received_at_ms; the total (PER_AUTHOR_MAX + 1) stays far under the global
+        // cap, so ONLY the per-author eviction can fire. If the per-author eviction DELETE were
+        // made global-scoped (dropping `WHERE claimed_author_account_id = ?1`), it would
+        // evict the globally-oldest row — author B's — instead of author A's own oldest,
+        // and this test fails. The single-author test above cannot catch that regression;
+        // the account layer's `pre_verify_budget_evicts_oldest_per_account_and_globally` is
+        // the sibling guard.
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x5b; 32]);
+        let author_a = super::super::super::AccountId::from_bytes([0x0a; 32]);
+        let author_b = super::super::super::AccountId::from_bytes([0x0b; 32]);
+
+        // Author B parks one row FIRST, at the oldest received_at_ms — the globally-oldest row, so
+        // a global-scoped eviction would target exactly this one.
+        let b_entry = content(&secret, author_b, [0xee; 32], 0, None);
+        let b_hash = cbor::sha256(&b_entry.signed_bytes);
+        assert_eq!(
+            content_ingest(&conn, &b_entry.signed_bytes, 0).unwrap(),
+            ContentIngestOutcome::PreVerify,
+        );
+
+        // Author A floods PER_AUTHOR_MAX + 1 rows, each strictly newer than author B's. Only the
+        // (MAX+1)th trips the per-author cap, evicting author A's OWN oldest row.
+        for seq in 0..=PRE_VERIFY_PER_AUTHOR_MAX as u64 {
+            // A garbage but non-null predecessor for seq > 0 (prev_hash must be null iff seq == 0);
+            // it keeps every row a distinct pre-verify entry and never resolves (still parked).
+            let previous = (seq > 0).then_some([seq as u8; 32]);
+            let a_entry = content(&secret, author_a, [0xee; 32], seq, previous);
+            let received_at_ms = seq as i64 + 1; // strictly newer than author B's 0
+            let outcome = content_ingest(&conn, &a_entry.signed_bytes, received_at_ms).unwrap();
+            if seq == PRE_VERIFY_PER_AUTHOR_MAX as u64 {
+                assert_eq!(outcome, ContentIngestOutcome::PreVerifyWithEviction {
+                    scopes: vec![ContentCapacityScope::PreVerifyAuthor],
+                });
+            } else {
+                assert_eq!(outcome, ContentIngestOutcome::PreVerify);
+            }
+        }
+
+        // Author B's older row survives — author A's per-author eviction must not reach across it.
+        assert!(
+            pre_verify_contains(&conn, &b_hash).unwrap(),
+            "author A's flood must NOT evict author B's parked row",
+        );
+        // Author A is held to EXACTLY the per-author cap.
+        let a_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM content_pre_verify WHERE claimed_author_account_id = ?1",
+                [author_a.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_count, PRE_VERIFY_PER_AUTHOR_MAX, "author A is capped at the per-author max");
+        // The global total is PER_AUTHOR_MAX + 1 (author A's cap + author B's surviving row), well
+        // under the global cap — proving the global eviction never fired.
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM content_pre_verify", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, PRE_VERIFY_PER_AUTHOR_MAX + 1);
+    }
+
+    #[test]
     fn reverse_delivery_heals_a_long_dense_chain_without_recursion() {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[10; 32]);
