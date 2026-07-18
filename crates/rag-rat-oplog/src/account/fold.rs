@@ -4716,4 +4716,186 @@ mod tests {
             assert_eq!(outcome.taxonomy(), expected, "taxonomy drift for {outcome:?}");
         }
     }
+
+    #[test]
+    fn removing_the_sole_owner_is_rejected_last_owner_and_keeps_the_account_live() {
+        // The INTRINSIC last-owner prefilter (§12/I2): when the prior-depth owner set is a
+        // SINGLETON, a cut that closes that sole owner can never succeed under any order, so it is
+        // reserved `LastOwner` before it can park, contest, or install a register — the account
+        // stays `Live` with its one owner intact, never a permanently-unrecoverable zero-owner
+        // state. This is the prefilter, not the multi-cut I2 sim: only one cut acts at the depth,
+        // against a size-1 prior-depth owner set.
+        //
+        // A genuine singleton owner set needs a NON-founder sole owner — the founder's own self-cut
+        // sits at stratum 0, where the prefilter is deliberately skipped (the prior-depth set is
+        // empty there). X becomes sole once F is removed and Y is demoted, both at depth 1. Y is
+        // demoted but its incarnation stays live WITHIN the demotion cut, so Y can still author an
+        // admitted cut at depth 2 — where the prior-depth owner set is exactly {X}. Y removing X is
+        // NOT self-defeating (the removal op lives on Y's chain, so X's watermark cannot cover it);
+        // only the prefilter stops it.
+        let (fdr, x, y) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&fdr);
+        let add_x = f.author(&fdr, Some(f.genesis_hash), &device_add(&x, DeviceRole::Owner));
+        // X (depth-1 owner) mints Y as a deeper owner, removes the founder, and demotes Y with a
+        // cut that COVERS Y's later removal op — so Y's incarnation stays live and its removal is
+        // admitted (not condemned) at depth 2.
+        let add_y = f.author(&x, Some(add_x), &device_add(&y, DeviceRole::Owner)); // X seq 0
+        let remove_x = f.author(&y, Some(add_y), &device_remove(&x, Cut::Empty)); // Y seq 0 (depth 2)
+        f.author(&x, Some(add_x), &owner_demote(&y, add_y, Cut::At { seq: 0, hash: remove_x })); // X seq 1
+        f.author(&x, Some(add_x), &device_remove(&fdr, Cut::At { seq: 1, hash: add_x })); // X seq 2
+
+        let h = f.fold();
+        assert_eq!(
+            h.outcome(&remove_x),
+            Some(Outcome::Rejected(RejectReason::LastOwner)),
+            "removing the sole remaining owner is reserved LastOwner by the intrinsic prefilter",
+        );
+        assert_eq!(h.classification(), AccountClassification::Live, "the account stays live");
+        assert!(!h.is_effective(&remove_x), "the sole-owner removal does not fold");
+        assert!(
+            matches!(h.owner_incarnation_effective(add_x, x.fp), AuthorityQuery::Effective(_)),
+            "X's owner incarnation stays open — the owner set is never emptied",
+        );
+        // Arrival order cannot change the verdict (I9): the intrinsic prefilter is order-free.
+        for rot in 0..f.entries.len() {
+            let r = f.fold_rotated(rot);
+            assert_eq!(r.classification(), AccountClassification::Live, "rotation {rot} class");
+            assert_eq!(
+                r.outcome(&remove_x),
+                Some(Outcome::Rejected(RejectReason::LastOwner)),
+                "rotation {rot}: still reserved LastOwner",
+            );
+            assert!(
+                matches!(r.owner_incarnation_effective(add_x, x.fp), AuthorityQuery::Effective(_)),
+                "rotation {rot}: X stays the sole open owner",
+            );
+        }
+    }
+
+    #[test]
+    fn last_of_two_same_depth_owner_removals_is_reserved_order_independently() {
+        // The multi-cut I2 simulation (§12/I2): across ALL same-depth admitted cuts, the removals
+        // are simulated in deterministic (hash) order over the prior-depth owner set, and any cut
+        // that would empty it is reserved `LastOwner`. Here the prior-depth owner set at depth 2 is
+        // exactly {A, B}; a demoted-but-live owner C authors TWO same-depth cuts, one closing A and
+        // one closing B (on independent target chains, so no mutual-condemnation cycle — the fold
+        // stays Live, not Contested). The first effective removal shrinks the set to a singleton;
+        // the second is reserved LastOwner, leaving one owner open. The reserved survivor is chosen
+        // by op hash, so it is identical under every arrival order (I9) — never a
+        // vacuous-survivor lottery decided by the sort.
+        let (fdr, a, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+        let mut f = Fixture::genesis(&fdr);
+        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        // A (depth-1 owner) mints B and C as deeper owners, then removes F and demotes C — leaving
+        // the prior-depth owner set at depth 2 exactly {A, B}. C's demotion cut COVERS both of C's
+        // later removals, so C's incarnation stays live and both cuts are admitted at depth 2.
+        let add_b = f.author(&a, Some(add_a), &device_add(&b, DeviceRole::Owner)); // A seq 0
+        let add_c = f.author(&a, Some(add_a), &device_add(&c, DeviceRole::Owner)); // A seq 1
+        let remove_a = f.author(&c, Some(add_c), &device_remove(&a, Cut::Empty)); // C seq 0 (depth 2)
+        let remove_b = f.author(&c, Some(add_c), &device_remove(&b, Cut::Empty)); // C seq 1 (depth 2)
+        f.author(&a, Some(add_a), &owner_demote(&c, add_c, Cut::At { seq: 1, hash: remove_b })); // A seq 2
+        f.author(&a, Some(add_a), &device_remove(&fdr, Cut::At { seq: 1, hash: add_a })); // A seq 3
+
+        let h = f.fold();
+        assert_eq!(h.classification(), AccountClassification::Live, "the standoff stays live");
+        // Exactly one of the two same-depth removals folds; the other is reserved LastOwner.
+        let a_removed = h.is_effective(&remove_a);
+        let b_removed = h.is_effective(&remove_b);
+        assert!(a_removed ^ b_removed, "exactly one owner removal folds — the other is reserved");
+        let (effective, reserved) =
+            if a_removed { (remove_a, remove_b) } else { (remove_b, remove_a) };
+        assert!(h.is_effective(&effective), "the first-in-order removal is effective");
+        assert_eq!(
+            h.outcome(&reserved),
+            Some(Outcome::Rejected(RejectReason::LastOwner)),
+            "the removal that would empty the owner set is reserved LastOwner",
+        );
+        // One owner incarnation stays open (the reserved survivor); the other is closed.
+        let a_open =
+            matches!(h.owner_incarnation_effective(add_a, a.fp), AuthorityQuery::Effective(_));
+        let b_open =
+            matches!(h.owner_incarnation_effective(add_b, b.fp), AuthorityQuery::Effective(_));
+        assert!(a_open ^ b_open, "exactly one owner incarnation stays open");
+        // Arrival order (I9): the SAME reserved survivor and verdict under every rotation.
+        for rot in 0..f.entries.len() {
+            let r = f.fold_rotated(rot);
+            assert_eq!(r.classification(), AccountClassification::Live, "rotation {rot} class");
+            assert_eq!(
+                r.outcome(&reserved),
+                Some(Outcome::Rejected(RejectReason::LastOwner)),
+                "rotation {rot}: the same removal is reserved LastOwner",
+            );
+            assert!(r.is_effective(&effective), "rotation {rot}: the same removal folds");
+        }
+    }
+
+    #[test]
+    fn a_removed_owners_within_cut_grant_survives_no_cascade_i5() {
+        // I5 no-cascade (§20): removing a legitimate owner bounds its valid prefix through the cut,
+        // it does NOT retroactively undo the authorizations that owner issued WITHIN the cut — only
+        // an explicit revoke closes a grant. Founder F adds owner B; B authors a StreamOwn and a
+        // StreamGrant (its within-cut authorizations) then one more op BEYOND the cut. F removes B,
+        // pinning the control cut AT the grant's seq: the own + grant stay effective (the grant
+        // stays queryable authority), while B's beyond-cut op is condemned. The removal bounds the
+        // prefix; it does not cascade to the grant.
+        let (fdr, b, x) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let grantee = AccountId::from_bytes([0x44; 32]);
+        let mut f = Fixture::genesis(&fdr);
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        // B's control chain (per-device seq numbering starts at 0 on B's own chain — add_b lives on
+        // F's chain, not B's): StreamOwn (seq 0), StreamGrant (seq 1), a member add BEYOND the cut
+        // (seq 2).
+        let (stream, own_op) = stream_own(f.account_id);
+        let own = f.author(&b, Some(add_b), &own_op); // B seq 0
+        let grant = f.author(&b, Some(add_b), &stream_grant(stream, grantee)); // B seq 1
+        let beyond = f.author(&b, Some(add_b), &device_add(&x, DeviceRole::Member)); // B seq 2
+        // F removes B with the valid prefix pinned AT the grant (B seq 1) — own + grant are within.
+        let remove_b = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &device_remove(&b, Cut::At { seq: 1, hash: grant }),
+        );
+
+        let h = f.fold();
+        assert!(h.is_effective(&remove_b), "the removal of B is effective");
+        assert!(h.is_effective(&own), "B's within-cut StreamOwn survives the removal (no cascade)");
+        assert!(
+            h.is_effective(&grant),
+            "B's within-cut StreamGrant survives the removal (no cascade)",
+        );
+        assert_eq!(
+            h.grant_effective(grant, stream, grantee),
+            AuthorityQuery::Effective(GrantAuthority {
+                stream_id: stream,
+                grantee_account_id: grantee,
+                role: GrantRole::Reader,
+            }),
+            "the grant stays queryable authority after its author is removed",
+        );
+        assert_eq!(
+            h.outcome(&beyond),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+            "B's op beyond the cut is condemned — the prefix is bounded, the within-cut grant is \
+             not",
+        );
+        // Arrival order (I9): same no-cascade result under every rotation.
+        for rot in 0..f.entries.len() {
+            let r = f.fold_rotated(rot);
+            assert!(r.is_effective(&grant), "rotation {rot}: grant survives");
+            assert_eq!(
+                r.grant_effective(grant, stream, grantee),
+                AuthorityQuery::Effective(GrantAuthority {
+                    stream_id: stream,
+                    grantee_account_id: grantee,
+                    role: GrantRole::Reader,
+                }),
+                "rotation {rot}: grant stays effective",
+            );
+            assert_eq!(
+                r.outcome(&beyond),
+                Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+                "rotation {rot}: beyond-cut op condemned",
+            );
+        }
+    }
 }
