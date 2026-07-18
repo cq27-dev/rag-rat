@@ -7,6 +7,25 @@ use super::*;
 pub const MAX_MEMORY_TITLE_LEN: usize = 160;
 pub const MAX_MEMORY_BODY_LEN: usize = 8000;
 
+/// Max BYTES for a memory's `payload_json` (the only otherwise-uncapped envelope input). Sized so a
+/// memory's full signed `/3` op envelope (kind, title, body, tags, payload) stays comfortably under
+/// the op-log's 256 KiB `CONTENT_ENVELOPE_MAX_BYTES` §18a cap, so a create/update can never persist
+/// an un-authorable row (#680). Bytes, not chars, because the envelope budget is a byte budget. The
+/// oplog crate pins this consistent in a cross-crate test (`content_op_is_authorable`); the
+/// dependency only flows oplog → query, never back, so the cap cannot import the envelope constant.
+pub const MAX_MEMORY_PAYLOAD_LEN: usize = 128 * 1024;
+
+/// Max BYTES for a typed-edge's free-form `target_anchor` / `target_repo_id` — the only otherwise-
+/// uncapped inputs on the edge write path. A resolved node/github anchor is short, but an EXPLICIT
+/// cross-repo edge to a not-yet-indexed repo (or a github ref) stores the caller's RAW anchor /
+/// repo id verbatim, and it is carried verbatim into the signed `EdgeAdd` op body. Sized so an
+/// `EdgeAdd`'s signed `/3` envelope — even with BOTH free-form fields at this cap — stays well
+/// under the op-log's 256 KiB `CONTENT_ENVELOPE_MAX_BYTES` §18a cap, so `add_edge` can never
+/// persist an un-authorable edge (#680). Bytes, not chars, because the envelope budget is a byte
+/// budget; the oplog crate pins this consistent with its authorable bound in
+/// `content_op_is_authorable`'s cross-crate test.
+pub const MAX_EDGE_ANCHOR_LEN: usize = 8 * 1024;
+
 pub fn memory_by_id(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<RepoMemory>> {
     // Scoped to the active repo (V042): this by-id read guards `memory_get` / `update_memory` /
     // `mark_obsolete` / `rebind_memory`, so an unscoped lookup would let any caller holding a

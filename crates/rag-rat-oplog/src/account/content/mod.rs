@@ -17,7 +17,7 @@ pub use acceptance::{
 };
 // The in-tx `/3` local-authoring seam + its genesis-detection reader (C3.4b-i, #663): live
 // callers in `query::memory` land with #664, so these are plain (un-frozen) re-exports.
-pub use author::{author_content_batch_in_tx, content_stream_is_empty};
+pub use author::{author_content_batch_in_tx, content_op_is_authorable, content_stream_is_empty};
 pub use envelope::{
     ContentEntryHeader, SignedContentEntry, VerifiedContentEntry, decode_content_signed,
     sign_content_entry, verify_content_signed,

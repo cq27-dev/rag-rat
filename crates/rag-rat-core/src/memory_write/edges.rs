@@ -7,7 +7,7 @@ use rag_rat_oplog::StreamId;
 use rag_rat_query::memory::{
     EDGE_SELECT, EdgeRelation, EdgeTarget, NodeEdge, edge_by_key, edge_key, edge_row,
     memory_repo_scope, periphery_edge_scope_clause, repo_is_registered, reresolve_on_read,
-    resolve_node_target, source_node_owner_repo,
+    resolve_node_target, source_node_owner_repo, validate_edge_len,
 };
 use rusqlite::{Connection, params};
 
@@ -31,6 +31,13 @@ pub(crate) fn add_edge(
     let hint_repo_id = target.target_repo_id(&owner_repo_id);
     let target_kind = target.kind();
     let target_anchor = target.anchor();
+    // Byte-cap the free-form edge inputs at the write boundary (#680), the edge twin of the
+    // create/update payload cap: the anchor + resolved target repo id are carried verbatim into the
+    // signed `EdgeAdd` op, so an oversized one would mint an un-authorable edge that the reconcile
+    // must then quarantine forever. Reject it here — cheaply, before the resolution lookups — so
+    // the normal API can never persist one. `target_repo_id` is re-checked post-resolution
+    // below (an unresolved cross-repo target keeps the caller's raw hint).
+    validate_edge_len("target_anchor", &target_anchor)?;
     let key = edge_key(source_node_id, relation.as_db_str(), target_kind, &target_anchor);
     // Resolve the target against the CURRENT db. A node's ACTUAL owning repo is authoritative when
     // it is present (self-healing across a repo-id re-point); an absent cross-repo target keeps
@@ -74,6 +81,10 @@ pub(crate) fn add_edge(
         },
         EdgeTarget::Github { .. } => (hint_repo_id.clone(), None, "current".to_string()),
     };
+    // A resolved node target's repo is the (bounded) owning repo, but an UNRESOLVED explicit
+    // cross-repo target keeps the caller's raw hint id — cap it too, on the value actually stored +
+    // signed (#680).
+    validate_edge_len("target_repo_id", &target_repo_id)?;
     let now = now_ms();
     // Backfill the pre-existing history (idempotent) + the edge INSERT + the EdgeAdd op in ONE
     // transaction (strict-atomic); the write via `conn` participates in the open txn.

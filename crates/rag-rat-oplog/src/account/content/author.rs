@@ -31,6 +31,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::super::bootstrap::{self, LocalAccountRef};
+use super::super::limits::CONTENT_ENVELOPE_MAX_BYTES;
 use super::super::{AccountId, storage as account_storage};
 use super::envelope::{self, ContentEntryHeader, VerifiedContentEntry};
 use super::storage as content_storage;
@@ -39,6 +40,62 @@ use crate::stream::StreamId;
 use crate::{content_projection, local_device};
 
 type EntryHash = [u8; 32];
+
+/// The PROVEN worst-case byte overhead a signed `/3` content entry adds around an op body —
+/// `signed_bytes.len() - payload.len()` maximized over every header field value and every payload
+/// size class, derived directly from `envelope::sign_content_entry` / `encode_header` (NOT a
+/// guessed margin, so it cannot silently drift).
+/// `content_entry_max_overhead_bounds_the_real_signed_envelope` pins it against the real encoders.
+///
+/// The sum is computed from named parts so the compiler checks the arithmetic and the breakdown is
+/// legible: CBOR encodes a 32-byte bstr as a 2-byte prefix + 32; a `u64` as at most 1 + 8; an
+/// `n`-byte str as its prefix + `n`. Every optional-hash field counts as PRESENT (34 B) — its
+/// widest form, which upper-bounds the null form (1 B) unconditionally, so the constant holds
+/// regardless of the header's nullity coupling.
+const CONTENT_ENTRY_MAX_OVERHEAD_BYTES: usize = {
+    // `encode_header`: the 13-part `rag-rat/entry/3` array, every field at its MAX CBOR width — an
+    // unconditional upper bound on the header bytes.
+    const HEADER_MAX: usize = 1                 // array(13) head
+        + (1 + 15)                              // domain str "rag-rat/entry/3"
+        + (2 + 32) * 3                          // stream_id, author_account_id, device_fingerprint
+        + (1 + 8) * 2                           // seq, lamport
+        + (2 + 32) * 2                          // prev_hash, grant_id (present ≥ null)
+        + (2 + 32)                              // roster_ref
+        + (1 + 8) * 3                           // owner_auth_len, author_auth_len, crypto_suite
+        + (2 + 32); // key_id (present ≥ null)
+    // `encode_body` = cbor([header_bytes, payload]).
+    const BODY_FRAMING: usize = 1               // array(2) head
+        + 3                                     // header_bytes bstr prefix (HEADER_MAX = 300 ⇒ 0x59+2)
+        + 5; // payload bstr prefix (a ~256 KiB body ⇒ 0x5a+4)
+    // `encode_signed` = cbor([domain, body_bytes, signature]).
+    const SIGNED_FRAMING: usize = 1             // array(3) head
+        + (1 + 22)                              // domain str "rag-rat/signed-entry/1"
+        + 5                                     // body_bytes bstr prefix (~256 KiB ⇒ 0x5a+4)
+        + (2 + 64); // signature bstr
+    HEADER_MAX + BODY_FRAMING + SIGNED_FRAMING // = 300 + 9 + 95 = 404
+};
+
+/// The largest op BODY (canonical CBOR) that always fits inside a signed `/3` content entry: the
+/// §18a `CONTENT_ENVELOPE_MAX_BYTES` cap minus the PROVEN worst-case envelope overhead
+/// ([`CONTENT_ENTRY_MAX_OVERHEAD_BYTES`]). A body at or under this bound signs to at most exactly
+/// `CONTENT_ENVELOPE_MAX_BYTES`, so it clears both of `sign_content_entry`'s size checks. The prior
+/// loose 1 KiB margin here permanently quarantined rows between `CAP - 1024` and the real limit
+/// that `sign_content_entry` would in fact accept — legitimate imported data left unprojected
+/// forever; this exact bound is a true lower-bound-safe mirror of the sign-time check (#680).
+const CONTENT_OP_BODY_MAX_BYTES: usize =
+    CONTENT_ENVELOPE_MAX_BYTES - CONTENT_ENTRY_MAX_OVERHEAD_BYTES;
+
+/// Whether `op` can be authored as a `/3` content entry without exceeding the §18a envelope cap.
+///
+/// The local reconcile uses this to QUARANTINE a row whose op is un-authorable (an oversized
+/// raw/imported memory body or payload) — skipping it instead of `bail!`ing the whole batch — so
+/// one bad row can never wedge every other memory write; the write path uses the same predicate at
+/// the create/update boundary to reject oversized input before the row is persisted (#680). Checks
+/// the encoded body only; the header + signature are the fixed overhead `CONTENT_OP_BODY_MAX_BYTES`
+/// already reserves for.
+pub fn content_op_is_authorable(op: &MemoryOp) -> bool {
+    op::encode(op).len() <= CONTENT_OP_BODY_MAX_BYTES
+}
 
 /// The `/3` chain tail for one `(stream, author, device)` coordinate: its highest-`seq` entry.
 struct ContentChainTail {
@@ -261,6 +318,167 @@ mod tests {
 
     fn node_update(id: &str, title: &str) -> MemoryOp {
         MemoryOp::NodeUpdate { node_id: NodeId::from(id), content: content(title) }
+    }
+
+    #[test]
+    fn content_op_is_authorable_agrees_with_the_query_side_write_caps() {
+        use rag_rat_query::memory::{
+            MAX_EDGE_ANCHOR_LEN, MAX_MEMORY_BODY_LEN, MAX_MEMORY_PAYLOAD_LEN, MAX_MEMORY_TITLE_LEN,
+        };
+        // A memory at EVERY query-side write cap must still fit the signed /3 envelope. Worst case
+        // for the char-counted title/body is a 4-byte char, plus a max-byte payload — this pins the
+        // two crates' caps consistent even though the dependency only flows oplog → query (#680).
+        let wide = '𝄞'.to_string(); // 4 UTF-8 bytes
+        let maxed = NodeContent {
+            kind: "Invariant".to_string(),
+            title: wide.repeat(MAX_MEMORY_TITLE_LEN),
+            body: wide.repeat(MAX_MEMORY_BODY_LEN),
+            confidence: "high".to_string(),
+            source: "agent".to_string(),
+            tags: Vec::new(),
+            payload: Some("x".repeat(MAX_MEMORY_PAYLOAD_LEN)),
+        };
+        assert!(
+            content_op_is_authorable(&MemoryOp::NodeCreate {
+                node_id: NodeId::from("mem_max"),
+                content: maxed,
+            }),
+            "a memory at every write cap must still be authorable",
+        );
+        // A body past the envelope cap is un-authorable — exactly what the reconcile quarantines.
+        let oversized = NodeContent { body: "x".repeat(300 * 1024), ..content("t") };
+        assert!(
+            !content_op_is_authorable(&MemoryOp::NodeCreate {
+                node_id: NodeId::from("mem_big"),
+                content: oversized,
+            }),
+            "an oversized body exceeds the /3 envelope",
+        );
+
+        // The EDGE twin (#680): both free-form edge fields at the query-side cap — plus realistic
+        // short source/owner ids — must still fit the signed /3 envelope, so `add_edge`'s write cap
+        // can never mint an un-authorable EdgeAdd. This pins `MAX_EDGE_ANCHOR_LEN` consistent with
+        // the oplog envelope bound even though the dependency only flows oplog → query.
+        let maxed_edge = EdgeSpec {
+            source_node_id: NodeId::from("mem_1700000000000_abcdef"),
+            relation: EdgeRelation::DependsOn,
+            target_repo_id: "r".repeat(MAX_EDGE_ANCHOR_LEN),
+            target_kind: "node".to_string(),
+            target_anchor: "a".repeat(MAX_EDGE_ANCHOR_LEN),
+            owner_repo_id: "owner-repo-id".to_string(),
+        };
+        assert!(
+            content_op_is_authorable(&MemoryOp::EdgeAdd { edge: maxed_edge }),
+            "an edge with both free-form fields at the write cap must still be authorable",
+        );
+        // An anchor past the cap is un-authorable — exactly what the write cap rejects and the
+        // reconcile quarantines.
+        assert!(
+            !content_op_is_authorable(&edge_add("mem_src", &"a".repeat(300 * 1024))),
+            "an oversized edge anchor exceeds the /3 envelope",
+        );
+    }
+
+    /// A `NodeCreate` on `id` whose canonical-CBOR body (`op::encode`) is EXACTLY `encoded_len`
+    /// bytes — used to place an op precisely relative to the authorable bound. Within one CBOR
+    /// text-length class each extra body char is exactly one extra encoded byte, so measuring the
+    /// fixed op-envelope framing on a body already in the ~256 KiB (5-byte-prefix) class lets us
+    /// size the real body to hit `encoded_len` on the nose.
+    fn node_create_sized(id: &str, encoded_len: usize) -> MemoryOp {
+        let build = |body: String| MemoryOp::NodeCreate {
+            node_id: NodeId::from(id),
+            content: NodeContent { body, ..content("t") },
+        };
+        let probe = 100_000;
+        let framing = op::encode(&build("a".repeat(probe))).len() - probe;
+        build("a".repeat(encoded_len - framing))
+    }
+
+    #[test]
+    fn an_op_in_the_band_the_old_margin_over_quarantined_is_authorable_and_signs() {
+        // #680 (P2b): the old body bound was `CAP - 1024`, but the real signed-entry overhead is
+        // far smaller, so an op whose encoded body sat between `CAP - 1024` and the true
+        // limit was permanently quarantined even though `sign_content_entry` would accept
+        // it. Place an op squarely in that reclaimed band and prove BOTH that the predicate
+        // now admits it AND that authoring it actually folds accepted — no `bail!`, no
+        // wedge.
+        let op = node_create_sized("mem_band", CONTENT_ENVELOPE_MAX_BYTES - 512);
+        let encoded = op::encode(&op).len();
+        assert_eq!(encoded, CONTENT_ENVELOPE_MAX_BYTES - 512, "the op is sized on the nose");
+        assert!(
+            encoded > CONTENT_ENVELOPE_MAX_BYTES - 1024,
+            "the op sits in the band the old 1 KiB margin wrongly quarantined",
+        );
+        assert!(
+            content_op_is_authorable(&op),
+            "the reclaimed-band op is authorable under the exact overhead bound",
+        );
+
+        let conn = db();
+        let stream = StreamId::from_bytes(STREAM_A);
+        owned_stream_account(&conn, stream);
+        let hashes = author_committed(&conn, stream, std::slice::from_ref(&op));
+        assert_eq!(
+            content_status(&conn.unchecked_transaction().unwrap(), &hashes[0]).unwrap().as_deref(),
+            Some("accepted"),
+            "the reclaimed-band op signs and folds accepted — the predicate did not \
+             over-quarantine",
+        );
+    }
+
+    #[test]
+    fn an_op_one_byte_over_the_exact_bound_is_quarantined() {
+        // Just past `CONTENT_OP_BODY_MAX_BYTES`: the predicate must return false. Returning true
+        // here would let the `/3` author's §18a size check `bail!` on the whole batch — the
+        // #680 wedge the quarantine exists to prevent.
+        let op = node_create_sized("mem_over", CONTENT_OP_BODY_MAX_BYTES + 1);
+        assert_eq!(op::encode(&op).len(), CONTENT_OP_BODY_MAX_BYTES + 1);
+        assert!(!content_op_is_authorable(&op), "an op past the exact body bound is quarantined");
+    }
+
+    #[test]
+    fn content_entry_max_overhead_bounds_the_real_signed_envelope() {
+        // Drift guard: prove the hand-derived overhead constant against the REAL encoders. A
+        // payload of exactly `CONTENT_OP_BODY_MAX_BYTES`, wrapped under the WIDEST header
+        // `sign_content_entry` accepts, must sign and land at or under the §18a envelope cap — i.e.
+        // the constant reserves enough headroom, and the measured overhead never exceeds it.
+        let secret = crate::device::DeviceSecret::from_seed(&[9; 32]);
+        // The widest signable header: crypto_suite 0 (⇒ key_id null), seq != 0 (⇒ prev_hash
+        // present), a present grant_id, and all u64 fields maxed.
+        let header = ContentEntryHeader {
+            stream_id: StreamId::from_bytes([0x11; 32]),
+            author_account_id: AccountId::from_bytes([0x22; 32]),
+            device_fingerprint: secret.public().fingerprint(),
+            seq: u64::MAX,
+            lamport: u64::MAX,
+            prev_hash: Some([0x33; 32]),
+            grant_id: Some([0x44; 32]),
+            roster_ref: [0x55; 32],
+            owner_auth_len: u64::MAX,
+            author_auth_len: u64::MAX,
+            crypto_suite: 0,
+            key_id: None,
+        };
+        // A canonical-CBOR payload of exactly `CONTENT_OP_BODY_MAX_BYTES` bytes — one bstr
+        // (`0x5a` + 4-byte length + content), the same near-limit shape envelope.rs's own size test
+        // uses.
+        let mut payload = vec![0x5a];
+        payload.extend_from_slice(&((CONTENT_OP_BODY_MAX_BYTES - 5) as u32).to_be_bytes());
+        payload.resize(CONTENT_OP_BODY_MAX_BYTES, 0);
+        let signed = envelope::sign_content_entry(&secret, &header, &payload)
+            .expect("a body at the exact bound signs under the worst-case header");
+        assert!(
+            signed.signed_bytes.len() <= CONTENT_ENVELOPE_MAX_BYTES,
+            "the derived overhead keeps the signed envelope within the §18a cap ({} > {})",
+            signed.signed_bytes.len(),
+            CONTENT_ENVELOPE_MAX_BYTES,
+        );
+        assert!(
+            signed.signed_bytes.len() - payload.len() <= CONTENT_ENTRY_MAX_OVERHEAD_BYTES,
+            "the real envelope overhead ({}) is within the derived worst-case constant ({})",
+            signed.signed_bytes.len() - payload.len(),
+            CONTENT_ENTRY_MAX_OVERHEAD_BYTES,
+        );
     }
 
     fn edge_add(source: &str, anchor: &str) -> MemoryOp {

@@ -27,6 +27,8 @@
 //! `/1` history) is signed on the next mutation and no later lifecycle op on it is ever inert.
 //! Genesis is just the empty-`/3`-chain case where every row is missing.
 
+use std::collections::HashSet;
+
 use anyhow::Context;
 use rag_rat_query::memory::hydrate::tags_for_memory;
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
@@ -201,6 +203,117 @@ fn build_reconcile_ops(
     Ok(ops)
 }
 
+/// Whether `row`'s `NodeCreate` fits the signed `/3` content envelope. A normal rag-rat memory
+/// (title ≤ 160 chars, body ≤ 8 000 chars, payload capped by [`validate_payload`]) always fits;
+/// only a raw writer / import / pre-cap ghost with an oversized body or payload can fail this, and
+/// such a row is QUARANTINED rather than allowed to wedge the whole batch (#680). The status/edge
+/// ops are tiny and never oversized, so the `NodeCreate` alone decides a node's authorability.
+fn node_is_authorable(row: &MemoryRow) -> bool {
+    let op = MemoryOp::NodeCreate {
+        node_id: NodeId::from(row.memory_id.as_str()),
+        content: node_content(
+            &row.kind,
+            &row.title,
+            &row.body,
+            &row.confidence,
+            &row.source,
+            &row.tags,
+            row.payload_json.as_deref(),
+        ),
+    };
+    rag_rat_oplog::content_op_is_authorable(&op)
+}
+
+/// Whether `edge`'s `EdgeAdd` fits the signed `/3` content envelope. The edge twin of
+/// [`node_is_authorable`] (#680): a normal edge (short ids + a resolved node/github anchor) always
+/// fits, and the write path now caps `target_anchor` / `target_repo_id`, so only a raw writer /
+/// pre-cap import / consolidation-remapped ghost with an oversized free-form field can fail this —
+/// and such an edge is QUARANTINED rather than allowed to make the whole reconcile `bail!` and
+/// wedge every other memory write. An edge whose relation TOKEN this binary can't map is a
+/// DIFFERENT (forward-compat) failure — [`build_reconcile_ops`] surfaces it loudly via
+/// [`edge_add_op`], exactly as an unknown node status does — so a build error counts as authorable
+/// here and defers to that path rather than silently quarantining it.
+fn edge_is_authorable(edge: &NodeEdge, owner_repo_id: &str) -> bool {
+    match edge_add_op(edge, owner_repo_id) {
+        Ok(op) => rag_rat_oplog::content_op_is_authorable(&op),
+        Err(_) => true,
+    }
+}
+
+/// The reconcile's missing set, split into what CAN be signed and what must be QUARANTINED (#680).
+/// `live_edges` already excludes any edge whose SOURCE node is quarantined — an `EdgeAdd` with no
+/// authored `NodeCreate` for its source would project a dangling edge — AND any edge whose OWN
+/// `EdgeAdd` is oversized (those go to `quarantined_edges`).
+struct ReconcileWork {
+    authorable_nodes: Vec<MemoryRow>,
+    live_edges: Vec<NodeEdge>,
+    quarantined_nodes: Vec<MemoryRow>,
+    quarantined_edges: Vec<NodeEdge>,
+}
+
+impl ReconcileWork {
+    /// Any AUTHORABLE work remaining. A quarantined row is intentionally NOT work: it never becomes
+    /// authorable on its own, so counting it would spin the reconcile's slow path forever (#680).
+    fn has_authorable_work(&self) -> bool {
+        !self.authorable_nodes.is_empty() || !self.live_edges.is_empty()
+    }
+
+    /// Surface every quarantined node + edge as a warning naming the repo + the row's id — the
+    /// per-row failure the caller can act on, in place of the old fail-loud that wedged the store.
+    fn warn_quarantined(&self, repo_id: &str) {
+        for row in &self.quarantined_nodes {
+            tracing::warn!(
+                repo_id,
+                memory_id = %row.memory_id,
+                "quarantining an un-authorable memory row: its signed /3 envelope exceeds the §18a \
+                 256 KiB cap, so it is skipped to keep the memory-write path live; shrink or delete \
+                 it through the public API to recover it (#680)",
+            );
+        }
+        for edge in &self.quarantined_edges {
+            tracing::warn!(
+                repo_id,
+                edge_key = %edge.edge_key,
+                source_node_id = %edge.source_node_id,
+                "quarantining an un-authorable node-edge: its signed /3 envelope exceeds the §18a \
+                 256 KiB cap, so it is skipped to keep the memory-write path live; remove it \
+                 through the public API to recover it (#680)",
+            );
+        }
+    }
+}
+
+/// Read the repo's unauthored nodes + edges and partition out the un-authorable (#680): the fast
+/// path calls it to decide whether real work remains, the slow path to build the batch from the
+/// AUTHORABLE half. Scope-independent like its two readers, so it runs on either an autocommit
+/// `Connection` (fast path) or the reconcile `Transaction` (slow path, via deref).
+fn read_reconcile_work(
+    conn: &Connection,
+    repo_id: &str,
+    stream: StreamId,
+) -> anyhow::Result<ReconcileWork> {
+    let (authorable_nodes, quarantined_nodes): (Vec<MemoryRow>, Vec<MemoryRow>) =
+        read_unauthored_memory_rows(conn, repo_id, stream)?
+            .into_iter()
+            .partition(node_is_authorable);
+    // An edge whose source node is quarantined has no authored `NodeCreate` to hang off, so drop it
+    // WITH its source (the source node's quarantine warning is the actionable one — it never
+    // reaches `quarantined_edges`).
+    let quarantined_node_ids: HashSet<&str> =
+        quarantined_nodes.iter().map(|row| row.memory_id.as_str()).collect();
+    // Partition the remaining edges by authorability the SAME way nodes are (#680): an edge whose
+    // OWN `EdgeAdd` is oversized (a raw / imported / pre-cap ghost carrying an oversized free-form
+    // field) is QUARANTINED rather than left in `live_edges` to make `author_content_batch_in_tx`
+    // `bail!` and wedge the write path — the exact failure mode the node quarantine removes,
+    // reached via an edge instead of a node.
+    let (live_edges, quarantined_edges): (Vec<NodeEdge>, Vec<NodeEdge>) =
+        super::edges::unauthored_edges(conn, repo_id, stream)?
+            .into_iter()
+            .filter(|edge| !quarantined_node_ids.contains(edge.source_node_id.as_str()))
+            .partition(|edge| edge_is_authorable(edge, repo_id));
+    Ok(ReconcileWork { authorable_nodes, live_edges, quarantined_nodes, quarantined_edges })
+}
+
 /// Reconcile the repo's owner-bound `/2` stream against its tables: establish ownership (mint the
 /// local account + publish a `StreamOwn` if needed) and author every `repo_memories` /
 /// `repo_node_edges` row MISSING from the accepted-`/3` projection as owner-authored `/3` content.
@@ -228,11 +341,20 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // the slow path to mint + publish ownership rather than early-returning on an empty set it
     // could not yet author into. `established_owned_stream_v2` is autocommit-only (it opens its
     // own read txn), so it runs here, not under the write lock.
-    if let Some(stream) = rag_rat_oplog::established_owned_stream_v2(conn, repo_id)?
-        && read_unauthored_memory_rows(conn, repo_id, stream)?.is_empty()
-        && super::edges::unauthored_edges(conn, repo_id, stream)?.is_empty()
-    {
-        return Ok(());
+    if let Some(stream) = rag_rat_oplog::established_owned_stream_v2(conn, repo_id)? {
+        let work = read_reconcile_work(conn, repo_id, stream)?;
+        if !work.has_authorable_work() {
+            // Nothing AUTHORABLE is missing. A quarantined (un-authorable) row can still be present
+            // here — it never becomes authorable on its own — so it is deliberately NOT "work":
+            // early-return on it too, or a single oversized ghost would force the write-locked slow
+            // path on every mutation forever (#680). Emit the per-row quarantine warning from the
+            // already-read work BEFORE returning (no write lock needed to warn) so a
+            // silently-skipped row surfaces its actionable warning on this cheap path
+            // exactly as the slow path does — otherwise the fast path skips the row on
+            // every reconcile with no signal at all.
+            work.warn_quarantined(repo_id);
+            return Ok(());
+        }
     }
 
     // Slow path. Mint the store's local account BEFORE the durability guard: the mint
@@ -257,18 +379,21 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // devices can populate the stream) must revisit whether local-chain-empty still implies
     // register-clean.
     let genesis = rag_rat_oplog::content_stream_is_empty(&tx, stream)?;
-    let missing_nodes = read_unauthored_memory_rows(&tx, repo_id, stream)?;
-    let missing_edges = super::edges::unauthored_edges(&tx, repo_id, stream)?;
-    let ops = build_reconcile_ops(&missing_nodes, &missing_edges, repo_id, genesis)?;
+    // Quarantine un-authorable rows (#680): partition the oversized ones out so a single row whose
+    // signed `/3` envelope exceeds the §18a cap cannot make the whole batch `bail!` and wedge every
+    // other memory write. The authorable rows are signed; the quarantined ones are logged and left
+    // for the public API to shrink or delete.
+    let work = read_reconcile_work(&tx, repo_id, stream)?;
+    work.warn_quarantined(repo_id);
+    let ops = build_reconcile_ops(&work.authorable_nodes, &work.live_edges, repo_id, genesis)?;
     // Skip the author when there is nothing to author: a fresh repo whose anti-join was empty only
     // needed ownership established (done above), and authoring an empty batch would still refold +
     // reproject for no change.
     if !ops.is_empty() {
-        // Fail-loud on an oversized envelope (a raw/adversarial memory body over the §18a 256 KiB
-        // cap): the `/3` author `bail!`s rather than dropping irreplaceable data, and we surface
-        // the failure with the repo it belongs to instead of wedging the store silently. A
-        // normal rag-rat memory (body ≤ 8 KiB) can never hit this; it is an
-        // adversarial/raw-writer backstop.
+        // Every op here is authorable — `read_reconcile_work` already quarantined any oversized row
+        // (#680), so the `/3` author's §18a size check cannot fire on this batch. `with_context`
+        // still names the repo so any OTHER authoring failure (a stale `auth_len`, a contested
+        // account) is attributable rather than surfacing as a bare rollback.
         rag_rat_oplog::author_content_batch_in_tx(&tx, stream, &ops, now_ms).with_context(
             || {
                 format!(
@@ -327,6 +452,45 @@ fn stable_owner_stream(conn: &Connection) -> anyhow::Result<Option<StreamId>> {
     rag_rat_oplog::owned_stream_v2_id(conn, &repo_id)
 }
 
+/// Reject a live content op whose ASSEMBLED signed `/3` envelope would exceed the §18a 256 KiB cap
+/// (#680) — the AUTHORITATIVE whole-op write-boundary guard. The cheap per-field caps
+/// (`validate_payload`'s payload byte cap, `validate_edge_len`'s edge-anchor cap, the title/body
+/// char caps) fast-fail a single pathological field, but they cannot see an AGGREGATE — most
+/// reachably an arbitrary NUMBER of individually-valid tags on a `NodeCreate`/`NodeUpdate`, or a
+/// max-ish payload + a long body + many tags TOGETHER — nor a FUTURE uncapped field. This one
+/// check, built on the SAME [`rag_rat_oplog::content_op_is_authorable`] the reconcile quarantine
+/// uses, rejects every such op before it is signed, so a write the guard accepts is exactly one the
+/// reconcile can later author. Without it an "otherwise valid" create/update assembles an
+/// un-authorable op that the #680 reconcile quarantine then SILENTLY skips — the user never learns
+/// at write time.
+fn reject_unauthorable_content_op(op: &MemoryOp) -> anyhow::Result<()> {
+    if rag_rat_oplog::content_op_is_authorable(op) {
+        return Ok(());
+    }
+    // The per-field caps have already passed, so the culprit is an aggregate (or a future uncapped
+    // field): name what to shrink rather than surfacing a bare envelope-overflow rollback.
+    match op {
+        MemoryOp::NodeCreate { node_id, .. } | MemoryOp::NodeUpdate { node_id, .. } =>
+            anyhow::bail!(
+                "memory `{}` is too large to store: even with each field within its own limit, \
+                 its title, body, payload and tags together exceed the 256 KiB signed-entry cap — \
+                 reduce the number of tags, or shrink the body/payload",
+                node_id.as_str()
+            ),
+        MemoryOp::EdgeAdd { edge } => anyhow::bail!(
+            "the edge from `{}` is too large to store: its assembled fields exceed the 256 KiB \
+             signed-entry cap — shorten the target anchor / target repo id",
+            edge.source_node_id.as_str()
+        ),
+        // NodeStatus / EdgeRemove / Rebind carry no unbounded free-form field and cannot exceed the
+        // cap; this arm keeps the guard total over the op vocabulary.
+        _ => anyhow::bail!(
+            "this memory operation is too large to store: its assembled /3 content envelope \
+             exceeds the 256 KiB signed-entry cap"
+        ),
+    }
+}
+
 /// Author `ops` as owner-authored `/3` content on the active repo's owner-bound `/2` stream WITHIN
 /// the caller's mutation txn — the strict-atomic live seam.
 /// [`rag_rat_oplog::author_content_batch_in_tx`] mints, inserts, refolds, and verify-accepts the
@@ -340,6 +504,16 @@ fn author_in_owner_stream(
     ops: &[MemoryOp],
     now_ms: i64,
 ) -> anyhow::Result<()> {
+    // Whole-op write-boundary guard (#680): every live mutation
+    // (`create_memory`/`update_memory`/`add_edge`/`remove_edge`) funnels its authored ops through
+    // this ONE seam, so rejecting an un-authorable op here — before it is signed — is the single
+    // authoritative catch-all for the aggregate no per-field cap sees (e.g. thousands of
+    // individually-valid tags) and any future uncapped field. Runs BEFORE the scope gate so an
+    // un-authorable op is rejected consistently even on a not-yet-owned stream (the reconcile does
+    // NOT pass through here, so its pre-cap/imported-row quarantine is unaffected).
+    for op in ops {
+        reject_unauthorable_content_op(op)?;
+    }
     let Some(stream) = stable_owner_stream(tx)? else {
         return Ok(());
     };
@@ -575,6 +749,19 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    /// Whether `node_id` has a projected `/3` node on the store's owner stream — the completeness
+    /// mirror. Unlike [`projected_node_status`], returns `false` (not a panic) when absent, so a
+    /// quarantined ghost can be asserted un-projected (#680).
+    fn is_projected(conn: &Connection, node_id: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM content_projected_nodes WHERE node_id = ?1)",
+            [node_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            != 0
     }
 
     /// Insert a node-edge by RAW SQL, bypassing the wired `add_edge` author — a "ghost edge" that
@@ -1085,6 +1272,131 @@ mod tests {
         assert_eq!(projected_edge_count(&conn), 0, "remove_edge authored an EdgeRemove tombstone");
     }
 
+    #[test]
+    fn add_edge_rejects_an_oversized_target_anchor_at_write_validation() {
+        // #680 (prevention): the write-boundary cap rejects an oversized `target_anchor` BEFORE the
+        // row is persisted, so the normal API can never mint the un-authorable edge the reconcile
+        // would otherwise have to quarantine. An EXPLICIT cross-repo target to a not-yet-indexed
+        // repo is the one path that stores the caller's raw anchor verbatim, so it exercises the
+        // cap.
+        let conn = scoped_conn();
+        let a = create_concept(&conn, "a").unwrap().memory.memory_id;
+        let oversized = "x".repeat(rag_rat_query::memory::MAX_EDGE_ANCHOR_LEN + 1);
+        let err = crate::memory_write::add_edge(&conn, &a, EdgeRelation::RelatesTo, &{
+            rag_rat_query::memory::EdgeTarget::Node {
+                repo_id: Some("some-unindexed-repo".to_string()),
+                node_id: oversized,
+            }
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("over the"),
+            "the byte cap rejects an oversized edge anchor: {err}",
+        );
+        let edges: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repo_node_edges", [], |r| r.get(0)).unwrap();
+        assert_eq!(edges, 0, "no edge row is stored when the anchor is over the cap");
+    }
+
+    #[test]
+    fn a_node_with_too_many_tags_is_rejected_at_write_validation() {
+        // #680 (P2): title/body are char-capped and payload is byte-capped, but the NUMBER of
+        // tags is not — each tag is individually validated (≤ 64 chars) with no limit on how many.
+        // Enough individually-valid tags overflow the signed `/3` envelope even with a tiny body
+        // and no payload, so an "otherwise valid" create assembles an un-authorable
+        // `NodeCreate`. Before the whole-op write-boundary guard that op was minted and
+        // then SILENTLY quarantined by the reconcile; now it is rejected at write time with
+        // an actionable error and no row persists.
+        let conn = scoped_conn();
+        // ~5000 unique 64-char tags: safely past the ~4000 the envelope admits, each within the
+        // per-tag cap so it is INDIVIDUALLY valid (i.e. would have been accepted before this fix).
+        let tags: Vec<String> = (0..5000).map(|i| format!("tag-{i:060}")).collect();
+        for tag in &tags {
+            assert_eq!(tag.chars().count(), 64, "each tag is exactly the 64-char per-tag cap");
+            rag_rat_query::memory::validate_len("tag", tag, 64)
+                .expect("each tag is individually valid — only the aggregate is un-authorable");
+        }
+        let err =
+            crate::memory_write::create_memory(&conn, rag_rat_query::memory::RepoMemoryCreate {
+                kind: "Concept".to_string(),
+                title: "too many tags".to_string(),
+                body: "body".to_string(),
+                confidence: "high".to_string(),
+                created_by: None,
+                source: None,
+                tags,
+                payload_json: None,
+                bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "the whole-op guard rejects the tag aggregate at write time: {err}",
+        );
+        // Rejected at the write boundary — the row never persists (not accepted-then-quarantined).
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repo_memories", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0, "the un-authorable create rolled back — nothing was persisted");
+    }
+
+    #[test]
+    fn the_whole_op_guard_rejects_an_aggregate_no_single_field_cap_catches() {
+        // #680 (the point of the ROOT fix): an op can overflow the signed `/3` envelope from
+        // the SUM of fields that are EACH within their own cap — a max-ish payload + a max body +
+        // many tags together. No single per-field cap (payload ≤ 128 KiB, body ≤ 8000 chars, tag ≤
+        // 64 chars) rejects it; only the whole-op guard, checking the ASSEMBLED op, does.
+        let conn = scoped_conn();
+        // Payload just under the 128 KiB cap, as a valid JSON object — so `validate_payload`'s
+        // object / canonical checks pass and only its byte cap could fire (and it does not).
+        let filler = "x".repeat(rag_rat_query::memory::MAX_MEMORY_PAYLOAD_LEN - 16);
+        let payload = format!("{{\"v\":\"{filler}\"}}");
+        assert!(
+            payload.len() <= rag_rat_query::memory::MAX_MEMORY_PAYLOAD_LEN,
+            "the payload is within its own byte cap",
+        );
+        // Body exactly at the char cap.
+        let body = "b".repeat(rag_rat_query::memory::MAX_MEMORY_BODY_LEN);
+        // A control create with the payload + body but NO tags SUCCEEDS — proving neither field,
+        // nor the two together, is over the envelope on its own, so it is specifically the
+        // tag aggregate (below) that trips the whole-op guard, not any single field.
+        crate::memory_write::create_memory(&conn, rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Task".to_string(),
+            title: "aggregate control".to_string(),
+            body: body.clone(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: Some(payload.clone()),
+            bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
+        })
+        .expect("payload + body alone are within the envelope — no single cap is exceeded");
+        // The SAME payload + body PLUS many individually-valid tags tips the assembled op over the
+        // envelope — caught ONLY by the whole-op guard, not by any per-field cap.
+        let tags: Vec<String> = (0..2500).map(|i| format!("tag-{i:060}")).collect();
+        let err =
+            crate::memory_write::create_memory(&conn, rag_rat_query::memory::RepoMemoryCreate {
+                kind: "Task".to_string(),
+                title: "aggregate over cap".to_string(),
+                body,
+                confidence: "high".to_string(),
+                created_by: None,
+                source: None,
+                tags,
+                payload_json: Some(payload),
+                bind: rag_rat_query::memory::RepoMemoryBindTarget::default(),
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "the aggregate op is rejected by the whole-op guard: {err}",
+        );
+        // Only the authorable control row persisted; the aggregate create rolled back.
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repo_memories", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "only the authorable control create persisted");
+    }
+
     // --- live mutation seam self-heals a ghost end to end (#541 Task 4) ---
 
     #[test]
@@ -1399,21 +1711,211 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_memory_body_fails_the_reconcile_loudly_and_surfaces_the_repo() {
-        // Fail-loud posture (#664): a raw/adversarial memory body over the §18a 256 KiB envelope
-        // cap makes the `/3` author bail rather than drop irreplaceable data, and the
-        // reconcile surfaces the failure (naming the repo) instead of silently skipping it.
-        // A normal rag-rat memory (body ≤ 8 KiB) can never reach this; it is an
-        // adversarial/raw-writer backstop.
+    fn an_oversized_ghost_is_quarantined_and_does_not_wedge_the_write_path() {
+        // #680: a raw/imported memory whose signed /3 envelope exceeds the §18a 256 KiB cap is
+        // un-authorable. The reconcile must QUARANTINE it (skip it) rather than `bail!` — the old
+        // fail-loud posture made EVERY subsequent mutation fail at its pre-write backfill, wedging
+        // the whole memory-write path with no recovery.
         let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap(); // roots the chain
         let oversized = "x".repeat(300 * 1024); // > 256 KiB ⇒ the signed envelope exceeds the cap
-        insert_memory_with_body(&conn, "mem_big", &oversized);
-        let err = backfill_memory_oplog(&conn, 1_000).unwrap_err();
+        insert_memory_with_body(&conn, "mem_big", &oversized); // raw, un-authorable ghost
+
+        // The reconcile no longer errors — the poison ghost is quarantined, not fatal.
+        backfill_memory_oplog(&conn, 1_000).unwrap();
         assert!(
-            format!("{err:#}").contains(REPO),
-            "the fail-loud error surfaces the reconcile failure for the repo, not a silent skip",
+            !is_projected(&conn, "mem_big"),
+            "the oversized ghost is quarantined, never signed into the /3 log",
         );
-        assert_eq!(entry_count(&conn), 0, "the oversized batch rolled back — no /3 content stored");
+        // The write path stays LIVE: a fresh mutation still succeeds instead of wedging.
+        let live = create_concept(&conn, "still alive").unwrap().memory.memory_id;
+        assert!(is_projected(&conn, &live), "other writes stay live despite the poison ghost");
+    }
+
+    #[test]
+    fn an_oversized_ghost_can_be_recovered_via_the_public_api() {
+        // #680: before the fix an oversized ghost wedged every write with no way out. Now the write
+        // path stays live, so the ghost is RECOVERABLE through the public API — shrink its body
+        // under the cap and the next reconcile signs it like any other healed ghost.
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap();
+        let oversized = "x".repeat(300 * 1024);
+        insert_memory_with_body(&conn, "mem_big", &oversized);
+
+        // Recover it: a plain `update_memory` shrinking the body under the cap — the mutation the
+        // wedge would have blocked — now succeeds.
+        crate::memory_write::update_memory(&conn, rag_rat_query::memory::RepoMemoryUpdate {
+            memory_id: "mem_big".to_string(),
+            kind: None,
+            title: None,
+            body: Some("shrunk".to_string()),
+            confidence: None,
+            status: None,
+            tags: None,
+            payload_json: None,
+        })
+        .unwrap();
+        // The row is authorable now, so the next reconcile (any mutation) signs it.
+        create_concept(&conn, "next").unwrap();
+        assert_eq!(
+            projected_node_status(&conn, "mem_big"),
+            NodeStatus::Active.as_db_str(),
+            "the shrunk row is signed on the next reconcile — fully recovered",
+        );
+    }
+
+    #[test]
+    fn an_oversized_ghost_edge_is_quarantined_and_does_not_wedge_the_write_path() {
+        // #680: the node quarantine's EDGE twin. A raw/imported edge whose signed /3 `EdgeAdd`
+        // exceeds the §18a 256 KiB cap (an oversized `target_anchor`) is un-authorable. The
+        // reconcile must QUARANTINE it (skip it) rather than `bail!` — otherwise that ONE edge
+        // makes EVERY subsequent mutation fail at its pre-write backfill, wedging the whole
+        // memory-write path exactly as an oversized node would (the gap the node-only
+        // quarantine left open).
+        let conn = scoped_conn();
+        let a = create_concept(&conn, "a").unwrap().memory.memory_id; // live, authorable source node
+        let oversized_anchor = "x".repeat(300 * 1024); // > 256 KiB ⇒ the EdgeAdd envelope exceeds cap
+        insert_raw_node_edge(&conn, &a, "relates_to", &oversized_anchor); // raw un-authorable ghost
+
+        // The reconcile no longer errors — the poison edge is quarantined, not fatal.
+        backfill_memory_oplog(&conn, 1_000).unwrap();
+        assert_eq!(
+            projected_edge_count(&conn),
+            0,
+            "the oversized ghost edge is quarantined, never signed into the /3 log",
+        );
+        assert!(
+            is_projected(&conn, &a),
+            "the authorable source node is unaffected — only its oversized edge is quarantined",
+        );
+        // The write path stays LIVE: a fresh mutation still succeeds instead of wedging.
+        let live = create_concept(&conn, "still alive").unwrap().memory.memory_id;
+        assert!(is_projected(&conn, &live), "other writes stay live despite the poison edge");
+    }
+
+    #[test]
+    fn an_oversized_ghost_edge_can_be_recovered_via_the_public_api() {
+        // #680: because the write path stays live, the quarantined edge is RECOVERABLE — an edge
+        // has no "shrink" (its anchor is its identity), so recovery is `remove_edge`
+        // (memory_edge_remove): it deletes the un-authorable ghost by its short, hashed `edge_key`
+        // (unaffected by the oversized anchor) and authors a tiny EdgeRemove, leaving the reconcile
+        // with nothing un-authorable.
+        let conn = scoped_conn();
+        let a = create_concept(&conn, "a").unwrap().memory.memory_id;
+        let oversized_anchor = "x".repeat(300 * 1024);
+        let key = rag_rat_query::memory::edge_key(&a, "relates_to", "node", &oversized_anchor);
+        insert_raw_node_edge(&conn, &a, "relates_to", &oversized_anchor);
+
+        // Remove it through the public API — the mutation the wedge would have blocked now
+        // succeeds.
+        assert!(
+            crate::memory_write::remove_edge(&conn, &key).unwrap(),
+            "the oversized ghost edge is removed through the public API",
+        );
+        let remaining: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repo_node_edges", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 0, "the un-authorable edge row is gone after recovery");
+        // The write path is clean: the next reconcile has nothing to quarantine.
+        let live = create_concept(&conn, "next").unwrap().memory.memory_id;
+        assert!(is_projected(&conn, &live), "the write path is clean after recovery");
+    }
+
+    /// A `MakeWriter` that appends every formatted log line into a shared buffer, so a test can
+    /// assert on emitted `tracing` events (`rag_rat_base::logging` uses the same `with_writer`
+    /// shape).
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn the_fast_path_warns_on_the_quarantined_row_it_skips() {
+        // #680 (P2a): once ownership is established and the ONLY pending row is un-authorable, the
+        // reconcile takes the lock-free fast path and early-returns without authoring. It must
+        // still emit the per-row quarantine warning from that path — otherwise the
+        // oversized row is silently skipped on every reconcile, defeating the
+        // actionable-warning contract that replaced the old fail-loud wedge. Before the fix
+        // the fast path returned with no warning.
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap(); // establishes ownership → the fast path is reachable
+        let oversized = "x".repeat(300 * 1024);
+        insert_memory_with_body(&conn, "mem_big", &oversized); // the only pending row, un-authorable
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CaptureWriter(std::sync::Arc::clone(&buf)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // Ownership established + nothing AUTHORABLE missing ⇒ the fast path handles this.
+            backfill_memory_oplog(&conn, 2_000).unwrap();
+        });
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("quarantining an un-authorable memory row"),
+            "the fast path emitted the per-row quarantine warning; got: {logged:?}",
+        );
+        assert!(
+            logged.contains("mem_big"),
+            "the warning names the skipped memory id; got: {logged:?}",
+        );
+        // The row stays unprojected — the warning is emitted IN PLACE OF authoring it, not
+        // alongside.
+        assert!(
+            !is_projected(&conn, "mem_big"),
+            "the quarantined row is still skipped, not signed"
+        );
+    }
+
+    #[test]
+    fn the_fast_path_warns_on_the_quarantined_edge_it_skips() {
+        // #680 (P2a, edge twin): once ownership is established and the ONLY pending row is an
+        // un-authorable EDGE, the reconcile takes the lock-free fast path and early-returns without
+        // authoring. It must STILL emit the per-edge quarantine warning from that path — otherwise
+        // the oversized edge is silently skipped on every reconcile, with no signal at all.
+        let conn = scoped_conn();
+        let a = create_concept(&conn, "a").unwrap().memory.memory_id; // establishes ownership
+        let oversized_anchor = "x".repeat(300 * 1024);
+        insert_raw_node_edge(&conn, &a, "relates_to", &oversized_anchor); // the only pending row
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CaptureWriter(std::sync::Arc::clone(&buf)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // Ownership established + nothing AUTHORABLE missing ⇒ the fast path handles this.
+            backfill_memory_oplog(&conn, 2_000).unwrap();
+        });
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("quarantining an un-authorable node-edge"),
+            "the fast path emitted the per-edge quarantine warning; got: {logged:?}",
+        );
+        assert_eq!(
+            projected_edge_count(&conn),
+            0,
+            "the quarantined edge is still skipped, not signed",
+        );
     }
 
     // --- read path is unchanged by the retarget (#665) ---

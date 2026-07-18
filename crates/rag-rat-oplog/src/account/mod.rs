@@ -52,7 +52,7 @@ pub use content::{
 };
 // The in-tx `/3` content-author seam + its genesis-detection reader (C3.4b-i, #663): #664
 // retargets the live memory path onto them, so they are plain re-exports.
-pub use content::{author_content_batch_in_tx, content_stream_is_empty};
+pub use content::{author_content_batch_in_tx, content_op_is_authorable, content_stream_is_empty};
 pub use fold::{
     AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, GrantAuthority,
     GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,

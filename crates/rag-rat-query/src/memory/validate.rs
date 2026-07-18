@@ -633,6 +633,17 @@ pub fn validate_payload(kind: &str, payload_json: Option<&str>) -> anyhow::Resul
             "a `{kind}` memory carries no payload (only Task/Concept may have a payload_json)"
         );
     }
+    // Byte cap at the write boundary (#680): the payload is the only otherwise-uncapped envelope
+    // input, so an oversized one is how a memory whose signed `/3` envelope exceeds the op-log's
+    // §18a cap gets created — an un-authorable row that would have to be quarantined. Reject it
+    // here so the normal API can never mint one. Checked before parsing, so a huge blob is
+    // rejected cheaply.
+    if payload.len() > MAX_MEMORY_PAYLOAD_LEN {
+        anyhow::bail!(
+            "payload_json is {} bytes, over the {MAX_MEMORY_PAYLOAD_LEN}-byte cap",
+            payload.len()
+        );
+    }
     // Strict parse: reject a LITERAL duplicate object key (serde_json's default silently keeps the
     // last, but parsers disagree on which wins → a cross-device hash divergence). Complete for a
     // caller that passes the RAW payload string (CLI, direct core); the MCP JSON-RPC transport
@@ -677,6 +688,22 @@ pub fn validate_len(field: &str, value: &str, max: usize) -> anyhow::Result<()> 
     }
     if len > max {
         anyhow::bail!("memory {field} exceeds {max} characters");
+    }
+    Ok(())
+}
+/// Reject an oversized free-form edge string at the write boundary (#680) — the edge twin of
+/// [`validate_payload`]'s byte cap. A `target_anchor` / `target_repo_id` is normally a short
+/// identifier, but an explicit cross-repo (or github) target stores the caller's raw string
+/// verbatim and it is signed verbatim into the `EdgeAdd` op; an oversized one is how an
+/// un-authorable edge (a signed `/3` envelope over the §18a cap) would otherwise be minted. `field`
+/// names the offending input for the error. Bytes, not chars, because the envelope budget is a byte
+/// budget.
+pub fn validate_edge_len(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.len() > MAX_EDGE_ANCHOR_LEN {
+        anyhow::bail!(
+            "edge {field} is {} bytes, over the {MAX_EDGE_ANCHOR_LEN}-byte cap",
+            value.len()
+        );
     }
     Ok(())
 }
@@ -862,6 +889,40 @@ mod content_hash_tests {
         // A float can't be a reliable content-hash input (binary64 collapse) — rejected on write.
         let err = super::validate_payload("Task", Some(r#"{"score":0.85}"#)).unwrap_err();
         assert!(err.to_string().contains("canonically encodable"), "{err}");
+    }
+
+    #[test]
+    fn an_oversized_payload_json_is_rejected_at_write_validation() {
+        // #680: the payload is the only uncapped envelope input, so a create/update with an
+        // oversized payload is how an un-authorable row (its signed /3 envelope over the op-log
+        // cap) would be minted. Reject it at the write boundary. Build a valid JSON object
+        // that still blows the byte cap so the SIZE check — not the object/canonical check
+        // — is what fires.
+        let big = "x".repeat(super::MAX_MEMORY_PAYLOAD_LEN);
+        let payload = format!("{{\"v\":\"{big}\"}}");
+        let err = super::validate_payload("Task", Some(&payload)).unwrap_err();
+        assert!(
+            err.to_string().contains("over the"),
+            "the byte cap rejects an oversized payload: {err}"
+        );
+        // A payload at/under the cap still validates.
+        super::validate_payload("Task", Some(r#"{"v":"ok"}"#)).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_edge_string_is_rejected_at_write_validation() {
+        // #680: `target_anchor` / `target_repo_id` are the only otherwise-uncapped edge inputs, so
+        // an oversized one is how an un-authorable `EdgeAdd` (its signed /3 envelope over the
+        // op-log cap) would be minted. Reject it at the write boundary — the edge twin of
+        // the payload cap.
+        let big = "x".repeat(super::MAX_EDGE_ANCHOR_LEN + 1);
+        let err = super::validate_edge_len("target_anchor", &big).unwrap_err();
+        assert!(
+            err.to_string().contains("over the"),
+            "the byte cap rejects an oversized edge string: {err}"
+        );
+        // A short identifier (the normal case) still validates.
+        super::validate_edge_len("target_anchor", "mem_1700000000000_abcdef").unwrap();
     }
 
     #[test]
