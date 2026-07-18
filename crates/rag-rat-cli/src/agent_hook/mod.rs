@@ -424,21 +424,44 @@ fn read_augment_hook(input: &HookInput) -> anyhow::Result<()> {
     let Some(file_path) = input.tool_input.get("file_path").and_then(|v| v.as_str()) else {
         return Ok(());
     };
-    // Relativize against the SESSION's worktree root — the directory holding the nearest
-    // `rag-rat.toml` at/above cwd — NOT `config.root`. `Config::load` deliberately anchors
-    // `config.root` to the MAIN worktree, but a linked-worktree `Read` targets a file under the
-    // LINKED root, so stripping `config.root` would fail and silently drop every augmentation (#756
-    // review). The main worktree is the fallback when discovery somehow finds nothing.
-    let worktree_root = rag_rat_base::config::nearest_config_at_or_above(Path::new(&input.cwd))
-        .and_then(|toml| toml.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| config.root.clone());
-    let Some(rel_path) = worktree_rel_path(file_path, &worktree_root) else { return Ok(()) };
+    let indexed_root = session_indexed_root(&config, &input.cwd);
+    let Some(rel_path) = worktree_rel_path(file_path, &indexed_root) else { return Ok(()) };
     let context = ask_listener_read(&config, &input.session_id, &input.cwd, &rel_path)
         .unwrap_or_else(|| fallback_compose_read(&config, &input.cwd, &rel_path));
     if let Some(context) = context {
         print_additional_context(&context);
     }
     Ok(())
+}
+
+/// The absolute directory that indexed `files.path` are relative to, IN THE SESSION'S checkout.
+/// `config.root` is main-anchored (`Config::load`, #219) and already folds in `[index] root`, so
+/// rebase it: swap its MAIN-worktree-top prefix for the SESSION worktree top (the dir holding the
+/// nearest `rag-rat.toml` at/above cwd). This resolves BOTH a linked-worktree read (main→linked
+/// top) and an `[index] root = "<subdir>"` layout — the subdir survives the rebase (#756 review).
+/// Falls back to `config.root` when either worktree top can't be discovered.
+fn session_indexed_root(config: &Config, cwd: &str) -> PathBuf {
+    let toml_dir = |p: &Path| {
+        rag_rat_base::config::nearest_config_at_or_above(p)
+            .and_then(|toml| toml.parent().map(Path::to_path_buf))
+    };
+    // `main_top` governs `config.root` (its own toml sits at the main worktree top); `session_top`
+    // is where the session actually is. `config.root = main_top / [index].root`.
+    match (toml_dir(&config.root), toml_dir(Path::new(cwd))) {
+        (Some(main_top), Some(session_top)) => rebase_root(&config.root, &main_top, &session_top),
+        _ => config.root.clone(),
+    }
+}
+
+/// Rebase `config_root` from `main_top` onto `session_top`, preserving the `[index] root` subdir
+/// (the part of `config_root` below `main_top`). Pure, so the linked-worktree + subdir-root matrix
+/// is unit-tested without a filesystem. Returns `config_root` unchanged when it isn't under
+/// `main_top` (an unexpected topology — never guess a wrong prefix).
+fn rebase_root(config_root: &Path, main_top: &Path, session_top: &Path) -> PathBuf {
+    match config_root.strip_prefix(main_top) {
+        Ok(subdir) => session_top.join(subdir),
+        Err(_) => config_root.to_path_buf(),
+    }
 }
 
 /// The worktree-root-relative, SLASH-separated path for `file_path`, or `None` when it's OUTSIDE

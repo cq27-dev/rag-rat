@@ -158,6 +158,35 @@ fn worktree_rel_path_is_none_outside_the_worktree() {
     );
 }
 
+#[test]
+fn rebase_root_swaps_the_worktree_top_and_preserves_the_index_subdir() {
+    // root = "." on the main worktree: identity.
+    assert_eq!(
+        rebase_root(Path::new("/main"), Path::new("/main"), Path::new("/main")),
+        Path::new("/main")
+    );
+    // root = "." in a linked worktree: main top → linked top.
+    assert_eq!(
+        rebase_root(Path::new("/main"), Path::new("/main"), Path::new("/linked")),
+        Path::new("/linked"),
+    );
+    // [index] root = "crates" on the main worktree: the subdir is preserved.
+    assert_eq!(
+        rebase_root(Path::new("/main/crates"), Path::new("/main"), Path::new("/main")),
+        Path::new("/main/crates"),
+    );
+    // [index] root = "crates" in a linked worktree: swap the top AND keep the subdir.
+    assert_eq!(
+        rebase_root(Path::new("/main/crates"), Path::new("/main"), Path::new("/linked")),
+        Path::new("/linked/crates"),
+    );
+    // config_root not under main_top (unexpected topology): unchanged, never a wrong prefix.
+    assert_eq!(
+        rebase_root(Path::new("/elsewhere"), Path::new("/main"), Path::new("/linked")),
+        Path::new("/elsewhere"),
+    );
+}
+
 // ─── PostToolUse edited-path extraction (#661) ──────────────────────────────
 
 #[test]

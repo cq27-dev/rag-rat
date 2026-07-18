@@ -56,11 +56,9 @@ pub fn compose(
             memories.push(m);
         }
     }
-    if let Some(dir) = parent_dir(path) {
-        for m in memory::memories_for_path(conn, dir, MAX_MEMORIES)? {
-            if seen.insert(m.memory_id.clone()) {
-                memories.push(m);
-            }
+    for m in memory::memories_for_path(conn, parent_dir(path), MAX_MEMORIES)? {
+        if seen.insert(m.memory_id.clone()) {
+            memories.push(m);
         }
     }
     // Session-level dedupe (what this agent was already shown), then the memory-surface projection.
@@ -107,8 +105,17 @@ fn rank_file_symbols(
     path: &str,
 ) -> anyhow::Result<Vec<(symbol::SymbolHit, i64, i64)>> {
     let mut ranked = Vec::new();
+    // Dedup by qualified name: a file can hold many concrete rows for one logical symbol —
+    // overloads, cfg variants, re-exports, or Python's per-class `__init__` (thousands in one
+    // dummy-objects file) — and without this the three slots fill with repeats of one symbol,
+    // hiding the rest (#756 review; the same defect grep-augment dedups). All rows here share
+    // the queried path, so the qualified name alone keys the logical symbol.
+    let mut seen: HashSet<String> = HashSet::new();
     for id in symbol::symbol_ids_in_file(conn, path, CANDIDATE_CAP)? {
         let Some(hit) = symbol::lookup_by_id(conn, id)? else { continue };
+        if !seen.insert(hit.qualified_name.clone()) {
+            continue;
+        }
         let (callers, callees) = grep_augment::edge_counts(conn, &hit)?;
         if callers > 0 {
             ranked.push((hit, callers, callees));
@@ -145,10 +152,14 @@ fn symbol_render_item(
     })
 }
 
-/// The immediate parent directory of a root-relative file path, or `None` for a top-level file (no
-/// `/`). Directory memories are bound to the directory path, so this is the key to look them up by.
-fn parent_dir(path: &str) -> Option<&str> {
-    path.rfind('/').map(|i| &path[..i])
+/// The immediate parent directory of a root-relative file path, to look up its directory memories.
+/// A top-level file's directory is the REPO ROOT, anchored as the empty path — the memory API's
+/// `dir = ""` repo-root binding — so return `""` there rather than skipping it (#756 review).
+fn parent_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "",
+    }
 }
 
 #[cfg(test)]
@@ -160,13 +171,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parent_dir_is_the_immediate_directory_or_none_at_top_level() {
+    fn parent_dir_is_the_immediate_directory_or_the_repo_root_at_top_level() {
         assert_eq!(
             parent_dir("crates/rag-rat-core/src/query/read_augment.rs"),
-            Some("crates/rag-rat-core/src/query")
+            "crates/rag-rat-core/src/query"
         );
-        assert_eq!(parent_dir("README.md"), None);
-        assert_eq!(parent_dir("src/lib.rs"), Some("src"));
+        // A top-level file's directory is the repo root, keyed as the empty path.
+        assert_eq!(parent_dir("README.md"), "");
+        assert_eq!(parent_dir("src/lib.rs"), "src");
     }
 
     fn empty_bind() -> RepoMemoryBindTarget {
@@ -232,6 +244,17 @@ mod tests {
             )
             .unwrap();
         }
+        // A SECOND concrete row for the SAME `watch::watcher_main` (a re-export/overload). The
+        // ranker must fold it into one line, not spend two slots on it.
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
+                                 end_byte, signature, docs)
+             VALUES (1, 'rust', 'watcher_main',
+                     (SELECT id FROM name_strings WHERE value = 'watch::watcher_main'),
+                     'function', 20, 30, NULL, NULL)",
+            [],
+        )
+        .unwrap();
         // One caller of watcher_main (symbol id 1) → callers=1; helper (id 2) has none.
         conn.execute(
             "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,
@@ -246,6 +269,11 @@ mod tests {
         });
         create(&conn, "Src directory note", RepoMemoryBindTarget {
             dir: Some("src".to_string()),
+            ..empty_bind()
+        });
+        // A repo-root directory memory (`dir = ""`), surfaced only for TOP-LEVEL reads.
+        create(&conn, "Repo root note", RepoMemoryBindTarget {
+            dir: Some(String::new()),
             ..empty_bind()
         });
         conn
@@ -283,6 +311,33 @@ mod tests {
             "a symbol with no callers is not load-bearing and is omitted:\n{}",
             out.context
         );
+        assert_eq!(
+            out.context.matches("`watch::watcher_main`").count(),
+            1,
+            "duplicate concrete rows of one symbol render once, not once per row:\n{}",
+            out.context
+        );
+    }
+
+    #[test]
+    fn read_augment_surfaces_the_repo_root_directory_memory_for_a_top_level_file() {
+        let conn = seeded_conn();
+        // A top-level file's directory is the repo root (`dir = ""`) — that memory must surface.
+        let out = compose(
+            &conn,
+            "README.md",
+            &DedupeFilter::default(),
+            rag_rat_base::config::MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("a top-level file with a repo-root directory memory augments");
+        assert!(
+            out.context.contains("Repo root note"),
+            "the repo-root (dir = \"\") memory surfaces for a top-level read:\n{}",
+            out.context
+        );
+        // The `src` directory memory must NOT leak into a top-level read.
+        assert!(!out.context.contains("Src directory note"), "src-dir memory stays scoped to src/");
     }
 
     #[test]
