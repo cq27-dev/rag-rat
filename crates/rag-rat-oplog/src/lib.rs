@@ -81,19 +81,20 @@ mod stream;
 //   caller's txn.
 pub use account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
-    CapacityScope, DeviceCut, DeviceRole, GrantAuthority, GrantDeviceAuthority,
-    GrantDeviceBoundary, GrantRole, IngestOutcome, OwnerAuthority, OwnerChainAuthority,
-    RosterContentAuthority, account_ingest, auth_len_freshness, author_content_batch_in_tx,
-    backfill_authority_projection, content_stream_is_empty, ensure_owned_stream_v2_in_tx,
-    established_owned_stream_v2, grant_effective_for_device, local_account,
-    mint_and_author_stream_key_wrap_in_tx, owned_stream_v2_id, owner_control_authority,
-    owner_secrets_authority, roster_content_authority, stream_owner_effective,
+    CapacityScope, ContentKey, DeviceCut, DeviceRole, GrantAuthority, GrantDeviceAuthority,
+    GrantDeviceBoundary, GrantRole, IngestOutcome, KeyId, OwnerAuthority, OwnerChainAuthority,
+    RosterContentAuthority, SealingKeyOutcome, SelectedWrap, account_ingest, auth_len_freshness,
+    author_content_batch_in_tx, backfill_authority_projection, content_stream_is_empty,
+    current_sealing_key, ensure_owned_stream_v2_in_tx, established_owned_stream_v2,
+    grant_effective_for_device, local_account, mint_and_author_stream_key_wrap_in_tx,
+    owned_stream_v2_id, owner_control_authority, owner_secrets_authority, roster_content_authority,
+    select_current_sealing_wrap, stream_owner_effective,
 };
 // The op-log's first crate-internal API surface (#524): the MINTING primitives + the op
 // vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
 // — and the only direction of the dependency (`oplog` never depends back on `query::memory`).
-pub use identity::local_device;
+pub use identity::{LocalDevice, local_device};
 pub use op::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
 // The `/1` shadow-projection read seams (`ProjectedState` / `load_projection`) and the
 // standalone (own-txn) `/1` authoring wrappers (`author_batch` / `author_op`) — test-only

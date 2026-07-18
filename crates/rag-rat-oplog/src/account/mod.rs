@@ -59,9 +59,16 @@ pub use fold::{
     RosterContentAuthority,
 };
 pub use id::AccountId;
+// C4.1 content-key primitives the C4.3b sealing surface exposes: `ContentKey` is the `Ready`
+// payload C5's seal path consumes; `KeyId` is the selection identity (#607).
+pub use keywrap::{ContentKey, KeyId};
 pub use ops::{DeviceCut, DeviceRole, GrantRole};
-// The in-tx content-key mint + owner-gated `StreamKeyWrap` author seam (C4.3a, #607).
-pub use secrets::mint_and_author_stream_key_wrap_in_tx;
+// The in-tx content-key mint + owner-gated `StreamKeyWrap` author seam (C4.3a) plus the C4.3b
+// READ side — derive-on-read sealing-key selection + the key_id adoption cross-check (#607).
+pub use secrets::{
+    SealingKeyOutcome, SelectedWrap, current_sealing_key, mint_and_author_stream_key_wrap_in_tx,
+    select_current_sealing_wrap,
+};
 pub use storage::{
     CapacityScope, IngestOutcome, account_ingest, auth_len_freshness,
     backfill_authority_projection, grant_effective_for_device, owner_control_authority,

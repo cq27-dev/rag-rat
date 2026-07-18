@@ -1324,6 +1324,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_073_ID => Some(73),
             MIGRATION_074_ID => Some(74),
             MIGRATION_075_ID => Some(75),
+            MIGRATION_076_ID => Some(76),
             _ => None,
         })
         .max()
@@ -1408,6 +1409,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_073_ID
             | MIGRATION_074_ID
             | MIGRATION_075_ID
+            | MIGRATION_076_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1489,6 +1491,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_073_ID => migration.checksum != MIGRATION_073_CHECKSUM,
         MIGRATION_074_ID => migration.checksum != MIGRATION_074_CHECKSUM,
         MIGRATION_075_ID => migration.checksum != MIGRATION_075_CHECKSUM,
+        MIGRATION_076_ID => migration.checksum != MIGRATION_076_CHECKSUM,
         _ => false,
     }
 }
@@ -4608,6 +4611,35 @@ pub fn apply_content_streams_pending_refold(conn: &Connection) -> rusqlite::Resu
     )
 }
 
+/// V076 (sync phase C4.3b, #607): the sealing-key adoption audit log. A recipient device records a
+/// row here when an accepted `StreamKeyWrap` naming it either fails to unwrap (AEAD tag failure —
+/// the primary manifestation of a substituted wrap) or unwraps to a key whose `key_id` disagrees
+/// with the op's signed `key_id`.
+///
+/// INVARIANT: local-only. These rows are never on the wire, never a fold input, and the adoption
+/// seam never mutates a fold verdict — the shared fold stays device-independent (convergent), so a
+/// recipient-only unwrap check can only ever be LOCAL evidence. `key_epoch` is stored as 8-byte BE
+/// (not INT) so a `u64` epoch round-trips without the `i64` narrowing hazard. `UNIQUE(kind,
+/// entry_hash)` + `INSERT OR IGNORE` (the write path) keep a hot seal-path retry from re-appending
+/// the same evidence for one op. Purely additive; CREATE ... IF NOT EXISTS, nothing to backfill.
+pub fn apply_sync_security_events(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_security_events(
+             id              INTEGER PRIMARY KEY,
+             kind            TEXT NOT NULL,
+             account_id      BLOB NOT NULL,
+             stream_id       BLOB NOT NULL,
+             key_epoch       BLOB NOT NULL,
+             entry_hash      BLOB NOT NULL,
+             expected_key_id BLOB,
+             observed_key_id BLOB,
+             observed_at_ms  INT NOT NULL
+         ) STRICT;
+         CREATE UNIQUE INDEX IF NOT EXISTS sync_security_events_dedup
+             ON sync_security_events(kind, entry_hash);",
+    )
+}
+
 /// V064 (sync phase C1, §16): query-ready authority facts derived from the accepted account fold.
 /// These are shadow tables, never independent sources of truth: `refold_account` deletes and
 /// rewrites every row for one account inside the SAME IMMEDIATE transaction as accepted/status.
@@ -5238,5 +5270,72 @@ mod memory_model_failure_migration_tests {
         let blocker_rows: i64 =
             conn.query_row("SELECT COUNT(*) FROM blocker", [], |r| r.get(0)).unwrap();
         assert_eq!(blocker_rows, 0, "the preexisting blocker table/index is left intact");
+    }
+}
+
+#[cfg(test)]
+mod sync_security_events_migration_tests {
+    use super::*;
+
+    /// Insert one adoption-audit event via the write path (`INSERT OR IGNORE`); returns rows
+    /// changed so a dedup can be observed as `0`.
+    fn insert_event(conn: &Connection, kind: &str, entry_hash: &[u8]) -> usize {
+        conn.execute(
+            "INSERT OR IGNORE INTO sync_security_events(
+                 kind, account_id, stream_id, key_epoch, entry_hash,
+                 expected_key_id, observed_key_id, observed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                kind,
+                [1u8; 32].as_slice(),
+                [2u8; 32].as_slice(),
+                0u64.to_be_bytes().as_slice(),
+                entry_hash,
+                Option::<Vec<u8>>::None,
+                Option::<Vec<u8>>::None,
+                123i64,
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn table_dedupes_on_kind_and_entry_hash() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_sync_security_events(&conn).unwrap();
+        assert!(table_exists(&conn, "sync_security_events").unwrap(), "the table is created");
+
+        // A first event lands; a second with the SAME (kind, entry_hash) is IGNOREd (the hot
+        // seal-path-retry guard); a different kind for the same entry_hash is a distinct event.
+        assert_eq!(insert_event(&conn, "wrap_unwrap_failed", &[9u8; 32]), 1, "first event inserts");
+        assert_eq!(
+            insert_event(&conn, "wrap_unwrap_failed", &[9u8; 32]),
+            0,
+            "a duplicate (kind, entry_hash) is ignored, not re-appended",
+        );
+        assert_eq!(
+            insert_event(&conn, "wrap_key_id_mismatch", &[9u8; 32]),
+            1,
+            "a distinct kind for the same entry is its own event",
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_security_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "exactly the two distinct events survive");
+    }
+
+    #[test]
+    fn strict_typing_rejects_a_non_blob_account_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_sync_security_events(&conn).unwrap();
+        // STRICT: `account_id` is declared BLOB, so an INTEGER literal there is a datatype mismatch
+        // rather than a silently coerced value.
+        let inserted = conn.execute(
+            "INSERT INTO sync_security_events(
+                 kind, account_id, stream_id, key_epoch, entry_hash, observed_at_ms)
+             VALUES ('wrap_unwrap_failed', 5, x'02', x'0000000000000000', x'09', 1)",
+            [],
+        );
+        assert!(inserted.is_err(), "STRICT rejects an INTEGER in the BLOB account_id column");
     }
 }

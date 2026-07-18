@@ -2775,7 +2775,6 @@ fn migration_074_refreshes_the_edges_view() {
 
 #[test]
 fn migration_075_materializes_edge_visibility() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 75, "move this pin with the next schema migration");
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn.execute(
@@ -2870,4 +2869,45 @@ fn migration_075_materializes_edge_visibility() {
         )
         .unwrap();
     assert_eq!(v75_recorded, 1, "the forward migration records V075");
+}
+
+#[test]
+fn migration_076_adds_sync_security_events() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 76, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    // Simulate a pre-V076 DB: the table's DDL is not part of truncate_schema_to (it rolls the
+    // ledger only), so drop it, then roll the ledger back to V075.
+    truncate_schema_to(&conn, 75);
+    conn.execute_batch("DROP TABLE sync_security_events;").unwrap();
+
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
+
+    let table_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = \
+             'sync_security_events'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_exists, 1, "the forward migration re-creates sync_security_events");
+    let dedup_index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = \
+             'sync_security_events_dedup'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dedup_index, 1, "the dedup unique index is installed");
+    let v76_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '076_sync_security_events'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v76_recorded, 1, "the forward migration records V076");
 }

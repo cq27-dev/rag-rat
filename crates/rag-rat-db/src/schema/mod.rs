@@ -40,7 +40,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 75;
+pub const LATEST_SCHEMA_VERSION: u32 = 76;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -547,6 +547,14 @@ const MIGRATION_075_DESCRIPTION: &str =
      #734): visibility is decided once at write time instead of re-deriving the dispatch-fact + \
      suppressed-candidate predicates on every view row. Adds the column, backfills it from the \
      predicate the view WHERE used to evaluate, and refreshes the view via ensure_edges_view";
+const MIGRATION_076_ID: &str = "076_sync_security_events";
+const MIGRATION_076_CHECKSUM: &str = "sha256:rag-rat-sync-security-events-v76";
+const MIGRATION_076_DESCRIPTION: &str =
+    "Add sync_security_events (sync phase C4.3b, #607): the local-only audit log the sealing-key \
+     adoption cross-check writes when an accepted StreamKeyWrap naming this device fails to \
+     unwrap (AEAD tag failure) or unwraps to a key whose key_id disagrees with the op's signed \
+     key_id. Never on the wire, never a fold input. Additive; CREATE ... IF NOT EXISTS + a dedup \
+     unique index, nothing pre-existing to backfill";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1188,6 +1196,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_075_CHECKSUM,
         description: MIGRATION_075_DESCRIPTION,
         apply: MigrationFn::Plain(apply_edges_hidden_flag),
+    },
+    Migration {
+        id: MIGRATION_076_ID,
+        checksum: MIGRATION_076_CHECKSUM,
+        description: MIGRATION_076_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_sync_security_events),
     },
 ];
 
