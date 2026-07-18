@@ -12,53 +12,53 @@ use super::super::AccountId;
 use super::super::limits::{
     CONTENT_ENTRY_DOMAIN, CONTENT_ENVELOPE_MAX_BYTES, CONTENT_SIGNED_DOMAIN,
 };
-use crate::oplog::cbor;
-use crate::oplog::device::{DevicePublic, DeviceSecret};
-use crate::oplog::op::DeviceFingerprint;
-use crate::oplog::stream::StreamId;
+use crate::cbor;
+use crate::device::{DevicePublic, DeviceSecret};
+use crate::op::DeviceFingerprint;
+use crate::stream::StreamId;
 
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// The fixed 13-part `/3` header. The domain is encoded as part 0 and therefore is not stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContentEntryHeader {
-    pub(crate) stream_id: StreamId,
-    pub(crate) author_account_id: AccountId,
-    pub(crate) device_fingerprint: DeviceFingerprint,
-    pub(crate) seq: u64,
-    pub(crate) lamport: u64,
-    pub(crate) prev_hash: Option<[u8; 32]>,
-    pub(crate) grant_id: Option<[u8; 32]>,
-    pub(crate) roster_ref: [u8; 32],
-    pub(crate) owner_auth_len: u64,
-    pub(crate) author_auth_len: u64,
-    pub(crate) crypto_suite: u64,
-    pub(crate) key_id: Option<[u8; 32]>,
+pub struct ContentEntryHeader {
+    pub stream_id: StreamId,
+    pub author_account_id: AccountId,
+    pub device_fingerprint: DeviceFingerprint,
+    pub seq: u64,
+    pub lamport: u64,
+    pub prev_hash: Option<[u8; 32]>,
+    pub grant_id: Option<[u8; 32]>,
+    pub roster_ref: [u8; 32],
+    pub owner_auth_len: u64,
+    pub author_auth_len: u64,
+    pub crypto_suite: u64,
+    pub key_id: Option<[u8; 32]>,
 }
 
 /// A structurally decoded content entry plus every signed wire unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SignedContentEntry {
-    pub(crate) header: ContentEntryHeader,
-    pub(crate) payload: Vec<u8>,
-    pub(crate) signature: [u8; 64],
-    pub(crate) header_bytes: Vec<u8>,
-    pub(crate) body_bytes: Vec<u8>,
-    pub(crate) signed_bytes: Vec<u8>,
-    pub(crate) entry_hash: [u8; 32],
+pub struct SignedContentEntry {
+    pub header: ContentEntryHeader,
+    pub payload: Vec<u8>,
+    pub signature: [u8; 64],
+    pub header_bytes: Vec<u8>,
+    pub body_bytes: Vec<u8>,
+    pub signed_bytes: Vec<u8>,
+    pub entry_hash: [u8; 32],
 }
 
 /// A decoded and signature-verified `/3` entry. Authority and branch acceptance are C3 concerns.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VerifiedContentEntry {
-    pub(crate) header: ContentEntryHeader,
-    pub(crate) payload: Vec<u8>,
-    pub(crate) header_bytes: Vec<u8>,
-    pub(crate) entry_hash: [u8; 32],
+pub struct VerifiedContentEntry {
+    pub header: ContentEntryHeader,
+    pub payload: Vec<u8>,
+    pub header_bytes: Vec<u8>,
+    pub entry_hash: [u8; 32],
 }
 
 /// Encode and sign one `/3` entry. The signing key always determines the device fingerprint.
-pub(in crate::oplog) fn sign_content_entry(
+pub fn sign_content_entry(
     secret: &DeviceSecret,
     header: &ContentEntryHeader,
     payload: &[u8],
@@ -99,7 +99,7 @@ pub(in crate::oplog) fn sign_content_entry(
 }
 
 /// Decode structure and canonical CBOR only. Signature verification is separate.
-pub(in crate::oplog) fn decode_content_signed(bytes: &[u8]) -> anyhow::Result<SignedContentEntry> {
+pub fn decode_content_signed(bytes: &[u8]) -> anyhow::Result<SignedContentEntry> {
     if bytes.len() > CONTENT_ENVELOPE_MAX_BYTES {
         anyhow::bail!(
             "content entry wire is {} bytes, over the {CONTENT_ENVELOPE_MAX_BYTES}-byte §18a limit",
@@ -111,7 +111,7 @@ pub(in crate::oplog) fn decode_content_signed(bytes: &[u8]) -> anyhow::Result<Si
 }
 
 /// Decode and verify the signature and signer fingerprint. Authority remains unresolved.
-pub(in crate::oplog) fn verify_content_signed(
+pub fn verify_content_signed(
     bytes: &[u8],
     public: &DevicePublic,
 ) -> anyhow::Result<VerifiedContentEntry> {
@@ -458,15 +458,15 @@ mod tests {
 
     #[test]
     fn content_account_and_legacy_envelopes_cannot_cross_decode() {
-        use crate::oplog::op::MemoryOp;
+        use crate::op::MemoryOp;
 
         let content = sign_content_entry(&secret(), &header(), &[0xf6]).unwrap();
-        assert!(crate::oplog::entry::decode_signed(&content.signed_bytes).is_err());
+        assert!(crate::entry::decode_signed(&content.signed_bytes).is_err());
         assert!(
             super::super::super::envelope::decode_account_signed(&content.signed_bytes).is_err()
         );
 
-        let legacy = crate::oplog::entry::sign_entry(
+        let legacy = crate::entry::sign_entry(
             &secret(),
             StreamId::from_bytes([0x91; 32]),
             None,

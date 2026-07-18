@@ -1,7 +1,7 @@
 //! The store's persisted local account — its ONE self-authorizing `AccountGenesis`, minted once and
 //! reused (sync phase C3.4a, #662).
 //!
-//! Where [`crate::oplog::local_device`] is the machine's signing identity, the local account is the
+//! Where [`crate::local_device`] is the machine's signing identity, the local account is the
 //! *principal* this install authors under: a seq-0, self-authorizing account genesis whose founder
 //! is the local device. It is minted from OS entropy on first use and pinned by the single-row
 //! `oplog_local_account` pointer table (`CHECK (id = 0)`), so later C3.4 slices author owner-bound
@@ -36,7 +36,7 @@ use super::envelope::{AccountEntryHeader, VerifiedAccountEntry, sign_account_ent
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp};
 use super::storage::{self, CandidateInsert};
-use crate::oplog::local_device;
+use crate::local_device;
 
 /// Return this store's persisted local account, minting its self-authorizing genesis on the first
 /// call and returning the SAME account stably thereafter. `now_ms` stamps a freshly-minted genesis
@@ -46,7 +46,7 @@ use crate::oplog::local_device;
 /// The account_id is the §4 content-commitment of the genesis payload, resolved through the
 /// pointer: idempotent, and a concurrent first-open converges on one account (the loser of the
 /// pointer race adopts the winner's genesis — see the module header).
-pub(crate) fn local_account(conn: &Connection, now_ms: i64) -> anyhow::Result<AccountId> {
+pub fn local_account(conn: &Connection, now_ms: i64) -> anyhow::Result<AccountId> {
     // Fast path: the pointer is already minted — adopt it WITHOUT taking the writer lock.
     // Candidates are grow-only, so a genesis this read resolves can never disappear underneath
     // us.
@@ -272,7 +272,7 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
     }
 
@@ -384,7 +384,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("local-account.db");
         let setup = Connection::open(&path).unwrap();
-        schema::apply(&setup, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&setup, &crate::test_hooks()).unwrap();
         drop(setup);
 
         // Two first-callers race from a fresh DB: each proposes a DISTINCT account (fresh nonce),

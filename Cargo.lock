@@ -3648,6 +3648,7 @@ dependencies = [
  "rag-rat-db",
  "rag-rat-dream",
  "rag-rat-llm",
+ "rag-rat-oplog",
  "rag-rat-oracle",
  "rag-rat-papertrail",
  "rag-rat-query",
@@ -3758,6 +3759,28 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rag-rat-oplog"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hkdf",
+ "minicbor",
+ "rag-rat-base",
+ "rag-rat-db",
+ "rag-rat-query",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

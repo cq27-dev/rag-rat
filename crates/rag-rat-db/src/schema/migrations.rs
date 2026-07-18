@@ -4518,7 +4518,7 @@ pub fn apply_content_candidate_dag(conn: &Connection) -> rusqlite::Result<()> {
 /// V069 (sync phase C3.4a): the store-global local-account pointer. `oplog_local_account` is a
 /// single-row (`CHECK (id = 0)`) STRICT table naming the `genesis_entry_hash` of THIS store's one
 /// local account — the seq-0, self-authorizing `AccountGenesis` minted once by
-/// [`crate::oplog::local_account`] and reused thereafter, so later C3.4 slices author owner-bound
+/// `rag_rat_oplog::local_account` and reused thereafter, so later C3.4 slices author owner-bound
 /// `/3` content under a stable account identity. The pointer is a 32-byte content address into
 /// `account_entries`, not the account_id itself: the id is resolved by looking the genesis up in
 /// the candidate DAG, so the pointer + genesis stay a single source of truth (one committed
@@ -4538,7 +4538,7 @@ pub fn apply_oplog_local_account(conn: &Connection) -> rusqlite::Result<()> {
 /// V070 (sync phase C3.4b-i): the accepted-`/3` → memory projection tables.
 /// `content_projected_nodes` / `content_projected_edges` mirror the `/1` shadow tables
 /// `oplog_projected_nodes` / `oplog_projected_edges` (stream-keyed since V053) but materialize the
-/// acceptance-gated `/3` DAG: [`crate::oplog::reproject_accepted_content_stream`] decodes each
+/// acceptance-gated `/3` DAG: `rag_rat_oplog::reproject_accepted_content_stream` decodes each
 /// `content_entries` row where `accepted = 1`, folds via the shared memory projector, and rewrites
 /// the keyed rows for one `/2` stream. Kept SEPARATE from the `/1` tables on purpose (decision 7):
 /// the `/1` projector sweep (`store::reproject_all_streams`) `DELETE`s the `oplog_projected_*`

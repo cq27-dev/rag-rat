@@ -15,9 +15,9 @@ use std::ops::ControlFlow;
 
 use super::acceptance::{AncestryRelation, UnknownAncestry};
 use super::envelope::ContentEntryHeader;
-use crate::oplog::account::AccountId;
-use crate::oplog::op::DeviceFingerprint;
-use crate::oplog::stream::StreamId;
+use crate::account::AccountId;
+use crate::op::DeviceFingerprint;
+use crate::stream::StreamId;
 
 type EntryHash = [u8; 32];
 

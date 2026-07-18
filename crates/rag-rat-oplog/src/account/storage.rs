@@ -17,10 +17,10 @@ use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::{AccountId, content, fold};
-use crate::oplog::cbor;
-use crate::oplog::device::DevicePublic;
-use crate::oplog::op::DeviceFingerprint;
-use crate::oplog::stream::StreamId;
+use crate::cbor;
+use crate::device::DevicePublic;
+use crate::op::DeviceFingerprint;
+use crate::stream::StreamId;
 
 type EntryHash = [u8; 32];
 type BranchKey = (u8, DeviceFingerprint, Option<EntryHash>);
@@ -69,7 +69,7 @@ struct PromotionOutcome {
 
 /// The operational admission budget that prevented an otherwise valid ingest from being stored.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CapacityScope {
+pub enum CapacityScope {
     PreVerifyAccount,
     PreVerifyGlobal,
     CandidateAccount,
@@ -80,7 +80,7 @@ pub(crate) enum CapacityScope {
 
 /// The result of ingesting one signed account entry (§16.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum IngestOutcome {
+pub enum IngestOutcome {
     /// Structurally rejected (bad canonicity / over §18a / bad signature / fingerprint or self-hash
     /// mismatch) — NEVER stored.
     Rejected(String),
@@ -118,7 +118,7 @@ pub(crate) enum IngestOutcome {
 /// Ingest one signed account entry: structural decode → content-addressed device resolution →
 /// signature verify → genesis self-hash → `INSERT OR IGNORE` into the candidate DAG → promote any
 /// pre-verify rows this entry now resolves → `refold_account`. Opens its own IMMEDIATE transaction.
-pub(crate) fn account_ingest(
+pub fn account_ingest(
     conn: &Connection,
     signed_bytes: &[u8],
     now_ms: i64,
@@ -271,7 +271,7 @@ fn stored_status_for_exact_envelope(
 /// selection §16.2), and rewrite `accepted` + `account_entry_status` in one IMMEDIATE transaction
 /// so the `account_accepted_slot` partial unique index (I10a) never transiently double-accepts a
 /// slot.
-pub(crate) fn refold_account(conn: &Connection, account_id: AccountId) -> anyhow::Result<()> {
+pub fn refold_account(conn: &Connection, account_id: AccountId) -> anyhow::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     refold_in_tx(&tx, account_id)?;
     tx.commit()?;
@@ -281,7 +281,7 @@ pub(crate) fn refold_account(conn: &Connection, account_id: AccountId) -> anyhow
 /// Populate V064's derived authority tables from every account already present in the V059
 /// candidate DAG. The migration owns `tx`; replaying all accounts and recording V064 therefore
 /// commits as one writer-locked unit, with no source-history gap between the scan and ledger.
-pub(crate) fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+pub fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     let account_ids = {
         let mut stmt =
             tx.prepare("SELECT DISTINCT account_id FROM account_entries ORDER BY account_id")?;
@@ -304,7 +304,7 @@ pub(crate) fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::R
 /// `/3` ingest: a keyed read, never a candidate-DAG replay. It resolves against the current fold —
 /// the only authority snapshot there is (§7) — and says nothing about the citing author's own
 /// control length; that is [`auth_len_freshness`]'s separate job.
-pub(crate) fn roster_ref_effective(
+pub fn roster_ref_effective(
     conn: &Connection,
     account_id: AccountId,
     roster_ref: EntryHash,
@@ -333,7 +333,7 @@ pub(crate) fn roster_ref_effective(
     validated_open_fact(authority, effective_at, closed_at)
 }
 
-pub(crate) fn roster_content_authority(
+pub fn roster_content_authority(
     conn: &Connection,
     account_id: AccountId,
     roster_ref: EntryHash,
@@ -356,7 +356,7 @@ pub(crate) fn roster_content_authority(
 /// freshness verdicts — and must see one consistent snapshot across all of them, or a refold
 /// committing mid-evaluation could pair an old grant with a new cut. It therefore reads inside its
 /// own transaction and cannot call the wrapper above, which would try to `BEGIN` a second one.
-pub(crate) fn roster_content_authority_in_snapshot(
+pub fn roster_content_authority_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
     roster_ref: EntryHash,
@@ -408,7 +408,7 @@ pub(crate) fn roster_content_authority_in_snapshot(
     }))
 }
 
-pub(crate) fn owner_control_authority(
+pub fn owner_control_authority(
     conn: &Connection,
     account_id: AccountId,
     owner_id: EntryHash,
@@ -417,7 +417,7 @@ pub(crate) fn owner_control_authority(
     owner_chain_authority(conn, account_id, owner_id, device_fingerprint, "control")
 }
 
-pub(crate) fn owner_secrets_authority(
+pub fn owner_secrets_authority(
     conn: &Connection,
     account_id: AccountId,
     owner_id: EntryHash,
@@ -521,7 +521,7 @@ fn owner_chain_authority(
     }))
 }
 
-pub(crate) fn owner_incarnation_effective(
+pub fn owner_incarnation_effective(
     conn: &Connection,
     account_id: AccountId,
     owner_id: EntryHash,
@@ -550,7 +550,7 @@ pub(crate) fn owner_incarnation_effective(
 
 type StoredGrantRow = (Vec<u8>, Vec<u8>, String, i64, Option<i64>);
 
-pub(crate) fn grant_effective(
+pub fn grant_effective(
     conn: &Connection,
     owner_account_id: AccountId,
     grant_id: EntryHash,
@@ -584,7 +584,7 @@ pub(crate) fn grant_effective(
 /// Resolve a grant and the requesting device's revoke cut as ONE authorization decision. C2 must
 /// use this combined seam when admitting content: two independent calls could otherwise straddle
 /// a refold and combine an old effective grant with a new (or absent) cut projection.
-pub(crate) fn grant_effective_for_device(
+pub fn grant_effective_for_device(
     conn: &Connection,
     owner_account_id: AccountId,
     grant_id: EntryHash,
@@ -605,7 +605,7 @@ pub(crate) fn grant_effective_for_device(
 
 /// The body of [`grant_effective_for_device`], reading whatever snapshot `conn` is already in — see
 /// [`roster_content_authority_in_snapshot`] for why the `/3` refold needs this shape.
-pub(crate) fn grant_effective_for_device_in_snapshot(
+pub fn grant_effective_for_device_in_snapshot(
     conn: &Connection,
     owner_account_id: AccountId,
     grant_id: EntryHash,
@@ -645,7 +645,7 @@ pub(crate) fn grant_effective_for_device_in_snapshot(
 
 /// Resolve the owner-bound `StreamOwn` fact from the current fold. A missing ownership fact is
 /// recoverable: the citing author may simply hold control ops we have not folded yet.
-pub(crate) fn stream_owner_effective(
+pub fn stream_owner_effective(
     conn: &Connection,
     account_id: AccountId,
     stream_id: StreamId,
@@ -656,7 +656,7 @@ pub(crate) fn stream_owner_effective(
 
 /// The body of [`stream_owner_effective`], reading whatever snapshot `conn` is already in — see
 /// [`roster_content_authority_in_snapshot`] for why the `/3` refold needs this shape.
-pub(crate) fn stream_owner_effective_in_snapshot(
+pub fn stream_owner_effective_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
     stream_id: StreamId,
@@ -735,7 +735,7 @@ fn load_grant_device_cut(
 /// cryptographically impossible (§14). The preimage is not invertible, though, so the owner is
 /// resolved through the `StreamOwn` fact the owner published. No fact ⇒ we do not know who owns
 /// this stream yet, and nothing on it can be authorized — that is recoverable, never a rejection.
-pub(crate) fn stream_owner_account(
+pub fn stream_owner_account(
     conn: &Connection,
     stream_id: StreamId,
 ) -> anyhow::Result<Option<AccountId>> {
@@ -752,10 +752,7 @@ pub(crate) fn stream_owner_account(
 /// Whether an account has folded to `contested` — a genuine owner-key-compromise / equivocation
 /// event (§12), which HALTS authority mutation. Content authorized by a contested account is
 /// fail-closed: parked (quota-bounded), never accepted, and reclassified if the account recovers.
-pub(crate) fn account_is_contested(
-    conn: &Connection,
-    account_id: AccountId,
-) -> anyhow::Result<bool> {
+pub fn account_is_contested(conn: &Connection, account_id: AccountId) -> anyhow::Result<bool> {
     let classification: Option<String> = conn
         .query_row(
             "SELECT classification FROM account_auth_state WHERE account_id = ?1",
@@ -772,7 +769,7 @@ pub(crate) fn account_is_contested(
 /// verdict as its own phase, where an `Ahead` author parks rather than pre-empting a decision the
 /// fold has already made. An account we hold nothing for has folded zero effective ops (its facts
 /// resolve `Unknown` long before freshness is consulted).
-pub(crate) fn auth_len_freshness(
+pub fn auth_len_freshness(
     conn: &Connection,
     account_id: AccountId,
     asserted_auth_len: u64,
@@ -799,10 +796,7 @@ pub(crate) fn auth_len_freshness(
 /// snapshot as the authoring txn, or a concurrent control-fold advance would let the citation
 /// straddle two folds. Zero for an account we hold nothing for (its facts resolve `Unknown` long
 /// before freshness).
-pub(crate) fn account_effective_count(
-    conn: &Connection,
-    account_id: AccountId,
-) -> anyhow::Result<u64> {
+pub fn account_effective_count(conn: &Connection, account_id: AccountId) -> anyhow::Result<u64> {
     let effective_count: Option<i64> = conn
         .query_row(
             "SELECT effective_count FROM account_auth_state WHERE account_id = ?1",
@@ -1652,16 +1646,16 @@ mod tests {
     use rag_rat_db::schema;
 
     use super::*;
-    use crate::oplog::account::envelope::sign_account_entry;
-    use crate::oplog::account::ops::{ContentCut, DeviceCut, DeviceRole, GrantRole};
-    use crate::oplog::device::{DeviceSecret, DeviceX25519Secret};
-    use crate::oplog::stream::{self, StreamSpec, StreamSpecV2};
+    use crate::account::envelope::sign_account_entry;
+    use crate::account::ops::{ContentCut, DeviceCut, DeviceRole, GrantRole};
+    use crate::device::{DeviceSecret, DeviceX25519Secret};
+    use crate::stream::{self, StreamSpec, StreamSpecV2};
 
     const NOW: i64 = 1_700_000_000_000;
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
     }
 
@@ -1748,7 +1742,7 @@ mod tests {
         }
     }
 
-    fn stream_own(account_id: AccountId) -> (crate::oplog::stream::StreamId, AccountOp) {
+    fn stream_own(account_id: AccountId) -> (crate::stream::StreamId, AccountOp) {
         let spec = StreamSpecV2 {
             owner_account_id: account_id,
             policy: StreamSpec {
@@ -2078,7 +2072,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grant-snapshot.db");
         let setup = Connection::open(&path).unwrap();
-        schema::apply(&setup, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&setup, &crate::test_hooks()).unwrap();
         setup.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
 
         let founder = Dev::new(1);
@@ -2235,7 +2229,7 @@ mod tests {
         )
         .unwrap();
 
-        schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::migrate_forward(&conn, &crate::test_hooks()).unwrap();
         assert_eq!(
             stream_owner_effective(&conn, account_id, stream_id).unwrap(),
             fold::AuthorityQuery::Effective(own_hash),
@@ -2274,7 +2268,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(schema::migrate_forward(&conn, &crate::index::migration_hooks()).is_err());
+        assert!(schema::migrate_forward(&conn, &crate::test_hooks()).is_err());
         let table_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -2358,7 +2352,7 @@ mod tests {
                 &conn,
                 account_id,
                 grant_id,
-                crate::oplog::stream::StreamId::from_bytes([0x55; 32]),
+                crate::stream::StreamId::from_bytes([0x55; 32]),
                 grantee,
             )
             .unwrap(),
@@ -2829,7 +2823,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account-cap.db");
         let setup = Connection::open(&path).unwrap();
-        schema::apply(&setup, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&setup, &crate::test_hooks()).unwrap();
         let tx = Transaction::new_unchecked(&setup, TransactionBehavior::Immediate).unwrap();
         seed_global_candidate_rows(&tx, CANDIDATES_GLOBAL_MAX - 1, 0);
         tx.commit().unwrap();
@@ -2876,7 +2870,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("known-key.db");
         let setup = Connection::open(&path).unwrap();
-        schema::apply(&setup, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&setup, &crate::test_hooks()).unwrap();
         let founder = Dev::new(1);
         let (_account_id, mut forged, _) = genesis(&founder);
         account_ingest(&setup, &forged, NOW).unwrap();
@@ -3260,7 +3254,7 @@ mod tests {
             [add_owner.as_slice()],
         )
         .unwrap();
-        schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::migrate_forward(&conn, &crate::test_hooks()).unwrap();
         assert!(matches!(
             owner_control_authority(&conn, account_id, add_owner, owner.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::OwnerChainAuthority {

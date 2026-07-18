@@ -1,6 +1,6 @@
 //! The in-tx `/3` content-author seam (sync phase C3.4b-i, #663).
 //!
-//! The local writer's counterpart to the `/1` trio in [`crate::oplog::store`]
+//! The local writer's counterpart to the `/1` trio in [`crate::store`]
 //! (`author_in_tx` / `author_batch_in_tx` / `author_genesis_in_tx`): it authors a batch of
 //! [`MemoryOp`]s as **owner-authored** `/3` content on one `/2` stream, inside the caller's
 //! IMMEDIATE transaction, minting each entry from the local chain tail. It is the LOCAL-authoring
@@ -16,7 +16,7 @@
 //! fold.
 //!
 //! `lamport = seq`. The seq is dense and monotone under the single local writer, and it IS the
-//! projection LWW key ([`crate::oplog::project`] orders on `(lamport, device)`); a non-monotone
+//! projection LWW key ([`crate::project`] orders on `(lamport, device)`); a non-monotone
 //! value would let a `NodeUpdate` lose to its own earlier `NodeCreate`.
 //!
 //! VERIFY-ACCEPTED. After the single batch refold, the seam reads back each authored entry's status
@@ -34,9 +34,9 @@ use super::super::bootstrap::{self, LocalAccountRef};
 use super::super::{AccountId, storage as account_storage};
 use super::envelope::{self, ContentEntryHeader, VerifiedContentEntry};
 use super::storage as content_storage;
-use crate::oplog::op::{self, DeviceFingerprint, MemoryOp};
-use crate::oplog::stream::StreamId;
-use crate::oplog::{content_projection, local_device};
+use crate::op::{self, DeviceFingerprint, MemoryOp};
+use crate::stream::StreamId;
+use crate::{content_projection, local_device};
 
 type EntryHash = [u8; 32];
 
@@ -53,7 +53,7 @@ struct ContentChainTail {
 /// in authoring order. Requires the store's local account to be minted already (see
 /// [`bootstrap::local_account`]); the caller mints it before opening this txn (that mint
 /// self-transacts and cannot nest here).
-pub(crate) fn author_content_batch_in_tx(
+pub fn author_content_batch_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
     ops: &[MemoryOp],
@@ -146,10 +146,7 @@ pub(crate) fn author_content_batch_in_tx(
 /// elides a create-time `active` status (a fresh chain holds no stale status register to override).
 /// A pure read opening no transaction, so it is safe inside the caller's IMMEDIATE txn (a
 /// `&Transaction` derefs to `&Connection`).
-pub(crate) fn content_stream_is_empty(
-    conn: &Connection,
-    stream_id: StreamId,
-) -> anyhow::Result<bool> {
+pub fn content_stream_is_empty(conn: &Connection, stream_id: StreamId) -> anyhow::Result<bool> {
     let has_row: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM content_entries WHERE stream_id = ?1)",
         params![stream_id.to_bytes().as_slice()],
@@ -211,7 +208,7 @@ mod tests {
     use rusqlite::{Connection, TransactionBehavior};
 
     use super::*;
-    use crate::oplog::op::{EdgeSpec, NodeContent, NodeId};
+    use crate::op::{EdgeSpec, NodeContent, NodeId};
 
     const NOW: i64 = 1_700_000_000_000;
     const STREAM_A: [u8; 32] = [0x44; 32];
@@ -219,7 +216,7 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
     }
 

@@ -12,18 +12,18 @@
 //! parks as `auth_len_ahead` instead of hardening into a rejection.
 
 use super::ContentEntryHeader;
-use crate::oplog::account::{
+use crate::account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
     GrantDeviceAuthority, GrantDeviceBoundary, GrantRole, RosterContentAuthority,
 };
-use crate::oplog::stream::StreamId;
+use crate::stream::StreamId;
 
 type EntryHash = [u8; 32];
 
 /// Why an ancestry walk against a cut watermark could not be decided (mirrors the account fold's
 /// `UnknownCause`: a withheld watermark parks, and never flips a verdict — I11).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum UnknownAncestry {
+pub enum UnknownAncestry {
     /// The cut's watermark entry itself is not held.
     UnknownCutTarget,
     /// A link on the walk from the watermark toward the entry is missing.
@@ -31,7 +31,7 @@ pub(crate) enum UnknownAncestry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AncestryRelation {
+pub enum AncestryRelation {
     /// The entry is the watermark itself or an ancestor reached walking backward from it.
     OnBranch,
     OffBranch,
@@ -42,42 +42,42 @@ pub(crate) enum AncestryRelation {
 /// length) is carried so a result computed for the owner cannot be read as the author's, and a
 /// result computed for a shorter assertion cannot stand in for the header's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CitedFreshness {
-    pub(crate) account_id: AccountId,
-    pub(crate) asserted_auth_len: u64,
-    pub(crate) state: AuthorityFreshness,
+pub struct CitedFreshness {
+    pub account_id: AccountId,
+    pub asserted_auth_len: u64,
+    pub state: AuthorityFreshness,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SubjectAuthorityHold {
+pub enum SubjectAuthorityHold {
     Clear,
     UnknownCutTarget,
     Contested,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CitedOwnership {
-    pub(crate) owner_account_id: AccountId,
-    pub(crate) stream_id: StreamId,
+pub struct CitedOwnership {
+    pub owner_account_id: AccountId,
+    pub stream_id: StreamId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CitedRosterAuthority {
-    pub(crate) account_id: AccountId,
-    pub(crate) roster_ref: EntryHash,
-    pub(crate) stream_id: StreamId,
-    pub(crate) authority: RosterContentAuthority,
+pub struct CitedRosterAuthority {
+    pub account_id: AccountId,
+    pub roster_ref: EntryHash,
+    pub stream_id: StreamId,
+    pub authority: RosterContentAuthority,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CitedGrantAuthority {
-    pub(crate) owner_account_id: AccountId,
-    pub(crate) grant_id: EntryHash,
-    pub(crate) authority: GrantDeviceAuthority,
+pub struct CitedGrantAuthority {
+    pub owner_account_id: AccountId,
+    pub grant_id: EntryHash,
+    pub authority: GrantDeviceAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContentParkReason {
+pub enum ContentParkReason {
     MissingPredecessor,
     UnknownOwner,
     UnknownRosterRef,
@@ -90,14 +90,14 @@ pub(crate) enum ContentParkReason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContentCondemnReason {
+pub enum ContentCondemnReason {
     BeyondCut,
     OffBranch,
     ClosedIncarnation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContentRejectReason {
+pub enum ContentRejectReason {
     OwnerReferenceInvalid,
     RosterReferenceInvalid,
     GrantReferenceInvalid,
@@ -107,12 +107,12 @@ pub(crate) enum ContentRejectReason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContentAcceptanceInputError {
+pub enum ContentAcceptanceInputError {
     FreshnessProvenance,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContentAcceptance {
+pub enum ContentAcceptance {
     Accepted,
     Forked,
     Parked(ContentParkReason),
@@ -121,7 +121,7 @@ pub(crate) enum ContentAcceptance {
 }
 
 impl ContentAcceptance {
-    pub(crate) fn as_db_str(self) -> &'static str {
+    pub fn as_db_str(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
             Self::Forked => "forked",
@@ -152,25 +152,25 @@ impl ContentAcceptance {
 }
 
 #[derive(Clone)]
-pub(crate) struct ContentAcceptanceInput<'a, F>
+pub struct ContentAcceptanceInput<'a, F>
 where
     F: Fn(EntryHash, EntryHash) -> AncestryRelation,
 {
-    pub(crate) header: &'a ContentEntryHeader,
-    pub(crate) entry_hash: EntryHash,
-    pub(crate) owner_account_id: AccountId,
-    pub(crate) dense_predecessor_reachable: bool,
-    pub(crate) branch_selected: bool,
-    pub(crate) ownership: AuthorityQuery<CitedOwnership>,
-    pub(crate) roster: AuthorityQuery<CitedRosterAuthority>,
-    pub(crate) grant: Option<AuthorityQuery<CitedGrantAuthority>>,
-    pub(crate) owner_freshness: CitedFreshness,
-    pub(crate) author_freshness: CitedFreshness,
-    pub(crate) subject_hold: SubjectAuthorityHold,
-    pub(crate) ancestry: F,
+    pub header: &'a ContentEntryHeader,
+    pub entry_hash: EntryHash,
+    pub owner_account_id: AccountId,
+    pub dense_predecessor_reachable: bool,
+    pub branch_selected: bool,
+    pub ownership: AuthorityQuery<CitedOwnership>,
+    pub roster: AuthorityQuery<CitedRosterAuthority>,
+    pub grant: Option<AuthorityQuery<CitedGrantAuthority>>,
+    pub owner_freshness: CitedFreshness,
+    pub author_freshness: CitedFreshness,
+    pub subject_hold: SubjectAuthorityHold,
+    pub ancestry: F,
 }
 
-pub(crate) fn evaluate_content_acceptance<F>(
+pub fn evaluate_content_acceptance<F>(
     input: &ContentAcceptanceInput<'_, F>,
 ) -> Result<ContentAcceptance, ContentAcceptanceInputError>
 where
@@ -206,7 +206,7 @@ where
 /// compete for its dense seq slot (a small-hash entry mined beyond a cut would otherwise fork an
 /// honest sibling off the accepted branch), so eligibility has to be decided before selection runs
 /// — and selection's output is itself an input to the full predicate.
-pub(crate) fn authority_verdict<F>(
+pub fn authority_verdict<F>(
     input: &ContentAcceptanceInput<'_, F>,
 ) -> Result<Option<ContentAcceptance>, ContentAcceptanceInputError>
 where
@@ -385,8 +385,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oplog::account::{DeviceCut, GrantAuthority};
-    use crate::oplog::op::DeviceFingerprint;
+    use crate::account::{DeviceCut, GrantAuthority};
+    use crate::op::DeviceFingerprint;
 
     const ENTRY_HASH: EntryHash = [9; 32];
     fn owner() -> AccountId {

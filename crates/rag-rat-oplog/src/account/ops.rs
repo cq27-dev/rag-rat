@@ -20,10 +20,10 @@ use minicbor::decode::{Decoder, Error as CborError};
 use super::AccountId;
 use super::cut::Cut;
 use super::limits::{CONTENT_CUTS_MAX, DEVICE_CUTS_MAX};
-use crate::oplog::cbor;
-use crate::oplog::device::{DevicePublic, DeviceX25519Public};
-use crate::oplog::op::DeviceFingerprint;
-use crate::oplog::stream::StreamId;
+use crate::cbor;
+use crate::device::{DevicePublic, DeviceX25519Public};
+use crate::op::DeviceFingerprint;
+use crate::stream::StreamId;
 
 /// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::super`.
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
@@ -33,22 +33,22 @@ const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 /// `ModerationOp` — C3/E). NOTE: §10 lists `StandoffResolve` before `AccountReRoot`, but
 /// `AccountReRoot` is frozen at 9 here, so `StandoffResolve` takes a 10+ slot, never 9.
 pub(super) mod entry_type {
-    pub(in crate::oplog::account) const ACCOUNT_GENESIS: u32 = 0;
-    pub(in crate::oplog::account) const DEVICE_ADD: u32 = 1;
-    pub(in crate::oplog::account) const DEVICE_REMOVE: u32 = 2;
-    pub(in crate::oplog::account) const OWNER_PROMOTE: u32 = 3;
-    pub(in crate::oplog::account) const OWNER_DEMOTE: u32 = 4;
-    pub(in crate::oplog::account) const CUT_EXTEND: u32 = 5;
-    pub(in crate::oplog::account) const STREAM_OWN: u32 = 6;
-    pub(in crate::oplog::account) const STREAM_GRANT: u32 = 7;
-    pub(in crate::oplog::account) const STREAM_REVOKE: u32 = 8;
-    pub(in crate::oplog::account) const ACCOUNT_REROOT: u32 = 9;
+    pub(in crate::account) const ACCOUNT_GENESIS: u32 = 0;
+    pub(in crate::account) const DEVICE_ADD: u32 = 1;
+    pub(in crate::account) const DEVICE_REMOVE: u32 = 2;
+    pub(in crate::account) const OWNER_PROMOTE: u32 = 3;
+    pub(in crate::account) const OWNER_DEMOTE: u32 = 4;
+    pub(in crate::account) const CUT_EXTEND: u32 = 5;
+    pub(in crate::account) const STREAM_OWN: u32 = 6;
+    pub(in crate::account) const STREAM_GRANT: u32 = 7;
+    pub(in crate::account) const STREAM_REVOKE: u32 = 8;
+    pub(in crate::account) const ACCOUNT_REROOT: u32 = 9;
 }
 
 /// A device's role in an account roster (§9). Owner holds all control/secrets ops; a member authors
 /// content on granted streams only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeviceRole {
+pub enum DeviceRole {
     Member,
     Owner,
 }
@@ -88,7 +88,7 @@ impl DeviceRole {
 /// A cross-account grant's role on a stream (§9). Reader = wrap recipient (sealed) / free (public);
 /// writer = reader + content accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GrantRole {
+pub enum GrantRole {
     Reader,
     Writer,
 }
@@ -163,10 +163,10 @@ pub(super) struct ContentCut {
 
 /// One device-chain cut inside a `StreamRevoke`: `[device_fingerprint, seq, entry_hash]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DeviceCut {
-    pub(crate) device_fingerprint: DeviceFingerprint,
-    pub(crate) seq: u64,
-    pub(crate) hash: [u8; 32],
+pub struct DeviceCut {
+    pub device_fingerprint: DeviceFingerprint,
+    pub seq: u64,
+    pub hash: [u8; 32],
 }
 
 /// The ten control-log ops (§10). Field order is the frozen wire order; goldens pin the bytes.
@@ -772,7 +772,7 @@ fn decode_opt_b32(d: &mut Decoder<'_>, field: &str) -> Result<Option<[u8; 32]>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oplog::device::{DeviceSecret, DeviceX25519Secret};
+    use crate::device::{DeviceSecret, DeviceX25519Secret};
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()

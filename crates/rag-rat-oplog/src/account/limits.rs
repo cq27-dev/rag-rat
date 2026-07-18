@@ -63,6 +63,6 @@ mod tests {
         assert_eq!(CONTENT_CUTS_MAX, 1_024);
         assert_eq!(WRAP_RECIPIENTS_MAX, 1_024);
         // CBOR depth is shared with the op wire, not re-declared here.
-        assert_eq!(crate::oplog::cbor::MAX_CBOR_DEPTH, 32);
+        assert_eq!(crate::cbor::MAX_CBOR_DEPTH, 32);
     }
 }

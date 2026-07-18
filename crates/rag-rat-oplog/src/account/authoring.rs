@@ -25,10 +25,10 @@ use super::envelope::{AccountEntryHeader, VerifiedAccountEntry, sign_account_ent
 use super::id::AccountId;
 use super::ops::{self, AccountOp};
 use super::storage::{self, CandidateInsert};
-use crate::oplog::identity::LocalDevice;
-use crate::oplog::local_device;
-use crate::oplog::op::DeviceFingerprint;
-use crate::oplog::stream::{self, StreamId};
+use crate::identity::LocalDevice;
+use crate::local_device;
+use crate::op::DeviceFingerprint;
+use crate::stream::{self, StreamId};
 
 type EntryHash = [u8; 32];
 
@@ -40,7 +40,7 @@ type EntryHash = [u8; 32];
 /// Requires the store's local account to be minted already (see [`bootstrap::local_account`]); the
 /// caller mints it before opening this txn — the mint self-transacts and cannot nest here, the same
 /// contract the `/3` content seam holds.
-pub(crate) fn ensure_owned_stream_v2_in_tx(
+pub fn ensure_owned_stream_v2_in_tx(
     tx: &Transaction<'_>,
     repo_id: &str,
     now_ms: i64,
@@ -94,10 +94,7 @@ pub(crate) fn ensure_owned_stream_v2_in_tx(
 /// (pass a `&Transaction`, which derefs to `&Connection`). The live authoring seam's stream
 /// resolver: a `None` means "no principal to author under yet", so the caller SKIPS authoring
 /// rather than forcing a mint — the exact analog of an unstable scope.
-pub(crate) fn owned_stream_v2_id(
-    conn: &Connection,
-    repo_id: &str,
-) -> anyhow::Result<Option<StreamId>> {
+pub fn owned_stream_v2_id(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<StreamId>> {
     let Some(LocalAccountRef { account_id, .. }) = bootstrap::local_account_ref(conn)? else {
         return Ok(None);
     };
@@ -112,7 +109,7 @@ pub(crate) fn owned_stream_v2_id(
 /// ownership rather than early-returning). AUTOCOMMIT-ONLY: [`storage::stream_owner_effective`]
 /// opens its OWN Deferred transaction, so this MUST NOT be called inside an open transaction (use
 /// [`owned_stream_v2_id`] there). The reconcile's fast-path probe.
-pub(crate) fn established_owned_stream_v2(
+pub fn established_owned_stream_v2(
     conn: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<Option<StreamId>> {
@@ -239,13 +236,13 @@ mod tests {
     use rusqlite::{Connection, TransactionBehavior};
 
     use super::*;
-    use crate::oplog::op::{MemoryOp, NodeContent, NodeId};
+    use crate::op::{MemoryOp, NodeContent, NodeId};
 
     const NOW: i64 = 1_700_000_000_000;
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
     }
 
@@ -378,7 +375,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ensure-race.db");
         let setup = Connection::open(&path).unwrap();
-        schema::apply(&setup, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&setup, &crate::test_hooks()).unwrap();
         // Pre-mint the account (the mint self-transacts and cannot nest inside the ensure txn),
         // then race two ensures from separate connections.
         bootstrap::local_account(&setup, NOW).expect("pre-mint the local account");

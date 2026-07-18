@@ -38,6 +38,7 @@ rusqlite.workspace = true
 # scip/protobuf stay direct deps: eval + query_api tests build SCIP fixtures in-process.
 protobuf.workspace = true
 rag-rat-oracle.workspace = true
+rag-rat-oplog.workspace = true
 rag-rat-query.workspace = true
 reqwest.workspace = true
 scip.workspace = true

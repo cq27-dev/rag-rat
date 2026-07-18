@@ -2,13 +2,7 @@
 pub mod eval;
 pub mod fleet;
 pub mod index;
-// Phase B op-log (#404). The authoring half is now wired into the memory write path (#532), but the
-// SYNC-TRANSPORT half — `append` (receiving a foreign signed entry), the fork quarantine,
-// `AppendOutcome` — is still unconsumed (a later increment), so the module keeps
-// `allow(dead_code)`.
 pub(crate) mod memory_write;
-#[allow(dead_code)]
-pub(crate) mod oplog;
 pub mod output;
 pub mod query;
 pub mod search;

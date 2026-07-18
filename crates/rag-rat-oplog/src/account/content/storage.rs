@@ -18,14 +18,14 @@ use super::candidate::{
     self, BranchPin, ChainCoordinate, ContentCandidate, CutBinding, HeaderView,
 };
 use super::envelope::{self, ContentEntryHeader, SignedContentEntry, VerifiedContentEntry};
-use crate::oplog::account::{
+use crate::account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityQuery, GrantDeviceBoundary,
     GrantRole,
 };
-use crate::oplog::device::DevicePublic;
-use crate::oplog::op::DeviceFingerprint;
-use crate::oplog::stream::StreamId;
-use crate::oplog::{cbor, content_projection, identity};
+use crate::device::DevicePublic;
+use crate::op::DeviceFingerprint;
+use crate::stream::StreamId;
+use crate::{cbor, content_projection, identity};
 
 type EntryHash = [u8; 32];
 
@@ -52,7 +52,7 @@ impl ContentStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContentCapacityScope {
+pub enum ContentCapacityScope {
     PreVerifyAuthor,
     PreVerifyGlobal,
     CandidateAuthor,
@@ -62,7 +62,7 @@ pub(crate) enum ContentCapacityScope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::oplog) enum ContentIngestOutcome {
+pub enum ContentIngestOutcome {
     Rejected(String),
     PreVerify,
     PreVerifyWithEviction { scopes: Vec<ContentCapacityScope> },
@@ -71,9 +71,9 @@ pub(in crate::oplog) enum ContentIngestOutcome {
 }
 
 #[derive(Debug, Default)]
-pub(in crate::oplog::account) struct ContentPromotionOutcome {
-    pub(in crate::oplog::account) scope: Option<ContentCapacityScope>,
-    pub(in crate::oplog::account) entry_hashes: Vec<EntryHash>,
+pub(in crate::account) struct ContentPromotionOutcome {
+    pub(in crate::account) scope: Option<ContentCapacityScope>,
+    pub(in crate::account) entry_hashes: Vec<EntryHash>,
 }
 
 /// Ingest one REMOTE, untrusted `/3` content envelope: resolve its roster key, verify the
@@ -89,7 +89,7 @@ pub(in crate::oplog::account) struct ContentPromotionOutcome {
 /// the STRUCTURAL verdict, not the acceptance verdict: a caller that needs foreign acceptance MUST
 /// settle first. Nothing reads foreign acceptance before transport lands (#691), so the deferral is
 /// invisible today; the local author path is unaffected (it never routes through here).
-pub(in crate::oplog) fn content_ingest(
+pub fn content_ingest(
     conn: &Connection,
     signed_bytes: &[u8],
     now_ms: i64,
@@ -315,7 +315,7 @@ fn evict_oldest_pre_verify(
     )
 }
 
-pub(in crate::oplog::account) fn promote_pre_verify_for_account(
+pub(in crate::account) fn promote_pre_verify_for_account(
     tx: &Transaction<'_>,
     account_id: super::super::AccountId,
     now_ms: i64,
@@ -598,7 +598,7 @@ struct ResolvedEntry {
 /// that content). The union covers every cross-account case — a `StreamRevoke` folds in the OWNER's
 /// log and reaches the grantee's content through the ownership branch; a roster change folds in the
 /// AUTHOR's log and reaches it through the author branch.
-pub(in crate::oplog::account) fn refold_streams_for_account(
+pub(in crate::account) fn refold_streams_for_account(
     tx: &Transaction<'_>,
     account_id: AccountId,
     previously_owned: &[[u8; 32]],
@@ -851,7 +851,7 @@ fn settle_one_pending_refold(conn: &Connection, stream_id: StreamId) -> anyhow::
 /// the local owner's big stream outside the caps, a single foreign candidate on it still makes one
 /// refold O(local history). Extending defer/batch to the account→content trigger is tracked
 /// separately (retro-condemn atomicity must survive there).
-pub(in crate::oplog) fn settle_pending_content_refolds(conn: &Connection) -> anyhow::Result<usize> {
+pub fn settle_pending_content_refolds(conn: &Connection) -> anyhow::Result<usize> {
     let mut settled = 0usize;
     let mut failures = 0usize;
     let mut first_error: Option<anyhow::Error> = None;
@@ -1331,7 +1331,7 @@ fn bind_grant_cut(
 }
 
 fn map_roster(
-    query: AuthorityQuery<crate::oplog::account::RosterContentAuthority>,
+    query: AuthorityQuery<crate::account::RosterContentAuthority>,
     header: &ContentEntryHeader,
 ) -> AuthorityQuery<CitedRosterAuthority> {
     match query {
@@ -1347,7 +1347,7 @@ fn map_roster(
 }
 
 fn map_grant(
-    query: AuthorityQuery<crate::oplog::account::GrantDeviceAuthority>,
+    query: AuthorityQuery<crate::account::GrantDeviceAuthority>,
     owner_account_id: AccountId,
     grant_id: EntryHash,
 ) -> AuthorityQuery<CitedGrantAuthority> {
@@ -1412,13 +1412,13 @@ mod tests {
     use super::super::super::id::account_id_from_genesis_payload;
     use super::super::ContentEntryHeader;
     use super::*;
-    use crate::oplog::account::ops::entry_type;
-    use crate::oplog::device::{DeviceSecret, DeviceX25519Secret};
-    use crate::oplog::stream::StreamId;
+    use crate::account::ops::entry_type;
+    use crate::device::{DeviceSecret, DeviceX25519Secret};
+    use crate::stream::StreamId;
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
     }
 
@@ -1484,7 +1484,7 @@ mod tests {
             device_fingerprint: member.public().fingerprint(),
             ed25519_pubkey: member.public().to_bytes(),
             x25519_pubkey: DeviceX25519Secret::from_seed(&[0x82; 32]).public().to_bytes(),
-            role: crate::oplog::account::DeviceRole::Member,
+            role: crate::account::DeviceRole::Member,
             label: None,
         };
         let payload = ops::encode(&op).unwrap();
@@ -3162,7 +3162,7 @@ mod tests {
         // signed by the local key), NOT the attacker-settable author_account_id, so seed the
         // ceiling-sized history under the local device's own fingerprint.
         let excluded = db();
-        let local_fp = crate::oplog::local_device(&excluded, 1).unwrap().fingerprint().to_bytes();
+        let local_fp = crate::local_device(&excluded, 1).unwrap().fingerprint().to_bytes();
         seed_content_candidates(
             &excluded,
             AccountId::from_bytes([0xd2; 32]),

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use super::AccountId;
 use super::cut::Cut;
 use super::envelope::AccountEntryHeader;
-use crate::oplog::op::DeviceFingerprint;
+use crate::op::DeviceFingerprint;
 
 /// A read view over candidate entries keyed by `entry_hash` — the seam the ancestry walk and cut
 /// binding use without depending on the fold's storage.

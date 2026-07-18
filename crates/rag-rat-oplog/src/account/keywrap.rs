@@ -40,8 +40,8 @@ use minicbor::decode::{Decoder, Error as CborError};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::oplog::cbor;
-use crate::oplog::device::{DeviceX25519Public, DeviceX25519Secret};
+use crate::cbor;
+use crate::device::{DeviceX25519Public, DeviceX25519Secret};
 
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
@@ -67,12 +67,12 @@ const WRAP_CONTEXT_AAD_LEN: usize = 32 + 32 + 8 + 32;
 /// under. Independent random material: `key_id` is a one-way function OF it, nothing derives it.
 /// Intentionally not `Debug` / `Clone` (secret material should not be trivially printed or copied);
 /// the 32 bytes are scrubbed on drop.
-pub(crate) struct ContentKey(Zeroizing<[u8; 32]>);
+pub struct ContentKey(Zeroizing<[u8; 32]>);
 
 impl ContentKey {
     /// Mint a FRESH content key from OS entropy — the production path (the same CSPRNG source
     /// [`DeviceX25519Secret::generate`] uses). Fails only if the OS CSPRNG is unavailable.
-    pub(crate) fn generate() -> anyhow::Result<Self> {
+    pub fn generate() -> anyhow::Result<Self> {
         let mut key = Zeroizing::new([0u8; 32]);
         getrandom::fill(key.as_mut_slice())
             .map_err(|e| anyhow::anyhow!("OS CSPRNG failed to generate a content key: {e}"))?;
@@ -81,12 +81,12 @@ impl ContentKey {
 
     /// Build a content key from fixed bytes — deterministic, for golden vectors (mirrors the
     /// device-key `from_seed` split). The bytes ARE the key; no derivation.
-    pub(crate) fn from_seed(seed: &[u8; 32]) -> Self {
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
         Self(Zeroizing::new(*seed))
     }
 
     /// The 32-byte key material.
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         self.0.as_slice()
     }
 
@@ -96,7 +96,7 @@ impl ContentKey {
     /// device that unwrapped the key can match an entry's `key_id` to it (and cross-check its
     /// peers' `key_id` at an epoch before adopting a key for sealing — the C4.3 authority
     /// cross-check).
-    pub(crate) fn key_id(&self) -> KeyId {
+    pub fn key_id(&self) -> KeyId {
         let hk = Hkdf::<Sha256>::new(Some(EMPTY_SALT), self.as_slice());
         let mut out = [0u8; 32];
         hk.expand(CONTENT_KEY_ID_INFO, &mut out)
@@ -108,17 +108,17 @@ impl ContentKey {
 /// The non-circular content-key identifier (32 bytes — the frozen `/3` header pins
 /// `key_id: Option<[u8; 32]>`). Public: derived one-way from the key, safe to carry in the clear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct KeyId([u8; 32]);
+pub struct KeyId([u8; 32]);
 
 impl KeyId {
     /// Wrap 32 header bytes as a [`KeyId`] (the decode-side counterpart to
     /// [`to_bytes`](Self::to_bytes)).
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
     /// The 32-byte id.
-    pub(crate) fn to_bytes(self) -> [u8; 32] {
+    pub fn to_bytes(self) -> [u8; 32] {
         self.0
     }
 }
@@ -128,17 +128,17 @@ impl KeyId {
 /// means a wrap opens ONLY under the exact context it was sealed for — it can't be replayed against
 /// another account, stream, epoch, or device.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WrapContext {
-    pub(crate) account_id: [u8; 32],
-    pub(crate) stream_id: [u8; 32],
-    pub(crate) key_epoch: u64,
-    pub(crate) recipient_pub: [u8; 32],
+pub struct WrapContext {
+    pub account_id: [u8; 32],
+    pub stream_id: [u8; 32],
+    pub key_epoch: u64,
+    pub recipient_pub: [u8; 32],
 }
 
 impl WrapContext {
     /// The ONE canonical fixed-width encoding: `account_id || stream_id || key_epoch(BE) ||
     /// recipient_pub` (104 bytes). Used verbatim as the AEAD AAD; golden-pinned.
-    pub(crate) fn to_bytes(&self) -> [u8; WRAP_CONTEXT_AAD_LEN] {
+    pub fn to_bytes(&self) -> [u8; WRAP_CONTEXT_AAD_LEN] {
         let mut out = [0u8; WRAP_CONTEXT_AAD_LEN];
         out[0..32].copy_from_slice(&self.account_id);
         out[32..64].copy_from_slice(&self.stream_id);
@@ -152,15 +152,15 @@ impl WrapContext {
 /// ciphertext (32-byte key + 16-byte Poly1305 tag). No stored nonce — it is HKDF-derived on both
 /// sides from `epk || recipient_pub`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SealedKeyWrap {
-    pub(crate) ephemeral_pubkey: [u8; 32],
-    pub(crate) ciphertext: [u8; 48],
+pub struct SealedKeyWrap {
+    pub ephemeral_pubkey: [u8; 32],
+    pub ciphertext: [u8; 48],
 }
 
 impl SealedKeyWrap {
     /// The canonical CBOR wire form: `[domain, epk, ciphertext]` (definite-length, domain-tagged
     /// `rag-rat/key-wrap/1`), so a `key_wrap` op payload can carry it.
-    pub(crate) fn to_cbor(&self) -> Vec<u8> {
+    pub fn to_cbor(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(96);
         let mut encoder = Encoder::new(&mut bytes);
         encoder.array(3).expect(INFALLIBLE);
@@ -172,7 +172,7 @@ impl SealedKeyWrap {
 
     /// Decode the canonical CBOR wire form, rejecting non-canonical encodings, the wrong domain,
     /// and wrong-width fields.
-    pub(crate) fn from_cbor(bytes: &[u8]) -> anyhow::Result<Self> {
+    pub fn from_cbor(bytes: &[u8]) -> anyhow::Result<Self> {
         Self::from_cbor_inner(bytes)
             .map_err(|error| anyhow::anyhow!("sealed key-wrap decode failed: {error}"))
     }
@@ -190,7 +190,7 @@ impl SealedKeyWrap {
 
 /// Seal `key` to `recipient`, binding `ctx`. Samples a fresh ephemeral X25519 key from OS entropy;
 /// see [`seal_with_ephemeral`] for the deterministic (seed-injected) variant the golden tests use.
-pub(crate) fn seal_content_key(
+pub fn seal_content_key(
     key: &ContentKey,
     ctx: &WrapContext,
     recipient: &DeviceX25519Public,
@@ -236,7 +236,7 @@ fn seal_with_ephemeral(
 }
 
 /// Open `sealed` with `secret`, requiring `ctx` to match the sealing context byte-for-byte.
-pub(crate) fn unwrap_content_key(
+pub fn unwrap_content_key(
     sealed: &SealedKeyWrap,
     secret: &DeviceX25519Secret,
     ctx: &WrapContext,

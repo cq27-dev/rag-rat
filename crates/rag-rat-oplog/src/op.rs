@@ -45,10 +45,10 @@ const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 /// A globally-unique memory/graph-node id (the `repo_memories.id` / `source_node_id` shape). Owned
 /// and `Ord` so it keys the projected `nodes` map.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct NodeId(String);
+pub struct NodeId(String);
 
 impl NodeId {
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -63,10 +63,10 @@ impl From<&str> for NodeId {
 /// via [`EdgeSpec::edge_key`] for an add, carried verbatim by a remove/rebind, and used only as a
 /// map key by the fold. `Ord` so it keys the projected `edges` map.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct EdgeKey(String);
+pub struct EdgeKey(String);
 
 impl EdgeKey {
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -87,15 +87,15 @@ impl From<String> for EdgeKey {
 /// opaque this increment (an ed25519 pubkey hash once the signed envelope lands); `Ord` compares
 /// the raw bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct DeviceFingerprint([u8; 32]);
+pub struct DeviceFingerprint([u8; 32]);
 
 impl DeviceFingerprint {
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
     /// The raw 32 bytes — the signed entry body encodes the fingerprint verbatim (`super::entry`).
-    pub(crate) fn to_bytes(self) -> [u8; 32] {
+    pub fn to_bytes(self) -> [u8; 32] {
         self.0
     }
 }
@@ -104,7 +104,7 @@ impl DeviceFingerprint {
 /// enum so the fold can carry it typed. The db tokens are pinned by test against
 /// `query::memory::validate_status`; do not add a token without that gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeStatus {
+pub enum NodeStatus {
     Active,
     Stale,
     Obsolete,
@@ -119,7 +119,7 @@ impl Default for NodeStatus {
 }
 
 impl NodeStatus {
-    pub(crate) fn as_db_str(self) -> &'static str {
+    pub fn as_db_str(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Stale => "stale",
@@ -130,7 +130,7 @@ impl NodeStatus {
 
     /// `None` for an unrecognized token — the caller treats that as a forward-compat status this
     /// binary can't project (→ [`DecodedOp::Unknown`]), not a decode error.
-    pub(crate) fn from_db_str(value: &str) -> Option<Self> {
+    pub fn from_db_str(value: &str) -> Option<Self> {
         Some(match value {
             "active" => Self::Active,
             "stale" => Self::Stale,
@@ -146,24 +146,24 @@ impl NodeStatus {
 /// timestamps) are NOT op payload. `kind`/`confidence`/`source` are carried verbatim as strings
 /// (their closed-set validation is the write path's job, not the wire's).
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct NodeContent {
-    pub(crate) kind: String,
-    pub(crate) title: String,
-    pub(crate) body: String,
-    pub(crate) confidence: String,
-    pub(crate) source: String,
+pub struct NodeContent {
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub confidence: String,
+    pub source: String,
     /// A SET: canonically sorted + deduped (via [`NodeContent::canonicalize`] / at encode time),
     /// so neither order nor duplicates perturb the wire bytes or the projected state.
-    pub(crate) tags: Vec<String>,
+    pub tags: Vec<String>,
     /// Opaque `schema_version`-tagged JSON payload for a polymorphic node; carried verbatim.
-    pub(crate) payload: Option<String>,
+    pub payload: Option<String>,
 }
 
 impl NodeContent {
     /// Put `tags` in canonical (sorted + deduplicated) SET order. The wire encoder applies the same
     /// rule, and the fold applies this before STORING content, so an in-memory op built with
     /// unsorted/duplicate tags projects identically to the same op round-tripped through the wire.
-    pub(crate) fn canonicalize(&mut self) {
+    pub fn canonicalize(&mut self) {
         self.tags.sort_unstable();
         self.tags.dedup();
     }
@@ -173,19 +173,19 @@ impl NodeContent {
 /// `(repo, kind, anchor)`, and the owner repo. `edge_key` is DERIVED from
 /// `(source, relation, target_kind, target_anchor)` (not the repo ids), matching the live table.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EdgeSpec {
-    pub(crate) source_node_id: NodeId,
-    pub(crate) relation: EdgeRelation,
-    pub(crate) target_repo_id: String,
-    pub(crate) target_kind: String,
-    pub(crate) target_anchor: String,
-    pub(crate) owner_repo_id: String,
+pub struct EdgeSpec {
+    pub source_node_id: NodeId,
+    pub relation: EdgeRelation,
+    pub target_repo_id: String,
+    pub target_kind: String,
+    pub target_anchor: String,
+    pub owner_repo_id: String,
 }
 
 impl EdgeSpec {
     /// Derive the stable `edge_key` through the SAME helper the live edge table uses, so an op-log
     /// add and a direct insert content-address identically.
-    pub(crate) fn edge_key(&self) -> EdgeKey {
+    pub fn edge_key(&self) -> EdgeKey {
         EdgeKey::from(memory::edge_key(
             self.source_node_id.as_str(),
             self.relation.as_db_str(),
@@ -200,16 +200,16 @@ impl EdgeSpec {
 /// `anchor_status`). `anchor_status` is carried verbatim (opaque resolution state, not a wire token
 /// this module owns).
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ResolvedAnchor {
-    pub(crate) target_repo_id: String,
-    pub(crate) target_node_id: Option<String>,
-    pub(crate) anchor_status: String,
+pub struct ResolvedAnchor {
+    pub target_repo_id: String,
+    pub target_node_id: Option<String>,
+    pub anchor_status: String,
 }
 
 /// The frozen op set (§5.4 / §6.3). Each op mutates exactly one LWW register of one node/edge (see
 /// the fold), except `NodeCreate`, which also establishes existence.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum MemoryOp {
+pub enum MemoryOp {
     /// Establish a node and set its content register.
     NodeCreate { node_id: NodeId, content: NodeContent },
     /// FULL content replacement for an existing node.
@@ -243,24 +243,24 @@ impl MemoryOp {
 
 /// One op plus its total-order metadata — the unit the fold consumes.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Entry {
-    pub(crate) meta: OpMeta,
-    pub(crate) op: MemoryOp,
+pub struct Entry {
+    pub meta: OpMeta,
+    pub op: MemoryOp,
 }
 
 /// The op-log's ordering key: a per-stream Lamport counter + the authoring device. Total order is
 /// `(lamport, device)` ascending, device bytes breaking a Lamport tie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OpMeta {
-    pub(crate) lamport: u64,
-    pub(crate) device: DeviceFingerprint,
+pub struct OpMeta {
+    pub lamport: u64,
+    pub device: DeviceFingerprint,
 }
 
 /// The outcome of decoding one op envelope. `Unknown` is the forward-compat seam: an op kind — or a
 /// relation/status token — this binary doesn't recognize is kept opaque (raw bytes RETAINED) rather
 /// than dropped or projected, so a later binary can re-fold the stream (§5.4).
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DecodedOp {
+pub enum DecodedOp {
     Known(MemoryOp),
     Unknown { tag: String, raw: Vec<u8> },
 }
@@ -272,7 +272,7 @@ type VecEncoder<'a> = Encoder<&'a mut Vec<u8>>;
 /// Encode one op to canonical CBOR: `[domain, op-kind, payload]`, definite lengths throughout,
 /// deterministic. The op's METADATA (`OpMeta`) is NOT encoded here — it belongs to the signed
 /// envelope (a later increment); these bytes freeze the op wire format the golden vectors pin.
-pub(crate) fn encode(op: &MemoryOp) -> Vec<u8> {
+pub fn encode(op: &MemoryOp) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     {
         let mut enc = Encoder::new(&mut buf);
@@ -363,7 +363,7 @@ fn encode_opt_str(enc: &mut VecEncoder<'_>, value: Option<&str>) {
 
 /// Decode one op envelope. A recognized op → `Known`; a future op kind / relation / status token →
 /// `Unknown` (raw bytes retained); structurally-invalid CBOR or a wrong/absent domain tag → `Err`.
-pub(crate) fn decode(bytes: &[u8]) -> anyhow::Result<DecodedOp> {
+pub fn decode(bytes: &[u8]) -> anyhow::Result<DecodedOp> {
     decode_envelope(bytes).map_err(|err| anyhow::anyhow!("op decode failed: {err}"))
 }
 

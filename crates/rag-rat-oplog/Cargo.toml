@@ -1,0 +1,32 @@
+[package]
+name = "rag-rat-oplog"
+version.workspace = true
+description = "Memory op-log for the rag-rat workspace: the op model and deterministic projection fold, the signed hash-chained entry envelope, the owner-bound account/authority substrate and content-candidate DAG, and the durable SQLite store."
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rag-rat-base.workspace = true
+rag-rat-db.workspace = true
+rag-rat-query.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+hkdf.workspace = true
+x25519-dalek.workspace = true
+getrandom.workspace = true
+minicbor.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -80,3 +80,8 @@ changelog_path = "./CHANGELOG.md"
 name = "rag-rat-clones"
 version_group = "rag-rat"
 changelog_path = "./CHANGELOG.md"
+
+[[package]]
+name = "rag-rat-oplog"
+version_group = "rag-rat"
+changelog_path = "./CHANGELOG.md"

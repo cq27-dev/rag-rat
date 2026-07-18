@@ -54,15 +54,15 @@ const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 /// A stream's immutable identity: `sha256` of the canonical policy tuple. The scoping key for
 /// chains, watermarks, fork detection, and the shadow projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct StreamId([u8; 32]);
+pub struct StreamId([u8; 32]);
 
 impl StreamId {
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
     /// By value — `StreamId` is `Copy` (clippy `wrong_self_convention` flags `to_*` on `&self`).
-    pub(crate) fn to_bytes(self) -> [u8; 32] {
+    pub fn to_bytes(self) -> [u8; 32] {
         self.0
     }
 }
@@ -70,7 +70,7 @@ impl StreamId {
 /// Whether a per-node override pulls a node INTO the view or drops it OUT — the per-node
 /// refinement on top of the per-kind allow-list defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum NodeOverrideAction {
+pub enum NodeOverrideAction {
     Include,
     Exclude,
 }
@@ -87,25 +87,25 @@ impl NodeOverrideAction {
 
 /// One per-node visibility override: `node_id` + the action applied to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NodeOverride {
-    pub(crate) node_id: String,
-    pub(crate) action: NodeOverrideAction,
+pub struct NodeOverride {
+    pub node_id: String,
+    pub action: NodeOverrideAction,
 }
 
 /// The visibility policy a stream identity is derived from. Collections may arrive in any order
 /// with duplicates — [`derive`] canonicalizes (byte-sort + dedup) before encoding, so caller order
 /// never perturbs the identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StreamSpec {
+pub struct StreamSpec {
     /// The repos this stream carries. Non-empty.
-    pub(crate) repo_set: Vec<String>,
+    pub repo_set: Vec<String>,
     /// `None` = the UNFILTERED view (every kind, present and future); `Some` = the enumerated
     /// per-kind allow-list (`Some(vec![])` is the valid nothing-visible degenerate).
-    pub(crate) kind_allow_list: Option<Vec<String>>,
+    pub kind_allow_list: Option<Vec<String>>,
     /// `None` = all relations; `Some` = the enumerated relation allow-list.
-    pub(crate) relation_policy: Option<Vec<String>>,
+    pub relation_policy: Option<Vec<String>>,
     /// Per-node overrides on top of the kind defaults. One action per `node_id`.
-    pub(crate) node_overrides: Vec<NodeOverride>,
+    pub node_overrides: Vec<NodeOverride>,
 }
 
 /// The full-visibility policy a repo's own authored log lives on: one repo, no kind or relation
@@ -123,14 +123,14 @@ fn owner_stream_spec(repo_id: &str) -> StreamSpec {
 
 /// The default full-visibility stream a repo's own authored log lives on: one repo, no kind or
 /// relation filtering, no overrides. The only stream shape mintable this increment.
-pub(crate) fn owner_stream(repo_id: &str) -> anyhow::Result<StreamId> {
+pub fn owner_stream(repo_id: &str) -> anyhow::Result<StreamId> {
     derive(&owner_stream_spec(repo_id))
 }
 
 /// Derive the immutable `stream_id` for a visibility policy. Canonicalizes the spec (sort + dedup)
 /// first; rejects a policy that has no coherent identity — an empty/blank `repo_set`, or two
 /// overrides that give one `node_id` conflicting actions.
-pub(crate) fn derive(spec: &StreamSpec) -> anyhow::Result<StreamId> {
+pub fn derive(spec: &StreamSpec) -> anyhow::Result<StreamId> {
     let bytes = canonical_spec_bytes(spec)?;
     let mut out = [0u8; 32];
     out.copy_from_slice(&Sha256::digest(&bytes));
@@ -198,12 +198,12 @@ fn encode_policy(enc: &mut Encoder<&mut Vec<u8>>, policy: &CanonicalPolicy) {
 /// The owner is committed INSIDE the hashed identity, so ownership is self-certifying and
 /// immutable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StreamSpecV2 {
+pub struct StreamSpecV2 {
     /// The account that owns this stream — all its authorization lives in this account's logs.
-    pub(crate) owner_account_id: AccountId,
+    pub owner_account_id: AccountId,
     /// The visibility policy (repos, kind/relation filters, per-node overrides), same shape as
     /// `/1`.
-    pub(crate) policy: StreamSpec,
+    pub policy: StreamSpec,
 }
 
 /// The owner-bound (`/2`) counterpart of [`owner_stream`]: the same full-visibility policy, wrapped
@@ -211,7 +211,7 @@ pub(crate) struct StreamSpecV2 {
 /// [`owner_stream_spec`] with the `/1` path keeps the two owner-stream identities byte-identical in
 /// their visibility rule. C3.4 authors a `StreamOwn` over the returned spec to publish ownership;
 /// nothing switches the live authoring path here.
-pub(crate) fn owner_stream_v2(repo_id: &str, account_id: AccountId) -> StreamSpecV2 {
+pub fn owner_stream_v2(repo_id: &str, account_id: AccountId) -> StreamSpecV2 {
     StreamSpecV2 { owner_account_id: account_id, policy: owner_stream_spec(repo_id) }
 }
 
@@ -219,7 +219,7 @@ pub(crate) fn owner_stream_v2(repo_id: &str, account_id: AccountId) -> StreamSpe
 /// owner_account_id (b32), repo_set, kind_allow_list|null, relation_policy|null, override_set]))`.
 /// C1 ships this ALONGSIDE [`owner_stream`] / [`derive`] (`/1`), which the live phase-B authoring
 /// path keeps using until C3 adoption — nothing switches the live path here.
-pub(crate) fn derive_v2(spec: &StreamSpecV2) -> anyhow::Result<StreamId> {
+pub fn derive_v2(spec: &StreamSpecV2) -> anyhow::Result<StreamId> {
     let bytes = canonical_spec_v2_bytes(spec)?;
     let mut out = [0u8; 32];
     out.copy_from_slice(&Sha256::digest(&bytes));
@@ -229,7 +229,7 @@ pub(crate) fn derive_v2(spec: &StreamSpecV2) -> anyhow::Result<StreamId> {
 /// The canonical CBOR tuple the `/2` identity hashes — `[domain, owner_account_id (b32), repo_set,
 /// kind_allow_list | null, relation_policy | null, override_pairs]`. The owner sits between the
 /// domain and the shared policy tail.
-pub(crate) fn canonical_spec_v2_bytes(spec: &StreamSpecV2) -> anyhow::Result<Vec<u8>> {
+pub fn canonical_spec_v2_bytes(spec: &StreamSpecV2) -> anyhow::Result<Vec<u8>> {
     let policy = canonical_policy(&spec.policy)?;
     let mut buf = Vec::with_capacity(128);
     {
@@ -246,7 +246,7 @@ pub(crate) fn canonical_spec_v2_bytes(spec: &StreamSpecV2) -> anyhow::Result<Vec
 /// these bytes as a self-certifying preimage, so accepting merely a matching SHA-256 digest is not
 /// enough: the tuple must have the frozen shape, contain a valid policy, and already be in its
 /// unique canonical encoding.
-pub(crate) fn decode_spec_v2(bytes: &[u8]) -> anyhow::Result<StreamSpecV2> {
+pub fn decode_spec_v2(bytes: &[u8]) -> anyhow::Result<StreamSpecV2> {
     cbor::require_canonical_cbor(bytes)?;
     let mut dec = Decoder::new(bytes);
     anyhow::ensure!(dec.array()? == Some(6), "stream/2 spec must be a 6-element array");
@@ -353,7 +353,7 @@ fn encode_optional_str_array(enc: &mut Encoder<&mut Vec<u8>>, values: Option<&[S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oplog::cbor;
+    use crate::cbor;
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()

@@ -10,7 +10,7 @@
 //! repo's owner-bound `/2` stream, under the store's single local account (minted once, store-
 //! global). Each reconcile/mutation ensures the repo's `/2` stream is owned (publishing a
 //! `StreamOwn` account op) and authors its ops as owner-authored `/3` content
-//! ([`crate::oplog::author_content_batch_in_tx`]), which verify-accepts and reprojects into
+//! ([`rag_rat_oplog::author_content_batch_in_tx`]), which verify-accepts and reprojects into
 //! `content_projected_nodes` / `content_projected_edges`. The completeness predicate is an
 //! anti-join against that accepted-`/3` projection; the pre-existing `/1` history is retained but
 //! no longer written by the live path (existing `/1` rows are adopted into `/3` by the reconcile).
@@ -65,9 +65,8 @@ impl Drop for AuthoredDurability<'_> {
         let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL;");
     }
 }
+use rag_rat_oplog::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, StreamId};
 use rag_rat_query::memory::{EdgeRelation, NodeEdge, RepoMemory, memory_repo_scope};
-
-use crate::oplog::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, StreamId};
 
 /// One memory's projectable content — the columns the op model carries (NOT the identity / anchor /
 /// dedup bookkeeping). Read in bulk so the backfill makes one pass over `repo_memories`.
@@ -229,7 +228,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // the slow path to mint + publish ownership rather than early-returning on an empty set it
     // could not yet author into. `established_owned_stream_v2` is autocommit-only (it opens its
     // own read txn), so it runs here, not under the write lock.
-    if let Some(stream) = crate::oplog::established_owned_stream_v2(conn, repo_id)?
+    if let Some(stream) = rag_rat_oplog::established_owned_stream_v2(conn, repo_id)?
         && read_unauthored_memory_rows(conn, repo_id, stream)?.is_empty()
         && super::edges::unauthored_edges(conn, repo_id, stream)?.is_empty()
     {
@@ -241,7 +240,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // drop — beginning our guard first would let the mint's drop downgrade our authored commit
     // below NORMAL, silently losing the #560 durability. The mint is store-global and
     // idempotent (a re-mint returns the same account).
-    crate::oplog::local_account(conn, now_ms)?;
+    rag_rat_oplog::local_account(conn, now_ms)?;
     // Authored, irreplaceable data → durable (#560). FULL for this txn only, restored on drop; set
     // OUTSIDE the txn (SQLite applies a `synchronous` change to SUBSEQUENT transactions only).
     let _durability = AuthoredDurability::begin(conn)?;
@@ -249,7 +248,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // Publish ownership of the repo's `/2` stream and resolve its id. Idempotent +
     // check-fact-first: a re-ensure (or a racer serialized on this IMMEDIATE lock) authors no
     // second `StreamOwn`.
-    let stream = crate::oplog::ensure_owned_stream_v2_in_tx(&tx, repo_id, now_ms)?;
+    let stream = rag_rat_oplog::ensure_owned_stream_v2_in_tx(&tx, repo_id, now_ms)?;
     // Authoritative re-read UNDER the write lock (TOCTOU): a concurrent author may have healed or
     // added rows between the probe and the lock, so re-read the missing set and re-derive `genesis`
     // here. `genesis` decides the status-elision: an empty `/3` content chain ⇒ no stale registers
@@ -257,7 +256,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // under the single-local-writer owner stream (see the module header); phase D (foreign
     // devices can populate the stream) must revisit whether local-chain-empty still implies
     // register-clean.
-    let genesis = crate::oplog::content_stream_is_empty(&tx, stream)?;
+    let genesis = rag_rat_oplog::content_stream_is_empty(&tx, stream)?;
     let missing_nodes = read_unauthored_memory_rows(&tx, repo_id, stream)?;
     let missing_edges = super::edges::unauthored_edges(&tx, repo_id, stream)?;
     let ops = build_reconcile_ops(&missing_nodes, &missing_edges, repo_id, genesis)?;
@@ -270,13 +269,15 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
         // the failure with the repo it belongs to instead of wedging the store silently. A
         // normal rag-rat memory (body ≤ 8 KiB) can never hit this; it is an
         // adversarial/raw-writer backstop.
-        crate::oplog::author_content_batch_in_tx(&tx, stream, &ops, now_ms).with_context(|| {
-            format!(
-                "reconciling the /3 owner log for repo `{repo_id}` failed while authoring {} \
-                 pre-existing memory op(s)",
-                ops.len()
-            )
-        })?;
+        rag_rat_oplog::author_content_batch_in_tx(&tx, stream, &ops, now_ms).with_context(
+            || {
+                format!(
+                    "reconciling the /3 owner log for repo `{repo_id}` failed while authoring {} \
+                     pre-existing memory op(s)",
+                    ops.len()
+                )
+            },
+        )?;
     }
     tx.commit()?;
     Ok(())
@@ -323,12 +324,12 @@ fn stable_owner_stream(conn: &Connection) -> anyhow::Result<Option<StreamId>> {
     {
         return Ok(None);
     }
-    crate::oplog::owned_stream_v2_id(conn, &repo_id)
+    rag_rat_oplog::owned_stream_v2_id(conn, &repo_id)
 }
 
 /// Author `ops` as owner-authored `/3` content on the active repo's owner-bound `/2` stream WITHIN
 /// the caller's mutation txn — the strict-atomic live seam.
-/// [`crate::oplog::author_content_batch_in_tx`] mints, inserts, refolds, and verify-accepts the
+/// [`rag_rat_oplog::author_content_batch_in_tx`] mints, inserts, refolds, and verify-accepts the
 /// batch (no open/commit), so an authoring error propagates via `?` and the caller's txn rolls the
 /// table write back with it. A NO-OP under an unstable scope or before the local account is minted.
 /// The caller MUST have run `backfill_memory_oplog` first, so the store's account plus `StreamOwn`
@@ -348,7 +349,7 @@ fn author_in_owner_stream(
     if ops.is_empty() {
         return Ok(());
     }
-    crate::oplog::author_content_batch_in_tx(tx, stream, ops, now_ms)?;
+    rag_rat_oplog::author_content_batch_in_tx(tx, stream, ops, now_ms)?;
     Ok(())
 }
 
@@ -597,11 +598,11 @@ mod tests {
     /// (via a prior live create); it authors through the real `/3` seam so the register truly
     /// lands.
     fn author_inert_status_op(conn: &Connection, node_id: &str, status: NodeStatus) {
-        let stream = crate::oplog::owned_stream_v2_id(conn, REPO)
+        let stream = rag_rat_oplog::owned_stream_v2_id(conn, REPO)
             .unwrap()
             .expect("account minted by a prior live create");
         let tx = conn.unchecked_transaction().unwrap();
-        crate::oplog::author_content_batch_in_tx(
+        rag_rat_oplog::author_content_batch_in_tx(
             &tx,
             stream,
             &[MemoryOp::NodeStatus { node_id: NodeId::from(node_id), status }],

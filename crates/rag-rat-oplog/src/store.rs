@@ -46,7 +46,7 @@ const PROJECTOR_VERSION_KEY: &str = "projector_version";
 /// A cryptographic failure, a stream mismatch, an undecodable op, or a lamport overflow is an
 /// `Err`, not an outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AppendOutcome {
+pub enum AppendOutcome {
     /// Verified, chain-continuous, newly inserted; the projection was re-folded in the same txn.
     Appended { entry_hash: [u8; 32] },
     /// `entry_hash` already stored — an idempotent redelivery; nothing changed.
@@ -65,9 +65,9 @@ pub(crate) enum AppendOutcome {
 
 /// The head of one `(stream, device)` chain — its highest-`lamport` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChainTail {
-    pub(crate) lamport: u64,
-    pub(crate) entry_hash: [u8; 32],
+pub struct ChainTail {
+    pub lamport: u64,
+    pub entry_hash: [u8; 32],
 }
 
 /// Verify and durably append one signed entry under `pubkey` onto `expected_stream`, keeping the
@@ -75,7 +75,7 @@ pub(crate) struct ChainTail {
 /// ordering). See [`AppendOutcome`] for the accept/reject cases; a tampered/wrong-keyed entry, an
 /// entry whose signed body names a DIFFERENT stream, an undecodable op, a lamport that overflows
 /// `i64`, or a store whose projection a NEWER rag-rat already owns is an `Err`.
-pub(crate) fn append(
+pub fn append(
     conn: &Connection,
     expected_stream: StreamId,
     signed_bytes: &[u8],
@@ -179,7 +179,7 @@ fn reproject_after_write(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Resu
 /// (which accepts a foreign, pre-signed entry and may Fork), this MINTS a valid continuation from
 /// the tail it just read, so under the single local writer it is always continuous. Returns the new
 /// `entry_hash`.
-pub(crate) fn author_in_tx(
+pub fn author_in_tx(
     tx: &Transaction<'_>,
     stream: StreamId,
     device: &LocalDevice,
@@ -195,7 +195,7 @@ pub(crate) fn author_in_tx(
 
 /// Author one entry in its OWN `IMMEDIATE` txn — the standalone wrapper over [`author_in_tx`] for a
 /// caller that is NOT already inside a transaction (the op-append is the whole unit of work).
-pub(crate) fn author_op(
+pub fn author_op(
     conn: &Connection,
     stream: StreamId,
     device: &LocalDevice,
@@ -215,7 +215,7 @@ pub(crate) fn author_op(
 /// the projection — an idempotent sweep, not a no-op. That preserves the pre-refactor empty-genesis
 /// behavior, where the 0-iteration loop still ran `reproject_after_write` +
 /// `stamp_projector_version`.
-pub(crate) fn author_batch_in_tx(
+pub fn author_batch_in_tx(
     tx: &Transaction<'_>,
     stream: StreamId,
     device: &LocalDevice,
@@ -238,7 +238,7 @@ pub(crate) fn author_batch_in_tx(
 /// (`false` = a chain already existed). The backfill opens its OWN `IMMEDIATE` txn, reads the
 /// memory snapshot UNDER that write lock, and calls this so the snapshot read + gate + write are
 /// one atomic unit (no memory created between the read and the batch is lost from the history).
-pub(crate) fn author_genesis_in_tx(
+pub fn author_genesis_in_tx(
     tx: &Transaction<'_>,
     stream: StreamId,
     device: &LocalDevice,
@@ -255,7 +255,7 @@ pub(crate) fn author_genesis_in_tx(
 
 /// [`author_genesis_in_tx`] in its OWN `IMMEDIATE` txn — the standalone wrapper for a caller that
 /// does not need to read a snapshot under the same write lock. Empty `ops` is a no-op.
-pub(crate) fn author_batch(
+pub fn author_batch(
     conn: &Connection,
     stream: StreamId,
     device: &LocalDevice,
@@ -393,7 +393,7 @@ fn insert_entry(
 }
 
 /// The `(stream, device)` chain's highest-`lamport` entry, or `None` for an empty chain.
-pub(crate) fn chain_tail(
+pub fn chain_tail(
     conn: &Connection,
     stream: StreamId,
     device: DeviceFingerprint,
@@ -507,7 +507,7 @@ fn record_fork_evidence(
 /// for a batch-append caller; a re-fold must sweep EVERY stream, not just the one a write touched,
 /// or a quiet stream would serve a stale materialization after an upgrade. Refuses (like
 /// [`append`]) if a NEWER projector already owns the projection.
-pub(crate) fn rebuild_projection(conn: &Connection) -> anyhow::Result<()> {
+pub fn rebuild_projection(conn: &Connection) -> anyhow::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     assert_projector_not_newer(&tx)?;
     reproject_all_streams(&tx)?;
@@ -544,7 +544,7 @@ fn streams_present(conn: &Connection) -> anyhow::Result<Vec<StreamId>> {
 /// whether it re-folded. A projection stamped by the current or a NEWER projector is left intact —
 /// never downgraded. (The mechanism; wiring this into the index open path lands when the store
 /// meets the live read path.)
-pub(crate) fn reproject_if_projector_stale(conn: &Connection) -> anyhow::Result<bool> {
+pub fn reproject_if_projector_stale(conn: &Connection) -> anyhow::Result<bool> {
     match stored_projector_version(conn)? {
         Some(version) if version >= PROJECTOR_VERSION => Ok(false),
         _ => {
@@ -652,10 +652,7 @@ fn load_known_entries(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<
 /// Reconstruct ONE stream's converged projection from the shadow tables — the read the eventual
 /// live path consumes, and the round-trip for idempotency tests (compare parsed `ProjectedState`,
 /// never JSON text, so serde_json key order is irrelevant).
-pub(crate) fn load_projection(
-    conn: &Connection,
-    stream: StreamId,
-) -> anyhow::Result<ProjectedState> {
+pub fn load_projection(conn: &Connection, stream: StreamId) -> anyhow::Result<ProjectedState> {
     let stream_bytes = stream.to_bytes();
     let mut state = ProjectedState::default();
     {
@@ -735,7 +732,7 @@ fn hash_from_vec(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
 
 // The shadow-table serialization DTOs. serde lives HERE, never on the frozen op-wire types (whose
 // wire is minicbor via `op::encode`); these tables are local, derived, and rebuilt wholesale.
-// `pub(super)` (= `pub(in crate::oplog)`): the `/3` accepted-content projection
+// `pub(super)` (= `pub`): the `/3` accepted-content projection
 // ([`super::content_projection`]) writes `content_projected_nodes`/`_edges` with the SAME JSON
 // shape, so it reuses these DTOs rather than duplicating the row schema.
 
@@ -860,7 +857,7 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
     }
 
@@ -957,7 +954,7 @@ mod tests {
     #[test]
     fn author_op_mints_a_genesis_chain_and_projects() {
         let conn = db();
-        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        let device = crate::local_device(&conn, 0).unwrap();
         // The FIRST authored op is genesis (lamport 0), each next advances by one — the allocator
         // reads the tail, unlike `append` which is fed a caller-chosen lamport.
         let h0 = author_op(&conn, stream_a(), &device, &create("mem_a", "first"), 1_000).unwrap();
@@ -976,7 +973,7 @@ mod tests {
     #[test]
     fn author_in_tx_commits_atomically_with_a_caller_write() {
         let conn = db();
-        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        let device = crate::local_device(&conn, 0).unwrap();
         // A live mutation: a table write and the op-append share ONE caller-owned txn.
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         tx.execute("CREATE TABLE probe(x INTEGER)", []).unwrap();
@@ -991,7 +988,7 @@ mod tests {
     #[test]
     fn author_in_tx_rolls_back_with_the_caller_transaction() {
         let conn = db();
-        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        let device = crate::local_device(&conn, 0).unwrap();
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         author_in_tx(&tx, stream_a(), &device, &create("mem_a", "first"), 1_000).unwrap();
         drop(tx); // roll back the caller's txn
@@ -1001,7 +998,7 @@ mod tests {
     #[test]
     fn author_batch_writes_one_atomic_chain_and_an_empty_batch_is_a_noop() {
         let conn = db();
-        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        let device = crate::local_device(&conn, 0).unwrap();
         let authored = author_batch(&conn, stream_a(), &device, &[], 1_000).unwrap();
         assert!(!authored, "an empty batch authors nothing");
         assert_eq!(entry_count(&conn), 0);
@@ -1020,7 +1017,7 @@ mod tests {
     #[test]
     fn author_batch_no_ops_on_a_nonempty_chain() {
         let conn = db();
-        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        let device = crate::local_device(&conn, 0).unwrap();
         author_op(&conn, stream_a(), &device, &create("mem_a", "genesis"), 1_000).unwrap();
         // author_batch is a GENESIS gate: on an already-non-empty chain it no-ops (returns false)
         // rather than appending — that atomic gate is the backfill's idempotency guarantee.
@@ -1033,7 +1030,7 @@ mod tests {
     #[test]
     fn author_batch_in_tx_chains_a_continuation_and_refolds_once() {
         let conn = db();
-        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        let device = crate::local_device(&conn, 0).unwrap();
         let stream = stream_a();
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         // NON-empty chain seeded, then a continuation batch on the SAME chain (must not gate).
@@ -1262,7 +1259,7 @@ mod tests {
         let expected;
         {
             let conn = Connection::open(&path).unwrap();
-            schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+            schema::apply(&conn, &crate::test_hooks()).unwrap();
             append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1).unwrap();
             append(&conn, stream_a(), &g_other.signed_bytes, &t.public(), 2).unwrap();
             append(&conn, stream_a(), &status.signed_bytes, &s.public(), 3).unwrap();

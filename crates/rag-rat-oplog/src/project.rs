@@ -27,25 +27,25 @@ use super::op::{
 /// The converged projection: existing nodes (content + status) and present edges (spec + resolved
 /// anchor), each keyed for a stable, sorted, byte-reproducible ordering.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct ProjectedState {
-    pub(crate) nodes: BTreeMap<NodeId, ProjectedNode>,
-    pub(crate) edges: BTreeMap<EdgeKey, ProjectedEdge>,
+pub struct ProjectedState {
+    pub nodes: BTreeMap<NodeId, ProjectedNode>,
+    pub edges: BTreeMap<EdgeKey, ProjectedEdge>,
 }
 
 /// A projected node: its winning content and status. Presence in `ProjectedState::nodes` IS its
 /// existence.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ProjectedNode {
-    pub(crate) content: NodeContent,
-    pub(crate) status: NodeStatus,
+pub struct ProjectedNode {
+    pub content: NodeContent,
+    pub status: NodeStatus,
 }
 
 /// A projected edge: its winning spec (from the last add) and its last resolved anchor, if any.
 /// Presence in `ProjectedState::edges` IS its presence.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ProjectedEdge {
-    pub(crate) spec: EdgeSpec,
-    pub(crate) resolved: Option<ResolvedAnchor>,
+pub struct ProjectedEdge {
+    pub spec: EdgeSpec,
+    pub resolved: Option<ResolvedAnchor>,
 }
 
 /// Per-node LWW accumulators, resolved into a [`ProjectedNode`] only if the node exists.
@@ -74,7 +74,7 @@ fn canonical_content(content: &NodeContent) -> NodeContent {
 }
 
 /// Fold entries into the converged [`ProjectedState`]. Pure, deterministic, idempotent.
-pub(crate) fn project(entries: &[Entry]) -> ProjectedState {
+pub fn project(entries: &[Entry]) -> ProjectedState {
     // One total order for every dimension: `(lamport, device)` ascending, then the canonical op
     // bytes as a final tie-break so a shuffled input — even one carrying a (malformed) duplicate
     // `(lamport, device)` — folds to byte-identical output. Walking this order ascending and

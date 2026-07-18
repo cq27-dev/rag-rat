@@ -1,7 +1,7 @@
 //! The accepted-`/3` → memory projection fold (sync phase C3.4b-i, #663).
 //!
 //! The `/3` acceptance layer classifies signed envelopes; it never decodes op payloads, so it has
-//! no analog of the `/1` shadow projection ([`crate::oplog::store::reproject`]) — no anti-join, no
+//! no analog of the `/1` shadow projection ([`crate::store::reproject`]) — no anti-join, no
 //! ghost detection. This module is that missing fold: for one `/2` stream it loads the ACCEPTED
 //! `/3` entries (`content_entries WHERE accepted = 1`), [`op::decode`]s each body, folds them
 //! through the shared memory projector ([`project::project`]), and materializes the result into
@@ -11,7 +11,7 @@
 //! `account::content`.
 //!
 //! SEPARATE TABLES (decision 7). The `/3` projection is NOT written to the `/1` shadow tables. The
-//! `/1` projector sweep ([`crate::oplog::store::reproject`]'s `reproject_all_streams`) `DELETE`s
+//! `/1` projector sweep ([`crate::store::reproject`]'s `reproject_all_streams`) `DELETE`s
 //! the `oplog_projected_*` tables wholesale and rebuilds only streams present in `oplog_entries`,
 //! so a projector-version bump would wipe a shared `/3` projection and never rebuild it — mass
 //! duplicate re-authoring into the immutable `/3` log. These tables are owned by the memory layer
@@ -19,7 +19,7 @@
 //! the ingest / account→content retro-triggers), never by the `/1` sweep.
 //!
 //! The projected `content_json` / `spec_json` / `resolved_json` reuse the `/1` shadow-row DTOs
-//! ([`crate::oplog::store::NodeContentRow`] et al.), so the two projections serialize identically.
+//! ([`crate::store::NodeContentRow`] et al.), so the two projections serialize identically.
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -46,7 +46,7 @@ const CONTENT_PROJECTOR_VERSION_KEY: &str = "content_projector_version";
 /// set and rewrite its rows in both `/3` projection tables — another stream's rows are never
 /// touched. Runs inside the caller's txn; called right after `refold_content_stream` (acceptance
 /// changed), so the projection always reflects the just-committed accepted DAG.
-pub(in crate::oplog) fn reproject_accepted_content_stream(
+pub fn reproject_accepted_content_stream(
     tx: &Transaction<'_>,
     stream_id: StreamId,
 ) -> anyhow::Result<()> {
@@ -72,7 +72,7 @@ pub(in crate::oplog) fn reproject_accepted_content_stream(
 
 /// Error if a NEWER `/3` projector already folded this store's content projection — an older binary
 /// must not reproject (it would drop ops the newer binary knows) or stamp the version down. Mirrors
-/// the `/1` guard in [`crate::oplog::store`], at the `/3` projection layer (a projector bump need
+/// the `/1` guard in [`crate::store`], at the `/3` projection layer (a projector bump need
 /// not carry a schema bump, so the schema guard does not cover it). Store-global, not per stream:
 /// one binary folds every stream it holds.
 fn assert_content_projector_not_newer(conn: &Connection) -> anyhow::Result<()> {
@@ -108,7 +108,7 @@ fn stored_content_projector_version(conn: &Connection) -> anyhow::Result<Option<
 }
 
 /// Rewrite one stream's rows in `content_projected_nodes` / `content_projected_edges` — clear the
-/// stream's prior rows, then insert the folded state (mirrors [`crate::oplog::store::reproject`]).
+/// stream's prior rows, then insert the folded state (mirrors [`crate::store::reproject`]).
 fn write_projection(
     tx: &Transaction<'_>,
     stream_id: StreamId,
@@ -156,7 +156,7 @@ fn write_projection(
 /// Load one stream's ACCEPTED `/3` entries as projector [`Entry`]s: decode the content envelope for
 /// its `lamport` + `device_fingerprint` (the `(lamport, device)` LWW order), then [`op::decode`]
 /// the body. An `Unknown` op is retained in the log but skipped here (mirrors
-/// [`crate::oplog::store`]'s `load_known_entries`), so a forward-version op never breaks the fold.
+/// [`crate::store`]'s `load_known_entries`), so a forward-version op never breaks the fold.
 fn load_accepted_entries(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::Result<Vec<Entry>> {
     let mut stmt = tx.prepare(
         "SELECT signed_bytes FROM content_entries

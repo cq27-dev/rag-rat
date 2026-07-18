@@ -31,9 +31,9 @@ use minicbor::decode::{Decoder, Error as CborError};
 
 use super::AccountId;
 use super::limits::{ACCOUNT_ENTRY_DOMAIN, ACCOUNT_ENVELOPE_MAX_BYTES, ACCOUNT_SIGNED_DOMAIN};
-use crate::oplog::cbor;
-use crate::oplog::device::{DevicePublic, DeviceSecret};
-use crate::oplog::op::DeviceFingerprint;
+use crate::cbor;
+use crate::device::{DevicePublic, DeviceSecret};
+use crate::op::DeviceFingerprint;
 
 /// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::super`.
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";

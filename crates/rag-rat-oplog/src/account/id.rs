@@ -9,7 +9,7 @@
 use minicbor::Encoder;
 
 use super::limits::ACCOUNT_ID_DOMAIN;
-use crate::oplog::cbor;
+use crate::cbor;
 
 /// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::super`.
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
@@ -17,15 +17,15 @@ const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 /// An account's immutable, content-derived identity: `sha256` of the domain-tagged genesis
 /// commitment. The store-global key for a principal's roster, grants, and folds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct AccountId([u8; 32]);
+pub struct AccountId([u8; 32]);
 
 impl AccountId {
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
     /// By value — `AccountId` is `Copy` (clippy `wrong_self_convention` flags `to_*` on `&self`).
-    pub(crate) fn to_bytes(self) -> [u8; 32] {
+    pub fn to_bytes(self) -> [u8; 32] {
         self.0
     }
 }
@@ -52,7 +52,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::oplog::cbor;
+    use crate::cbor;
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()

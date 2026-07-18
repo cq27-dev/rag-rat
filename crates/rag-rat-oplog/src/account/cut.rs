@@ -14,7 +14,7 @@ use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 
-use crate::oplog::cbor;
+use crate::cbor;
 
 /// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::super`.
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";

@@ -3,6 +3,7 @@
 //! `rag_rat_query::memory`.
 
 use rag_rat_base::time::now_ms;
+use rag_rat_oplog::StreamId;
 use rag_rat_query::memory::{
     EDGE_SELECT, EdgeRelation, EdgeTarget, NodeEdge, edge_by_key, edge_key, edge_row,
     memory_repo_scope, periphery_edge_scope_clause, repo_is_registered, reresolve_on_read,
@@ -11,7 +12,6 @@ use rag_rat_query::memory::{
 use rusqlite::{Connection, params};
 
 use super::authoring;
-use crate::oplog::StreamId;
 
 pub(crate) fn add_edge(
     conn: &Connection,
@@ -170,11 +170,11 @@ pub(crate) fn unauthored_edges(
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_oplog::StreamId;
     use rag_rat_query::memory::edge_key;
     use rusqlite::{Connection, params};
 
     use super::unauthored_edges;
-    use crate::oplog::StreamId;
 
     const REPO: &str = "repo-a";
 

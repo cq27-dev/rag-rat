@@ -23,7 +23,7 @@ use super::op::DeviceFingerprint;
 /// The store's local device identity: the ed25519 signing key (secret + verifying key + opaque
 /// fingerprint) AND the X25519 encryption key (sync phase C, §5). Owns both secrets, so it is
 /// neither `Clone` nor `Debug`-printable.
-pub(crate) struct LocalDevice {
+pub struct LocalDevice {
     secret: DeviceSecret,
     public: DevicePublic,
     fingerprint: DeviceFingerprint,
@@ -51,10 +51,10 @@ impl LocalDevice {
         self.public
     }
 
-    /// The opaque device fingerprint the op model + signed entry body carry. `pub(crate)` — the
+    /// The opaque device fingerprint the op model + signed entry body carry. `pub` — the
     /// authoring seam in `query::memory` passes it to `chain_tail`; `DeviceFingerprint` is likewise
     /// crate-visible.
-    pub(crate) fn fingerprint(&self) -> DeviceFingerprint {
+    pub fn fingerprint(&self) -> DeviceFingerprint {
         self.fingerprint
     }
 
@@ -80,9 +80,7 @@ impl LocalDevice {
 /// persisted `fingerprint` column, which is a forge-proof key: a content row can carry this
 /// fingerprint only if it was signed with the local device key (`verify_content_signed` binds the
 /// signature to `header.device_fingerprint`), unlike the attacker-settable `author_account_id`.
-pub(crate) fn local_device_fingerprint(
-    conn: &Connection,
-) -> anyhow::Result<Option<DeviceFingerprint>> {
+pub fn local_device_fingerprint(conn: &Connection) -> anyhow::Result<Option<DeviceFingerprint>> {
     let stored: Option<Vec<u8>> = conn
         .query_row("SELECT fingerprint FROM oplog_device_identity WHERE id = 0", [], |row| {
             row.get(0)
@@ -113,7 +111,7 @@ struct StoredIdentity {
 /// the SAME identity (a stable fingerprint AND a stable encryption key). `now_ms` stamps a
 /// freshly-minted row (injected, matching the op-log store convention); it is ignored once an
 /// identity already exists.
-pub(crate) fn local_device(conn: &Connection, now_ms: i64) -> anyhow::Result<LocalDevice> {
+pub fn local_device(conn: &Connection, now_ms: i64) -> anyhow::Result<LocalDevice> {
     let stored = match read_identity(conn)? {
         Some(stored) => stored,
         None => {
@@ -290,7 +288,7 @@ mod tests {
     /// A fully-migrated in-memory DB carrying the identity table with its V058 X25519 columns.
     fn conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory db");
-        schema::apply(&conn, &crate::index::migration_hooks()).expect("apply schema");
+        schema::apply(&conn, &crate::test_hooks()).expect("apply schema");
         conn
     }
 

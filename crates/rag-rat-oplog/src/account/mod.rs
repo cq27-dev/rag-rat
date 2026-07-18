@@ -36,27 +36,27 @@ mod storage;
 // `owned_stream_v2_id` (pure derivation — the live seam's stream resolver) and
 // `established_owned_stream_v2` (derivation + effective-ownership fact — the reconcile's fast-path
 // probe). #664 wires all three into `query::memory`, so they are plain re-exports.
-pub(crate) use authoring::{
+pub use authoring::{
     ensure_owned_stream_v2_in_tx, established_owned_stream_v2, owned_stream_v2_id,
 };
-pub(crate) use bootstrap::local_account;
+pub use bootstrap::local_account;
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
-pub(in crate::oplog) use content::{
+pub use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, SignedContentEntry,
     VerifiedContentEntry, content_ingest, decode_content_signed, settle_pending_content_refolds,
     sign_content_entry, verify_content_signed,
 };
 // The in-tx `/3` content-author seam + its genesis-detection reader (C3.4b-i, #663): #664
 // retargets the live memory path onto them, so they are plain re-exports.
-pub(crate) use content::{author_content_batch_in_tx, content_stream_is_empty};
-pub(crate) use fold::{
+pub use content::{author_content_batch_in_tx, content_stream_is_empty};
+pub use fold::{
     AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, GrantAuthority,
     GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,
     RosterContentAuthority,
 };
-pub(crate) use id::AccountId;
-pub(crate) use ops::{DeviceCut, DeviceRole, GrantRole};
-pub(crate) use storage::{
+pub use id::AccountId;
+pub use ops::{DeviceCut, DeviceRole, GrantRole};
+pub use storage::{
     CapacityScope, IngestOutcome, account_ingest, auth_len_freshness,
     backfill_authority_projection, grant_effective_for_device, owner_control_authority,
     owner_secrets_authority, roster_content_authority, stream_owner_effective,

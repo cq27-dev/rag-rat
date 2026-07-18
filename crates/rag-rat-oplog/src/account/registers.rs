@@ -18,8 +18,8 @@
 use super::AccountId;
 use super::cut::Cut;
 use super::envelope::AccountEntryHeader;
-use crate::oplog::op::DeviceFingerprint;
-use crate::oplog::stream::StreamId;
+use crate::op::DeviceFingerprint;
+use crate::stream::StreamId;
 
 /// Which chain a register bounds (§11). The variant selects the family; the fields are the family's
 /// key.

@@ -305,7 +305,7 @@ fn decode_prev_hash(d: &mut Decoder<'_>) -> Result<Option<[u8; 32]>, CborError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oplog::op::{NodeContent, NodeId};
+    use crate::op::{NodeContent, NodeId};
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()

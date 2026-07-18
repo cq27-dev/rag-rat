@@ -6,6 +6,7 @@ members = [
   "crates/rag-rat-dream",
   "crates/rag-rat-llm",
   "crates/rag-rat-oracle",
+  "crates/rag-rat-oplog",
   "crates/rag-rat-papertrail",
   "crates/rag-rat-query",
   "crates/rag-rat-cli",
@@ -42,6 +43,7 @@ rag-rat-db = { version = "0.19.0", path = "crates/rag-rat-db", default-features 
 rag-rat-dream = { version = "0.19.0", path = "crates/rag-rat-dream", default-features = false }
 rag-rat-llm = { version = "0.19.0", path = "crates/rag-rat-llm", default-features = false }
 rag-rat-oracle = { version = "0.19.0", path = "crates/rag-rat-oracle", default-features = false }
+rag-rat-oplog = { version = "0.19.0", path = "crates/rag-rat-oplog", default-features = false }
 rag-rat-papertrail = { version = "0.19.0", path = "crates/rag-rat-papertrail", default-features = false }
 rag-rat-query = { version = "0.19.0", path = "crates/rag-rat-query", default-features = false }
 rag-rat-core = { version = "0.19.0", path = "crates/rag-rat-core", default-features = false }

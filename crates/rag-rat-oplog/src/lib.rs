@@ -32,6 +32,25 @@
 //! seam, roster/epochs, and transport) — this mirrors the `content_hash` freeze: pin the semantic
 //! primitive first, in isolation-testable form.
 
+// The authoring half is wired into the memory write path (#532), but the SYNC-TRANSPORT half —
+// `append` (receiving a foreign signed entry), the fork quarantine, `AppendOutcome`, and the C4/C5
+// authority primitives that precede their consumers (#607) — is still unconsumed frozen
+// scaffolding, so the crate keeps `allow(dead_code)` (carried over from the module's own
+// suppression before the #706-phase-8 extraction).
+#![allow(dead_code)]
+
+/// Migration hooks for oplog's own tests. The only migration hook oplog's schema uses is its OWN
+/// `backfill_authority_projection` (the V064 forward-migration backfill over populated account
+/// histories); the other domains' hooks are irrelevant here, so they stay noop. Wiring the crate's
+/// own function means the tests need no dev-dependency on rag-rat-core's `migration_hooks()`.
+#[cfg(test)]
+pub(crate) fn test_hooks() -> rag_rat_db::MigrationHooks {
+    rag_rat_db::MigrationHooks {
+        backfill_authority_projection: account::backfill_authority_projection,
+        ..rag_rat_db::MigrationHooks::noop()
+    }
+}
+
 mod account;
 mod cbor;
 mod content_projection;
@@ -57,35 +76,28 @@ mod stream;
 // - `author_content_batch_in_tx` (C3.4b-i, #663): author a batch of ops as owner-authored `/3`
 //   content, verify-accepted in the caller's txn.
 // - `content_stream_is_empty` (C3.4b-i, #663): the `/3` genesis-detection reader.
-#[expect(unused_imports, reason = "C2 authority seam is frozen before its caller lands")]
-pub(crate) use account::{
+pub use account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
     CapacityScope, DeviceCut, DeviceRole, GrantAuthority, GrantDeviceAuthority,
     GrantDeviceBoundary, GrantRole, IngestOutcome, OwnerAuthority, OwnerChainAuthority,
-    RosterContentAuthority, account_ingest, auth_len_freshness, backfill_authority_projection,
-    grant_effective_for_device, owner_control_authority, owner_secrets_authority,
-    roster_content_authority, stream_owner_effective,
-};
-pub(crate) use account::{
-    author_content_batch_in_tx, content_stream_is_empty, ensure_owned_stream_v2_in_tx,
-    established_owned_stream_v2, local_account, owned_stream_v2_id,
+    RosterContentAuthority, account_ingest, auth_len_freshness, author_content_batch_in_tx,
+    backfill_authority_projection, content_stream_is_empty, ensure_owned_stream_v2_in_tx,
+    established_owned_stream_v2, grant_effective_for_device, local_account, owned_stream_v2_id,
+    owner_control_authority, owner_secrets_authority, roster_content_authority,
+    stream_owner_effective,
 };
 // The op-log's first crate-internal API surface (#524): the MINTING primitives + the op
 // vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
 // — and the only direction of the dependency (`oplog` never depends back on `query::memory`).
-pub(crate) use identity::local_device;
-pub(crate) use op::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
+pub use identity::local_device;
+pub use op::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
 // The `/1` shadow-projection read seams (`ProjectedState` / `load_projection`) and the
 // standalone (own-txn) `/1` authoring wrappers (`author_batch` / `author_op`) — test-only
 // scaffolding for the retained `/1` store. The live memory path now authors owner-bound `/3`
 // content (#664), so these `/1` seams have no non-test caller; the re-exports stay `allow`'d
 // rather than removed because the `/1` store itself is retained (its history is not migrated,
 // per J1).
-#[allow(unused_imports)]
-pub(crate) use project::ProjectedState;
-#[allow(unused_imports)]
-pub(crate) use store::load_projection;
-#[allow(unused_imports)]
-pub(crate) use store::{author_batch, author_op};
-pub(crate) use stream::StreamId;
+pub use project::ProjectedState;
+pub use store::{author_batch, author_op, load_projection};
+pub use stream::StreamId;

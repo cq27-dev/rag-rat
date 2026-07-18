@@ -22,9 +22,9 @@ use super::envelope::{AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp, ChainKind, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::registers::RegisterKey;
-use crate::oplog::cbor;
-use crate::oplog::op::DeviceFingerprint;
-use crate::oplog::stream::{self, StreamId};
+use crate::cbor;
+use crate::op::DeviceFingerprint;
+use crate::stream::{self, StreamId};
 
 /// The account CONTROL log the fold operates on (§11) — its registers are control-log scoped
 /// (`log: 0`). A known op on the secrets (1) or content (2) log is not a control op and is retained
@@ -199,7 +199,7 @@ pub(super) struct AccountAuthHistory {
 /// query answers from what we have folded and says nothing about the author's own control length.
 /// Freshness is a separate axis ([`AuthorityFreshness`]) the caller applies in its own phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthorityQuery<T> {
+pub enum AuthorityQuery<T> {
     Effective(T),
     /// The citation names an entry our fold does not hold. Recoverable: refetch and re-evaluate.
     Unknown,
@@ -211,7 +211,7 @@ pub(crate) enum AuthorityQuery<T> {
 /// refetch, never a rejection — the missing ops are recoverable and may still re-bless a citation
 /// our fold currently reads as ineffective (§11.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthorityFreshness {
+pub enum AuthorityFreshness {
     /// The author cites a control log no longer than the one we hold.
     CurrentOrBehind,
     /// The author cites effective ops we have not folded yet.
@@ -219,7 +219,7 @@ pub(crate) enum AuthorityFreshness {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthorityInvalidReason {
+pub enum AuthorityInvalidReason {
     /// The cited entry's own header names a different subject than the citation claims. Decided by
     /// bytes we already hold, so a deeper control log can never overturn it.
     WrongSubject,
@@ -230,57 +230,57 @@ pub(crate) enum AuthorityInvalidReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RosterAuthority {
-    pub(crate) device_fingerprint: DeviceFingerprint,
+pub struct RosterAuthority {
+    pub device_fingerprint: DeviceFingerprint,
     /// Current roster metadata, not authority for an owner-required operation. Owner authority is
     /// established only by citing a fresh `owner_id` and applying both revocation registers.
-    pub(crate) current_role: DeviceRole,
+    pub current_role: DeviceRole,
 }
 
 /// The valid prefix of a cited device chain. `Closed` is the empty cut: no entry on that chain is
 /// admissible. Callers must still verify ancestry for `Cut`; the hash prevents an equal/older
 /// off-branch entry from laundering through a sequence-only check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthorityBoundary {
+pub enum AuthorityBoundary {
     Open,
     Cut { seq: u64, hash: [u8; 32] },
     Closed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RosterContentAuthority {
-    pub(crate) device_fingerprint: DeviceFingerprint,
-    pub(crate) boundary: AuthorityBoundary,
+pub struct RosterContentAuthority {
+    pub device_fingerprint: DeviceFingerprint,
+    pub boundary: AuthorityBoundary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OwnerAuthority {
-    pub(crate) device_fingerprint: DeviceFingerprint,
+pub struct OwnerAuthority {
+    pub device_fingerprint: DeviceFingerprint,
 }
 
 /// Owner-required entries are admitted by the conjunction of these two independent registers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OwnerChainAuthority {
-    pub(crate) owner: OwnerAuthority,
-    pub(crate) device_boundary: AuthorityBoundary,
-    pub(crate) incarnation_boundary: AuthorityBoundary,
+pub struct OwnerChainAuthority {
+    pub owner: OwnerAuthority,
+    pub device_boundary: AuthorityBoundary,
+    pub incarnation_boundary: AuthorityBoundary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GrantAuthority {
-    pub(crate) stream_id: StreamId,
-    pub(crate) grantee_account_id: AccountId,
-    pub(crate) role: GrantRole,
+pub struct GrantAuthority {
+    pub stream_id: StreamId,
+    pub grantee_account_id: AccountId,
+    pub role: GrantRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GrantDeviceAuthority {
-    pub(crate) grant: GrantAuthority,
-    pub(crate) boundary: GrantDeviceBoundary,
+pub struct GrantDeviceAuthority {
+    pub grant: GrantAuthority,
+    pub boundary: GrantDeviceBoundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GrantDeviceBoundary {
+pub enum GrantDeviceBoundary {
     Open,
     Cut(DeviceCut),
     /// The grant is revoked and this device was not named in its prefix-preserving cuts. A fresh
@@ -2052,10 +2052,10 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oplog::account::envelope::{sign_account_entry, verify_account_signed};
-    use crate::oplog::account::{AccountId, ops as account_ops};
-    use crate::oplog::device::{DeviceSecret, DeviceX25519Secret};
-    use crate::oplog::stream::{StreamId, StreamSpec, StreamSpecV2};
+    use crate::account::envelope::{sign_account_entry, verify_account_signed};
+    use crate::account::{AccountId, ops as account_ops};
+    use crate::device::{DeviceSecret, DeviceX25519Secret};
+    use crate::stream::{StreamId, StreamSpec, StreamSpecV2};
 
     /// A seed-deterministic test device: its ed25519 signer + fingerprint + the pubkeys a
     /// Genesis/DeviceAdd op carries.
