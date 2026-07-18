@@ -1045,18 +1045,18 @@ fn resolve_stream_authority(
         };
         // A content cut's watermark is a CONTENT candidate the account fold could not validate (it
         // only holds the account log), so bind it against the content DAG HERE, exactly as
-        // `pinned_branch` does — otherwise `combine_boundaries` would condemn `beyond_cut` off a
-        // watermark that names a foreign coordinate or is not held (§11.3 laundering). A cut naming
-        // a different coordinate is malformed → ignored (Open); an unheld watermark parks the whole
-        // coordinate (`unknown_cut_target`, I11) rather than condemning.
+        // `pinned_branch` does. A cut naming a DIFFERENT coordinate/seq is malformed → ignored
+        // (Open, the §11.3 laundering guard); a held-and-correct OR not-yet-held watermark keeps
+        // the cut intact so `combine_boundaries` still condemns `beyond_cut` from seq alone (I11)
+        // and `candidate::ancestry` parks only the genuinely under-cut prefix (a withheld watermark
+        // never flips a verdict).
         let coordinate = ChainCoordinate {
             stream_id: header.stream_id,
             author_account_id: header.author_account_id,
             device_fingerprint: header.device_fingerprint,
         };
-        let mut cut_target_unknown = false;
-        let roster = bind_roster_cut(roster, &coordinate, &view, &mut cut_target_unknown);
-        let grant = bind_grant_cut(grant, &coordinate, &view, &mut cut_target_unknown);
+        let roster = bind_roster_cut(roster, &coordinate, &view);
+        let grant = bind_grant_cut(grant, &coordinate, &view);
         let owner_freshness = CitedFreshness {
             account_id: owner_account_id,
             asserted_auth_len: header.owner_auth_len,
@@ -1075,8 +1075,6 @@ fn resolve_stream_authority(
         // a tracked follow-up.
         let subject_hold = if owner_contested || caches.contested(tx, header.author_account_id)? {
             SubjectAuthorityHold::Contested
-        } else if cut_target_unknown {
-            SubjectAuthorityHold::UnknownCutTarget
         } else {
             SubjectAuthorityHold::Clear
         };
@@ -1276,28 +1274,26 @@ fn branch_pins(resolved: &[ResolvedEntry]) -> Vec<BranchPin> {
     pins
 }
 
-/// Bind a roster content cut's watermark to this coordinate against the content DAG (§11.3). An
-/// `Ok` binding keeps the cut; a watermark naming a foreign coordinate is malformed and drops to
-/// `Open`; an unheld watermark drops to `Open` and flags `unknown_cut_target` so the caller parks
-/// the coordinate instead of condemning off an unverifiable cut.
+/// Bind a roster content cut's watermark to this coordinate against the content DAG (§11.3). A
+/// held-and-correct OR a not-yet-held watermark keeps the cut INTACT: its `[seq]` condemns
+/// beyond-cut entries from seq alone (I11) even before the watermark syncs, and the under-cut
+/// prefix parks — via `candidate::ancestry` yielding `Unknown(UnknownCutTarget)` — until it does.
+/// A withheld watermark must never flip a verdict nor launder a beyond-cut forgery into a park.
+/// ONLY a watermark naming a DIFFERENT coordinate/seq is malformed and drops to `Open` (the §11.3
+/// laundering guard: a misbound cut may neither condemn nor pin). This mirrors the account fold's
+/// cut-target binding.
 fn bind_roster_cut(
     roster: AuthorityQuery<CitedRosterAuthority>,
     coordinate: &ChainCoordinate,
     view: &dyn HeaderView,
-    cut_target_unknown: &mut bool,
 ) -> AuthorityQuery<CitedRosterAuthority> {
     let AuthorityQuery::Effective(mut fact) = roster else {
         return roster;
     };
-    if let AuthorityBoundary::Cut { seq, hash } = fact.authority.boundary {
-        match candidate::validate_cut_target(seq, &hash, coordinate, view) {
-            CutBinding::Ok => {},
-            CutBinding::TargetNotHeld => {
-                *cut_target_unknown = true;
-                fact.authority.boundary = AuthorityBoundary::Open;
-            },
-            CutBinding::Mismatch => fact.authority.boundary = AuthorityBoundary::Open,
-        }
+    if let AuthorityBoundary::Cut { seq, hash } = fact.authority.boundary
+        && candidate::validate_cut_target(seq, &hash, coordinate, view) == CutBinding::Mismatch
+    {
+        fact.authority.boundary = AuthorityBoundary::Open;
     }
     AuthorityQuery::Effective(fact)
 }
@@ -1308,7 +1304,6 @@ fn bind_grant_cut(
     grant: Option<AuthorityQuery<CitedGrantAuthority>>,
     coordinate: &ChainCoordinate,
     view: &dyn HeaderView,
-    cut_target_unknown: &mut bool,
 ) -> Option<AuthorityQuery<CitedGrantAuthority>> {
     let Some(AuthorityQuery::Effective(mut fact)) = grant else {
         return grant;
@@ -1317,15 +1312,10 @@ fn bind_grant_cut(
         GrantDeviceBoundary::Cut(cut) => Some((cut.seq, cut.hash)),
         _ => None,
     };
-    if let Some((seq, hash)) = cut {
-        match candidate::validate_cut_target(seq, &hash, coordinate, view) {
-            CutBinding::Ok => {},
-            CutBinding::TargetNotHeld => {
-                *cut_target_unknown = true;
-                fact.authority.boundary = GrantDeviceBoundary::Open;
-            },
-            CutBinding::Mismatch => fact.authority.boundary = GrantDeviceBoundary::Open,
-        }
+    if let Some((seq, hash)) = cut
+        && candidate::validate_cut_target(seq, &hash, coordinate, view) == CutBinding::Mismatch
+    {
+        fact.authority.boundary = GrantDeviceBoundary::Open;
     }
     Some(AuthorityQuery::Effective(fact))
 }
@@ -2414,15 +2404,16 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_whose_watermark_is_not_held_parks_rather_than_condemning() {
+    fn a_beyond_cut_entry_is_condemned_even_when_the_watermark_is_withheld() {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[0x62; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
         seed_roster_fact(&conn, genesis, owner, &secret, "owner");
-        // A malformed/late cut names a watermark we do not hold. It must NOT condemn an honest
-        // beyond-`seq` entry (§11.3 / I11 — an unheld watermark parks, never flips a verdict); a
-        // later `CutExtend` or the watermark's arrival re-evaluates it.
+        // A cut bounds this coordinate at seq 3, but its watermark has not synced. I11: the `[seq]`
+        // condemns a beyond-cut entry from seq alone even while the watermark is withheld — a
+        // withheld watermark must NOT launder a back-dated forgery into a park (the divergence this
+        // guards against; parity with the account fold's P10 beyond-cut verdict).
         seed_roster_content_cut(&conn, genesis, owner, 3, [0xcc; 32]);
 
         let entry = authored(&secret, owner, genesis, ContentSpec {
@@ -2430,6 +2421,23 @@ mod tests {
             previous: Some([0xaa; 32]),
             ..ContentSpec::default()
         });
+        assert_eq!(verdict_after_ingest(&conn, &entry), ("condemned{beyond_cut}".into(), 0));
+    }
+
+    #[test]
+    fn an_under_cut_entry_parks_while_the_watermark_is_withheld() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x64; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        // The same withheld cut at seq 3, but the entry is UNDER the cut (seq 0). Its on/off-branch
+        // placement can't be decided until the watermark syncs, so it PARKS as `unknown_cut_target`
+        // — never silently accepted, never condemned (I11: a withheld watermark never flips a
+        // verdict). This is the correct under-cut park the beyond-cut fix must preserve.
+        seed_roster_content_cut(&conn, genesis, owner, 3, [0xcc; 32]);
+
+        let entry = authored(&secret, owner, genesis, ContentSpec::default());
         assert_eq!(verdict_after_ingest(&conn, &entry), ("parked{unknown_cut_target}".into(), 0));
     }
 
@@ -3243,5 +3251,285 @@ mod tests {
             after_first,
             "a redundant settle leaves the verdict unchanged",
         );
+    }
+
+    /// Differential cut-binding parity harness (I11). The account control fold and the `/3` content
+    /// fold share the "deliberately identical" cut substrate (see `candidate.rs`) — a withheld
+    /// watermark condemns beyond-cut from seq alone and parks only the under-cut prefix, and a
+    /// misbound watermark neither condemns nor pins. The content fold once diverged (a withheld
+    /// watermark parked a beyond-cut entry the account fold condemns). This runs the SAME cut
+    /// scenarios — watermark held / withheld / misbound, against an entry beyond and under the cut
+    /// — through BOTH real folds and asserts the target entry reaches an IDENTICAL verdict, so
+    /// any future re-divergence of the whole class (not just this instance) fails here.
+    mod cut_binding_parity {
+        use std::collections::HashMap;
+
+        use super::*;
+        use crate::account::cut::Cut;
+        use crate::account::envelope::{
+            AccountEntryHeader, VerifiedAccountEntry, sign_account_entry, verify_account_signed,
+        };
+        use crate::account::fold::{
+            AccountAuthHistory, CondemnedReason, Outcome, ParkReason, fold_account,
+        };
+        use crate::account::id::account_id_from_genesis_payload;
+        use crate::account::ops::{self as account_ops, AccountOp, entry_type};
+        use crate::account::{AccountId, DeviceRole};
+        use crate::device::{DeviceSecret, DeviceX25519Secret};
+        use crate::op::DeviceFingerprint;
+
+        /// The normalized verdict both folds must agree on — the effect the cut has on ONE target
+        /// entry, projected out of each fold's own taxonomy.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum CutParity {
+            CondemnedBeyondCut,
+            ParkedUnknownCutTarget,
+            /// The cut did not bite this entry: `accepted` (content) / `effective` (account).
+            Survives,
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum Watermark {
+            Held,
+            Withheld,
+            Misbound,
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum Target {
+            BeyondCut,
+            UnderCut,
+        }
+
+        /// A seed-deterministic account-fold test device.
+        struct Dev {
+            secret: DeviceSecret,
+            fp: DeviceFingerprint,
+            ed: [u8; 32],
+            x: [u8; 32],
+        }
+
+        impl Dev {
+            fn new(seed: u8) -> Self {
+                let secret = DeviceSecret::from_seed(&[seed; 32]);
+                let public = secret.public();
+                let x = DeviceX25519Secret::from_seed(&[seed.wrapping_add(0x80); 32])
+                    .public()
+                    .to_bytes();
+                Dev { fp: public.fingerprint(), ed: public.to_bytes(), x, secret }
+            }
+        }
+
+        /// A minimal account-log authoring fixture: it threads each device's `(seq, prev)` chain
+        /// and signs real entries so `fold_account` runs over verified input.
+        struct AccountLog {
+            account_id: AccountId,
+            genesis_hash: [u8; 32],
+            chains: HashMap<[u8; 32], (u64, Option<[u8; 32]>)>,
+            entries: Vec<VerifiedAccountEntry>,
+        }
+
+        impl AccountLog {
+            fn genesis(founder: &Dev) -> Self {
+                let op = AccountOp::AccountGenesis {
+                    ed25519_pubkey: founder.ed,
+                    x25519_pubkey: founder.x,
+                    nonce16: [0u8; 16],
+                    created_at_ms: 1_700_000_000_000,
+                    label: None,
+                };
+                let payload = account_ops::encode(&op).unwrap();
+                let account_id = account_id_from_genesis_payload(&payload);
+                let header = AccountEntryHeader {
+                    account_id,
+                    log_id: 0,
+                    device_fingerprint: founder.fp,
+                    seq: 0,
+                    prev_hash: None,
+                    parent_ref: None,
+                    entry_type: entry_type::ACCOUNT_GENESIS,
+                    op_version: 1,
+                    crypto_suite: 0,
+                    auth_len: 0,
+                    key_id: None,
+                    authority_ref: None,
+                };
+                let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
+                let verified =
+                    verify_account_signed(&signed.signed_bytes, &founder.secret.public()).unwrap();
+                let genesis_hash = verified.entry_hash;
+                let mut chains = HashMap::new();
+                chains.insert(founder.fp.to_bytes(), (1, Some(genesis_hash)));
+                AccountLog { account_id, genesis_hash, chains, entries: vec![verified] }
+            }
+
+            fn author(
+                &mut self,
+                author: &Dev,
+                authority_ref: Option<[u8; 32]>,
+                op: &AccountOp,
+            ) -> [u8; 32] {
+                let payload = account_ops::encode(op).unwrap();
+                let (seq, prev) =
+                    self.chains.get(&author.fp.to_bytes()).copied().unwrap_or((0, None));
+                let header = AccountEntryHeader {
+                    account_id: self.account_id,
+                    log_id: 0,
+                    device_fingerprint: author.fp,
+                    seq,
+                    prev_hash: prev,
+                    parent_ref: Some(self.genesis_hash),
+                    entry_type: account_ops::entry_type_of(op),
+                    op_version: 1,
+                    auth_len: 1,
+                    crypto_suite: 0,
+                    key_id: None,
+                    authority_ref,
+                };
+                let signed = sign_account_entry(&author.secret, &header, &payload).unwrap();
+                let verified =
+                    verify_account_signed(&signed.signed_bytes, &author.secret.public()).unwrap();
+                let hash = verified.entry_hash;
+                self.chains.insert(author.fp.to_bytes(), (seq + 1, Some(hash)));
+                self.entries.push(verified);
+                hash
+            }
+        }
+
+        fn member_add(dev: &Dev) -> AccountOp {
+            AccountOp::DeviceAdd {
+                device_fingerprint: dev.fp,
+                ed25519_pubkey: dev.ed,
+                x25519_pubkey: dev.x,
+                role: DeviceRole::Member,
+                label: None,
+            }
+        }
+
+        /// Drive the account control fold: founder F (owner) enrolls owner B; B authors a dense
+        /// control chain b0→b1→b2; F removes B with a cut bounding B's chain at seq 1 (watermark
+        /// b1). B's own chain is the cut coordinate — the account analog of the content stream
+        /// chain.
+        fn account_verdict(target: Target, watermark: Watermark) -> CutParity {
+            let founder = Dev::new(0xF1);
+            let b = Dev::new(0xB1);
+            let mut log = AccountLog::genesis(&founder);
+            let add_b = log.author(&founder, Some(log.genesis_hash), &AccountOp::DeviceAdd {
+                device_fingerprint: b.fp,
+                ed25519_pubkey: b.ed,
+                x25519_pubkey: b.x,
+                role: DeviceRole::Owner,
+                label: None,
+            });
+            let b0 = log.author(&b, Some(add_b), &member_add(&Dev::new(0xD1)));
+            let b1 = log.author(&b, Some(add_b), &member_add(&Dev::new(0xE1)));
+            let b2 = log.author(&b, Some(add_b), &member_add(&Dev::new(0x71)));
+            let control_cut = match watermark {
+                // A misbound watermark names the WRONG seq on B's chain (b0 is seq 0, the cut
+                // claims seq 1): the §11.3 guard rejects the whole remove, so B
+                // (and b0/b2) survives.
+                Watermark::Misbound => Cut::At { seq: 1, hash: b0 },
+                Watermark::Held | Watermark::Withheld => Cut::At { seq: 1, hash: b1 },
+            };
+            log.author(&founder, Some(log.genesis_hash), &AccountOp::DeviceRemove {
+                device_fingerprint: b.fp,
+                control_cut,
+                secrets_cut: Cut::Empty,
+                content_cuts: Vec::new(),
+                reason: "revoked".to_string(),
+            });
+            // A withheld watermark models b1 not yet synced — fold every entry EXCEPT b1.
+            let history: AccountAuthHistory = match watermark {
+                Watermark::Withheld => {
+                    let held: Vec<VerifiedAccountEntry> =
+                        log.entries.iter().filter(|e| e.entry_hash != b1).cloned().collect();
+                    fold_account(&held)
+                },
+                _ => fold_account(&log.entries),
+            };
+            let target_hash = match target {
+                Target::BeyondCut => b2,
+                Target::UnderCut => b0,
+            };
+            match history.outcome(&target_hash) {
+                Some(Outcome::Condemned(CondemnedReason::BeyondCut)) =>
+                    CutParity::CondemnedBeyondCut,
+                Some(Outcome::Parked(ParkReason::UnknownCutTarget)) =>
+                    CutParity::ParkedUnknownCutTarget,
+                Some(Outcome::Effective { .. }) => CutParity::Survives,
+                other =>
+                    panic!("account fold: unexpected {target:?}/{watermark:?} outcome {other:?}"),
+            }
+        }
+
+        /// Drive the `/3` content fold over the analogous scenario: a dense stream chain s0→s1→s2
+        /// on one coordinate, a roster content cut bounding it at seq 1 (watermark s1).
+        fn content_verdict(target: Target, watermark: Watermark) -> CutParity {
+            let conn = db();
+            let secret = DeviceSecret::from_seed(&[0xC0; 32]);
+            let (owner, genesis) = roster(&conn, &secret);
+            seed_ownership(&conn, owner);
+            seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+            let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+            let s1 = authored(&secret, owner, genesis, ContentSpec {
+                seq: 1,
+                previous: Some(s0.entry_hash),
+                ..ContentSpec::default()
+            });
+            let s2 = authored(&secret, owner, genesis, ContentSpec {
+                seq: 2,
+                previous: Some(s1.entry_hash),
+                ..ContentSpec::default()
+            });
+            let cut_watermark = match watermark {
+                // Misbound: names s0 (seq 0) as the seq-1 watermark — a same-coordinate seq
+                // mismatch.
+                Watermark::Misbound => s0.entry_hash,
+                Watermark::Held | Watermark::Withheld => s1.entry_hash,
+            };
+            seed_roster_content_cut(&conn, genesis, owner, 1, cut_watermark);
+            content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
+            // A withheld watermark models s1 not yet ingested — the content analog of dropping b1.
+            if !matches!(watermark, Watermark::Withheld) {
+                content_ingest(&conn, &s1.signed_bytes, 2).unwrap();
+            }
+            content_ingest(&conn, &s2.signed_bytes, 3).unwrap();
+            settle_pending_content_refolds(&conn).unwrap();
+            let target_hash = match target {
+                Target::BeyondCut => s2.entry_hash,
+                Target::UnderCut => s0.entry_hash,
+            };
+            match verdict(&conn, &target_hash).0.as_str() {
+                "condemned{beyond_cut}" => CutParity::CondemnedBeyondCut,
+                "parked{unknown_cut_target}" => CutParity::ParkedUnknownCutTarget,
+                "accepted" => CutParity::Survives,
+                other => panic!("content fold: unexpected {target:?}/{watermark:?} status {other}"),
+            }
+        }
+
+        #[test]
+        fn account_and_content_folds_agree_on_every_cut_binding() {
+            for (target, watermark, expected) in [
+                (Target::BeyondCut, Watermark::Held, CutParity::CondemnedBeyondCut),
+                // The exact divergence this fix closes: a withheld watermark must still condemn.
+                (Target::BeyondCut, Watermark::Withheld, CutParity::CondemnedBeyondCut),
+                (Target::BeyondCut, Watermark::Misbound, CutParity::Survives),
+                (Target::UnderCut, Watermark::Held, CutParity::Survives),
+                (Target::UnderCut, Watermark::Withheld, CutParity::ParkedUnknownCutTarget),
+                (Target::UnderCut, Watermark::Misbound, CutParity::Survives),
+            ] {
+                let account = account_verdict(target, watermark);
+                let content = content_verdict(target, watermark);
+                assert_eq!(
+                    account, content,
+                    "folds diverged for {target:?}/{watermark:?}: account={account:?} \
+                     content={content:?}",
+                );
+                assert_eq!(
+                    account, expected,
+                    "the account fold verdict for {target:?}/{watermark:?} is not the intended one",
+                );
+            }
+        }
     }
 }

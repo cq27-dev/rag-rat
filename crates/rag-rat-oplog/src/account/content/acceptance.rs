@@ -48,10 +48,13 @@ pub struct CitedFreshness {
     pub state: AuthorityFreshness,
 }
 
+/// A whole-coordinate authority hold that fails content closed regardless of the revocation
+/// registers. A withheld cut watermark is NOT one of these: it is bound at the register (the cut
+/// stays intact), so beyond-cut still condemns from seq alone and only the genuinely under-cut
+/// prefix parks via `combine_boundaries`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubjectAuthorityHold {
     Clear,
-    UnknownCutTarget,
     Contested,
 }
 
@@ -312,8 +315,6 @@ where
         return Ok(boundary_decision);
     }
     match input.subject_hold {
-        SubjectAuthorityHold::UnknownCutTarget =>
-            return parked(ContentParkReason::UnknownCutTarget),
         SubjectAuthorityHold::Contested => return parked(ContentParkReason::ContestedSubject),
         SubjectAuthorityHold::Clear => {},
     }
@@ -1093,44 +1094,35 @@ mod tests {
     }
 
     #[test]
-    fn subject_holds_are_fail_closed_and_re_evaluable() {
+    fn a_contested_subject_hold_is_fail_closed_and_re_evaluable() {
         let entry = header(owner(), None, 0);
-        for (hold, expected) in [
-            (
-                SubjectAuthorityHold::UnknownCutTarget,
-                ContentAcceptance::Parked(ContentParkReason::UnknownCutTarget),
-            ),
-            (
-                SubjectAuthorityHold::Contested,
-                ContentAcceptance::Parked(ContentParkReason::ContestedSubject),
-            ),
-        ] {
-            assert_eq!(
-                evaluate_content_acceptance(&ContentAcceptanceInput {
-                    header: &entry,
-                    entry_hash: ENTRY_HASH,
-                    owner_account_id: owner(),
-                    dense_predecessor_reachable: true,
-                    branch_selected: true,
-                    ownership: ownership(&entry),
-                    roster: roster(&entry, AuthorityBoundary::Open),
-                    grant: None,
-                    owner_freshness: freshness(
-                        owner(),
-                        entry.owner_auth_len,
-                        AuthorityFreshness::CurrentOrBehind
-                    ),
-                    author_freshness: freshness(
-                        owner(),
-                        entry.author_auth_len,
-                        AuthorityFreshness::CurrentOrBehind
-                    ),
-                    subject_hold: hold,
-                    ancestry: |_, _| AncestryRelation::OnBranch,
-                }),
-                Ok(expected)
-            );
-        }
+        // A contested subject fails content closed even with an Open boundary and clear ancestry —
+        // the hold is quota-bounded and reclassifies on recovery, never a flipped verdict.
+        assert_eq!(
+            evaluate_content_acceptance(&ContentAcceptanceInput {
+                header: &entry,
+                entry_hash: ENTRY_HASH,
+                owner_account_id: owner(),
+                dense_predecessor_reachable: true,
+                branch_selected: true,
+                ownership: ownership(&entry),
+                roster: roster(&entry, AuthorityBoundary::Open),
+                grant: None,
+                owner_freshness: freshness(
+                    owner(),
+                    entry.owner_auth_len,
+                    AuthorityFreshness::CurrentOrBehind
+                ),
+                author_freshness: freshness(
+                    owner(),
+                    entry.author_auth_len,
+                    AuthorityFreshness::CurrentOrBehind
+                ),
+                subject_hold: SubjectAuthorityHold::Contested,
+                ancestry: |_, _| AncestryRelation::OnBranch,
+            }),
+            Ok(ContentAcceptance::Parked(ContentParkReason::ContestedSubject))
+        );
     }
 
     #[test]
@@ -1327,7 +1319,7 @@ mod tests {
             ),
             (
                 AuthorityBoundary::Cut { seq: 0, hash: [1; 32] },
-                SubjectAuthorityHold::UnknownCutTarget,
+                SubjectAuthorityHold::Contested,
                 false,
                 ContentAcceptance::Condemned(ContentCondemnReason::BeyondCut),
             ),
@@ -1336,12 +1328,6 @@ mod tests {
                 SubjectAuthorityHold::Contested,
                 true,
                 ContentAcceptance::Parked(ContentParkReason::ContestedSubject),
-            ),
-            (
-                AuthorityBoundary::Open,
-                SubjectAuthorityHold::UnknownCutTarget,
-                false,
-                ContentAcceptance::Parked(ContentParkReason::UnknownCutTarget),
             ),
         ] {
             let decision = evaluate_content_acceptance(&ContentAcceptanceInput {
