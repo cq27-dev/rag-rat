@@ -952,6 +952,22 @@ mod tests {
     }
 
     #[test]
+    fn append_rejects_lamport_overflowing_i64() {
+        // Phase-B bound guard: `append` narrows the u64 lamport via `i64::try_from`. A regression
+        // to `as i64` would wrap a lamport >= 2^63 to a NEGATIVE i64 and durably poison the
+        // (stream, device) chain order (it stores + orders by the signed INTEGER). A genesis signed
+        // at exactly 2^63 must be a hard `Err` (NOT an `AppendOutcome`), and nothing may enter the
+        // log — the reject-don't-trust posture the comment at the `try_from` pins.
+        let conn = db();
+        let s = secret(7);
+        let g = entry::sign_entry(&s, stream_a(), None, 1u64 << 63, &create("mem_a", "overflow"));
+        let err = append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1_000)
+            .expect_err("a lamport that overflows i64 is a hard error, not an outcome");
+        assert!(err.to_string().contains("exceeds i64"), "unexpected error: {err}");
+        assert_eq!(entry_count(&conn), 0, "the overflowing entry never entered the log");
+    }
+
+    #[test]
     fn author_op_mints_a_genesis_chain_and_projects() {
         let conn = db();
         let device = crate::local_device(&conn, 0).unwrap();

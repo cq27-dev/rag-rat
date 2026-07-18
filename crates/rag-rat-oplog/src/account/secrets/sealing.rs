@@ -511,6 +511,20 @@ mod tests {
             .unwrap()
     }
 
+    /// The SHARED fold verdict for one entry: its `accepted` flag plus the persisted §16.3
+    /// `(status, detail)` taxonomy. This is exactly the device-independent state the read-time
+    /// cross-check must NEVER touch (the fold firewall).
+    fn fold_verdict(conn: &Connection, entry_hash: [u8; 32]) -> (i64, String, Option<String>) {
+        conn.query_row(
+            "SELECT e.accepted, s.status, s.detail
+             FROM account_entries e JOIN account_entry_status s ON s.entry_hash = e.entry_hash
+             WHERE e.entry_hash = ?1",
+            [entry_hash.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
     fn expect_ready(outcome: SealingKeyOutcome) -> ContentKey {
         match outcome {
             SealingKeyOutcome::Ready(key) => key,
@@ -634,11 +648,28 @@ mod tests {
         let (bytes, entry_hash) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
         ingest(&conn, &bytes);
 
+        // FOLD FIREWALL: the wrap is validly signed by an owner, so the shared fold ACCEPTS it
+        // (device-independent). The read-time cross-check below must leave that verdict untouched.
+        let verdict_before = fold_verdict(&conn, entry_hash);
+        assert_eq!(
+            verdict_before,
+            (1, "accepted".to_string(), None),
+            "the offending wrap folds accepted before the cross-check",
+        );
+
         assert!(matches!(
             current_sealing_key(&conn, account, stream_id, &device, NOW).unwrap(),
             SealingKeyOutcome::FailedClosed
         ));
         assert_eq!(security_event_kinds(&conn), vec!["wrap_key_id_mismatch".to_string()]);
+        // The cross-check wrote ONLY sync_security_events — the fold verdict (accepted flag +
+        // persisted status/detail) is byte-for-byte unchanged. A regression that let the read path
+        // condemn/unaccept the offending wrap would break fold device-independence and fail here.
+        assert_eq!(
+            fold_verdict(&conn, entry_hash),
+            verdict_before,
+            "a key_id mismatch must NOT mutate the shared fold verdict",
+        );
         // The recorded event names the offending op + both key_ids.
         let (recorded_hash, expected, observed): (Vec<u8>, Vec<u8>, Vec<u8>) = conn
             .query_row(
@@ -674,11 +705,27 @@ mod tests {
         let (bytes, entry_hash) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
         ingest(&conn, &bytes);
 
+        // FOLD FIREWALL: the corrupted-ciphertext wrap is still a validly-signed owner op, so the
+        // shared fold ACCEPTS it (the AEAD failure is a device-LOCAL read-time fact, not a fold
+        // input). Capture the accepted verdict so the cross-check below can be proven inert on it.
+        let verdict_before = fold_verdict(&conn, entry_hash);
+        assert_eq!(
+            verdict_before,
+            (1, "accepted".to_string(), None),
+            "the offending wrap folds accepted before the cross-check",
+        );
+
         assert!(matches!(
             current_sealing_key(&conn, account, stream_id, &device, NOW).unwrap(),
             SealingKeyOutcome::FailedClosed
         ));
         assert_eq!(security_event_kinds(&conn), vec!["wrap_unwrap_failed".to_string()]);
+        // The unwrap failure recorded LOCAL evidence only; the shared fold verdict is unchanged.
+        assert_eq!(
+            fold_verdict(&conn, entry_hash),
+            verdict_before,
+            "an unwrap failure must NOT mutate the shared fold verdict",
+        );
         // No observed key_id (no key was recovered).
         let observed: Option<Vec<u8>> = conn
             .query_row(

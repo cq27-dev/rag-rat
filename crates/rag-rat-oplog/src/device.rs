@@ -248,6 +248,61 @@ fn is_small_order(bytes: &[u8; 32]) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn verify_rejects_small_order_signature() {
+        // The module doc pins the CHOICE of `verify_strict` precisely BECAUSE it rejects
+        // malleable / small-order signatures a plain `verify` would accept. Guard that choice with
+        // a genuine small-order vector: the pubkey A and the signature's R are both the curve
+        // IDENTITY point (compressed `01 00..00`), with S = 0.
+        //
+        // Why this vector isolates the strict check:
+        //   - `DevicePublic::from_bytes` ACCEPTS A: `from_bytes` only rejects encodings that fail
+        //     to decompress, and the identity decompresses (y = 1, x = 0). Small-order points are
+        //     deliberately NOT refused there — that is verification's job.
+        //   - a plain (cofactorless) `verify` ACCEPTS this signature: with A = identity, `[k]A` is
+        //     the identity for any k, so the group equation `[S]B == R + [k]A` reduces to `[0]B ==
+        //     R`, i.e. `identity == identity`. (Asserted below, so the vector genuinely DISAGREES
+        //     with the strict path — a regression to non-strict `verify` would start ACCEPTING it
+        //     and fail this test.)
+        //   - `verify_strict` REJECTS it: `R.is_small_order() || A.is_small_order()` fires.
+        //
+        // This is NOT the S+L malleability transform: S here is the canonical scalar 0, not a
+        // non-canonical `s + L`. A non-canonical S is rejected by plain `verify` too, so it would
+        // pass this assertion even after a regression to non-strict verify and would NOT guard the
+        // documented choice. A small-order component is the only property that separates the two.
+        let identity = {
+            let mut a = [0u8; 32];
+            a[0] = 1; // compressed Edwards identity: y = 1, sign bit 0
+            a
+        };
+        let sig_bytes = {
+            let mut s = [0u8; 64];
+            s[0] = 1; // R = compressed identity; the S half stays all-zero (the scalar 0)
+            s
+        };
+        let msg = b"small-order rejection vector";
+
+        // Premise: the plain, non-strict cofactorless verify ACCEPTS this signature — the
+        // disagreement that makes the strict assertion below load-bearing.
+        {
+            use ed25519_dalek::Verifier;
+            let vk = VerifyingKey::from_bytes(&identity).expect("identity decompresses");
+            let sig = Signature::from_bytes(&sig_bytes);
+            assert!(
+                vk.verify(msg, &sig).is_ok(),
+                "premise: plain verify accepts the small-order vector (so only strict rejects it)",
+            );
+        }
+
+        // `from_bytes` accepts the small-order/identity pubkey (it is a well-formed curve point)…
+        let public = DevicePublic::from_bytes(&identity).expect("identity is a valid curve point");
+        // …but the module's `verify` (verify_strict) rejects the small-order signature.
+        assert!(
+            public.verify(msg, &sig_bytes).is_err(),
+            "verify_strict must reject a small-order R / identity-key signature",
+        );
+    }
+
     /// Two distinct fixed seeds → two distinct devices; deterministic across calls.
     fn seed_a() -> [u8; 32] {
         [7u8; 32]

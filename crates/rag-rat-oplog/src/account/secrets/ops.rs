@@ -333,6 +333,32 @@ mod tests {
     }
 
     #[test]
+    fn an_over_bound_wrap_recipient_set_is_rejected() {
+        // §18a bound guard at the WIRE: authoring an op whose wrap fan-out exceeds
+        // `WRAP_RECIPIENTS_MAX` must FAIL in `encode` (the cap is enforced in `canonical_wraps`),
+        // so the signer can never emit a payload the bounded decoder — and every peer — would
+        // structurally reject. `WRAP_RECIPIENTS_MAX + 1` DISTINCT recipients (distinct so neither
+        // the exact-duplicate dedup nor the conflicting-recipient check consumes them before the
+        // bound check) is over the line by exactly one.
+        let sealed = sealed_for(0x10); // one valid SealedKeyWrap reused; the cap is on COUNT
+        let wraps: Vec<WrapEntry> = (0..=WRAP_RECIPIENTS_MAX as u32)
+            .map(|i| {
+                let mut fp = [0u8; 32];
+                fp[..4].copy_from_slice(&i.to_be_bytes()); // distinct recipient_fp per entry
+                WrapEntry {
+                    recipient_fp: DeviceFingerprint::from_bytes(fp),
+                    sealed: sealed.clone(),
+                }
+            })
+            .collect();
+        assert_eq!(wraps.len(), WRAP_RECIPIENTS_MAX + 1, "one over the bound");
+        assert!(
+            encode(&op(wraps)).is_err(),
+            "encode must reject a wrap set over WRAP_RECIPIENTS_MAX",
+        );
+    }
+
+    #[test]
     fn non_canonical_known_wire_is_rejected_by_re_encode() {
         // A trailing byte after a valid StreamKeyWrap fails the encode(decode) == bytes check.
         let good = encode(&op(vec![wrap_entry(0x10)])).unwrap();
