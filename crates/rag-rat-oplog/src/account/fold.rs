@@ -26,10 +26,16 @@ use crate::cbor;
 use crate::op::DeviceFingerprint;
 use crate::stream::{self, StreamId};
 
-/// The account CONTROL log the fold operates on (§11) — its registers are control-log scoped
-/// (`log: 0`). A known op on the secrets (1) or content (2) log is not a control op and is retained
-/// unfolded here (its own C2/C4 fold owns it), never minting control authority.
+/// The account CONTROL log the fold operates on (§11) — its authority-minting ops (genesis, adds,
+/// promotes/demotes, removes, cut extends) live here. A known op on the secrets (1) or content (2)
+/// log is not a control op and is retained unfolded here (its own C2/C4 fold owns it), never
+/// minting control authority.
 pub(super) const CONTROL_LOG: u8 = 0;
+/// The account SECRETS log (§11). Control ops never fold here, but a `DeviceRemove`/`OwnerDemote`
+/// on the control log CARRIES a `secrets_cut` that installs a revocation register scoped to this
+/// log, and a `CutExtend { chain_kind: Secrets }` raises it — the same register machinery the
+/// control chain uses, keyed at `log: SECRETS_LOG` instead of `log: CONTROL_LOG`.
+pub(super) const SECRETS_LOG: u8 = 1;
 /// The account-op version this fold understands. A known `entry_type` at a different version may
 /// reuse the tag with new semantics, so it is retained-unfolded rather than folded as today's op.
 pub(super) const SUPPORTED_OP_VERSION: u32 = 1;
@@ -713,38 +719,56 @@ impl HeaderView for CandidateView<'_> {
     }
 }
 
-/// The CONTROL-log register a cut op installs (§11): `DeviceRemove` → a device-level register on
-/// the removed device's control chain (scopes the whole chain); `OwnerDemote` → an
-/// owner-incarnation register scoped to the ops citing `owner_id`. Returns the key, the watermark,
-/// and the coordinate the watermark MUST name (§11.3). Non-cut ops and the secrets/content cuts
-/// (C2/C4) return `None`.
-fn control_register(c: &Candidate) -> Option<(RegisterKey, Cut, CutCoordinate)> {
+/// The revocation registers a cut op installs (§11). A `DeviceRemove` bounds the removed device's
+/// WHOLE chain (a device-level register); an `OwnerDemote` bounds only the ops citing `owner_id`
+/// (an owner-incarnation register). Each such op carries TWO watermarks — a `control_cut` on the
+/// device's control chain (`log: CONTROL_LOG`) and a `secrets_cut` on its secrets chain
+/// (`log: SECRETS_LOG`) — so it installs one register per chain, keyed identically apart from the
+/// log. Each element is `(key, watermark, coordinate the watermark MUST name, §11.3)`. Element 0 is
+/// the control register; element 1 (when present) is the secrets register. Non-cut ops return an
+/// empty vec.
+fn cut_op_registers(c: &Candidate) -> Vec<(RegisterKey, Cut, CutCoordinate)> {
     let account = c.header().account_id;
+    // The device-level and owner-incarnation register keys for one `(log, cut)`, differing only by
+    // the log — the control chain and the secrets chain share the same key shape (§11).
+    let device_register = |log: u8, device: DeviceFingerprint, cut: &Cut| {
+        (RegisterKey::Device { account, log, device }, cut.clone(), CutCoordinate {
+            account,
+            log,
+            device,
+        })
+    };
+    let owner_register = |log: u8, device: DeviceFingerprint, owner_id: [u8; 32], cut: &Cut| {
+        (
+            RegisterKey::OwnerIncarnation { account, log, device, owner_id },
+            cut.clone(),
+            CutCoordinate { account, log, device },
+        )
+    };
     match &c.op {
-        AccountOp::DeviceRemove { device_fingerprint, control_cut, .. } => Some((
-            RegisterKey::Device { account, log: 0, device: *device_fingerprint },
-            control_cut.clone(),
-            CutCoordinate { account, log: 0, device: *device_fingerprint },
-        )),
-        AccountOp::OwnerDemote { device_fingerprint, owner_id, control_cut, .. } => Some((
-            RegisterKey::OwnerIncarnation {
-                account,
-                log: 0,
-                device: *device_fingerprint,
-                owner_id: *owner_id,
-            },
-            control_cut.clone(),
-            CutCoordinate { account, log: 0, device: *device_fingerprint },
-        )),
-        _ => None,
+        AccountOp::DeviceRemove { device_fingerprint, control_cut, secrets_cut, .. } => vec![
+            device_register(CONTROL_LOG, *device_fingerprint, control_cut),
+            device_register(SECRETS_LOG, *device_fingerprint, secrets_cut),
+        ],
+        AccountOp::OwnerDemote {
+            device_fingerprint, owner_id, control_cut, secrets_cut, ..
+        } => {
+            vec![
+                owner_register(CONTROL_LOG, *device_fingerprint, *owner_id, control_cut),
+                owner_register(SECRETS_LOG, *device_fingerprint, *owner_id, secrets_cut),
+            ]
+        },
+        _ => Vec::new(),
     }
 }
 
-/// The CONTROL register a `CutExtend` raises (§10/§11.4) and the new watermark it joins in. A
-/// `CutExtend` does NOT create a register — it extends one a prior `DeviceRemove` / `OwnerDemote`
-/// made — so it is joined separately from the creator cut ops (it is never a cycle participant).
+/// The register a `CutExtend` raises (§10/§11.4) and the new watermark it joins in. A `CutExtend`
+/// does NOT create a register — it extends one a prior `DeviceRemove` / `OwnerDemote` made — so it
+/// is joined separately from the creator cut ops (it is never a cycle participant).
 /// `incarnation_id` selects the owner-incarnation register; its absence selects the device-level
-/// one. Secrets / content extends (C2/C4) return `None`.
+/// one. A `Ctrl` extend raises the control-chain register; a `Secrets` extend raises the
+/// secrets-chain register — both account-log chains the fold holds. A `Content` extend binds a
+/// stream chain (C2's fold), so it has no account-log register here and returns `None`.
 fn cut_extend_register(c: &Candidate) -> Option<(RegisterKey, Cut, CutCoordinate)> {
     let AccountOp::CutExtend {
         chain_kind,
@@ -758,20 +782,22 @@ fn cut_extend_register(c: &Candidate) -> Option<(RegisterKey, Cut, CutCoordinate
     else {
         return None;
     };
-    if *chain_kind != ChainKind::Ctrl {
-        return None;
-    }
+    let log = match chain_kind {
+        ChainKind::Ctrl => CONTROL_LOG,
+        ChainKind::Secrets => SECRETS_LOG,
+        ChainKind::Content => return None,
+    };
     let account = *subject_account_id;
     let cut = Cut::At { seq: *new_seq, hash: *new_entry_hash };
-    let coord = CutCoordinate { account, log: 0, device: *device_fingerprint };
+    let coord = CutCoordinate { account, log, device: *device_fingerprint };
     let key = match incarnation_id {
         Some(owner_id) => RegisterKey::OwnerIncarnation {
             account,
-            log: 0,
+            log,
             device: *device_fingerprint,
             owner_id: *owner_id,
         },
-        None => RegisterKey::Device { account, log: 0, device: *device_fingerprint },
+        None => RegisterKey::Device { account, log, device: *device_fingerprint },
     };
     Some((key, cut, coord))
 }
@@ -834,13 +860,23 @@ fn register_verdict(
 /// Detect the ONE cycle that means owner-key compromise (§11.1/§12): among the same-depth cut ops
 /// that install registers, `X → Y` iff X's register scopes Y's own chain AND condemns it (beyond /
 /// off-branch). A cycle in this relation is two (or more) owners cutting each other simultaneously
-/// ⇒ `contested`. Self-edges (a device cutting its own chain) are not mutual and are excluded.
+/// ⇒ `contested`. Only a LITERAL self-edge (`i == j`, an op against itself) is excluded — DISTINCT
+/// ops on the SAME device chain (e.g. a sole owner's two forked self-removals) DO condemn each
+/// other and would 2-cycle here. Those are intrinsically dead (they close the sole prior-depth
+/// owner) and are dropped by the intrinsic last-owner prefilter BEFORE this runs, so a cycle
+/// detected here is only ever genuine cross-owner mutual condemnation.
 fn has_condemn_cycle(admitted: &[AdmittedCut<'_>], view: &dyn HeaderView) -> bool {
     let n = admitted.len();
+    // An edge X → Y iff ANY register X installs scopes Y's own cut op and condemns it. A secrets
+    // register (`log: SECRETS_LOG`) never scopes a control-log cut op, so it adds no edges here —
+    // the mutual-owner-condemnation cycle stays a property of the CONTROL chains — but iterating
+    // every register keeps the detector correct as the register set grows.
     let condemns = |x: &AdmittedCut<'_>, y: &AdmittedCut<'_>| -> bool {
-        x.key.scopes(y.op.header())
-            && (beyond(y.op.header().seq, &x.cut)
-                || candidate::ancestry(&y.op.hash(), &x.cut, view) == Ancestry::OffBranch)
+        x.registers.iter().any(|(key, cut)| {
+            key.scopes(y.op.header())
+                && (beyond(y.op.header().seq, cut)
+                    || candidate::ancestry(&y.op.hash(), cut, view) == Ancestry::OffBranch)
+        })
     };
     let adj: Vec<Vec<usize>> = (0..n)
         .map(|i| (0..n).filter(|&j| i != j && condemns(&admitted[i], &admitted[j])).collect())
@@ -875,12 +911,13 @@ fn has_condemn_cycle(admitted: &[AdmittedCut<'_>], view: &dyn HeaderView) -> boo
     false
 }
 
-/// A same-depth cut op that passed cut-target binding + the I2 last-owner guard and so installs a
-/// register — the unit the cycle detector and the `⊔` join operate over.
+/// A same-depth cut op that passed cut-target binding + the I2 last-owner guard and so installs its
+/// register(s) — the unit the cycle detector and the `⊔` join operate over. A `DeviceRemove` /
+/// `OwnerDemote` carries BOTH its control-chain and secrets-chain registers here (see
+/// [`cut_op_registers`]); each is `⊔`-joined independently under its own log-scoped key.
 struct AdmittedCut<'a> {
     op: &'a Candidate,
-    key: RegisterKey,
-    cut: Cut,
+    registers: Vec<(RegisterKey, Cut)>,
 }
 
 /// The result of `⊔`-joining one register into the accumulated set.
@@ -891,6 +928,25 @@ enum RegisterJoin {
     Contested,
     /// The branch relation can't be decided yet — leave the held register, park the newcomer.
     Parked,
+}
+
+/// The join outcome for `cut` under `key` WITHOUT mutating `registers` — the read-only twin of
+/// [`join_register`]. Lets a multi-chain cut op decide ALL its registers before committing any, so
+/// a register that would park never gets raised alongside one that would apply.
+fn join_register_peek(
+    registers: &HashMap<RegisterKey, Cut>,
+    key: &RegisterKey,
+    cut: &Cut,
+    view: &dyn HeaderView,
+) -> RegisterJoin {
+    match registers.get(key) {
+        None => RegisterJoin::Applied,
+        Some(existing) => match candidate::join_cuts(existing, cut, view) {
+            JoinResult::Extended(_) => RegisterJoin::Applied,
+            JoinResult::Incomparable => RegisterJoin::Contested,
+            JoinResult::Unknown => RegisterJoin::Parked,
+        },
+    }
 }
 
 /// `⊔`-join `cut` into `registers` under `key` (§11.3): a fresh key installs it; an existing key
@@ -1082,9 +1138,10 @@ fn fold_account_pass(
             if condemned.contains_key(&c.hash()) || parked.contains_key(&c.hash()) {
                 continue;
             }
-            let Some((key, cut, coord)) = control_register(c) else {
-                continue;
-            };
+            let op_registers = cut_op_registers(c);
+            if op_registers.is_empty() {
+                continue; // not a cut op
+            }
             if !matches!(authority_status(c, &incarnations, &state, &parked), AuthorityStatus::Live)
             {
                 continue; // unauthorized → the effect pass classifies it (wrong-device / stale / park)
@@ -1113,34 +1170,109 @@ fn fold_account_pass(
                     Some(_) => {},
                 }
             }
-            match candidate::validate_cut_target(&cut, &coord, &view) {
-                // A held watermark naming a DIFFERENT coordinate is a structural reject
-                // (§11.3).
-                candidate::CutBinding::Mismatch => {
-                    cut_verdicts
-                        .insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
-                    continue;
-                },
-                // Held-and-correct, OR not-yet-held: install the register either way. Its
-                // `[seq]` condemns beyond entries from seq alone (I11) even before the watermark
-                // syncs; the under-cut branch decision parks until it does (a withheld watermark
-                // never flips a verdict). A revoking owner is TRUSTED not to misstate the watermark
-                // seq (§10) — a watermark that later resolves to a different coordinate (flipping
-                // this to `CutTargetMismatch`) is owner misbehaviour, out of the trusted-owner
-                // model.
-                candidate::CutBinding::Ok | candidate::CutBinding::TargetNotHeld => {},
+            // Cut-target binding (§11.3) applies to EVERY chain the op cuts — its control cut AND
+            // its secrets cut. A held watermark naming a DIFFERENT coordinate on any of them is a
+            // structural reject of the WHOLE op (an owner who misbinds one chain's watermark is
+            // misbehaving; extending the control-cut precedent, that condemns the op rather than
+            // silently projecting the bad watermark). Held-and-correct OR not-yet-held installs the
+            // register either way: its `[seq]` condemns beyond entries from seq alone (I11) even
+            // before the watermark syncs; the under-cut branch decision parks until it does (a
+            // withheld watermark never flips a verdict). A revoking owner is TRUSTED not to
+            // misstate a watermark seq (§10) — a watermark that later resolves to a
+            // different coordinate is owner misbehaviour, out of the trusted-owner
+            // model.
+            let misbound = op_registers.iter().any(|(_, cut, coord)| {
+                candidate::validate_cut_target(cut, coord, &view) == candidate::CutBinding::Mismatch
+            });
+            if misbound {
+                cut_verdicts.insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
+                continue;
             }
-            admitted.push(AdmittedCut { op: c, key, cut });
+            admitted.push(AdmittedCut {
+                op: c,
+                registers: op_registers.into_iter().map(|(key, cut, _)| (key, cut)).collect(),
+            });
         }
         // Deterministic order (by entry hash) so cut selection + the `⊔` join + the I2
         // reservation are arrival-independent (I9) when two same-depth cuts contend
         // for one register key.
         admitted.sort_by_key(|a| a.op.hash());
 
+        // INTRINSIC last-owner prefilter (order-free, §12/I2). A cut that closes the SOLE
+        // prior-depth owner can never succeed under ANY processing order — a size-1 surviving set
+        // never shrinks, so the sequential I2 sim would reject it as `LastOwner` whatever the sort
+        // — so reject it HERE and drop it BEFORE the park preflight, cycle-detection, AND
+        // the I2 sim. An intrinsically-dead cut must not park, contest, or form a
+        // condemnation cycle: this is what makes a SOLE owner's equivocating self-removals
+        // fold `Live` (each rejected `LastOwner`) instead of manufacturing a contested cut
+        // (incomparable variant) or a same-device 2-cycle (same-cut variant, which
+        // `has_condemn_cycle` WOULD flag). Keyed on the SAME `closes` predicate the I2 sim
+        // uses, against the prior-depth `state.owners` (empty at stratum 0, so genesis / a
+        // founder self-remove is never intrinsic here) — NEVER on "is a self-removal". The
+        // multi-owner mutual-removal case (owner set > 1) is untouched and still
+        // reaches `has_condemn_cycle` before I2, so it folds contested (§12).
+        if state.owners.len() == 1 {
+            admitted.retain(|a| {
+                let closes_sole_owner = match &a.op.op {
+                    AccountOp::DeviceRemove { device_fingerprint, .. } =>
+                        state.owners.contains_key(device_fingerprint),
+                    AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } =>
+                        state.owners.get(device_fingerprint) == Some(owner_id),
+                    _ => false,
+                };
+                if closes_sole_owner {
+                    cut_verdicts.insert(a.op.hash(), Outcome::Rejected(RejectReason::LastOwner));
+                    return false;
+                }
+                true
+            });
+        }
+
+        // Decide which admitted cut ops will actually INSTALL registers this depth, BEFORE
+        // cycle-detection and the I2 last-owner simulation consume `admitted`. One signed op cuts
+        // BOTH the device's control chain and its secrets chain, and its registers commit
+        // ATOMICALLY: if EITHER chain's join is undecidable the WHOLE op raises NO register, so it
+        // is NOT an active cut this depth — it parks `UnknownCutTarget` and must not manufacture a
+        // mutual-condemnation cycle or reserve a surviving owner it never actually removes (the
+        // ordering bug: a would-be-parked op left in `admitted` would wrongly drive cycle/I2). An
+        // incomparable pair (→ Contested) is genuine owner-key compromise and still halts. The
+        // decision runs against a WORKING copy so a same-key same-depth op sees the prior op's
+        // would-be watermark, while the real register set stays untouched until after cycle/I2 (a
+        // Contested must leave this depth's registers uninstalled).
+        {
+            let mut working = registers.clone();
+            let mut parked: HashSet<[u8; 32]> = HashSet::new();
+            for a in &admitted {
+                let mut any_parked = false;
+                for (key, cut) in &a.registers {
+                    match join_register_peek(&working, key, cut, &view) {
+                        RegisterJoin::Applied => {},
+                        RegisterJoin::Contested => {
+                            classification =
+                                AccountClassification::Contested { state_before_depth: depth };
+                            break 'depths;
+                        },
+                        RegisterJoin::Parked => any_parked = true,
+                    }
+                }
+                if any_parked {
+                    cut_verdicts.insert(a.op.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
+                    parked.insert(a.op.hash());
+                } else {
+                    // Apply so a same-key same-depth op joins against this op's would-be watermark.
+                    for (key, cut) in &a.registers {
+                        join_register(&mut working, key.clone(), cut.clone(), &view);
+                    }
+                }
+            }
+            admitted.retain(|a| !parked.contains(&a.op.hash()));
+        }
+
         // A same-depth mutual owner-condemnation cycle is genuine owner-key compromise (§12):
         // halt at the last cycle-free stratum. Detected BEFORE I2 so a two-owner
         // mutual removal folds contested rather than being resolved by reserving
-        // one owner.
+        // one owner. Parked ops are already excluded above — a cut that installs nothing is not a
+        // cycle participant.
         if has_condemn_cycle(&admitted, &view) {
             classification = AccountClassification::Contested { state_before_depth: depth };
             break 'depths;
@@ -1172,32 +1304,34 @@ fn fold_account_pass(
             true
         });
 
-        // Join each admitted creator register (§11.3 `⊔`). Two incomparable cuts for ONE key
-        // (equal-seq different-hash, or divergent branches — only two owner cut ops can produce
-        // this) are a same-depth mutual condemnation ⇒ contested, never a chosen hash.
+        // Stage ALL of this depth's register changes (creator cuts + `CutExtend`s) in ONE working
+        // copy, then merge into the REAL register set only at the END of a NON-contested depth.
+        // This is the class fix for "partial register mutation on a contested stratum": every
+        // `break 'depths` still reachable below (an incomparable extend) must leave the real
+        // registers EXACTLY as the prior depth left them (§12 `state_before_depth`), so a
+        // half-applied cut whose stratum then halts cannot leak its watermark into
+        // `derive_authority_facts`. (The creator-sim and cycle breaks above already run before any
+        // real mutation; this staging covers the two remaining mutation sites — the creator commit
+        // and the extends join — which both precede the extends contest break.)
+        let mut depth_registers = registers.clone();
+
+        // Commit the surviving admitted cut ops' registers (§11.3 `⊔`) into the staging copy. The
+        // park / contested / incomparable decisions were all made above against the working copy,
+        // and I2 only REMOVES ops (same-key removers are all-rejected-or-all-kept together, so a
+        // kept op never loses a same-key predecessor), so every remaining register here joins
+        // `Applied`.
         for a in &admitted {
-            match join_register(&mut registers, a.key.clone(), a.cut.clone(), &view) {
-                RegisterJoin::Applied => {
-                    register_contributors.insert(a.op.hash());
-                },
-                RegisterJoin::Contested => {
-                    classification = AccountClassification::Contested { state_before_depth: depth };
-                    break 'depths;
-                },
-                // The branch relation can't be decided yet — keep the held register and park
-                // the newcomer (it re-joins on the next refold once its
-                // watermark syncs).
-                RegisterJoin::Parked => {
-                    cut_verdicts.insert(a.op.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
-                },
+            for (key, cut) in &a.registers {
+                join_register(&mut depth_registers, key.clone(), cut.clone(), &view);
             }
+            register_contributors.insert(a.op.hash());
         }
 
         // Raise registers with this depth's live `CutExtend`s (§11.4 recovery). An extend is
-        // EXTEND-ONLY: it may only raise a register a prior DeviceRemove/OwnerDemote created,
-        // never conjure a fresh one (else a live owner could condemn a chain with a
-        // bare extend). An extend for a not-yet-established register parks until
-        // the creator syncs.
+        // EXTEND-ONLY: it may only raise a register a prior DeviceRemove/OwnerDemote created (this
+        // depth's creators are already in `depth_registers`), never conjure a fresh one (else a
+        // live owner could condemn a chain with a bare extend). An extend for a not-yet-established
+        // register parks until the creator syncs.
         let mut extends: Vec<(&Candidate, RegisterKey, Cut)> = Vec::new();
         for &i in idxs {
             let c = &candidates[i];
@@ -1217,7 +1351,7 @@ fn fold_account_pass(
                 cut_verdicts.insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
                 continue;
             }
-            if !registers.contains_key(&key) {
+            if !depth_registers.contains_key(&key) {
                 cut_verdicts.insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
                 continue;
             }
@@ -1225,7 +1359,11 @@ fn fold_account_pass(
         }
         extends.sort_by_key(|(c, _, _)| c.hash());
         for (c, key, cut) in extends {
-            match join_register(&mut registers, key, cut, &view) {
+            // Join into the STAGING copy. A same-key same-depth extend joins against the prior
+            // extend's watermark; an incomparable pair (→ Contested) is owner-key compromise and
+            // breaks 'depths with the REAL registers still untouched — `depth_registers` is
+            // dropped, never merged, so no watermark leaks from the halted stratum.
+            match join_register(&mut depth_registers, key, cut, &view) {
                 RegisterJoin::Applied => {
                     register_contributors.insert(c.hash());
                 },
@@ -1238,6 +1376,10 @@ fn fold_account_pass(
                 },
             }
         }
+
+        // No contest this depth — merge the staged changes into the real register set. The
+        // condemnation scan below and every later depth now see this depth's creators + extends.
+        registers = depth_registers;
 
         // Re-derive condemnation + parking against the current registers. Condemnation grows
         // monotonically: the frozen stratified model never lets a deeper authority revise a
@@ -1682,18 +1824,30 @@ fn derive_authority_facts(
                 });
                 owners.insert(*device_fingerprint, hash);
             },
-            AccountOp::DeviceRemove { device_fingerprint, secrets_cut, content_cuts, .. } => {
+            AccountOp::DeviceRemove { device_fingerprint, content_cuts, .. } => {
                 if let Some(roster_ref) = roster.remove(device_fingerprint) {
                     let fact = facts.roster_refs.get_mut(&roster_ref).expect("active roster fact");
+                    let account = candidate.header().account_id;
                     fact.closed_at = Some(epoch);
+                    // Both boundaries are the §11.3-validated, `⊔`-joined watermark for the
+                    // device's chain — NOT the raw op-field cut — so a
+                    // `CutExtend` that raised either chain is reflected. An
+                    // effective remove always installed its registers, so the `Closed`
+                    // default is defensive.
                     fact.control_boundary = registers
                         .get(&RegisterKey::Device {
-                            account: candidate.header().account_id,
-                            log: 0,
+                            account,
+                            log: CONTROL_LOG,
                             device: *device_fingerprint,
                         })
                         .map_or(AuthorityBoundary::Closed, boundary_from_cut);
-                    fact.secrets_boundary = boundary_from_cut(secrets_cut);
+                    fact.secrets_boundary = registers
+                        .get(&RegisterKey::Device {
+                            account,
+                            log: SECRETS_LOG,
+                            device: *device_fingerprint,
+                        })
+                        .map_or(AuthorityBoundary::Closed, boundary_from_cut);
                     fact.content_boundaries = content_cuts
                         .iter()
                         .map(|cut| {
@@ -1709,9 +1863,10 @@ fn derive_authority_facts(
                         .closed_at = Some(epoch);
                 }
             },
-            AccountOp::OwnerDemote { device_fingerprint, owner_id, secrets_cut, .. } => {
+            AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } => {
                 if owners.get(device_fingerprint) == Some(owner_id) {
                     owners.remove(device_fingerprint);
+                    let account = candidate.header().account_id;
                     let roster_ref = roster
                         .get(device_fingerprint)
                         .expect("demoted device has an active roster fact");
@@ -1724,15 +1879,21 @@ fn derive_authority_facts(
                     let fact =
                         facts.owner_incarnations.get_mut(owner_id).expect("active owner fact");
                     fact.closed_at = Some(epoch);
+                    // Both boundaries read the §11.3-validated, `⊔`-joined owner-incarnation
+                    // register for the demoted `owner_id` — not the raw op-field cut — so a
+                    // `CutExtend` raising either chain is reflected.
+                    let owner_register = |log: u8| RegisterKey::OwnerIncarnation {
+                        account,
+                        log,
+                        device: *device_fingerprint,
+                        owner_id: *owner_id,
+                    };
                     fact.control_boundary = registers
-                        .get(&RegisterKey::OwnerIncarnation {
-                            account: candidate.header().account_id,
-                            log: 0,
-                            device: *device_fingerprint,
-                            owner_id: *owner_id,
-                        })
+                        .get(&owner_register(CONTROL_LOG))
                         .map_or(AuthorityBoundary::Closed, boundary_from_cut);
-                    fact.secrets_boundary = boundary_from_cut(secrets_cut);
+                    fact.secrets_boundary = registers
+                        .get(&owner_register(SECRETS_LOG))
+                        .map_or(AuthorityBoundary::Closed, boundary_from_cut);
                 }
             },
             AccountOp::StreamOwn { stream_id, .. } => {
@@ -1762,17 +1923,27 @@ fn derive_authority_facts(
         }
     }
     // Register creators can be retained even when their state mutation is ineffective (notably a
-    // remove that arrived before enrollment). Project the fold's FINAL device register onto every
-    // roster incarnation for that device; deriving only from effective close ops would otherwise
-    // expose Open while the fold condemns that chain.
+    // remove that arrived before enrollment). Project the fold's FINAL joined device register onto
+    // every roster incarnation for that device — control from `log: CONTROL_LOG`, secrets from
+    // `log: SECRETS_LOG` — so a device whose chain the fold condemns never reports an Open boundary
+    // while a register bounds it. Deriving only from effective close ops would otherwise expose
+    // Open on both chains for a state-ineffective creator, misstating the secrets chain as
+    // unbounded.
     for fact in facts.roster_refs.values_mut() {
-        if let Some(cut) = registers.iter().find_map(|(key, cut)| match key {
-            RegisterKey::Device { log: 0, device, .. }
-                if *device == fact.authority.device_fingerprint =>
-                Some(cut),
-            _ => None,
-        }) {
+        let device = fact.authority.device_fingerprint;
+        let device_register = |want_log: u8| {
+            registers.iter().find_map(|(key, cut)| match key {
+                RegisterKey::Device { log, device: reg_device, .. }
+                    if *log == want_log && *reg_device == device =>
+                    Some(cut),
+                _ => None,
+            })
+        };
+        if let Some(cut) = device_register(CONTROL_LOG) {
             fact.control_boundary = boundary_from_cut(cut);
+        }
+        if let Some(cut) = device_register(SECRETS_LOG) {
+            fact.secrets_boundary = boundary_from_cut(cut);
         }
     }
     facts
@@ -1977,15 +2148,14 @@ fn classify_effect(
         // An OwnerDemote reaching here is an admitted cut op (register + binding decided in the
         // register pass); it is effective.
         AccountOp::OwnerDemote { .. } => effective(state),
-        // A CONTROL-log CutExtend reaching here was admitted in the register pass. A
-        // secrets/content extend has no control register (its binding is the C2/C4 fold's)
-        // — defer it rather than mark it effective on an unvalidated target.
-        AccountOp::CutExtend { chain_kind, .. } =>
-            if *chain_kind == ChainKind::Ctrl {
-                effective(state)
-            } else {
-                Outcome::Parked(ParkReason::DeferredStreamAuthorization)
-            },
+        // A control- or secrets-chain CutExtend reaching here was admitted in the register pass
+        // (its register joined against the fold's account-log chains), so it is effective. A
+        // content extend binds a stream chain (C2's fold), not an account log — defer it rather
+        // than mark it effective on a target this fold never validated.
+        AccountOp::CutExtend { chain_kind, .. } => match chain_kind {
+            ChainKind::Ctrl | ChainKind::Secrets => effective(state),
+            ChainKind::Content => Outcome::Parked(ParkReason::DeferredStreamAuthorization),
+        },
     }
 }
 
@@ -2211,6 +2381,44 @@ mod tests {
             hash
         }
 
+        /// Author a raw log-1 (secrets) entry at an explicit `(seq, prev_hash)` on `author`'s
+        /// secrets chain. The control fold never FOLDS a log-1 entry — it only reads its HEADER for
+        /// cut-target binding + ancestry — so the payload is opaque here; any verifiable entry
+        /// serves as a secrets-chain watermark / ancestry target. `filler` only varies the opaque
+        /// payload, so two entries at the SAME `(seq, prev_hash)` with DIFFERENT `filler`s are
+        /// distinct-hash siblings (an equivocation at one slot). (A `DeviceAdd` payload is a handy
+        /// opaque body; on log 1 it is retained-unfolded, never interpreted as a control op.)
+        fn author_secrets_entry(
+            &mut self,
+            author: &Dev,
+            filler: &Dev,
+            seq: u64,
+            prev_hash: Option<[u8; 32]>,
+        ) -> [u8; 32] {
+            let op = device_add(filler, DeviceRole::Member);
+            let payload = account_ops::encode(&op).unwrap();
+            let header = AccountEntryHeader {
+                account_id: self.account_id,
+                log_id: SECRETS_LOG,
+                device_fingerprint: author.fp,
+                seq,
+                prev_hash,
+                parent_ref: Some(self.genesis_hash),
+                entry_type: account_ops::entry_type_of(&op),
+                op_version: 1,
+                auth_len: 1,
+                crypto_suite: 0,
+                key_id: None,
+                authority_ref: None,
+            };
+            let signed = sign_account_entry(&author.secret, &header, &payload).unwrap();
+            let verified =
+                verify_account_signed(&signed.signed_bytes, &author.secret.public()).unwrap();
+            let hash = verified.entry_hash;
+            self.entries.push(verified);
+            hash
+        }
+
         fn fold(&self) -> AccountAuthHistory {
             fold_account(&self.entries)
         }
@@ -2261,6 +2469,34 @@ mod tests {
             owner_id,
             control_cut,
             secrets_cut: Cut::Empty,
+            reason: "demoted".to_string(),
+        }
+    }
+
+    /// A `DeviceRemove` that cuts BOTH the device's control chain and its secrets chain — the
+    /// vehicle for exercising the secrets-chain register.
+    fn device_remove_with_secrets(dev: &Dev, control_cut: Cut, secrets_cut: Cut) -> AccountOp {
+        AccountOp::DeviceRemove {
+            device_fingerprint: dev.fp,
+            control_cut,
+            secrets_cut,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        }
+    }
+
+    /// An `OwnerDemote` that cuts BOTH the incarnation's control chain and its secrets chain.
+    fn owner_demote_with_secrets(
+        dev: &Dev,
+        owner_id: [u8; 32],
+        control_cut: Cut,
+        secrets_cut: Cut,
+    ) -> AccountOp {
+        AccountOp::OwnerDemote {
+            device_fingerprint: dev.fp,
+            owner_id,
+            control_cut,
+            secrets_cut,
             reason: "demoted".to_string(),
         }
     }
@@ -2317,6 +2553,26 @@ mod tests {
     ) -> AccountOp {
         AccountOp::CutExtend {
             chain_kind: ops::ChainKind::Ctrl,
+            stream_id: None,
+            incarnation_id,
+            subject_account_id: account,
+            device_fingerprint: subject.fp,
+            new_seq,
+            new_entry_hash,
+        }
+    }
+
+    /// A `CutExtend` raising `subject`'s SECRETS-chain register (device-level when `incarnation_id`
+    /// is `None`, owner-incarnation otherwise) to `[new_seq, new_entry_hash]`.
+    fn cut_extend_secrets(
+        account: AccountId,
+        subject: &Dev,
+        incarnation_id: Option<[u8; 32]>,
+        new_seq: u64,
+        new_entry_hash: [u8; 32],
+    ) -> AccountOp {
+        AccountOp::CutExtend {
+            chain_kind: ops::ChainKind::Secrets,
             stream_id: None,
             incarnation_id,
             subject_account_id: account,
@@ -3863,14 +4119,16 @@ mod tests {
     }
 
     #[test]
-    fn a_non_control_cut_extend_is_deferred_not_effective() {
-        // A secrets/content `CutExtend` has no control register (its binding is the C2/C4 fold's),
-        // so it must be deferred, never marked effective on an unvalidated target.
+    fn a_content_cut_extend_is_deferred_not_effective() {
+        // A CONTENT `CutExtend` binds a stream chain (C2's fold), so the account fold has no
+        // register for it and must defer it, never marking it effective on a target this fold never
+        // validated. (A secrets extend, by contrast, IS an account-log chain — see
+        // `a_secrets_cut_extend_reblesses_beyond_a_secrets_cut`.)
         let fdr = Dev::new(1);
         let mut f = Fixture::genesis(&fdr);
         let op = AccountOp::CutExtend {
-            chain_kind: ops::ChainKind::Secrets,
-            stream_id: None,
+            chain_kind: ops::ChainKind::Content,
+            stream_id: Some(StreamId::from_bytes([0x55; 32])),
             incarnation_id: None,
             subject_account_id: f.account_id,
             device_fingerprint: fdr.fp,
@@ -3883,8 +4141,497 @@ mod tests {
         assert_eq!(
             h.outcome(&extend),
             Some(Outcome::Parked(ParkReason::DeferredStreamAuthorization)),
-            "a non-control CutExtend is deferred, not effective",
+            "a content CutExtend is deferred, not effective",
         );
+    }
+
+    #[test]
+    fn a_secrets_cut_extend_without_a_creating_register_parks_not_defers() {
+        // A secrets `CutExtend` is now admissible on the account log (it extends the device's
+        // secrets-chain register), but it is EXTEND-ONLY: with no prior DeviceRemove/OwnerDemote to
+        // create that register it parks `unknown_cut_target` (re-joining once the creator syncs) —
+        // the gap B1 closes, where it used to park `deferred_stream_authorization` forever.
+        let fdr = Dev::new(1);
+        let mut f = Fixture::genesis(&fdr);
+        let extend = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &cut_extend_secrets(f.account_id, &fdr, None, 3, [0x44; 32]),
+        );
+
+        let h = f.fold();
+        assert_eq!(
+            h.outcome(&extend),
+            Some(Outcome::Parked(ParkReason::UnknownCutTarget)),
+            "a secrets CutExtend with no creating register parks, extend-only",
+        );
+    }
+
+    #[test]
+    fn a_device_remove_installs_a_queryable_secrets_register() {
+        // A DeviceRemove carrying a secrets_cut installs a log-1 device register bound at
+        // CutCoordinate{log: SECRETS_LOG} (§11.3), so the removed device's secrets_boundary is the
+        // validated, joined watermark — queryable via owner_secrets_authority's device_boundary —
+        // NOT a raw op-field copy and NOT Open/Closed. The empty control cut proves the two chains
+        // are bounded independently under one op.
+        let (fdr, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&fdr);
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        // A second owner so removing B is not the last-owner reject.
+        f.author(&fdr, Some(f.genesis_hash), &device_add(&c, DeviceRole::Owner));
+        // A held watermark on B's secrets chain (log 1) so §11.3 binding is Ok, not TargetNotHeld.
+        let s0 = f.author_secrets_entry(&b, &b, 0, None);
+        let remove_b = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &device_remove_with_secrets(&b, Cut::Empty, Cut::At { seq: 0, hash: s0 }),
+        );
+
+        let h = f.fold();
+        assert!(h.is_effective(&remove_b), "the remove is admitted — both cuts bind");
+        let fact = h.roster_refs.get(&add_b).expect("B has a roster fact");
+        assert_eq!(
+            fact.secrets_boundary,
+            AuthorityBoundary::Cut { seq: 0, hash: s0 },
+            "secrets_boundary is the joined log-1 register",
+        );
+        assert_eq!(
+            fact.control_boundary,
+            AuthorityBoundary::Closed,
+            "the control chain is bounded independently by its own (empty) cut",
+        );
+        match h.owner_secrets_authority(add_b, b.fp) {
+            AuthorityQuery::Effective(auth) => assert_eq!(
+                auth.device_boundary,
+                AuthorityBoundary::Cut { seq: 0, hash: s0 },
+                "owner_secrets_authority device_boundary reflects the secrets register",
+            ),
+            other => panic!("expected an effective owner-secrets authority, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_owner_demote_secrets_cut_bounds_the_incarnation() {
+        // An OwnerDemote's secrets_cut installs an owner-incarnation register on the demoted
+        // incarnation's secrets chain, so owner_secrets_authority's incarnation_boundary is the
+        // validated, joined watermark. (Mirrors the control owner-incarnation boundary.)
+        let (fdr, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&fdr);
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash), &device_add(&c, DeviceRole::Owner));
+        let s0 = f.author_secrets_entry(&b, &b, 0, None);
+        let demote_b = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &owner_demote_with_secrets(&b, add_b, Cut::Empty, Cut::At { seq: 0, hash: s0 }),
+        );
+
+        let h = f.fold();
+        assert!(h.is_effective(&demote_b), "the demote is admitted — both cuts bind");
+        match h.owner_secrets_authority(add_b, b.fp) {
+            AuthorityQuery::Effective(auth) => assert_eq!(
+                auth.incarnation_boundary,
+                AuthorityBoundary::Cut { seq: 0, hash: s0 },
+                "owner_secrets_authority incarnation_boundary reflects the secrets register",
+            ),
+            other => panic!("expected an effective owner-secrets authority, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_secrets_cut_extend_reblesses_beyond_a_secrets_cut() {
+        // Mirror the control cut-extend re-bless (p7) on the SECRETS chain. F removes B pinned to
+        // B's secrets seq 0, then a CutExtend{Secrets} raises that register to seq 2. The secrets
+        // register is `⊔`-joined, so B's secrets_boundary reflects the RAISED watermark (seq 2) and
+        // the extend is effective — the gap B1 closes (a secrets extend used to park forever).
+        let (fdr, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&fdr);
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash), &device_add(&c, DeviceRole::Owner));
+        // B's secrets chain s0 <- s1 <- s2 (log 1), so the extend's watermark descends the
+        // remove's.
+        let s0 = f.author_secrets_entry(&b, &b, 0, None);
+        let s1 = f.author_secrets_entry(&b, &b, 1, Some(s0));
+        let s2 = f.author_secrets_entry(&b, &b, 2, Some(s1));
+        let remove_b = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &device_remove_with_secrets(&b, Cut::Empty, Cut::At { seq: 0, hash: s0 }),
+        );
+        let extend = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &cut_extend_secrets(f.account_id, &b, None, 2, s2),
+        );
+
+        // Without the extend, the boundary is the original seq-0 watermark.
+        let before = f.fold_without(extend);
+        assert_eq!(
+            before.roster_refs.get(&add_b).unwrap().secrets_boundary,
+            AuthorityBoundary::Cut { seq: 0, hash: s0 },
+        );
+
+        // With the extend, the register joins to seq 2 and the extend is effective.
+        let after = f.fold();
+        assert!(after.is_effective(&extend), "the secrets extend re-blesses and is effective");
+        assert!(after.is_effective(&remove_b));
+        assert_eq!(
+            after.roster_refs.get(&add_b).unwrap().secrets_boundary,
+            AuthorityBoundary::Cut { seq: 2, hash: s2 },
+            "secrets_boundary reflects the extend-raised (joined) watermark, not the raw cut",
+        );
+    }
+
+    #[test]
+    fn a_misbound_secrets_cut_rejects_the_whole_cut_op() {
+        // A held secrets_cut watermark naming a DIFFERENT coordinate (here a control-log entry, not
+        // a log-1 entry on B's chain) fails §11.3 binding. Extending the control-cut precedent,
+        // that REJECTS the whole cut op (cut_target_mismatch) — it no longer projects the
+        // bad watermark silently. The control cut is a valid Empty, so the rejection is due
+        // to the secrets cut.
+        let (fdr, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&fdr);
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let add_c = f.author(&fdr, Some(f.genesis_hash), &device_add(&c, DeviceRole::Owner));
+        let remove_b = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            // add_c is a held CONTROL-log entry — the wrong coordinate for a log-1 watermark on B.
+            &device_remove_with_secrets(&b, Cut::Empty, Cut::At { seq: 1, hash: add_c }),
+        );
+
+        let h = f.fold();
+        assert_eq!(
+            h.outcome(&remove_b),
+            Some(Outcome::Rejected(RejectReason::CutTargetMismatch)),
+            "a misbound secrets_cut rejects the whole remove",
+        );
+        assert!(h.is_effective(&add_b), "B stays enrolled — the misbound remove never took effect");
+    }
+
+    #[test]
+    fn incomparable_secrets_cuts_for_one_key_are_contested() {
+        // Two owners A and B each remove D, but their SECRETS cuts name two different seq-0
+        // watermarks on D's secrets chain. One register key (Device{log: SECRETS_LOG, D}) with
+        // equal-seq / different-hash cuts is incomparable — the fold folds contested (§11.3),
+        // exactly as an incomparable CONTROL pair does. (Equal-seq/different-hash is incomparable
+        // without an ancestry lookup, so the watermarks need not be held.)
+        let (fdr, a, b, d) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+        let mut f = Fixture::genesis(&fdr);
+        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let add_d = f.author(&fdr, Some(f.genesis_hash), &device_add(&d, DeviceRole::Owner));
+        // Control cuts Empty (comparable); secrets cuts at the same seq with distinct hashes.
+        f.author(
+            &a,
+            Some(add_a),
+            &device_remove_with_secrets(&d, Cut::Empty, Cut::At { seq: 0, hash: [0xaa; 32] }),
+        );
+        f.author(
+            &b,
+            Some(add_b),
+            &device_remove_with_secrets(&d, Cut::Empty, Cut::At { seq: 0, hash: [0xbb; 32] }),
+        );
+
+        let h = f.fold();
+        assert_eq!(
+            h.classification(),
+            AccountClassification::Contested { state_before_depth: 1 },
+            "incomparable secrets cuts for one key fold contested",
+        );
+        assert!(h.is_effective(&add_a) && h.is_effective(&add_b) && h.is_effective(&add_d));
+        // Arrival-order-free: the incomparable join is symmetric (I9).
+        for rot in 0..f.entries.len() {
+            assert_eq!(
+                f.fold_rotated(rot).classification(),
+                AccountClassification::Contested { state_before_depth: 1 },
+                "rotation {rot} must reach the same contested verdict",
+            );
+        }
+    }
+
+    #[test]
+    fn a_cut_op_that_parks_on_one_chain_raises_neither_register() {
+        // Register-join ATOMICITY. One signed cut op cuts BOTH the device's control chain and its
+        // secrets chain (unlike the single-register control precedent). If EITHER chain's join is
+        // undecidable, the WHOLE op parks and NEITHER register is raised — a parked (non-effective)
+        // op must never advance a boundary. Here g's control cut WOULD extend d's control register
+        // (Empty ⊔ At = At), but its secrets cut is undecidable against the already-installed
+        // secrets register (its higher watermark is not in the view), so the whole op parks
+        // and d's control boundary stays at the founder's value. A commit-as-you-go join
+        // would advance the control register while the secrets one parks — this test's
+        // control-boundary assertion is the discriminator that fails without the atomicity
+        // guard.
+        let (fdr, g, d, e) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+        let mut f = Fixture::genesis(&fdr);
+        // g is a DEEPER incarnation than the founder, so its cut sits at a strictly LATER stratum —
+        // it deterministically joins AFTER the founder's remove installs d's registers.
+        let add_g = f.author(&fdr, Some(f.genesis_hash), &device_add(&g, DeviceRole::Owner));
+        let add_d = f.author(&fdr, Some(f.genesis_hash), &device_add(&d, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash), &device_add(&e, DeviceRole::Owner)); // spare owner
+        // Founder removes d, installing d's control register (Empty) and secrets register (At{0}).
+        let remove_d = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &device_remove_with_secrets(&d, Cut::Empty, Cut::At { seq: 0, hash: [0x50; 32] }),
+        );
+        // g removes d again: its control cut WOULD raise d's control register (Empty ⊔ At{0} =
+        // At{0}), but its secrets cut is undecidable — the higher watermark [0x52] is not held, so
+        // the branch relation against the founder's At{0} secrets register can't be decided → the
+        // secrets join parks.
+        let remove_d_by_g = f.author(
+            &g,
+            Some(add_g),
+            &device_remove_with_secrets(&d, Cut::At { seq: 0, hash: [0xc0; 32] }, Cut::At {
+                seq: 2,
+                hash: [0x52; 32],
+            }),
+        );
+
+        let h = f.fold();
+        // g's op parks (one chain undecidable) — NOT effective.
+        assert_eq!(
+            h.outcome(&remove_d_by_g),
+            Some(Outcome::Parked(ParkReason::UnknownCutTarget)),
+            "the op parks because one chain's cut is undecidable",
+        );
+        assert!(h.is_effective(&remove_d), "the founder's remove is unaffected");
+        let fact = h.roster_refs.get(&add_d).expect("d has a roster fact");
+        // DISCRIMINATOR: g parked, so it raised NEITHER register. d's control boundary stays at the
+        // founder's Empty cut (Closed) — a commit-as-you-go join would have advanced it to
+        // Cut{seq:0, hash:0xc0}.
+        assert_eq!(
+            fact.control_boundary,
+            AuthorityBoundary::Closed,
+            "a parked op must not advance the control register",
+        );
+        // And the secrets register stays at the founder's watermark too.
+        assert_eq!(
+            fact.secrets_boundary,
+            AuthorityBoundary::Cut { seq: 0, hash: [0x50; 32] },
+            "a parked op must not advance the secrets register",
+        );
+        // Arrival-order-free: strata are content-derived, so the parked op raises no register under
+        // any rotation (I9).
+        for rot in 0..f.entries.len() {
+            let rotated = f.fold_rotated(rot);
+            assert_eq!(
+                rotated.roster_refs.get(&add_d).unwrap().control_boundary,
+                AuthorityBoundary::Closed,
+                "rotation {rot}: the parked op still raises no register",
+            );
+        }
+    }
+
+    #[test]
+    fn a_secrets_park_does_not_manufacture_a_contested_cycle() {
+        // ORDERING invariant: an op that will PARK (its registers don't all join) must be excluded
+        // from cycle-detection and the I2 last-owner simulation — it installs nothing, so it is not
+        // an active cut and must not manufacture a mutual-condemnation cycle. A cuts D and D cuts A
+        // at the same stratum (a control-chain mutual removal), but A's SECRETS cut is undecidable
+        // against a pre-existing secrets register on D's chain, so A parks. With the park decided
+        // BEFORE cycle-detection, A is excluded, no cycle exists, and D's removal of A takes effect
+        // — the account stays Live. If the park were decided AFTER cycle-detection (the bug), A's
+        // would-be control register would form an A↔D cycle → wrongly `contested`.
+        //
+        // Deeper nesting puts A and D at stratum 2 (so their removals are same-stratum) while F's
+        // early remove of D — processed at stratum 0, BEFORE D is enrolled at stratum 1, hence
+        // state-ineffective — installs the pre-existing `Device{log:1, D}` secrets register A's cut
+        // is undecidable against, WITHOUT tombstoning D (its control cut names D's own later op, so
+        // it condemns nothing D authors).
+        let (fdr, p, s) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let (a, d) = (Dev::new(4), Dev::new(5));
+        let mut f = Fixture::genesis(&fdr);
+        let add_p = f.author(&fdr, Some(f.genesis_hash), &device_add(&p, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash), &device_add(&s, DeviceRole::Owner)); // spare owner
+        // P (a depth-1 owner) mints A and D at depth 2 — so A's/D's own ops sit at stratum 2.
+        let add_a = f.author(&p, Some(add_p), &device_add(&a, DeviceRole::Owner));
+        let add_d = f.author(&p, Some(add_p), &device_add(&d, DeviceRole::Owner));
+        // D removes A (a plain, valid mutual-removal partner: both cuts empty).
+        let d_removes_a =
+            f.author(&d, Some(add_d), &device_remove_with_secrets(&a, Cut::Empty, Cut::Empty));
+        // F's early remove of D: at stratum 0 (before D is enrolled at stratum 1) it is
+        // state-ineffective, but installs D's `Device{log:1}` secrets register (At{0}) and a
+        // `Device{log:0}` control register whose cut names D's OWN op, so it condemns nothing D
+        // does.
+        f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &device_remove_with_secrets(&d, Cut::At { seq: 0, hash: d_removes_a }, Cut::At {
+                seq: 0,
+                hash: [0x50; 32],
+            }),
+        );
+        // A removes D: its control cut WOULD condemn D's op (the A→D cycle edge), but its secrets
+        // cut is undecidable against the pre-existing At{0} secrets register (higher watermark
+        // [0x52] not held) → A parks, and must NOT drive cycle-detection.
+        let a_removes_d = f.author(
+            &a,
+            Some(add_a),
+            &device_remove_with_secrets(&d, Cut::Empty, Cut::At { seq: 2, hash: [0x52; 32] }),
+        );
+
+        let h = f.fold();
+        // DISCRIMINATOR: the parked op is excluded from cycle-detection, so the account is NOT
+        // contested and D's removal of A takes effect. (With the park decided after cycle/I2, this
+        // would be `Contested` and A would survive.)
+        assert_eq!(
+            h.classification(),
+            AccountClassification::Live,
+            "a parked op must not manufacture a contested cycle",
+        );
+        assert!(h.is_effective(&d_removes_a), "D's valid removal of A takes effect");
+        assert!(!h.is_effective(&a_removes_d), "A's own removal never goes effective (it parked)");
+        assert!(
+            matches!(h.owner_incarnation_effective(add_a, a.fp), AuthorityQuery::Invalid(_)),
+            "A's incarnation is closed by D's removal",
+        );
+        // Order-independent (I9).
+        for rot in 0..f.entries.len() {
+            assert_eq!(
+                f.fold_rotated(rot).classification(),
+                AccountClassification::Live,
+                "rotation {rot}: still not contested",
+            );
+        }
+    }
+
+    #[test]
+    fn a_contested_extend_stratum_leaks_no_register_watermark() {
+        // A contested stratum must leave the register set EXACTLY as the prior depth left it (§12
+        // `state_before_depth`) — no half-applied cut may leak its watermark. Two same-depth
+        // `CutExtend{Secrets}` raise D's ONE secrets register with equal-seq / different-hash
+        // watermarks: the first joins `Applied`, the second is incomparable → contested. Because
+        // the depth's register changes are STAGED and only merged at
+        // end-of-non-contested-depth, the first extend's raised watermark never reaches the
+        // real registers — D's secrets_boundary stays the founder's original cut. (With an
+        // in-place join the first extend would mutate the real registers before the second
+        // contests, leaking its watermark into `derive_authority_facts`.)
+        let (fdr, p, d) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let (t8, t9) = (Dev::new(8), Dev::new(9));
+        let mut f = Fixture::genesis(&fdr);
+        // P is a depth-1 owner, so its extends sit at stratum 1 — AFTER the founder's stratum-0
+        // remove installs D's secrets register (so the removal stays effective and D keeps a roster
+        // fact whose secrets_boundary we can inspect on the contested fold).
+        let add_p = f.author(&fdr, Some(f.genesis_hash), &device_add(&p, DeviceRole::Owner));
+        let add_d = f.author(&fdr, Some(f.genesis_hash), &device_add(&d, DeviceRole::Owner));
+        // D's secrets chain: s0, then an EQUIVOCATION at seq 1 (two distinct siblings off s0).
+        let s0 = f.author_secrets_entry(&d, &d, 0, None);
+        let e1a = f.author_secrets_entry(&d, &t8, 1, Some(s0));
+        let e1b = f.author_secrets_entry(&d, &t9, 1, Some(s0));
+        assert_ne!(e1a, e1b, "the two seq-1 secrets watermarks must be distinct");
+        // Founder removes D (stratum 0, effective): installs D's secrets register at At{0, s0}.
+        f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &device_remove_with_secrets(&d, Cut::Empty, Cut::At { seq: 0, hash: s0 }),
+        );
+        // Two stratum-1 extends of D's secrets register to the two incomparable seq-1 watermarks.
+        f.author(&p, Some(add_p), &cut_extend_secrets(f.account_id, &d, None, 1, e1a));
+        f.author(&p, Some(add_p), &cut_extend_secrets(f.account_id, &d, None, 1, e1b));
+
+        let h = f.fold();
+        assert_eq!(
+            h.classification(),
+            AccountClassification::Contested { state_before_depth: 1 },
+            "incomparable same-depth secrets extends fold contested at their stratum",
+        );
+        // DISCRIMINATOR: the contested stratum leaked NO watermark — D's secrets_boundary is still
+        // the founder's original cut (At{0, s0}), NOT the first extend's raised At{1, e1a}.
+        let fact =
+            h.roster_refs.get(&add_d).expect("D has a roster fact from the stratum-0 remove");
+        assert_eq!(
+            fact.secrets_boundary,
+            AuthorityBoundary::Cut { seq: 0, hash: s0 },
+            "a contested extend stratum must not leak the first extend's watermark",
+        );
+        // Order-independent (I9): same verdict + same non-leaked boundary under any rotation.
+        for rot in 0..f.entries.len() {
+            let rotated = f.fold_rotated(rot);
+            assert_eq!(
+                rotated.classification(),
+                AccountClassification::Contested { state_before_depth: 1 },
+                "rotation {rot}: same contested verdict",
+            );
+            assert_eq!(
+                rotated.roster_refs.get(&add_d).unwrap().secrets_boundary,
+                AuthorityBoundary::Cut { seq: 0, hash: s0 },
+                "rotation {rot}: still no leaked watermark",
+            );
+        }
+    }
+
+    #[test]
+    fn removing_one_of_several_owners_is_effective_and_keeps_the_rest() {
+        // Basic I2 behavior (there was no behavioral last-owner test before this): with more than
+        // one owner, removing one is EFFECTIVE and does not empty the owner set — the last-owner
+        // guard only reserves when a removal WOULD empty it, and the intrinsic prefilter only fires
+        // at `state.owners.len() == 1`. Guards against over-rejection by either.
+        let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&fdr);
+        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let remove_b = f.author(&fdr, Some(f.genesis_hash), &device_remove(&b, Cut::Empty));
+
+        let h = f.fold();
+        assert_eq!(h.classification(), AccountClassification::Live);
+        assert!(h.is_effective(&remove_b), "removing one of several owners is effective");
+        assert!(h.is_effective(&add_a) && h.is_effective(&add_b), "both devices were enrolled");
+        assert!(
+            matches!(h.owner_incarnation_effective(add_b, b.fp), AuthorityQuery::Invalid(_)),
+            "B's owner incarnation is closed by the removal",
+        );
+        assert!(
+            matches!(h.owner_incarnation_effective(add_a, a.fp), AuthorityQuery::Effective(_)),
+            "A's owner incarnation stays open — the owner set is not emptied",
+        );
+    }
+
+    #[test]
+    fn an_owner_equivocated_self_removal_is_contested_deterministically() {
+        // A signs TWO conflicting self-removals (incomparable `Device{A}` cuts) while a PEER owner
+        // (the founder) remains — owner-key equivocation ⇒ the account folds `contested` (§12). The
+        // incomparable-cut detection is order-free (symmetric), so the verdict is identical under
+        // EVERY arrival order — there is no "vacuous-survivor lottery" where the sort decides which
+        // op wins. (The concurrent removal of the founder never gets to matter.) This is the
+        // multi-owner sibling of the intrinsic-prefilter case: with a peer owner present the
+        // equivocating device is NOT the sole owner, so its self-removals are real cuts and their
+        // equivocation is genuine compromise.
+        let (fdr, a) = (Dev::new(1), Dev::new(2));
+        let mut f = Fixture::genesis(&fdr);
+        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        // A removes the founder (A's seq 0), then equivocates its OWN removal at A's seq 1.
+        let remove_f =
+            f.author(&a, Some(add_a), &device_remove(&fdr, Cut::At { seq: 1, hash: add_a }));
+        let self_x = f.author_forked(
+            &a,
+            Some(add_a),
+            &device_remove(&a, Cut::At { seq: 5, hash: [0xc1; 32] }),
+            1,
+            Some(remove_f),
+        );
+        let self_y = f.author_forked(
+            &a,
+            Some(add_a),
+            &device_remove(&a, Cut::At { seq: 5, hash: [0xc2; 32] }),
+            1,
+            Some(remove_f),
+        );
+        let _ = (self_x, self_y);
+
+        let h = f.fold();
+        assert_eq!(
+            h.classification(),
+            AccountClassification::Contested { state_before_depth: 1 },
+            "an owner's self-removal equivocation is owner-key compromise (§12)",
+        );
+        for rot in 0..f.entries.len() {
+            assert_eq!(
+                f.fold_rotated(rot).classification(),
+                AccountClassification::Contested { state_before_depth: 1 },
+                "rotation {rot}: deterministic — no vacuous-survivor lottery (I9)",
+            );
+        }
     }
 
     #[test]
