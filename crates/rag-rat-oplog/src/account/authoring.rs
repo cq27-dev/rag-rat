@@ -246,11 +246,13 @@ mod tests {
         conn
     }
 
-    /// Count the account's `StreamOwn` candidate rows — the idempotency witness.
+    /// Count the account's `StreamOwn` candidate rows — the idempotency witness. Gated on
+    /// `log_id == CONTROL_LOG` (S-f): a fresh-numbered secrets tag colliding with the 6 number must
+    /// not inflate this witness.
     fn stream_own_count(conn: &Connection) -> i64 {
         conn.query_row(
-            "SELECT COUNT(*) FROM account_entries WHERE entry_type = ?1",
-            params![ops::entry_type::STREAM_OWN],
+            "SELECT COUNT(*) FROM account_entries WHERE entry_type = ?1 AND log_id = ?2",
+            params![ops::entry_type::STREAM_OWN, crate::account::fold::CONTROL_LOG],
             |row| row.get(0),
         )
         .unwrap()

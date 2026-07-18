@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
-use super::{AccountId, content, fold};
+use super::{AccountId, content, fold, secrets};
 use crate::cbor;
 use crate::device::DevicePublic;
 use crate::op::DeviceFingerprint;
@@ -426,6 +426,19 @@ pub fn owner_secrets_authority(
     owner_chain_authority(conn, account_id, owner_id, device_fingerprint, "secrets")
 }
 
+/// The body of [`owner_secrets_authority`], reading whatever snapshot `conn` is already in — the
+/// secrets refold (C4.2b) resolves every wrap's owner-incarnation authority inside its own txn and
+/// cannot call the wrapper above, which would try to `BEGIN` a second one (S1; mirrors
+/// [`stream_owner_effective_in_snapshot`]).
+pub fn owner_secrets_authority_in_snapshot(
+    conn: &Connection,
+    account_id: AccountId,
+    owner_id: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
+    owner_chain_authority_in_snapshot(conn, account_id, owner_id, device_fingerprint, "secrets")
+}
+
 fn owner_chain_authority(
     conn: &Connection,
     account_id: AccountId,
@@ -434,7 +447,17 @@ fn owner_chain_authority(
     chain: &str,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    let conn: &Connection = &read_tx;
+    owner_chain_authority_in_snapshot(&read_tx, account_id, owner_id, device_fingerprint, chain)
+}
+
+/// The body of [`owner_chain_authority`], reading whatever snapshot `conn` is already in.
+fn owner_chain_authority_in_snapshot(
+    conn: &Connection,
+    account_id: AccountId,
+    owner_id: EntryHash,
+    device_fingerprint: DeviceFingerprint,
+    chain: &str,
+) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     let sql = format!(
         "SELECT o.device_fingerprint, o.effective_at, o.closed_at,
                 o.{chain}_boundary, o.{chain}_seq, o.{chain}_hash,
@@ -940,6 +963,13 @@ pub(super) fn refold_in_tx(
         statuses.insert(row.entry_hash, status);
     }
     rewrite_authority_projection(tx, account_id, &projection.history)?;
+    // Re-derive secrets-log (log 1) acceptance from the just-rewritten authority projection, in
+    // this SAME txn (§15, C4.2b). The main loop above wrote `retained_unfolded` for every log-1
+    // row (the declassify baseline); this pass OVERWRITES that — in both `account_entry_status`
+    // and the returned `statuses` map (S4) — for the wraps it classifies. Same-txn placement is
+    // what makes a control fold that condemns a device's secrets chain retro-condemn its wraps
+    // atomically.
+    super::secrets::refold_secrets_log(tx, account_id, &mut statuses)?;
     // Authority just changed, so content acceptance can change with it: re-evaluate every stream
     // this account's authority reaches (§13). Same txn as the projection rewrite ⇒ a revocation
     // retro-condemns accepted content atomically, and content that arrived before its owner's
@@ -1349,13 +1379,18 @@ fn stored_device_pubkeys(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<HashMap<DeviceFingerprint, [u8; 32]>> {
+    // Gated on `log_id == CONTROL_LOG` (S3): only control-log genesis / DeviceAdd carry device
+    // keys. A secrets-log tag reusing the 0/1 numbers must not be decoded here as a key
+    // certificate.
     let mut stmt = conn.prepare(
-        "SELECT signed_bytes FROM account_entries WHERE account_id = ?1 AND entry_type IN (?2, ?3)",
+        "SELECT signed_bytes FROM account_entries
+         WHERE account_id = ?1 AND log_id = ?2 AND entry_type IN (?3, ?4)",
     )?;
     let rows = stmt
         .query_map(
             params![
                 account_id.to_bytes().as_slice(),
+                fold::CONTROL_LOG,
                 ops::entry_type::ACCOUNT_GENESIS,
                 ops::entry_type::DEVICE_ADD,
             ],
@@ -1569,12 +1604,23 @@ fn delete_pre_verify(conn: &Connection, signed_hash: &[u8]) -> rusqlite::Result<
     Ok(())
 }
 
+/// A genesis op — gated on `log_id == CONTROL_LOG` (S3) so a secrets-log tag reusing the 0 number
+/// can never be mistaken for `AccountGenesis` (pre-verify / device-key promotion).
 fn is_genesis(header: &AccountEntryHeader) -> bool {
-    header.entry_type == ops::entry_type::ACCOUNT_GENESIS
+    header.log_id == fold::CONTROL_LOG && header.entry_type == ops::entry_type::ACCOUNT_GENESIS
 }
 
 fn is_current_control_plaintext(header: &AccountEntryHeader) -> bool {
     header.log_id == fold::CONTROL_LOG
+        && header.crypto_suite == 0
+        && header.op_version == fold::SUPPORTED_OP_VERSION
+}
+
+/// The secrets-log analog of [`is_current_control_plaintext`]: a current-version plaintext entry on
+/// `log_id == SECRETS_LOG`. Its payload is a secrets op, structurally validated by the secrets
+/// twin.
+fn is_current_secrets_plaintext(header: &AccountEntryHeader) -> bool {
+    header.log_id == fold::SECRETS_LOG
         && header.crypto_suite == 0
         && header.op_version == fold::SUPPORTED_OP_VERSION
 }
@@ -1589,6 +1635,12 @@ fn validate_storable_header_payload(
         ops::decode(header.entry_type, payload)
             .map_err(|err| format!("op payload decode failed: {err}"))?;
         validate_genesis_binding(header, payload)?;
+    } else if is_current_secrets_plaintext(header) {
+        // The secrets-plaintext twin (C4.2b): a known secrets tag is fully validated, an unknown
+        // tag is retained opaque. A future-version / sealed secrets entry falls through
+        // unvalidated (it is slot-eligible, folded by a newer binary).
+        secrets::validate_storable_secrets_payload(header.entry_type, payload)
+            .map_err(|err| format!("secrets op payload decode failed: {err}"))?;
     }
     Ok(())
 }
@@ -1613,8 +1665,11 @@ fn validate_genesis_binding(header: &AccountEntryHeader, payload: &[u8]) -> Resu
     }
 }
 
+/// A DeviceAdd op — gated on `log_id == CONTROL_LOG` (S3) so a secrets-log tag reusing the 1 number
+/// can never spuriously trigger the device-key promotion path.
 fn is_device_add(verified: &VerifiedAccountEntry) -> bool {
-    verified.header.entry_type == ops::entry_type::DEVICE_ADD
+    verified.header.log_id == fold::CONTROL_LOG
+        && verified.header.entry_type == ops::entry_type::DEVICE_ADD
 }
 
 /// A stored fixed-width blob as an array (errors, never panics, on a wrong-length value).
@@ -3970,6 +4025,42 @@ mod tests {
         let founder = Dev::new(1);
         let (acct, gbytes, gh) = genesis(&founder);
         account_ingest(&conn, &gbytes, NOW).unwrap();
+        // A log-1 entry carrying the control DEVICE_ADD tag: on the SECRETS log that number is an
+        // unknown secrets tag, so the control DEVICE_ADD schema is never applied. C4.2b's secrets
+        // twin DOES validate log-1 plaintext at ingest, but only as one canonical CBOR item (the
+        // same opaque-retention rule as an unknown control tag) — a canonical payload is retained
+        // `retained_unfolded`, never decoded against any op schema.
+        let header = AccountEntryHeader {
+            account_id: acct,
+            log_id: 1,
+            device_fingerprint: founder.fp,
+            seq: 1,
+            prev_hash: Some(gh),
+            parent_ref: None,
+            entry_type: ops::entry_type::DEVICE_ADD,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: Some(gh),
+        };
+        let signed = sign_account_entry(&founder.secret, &header, &[0x80]).unwrap();
+        assert_eq!(
+            account_ingest(&conn, &signed.signed_bytes, NOW).unwrap(),
+            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_secrets_plaintext_payload_is_rejected_at_ingest() {
+        // The secrets twin (C4.2b) rejects a non-canonical log-1 plaintext payload at ingest,
+        // exactly as an unknown control tag with a non-canonical payload is rejected — a
+        // cross-version consensus split on a signed log is the hazard the canonicity rule
+        // closes.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        account_ingest(&conn, &gbytes, NOW).unwrap();
         let header = AccountEntryHeader {
             account_id: acct,
             log_id: 1,
@@ -3985,10 +4076,14 @@ mod tests {
             authority_ref: Some(gh),
         };
         let signed = sign_account_entry(&founder.secret, &header, &[0xff, 0x00]).unwrap();
-        assert_eq!(
-            account_ingest(&conn, &signed.signed_bytes, NOW).unwrap(),
-            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+        assert!(
+            matches!(
+                account_ingest(&conn, &signed.signed_bytes, NOW).unwrap(),
+                IngestOutcome::Rejected(_)
+            ),
+            "a non-canonical secrets plaintext payload is a structural reject",
         );
+        assert_eq!(status(&conn, &signed.entry_hash), None, "a rejected entry is not stored");
     }
 
     #[test]

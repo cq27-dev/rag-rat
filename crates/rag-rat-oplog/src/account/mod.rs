@@ -30,6 +30,9 @@ mod keywrap;
 mod limits;
 mod ops;
 mod registers;
+// C4.2b: the account secrets log (`log_id = 1`) — the `StreamKeyWrap` op + owner-gated acceptance
+// evaluator, consuming the control fold's authority projection (#607).
+mod secrets;
 mod storage;
 
 // The in-tx `/2`-ownership ensure seam + the two read-only `/2`-stream resolvers (C3.4b-ii, #676):

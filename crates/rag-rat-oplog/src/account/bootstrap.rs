@@ -277,9 +277,11 @@ mod tests {
     }
 
     fn genesis_row_count(conn: &Connection) -> i64 {
+        // Gated on `log_id == CONTROL_LOG` (S-f): a fresh-numbered secrets tag colliding with the 0
+        // number must not inflate this witness.
         conn.query_row(
-            "SELECT COUNT(*) FROM account_entries WHERE entry_type = ?1",
-            params![ops::entry_type::ACCOUNT_GENESIS],
+            "SELECT COUNT(*) FROM account_entries WHERE entry_type = ?1 AND log_id = ?2",
+            params![ops::entry_type::ACCOUNT_GENESIS, crate::account::fold::CONTROL_LOG],
             |row| row.get(0),
         )
         .unwrap()
