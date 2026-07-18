@@ -7,7 +7,7 @@
 //! Versions are reported as opaque strings; comparison is a lenient numeric semver (`major.minor.
 //! patch`, pre-release/build stripped) — if either side won't parse, no update is claimed.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -47,28 +47,16 @@ pub struct CachedVersion {
     pub checked_at_ms: i64,
 }
 
-/// Where the version-check cache lives: next to the index DB (under the gitignored, floor-skipped
-/// `.rag-rat/`), so it's per-project and never indexed.
-pub fn cache_path(database: &Path) -> PathBuf {
-    database.parent().unwrap_or_else(|| Path::new(".")).join("version-check.json")
-}
-
-/// Read the cached crates.io result, or `None` when absent/unreadable/corrupt (all fail-open).
+/// Read the cached crates.io result, or `None` when never checked (fail-open). The value lives in
+/// the combined sidecar store (#752), `.rag-rat/mcp-state.json`, alongside other MCP signals.
 pub fn read_cache(database: &Path) -> Option<CachedVersion> {
-    let text = std::fs::read_to_string(cache_path(database)).ok()?;
-    serde_json::from_str(&text).ok()
+    crate::sidecar_state::read_version_cache(database)
 }
 
-/// Persist a fresh crates.io result. Best-effort: a write error is swallowed (the next refresh
-/// retries), never surfaced.
+/// Persist a fresh crates.io result into the combined sidecar store (preserving other sections).
+/// Best-effort: a write error is swallowed (the next refresh retries), never surfaced.
 fn write_cache(database: &Path, cached: &CachedVersion) {
-    let path = cache_path(database);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string(cached) {
-        let _ = std::fs::write(path, json);
-    }
+    crate::sidecar_state::write_version_cache(database, cached);
 }
 
 /// Build the agent/operator-facing status from the current version and the last cached check.
@@ -290,7 +278,10 @@ mod tests {
             read_cache(&database),
             Some(CachedVersion { latest_version: "0.7.1".into(), checked_at_ms: 42 })
         );
-        assert_eq!(cache_path(&database), dir.join(".rag-rat").join("version-check.json"));
+        assert_eq!(
+            crate::sidecar_state::state_path(&database),
+            dir.join(".rag-rat").join("mcp-state.json")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

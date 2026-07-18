@@ -15,6 +15,13 @@ use crate::graph::{self, GraphHop, GraphResolutionMode, GraphTraversalOptions};
 use crate::memory::{self, CompactRepoMemoryEvidence, RepoMemoryEvidence};
 use crate::symbol::SymbolHit;
 
+/// The always-present impact/graph disclaimer: tree-sitter evidence is syntactic, not
+/// compiler-grade. Exposed as a const so the MCP output layer can recognize it and throttle the
+/// repeat per agent (#752) — it is the same string every call, so an agent only needs it once in a
+/// while.
+pub const GRAPH_SYNTACTIC_CAVEAT: &str =
+    "Graph evidence is tree-sitter/syntactic, not compiler-grade name resolution.";
+
 /// An FTS5 phrase query for `needle` (a symbol name / qualified name / path), or `None` when it has
 /// no alphanumeric token. Used to find chunks that MENTION the needle through the `chunk_fts` index
 /// instead of a raw `chunks.text LIKE '%needle%'` full-table scan — same intent, but tokenized +
@@ -279,9 +286,7 @@ pub fn impact_surface_report_for_symbol(
             false,
         )
     };
-    let mut caveats = vec![
-        "Graph evidence is tree-sitter/syntactic, not compiler-grade name resolution.".to_string(),
-    ];
+    let mut caveats = vec![GRAPH_SYNTACTIC_CAVEAT.to_string()];
     if options.resolution_mode == GraphResolutionMode::Exact
         && direct_semantic_callers.is_empty()
         && !text_fallback_hits.is_empty()

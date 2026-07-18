@@ -285,12 +285,7 @@ pub fn traversal_summary(
         if summary.completeness_risk == "low" {
             summary.completeness_risk = "medium".to_string();
         }
-        summary.completeness_note = Some(
-            "no static callers found; a static call graph can't see callers reached via \
-             message/enum dispatch, dynamic dispatch, trait objects, FFI, or reflection, nor \
-             external/entry-point callers — 0 may be incomplete"
-                .to_string(),
-        );
+        summary.completeness_note = Some(super::NO_STATIC_CALLERS_NOTE.to_string());
     }
     Ok(summary)
 }

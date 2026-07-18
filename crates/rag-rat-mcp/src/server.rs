@@ -14,6 +14,11 @@ use tokio::sync::Semaphore;
 
 use crate::blocking::{self, ToolTimeoutPolicy};
 
+/// How often the stale-anchor rebind nudge may ride a tool result across the fleet (#752): once per
+/// 30 minutes, unless a `memory_create`/`memory_update` forces it. Keeps the nudge off the vast
+/// majority of tool calls so it stops inflating per-call tokens.
+const NUDGE_TTL_MS: i64 = 30 * 60 * 1000;
+
 #[derive(Clone)]
 pub struct RagRatService {
     /// `None` ⇒ DORMANT: the server was launched outside any rag-rat repo (no `rag-rat.toml` at or
@@ -30,6 +35,10 @@ pub struct RagRatService {
     #[cfg(unix)]
     inflight: std::sync::Arc<crate::upgrade::Inflight>,
     tool_workers: Arc<Semaphore>,
+    /// Per-agent (= per process) record of meta this session already saw — drive-by memories and
+    /// static caveats — so re-surfacing them can be trimmed (#752). An `Arc` so every `Clone` of
+    /// the service (each tool call clones it) shares one seen-set for the whole session.
+    agent_seen: Arc<crate::output_trim::AgentSeen>,
 }
 
 impl RagRatService {
@@ -57,6 +66,7 @@ impl RagRatService {
             #[cfg(unix)]
             inflight: crate::upgrade::Inflight::new(),
             tool_workers: Arc::new(Semaphore::new(blocking::tool_workers())),
+            agent_seen: Arc::new(crate::output_trim::AgentSeen::default()),
         }
     }
 
@@ -82,8 +92,17 @@ impl RagRatService {
             }
             return Ok(self.dormant_tool_result());
         };
-        let value = crate::tools::call_tool_for_config(config, name, value)
+        let mut value = crate::tools::call_tool_for_config(config, name, value)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
+        // Trim repeated meta to cut per-call tokens (#752): dedup drive-by memories this agent
+        // already saw (to a tiny stub), throttle the static caveats, drop redundant per-edge flags.
+        // TOON-only — it is a lossy transform (stubs a memory, drops default-valued fields), so it
+        // stays off `--json` mode, whose whole purpose is stable, complete shapes for programmatic
+        // clients (same reason the prose nudge is JSON-suppressed). And NEVER on the explicit
+        // `memory_*` tools — there the agent asked for the memory, so it gets it in full.
+        if self.output_format != rag_rat_core::OutputFormat::Json && !name.starts_with("memory_") {
+            crate::output_trim::trim_result(&mut value, &self.agent_seen);
+        }
         // MCP tool results are text content read by an LLM, so render TOON by default — it is
         // materially denser than JSON on the uniform-row payloads that dominate these tools, and
         // ties JSON on nested ones. `render` falls back to compact JSON on a TOON encode error, so
@@ -91,7 +110,7 @@ impl RagRatService {
         // (the format is chosen once at launch; MCP has no per-call flag).
         let text = rag_rat_core::render(&value, self.output_format);
         let mut content = vec![Content::text(text)];
-        if let Some(nudge) = self.stale_memory_nudge() {
+        if let Some(nudge) = self.stale_memory_nudge(name) {
             content.push(Content::text(nudge));
         }
         Ok(CallToolResult::success(content))
@@ -121,12 +140,17 @@ impl RagRatService {
     /// the UI/logs but NOT the model's context (anthropics/claude-code#3174) — so a tool result is
     /// the one MCP-native channel that puts an actionable signal in front of the model. The nudge
     /// self-limits: once the agent runs `memory_rebind`, the count drops to 0 and it stops showing.
-    /// Best-effort + lock-free (a bare read-only count), so it never slows or fails a tool call.
+    ///
+    /// THROTTLED (#752) to cut per-call tokens: it rides at most once per [`NUDGE_TTL_MS`] across
+    /// the fleet (a shared last-shown timestamp in the sidecar store, claimed atomically so
+    /// concurrent sessions don't both show), EXCEPT right after a `memory_create` /
+    /// `memory_update` — the agent just touched memory, so a freshly-needed rebind is worth
+    /// surfacing on that call regardless.
     ///
     /// Suppressed in `--json` mode: that mode exists for clients that parse the tool text AS JSON
     /// (or concatenate all text blocks), and a prose block would break them. The nudge is
     /// agent-directed prose, meaningful only in the default TOON (LLM-facing) mode.
-    fn stale_memory_nudge(&self) -> Option<String> {
+    fn stale_memory_nudge(&self, tool: &str) -> Option<String> {
         // No nudge in dormant mode (no index to read) or in `--json` mode (prose breaks JSON
         // clients).
         let config = self.config.as_ref()?;
@@ -134,14 +158,27 @@ impl RagRatService {
             return None;
         }
         let n = rag_rat_core::memory_attention_count(&config.database);
-        (n > 0).then(|| {
-            let noun = if n == 1 { "memory" } else { "memories" };
-            format!(
-                "rag-rat: {n} active repo {noun} have stale/gone anchors. Call `memory_doctor` to \
-                 list them with suggested re-anchor targets, then `memory_rebind` to fix — so \
-                 source-anchored memory stays trustworthy for the next agent."
-            )
-        })
+        if n == 0 {
+            return None;
+        }
+        // A memory create/update forces the nudge (and resets the window); everything else is gated
+        // on the shared throttle. The slot is claimed atomically — a `false` return means either
+        // throttled or another session just claimed it, so this call stays silent.
+        let force = matches!(tool, "memory_create" | "memory_update");
+        if !rag_rat_core::sidecar_state::take_memory_nudge_slot(
+            &config.database,
+            rag_rat_base::time::now_ms(),
+            NUDGE_TTL_MS,
+            force,
+        ) {
+            return None;
+        }
+        let noun = if n == 1 { "memory" } else { "memories" };
+        Some(format!(
+            "rag-rat: {n} active repo {noun} have stale/gone anchors. Call `memory_doctor` to \
+             list them with suggested re-anchor targets, then `memory_rebind` to fix — so \
+             source-anchored memory stays trustworthy for the next agent."
+        ))
     }
 
     /// The result every tool call returns while the server is DORMANT (launched outside any rag-rat
@@ -613,10 +650,11 @@ mod tests {
         );
     }
 
-    /// The staleness nudge (#160) rides a TOON tool result as a second content block, but is
-    /// SUPPRESSED in `--json` mode so JSON-parsing clients aren't broken (Codex #160 review).
+    /// The staleness nudge (#160) rides a TOON tool result as a second content block, SUPPRESSED in
+    /// `--json` mode (Codex #160 review), and THROTTLED (#752) to at most once per window across
+    /// the fleet — except a `memory_create`/`memory_update` forces it (and resets the window).
     #[test]
-    fn stale_memory_nudge_rides_toon_but_not_json() {
+    fn stale_memory_nudge_throttles_forces_and_suppresses_json() {
         let (root, config) = config_over_temp_repo();
         // A memory bound to an unindexed/absent path resolves `gone` → drift the nudge reports.
         let toon = RagRatService::new(config.clone(), OutputFormat::Toon);
@@ -636,14 +674,95 @@ mod tests {
         toon.call("memory_validate", json!({})).unwrap();
         toon.call("memory_validate", json!({})).unwrap();
 
-        // TOON (default, LLM-facing): nudge present as a second block.
-        let toon_result = toon.call("index_status", json!({})).unwrap();
-        assert_eq!(toon_result.content.len(), 2, "TOON result carries the nudge block");
-
-        // JSON mode: suppressed (single parseable block).
+        // JSON mode NEVER shows the prose nudge (would break JSON-parsing clients).
         let json_svc = RagRatService::new(config, OutputFormat::Json);
-        let json_result = json_svc.call("index_status", json!({})).unwrap();
-        assert_eq!(json_result.content.len(), 1, "JSON result omits the prose nudge");
+        assert!(json_svc.stale_memory_nudge("index_status").is_none(), "JSON suppresses the nudge");
+
+        // A memory_create FORCES the nudge regardless of the throttle window, and proves it rides a
+        // real TOON tool result as a second content block. (n stays > 0 — this new binding is
+        // `current`, the original one is still `gone`.)
+        let forced = toon
+            .call(
+                "memory_create",
+                json!({
+                    "kind": "Decision", "title": "another", "body": "b", "confidence": "high",
+                    "bind": {"path": "also/absent.rs"}
+                }),
+            )
+            .unwrap();
+        assert_eq!(forced.content.len(), 2, "a forced nudge rides the tool result as a 2nd block");
+
+        // Immediately after — within the window — a plain read tool is THROTTLED (nudge
+        // suppressed).
+        assert!(
+            toon.stale_memory_nudge("semantic_search").is_none(),
+            "throttled inside the window",
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #752 end-to-end: in TOON (LLM-facing) mode a repo memory riding a DRIVE-BY result
+    /// (symbol_lookup) is full on first surface and STUBBED on re-show within the session, while an
+    /// EXPLICIT `memory_*` tool is never trimmed. JSON mode is UNTRIMMED even on repeat, so
+    /// programmatic clients keep stable, complete shapes (Codex #752 review).
+    #[test]
+    fn drive_by_memories_dedup_in_toon_but_json_mode_is_untrimmed() {
+        fn text_of(result: &CallToolResult) -> String {
+            result.content[0].as_text().unwrap().text.clone()
+        }
+        fn call_json(svc: &RagRatService, tool: &str, args: Value) -> Value {
+            serde_json::from_str(&text_of(&svc.call(tool, args).unwrap())).unwrap()
+        }
+
+        let (root, config) = config_over_temp_repo(); // indexes `open_database`
+        let lookup_args = json!({"symbol": "open_database", "allow_ambiguous": true});
+        const ELIDED: &str = "already surfaced this session";
+
+        // Setup on a JSON service (results parse cleanly): resolve the symbol, bind a memory to it
+        // so it rides drive-by results. The anchor is `current` (real indexed symbol) → no nudge.
+        let json_svc = RagRatService::new(config.clone(), OutputFormat::Json);
+        let lookup = call_json(&json_svc, "symbol_lookup", lookup_args.clone());
+        let sym_id = lookup["candidates"][0]["id"].as_str().unwrap().to_string();
+        let created = call_json(
+            &json_svc,
+            "memory_create",
+            json!({
+                "kind": "Invariant", "title": "db open invariant",
+                "body": "a distinctive memory body", "confidence": "high",
+                "bind": {"id": sym_id.clone()}
+            }),
+        );
+        let mem_id = created["memory"]["memory_id"].as_str().unwrap().to_string();
+
+        // TOON: first surface carries the full memory (no stub marker); the re-show is stubbed —
+        // the `elided` marker appears, id + title stay. (A fresh service = a fresh per-agent
+        // seen-set.)
+        let toon = RagRatService::new(config.clone(), OutputFormat::Toon);
+        let first = text_of(&toon.call("symbol_lookup", lookup_args.clone()).unwrap());
+        assert!(first.contains(&mem_id), "the memory rides the first drive-by result");
+        assert!(!first.contains(ELIDED), "first TOON surface is the full memory, not a stub");
+        let second = text_of(&toon.call("symbol_lookup", lookup_args.clone()).unwrap());
+        assert!(second.contains(ELIDED), "re-shown drive-by memory is stubbed with a fetch hint");
+        assert!(
+            second.contains(&mem_id) && second.contains("db open invariant"),
+            "the stub keeps the id and title",
+        );
+
+        // An EXPLICIT memory tool is NEVER trimmed — even though this agent already saw the memory
+        // via the drive-by surfaces above, `memory_for_symbol` returns it in full, not a stub.
+        let explicit =
+            text_of(&toon.call("memory_for_symbol", json!({"id": sym_id.clone()})).unwrap());
+        assert!(explicit.contains(&mem_id), "the explicit memory tool returns the memory");
+        assert!(!explicit.contains(ELIDED), "the explicit memory tool is not stubbed");
+
+        // JSON mode is UNTRIMMED even on repeat: the drive-by memory keeps its full shape, no stub.
+        for _ in 0..2 {
+            let v = call_json(&json_svc, "symbol_lookup", lookup_args.clone());
+            let m = &v["candidates"][0]["memories"][0];
+            assert_eq!(m["memory_id"].as_str(), Some(mem_id.as_str()));
+            assert!(m["elided"].is_null(), "JSON mode never stubs a drive-by memory");
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }

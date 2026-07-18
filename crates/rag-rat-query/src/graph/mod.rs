@@ -110,6 +110,13 @@ pub struct GraphTraversalSummary {
     pub completeness_note: Option<String>,
 }
 
+/// The `find_callers`-found-zero completeness note (#200). A const so the MCP output layer can
+/// recognize this always-identical string and throttle the repeat per agent (#752).
+pub const NO_STATIC_CALLERS_NOTE: &str = "no static callers found; a static call graph can't see \
+                                          callers reached via message/enum dispatch, dynamic \
+                                          dispatch, trait objects, FFI, or reflection, nor \
+                                          external/entry-point callers — 0 may be incomplete";
+
 #[derive(Debug, Default, Serialize)]
 pub struct GraphCoverage {
     pub indexed_files: u64,

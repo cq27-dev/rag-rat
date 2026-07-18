@@ -346,10 +346,15 @@ fn enum_like_tool_args_reject_unknown_values_during_decoding() {
 fn index_status_surfaces_version_when_cached_and_enabled() {
     let (root, config) = mixed_config();
     IndexDatabase::rebuild(&config).unwrap();
-    // Seed a clearly-newer cached crates.io result next to the index (cache_path is public; the
-    // network refresh that normally writes this is out of band).
-    let cache = rag_rat_core::version_check::cache_path(&config.database);
-    std::fs::write(&cache, r#"{"latest_version":"99.0.0","checked_at_ms":1}"#).unwrap();
+    // Seed a clearly-newer cached crates.io result into the combined sidecar store (the network
+    // refresh that normally writes this is out of band).
+    rag_rat_core::sidecar_state::write_version_cache(
+        &config.database,
+        &rag_rat_core::version_check::CachedVersion {
+            latest_version: "99.0.0".into(),
+            checked_at_ms: 1,
+        },
+    );
 
     let status = call_tool_for_config(&config, "index_status", json!({})).unwrap();
     let version = status.get("version").expect("index_status surfaces a version field");

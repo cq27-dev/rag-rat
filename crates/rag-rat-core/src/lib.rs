@@ -6,6 +6,7 @@ pub(crate) mod memory_write;
 pub mod output;
 pub mod query;
 pub mod search;
+pub mod sidecar_state;
 pub mod version_check;
 pub mod watch;
 
