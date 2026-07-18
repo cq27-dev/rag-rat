@@ -636,9 +636,9 @@ pub(crate) fn clear_edge_oracle_for_tool(
               AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
               AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
               AND ek.value = edge_oracle.edge_kind
-              AND edges_data.resolution_id <> COALESCE(
-                  (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
-              )
+              -- Materialized visibility (#734): a suppressed candidate is not a live oracle
+              -- edge, so its content twin must not anchor a verdict here.
+              AND edges_data.hidden = 0
               AND {scope}
           )
         ",
@@ -1442,9 +1442,9 @@ pub(crate) fn prune_edge_oracle_without_live_edge(conn: &Connection) -> anyhow::
               AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
               AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
               AND ek.value = edge_oracle.edge_kind
-              AND edges_data.resolution_id <> COALESCE(
-                  (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
-              )
+              -- Materialized visibility (#734): a suppressed candidate does not keep a
+              -- dangling verdict alive.
+              AND edges_data.hidden = 0
         ){repo_clause}
         "
         ),

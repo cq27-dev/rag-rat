@@ -2054,10 +2054,14 @@ fn migration_068_hides_suppressed_edge_candidates() {
             |row| row.get(0),
         )
         .unwrap();
+    // The current view filters on the materialized `hidden` flag (V075); the pre-V068 view had
+    // only the dispatch-fact exclusion, evaluated inline. Reconstruct that shape so the row (a
+    // suppressed `uses_macro` candidate) is visible before the upgrade.
     let v67_view = current_view.replace(
-        "\n        AND d.resolution_id <> COALESCE(\n            (SELECT id FROM name_strings \
-         WHERE value = 'suppressed'), -1\n        )",
-        "",
+        "WHERE d.hidden = 0",
+        "WHERE d.edge_kind_id NOT IN (
+            SELECT id FROM name_strings WHERE value IN ('dispatch_construct', 'dispatch_handle')
+        )",
     );
     assert_ne!(v67_view, current_view, "fixture must remove the V068 public-edge filter");
     conn.execute_batch("DROP VIEW edges;").unwrap();
@@ -2688,14 +2692,21 @@ fn migration_073_backfills_state_normalized_from_the_provider_truthful_pair() {
 }
 
 #[test]
-fn migration_074_is_the_tip_and_refreshes_the_edges_view() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 74, "move this pin with the next schema migration");
+fn migration_074_refreshes_the_edges_view() {
+    // The absolute-tip pin moved to `migration_075_*` (V075 is the tip now); this drops to the
+    // symbolic `current_version == LATEST` freshness check, per the ladder convention.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply",
+    );
 
     // A DB that migrated through V068-V073 carries the ORIGINAL view text (per-row
-    // `NOT IN (SELECT ...)` suppressed-edge probe). Simulate it: swap the scalar clause back to
-    // the old form, truncate the ledger to V073, and seed one suppressed candidate.
+    // `NOT IN (SELECT ...)` suppressed-edge probe). Simulate it: swap the current materialized
+    // WHERE back to the historical inline predicates, truncate the ledger to V073, and seed one
+    // suppressed candidate.
     let current_view: String = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'edges'",
@@ -2704,10 +2715,13 @@ fn migration_074_is_the_tip_and_refreshes_the_edges_view() {
         )
         .unwrap();
     let old_view = current_view.replace(
-        "AND d.resolution_id <> COALESCE(\n            (SELECT id FROM name_strings WHERE value = \
-         'suppressed'), -1\n        )",
-        "AND d.resolution_id NOT IN (\n            SELECT id FROM name_strings WHERE value = \
-         'suppressed'\n        )",
+        "WHERE d.hidden = 0",
+        "WHERE d.edge_kind_id NOT IN (
+            SELECT id FROM name_strings WHERE value IN ('dispatch_construct', 'dispatch_handle')
+        )
+        AND d.resolution_id NOT IN (
+            SELECT id FROM name_strings WHERE value = 'suppressed'
+        )",
     );
     assert_ne!(old_view, current_view, "fixture must reconstruct the pre-V074 clause");
     conn.execute(
@@ -2735,9 +2749,11 @@ fn migration_074_is_the_tip_and_refreshes_the_edges_view() {
             |row| row.get(0),
         )
         .unwrap();
+    // The V074 refresh runs inside the same forward pass as V075, so the re-installed view is
+    // the current shape: the materialized flag, no inline membership probes.
     assert!(
-        refreshed_view.contains("<> COALESCE"),
-        "V074 re-installs the scalar suppressed-edge clause: {refreshed_view}"
+        refreshed_view.contains("WHERE d.hidden = 0"),
+        "the forward pass re-installs the materialized-visibility view: {refreshed_view}"
     );
     // Semantics preserved across the refresh: the suppressed candidate stays in edges_data for
     // the resolver but never surfaces through the compatibility view.
@@ -2755,4 +2771,103 @@ fn migration_074_is_the_tip_and_refreshes_the_edges_view() {
         )
         .unwrap();
     assert_eq!(v74_recorded, 1, "the forward migration records V074");
+}
+
+#[test]
+fn migration_075_materializes_edge_visibility() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 75, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    conn.execute(
+        "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id) VALUES ('App.swift', 'swift', 'source', 'sha', 0, 0, 'head', '')",
+        [],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    // One row per visibility class: a suppressed candidate, an internal dispatch FACT, and a
+    // public edge.
+    for (to_name, edge_kind, resolution) in [
+        ("Observable", "uses_macro", "suppressed"),
+        ("Msg::Start", "dispatch_construct", "unresolved"),
+        ("spawn_worker", "calls_name", "unresolved"),
+    ] {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution) VALUES \
+             (?1, ?2, ?3, 'NameOnly', ?4)",
+            rusqlite::params![file_id, to_name, edge_kind, resolution],
+        )
+        .unwrap();
+    }
+
+    // Simulate a pre-V075 DB: rows never carried the flag (zero it under the writers' backs) and
+    // the view still evaluates the V074 scalar clause inline. The backfill — not the insert
+    // trigger that already stamped these rows — must be what restores visibility.
+    conn.execute("UPDATE edges_data SET hidden = 0", []).unwrap();
+    let current_view: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'edges'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let v74_view = current_view.replace(
+        "WHERE d.hidden = 0",
+        "WHERE d.edge_kind_id NOT IN (
+            SELECT id FROM name_strings WHERE value IN ('dispatch_construct', 'dispatch_handle')
+        )
+        AND d.resolution_id <> COALESCE(
+            (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
+        )",
+    );
+    assert_ne!(v74_view, current_view, "fixture must reconstruct the V074 view shape");
+    truncate_schema_to(&conn, 74);
+    conn.execute_batch("DROP VIEW edges;").unwrap();
+    conn.execute_batch(&v74_view).unwrap();
+
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
+
+    // The backfill re-derives the flag from the kind/resolution predicates.
+    let hidden_for = |to_name: &str| -> i64 {
+        conn.query_row(
+            "SELECT hidden FROM edges_data
+             WHERE to_name_id = (SELECT id FROM name_strings WHERE value = ?1)",
+            [to_name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(hidden_for("Observable"), 1, "suppressed candidates backfill hidden");
+    assert_eq!(hidden_for("Msg::Start"), 1, "dispatch FACT rows backfill hidden");
+    assert_eq!(hidden_for("spawn_worker"), 0, "public edges stay visible");
+
+    // The refreshed view filters on the flag alone — the per-row kind/resolution machinery is
+    // gone from the read path (the point of the migration).
+    let refreshed_view: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'edges'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        refreshed_view.contains("WHERE d.hidden = 0"),
+        "V075 installs the materialized-visibility filter: {refreshed_view}"
+    );
+    let visible: Vec<String> = conn
+        .prepare("SELECT to_name FROM edges ORDER BY to_name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(visible, ["spawn_worker"], "only the public edge surfaces through the view");
+    let v75_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '075_edges_hidden_flag'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v75_recorded, 1, "the forward migration records V075");
 }

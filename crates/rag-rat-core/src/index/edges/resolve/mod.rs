@@ -330,10 +330,15 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             conn.prepare_cached(
                 "UPDATE edges_data
                  SET to_symbol_id = NULL, target_start_line = NULL, target_end_line = NULL,
-                     confidence_id = ?2, resolution_id = ?3
+                     confidence_id = ?2, resolution_id = ?3, hidden = ?4
                  WHERE id = ?1",
             )?
-            .execute(params![edge_id, confidence_id, resolution_id])?;
+            .execute(params![
+                edge_id,
+                confidence_id,
+                resolution_id,
+                edge_hidden_flag(&edge_kind, "unresolved"),
+            ])?;
             continue;
         }
         // The reference's byte position drives the module-aware covering test (#61).
@@ -390,19 +395,25 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             };
             // prepare_cached: one UPDATE per edge; cache the statement so the SQL compiles once per
             // connection instead of on every call.
+            let resolution = if suppressed { "suppressed" } else { "unresolved" };
             let confidence_id = interner.get(conn, confidence.as_str())?;
-            let resolution_id =
-                interner.get(conn, if suppressed { "suppressed" } else { "unresolved" })?;
+            let resolution_id = interner.get(conn, resolution)?;
             conn.prepare_cached(
                 "UPDATE edges_data
                  SET to_symbol_id = NULL,
                      target_start_line = NULL,
                      target_end_line = NULL,
                      confidence_id = ?2,
-                     resolution_id = ?3
+                     resolution_id = ?3,
+                     hidden = ?4
                  WHERE id = ?1",
             )?
-            .execute(params![edge_id, confidence_id, resolution_id])?;
+            .execute(params![
+                edge_id,
+                confidence_id,
+                resolution_id,
+                edge_hidden_flag(&edge_kind, resolution),
+            ])?;
             continue;
         };
         let confidence_id = interner.get(conn, confidence.as_str())?;
@@ -413,7 +424,8 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                  confidence_id = ?3,
                  target_start_line = ?4,
                  target_end_line = ?5,
-                 resolution_id = ?6
+                 resolution_id = ?6,
+                 hidden = ?7
              WHERE id = ?1",
         )?
         .execute(params![
@@ -423,6 +435,9 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             to_symbol_id.start_line,
             to_symbol_id.end_line,
             resolution_id,
+            // A re-resolved candidate un-hides (a previously suppressed Swift macro candidate
+            // whose target appears later); a resolved dispatch_handle FACT stays hidden.
+            edge_hidden_flag(&edge_kind, reason),
         ])?;
     }
     // #200: now that the dispatch FACT rows are resolved (handlers bound to symbols), synthesize
@@ -648,10 +663,10 @@ pub(crate) fn resolve_and_insert_edges(
                 callee_start_byte, callee_end_byte,
                 import_scope_start_byte, import_scope_end_byte, import_mod_id,
                 edge_kind_id, confidence_id,
-                to_symbol_id, target_start_line, target_end_line, resolution_id
+                to_symbol_id, target_start_line, target_end_line, resolution_id, hidden
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22)
+             ?18, ?19, ?20, ?21, ?22, ?23)
             ",
         )?
         .execute(params![
@@ -677,6 +692,7 @@ pub(crate) fn resolve_and_insert_edges(
             target_start_line,
             target_end_line,
             resolution_id,
+            edge_hidden_flag(candidate.edge_kind.as_str(), reason),
         ])?;
     }
     crate::index::mem_trace("edges: inserted, before index rebuild");

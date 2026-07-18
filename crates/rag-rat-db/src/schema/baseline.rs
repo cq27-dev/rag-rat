@@ -212,6 +212,11 @@ pub fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             import_mod_id INTEGER,
             edge_kind_id INTEGER NOT NULL,
             confidence_id INTEGER NOT NULL,
+            -- Materialized visibility (#734): 1 exactly when the row is not a public graph edge —
+            -- an internal dispatch FACT kind (#200) or a suppressed unresolved candidate (V068).
+            -- The `edges` view filters on `hidden = 0` (one integer compare per row); every
+            -- writer keeps the flag in lockstep with that predicate (see `edge_hidden_flag`).
+            hidden INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE,
             FOREIGN KEY(from_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL,
             FOREIGN KEY(to_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL

@@ -40,7 +40,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 74;
+pub const LATEST_SCHEMA_VERSION: u32 = 75;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -540,6 +540,13 @@ const MIGRATION_074_DESCRIPTION: &str =
      compare instead of a per-row NOT IN membership probe (the query_warm regression: the probe \
      taxed every per-hit graph-evidence query). Pure view DDL refresh via ensure_edges_view; no \
      data change";
+const MIGRATION_075_ID: &str = "075_edges_hidden_flag";
+const MIGRATION_075_CHECKSUM: &str = "sha256:rag-rat-edges-hidden-flag-v75";
+const MIGRATION_075_DESCRIPTION: &str =
+    "Materialize edge visibility as edges_data.hidden and filter the edges view on it (issue \
+     #734): visibility is decided once at write time instead of re-deriving the dispatch-fact + \
+     suppressed-candidate predicates on every view row. Adds the column, backfills it from the \
+     predicate the view WHERE used to evaluate, and refreshes the view via ensure_edges_view";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1175,6 +1182,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_074_CHECKSUM,
         description: MIGRATION_074_DESCRIPTION,
         apply: MigrationFn::Plain(apply_edges_view_scalar_suppression),
+    },
+    Migration {
+        id: MIGRATION_075_ID,
+        checksum: MIGRATION_075_CHECKSUM,
+        description: MIGRATION_075_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_edges_hidden_flag),
     },
 ];
 

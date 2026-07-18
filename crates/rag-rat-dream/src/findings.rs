@@ -184,9 +184,9 @@ pub(super) fn coverage_gap(conn: &Connection, limit: usize) -> anyhow::Result<Ve
         .prepare(
             "SELECT DISTINCT d.to_symbol_id FROM edges_data d JOIN files ON files.id = \
              d.source_file_id WHERE d.to_symbol_id IS NOT NULL AND d.from_symbol_id IS NOT NULL
-             AND d.resolution_id <> COALESCE(
-                 (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
-             )",
+             -- Materialized visibility (#734): only public graph edges mark a symbol as
+             -- depended-upon; suppressed candidates and dispatch FACT rows are not evidence.
+             AND d.hidden = 0",
         )?
         .query_map([], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<_>>()?;

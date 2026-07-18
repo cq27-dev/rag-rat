@@ -419,6 +419,7 @@ fn swift_suppresses_and_re_resolves_attached_macro_candidates() {
         .query_row("SELECT COUNT(*) FROM edges WHERE to_name = 'external'", [], |row| row.get(0))
         .unwrap();
     assert_eq!(freestanding_count, 1, "unresolved freestanding macros remain graph evidence");
+    assert_hidden_agrees_with_visibility(&conn);
 
     let observable = add_symbol_kind_language(
         &conn,
@@ -435,6 +436,7 @@ fn swift_suppresses_and_re_resolves_attached_macro_candidates() {
         })
         .unwrap();
     assert_eq!(resolved_macro, Some(observable), "a later macro definition must heal the edge");
+    assert_hidden_agrees_with_visibility(&conn);
 
     conn.execute("DELETE FROM symbols WHERE id = ?1", [observable]).unwrap();
     resolve_all_edges(&conn).unwrap();
@@ -442,6 +444,7 @@ fn swift_suppresses_and_re_resolves_attached_macro_candidates() {
         .query_row("SELECT COUNT(*) FROM edges WHERE to_name = 'Observable'", [], |row| row.get(0))
         .unwrap();
     assert_eq!(visible_after_removal, 0, "removing the macro must suppress the candidate again");
+    assert_hidden_agrees_with_visibility(&conn);
 }
 
 #[test]

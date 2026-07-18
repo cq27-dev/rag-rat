@@ -911,6 +911,27 @@ pub fn apply_edges_view_scalar_suppression(conn: &Connection) -> rusqlite::Resul
     ensure_edges_view(conn)
 }
 
+/// V075: materialize edge visibility as `edges_data.hidden` and filter the `edges` view on it.
+/// V074's scalar compare removed the per-row membership probe but still charged every view row a
+/// resolution-id comparison — measurable on the per-hit graph-evidence queries because they run
+/// per search hit. A stamped flag moves the classification to write time (each row's visibility
+/// is decided once, by the writer that knows it) and leaves the read side a single integer
+/// compare. The backfill mirrors the predicate the view WHERE used to evaluate: dispatch FACT
+/// kinds (#200) and suppressed unresolved candidates (V068). Idempotent — the ADD is guarded, the
+/// UPDATE only ever promotes `hidden = 0` rows the predicate says are invisible, and the view
+/// refresh is DROP + CREATE.
+pub fn apply_edges_hidden_flag(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges_data", "hidden", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute_batch(
+        "UPDATE edges_data SET hidden = 1
+         WHERE hidden = 0
+           AND (edge_kind_id IN (SELECT id FROM name_strings
+                                 WHERE value IN ('dispatch_construct', 'dispatch_handle'))
+                OR resolution_id IN (SELECT id FROM name_strings WHERE value = 'suppressed'));",
+    )?;
+    ensure_edges_view(conn)
+}
+
 pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     let legacy_table: Option<String> = conn
         .query_row(
@@ -930,6 +951,10 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "edges_data", "import_scope_start_byte", "INTEGER")?;
     add_column_if_missing(conn, "edges_data", "import_scope_end_byte", "INTEGER")?;
     add_column_if_missing(conn, "edges_data", "import_mod_id", "INTEGER")?;
+    // Same guarantee for the materialized visibility flag (V075): the view WHERE below references
+    // `d.hidden`, and this function runs at V020 — before V075 adds the column in the linear
+    // ladder. The V075 backfill then hides any pre-existing dispatch-fact/suppressed rows.
+    add_column_if_missing(conn, "edges_data", "hidden", "INTEGER NOT NULL DEFAULT 0")?;
     conn.execute_batch(
         "
         -- Recreate unconditionally: the view's definition evolves (e.g. the appended *_id
@@ -989,21 +1014,17 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
         LEFT JOIN name_strings res ON res.id = d.resolution_id
         LEFT JOIN name_strings ek ON ek.id = d.edge_kind_id
         LEFT JOIN name_strings conf ON conf.id = d.confidence_id
-        -- #200: the internal dispatch FACT rows (`dispatch_construct`/`dispatch_handle`) are \
-         inputs
-        -- to `synthesize_dispatch_edges`, NOT real edges — the handle fact duplicates the
-        -- dispatcher's existing `calls_name`. Hide them at the compatibility view so EVERY \
-         query-layer
-        -- reader (graph traversal, repo_brief, clusters, grep-augment, orientation, …) is
-        -- structurally safe without each remembering an exclusion; the synthesized `dispatches` \
-         edge
-        -- (a real edge) stays visible. Resolution + synthesis read `edges_data` directly, so they
-        -- still see the facts. Filter on the raw `edge_kind_id` (a one-time constant subselect) \
-         so the
-        -- planner keeps the indexed-id predicates, not a value-join string compare.
-        WHERE d.edge_kind_id NOT IN (
-            SELECT id FROM name_strings WHERE value IN ('dispatch_construct', 'dispatch_handle')
-        );
+        -- Visibility is MATERIALIZED (#734): the writers stamp `hidden = 1` on every row that is
+        -- not a public graph edge — the internal dispatch FACT kinds (#200: inputs to
+        -- `synthesize_dispatch_edges`, where the handle fact duplicates the dispatcher's existing
+        -- `calls_name`) and the suppressed unresolved candidates (V068). Filtering here keeps
+        -- EVERY query-layer reader (graph traversal, repo_brief, clusters, grep-augment,
+        -- orientation, …) structurally safe without each remembering an exclusion; the
+        -- synthesized `dispatches` edge (a real edge) stays visible, and resolution + synthesis
+        -- read `edges_data` directly so they still see the facts. A single integer compare per
+        -- row is the point: evaluating the kind/resolution predicates inline — even as scalar
+        -- subselects — taxed every per-hit graph-evidence query (the query_warm regression).
+        WHERE d.hidden = 0;
 
         -- Interning per column: `INSERT OR IGNORE` + `value NOT NULL` means a NULL string is
         -- silently skipped and its id subselect yields NULL — exactly the legacy nullability.
@@ -1023,7 +1044,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                 target_start_line, target_end_line, target_qualified_name_id, evidence,
                 receiver_hint_id, resolution_id, callee_start_byte, callee_end_byte,
                 import_scope_start_byte, import_scope_end_byte, import_mod_id,
-                edge_kind_id, confidence_id
+                edge_kind_id, confidence_id, hidden
             )
             VALUES (
                 NEW.id, NEW.source_file_id, NEW.from_symbol_id, NEW.to_symbol_id,
@@ -1040,7 +1061,11 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                 NEW.callee_start_byte, NEW.callee_end_byte,
                 NEW.import_scope_start_byte, NEW.import_scope_end_byte, NEW.import_mod_id,
                 (SELECT id FROM name_strings WHERE value = NEW.edge_kind),
-                (SELECT id FROM name_strings WHERE value = NEW.confidence)
+                (SELECT id FROM name_strings WHERE value = NEW.confidence),
+                -- The same visibility predicate the direct writers stamp (see the view WHERE).
+                CASE WHEN NEW.edge_kind IN ('dispatch_construct', 'dispatch_handle')
+                          OR COALESCE(NEW.resolution, 'unresolved') = 'suppressed'
+                     THEN 1 ELSE 0 END
             );
         END;
 
@@ -1075,7 +1100,11 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                 import_scope_end_byte = NEW.import_scope_end_byte,
                 import_mod_id = NEW.import_mod_id,
                 edge_kind_id = (SELECT id FROM name_strings WHERE value = NEW.edge_kind),
-                confidence_id = (SELECT id FROM name_strings WHERE value = NEW.confidence)
+                confidence_id = (SELECT id FROM name_strings WHERE value = NEW.confidence),
+                -- Recompute visibility from the updated kind/resolution (see the view WHERE).
+                hidden = CASE WHEN NEW.edge_kind IN ('dispatch_construct', 'dispatch_handle')
+                                   OR NEW.resolution = 'suppressed'
+                              THEN 1 ELSE 0 END
             WHERE id = OLD.id;
         END;
 
@@ -1294,6 +1323,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_072_ID => Some(72),
             MIGRATION_073_ID => Some(73),
             MIGRATION_074_ID => Some(74),
+            MIGRATION_075_ID => Some(75),
             _ => None,
         })
         .max()
@@ -1377,6 +1407,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_072_ID
             | MIGRATION_073_ID
             | MIGRATION_074_ID
+            | MIGRATION_075_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1457,6 +1488,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_072_ID => migration.checksum != MIGRATION_072_CHECKSUM,
         MIGRATION_073_ID => migration.checksum != MIGRATION_073_CHECKSUM,
         MIGRATION_074_ID => migration.checksum != MIGRATION_074_CHECKSUM,
+        MIGRATION_075_ID => migration.checksum != MIGRATION_075_CHECKSUM,
         _ => false,
     }
 }

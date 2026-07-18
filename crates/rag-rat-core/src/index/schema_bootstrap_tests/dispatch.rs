@@ -134,6 +134,9 @@ pub fn upsert(_id: i64) {}
     assert_eq!(view_count("dispatch_handle"), 0, "handle fact must be hidden from the view");
     // The synthesized real edge is visible through the view.
     assert!(view_count("dispatches") > 0, "the synthesized dispatches edge must stay visible");
+    // #734: the full-rebuild writers + dispatch synthesis stamped `hidden` consistently with the
+    // visibility predicate the view enforces.
+    crate::index::edges::assert_hidden_agrees_with_visibility(conn);
 
     let _ = fs::remove_dir_all(root);
 }

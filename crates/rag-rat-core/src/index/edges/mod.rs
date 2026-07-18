@@ -72,6 +72,43 @@ impl EdgeKind {
     }
 }
 
+/// The `edges_data.hidden` value for a row (#734): 1 exactly when the row is not a public graph
+/// edge — an internal dispatch FACT kind ([`EdgeKind::DispatchConstruct`] /
+/// [`EdgeKind::DispatchHandle`], #200) or a suppressed unresolved candidate. Every direct
+/// `edges_data` writer stamps the flag through this one helper so the `edges` view's
+/// `WHERE hidden = 0` — a single integer compare per row, the point of materializing
+/// visibility — can trust it. The view's INSTEAD OF triggers and the V075 backfill mirror the
+/// same predicate in SQL.
+pub(crate) fn edge_hidden_flag(edge_kind: &str, resolution: &str) -> i64 {
+    let dispatch_fact = edge_kind == EdgeKind::DispatchConstruct.as_str()
+        || edge_kind == EdgeKind::DispatchHandle.as_str();
+    i64::from(dispatch_fact || resolution == "suppressed")
+}
+
+/// #734 test tripwire: assert `edges_data.hidden` agrees with the visibility predicate it
+/// materializes ([`edge_hidden_flag`]) on EVERY row, whatever writer produced it. A disagreeing
+/// row either leaks an internal/suppressed row into every query-layer read or silently drops a
+/// real edge from the graph — call this after any test pass that inserts or re-resolves edges.
+#[cfg(test)]
+pub(crate) fn assert_hidden_agrees_with_visibility(conn: &rusqlite::Connection) {
+    let disagreeing: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges_data d
+             JOIN name_strings ek ON ek.id = d.edge_kind_id
+             JOIN name_strings r ON r.id = d.resolution_id
+             WHERE d.hidden <> CASE WHEN ek.value IN ('dispatch_construct', 'dispatch_handle')
+                                         OR r.value = 'suppressed'
+                                    THEN 1 ELSE 0 END",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        disagreeing, 0,
+        "edges_data.hidden must match the visibility predicate on every row"
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum EdgeConfidence {
     Exact,

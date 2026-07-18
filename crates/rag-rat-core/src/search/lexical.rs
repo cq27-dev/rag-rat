@@ -605,9 +605,9 @@ fn graph_boost(
         JOIN name_strings tn ON tn.id = d.to_name_id
         WHERE (d.from_name_id IN (SELECT id FROM name_strings WHERE value IN (?1, ?2))
             OR d.to_name_id IN (SELECT id FROM name_strings WHERE value IN (?1, ?2)))
-          AND d.resolution_id <> COALESCE(
-              (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
-          )
+          -- Materialized visibility (#734): excludes suppressed candidates and internal
+          -- dispatch FACT rows in one integer compare (the predicate the edges view enforces).
+          AND d.hidden = 0
           AND EXISTS (SELECT 1 FROM main.files f
                        WHERE f.id = d.source_file_id AND f.repo_id = ?3)
         ORDER BY
@@ -976,9 +976,7 @@ mod tests {
                  JOIN name_strings ek ON ek.id = d.edge_kind_id
                  WHERE (d.from_name_id IN (SELECT id FROM name_strings WHERE value IN ('a', 'b'))
                      OR d.to_name_id IN (SELECT id FROM name_strings WHERE value IN ('a', 'b')))
-                   AND d.resolution_id <> COALESCE(
-                       (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
-                   )
+                   AND d.hidden = 0
                    AND EXISTS (SELECT 1 FROM main.files f
                                 WHERE f.id = d.source_file_id AND f.repo_id = 'r')",
             )

@@ -334,13 +334,11 @@ pub fn important_symbols(
          JOIN name_strings ek ON ek.id = d.edge_kind_id
          JOIN name_strings cf ON cf.id = d.confidence_id
          WHERE d.from_symbol_id IS NOT NULL
-           AND d.resolution_id <> COALESCE(
-               (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
-           )
-           -- Internal dispatch FACT rows (#200) are synthesis inputs, not real edges — they'd
-           -- double-count (the handle fact duplicates the dispatcher's existing calls_name) and
-           -- inflate rank. The synthesized `dispatches` edge IS counted (it's a real dependency).
-           AND ek.value NOT IN ('dispatch_construct', 'dispatch_handle')",
+           -- Materialized visibility (#734): excludes suppressed candidates and the internal
+           -- dispatch FACT rows (#200 — synthesis inputs whose handle fact duplicates the
+           -- dispatcher's existing calls_name; counting them would inflate rank). The
+           -- synthesized `dispatches` edge IS counted (it's a real dependency).
+           AND d.hidden = 0",
     )?;
     let rows = stmt
         .query_map([], |row| {

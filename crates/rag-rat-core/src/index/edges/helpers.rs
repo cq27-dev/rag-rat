@@ -440,6 +440,7 @@ pub(crate) fn insert_candidates(
         let edge_kind_id = intern_edge_string(conn, candidate.edge_kind.as_str())?;
         let confidence_id = intern_edge_string(conn, candidate.confidence.as_str())?;
         let resolution_id = intern_edge_string(conn, "unresolved")?;
+        let hidden = super::edge_hidden_flag(candidate.edge_kind.as_str(), "unresolved");
         conn.prepare_cached(
             "
             INSERT INTO edges_data(
@@ -448,10 +449,10 @@ pub(crate) fn insert_candidates(
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 callee_start_byte, callee_end_byte,
                 import_scope_start_byte, import_scope_end_byte, import_mod_id,
-                edge_kind_id, confidence_id, resolution_id
+                edge_kind_id, confidence_id, resolution_id, hidden
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19)
+             ?18, ?19, ?20)
             ",
         )?
         .execute(params![
@@ -474,6 +475,7 @@ pub(crate) fn insert_candidates(
             edge_kind_id,
             confidence_id,
             resolution_id,
+            hidden,
         ])?;
     }
     Ok(())

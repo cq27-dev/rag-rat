@@ -222,13 +222,11 @@ pub fn scoped_weighted_fan_in(
          JOIN name_strings ek ON ek.id = d.edge_kind_id
          JOIN name_strings cf ON cf.id = d.confidence_id
          WHERE d.to_symbol_id = ?1
-           AND d.resolution_id <> COALESCE(
-               (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
-           )
-           -- Internal dispatch FACT rows (#200) are synthesis inputs, not real in-edges — the
-           -- handle fact duplicates the dispatcher's existing calls_name, so counting it would
-           -- double-weight the handler. The synthesized `dispatches` edge IS counted.
-           AND ek.value NOT IN ('dispatch_construct', 'dispatch_handle')",
+           -- Materialized visibility (#734): excludes suppressed candidates and the internal
+           -- dispatch FACT rows (#200 — the handle fact duplicates the dispatcher's existing
+           -- calls_name, so counting it would double-weight the handler). The synthesized
+           -- `dispatches` edge IS counted.
+           AND d.hidden = 0",
     )?;
     let rows = stmt
         .query_map([to_symbol_id], |row| {
