@@ -50,7 +50,7 @@ pub use listener::{socket_path_for, spawn_listener};
 
 #[cfg(unix)]
 mod listener {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -67,6 +67,13 @@ mod listener {
     const ELECTION_RETRY: Duration = Duration::from_secs(5);
     const SESSION_CAP: usize = 64;
     const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+    /// How long an injected memory / symbol stays deduped for a session before it may resurface
+    /// (#759). Measured between FULL SURFACES, not encounters: a suppressed repeat does NOT refresh
+    /// the timestamp, so an item stays hidden for exactly one window after its last SHOW, then
+    /// resurfaces — the same non-sliding semantics as the MCP output trim (#752). Matches that
+    /// window so the two dedup paths behave alike. Replaces the old monotonic "shown once, hidden
+    /// for the whole session" filter, which dropped context an agent would still benefit from.
+    const RESURFACE_WINDOW: Duration = Duration::from_secs(30 * 60);
     /// > client's 250 ms timeout; a stalled peer cannot wedge the serialized accept loop.
     const READ_BUDGET: Duration = Duration::from_millis(500);
 
@@ -113,11 +120,24 @@ mod listener {
         }
     }
 
-    /// Per-session record of what was already injected. Pruned by LRU cap + TTL.
+    /// Per-session record of when each memory / symbol was last SURFACED IN FULL, so a repeat is
+    /// deduped only within [`RESURFACE_WINDOW`] of its last show (#759). Whole sessions are pruned
+    /// by LRU cap + [`SESSION_TTL`]; individual entries past the window are dropped on read
+    /// (see [`recently_seen`]).
     #[derive(Default)]
     struct SessionState {
-        filter: DedupeFilter,
+        seen_memories: HashMap<String, Instant>,
+        seen_symbols: HashMap<String, Instant>,
         last_used: Option<Instant>,
+    }
+
+    /// The keys in `seen` still within [`RESURFACE_WINDOW`] of `now` — the set to suppress this
+    /// call. Prunes expired entries in passing: an entry older than the window is NOT
+    /// suppressed anyway (it will resurface and re-stamp), so dropping it is behavior-neutral
+    /// and bounds the map to the in-window working set.
+    fn recently_seen(seen: &mut HashMap<String, Instant>, now: Instant) -> HashSet<String> {
+        seen.retain(|_, shown| now.duration_since(*shown) < RESURFACE_WINDOW);
+        seen.keys().cloned().collect()
     }
 
     /// Shared body of the listener task. In non-test builds the `$hooks` argument is compiled away.
@@ -236,11 +256,18 @@ mod listener {
                 if req.v == PROTOCOL_VERSION
                     && matches!(req.kind.as_str(), "grep_augment" | "read_augment") =>
             {
+                // One logical timestamp for this request: it decides what's still within the
+                // resurface window AND stamps whatever gets shown, so the window measures time
+                // between full surfaces (#759).
+                let now = Instant::now();
                 let filter = {
                     let state = sessions.entry(req.session_id.clone()).or_default();
-                    state.last_used = Some(Instant::now());
-                    // Clone ends the borrow before the spawn_blocking await below.
-                    state.filter.clone()
+                    state.last_used = Some(now);
+                    // The suppress set is a snapshot (owned), so the borrow ends before the await.
+                    DedupeFilter {
+                        memory_ids: recently_seen(&mut state.seen_memories, now),
+                        symbol_keys: recently_seen(&mut state.seen_symbols, now),
+                    }
                 };
                 let database = config.database.clone();
                 let config_root = config.root.clone();
@@ -303,11 +330,18 @@ mod listener {
                 })?;
                 match composed {
                     Some(out) => {
-                        // compose's returned IDs are exactly the items rendered, so the
-                        // session filter grows by exactly what the model now has.
+                        // compose's returned IDs are exactly the items RENDERED, so stamp each with
+                        // `now`: only a full surface (re)starts its resurface window. A key that
+                        // was suppressed this call isn't in these lists, so
+                        // its earlier timestamp — and thus its window — is
+                        // left untouched (#759).
                         let state = sessions.entry(req.session_id).or_default();
-                        state.filter.memory_ids.extend(out.memory_ids.iter().cloned());
-                        state.filter.symbol_keys.extend(out.symbol_keys.iter().cloned());
+                        for id in &out.memory_ids {
+                            state.seen_memories.insert(id.clone(), now);
+                        }
+                        for key in &out.symbol_keys {
+                            state.seen_symbols.insert(key.clone(), now);
+                        }
                         HookResponse {
                             v: PROTOCOL_VERSION,
                             context: Some(out.context),
@@ -330,6 +364,32 @@ mod listener {
         payload.push('\n');
         write.write_all(payload.as_bytes()).await?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod window_tests {
+        use super::*;
+
+        #[test]
+        fn suppresses_within_the_window_and_prunes_past_it() {
+            // Build synthetic instants from a base so subtraction can't underflow the monotonic
+            // clock on a freshly-booted host.
+            let base = Instant::now();
+            let now = base + RESURFACE_WINDOW * 2;
+            let mut seen = HashMap::new();
+            seen.insert("fresh".to_string(), now); // shown just now → within window
+            seen.insert("edge".to_string(), now - RESURFACE_WINDOW + Duration::from_secs(1)); // inside
+            seen.insert("stale".to_string(), base); // a full window+ ago → window elapsed
+
+            let suppress = recently_seen(&mut seen, now);
+
+            assert!(suppress.contains("fresh"), "a just-shown item is still deduped");
+            assert!(suppress.contains("edge"), "an item inside the window is deduped");
+            assert!(!suppress.contains("stale"), "an item past the window resurfaces");
+            // The expired entry is pruned (behavior-neutral: it would resurface anyway).
+            assert!(!seen.contains_key("stale"), "expired entries are dropped to bound the map");
+            assert!(seen.contains_key("fresh") && seen.contains_key("edge"));
+        }
     }
 }
 
