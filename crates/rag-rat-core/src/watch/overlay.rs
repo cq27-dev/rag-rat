@@ -318,14 +318,19 @@ where
         // failure — the caller (an edit hook) must be able to tell the reindex did not land
         // and retry.
         //
-        // EXCEPT a branch `rag-rat.toml` edit: a config change can re-language / add / drop targets
-        // across the WHOLE overlay (not just the supplied file, which is not itself a source
-        // target), so it is inherently NOT path-scopable — run the whole-delta pass, which includes
-        // the target-fingerprint-gated `overlay_target_config_reconcile` (#679 review). Config
+        // EXCEPT a branch `rag-rat.toml` or `.gitignore` edit: both change the indexable set across
+        // the WHOLE overlay — a config edit re-languages / adds / drops targets; a `.gitignore`
+        // edit flips OTHER files' ignore status — and neither is itself a source target, so
+        // the path-scoped route would no-op on them and leave the drift for a later sweep.
+        // Run the whole-delta pass, which reconciles both
+        // (`overlay_target_config_reconcile` for target
+        // drift, `expand_candidates_for_ignore_only_flips` for ignore flips) (#679 review). Such
         // edits are rare, so paying the full tree-diff there is fine.
         let overlay_config = config.for_linked_worktree_overlay(checkout);
-        let touches_config = checkout_paths.iter().any(|path| is_config_path(path));
-        let report = if touches_config {
+        let overlay_wide_edit = checkout_paths
+            .iter()
+            .any(|path| is_config_path(path) || super::placement::is_gitignore_path(path));
+        let report = if overlay_wide_edit {
             db.index_worktree_overlay(&overlay_config, checkout, &mut progress)?
         } else {
             db.index_worktree_overlay_paths(

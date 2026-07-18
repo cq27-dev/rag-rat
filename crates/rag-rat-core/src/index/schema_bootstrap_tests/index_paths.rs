@@ -386,6 +386,40 @@ fn reindex_paths_reconciles_target_drift_on_a_linked_config_edit() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+/// #679 review: a supplied linked `.gitignore` edit routes to the WHOLE-delta overlay pass, so an
+/// ignore-rule change is reconciled immediately — a base file the branch now ignores is tombstoned
+/// in the overlay. The path-scoped route alone would no-op on `.gitignore` (not a source target)
+/// and leave the flipped files stale until a later sweep.
+#[test]
+fn reindex_paths_reconciles_an_ignore_flip_on_a_linked_gitignore_edit() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_base() {}\n").unwrap();
+    fs::write(main.join("src/gen.rs"), "pub fn gen_base() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let _ = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // The branch adds a `.gitignore` that now ignores the base-indexed gen.rs.
+    fs::write(linked.join(".gitignore"), "gen.rs\n").unwrap();
+
+    crate::watch::reindex_paths(&config, &[linked.join(".gitignore")], |_| {}).unwrap();
+
+    assert!(
+        deleted_overlay_rows(&config, "src/gen.rs") >= 1,
+        "a base file the branch newly ignores is tombstoned in the overlay (#679 review)",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 #[test]
 fn index_paths_rejects_a_path_that_escapes_the_repo_root() {
     let root = unique_temp_root();
