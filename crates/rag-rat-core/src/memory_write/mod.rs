@@ -23,3 +23,25 @@ pub(crate) use authoring::backfill_memory_oplog;
 // `index::consolidate` names this through this re-export (Task 5 of #541).
 pub(crate) use authoring::reconcile_owner_stream_for_repo;
 pub(crate) use edges::{add_edge, remove_edge};
+
+/// #767 review: fail a repo-scoped memory mutation CLOSED when the active repo was removed by
+/// `rag-rat rm`. The removal tombstone is normally enforced at connection-registration time, but
+/// an MCP connection that opened (and resolved its active repo scope) BEFORE `rm` acquired the
+/// repo lock keeps that stale scope; without this re-check its `create_memory` / `add_edge` would
+/// INSERT fresh `repo_memories` / `repo_node_edges` rows stamped with the removed `repo_id` (and
+/// author op-log state) AFTER `rm`'s purge committed and reported success. Call INSIDE the write
+/// transaction, immediately before the INSERT, so the tombstone read shares the transaction's
+/// snapshot: an `rm` that committed first is seen (fail closed); an `rm` that commits after purges
+/// the just-written row itself (also consistent). The reverse-order hazard is the one this closes.
+pub(crate) fn assert_repo_not_removed(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+) -> anyhow::Result<()> {
+    if rag_rat_db::schema::is_repo_removed(conn, repo_id)? {
+        anyhow::bail!(
+            "repo {repo_id} was removed with `rag-rat rm` — refusing the write; run `rag-rat \
+             init` in the repo to re-add it"
+        );
+    }
+    Ok(())
+}

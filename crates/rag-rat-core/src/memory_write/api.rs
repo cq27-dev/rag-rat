@@ -74,6 +74,12 @@ pub(crate) fn create_memory(
     // (#560). FULL for this transaction only; the connection restores NORMAL on drop.
     let _durability = authoring::AuthoredDurability::begin(conn)?;
     let tx = conn.unchecked_transaction()?;
+    // #767: revalidate the removal tombstone INSIDE the write txn — a connection that resolved its
+    // active scope before `rm` ran must fail closed here rather than stamp the removed `repo_id`
+    // onto a fresh row after the purge.
+    if let Some(repo_id) = &scope {
+        super::assert_repo_not_removed(conn, repo_id)?;
+    }
     conn.execute(
         "
         INSERT INTO repo_memories(
@@ -281,4 +287,113 @@ pub(crate) fn rebind_memory(
     tx.commit()?;
     memory_by_id(conn, memory_id)?
         .ok_or_else(|| anyhow::anyhow!("rebound memory `{memory_id}` could not be read back"))
+}
+
+#[cfg(test)]
+mod tests {
+    use rag_rat_query::memory::{EdgeRelation, EdgeTarget, RepoMemoryBindTarget, RepoMemoryCreate};
+    use rusqlite::Connection;
+
+    use super::{create_memory, rebind_memory};
+    use crate::memory_write::add_edge;
+
+    const REPO: &str = "repo-a";
+
+    /// A DB with the memory schema, one registered repo, and the connection scoped to it — the
+    /// minimal setup `memory_repo_scope` needs to resolve an active repo. Mirrors
+    /// `authoring::tests::scoped_conn` (each module's test scaffolding is self-contained).
+    fn scoped_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
+            [REPO],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', ?1)",
+            [REPO],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Create an unanchored `Concept` (needs no code binding) through the LIVE `create_memory`.
+    fn create_concept(conn: &Connection, title: &str) -> anyhow::Result<String> {
+        Ok(create_memory(conn, RepoMemoryCreate {
+            kind: "Concept".to_string(),
+            title: title.to_string(),
+            body: "body".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget::default(),
+        })?
+        .memory
+        .memory_id)
+    }
+
+    /// #767 review: a connection that resolved its active repo scope BEFORE `rag-rat rm` ran must
+    /// fail closed at write time — the removal tombstone is revalidated inside the write
+    /// transaction, so a post-purge `create_memory` cannot stamp the removed `repo_id` onto a fresh
+    /// row (and its op-log entry) after `rm` reported success.
+    #[test]
+    fn create_memory_refuses_a_tombstoned_repo_until_it_is_cleared() {
+        let conn = scoped_conn();
+        create_concept(&conn, "before removal").unwrap();
+
+        rag_rat_db::schema::mark_repo_removed(&conn, REPO, 1).unwrap();
+        let err = create_concept(&conn, "after removal")
+            .expect_err("a tombstoned repo must refuse a memory create");
+        assert!(
+            err.to_string().contains("rag-rat rm"),
+            "the refusal must name the removal remedy, got: {err}"
+        );
+
+        rag_rat_db::schema::clear_repo_removed(&conn, REPO).unwrap();
+        create_concept(&conn, "after re-add").unwrap();
+    }
+
+    /// The same gate covers the edge INSERT path: `add_edge` stamps the source node's owner
+    /// `repo_id` onto the new row, so it revalidates the tombstone in-transaction too.
+    #[test]
+    fn add_edge_refuses_a_tombstoned_repo() {
+        let conn = scoped_conn();
+        let source = create_concept(&conn, "source").unwrap();
+        let target = create_concept(&conn, "target").unwrap();
+
+        rag_rat_db::schema::mark_repo_removed(&conn, REPO, 1).unwrap();
+        let err = add_edge(&conn, &source, EdgeRelation::RelatesTo, &EdgeTarget::Node {
+            repo_id: None,
+            node_id: target,
+        })
+        .expect_err("a tombstoned repo must refuse an edge add");
+        assert!(
+            err.to_string().contains("rag-rat rm"),
+            "the refusal must name the removal remedy, got: {err}"
+        );
+    }
+
+    /// A NON-insert mutation is unaffected by the gate: `rebind_memory` writes no new repo-stamped
+    /// rows (and post-purge it has no row to find anyway), so it must not trip the tombstone check
+    /// on a still-populated store.
+    #[test]
+    fn rebind_memory_is_not_blocked_by_the_tombstone_gate() {
+        let conn = scoped_conn();
+        let id = create_concept(&conn, "rebind me").unwrap();
+
+        rag_rat_db::schema::mark_repo_removed(&conn, REPO, 1).unwrap();
+        rebind_memory(&conn, &id, RepoMemoryBindTarget {
+            path: Some("src/lib.rs".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    }
 }

@@ -74,7 +74,7 @@ fn run_non_interactive(
 
     let config = Config::load(&options.config_path)?;
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
-    let db = setup_index(&config)?;
+    let db = setup_index(&config, &options.config_path)?;
     setup_model_and_reconcile(&config, &db, options.yes)?;
     if !options.no_hooks {
         offer_hooks_install(&config, options.yes)?;
@@ -117,7 +117,7 @@ fn run_interactive(options: &InitOptions) -> anyhow::Result<()> {
 
     let config = Config::load(&options.config_path)?;
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
-    let db = setup_index(&config)?;
+    let db = setup_index(&config, &options.config_path)?;
     setup_model_and_reconcile(&config, &db, false)?;
     apply_wizard_hooks(&config, &result)?;
     eprintln!("init: complete");
@@ -310,7 +310,7 @@ pub(crate) fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
     // Non-interactive default mirrors `OracleConfig`'s default: off until explicitly enabled.
     InitPlan { root_value, languages, bindings, backend, oracle_auto_run: false }
 }
-pub(crate) fn setup_index(config: &Config) -> anyhow::Result<IndexDatabase> {
+pub(crate) fn setup_index(config: &Config, config_path: &Path) -> anyhow::Result<IndexDatabase> {
     eprintln!("init: migrating SQLite schema");
     // SCHEMA-ONLY: init's subject repo is NOT registered yet (this is its very first index), so on
     // a global DB that already holds another repo the healing `migrate`'s open-time healers would
@@ -326,7 +326,7 @@ pub(crate) fn setup_index(config: &Config) -> anyhow::Result<IndexDatabase> {
     // The returned lock is held across `index_discover_with_progress` so the clear and the re-
     // registration stay under ONE serialization boundary; otherwise another `rm` could acquire the
     // lock in the gap and remove the repo init is about to re-register.
-    let tombstone_lock = clear_removal_tombstone(config)?;
+    let tombstone_lock = clear_removal_tombstone(config, config_path)?;
     eprintln!("init: indexing discovered files");
     let db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
     // The lock, if held, is released here AFTER the indexing pass that re-registers the repo.
@@ -343,6 +343,7 @@ pub(crate) fn setup_index(config: &Config) -> anyhow::Result<IndexDatabase> {
 /// quiet.
 fn clear_removal_tombstone(
     config: &Config,
+    config_path: &Path,
 ) -> anyhow::Result<Option<rag_rat_base::locks::WriteLock>> {
     let Ok(identity) = rag_rat_base::repo_identity::resolve_repo_identity(
         &config.root,
@@ -368,6 +369,21 @@ fn clear_removal_tombstone(
              — a removal or index pass is running; retry `rag-rat init` once it finishes"
         );
     };
+    // RE-CHECK the config init wrote BEFORE clearing: if rm acquired the lock between init's
+    // `fs::write` and this acquisition, it deleted that config while holding the lock (its
+    // deconfigure step) and released it — this wait then resumes with a STALE in-memory `Config`.
+    // Clearing the tombstone now would let `index_discover_with_progress` re-register from that
+    // stale config after rm reported `removed`, with no `rag-rat.toml` left for maintenance. The
+    // lock alone cannot close this: rm's deconfigure already ran INSIDE it. Abort instead — the
+    // tombstone stays, and the operator re-runs `init` to deliberately re-add.
+    if !config_path.exists() {
+        anyhow::bail!(
+            "the config init wrote ({}) was removed while init waited for the repo write lock — a \
+             concurrent `rag-rat rm` deleted it; aborting without clearing the removal tombstone. \
+             Re-run `rag-rat init` to re-add the repo.",
+            config_path.display()
+        );
+    }
     let storage = rag_rat_db::storage::IndexConnection::open(&config.database)?;
     rag_rat_db::schema::clear_repo_removed(storage.connection(), &identity.repo_id)?;
     Ok(Some(lock))
@@ -630,6 +646,60 @@ mod default_plan_tests {
         }
         let plan = default_plan(".".to_string(), &scan);
         assert_eq!(plan.bindings.get(&Language::Python), Some(&vec![PathBuf::from("myapp")]));
+    }
+
+    /// #767 review: after acquiring the repo write lock, init must RE-CHECK that the config it
+    /// loaded still exists before clearing the removal tombstone — a concurrent `rag-rat rm` may
+    /// have deleted it (its deconfigure step) while init waited on the lock. Clearing anyway would
+    /// let the re-registration repopulate the repo after rm reported `removed`, with no
+    /// `rag-rat.toml` left.
+    #[test]
+    fn clear_removal_tombstone_aborts_when_rm_deleted_the_config_while_init_waited() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let db_path = root.path().join("index.sqlite");
+        let config_path = root.path().join("rag-rat.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[index]\nroot = \".\"\nrepo_id = \"rm-victim\"\ndatabase = \
+                 \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&config_path).unwrap();
+        // The store must exist at the current schema for the tombstone read/write.
+        IndexDatabase::migrate_schema_only(&config.database).unwrap();
+
+        let mark_removed = || {
+            let storage = rag_rat_db::storage::IndexConnection::open(&config.database).unwrap();
+            rag_rat_db::schema::mark_repo_removed(storage.connection(), "rm-victim", 1).unwrap();
+        };
+        let is_removed = || {
+            let storage = rag_rat_db::storage::IndexConnection::open(&config.database).unwrap();
+            rag_rat_db::schema::is_repo_removed(storage.connection(), "rm-victim").unwrap()
+        };
+
+        // Baseline: tombstoned, config present → the clear lifts the tombstone and returns the
+        // held lock.
+        mark_removed();
+        let lock = clear_removal_tombstone(&config, &config_path).unwrap();
+        assert!(lock.is_some(), "a resolvable identity takes the lock");
+        drop(lock);
+        assert!(!is_removed(), "the baseline clear lifts the tombstone");
+
+        // The race: rm deleted the config while init waited for the lock → the clear ABORTS and
+        // the tombstone STAYS, so no re-registration can follow from the stale in-memory config.
+        mark_removed();
+        std::fs::remove_file(&config_path).unwrap();
+        let err = clear_removal_tombstone(&config, &config_path)
+            .expect_err("a config removed mid-wait must abort the tombstone clear");
+        assert!(
+            err.to_string().contains("rag-rat rm"),
+            "the abort must name the concurrent removal, got: {err}"
+        );
+        assert!(is_removed(), "the tombstone must survive the aborted clear");
     }
 
     #[test]

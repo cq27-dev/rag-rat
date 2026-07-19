@@ -92,6 +92,10 @@ pub(crate) fn add_edge(
     // Authored write: the EdgeAdd op is signed op-log content, so commit durably (#560).
     let _durability = authoring::AuthoredDurability::begin(conn)?;
     let tx = conn.unchecked_transaction()?;
+    // #767: revalidate the removal tombstone INSIDE the write txn — a connection that resolved the
+    // source node's owner before `rm` ran must fail closed here rather than INSERT an edge row
+    // stamped with the removed `repo_id` after the purge.
+    super::assert_repo_not_removed(conn, &owner_repo_id)?;
     // Whether this is a GENUINELY new edge vs an idempotent re-add: the INSERT below is
     // `ON CONFLICT DO UPDATE` refreshing ONLY the per-device resolution columns
     // (`target_repo_id`/`target_node_id`/`anchor_status`) — state the log deliberately excludes (no
