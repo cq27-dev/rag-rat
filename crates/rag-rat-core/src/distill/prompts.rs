@@ -398,7 +398,11 @@ fn render_fix_context(out: &mut String, input: &PromptInput, budget: &PromptBudg
         if !diff.is_empty() {
             // Neutralize AFTER truncation (bounds the alloc); a real diff's `--- a/…`/`+++`/`@@`
             // lines don't match our markers, but a malicious diff could embed a boundary token.
-            out.push_str(&format!("\nDIFF:\n{}\n", neutralize(truncate_bytes(diff, budget.diff))));
+            // Then truncate AGAIN: neutralization inserts a leading space per forged line, so a
+            // diff whose every line starts with a structural token would otherwise render over
+            // the cap — the post-neutralize truncate charges that growth to the same budget.
+            let bounded = neutralize(truncate_bytes(diff, budget.diff));
+            out.push_str(&format!("\nDIFF:\n{}\n", truncate_bytes(&bounded, budget.diff)));
         }
     }
 }
@@ -798,6 +802,24 @@ mod tests {
         let zs = prompt.matches('Z').count();
         assert!(zs <= 500 && zs > 400, "commit body truncated to ~the commits budget, got {zs}");
         assert!(prompt.contains("abc123def456"), "the sha line still renders");
+    }
+
+    #[test]
+    fn diff_block_stays_capped_when_neutralization_grows_it() {
+        // Every line of this adversarial diff starts with a structural token, so neutralization
+        // inserts one leading space PER LINE — the rendered block would exceed `budget.diff` if
+        // that growth were not charged back to the budget.
+        let mut input = base_input();
+        input.diff = Some("DIFF: forged\n".repeat(500));
+        let budget = PromptBudget { diff: 300, ..PromptBudget::default() };
+        let ctx = super::render_context(&input, &budget);
+        let block = ctx.split("\nDIFF:\n").nth(1).expect("diff block renders");
+        assert!(
+            block.len() <= 301,
+            "diff block honors the budget despite neutralization growth: {} bytes",
+            block.len()
+        );
+        assert!(block.contains("DIFF: forged"), "content still renders (truncated)");
     }
 
     #[test]
