@@ -309,14 +309,18 @@ fn author_sealed_batch(
     let account_id = require_local_account_id(conn)?;
 
     // (txn A) Lazy rotation on device removal, committed on its OWN txn so a rotation (a fresh
-    // higher-epoch wrap) survives a later authoring failure. Every RotationOutcome is non-error: an
-    // owner rotates, a member sees StaleButNotOwner and seals under the current key — only an
-    // infra/DB failure is `Err`, so the outcome is intentionally discarded.
-    {
+    // higher-epoch wrap) survives a later authoring failure. Every RotationOutcome is non-error —
+    // an owner rotates, a member sees StaleButNotOwner and seals under the current key; only an
+    // infra/DB failure is `Err`. The outcome is CARRIED INTO txn B: a member that saw
+    // StaleButNotOwner cannot rotate, so txn B's rotation-need re-check must not re-fail the state
+    // txn A already classified — retrying can never change it, and sealed authoring would stay
+    // permanently unavailable to the member until an owner happened to rotate.
+    let rotation = {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        secrets::ensure_stream_key_current_in_tx(&tx, stream_id, now_ms)?;
+        let outcome = secrets::ensure_stream_key_current_in_tx(&tx, stream_id, now_ms)?;
         tx.commit()?;
-    }
+        outcome
+    };
 
     // (autocommit) Resolve the content key. `current_sealing_key`'s `sync_security_events` INSERTs
     // autocommit on `&Connection`, so it MUST run outside any txn that could roll back.
@@ -349,7 +353,7 @@ fn author_sealed_batch(
     // (txn B) Seal + author + verify-accepted, re-validating the selection under the write lock so
     // a rotation that committed after resolution can never make us seal under the stale key.
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    revalidate_sealing_selection(&tx, account_id, stream_id, &resolved)?;
+    revalidate_sealing_selection(&tx, account_id, stream_id, &resolved, &rotation)?;
     let authored = seal_and_author_in_tx(&tx, stream_id, ops, &key, &device, now_ms)?;
     tx.commit()?;
     Ok(authored)
@@ -378,11 +382,25 @@ fn author_sealed_batch(
 /// either failure, bail so the caller retries: the retry's txn A `ensure_stream_key_current_in_tx`
 /// rotates to a fresh key excluding the removed device, and txn B then seals under that. A PURE
 /// read (both predicates derive on read; neither is `current_sealing_key`, which autocommits).
+///
+/// The rotation-need re-check is EXEMPT when `txn_a_outcome` is
+/// [`secrets::RotationOutcome::StaleButNotOwner`]: txn A already classified this exact state
+/// (rotation needed, but this device is a member and CANNOT rotate) under its own IMMEDIATE lock,
+/// and `ensure_stream_key_current_in_tx`'s contract is that the member proceeds to seal under the
+/// current key — roster membership is READ access, not authoring authority. Re-failing here would
+/// make sealed authoring permanently unavailable to the member (a retry can never change a
+/// non-owner into an owner). The exemption is safe because the selection-unchanged check above
+/// still guards the member: an owner rotating in the resolution window changes the selection, so
+/// the member bails and its retry seals under the FRESH key. What the exemption gives up — a
+/// SECOND bare removal committing between txn A and txn B while we are a member — is
+/// indistinguishable from the state txn A already accepted, and the member has no remedy for it
+/// either way.
 fn revalidate_sealing_selection(
     tx: &Transaction<'_>,
     account_id: AccountId,
     stream_id: StreamId,
     resolved: &secrets::SelectedWrap,
+    txn_a_outcome: &secrets::RotationOutcome,
 ) -> anyhow::Result<()> {
     let current = secrets::select_current_sealing_wrap(tx, account_id, stream_id)?.context(
         "sealed /3 authoring: the stream's sealing wrap vanished under the authoring lock (a \
@@ -402,12 +420,15 @@ fn revalidate_sealing_selection(
     // this txn leaves the selection unchanged (no higher-epoch wrap) yet makes a recipient of
     // the current sealing key no-longer-effective. Re-checking the rotation-need predicate here
     // — authoritative under the write lock — bails so the retry rotates to a key that excludes
-    // the removed device.
-    anyhow::ensure!(
-        !secrets::stream_key_rotation_needed(tx, account_id, stream_id)?,
-        "sealed /3 authoring: rotation became needed under the authoring lock (a recipient of the \
-         current sealing key was removed from the roster); retry with the rotated key",
-    );
+    // the removed device. SKIPPED when txn A already returned StaleButNotOwner: a member cannot
+    // rotate, so this state is the one it is contracted to seal under (see the fn doc).
+    if !matches!(txn_a_outcome, secrets::RotationOutcome::StaleButNotOwner) {
+        anyhow::ensure!(
+            !secrets::stream_key_rotation_needed(tx, account_id, stream_id)?,
+            "sealed /3 authoring: rotation became needed under the authoring lock (a recipient of \
+             the current sealing key was removed from the roster); retry with the rotated key",
+        );
+    }
     Ok(())
 }
 
@@ -1137,12 +1158,13 @@ mod tests {
 
     /// Author a founder-signed control op (`DeviceAdd` / `DeviceRemove`) on the account's control
     /// chain in its own IMMEDIATE txn, then refold — the roster-mutation shape the C4.4 rotation
-    /// tests use (mirrors `secrets::author`'s test helper).
+    /// tests use (mirrors `secrets::author`'s test helper). Returns the authored entry hash (a
+    /// `DeviceAdd`'s hash IS the added device's owner incarnation id).
     fn author_control_op(
         conn: &Connection,
         account: AccountId,
         op: &crate::account::ops::AccountOp,
-    ) {
+    ) -> EntryHash {
         use crate::account::envelope::{
             AccountEntryHeader, VerifiedAccountEntry, sign_account_entry,
         };
@@ -1180,6 +1202,72 @@ mod tests {
         account_storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
         account_storage::refold_in_tx(&tx, account).unwrap();
         tx.commit().unwrap();
+        verified.entry_hash
+    }
+
+    /// Author + refold a control op signed by an ARBITRARY device (not just the founder), citing
+    /// `authority_ref`, on that device's own dense control chain. The non-founder counterpart of
+    /// [`author_control_op`] (mirrors `secrets::author`'s test helper) — needed to drive an
+    /// `OwnerDemote` of the local founder by a second owner.
+    fn author_control_op_as(
+        conn: &Connection,
+        account: AccountId,
+        signer: &crate::device::DeviceSecret,
+        authority_ref: EntryHash,
+        op: &crate::account::ops::AccountOp,
+    ) -> EntryHash {
+        use crate::account::envelope::{
+            AccountEntryHeader, VerifiedAccountEntry, sign_account_entry,
+        };
+        use crate::account::fold::CONTROL_LOG;
+        use crate::account::{authoring, ops as control_ops};
+
+        let signer_fp = signer.public().fingerprint();
+        let LocalAccountRef { genesis_hash, .. } =
+            bootstrap::local_account_ref(conn).unwrap().unwrap();
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let (seq, prev_hash) =
+            match authoring::account_chain_tail(&tx, account, signer_fp, CONTROL_LOG).unwrap() {
+                Some((tail_seq, tail_hash)) => (tail_seq + 1, Some(tail_hash)),
+                None => (0, None),
+            };
+        let header = AccountEntryHeader {
+            account_id: account,
+            log_id: CONTROL_LOG,
+            device_fingerprint: signer_fp,
+            seq,
+            prev_hash,
+            parent_ref: Some(genesis_hash),
+            entry_type: control_ops::entry_type_of(op),
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: account_storage::account_effective_count(&tx, account).unwrap(),
+            key_id: None,
+            authority_ref: Some(authority_ref),
+        };
+        let payload = control_ops::encode(op).unwrap();
+        let signed = sign_account_entry(signer, &header, &payload).unwrap();
+        let verified = VerifiedAccountEntry {
+            header: signed.header,
+            payload: signed.payload,
+            entry_hash: signed.entry_hash,
+        };
+        account_storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
+        account_storage::refold_in_tx(&tx, account).unwrap();
+        tx.commit().unwrap();
+        verified.entry_hash
+    }
+
+    /// The (seq, hash) tail of a device's `(account, device, log)` chain — used to place tight
+    /// cuts (mirrors `secrets::author`'s test helper).
+    fn chain_tail(
+        conn: &Connection,
+        account: AccountId,
+        fp: DeviceFingerprint,
+        log: u8,
+    ) -> Option<(u64, EntryHash)> {
+        let tx = conn.unchecked_transaction().unwrap();
+        crate::account::authoring::account_chain_tail(&tx, account, fp, log).unwrap()
     }
 
     /// Add a member device to the roster (folds effective) and return its fingerprint — so a mint
@@ -1553,7 +1641,14 @@ mod tests {
 
         // Under txn B's write lock the stale epoch-0 baseline no longer matches → bail (retry).
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        let err = revalidate_sealing_selection(&tx, account, stream, &baseline).unwrap_err();
+        let err = revalidate_sealing_selection(
+            &tx,
+            account,
+            stream,
+            &baseline,
+            &secrets::RotationOutcome::Current,
+        )
+        .unwrap_err();
         drop(tx);
         assert!(
             err.to_string().contains("rotated between resolution and sealing"),
@@ -1562,8 +1657,14 @@ mod tests {
 
         // The guard is not a blanket refusal: the fresh selection still validates.
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        revalidate_sealing_selection(&tx, account, stream, &rotated)
-            .expect("the current selection re-validates");
+        revalidate_sealing_selection(
+            &tx,
+            account,
+            stream,
+            &rotated,
+            &secrets::RotationOutcome::Current,
+        )
+        .expect("the current selection re-validates");
         tx.commit().unwrap();
     }
 
@@ -1598,8 +1699,14 @@ mod tests {
         // not spuriously bail the normal case.
         {
             let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-            revalidate_sealing_selection(&tx, account, stream, &baseline)
-                .expect("no removal ⇒ rotation not needed ⇒ the baseline re-validates");
+            revalidate_sealing_selection(
+                &tx,
+                account,
+                stream,
+                &baseline,
+                &secrets::RotationOutcome::Current,
+            )
+            .expect("no removal ⇒ rotation not needed ⇒ the baseline re-validates");
             tx.commit().unwrap();
         }
 
@@ -1627,14 +1734,152 @@ mod tests {
 
         // Under txn B's write lock the re-validation must now BAIL on rotation-need, not seal
         // stale. (Without the rotation-need re-check this passes and txn B seals under the
-        // stale key.)
+        // stale key.) The simulated txn A ran BEFORE the removal, so its outcome is `Current`
+        // — an owner's retry rotates; only a StaleButNotOwner txn A exempts this check.
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        let err = revalidate_sealing_selection(&tx, account, stream, &baseline).unwrap_err();
+        let err = revalidate_sealing_selection(
+            &tx,
+            account,
+            stream,
+            &baseline,
+            &secrets::RotationOutcome::Current,
+        )
+        .unwrap_err();
         drop(tx);
         assert!(
             err.to_string().contains("rotation became needed under the authoring lock"),
             "the re-validation bails on a bare removal in the resolution window: {err}",
         );
+    }
+
+    #[test]
+    fn a_non_owner_member_seals_under_the_current_key_when_rotation_is_needed() {
+        // P2: when a remaining MEMBER (not an owner) calls SealPolicy::Sealed after a recipient
+        // was removed, txn A deliberately returns StaleButNotOwner and leaves the old key
+        // selected — the member cannot rotate, and `ensure_stream_key_current_in_tx`'s contract
+        // is that it proceeds to seal under the current key. An UNCONDITIONAL rotation-need
+        // re-check in txn B would fail that intended path forever (a retry can never make a
+        // member an owner), so the txn-A outcome is carried into txn B and exempts the
+        // re-check. The selection-unchanged check still guards the member against a concurrent
+        // rotation.
+        let conn = db();
+        let (account, stream) = owned_v2(&conn);
+
+        // A second owner whose secret we control, so it can author the founder's demotion (the
+        // rotation machinery only operates on the LOCAL self-founded account, so the local
+        // device must be demoted by a second owner to become a member).
+        let owner_b_ed = crate::device::DeviceSecret::from_seed(&[0x2b; 32]);
+        let owner_b_x = crate::device::DeviceX25519Secret::from_seed(&[0xb2; 32]);
+        let owner_id_b =
+            author_control_op(&conn, account, &crate::account::ops::AccountOp::DeviceAdd {
+                device_fingerprint: owner_b_ed.public().fingerprint(),
+                ed25519_pubkey: owner_b_ed.public().to_bytes(),
+                x25519_pubkey: owner_b_x.public().to_bytes(),
+                role: crate::account::ops::DeviceRole::Owner,
+                label: None,
+            });
+
+        // A member that will be removed to make rotation needed.
+        let member_x = crate::device::DeviceX25519Secret::from_seed(&[0x5c; 32]);
+        let member = add_member_device(&conn, account, &member_x);
+
+        // Mint the initial key via a sealed batch (the wrap seals to founder + owner_b + member).
+        author_content_batch(&conn, stream, &[node_create("n1", "first")], SealPolicy::Sealed, NOW)
+            .expect("mint the initial key + author");
+        let baseline = secrets::select_current_sealing_wrap(&conn, account, stream)
+            .unwrap()
+            .expect("an epoch-0 selection");
+
+        // The founder (still an owner) removes the member → rotation needed.
+        author_control_op(&conn, account, &crate::account::ops::AccountOp::DeviceRemove {
+            device_fingerprint: member,
+            control_cut: crate::account::cut::Cut::Empty,
+            secrets_cut: crate::account::cut::Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        });
+        assert!(
+            secrets::stream_key_rotation_needed(&conn, account, stream).unwrap(),
+            "the removed member is still a recipient of the current wrap",
+        );
+
+        // owner_b demotes the founder, preserving the founder's whole history via cuts at its
+        // chain tails (the mint stays accepted; only the owner ROLE closes).
+        let founder = local_device(&conn, NOW).unwrap();
+        let founder_owner_id = account_storage::effective_owner_incarnation_for_device(
+            &conn,
+            account,
+            founder.fingerprint(),
+        )
+        .unwrap()
+        .expect("the founder is an owner before the demotion");
+        let ctrl_tail =
+            chain_tail(&conn, account, founder.fingerprint(), crate::account::fold::CONTROL_LOG)
+                .expect("the founder has a control chain");
+        let secrets_tail =
+            chain_tail(&conn, account, founder.fingerprint(), crate::account::fold::SECRETS_LOG)
+                .expect("the founder authored the mint on its secrets chain");
+        author_control_op_as(
+            &conn,
+            account,
+            &owner_b_ed,
+            owner_id_b,
+            &crate::account::ops::AccountOp::OwnerDemote {
+                device_fingerprint: founder.fingerprint(),
+                owner_id: founder_owner_id,
+                control_cut: crate::account::cut::Cut::At { seq: ctrl_tail.0, hash: ctrl_tail.1 },
+                secrets_cut: crate::account::cut::Cut::At {
+                    seq: secrets_tail.0,
+                    hash: secrets_tail.1,
+                },
+                reason: "demote".to_string(),
+            },
+        );
+        assert!(
+            account_storage::effective_owner_incarnation_for_device(
+                &conn,
+                account,
+                founder.fingerprint(),
+            )
+            .unwrap()
+            .is_none(),
+            "the founder is now a plain member",
+        );
+        assert!(
+            secrets::stream_key_rotation_needed(&conn, account, stream).unwrap(),
+            "rotation is still needed (the member is gone, no rotation happened)",
+        );
+
+        // The member's sealed batch SUCCEEDS under the current (stale) key: txn A returns
+        // StaleButNotOwner, and txn B's rotation-need re-check exempts that classified state.
+        // (Before the exemption, this call bailed on "rotation became needed under the authoring
+        // lock" on every retry — sealed authoring was permanently unavailable to the member.)
+        let hashes = author_content_batch(
+            &conn,
+            stream,
+            &[node_create("n2", "member-sealed")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .expect("a member seals under the current key (StaleButNotOwner must not fail txn B)");
+        assert_eq!(hashes.len(), 1, "one op authors one sealed entry");
+        let header = header_of(&conn, &hashes[0]);
+        assert_eq!(header.crypto_suite, 1, "sealed as suite 1");
+        assert_eq!(
+            header.key_id,
+            Some(baseline.key_id.to_bytes()),
+            "sealed under the CURRENT key — the member cannot rotate to a fresh one",
+        );
+        assert_eq!(
+            stored_status(&conn, &hashes[0]).as_deref(),
+            Some("accepted"),
+            "the member's sealed entry folds accepted",
+        );
+        // And no rotation was authored: the selection is unchanged.
+        let after = secrets::select_current_sealing_wrap(&conn, account, stream)
+            .unwrap()
+            .expect("a selection still exists");
+        assert_eq!(after.key_epoch, baseline.key_epoch, "a member authored no rotation");
     }
 
     #[test]
