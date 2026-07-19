@@ -52,17 +52,18 @@ pub use content::{
 };
 // The C5a sealed-authoring surface (#608): the envelope-layer seal
 // (`sign_sealed_content_entry` + its OS-nonce wrapper `seal_and_sign_content_entry`), the
-// policy-aware self-transacting author (`author_content_batch` + `SealPolicy`), and the
-// sealed-op size predicate. UNWIRED — tests consume it, but no live privacy-intent source
-// does, so the group keeps the unused-import allowance.
+// policy-aware prepared authoring surface, and the sealed-op size predicate. UNWIRED — tests
+// consume it, but no live privacy-intent source does, so the group keeps the unused-import
+// allowance.
 #[allow(
     unused_imports,
     reason = "sealed authoring remains unwired until a live privacy-intent source consumes it \
               (#608)"
 )]
 pub use content::{
-    SealPolicy, author_content_batch, content_op_is_sealed_authorable, seal_and_sign_content_entry,
-    sign_sealed_content_entry,
+    PreparedContentAuthoring, SealPolicy, author_content_batch,
+    author_prepared_content_batch_in_tx, content_op_is_sealed_authorable,
+    prepare_content_authoring, seal_and_sign_content_entry, sign_sealed_content_entry,
 };
 // The in-tx `/3` content-author seam + its genesis-detection reader (C3.4b-i, #663): #664
 // retargets the live memory path onto them, so they are plain re-exports.

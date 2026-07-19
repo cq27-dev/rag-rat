@@ -82,10 +82,11 @@ mod stream;
 // - `rotate_stream_key_in_tx` / `ensure_stream_key_current_in_tx` / `stream_key_rotation_needed`
 //   (C4.4, #607): lazy content-key rotation on device removal — re-seal a fresh higher-epoch key to
 //   the remaining roster when a removed device still holds the current key.
-// `author_content_batch` / `SealPolicy` / `content_op_is_sealed_authorable` (C5a, #608): the
-// sealed-authoring seam — a policy-aware, self-transacting `/3` author that seals under the
-// stream's content key. UNWIRED: decrypt-at-projection is available, but no live privacy-intent
-// source calls it yet; the live memory path stays on `author_content_batch_in_tx` (suite 0). The
+// `prepare_content_authoring` / `author_prepared_content_batch_in_tx` / `SealPolicy` (C5, #608):
+// policy-aware `/3` authoring prepared before, then executed inside, a caller-owned transaction;
+// `author_content_batch` is the self-transacting convenience composition. UNWIRED: no live
+// privacy-intent source calls it yet; the live memory path stays on `author_content_batch_in_tx`
+// (suite 0). The
 // envelope-layer seal
 // primitives (`sign_sealed_content_entry` / `seal_and_sign_content_entry`) take a `&DeviceSecret`,
 // so — like `sign_content_entry` — they stay account-crate-internal (never re-exported at the crate
@@ -94,14 +95,15 @@ pub use account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
     CapacityScope, ContentKey, ContentKeyring, DeviceCut, DeviceRole, GrantAuthority,
     GrantDeviceAuthority, GrantDeviceBoundary, GrantRole, IngestOutcome, KeyId, OwnerAuthority,
-    OwnerChainAuthority, RosterContentAuthority, RotationOutcome, SealPolicy, SealingKeyOutcome,
-    SelectedWrap, account_ingest, auth_len_freshness, author_content_batch,
-    author_content_batch_in_tx, backfill_authority_projection, content_op_is_authorable,
-    content_op_is_sealed_authorable, content_stream_is_empty, current_sealing_key,
-    ensure_owned_stream_v2_in_tx, ensure_stream_key_current_in_tx, established_owned_stream_v2,
-    grant_effective_for_device, historical_content_keyring, local_account,
-    mint_and_author_stream_key_wrap_in_tx, owned_stream_v2_id, owner_control_authority,
-    owner_secrets_authority, roster_content_authority, rotate_stream_key_in_tx,
+    OwnerChainAuthority, PreparedContentAuthoring, RosterContentAuthority, RotationOutcome,
+    SealPolicy, SealingKeyOutcome, SelectedWrap, account_ingest, auth_len_freshness,
+    author_content_batch, author_content_batch_in_tx, author_prepared_content_batch_in_tx,
+    backfill_authority_projection, content_op_is_authorable, content_op_is_sealed_authorable,
+    content_stream_is_empty, current_sealing_key, ensure_owned_stream_v2_in_tx,
+    ensure_stream_key_current_in_tx, established_owned_stream_v2, grant_effective_for_device,
+    historical_content_keyring, local_account, mint_and_author_stream_key_wrap_in_tx,
+    owned_stream_v2_id, owner_control_authority, owner_secrets_authority,
+    prepare_content_authoring, roster_content_authority, rotate_stream_key_in_tx,
     select_current_sealing_wrap, stream_key_rotation_needed, stream_owner_effective,
 };
 // The `/3` content projection's store-global upgrade re-fold (#688): wired into the index

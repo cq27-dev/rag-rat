@@ -238,12 +238,102 @@ pub enum SealPolicy {
     Sealed,
 }
 
+/// Policy-aware `/3` authoring state prepared before a caller opens its write transaction.
+///
+/// The fields are deliberately opaque: sealed preparation owns the recovered content key and the
+/// local signing capability, but callers can only hand both back to
+/// [`author_prepared_content_batch_in_tx`]. [`ContentKey`] zeroizes its bytes on drop.
+pub struct PreparedContentAuthoring {
+    stream_id: StreamId,
+    account_id: AccountId,
+    kind: PreparedContentAuthoringKind,
+}
+
+enum PreparedContentAuthoringKind {
+    Plaintext,
+    Sealed(Box<PreparedSealedContentAuthoring>),
+}
+
+struct PreparedSealedContentAuthoring {
+    key: ContentKey,
+    device: LocalDevice,
+    resolved: secrets::SelectedWrap,
+    rotation: secrets::RotationOutcome,
+}
+
+/// Prepare policy-aware `/3` authoring before the caller opens its write transaction.
+///
+/// Plaintext preparation is read-only; the downgrade ratchet is checked later under the caller's
+/// write lock. Sealed preparation performs the existing pre-transaction key protocol: lazy
+/// rotation in its own transaction, key resolution outside a transaction so security events
+/// autocommit, and first-key minting when necessary. The returned value is bound to `stream_id` and
+/// the current local account and exposes no key material.
+pub fn prepare_content_authoring(
+    conn: &Connection,
+    stream_id: StreamId,
+    policy: SealPolicy,
+    now_ms: i64,
+) -> anyhow::Result<PreparedContentAuthoring> {
+    let account_id = require_local_account_id(conn)?;
+    let kind = match policy {
+        SealPolicy::Plaintext => PreparedContentAuthoringKind::Plaintext,
+        SealPolicy::Sealed =>
+            prepare_sealed_content_authoring(conn, stream_id, account_id, now_ms)?,
+    };
+    Ok(PreparedContentAuthoring { stream_id, account_id, kind })
+}
+
+/// Author a prepared policy-aware batch inside the caller's transaction. Neither opens nor commits
+/// the transaction. All ratchet and sealing-selection checks run under this write lock before any
+/// content row is inserted; authoring then refolds once, reprojects, and verifies every entry was
+/// accepted.
+pub fn author_prepared_content_batch_in_tx(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    ops: &[MemoryOp],
+    prepared: &PreparedContentAuthoring,
+    now_ms: i64,
+) -> anyhow::Result<Vec<EntryHash>> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        prepared.stream_id == stream_id,
+        "prepared /3 authoring belongs to a different stream"
+    );
+    anyhow::ensure!(
+        require_local_account_id(tx)? == prepared.account_id,
+        "prepared /3 authoring belongs to a different local account"
+    );
+
+    match &prepared.kind {
+        PreparedContentAuthoringKind::Plaintext => {
+            if stream_has_sealed_ratchet(tx, prepared.account_id, stream_id)? {
+                anyhow::bail!(
+                    "refusing plaintext /3 authoring on a stream that has ratcheted to sealed (an \
+                     accepted key wrap or a sealed entry exists)"
+                );
+            }
+            author_content_batch_in_tx(tx, stream_id, ops, now_ms)
+        },
+        PreparedContentAuthoringKind::Sealed(sealed) => {
+            revalidate_sealing_selection(
+                tx,
+                prepared.account_id,
+                stream_id,
+                &sealed.resolved,
+                &sealed.rotation,
+            )?;
+            seal_and_author_in_tx(tx, stream_id, ops, &sealed.key, &sealed.device, now_ms)
+        },
+    }
+}
+
 /// Author `ops` as owner-authored `/3` content on `stream_id` under an explicit [`SealPolicy`],
-/// managing its OWN transactions — unlike [`author_content_batch_in_tx`], which runs inside a
-/// caller's txn. `Sealed` acquires the stream's content key across THREE transactions (lazy
-/// rotation; then a key resolve whose security-event writes autocommit; then seal + author +
-/// verify-accepted), so it cannot nest inside a caller txn. Returns the authored entry hashes in
-/// authoring order. Requires the store's local account to be minted already.
+/// as a convenience composition of [`prepare_content_authoring`] and
+/// [`author_prepared_content_batch_in_tx`] with an owned IMMEDIATE transaction. Returns the
+/// authored entry hashes in authoring order. Requires the store's local account to be minted
+/// already.
 ///
 /// UNWIRED (C5a): nothing live calls this — see [`SealPolicy`].
 pub fn author_content_batch(
@@ -261,50 +351,24 @@ pub fn author_content_batch(
     if ops.is_empty() {
         return Ok(Vec::new());
     }
-    match policy {
-        SealPolicy::Plaintext => author_plaintext_batch_ratcheted(conn, stream_id, ops, now_ms),
-        SealPolicy::Sealed => author_sealed_batch(conn, stream_id, ops, now_ms),
-    }
-}
-
-/// The `SealPolicy::Plaintext` arm: refuse if the stream has ratcheted to sealed, then author
-/// suite-0 through the existing in-tx seam — all in ONE self-owned txn so the ratchet gate and the
-/// authoring commit atomically (a concurrent wrap/seal cannot slip between them).
-fn author_plaintext_batch_ratcheted(
-    conn: &Connection,
-    stream_id: StreamId,
-    ops: &[MemoryOp],
-    now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+    let prepared = prepare_content_authoring(conn, stream_id, policy, now_ms)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    // Downgrade ratchet: once a stream carries an accepted StreamKeyWrap (any epoch) OR an accepted
-    // suite-1 entry, plaintext authoring is a silent downgrade — refuse it.
-    let account_id = require_local_account_id(&tx)?;
-    if stream_has_sealed_ratchet(&tx, account_id, stream_id)? {
-        anyhow::bail!(
-            "refusing plaintext /3 authoring on a stream that has ratcheted to sealed (an \
-             accepted key wrap or a sealed entry exists)"
-        );
-    }
-    let authored = author_content_batch_in_tx(&tx, stream_id, ops, now_ms)?;
+    let authored = author_prepared_content_batch_in_tx(&tx, stream_id, ops, &prepared, now_ms)?;
     tx.commit()?;
     Ok(authored)
 }
 
-/// The `SealPolicy::Sealed` arm: the S4 three-txn key acquisition, then seal + author. Fail-closed
-/// — if no content key resolves, the whole batch bails, NEVER plaintext-fallback and NEVER a
-/// plaintext park (the row simply never enters the tables; the reconcile anti-join is the retry
-/// once this device gains a key).
-fn author_sealed_batch(
+/// Prepare the sealed arm's pre-transaction key protocol. Fail closed if no content key resolves;
+/// plaintext fallback is never represented by the returned type.
+fn prepare_sealed_content_authoring(
     conn: &Connection,
     stream_id: StreamId,
-    ops: &[MemoryOp],
+    account_id: AccountId,
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<PreparedContentAuthoringKind> {
     // Authoring needs a local device, so minting it here is fine; `current_sealing_key` must NOT
     // mint (a read API), so we resolve it once and hand it in.
     let device = local_device(conn, now_ms)?;
-    let account_id = require_local_account_id(conn)?;
 
     // (txn A) Lazy rotation on device removal, committed on its OWN txn so a rotation (a fresh
     // higher-epoch wrap) survives a later authoring failure. Every RotationOutcome is non-error —
@@ -348,20 +412,19 @@ fn author_sealed_batch(
         "sealed /3 authoring: the sealing selection changed during key resolution (retry)",
     );
 
-    // (txn B) Seal + author + verify-accepted, re-validating the selection under the write lock so
-    // a rotation that committed after resolution can never make us seal under the stale key.
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    revalidate_sealing_selection(&tx, account_id, stream_id, &resolved, &rotation)?;
-    let authored = seal_and_author_in_tx(&tx, stream_id, ops, &key, &device, now_ms)?;
-    tx.commit()?;
-    Ok(authored)
+    Ok(PreparedContentAuthoringKind::Sealed(Box::new(PreparedSealedContentAuthoring {
+        key,
+        device,
+        resolved,
+        rotation,
+    })))
 }
 
 /// Re-confirm, under txn B's IMMEDIATE write lock, that `stream_id` is STILL safe to seal under the
 /// key the pre-txn resolution named — i.e. the selection is unchanged AND no rotation is now due.
 ///
 /// Two roster changes can commit in the autocommit window between resolving the key
-/// ([`author_sealed_batch`]) and opening this txn, and BOTH must abort the seal:
+/// ([`prepare_content_authoring`]) and opening this txn, and BOTH must abort the seal:
 ///
 /// - A `DeviceRemove` + rotation commits a fresh higher-epoch `StreamKeyWrap`, so the resolved
 ///   `(epoch, key_id)` no longer names the current selection — caught by the selection-unchanged
@@ -1506,6 +1569,66 @@ mod tests {
     }
 
     #[test]
+    fn prepared_sealed_authoring_runs_inside_and_commits_with_the_caller_transaction() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        let prepared =
+            prepare_content_authoring(&conn, stream, SealPolicy::Sealed, NOW).expect("prepare");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let hashes = author_prepared_content_batch_in_tx(
+            &tx,
+            stream,
+            &[node_create("prepared", "secret")],
+            &prepared,
+            NOW,
+        )
+        .expect("author in caller transaction");
+        assert_eq!(
+            projected_node_count(&tx, stream),
+            1,
+            "projection is visible in the transaction"
+        );
+        assert_eq!(stored_status(&tx, &hashes[0]).as_deref(), Some("accepted"));
+        tx.commit().unwrap();
+
+        assert_eq!(
+            projected_node_count(&conn, stream),
+            1,
+            "content and projection commit together"
+        );
+        assert_eq!(header_of(&conn, &hashes[0]).crypto_suite, 1);
+    }
+
+    #[test]
+    fn rolling_back_prepared_sealed_authoring_leaves_no_content_or_projection() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        let prepared =
+            prepare_content_authoring(&conn, stream, SealPolicy::Sealed, NOW).expect("prepare");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_prepared_content_batch_in_tx(
+            &tx,
+            stream,
+            &[node_create("rolled-back", "secret")],
+            &prepared,
+            NOW,
+        )
+        .expect("author in caller transaction");
+        assert_eq!(projected_node_count(&tx, stream), 1, "projection is transactional");
+        tx.rollback().unwrap();
+
+        let content_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM content_entries WHERE stream_id = ?1",
+                [stream.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content_rows, 0, "rollback removes the authored content");
+        assert_eq!(projected_node_count(&conn, stream), 0, "rollback removes its projection");
+    }
+
+    #[test]
     fn mixed_plaintext_and_sealed_entries_project_together() {
         let conn = db();
         let (_account, stream) = owned_v2(&conn);
@@ -1888,6 +2011,35 @@ mod tests {
     }
 
     #[test]
+    fn prepared_plaintext_rechecks_the_downgrade_ratchet_in_the_caller_transaction() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        let prepared = prepare_content_authoring(&conn, stream, SealPolicy::Plaintext, NOW)
+            .expect("prepare plaintext while the stream is fresh");
+        author_content_batch(
+            &conn,
+            stream,
+            &[node_create("sealed", "first")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .expect("ratchet the stream after preparation");
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = author_prepared_content_batch_in_tx(
+            &tx,
+            stream,
+            &[node_create("plaintext", "must-not-leak")],
+            &prepared,
+            NOW,
+        )
+        .unwrap_err();
+        drop(tx);
+        assert!(err.to_string().contains("ratcheted to sealed"));
+        assert_eq!(projected_node_count(&conn, stream), 1, "the plaintext op was not projected");
+    }
+
+    #[test]
     fn the_downgrade_ratchet_fires_on_an_accepted_wrap_or_an_accepted_sealed_entry() {
         let conn = db();
         let (account, stream) = owned_v2(&conn);
@@ -2099,6 +2251,76 @@ mod tests {
     }
 
     #[test]
+    fn prepared_sealed_authoring_rejects_a_rotation_before_the_caller_transaction() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        author_content_batch(
+            &conn,
+            stream,
+            &[node_create("old", "epoch-zero")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .unwrap();
+        let prepared =
+            prepare_content_authoring(&conn, stream, SealPolicy::Sealed, NOW).expect("prepare");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        secrets::rotate_stream_key_in_tx(&tx, stream, NOW + 1).unwrap();
+        tx.commit().unwrap();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = author_prepared_content_batch_in_tx(
+            &tx,
+            stream,
+            &[node_create("stale", "must-not-leak")],
+            &prepared,
+            NOW + 2,
+        )
+        .unwrap_err();
+        drop(tx);
+        assert!(err.to_string().contains("rotated between resolution and sealing"));
+        assert_eq!(projected_node_count(&conn, stream), 1, "no stale-key content was projected");
+    }
+
+    #[test]
+    fn prepared_sealed_authoring_rejects_a_recipient_removal_before_the_caller_transaction() {
+        let conn = db();
+        let (account, stream) = owned_v2(&conn);
+        let member_x = crate::device::DeviceX25519Secret::from_seed(&[0x5d; 32]);
+        let member = add_member_device(&conn, account, &member_x);
+        author_content_batch(
+            &conn,
+            stream,
+            &[node_create("old", "before-removal")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .unwrap();
+        let prepared =
+            prepare_content_authoring(&conn, stream, SealPolicy::Sealed, NOW).expect("prepare");
+
+        author_control_op(&conn, account, &crate::account::ops::AccountOp::DeviceRemove {
+            device_fingerprint: member,
+            control_cut: crate::account::cut::Cut::Empty,
+            secrets_cut: crate::account::cut::Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked after preparation".to_string(),
+        });
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = author_prepared_content_batch_in_tx(
+            &tx,
+            stream,
+            &[node_create("stale", "removed-recipient-must-not-decrypt")],
+            &prepared,
+            NOW + 1,
+        )
+        .unwrap_err();
+        drop(tx);
+        assert!(err.to_string().contains("rotation became needed under the authoring lock"));
+        assert_eq!(projected_node_count(&conn, stream), 1, "no post-removal content leaked");
+    }
+
+    #[test]
     fn a_device_removal_in_the_resolution_window_makes_txn_b_bail_not_seal_stale() {
         // P1: a BARE `DeviceRemove` of a wrap RECIPIENT — committed in the autocommit window
         // between txn A (rotation check) and txn B (seal), with NO rotation, so NO
@@ -2284,14 +2506,18 @@ mod tests {
         // StaleButNotOwner, and txn B's rotation-need re-check exempts that classified state.
         // (Before the exemption, this call bailed on "rotation became needed under the authoring
         // lock" on every retry — sealed authoring was permanently unavailable to the member.)
-        let hashes = author_content_batch(
-            &conn,
+        let prepared = prepare_content_authoring(&conn, stream, SealPolicy::Sealed, NOW)
+            .expect("a member prepares under the current key (StaleButNotOwner)");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let hashes = author_prepared_content_batch_in_tx(
+            &tx,
             stream,
             &[node_create("n2", "member-sealed")],
-            SealPolicy::Sealed,
+            &prepared,
             NOW,
         )
         .expect("a member seals under the current key (StaleButNotOwner must not fail txn B)");
+        tx.commit().unwrap();
         assert_eq!(hashes.len(), 1, "one op authors one sealed entry");
         let header = header_of(&conn, &hashes[0]);
         assert_eq!(header.crypto_suite, 1, "sealed as suite 1");
