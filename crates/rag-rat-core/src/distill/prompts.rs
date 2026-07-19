@@ -328,7 +328,11 @@ fn render_units(out: &mut String, units: &[PromptUnit], max_bytes: usize) -> Vec
         push_capped(out, &mut remaining, &label);
         let before_text = remaining;
         push_capped(out, &mut remaining, &texts[idx]);
-        if label_is_complete && remaining < before_text {
+        let text_written = before_text - remaining;
+        // A forged marker at the start adds one synthetic leading space. Do not expose this ID in
+        // the schema when that defense byte is ALL that fit — the model saw no original evidence.
+        let synthetic_prefix = usize::from(forges_structural_line(&unit.text));
+        if label_is_complete && text_written > synthetic_prefix {
             visible_ids.push(idx);
         }
         push_capped(out, &mut remaining, "\n");
@@ -518,16 +522,18 @@ const STRUCTURAL_MARKERS: &[&str] = &[
 fn neutralize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for line in s.split_inclusive('\n') {
-        let t = line.trim_start();
-        let forges_marker = STRUCTURAL_MARKERS.iter().any(|m| t.starts_with(m));
-        let forges_unit_id =
-            t.starts_with("[U") && t.as_bytes().get(2).is_some_and(u8::is_ascii_digit);
-        if forges_marker || forges_unit_id {
+        if forges_structural_line(line) {
             out.push(' ');
         }
         out.push_str(line);
     }
     out
+}
+
+fn forges_structural_line(line: &str) -> bool {
+    let t = line.trim_start();
+    STRUCTURAL_MARKERS.iter().any(|m| t.starts_with(m))
+        || (t.starts_with("[U") && t.as_bytes().get(2).is_some_and(u8::is_ascii_digit))
 }
 
 /// Truncate to at most `max` chars (not bytes) on a char boundary — for human-facing snippets.
@@ -809,6 +815,26 @@ mod tests {
                 "no unseen unit ID is offered for {field}"
             );
         }
+    }
+
+    #[test]
+    fn citation_schema_requires_original_evidence_not_only_a_neutralization_space() {
+        let mut input = base_input();
+        input.units = vec![unit("s", "DIFF: original evidence")];
+        let defense_only = "--- source: s\n".len() + "[U0] ".len() + 1;
+
+        // Exactly one text byte fits, but it is the synthetic space inserted before `DIFF:`.
+        let budget = PromptBudget { units: defense_only, ..PromptBudget::default() };
+        let context = super::render_context(&input, &budget);
+        assert!(context.contains("[U0]  "), "label + defense space render: {context}");
+        assert!(!context.contains("DIFF: original"), "no original evidence rendered: {context}");
+        let schema = record_schema(&input, &budget);
+        assert_eq!(schema["properties"]["decision_units"]["maxItems"], 0);
+
+        // One more byte renders the first original character, making U0 legitimately citeable.
+        let budget = PromptBudget { units: defense_only + 1, ..PromptBudget::default() };
+        let schema = record_schema(&input, &budget);
+        assert_eq!(schema["properties"]["decision_units"]["items"]["enum"][0], 0);
     }
 
     #[test]
