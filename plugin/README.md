@@ -1,9 +1,9 @@
 # rag-rat plugin (prototype)
 
-A coding-agent plugin — for **Claude Code and Codex** (and any other harness with the same plugin
-shape) — that bundles rag-rat's MCP server, skills, and hooks, and **installs a version-matched
-rag-rat binary on first run**. Installing the plugin is one step: the user does not need to
-`cargo install` / `brew install` / put `rag-rat` on `PATH` first.
+A coding-agent plugin — for **Claude Code, Codex, and opencode** (and any other harness with the
+same plugin shape) — that bundles rag-rat's MCP server, skills, and hooks, and **installs a
+version-matched rag-rat binary on first run**. Installing the plugin is one step: the user does
+not need to `cargo install` / `brew install` / put `rag-rat` on `PATH` first.
 
 ## Layout (single source, shared across harnesses)
 
@@ -17,6 +17,7 @@ plugin/                          plugin root (CLAUDE_PLUGIN_ROOT / CODEX_PLUGIN_
   .claude-plugin/marketplace.json
   .codex-plugin/plugin.json        Codex manifest: mcpServers → ./.mcp.json, skills → ./skills/
   .codex-plugin/hooks/hooks.json   Codex hooks
+  opencode/rag-rat.ts              opencode plugin (TS module; MCP self-registration + hooks)
 ```
 
 Both harnesses treat `plugin/` as the plugin root, so `scripts/`, `skills/`, and the launcher are
@@ -72,6 +73,34 @@ output.
 - `PreToolUse` on `^Bash$` → grep-augmentation.
 - `PreToolUse` on `^apply_patch$` → write-time clone check. The handler parses the V4A diff in
   `tool_input.command` for added lines (Codex/Cursor edit via `apply_patch`, not `Write`/`Edit`).
+
+**opencode** (`opencode/rag-rat.ts`, a TS plugin module — no hooks manifest exists there):
+- `config` hook → self-registers the `rag-rat` MCP server (`npx -y @rag-rat/bin@<version> mcp`)
+  unless the user's `opencode.json` already defines one.
+- `session.created` event → orientation digest, injected into the system prompt via
+  `experimental.chat.system.transform`; `experimental.session.compacting` re-injects a fresh
+  digest into the compaction prompt (parity with Claude's `SessionStart(compact)`).
+- `tool.execute.after` on `grep`/`bash`/`read` → grep/read augmentation. opencode's
+  `tool.execute.before` has no additionalContext channel, so the context rides **on the tool
+  result** instead of preceding it.
+- `tool.execute.after` on `write`/`edit` → PostToolUse scoped reindex + write-time clone check.
+- The shim translates opencode's lowercase/camelCase tool calls (`grep`, `filePath`, `newString`)
+  to the harness-neutral `agent-hook` payload (`Grep`, `file_path`, `new_string`) — the Rust hook
+  handler is unchanged. Every path fails silent (never blocks a tool call), mirroring the
+  `--no-install` contract.
+
+### Installing in opencode
+
+Two options:
+- **Whole bundle** (keeps the shared launcher): copy or symlink the repo's `plugin/` tree
+  somewhere stable and symlink `plugin/opencode/rag-rat.ts` into `~/.config/opencode/plugins/`
+  (global) or `.opencode/plugins/` (project). The shim finds `../scripts/launch.js` relative to
+  its real path.
+- **Single file**: drop `opencode/rag-rat.ts` alone into the plugins dir. The shim then resolves
+  the binary itself with the launcher's `--no-install` policy (`$RAG_RAT_BIN` → managed cache →
+  npx cache → version-matched `PATH`); hooks no-op until the MCP server's first `npx` run has
+  installed the binary. Its type-only `@opencode-ai/plugin` import is erased at compile time, so
+  no `node_modules` is needed.
 
 ### Still to verify on-device
 

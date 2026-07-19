@@ -58,6 +58,7 @@ for (const file of VERSION_FILES) {
 const PIN_FILES = [
   "plugin/.claude-plugin/plugin.json",
   "plugin/.mcp.json",
+  "plugin/opencode/rag-rat.ts",
   ".agents/skills/init-rag-rat/SKILL.md",
   "plugin/skills/init-rag-rat/SKILL.md",
 ];
