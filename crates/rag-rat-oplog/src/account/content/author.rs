@@ -355,16 +355,29 @@ fn author_sealed_batch(
     Ok(authored)
 }
 
-/// Re-confirm, under txn B's IMMEDIATE write lock, that `stream_id`'s current sealing selection is
-/// STILL the `(key_epoch, key_id)` the pre-txn resolution named.
+/// Re-confirm, under txn B's IMMEDIATE write lock, that `stream_id` is STILL safe to seal under the
+/// key the pre-txn resolution named — i.e. the selection is unchanged AND no rotation is now due.
 ///
-/// A `DeviceRemove` + rotation can commit a fresh higher-epoch `StreamKeyWrap` in the autocommit
-/// window between resolving the key ([`author_sealed_batch`]) and opening this txn. Sealing under
-/// the now-stale key would let a device that rotation revoked decrypt this post-removal entry — a
-/// confidentiality regression, and NOT the §15 sync-lag window, because the removal is LOCALLY
-/// committed. Because txn B holds the write lock, no rotation can commit until it ends, so a
-/// selection that still matches here is authoritative for the seal that follows. On mismatch, bail
-/// so the caller retries under the fresh key. A PURE read (never `current_sealing_key`).
+/// Two roster changes can commit in the autocommit window between resolving the key
+/// ([`author_sealed_batch`]) and opening this txn, and BOTH must abort the seal:
+///
+/// - A `DeviceRemove` + rotation commits a fresh higher-epoch `StreamKeyWrap`, so the resolved
+///   `(epoch, key_id)` no longer names the current selection — caught by the selection-unchanged
+///   check.
+/// - A BARE `DeviceRemove` (no rotation yet) makes a recipient of the current wrap no longer
+///   roster-effective WITHOUT minting a higher-epoch wrap. No rotation has happened, so the
+///   selection is UNCHANGED and the check above passes — yet sealing under this key would let the
+///   just-removed device decrypt this post-removal entry. The real invariant is "rotation is not
+///   NOW needed", not merely "the selection did not change", so we also re-check the C4.4
+///   rotation-need predicate.
+///
+/// Either way, sealing under the now-stale key is a confidentiality regression (NOT the §15
+/// sync-lag window, because the removal is LOCALLY committed) — acceptance is key-independent, so
+/// the batch would fold accepted anyway. Because txn B holds the write lock, no removal/rotation
+/// can commit until it ends, so both checks here are authoritative for the seal that follows. On
+/// either failure, bail so the caller retries: the retry's txn A `ensure_stream_key_current_in_tx`
+/// rotates to a fresh key excluding the removed device, and txn B then seals under that. A PURE
+/// read (both predicates derive on read; neither is `current_sealing_key`, which autocommits).
 fn revalidate_sealing_selection(
     tx: &Transaction<'_>,
     account_id: AccountId,
@@ -375,12 +388,25 @@ fn revalidate_sealing_selection(
         "sealed /3 authoring: the stream's sealing wrap vanished under the authoring lock (a \
          concurrent condemn); retry",
     )?;
+    // The rotation-already-happened case: a fresh higher-epoch wrap advanced the selection off the
+    // resolved key (defense in depth — the bare-removal check below covers the not-yet-rotated
+    // case).
     anyhow::ensure!(
         current.key_epoch == resolved.key_epoch && current.key_id == resolved.key_id,
         "sealed /3 authoring: the stream's sealing key rotated between resolution and sealing \
          (was epoch {}, now epoch {}); retry with the fresh key",
         resolved.key_epoch,
         current.key_epoch,
+    );
+    // The bare-removal case: a `DeviceRemove` committed after txn A's rotation check and before
+    // this txn leaves the selection unchanged (no higher-epoch wrap) yet makes a recipient of
+    // the current sealing key no-longer-effective. Re-checking the rotation-need predicate here
+    // — authoritative under the write lock — bails so the retry rotates to a key that excludes
+    // the removed device.
+    anyhow::ensure!(
+        !secrets::stream_key_rotation_needed(tx, account_id, stream_id)?,
+        "sealed /3 authoring: rotation became needed under the authoring lock (a recipient of the \
+         current sealing key was removed from the roster); retry with the rotated key",
     );
     Ok(())
 }
@@ -1109,6 +1135,75 @@ mod tests {
         (account, stream)
     }
 
+    /// Author a founder-signed control op (`DeviceAdd` / `DeviceRemove`) on the account's control
+    /// chain in its own IMMEDIATE txn, then refold — the roster-mutation shape the C4.4 rotation
+    /// tests use (mirrors `secrets::author`'s test helper).
+    fn author_control_op(
+        conn: &Connection,
+        account: AccountId,
+        op: &crate::account::ops::AccountOp,
+    ) {
+        use crate::account::envelope::{
+            AccountEntryHeader, VerifiedAccountEntry, sign_account_entry,
+        };
+        use crate::account::fold::CONTROL_LOG;
+        use crate::account::{authoring, ops as control_ops};
+
+        let founder = local_device(conn, NOW).unwrap();
+        let LocalAccountRef { genesis_hash, .. } =
+            bootstrap::local_account_ref(conn).unwrap().unwrap();
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let tail = authoring::account_chain_tail(&tx, account, founder.fingerprint(), CONTROL_LOG)
+            .unwrap()
+            .expect("control chain is non-empty post-genesis");
+        let header = AccountEntryHeader {
+            account_id: account,
+            log_id: CONTROL_LOG,
+            device_fingerprint: founder.fingerprint(),
+            seq: tail.0 + 1,
+            prev_hash: Some(tail.1),
+            parent_ref: Some(genesis_hash),
+            entry_type: control_ops::entry_type_of(op),
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: account_storage::account_effective_count(&tx, account).unwrap(),
+            key_id: None,
+            authority_ref: Some(genesis_hash),
+        };
+        let payload = control_ops::encode(op).unwrap();
+        let signed = sign_account_entry(founder.secret(), &header, &payload).unwrap();
+        let verified = VerifiedAccountEntry {
+            header: signed.header,
+            payload: signed.payload,
+            entry_hash: signed.entry_hash,
+        };
+        account_storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
+        account_storage::refold_in_tx(&tx, account).unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// Add a member device to the roster (folds effective) and return its fingerprint — so a mint
+    /// seals the current wrap to a recipient the test can later remove.
+    fn add_member_device(
+        conn: &Connection,
+        account: AccountId,
+        member_x: &crate::device::DeviceX25519Secret,
+    ) -> DeviceFingerprint {
+        use crate::account::ops::{AccountOp, DeviceRole};
+        use crate::device::DeviceSecret;
+
+        let member_pub = DeviceSecret::from_seed(&[0x2c; 32]).public();
+        let member_fp = member_pub.fingerprint();
+        author_control_op(conn, account, &AccountOp::DeviceAdd {
+            device_fingerprint: member_fp,
+            ed25519_pubkey: member_pub.to_bytes(),
+            x25519_pubkey: member_x.public().to_bytes(),
+            role: DeviceRole::Member,
+            label: None,
+        });
+        member_fp
+    }
+
     #[test]
     fn a_sealed_batch_authors_suite_1_entries_that_fold_accepted_locally() {
         let conn = db();
@@ -1470,6 +1565,76 @@ mod tests {
         revalidate_sealing_selection(&tx, account, stream, &rotated)
             .expect("the current selection re-validates");
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn a_device_removal_in_the_resolution_window_makes_txn_b_bail_not_seal_stale() {
+        // P1: a BARE `DeviceRemove` of a wrap RECIPIENT — committed in the autocommit window
+        // between txn A (rotation check) and txn B (seal), with NO rotation, so NO
+        // higher-epoch wrap exists — leaves the current sealing selection UNCHANGED:
+        // `select_current_sealing_wrap` still returns the old `(epoch, key_id)`. The
+        // selection-unchanged check alone therefore PASSES, and txn B would seal under the
+        // key the just-removed device still holds — a device revoked by that removal could
+        // decrypt this post-removal entry (acceptance is key-independent, so
+        // the batch folds accepted regardless). The rotation-need re-check under txn B's write lock
+        // catches it. Contrast with `a_rotation_in_the_resolution_window_...`, which mints a
+        // HIGHER-epoch wrap so the selection-unchanged check alone already bails.
+        let conn = db();
+        let (account, stream) = owned_v2(&conn);
+        // A second roster device so the initial mint seals to ≥2 recipients — one we can remove.
+        let member_x = crate::device::DeviceX25519Secret::from_seed(&[0x5c; 32]);
+        let member = add_member_device(&conn, account, &member_x);
+
+        // Establish the epoch-0 sealing wrap (sealed to founder + member) the resolution would
+        // name.
+        author_content_batch(&conn, stream, &[node_create("n1", "first")], SealPolicy::Sealed, NOW)
+            .expect("mint the initial key + author");
+        let baseline = secrets::select_current_sealing_wrap(&conn, account, stream)
+            .unwrap()
+            .expect("an epoch-0 selection");
+        assert_eq!(baseline.key_epoch, 0, "the initial mint is epoch 0");
+
+        // No removal yet ⇒ rotation is not needed ⇒ the baseline re-validates. Proves the fix does
+        // not spuriously bail the normal case.
+        {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            revalidate_sealing_selection(&tx, account, stream, &baseline)
+                .expect("no removal ⇒ rotation not needed ⇒ the baseline re-validates");
+            tx.commit().unwrap();
+        }
+
+        // The concurrent BARE removal: revoke the member WITHOUT rotating (mint no higher-epoch
+        // wrap).
+        author_control_op(&conn, account, &crate::account::ops::AccountOp::DeviceRemove {
+            device_fingerprint: member,
+            control_cut: crate::account::cut::Cut::Empty,
+            secrets_cut: crate::account::cut::Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        });
+        // The selection is UNCHANGED (no rotation happened) — the stale-baseline check would
+        // pass...
+        let after = secrets::select_current_sealing_wrap(&conn, account, stream)
+            .unwrap()
+            .expect("a still-epoch-0 selection");
+        assert_eq!(after.key_epoch, 0, "no rotation happened — the epoch is unchanged");
+        assert_eq!(after.key_id, baseline.key_id, "the bare removal did not change the key_id");
+        // ...yet rotation is now DUE (the removed member still holds the current wrap).
+        assert!(
+            secrets::stream_key_rotation_needed(&conn, account, stream).unwrap(),
+            "the bare removal makes rotation needed without changing the selection",
+        );
+
+        // Under txn B's write lock the re-validation must now BAIL on rotation-need, not seal
+        // stale. (Without the rotation-need re-check this passes and txn B seals under the
+        // stale key.)
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = revalidate_sealing_selection(&tx, account, stream, &baseline).unwrap_err();
+        drop(tx);
+        assert!(
+            err.to_string().contains("rotation became needed under the authoring lock"),
+            "the re-validation bails on a bare removal in the resolution window: {err}",
+        );
     }
 
     #[test]
