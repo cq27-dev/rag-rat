@@ -282,9 +282,9 @@ pub(crate) fn render_prompt(input: &PromptInput, budget: &PromptBudget) -> Strin
 /// Emit the thread units with `[U#]` ORIGINAL indices, `--- source:` markers on source change, and
 /// tail-aware budgeting: whole units from the head and the tail survive, a contiguous middle run is
 /// elided with a marker naming how many were dropped.
-fn render_units(out: &mut String, units: &[PromptUnit], max_bytes: usize) {
+fn render_units(out: &mut String, units: &[PromptUnit], max_bytes: usize) -> Vec<usize> {
     if units.is_empty() {
-        return;
+        return Vec::new();
     }
     // Synthetic contiguous spans (one per unit) so the tested head+tail budgeter decides what to
     // keep; the returned indices ARE the units' original indices (spans are in order), which is
@@ -305,6 +305,7 @@ fn render_units(out: &mut String, units: &[PromptUnit], max_bytes: usize) {
     let mut remaining = max_bytes;
     let mut prev_source: Option<&str> = None;
     let mut prev_idx: Option<usize> = None;
+    let mut visible_ids = Vec::with_capacity(plan.kept.len());
     for &idx in &plan.kept {
         // A gap between consecutive kept indices is the dropped middle run — mark it once.
         if let Some(p) = prev_idx
@@ -322,8 +323,14 @@ fn render_units(out: &mut String, units: &[PromptUnit], max_bytes: usize) {
             push_capped(out, &mut remaining, &format!("--- source: {}\n", unit.source));
             prev_source = Some(unit.source.as_str());
         }
-        push_capped(out, &mut remaining, &format!("[U{idx}] "));
+        let label = format!("[U{idx}] ");
+        let label_is_complete = remaining >= label.len();
+        push_capped(out, &mut remaining, &label);
+        let before_text = remaining;
         push_capped(out, &mut remaining, &texts[idx]);
+        if label_is_complete && remaining < before_text {
+            visible_ids.push(idx);
+        }
         push_capped(out, &mut remaining, "\n");
         prev_idx = Some(idx);
     }
@@ -336,6 +343,7 @@ fn render_units(out: &mut String, units: &[PromptUnit], max_bytes: usize) {
     {
         out.push_str(&format!("[... {} trailing units elided ...]\n", units.len() - 1 - last));
     }
+    visible_ids
 }
 
 const UNIT_ELISION_RESERVE: usize = 64;
@@ -357,7 +365,8 @@ fn unit_render_plan(units: &[PromptUnit], max_bytes: usize) -> (Vec<String>, uni
 }
 
 fn visible_unit_ids(input: &PromptInput, budget: &PromptBudget) -> Vec<usize> {
-    unit_render_plan(&input.units, budget.units).1.kept
+    let mut rendered = String::new();
+    render_units(&mut rendered, &input.units, budget.units)
 }
 
 /// Append `s` to `out`, truncated so at most `*remaining` bytes are written, and debit `remaining`.
@@ -779,6 +788,26 @@ mod tests {
                 .collect();
             assert_eq!(visible, [0, 4], "only rendered IDs are accepted for {field}");
             assert!(citations["maxItems"].as_u64().unwrap() <= super::MAX_EVIDENCE_UNITS as u64);
+        }
+    }
+
+    #[test]
+    fn citation_schema_rejects_planned_units_whose_labels_did_not_render() {
+        let input = base_input();
+        // `tail_aware_budget` always plans U0, but this cap is exhausted by the source marker
+        // before `[U0]` or any unit text can render. The schema must therefore permit only [].
+        let budget = PromptBudget { units: 10, ..PromptBudget::default() };
+        let context = super::render_context(&input, &budget);
+        assert!(!context.contains("[U0]"), "the unit label did not render: {context}");
+
+        let schema = record_schema(&input, &budget);
+        for field in ["root_cause_units", "decision_units", "outcome_units"] {
+            let citations = &schema["properties"][field];
+            assert_eq!(citations["maxItems"], 0, "{field} only accepts an empty array");
+            assert!(
+                citations["items"].get("enum").is_none(),
+                "no unseen unit ID is offered for {field}"
+            );
         }
     }
 
