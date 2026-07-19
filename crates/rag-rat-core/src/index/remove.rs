@@ -88,7 +88,7 @@ pub fn resolve_removable_repo(
 ) -> anyhow::Result<Option<ResolvedRepo>> {
     let canonical = path
         .canonicalize()
-        .or_else(|_| std::path::absolute(path))
+        .or_else(|_| std::path::absolute(path).map(|path| lexically_normalize(&path)))
         .unwrap_or_else(|_| path.to_path_buf());
 
     // Route 1: a derivable git identity that is a REGISTERED repo. Try the GOVERNING config's
@@ -129,6 +129,24 @@ pub fn resolve_removable_repo(
         }
     }
     Ok(None)
+}
+
+/// Remove `.` / `..` components WITHOUT touching the filesystem. Used only after
+/// [`std::path::absolute`] when `canonicalize` failed because the target checkout is gone: absolute
+/// deliberately preserves lexical parents (`gone/../old`), but `repo_roots` records the canonical
+/// normalized root (`/cwd/old`). At an absolute root, extra `..` components stay pinned at root.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {},
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            },
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// The repo that recorded `root` in `repo_roots` (a physical path belongs to exactly one repo), or
@@ -319,6 +337,17 @@ mod tests {
     use crate::index::IndexDatabase;
     use crate::index::poison_sibling::{POISON_REPO_ID, assert_sibling_intact};
     use crate::index::schema_bootstrap_tests::poison_test_config;
+
+    #[test]
+    fn missing_path_fallback_lexically_normalizes_parent_components() {
+        let base = std::path::absolute(".").unwrap();
+        let spelled_with_parent = base.join("gone").join("..").join("old");
+        assert_eq!(
+            super::lexically_normalize(&spelled_with_parent),
+            base.join("old"),
+            "a missing checkout path must match the canonical repo_roots spelling"
+        );
+    }
 
     /// The one REAL fixture repo (neither the `__unassigned__` placeholder nor the poison sibling).
     fn fixture_repo_id(conn: &rusqlite::Connection) -> String {

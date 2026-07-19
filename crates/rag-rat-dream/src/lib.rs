@@ -227,6 +227,37 @@ pub fn dream_run_with_passes(
     dream_run(conn, opts)
 }
 
+/// #767 review: run ONE model-pass entry's writes in ONE IMMEDIATE transaction with the `rag-rat
+/// rm` removal tombstone re-checked INSIDE it. A `dream --verify/--compact` process that opened
+/// its scoped connection before `rm` keeps that stale scope; the passes UPSERT `memory_reality` /
+/// `memory_summaries` / `memory_model_failures` (all repo-scoped, no FK to `repos`) per entry in
+/// autocommit, so without this a post-purge write survives a removal that reported success — the
+/// findings sync's own guard then refuses, but the already-written rows remain. This transaction
+/// and rm's purge are both IMMEDIATE, so they serialize on the SQLite write lock and the tombstone
+/// state read here is stable for the wrapped writes: set → rm committed first, fail closed; unset
+/// → rm's purge waits for the commit and sweeps the rows itself. The model call stays OUTSIDE the
+/// transaction (minutes-long inference must not hold the write lock); only the per-entry writes
+/// are wrapped. `scope` is the pass's repo_memories periphery scope — `None` (unscoped legacy
+/// connection) skips the check; there is no repo to tombstone.
+pub(crate) fn removal_guarded_write_tx(
+    conn: &Connection,
+    scope: &Option<String>,
+    write: impl FnOnce(&Connection) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(repo_id) = scope
+        && rag_rat_db::schema::is_repo_removed(&tx, repo_id)?
+    {
+        anyhow::bail!(
+            "repo {repo_id} was removed with `rag-rat rm` — refusing the dream model-pass write; \
+             run `rag-rat init` in the repo to re-add it"
+        );
+    }
+    write(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Whether the model passes would call the model AT ALL this run — the zero-work guard for
 /// EPHEMERAL `[llm.dream.remote]`. A fully churn-skipped (or all-uncitable) repo returns `false`,
 /// so `rag-rat dream --verify/--compact` never cold-starts a paid GPU box that would then do zero
@@ -309,6 +340,26 @@ pub(crate) mod tests {
             [repo_id],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn model_pass_write_transaction_refuses_a_removed_repo_before_running_the_write() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        rag_rat_db::schema::mark_repo_removed(&c, "r", 1).unwrap();
+        let called = std::cell::Cell::new(false);
+
+        let err = super::removal_guarded_write_tx(&c, &Some("r".to_string()), |_| {
+            called.set(true);
+            Ok(())
+        })
+        .expect_err("a tombstoned repo must refuse a model-pass write transaction");
+
+        assert!(!called.get(), "the guarded write closure must not run");
+        assert!(
+            err.to_string().contains("rag-rat rm"),
+            "the refusal should identify removal as the cause: {err}"
+        );
     }
 
     #[test]

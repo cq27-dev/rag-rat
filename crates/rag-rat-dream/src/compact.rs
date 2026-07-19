@@ -91,33 +91,40 @@ pub(super) fn run_compact_pass(
         let summary = match obtain_summary(conn, pass.model, &prompt)? {
             Ok(summary) => summary,
             Err(failure) => {
-                failure::record_failure(conn, RecordFailure {
-                    stamp: failure_stamp,
-                    failure: &failure,
-                    now_ms,
+                super::removal_guarded_write_tx(conn, &scope, |tx| {
+                    failure::record_failure(tx, RecordFailure {
+                        stamp: failure_stamp,
+                        failure: &failure,
+                        now_ms,
+                    })?;
+                    Ok(())
                 })?;
                 continue;
             },
         };
-        record_summary(conn, RecordSummary {
-            memory_id: &entry.memory_id,
-            repo_id,
-            title: &entry.title,
-            body: &entry.body,
-            summary: &summary,
-            model_id: pass.model.model_id(),
-            now_ms,
+        // #767 review: summary prune/UPSERT + failure clear commit in ONE guarded transaction.
+        super::removal_guarded_write_tx(conn, &scope, |tx| {
+            record_summary(tx, RecordSummary {
+                memory_id: &entry.memory_id,
+                repo_id,
+                title: &entry.title,
+                body: &entry.body,
+                summary: &summary,
+                model_id: pass.model.model_id(),
+                now_ms,
+            })?;
+            let failure_stamp = FailureStamp {
+                memory_id: &entry.memory_id,
+                repo_id,
+                pass: DreamModelPass::Compact,
+                content_hash: &content_hash,
+                checked_inputs_hash: None,
+                prompt_version: COMPACT_PROMPT_VERSION,
+                model_id: pass.model.model_id(),
+            };
+            failure::clear_failure(tx, &failure_stamp)?;
+            Ok(())
         })?;
-        let failure_stamp = FailureStamp {
-            memory_id: &entry.memory_id,
-            repo_id,
-            pass: DreamModelPass::Compact,
-            content_hash: &content_hash,
-            checked_inputs_hash: None,
-            prompt_version: COMPACT_PROMPT_VERSION,
-            model_id: pass.model.model_id(),
-        };
-        failure::clear_failure(conn, &failure_stamp)?;
     }
     Ok(())
 }
@@ -284,21 +291,21 @@ struct RecordSummary<'a> {
 }
 
 /// UPSERT the accepted summary into `memory_summaries` (PK `(repo_id, memory_id, content_hash)`)
-/// AND prune every superseded row (same memory, a DIFFERENT content_hash) in ONE transaction. That
-/// prune is the invariant: in steady state `memory_summaries` holds exactly ONE row per memory —
+/// AND prune every superseded row (same memory, a DIFFERENT content_hash). The caller runs both
+/// statements in ONE [`super::removal_guarded_write_tx`] transaction. That prune is the invariant:
+/// in steady state `memory_summaries` holds exactly ONE row per memory —
 /// the summary of its current note. Without it a churny memory would accrete a stale summary per
 /// past content_hash, and the surfacing LEFT JOIN (keyed on the current content_hash) would still
 /// be correct but the table would grow unboundedly. NEVER writes a `repo_memories` column.
 fn record_summary(conn: &Connection, r: RecordSummary<'_>) -> rusqlite::Result<()> {
     let content_hash = super::verify::note_content_hash(r.title, r.body);
-    let tx = conn.unchecked_transaction()?;
     // Prune superseded summaries (older content_hash) FIRST, so the memory is left with only its
     // current-note summary after the UPSERT.
-    tx.execute(
+    conn.execute(
         "DELETE FROM memory_summaries WHERE repo_id = ?1 AND memory_id = ?2 AND content_hash != ?3",
         rusqlite::params![r.repo_id, r.memory_id, content_hash],
     )?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, model_id, \
          prompt_version, generated_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(repo_id, \
          memory_id, content_hash) DO UPDATE SET summary = excluded.summary, model_id = \
@@ -314,7 +321,7 @@ fn record_summary(conn: &Connection, r: RecordSummary<'_>) -> rusqlite::Result<(
             r.now_ms,
         ],
     )?;
-    tx.commit()
+    Ok(())
 }
 
 // ── Deterministic acceptance guards ──────────────────────────────────────────────────────────

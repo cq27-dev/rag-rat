@@ -177,16 +177,21 @@ pub(super) fn run_verdict_pass(
         // NULL verdict stays inert for verdict markers and divergence findings. A
         // body/inputs/prompt change re-queues it exactly like any other row.
         if !pack.is_citable() {
-            record_uncitable(conn, Uncitable {
-                memory_id: &entry.memory_id,
-                repo_id,
-                title: &entry.title,
-                body: &entry.body,
-                checked_inputs_hash: &inputs_hash,
-                checked_against_commit: checked_against_commit.as_deref(),
-                now_ms,
+            // #767 review: the entry's writes commit under the removal-tombstone guard (the
+            // model itself is never called for an uncitable entry, so the whole step is a write).
+            super::removal_guarded_write_tx(conn, &scope, |tx| {
+                record_uncitable(tx, Uncitable {
+                    memory_id: &entry.memory_id,
+                    repo_id,
+                    title: &entry.title,
+                    body: &entry.body,
+                    checked_inputs_hash: &inputs_hash,
+                    checked_against_commit: checked_against_commit.as_deref(),
+                    now_ms,
+                })?;
+                failure::clear_failure(tx, &failure_stamp)?;
+                Ok(())
             })?;
-            failure::clear_failure(conn, &failure_stamp)?;
             continue;
         }
         let pack_text = render_pack(&pack);
@@ -195,35 +200,44 @@ pub(super) fn run_verdict_pass(
         let accepted = match obtain_verdict(pass.model, &prompt, &pack_text) {
             Ok(accepted) => accepted,
             Err(failure) => {
-                failure::record_failure(conn, RecordFailure {
-                    stamp: failure_stamp,
-                    failure: &failure,
-                    now_ms,
+                super::removal_guarded_write_tx(conn, &scope, |tx| {
+                    failure::record_failure(tx, RecordFailure {
+                        stamp: failure_stamp,
+                        failure: &failure,
+                        now_ms,
+                    })?;
+                    Ok(())
                 })?;
                 continue;
             },
         };
-        record_verdict(conn, RecordVerdict {
-            memory_id: &entry.memory_id,
-            repo_id,
-            title: &entry.title,
-            body: &entry.body,
-            accepted: &accepted,
-            checked_inputs_hash: &inputs_hash,
-            checked_against_commit: checked_against_commit.as_deref(),
-            model_id: pass.model.model_id(),
-            now_ms,
+        // #767 review: the verdict UPSERT + failure clear commit in ONE guarded transaction — the
+        // tombstone re-check inside serializes with `rag-rat rm`'s purge, so a removal landing
+        // mid-pass cannot leave this repo-scoped `memory_reality` row behind.
+        super::removal_guarded_write_tx(conn, &scope, |tx| {
+            record_verdict(tx, RecordVerdict {
+                memory_id: &entry.memory_id,
+                repo_id,
+                title: &entry.title,
+                body: &entry.body,
+                accepted: &accepted,
+                checked_inputs_hash: &inputs_hash,
+                checked_against_commit: checked_against_commit.as_deref(),
+                model_id: pass.model.model_id(),
+                now_ms,
+            })?;
+            let failure_stamp = FailureStamp {
+                memory_id: &entry.memory_id,
+                repo_id,
+                pass: DreamModelPass::Verify,
+                content_hash: &content_hash,
+                checked_inputs_hash: Some(&inputs_hash),
+                prompt_version: PROMPT_VERSION,
+                model_id: pass.model.model_id(),
+            };
+            failure::clear_failure(tx, &failure_stamp)?;
+            Ok(())
         })?;
-        let failure_stamp = FailureStamp {
-            memory_id: &entry.memory_id,
-            repo_id,
-            pass: DreamModelPass::Verify,
-            content_hash: &content_hash,
-            checked_inputs_hash: Some(&inputs_hash),
-            prompt_version: PROMPT_VERSION,
-            model_id: pass.model.model_id(),
-        };
-        failure::clear_failure(conn, &failure_stamp)?;
     }
     Ok(())
 }

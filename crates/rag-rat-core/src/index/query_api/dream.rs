@@ -12,8 +12,7 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         // #767 review: fail closed when the active repo was `rag-rat rm`-removed after this
         // connection resolved its scope (a stale MCP `dream` writer). This is the PREFLIGHT — it
-        // keeps a removed repo from paying the finding computation (and, in
-        // `dream_run_with_passes`, the model/provisioning side effects); the AUTHORITATIVE check
+        // keeps a removed repo from paying the finding computation; the AUTHORITATIVE check
         // lives inside the findings sync's IMMEDIATE transaction (`findings::sync`), which
         // serializes with rm's purge on the SQLite write lock so a removal landing mid-run cannot
         // let the sync re-insert `dream_findings` rows for the removed `repo_id`.
@@ -32,6 +31,15 @@ impl IndexDatabase {
         verdict_pass: Option<VerdictPass<'_>>,
         compact_pass: Option<CompactPass<'_>>,
     ) -> anyhow::Result<DreamReport> {
+        let conn = self.storage.connection();
+        // #767 review: this entry point does NOT route through `Self::dream_run` until AFTER the
+        // verdict/compaction passes. Fail early before FTS healing, model provisioning/inference,
+        // and derived writes. The authoritative per-entry checks live inside each model-pass
+        // IMMEDIATE write transaction (`rag_rat_dream::removal_guarded_write_tx`), so a removal
+        // landing after this preflight still cannot leave `memory_reality`, `memory_summaries`, or
+        // `memory_model_failures` rows behind.
+        let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+        crate::index::remove::assert_repo_not_removed(conn, &active_repo_id)?;
         // #582 review: the model passes rank chunk_fts (evidence-pack probes) MID-RUN, after
         // model side effects — a blanket retry would replay them. PRE-FLIGHT the probe-and-heal
         // instead so the run starts on healthy mirrors; on a clean index the probe is four
@@ -49,12 +57,7 @@ impl IndexDatabase {
                 preflight.deferred
             );
         }
-        rag_rat_dream::dream_run_with_passes(
-            self.storage.connection(),
-            opts,
-            verdict_pass,
-            compact_pass,
-        )
+        rag_rat_dream::dream_run_with_passes(conn, opts, verdict_pass, compact_pass)
     }
 
     /// Whether the model passes have pending work (the zero-work guard for ephemeral
