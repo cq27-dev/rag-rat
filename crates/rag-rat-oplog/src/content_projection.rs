@@ -22,9 +22,9 @@
 //! ([`crate::store::NodeContentRow`] et al.), so the two projections serialize identically.
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::account::decode_content_signed;
+use super::account::{content_projected_tables_exist, decode_content_signed};
 use super::op::{self, DecodedOp, Entry, OpMeta};
 use super::project;
 use super::project::ProjectedState;
@@ -33,8 +33,10 @@ use super::stream::StreamId;
 
 /// Bump when the accepted-`/3` → memory fold's projectable set or LWW semantics change (a new op
 /// kind becomes `Known`, a register is added). A `/3` projection stamped with an older version is
-/// rebuilt on the next content refold, never trusted incrementally; a NEWER stamp blocks this
-/// binary from reprojecting at all (see [`assert_content_projector_not_newer`]).
+/// rebuilt WHOLESALE on the next store open — [`rebuild_all_content_projections_if_stale`] runs at
+/// the open/migrate seam and re-folds every stream before stamping — never trusted incrementally;
+/// a NEWER stamp blocks this binary from reprojecting at all (see
+/// [`assert_content_projector_not_newer`]).
 const CONTENT_PROJECTOR_VERSION: i64 = 1;
 
 /// The `oplog_meta` key holding the `/3` projector version the content projection was last folded
@@ -46,6 +48,16 @@ const CONTENT_PROJECTOR_VERSION_KEY: &str = "content_projector_version";
 /// set and rewrite its rows in both `/3` projection tables — another stream's rows are never
 /// touched. Runs inside the caller's txn; called right after `refold_content_stream` (acceptance
 /// changed), so the projection always reflects the just-committed accepted DAG.
+///
+/// VERSION DISCIPLINE (#688), mirroring the `/1` two-part design
+/// ([`crate::store::reproject_if_projector_stale`] + the per-write stamp): this per-stream path
+/// only ever MAINTAINS an already-current store-global stamp. The store-global version is upgraded
+/// EXCLUSIVELY by [`rebuild_all_content_projections_if_stale`], which rebuilds EVERY stream before
+/// the one stamp — so the stamp can never come to cover another stream's stale projection (which
+/// the memory reconcile's anti-join would then trust, mass-duplicating or skipping rows against
+/// it). A missing or older stamp is therefore left UNTOUCHED here: the open-path trigger stays
+/// owed its rebuild-all, and this stream's just-written rows are simply rebuilt again there (the
+/// fold is idempotent).
 pub fn reproject_accepted_content_stream(
     tx: &Transaction<'_>,
     stream_id: StreamId,
@@ -56,18 +68,87 @@ pub fn reproject_accepted_content_stream(
     // `content_projected_nodes`. The memory reconcile's anti-join would then read them as
     // unauthored and mass-duplicate them into the immutable `/3` log. Guard BEFORE any write.
     assert_content_projector_not_newer(tx)?;
+    reproject_stream_projection(tx, stream_id)?;
+    // Stamp only when the store is already current (see the fn doc): this maintains the stamp, it
+    // never upgrades it.
+    if stored_content_projector_version(tx)? == Some(CONTENT_PROJECTOR_VERSION) {
+        stamp_content_projector_version(tx)?;
+    }
+    Ok(())
+}
+
+/// The store-global upgrade re-fold for the `/3` projection (#688) — the `/3` analog of the `/1`
+/// [`crate::store::reproject_if_projector_stale`], wired into the index open/migrate seam (after
+/// migrations, so a store that just gained V070 has its tables). When the stored content-projector
+/// stamp is MISSING or STRICTLY OLDER than this binary's projector, re-fold EVERY `/2` stream
+/// holding accepted content, then stamp the store-global version ONCE; a current or NEWER stamp is
+/// left intact (never downgraded, never re-folded). Returns whether it rebuilt.
+///
+/// This is the ONLY path allowed to raise the stored version: running before any per-stream write,
+/// it makes the store current so [`reproject_accepted_content_stream`]'s stamp only ever maintains
+/// an already-current store. The rebuild is idempotent and serialized by its own `IMMEDIATE` txn,
+/// so racing openers converge without an extra lock (the loser either observes the winner's
+/// current stamp and no-ops, or rebuilds the same state again).
+pub fn rebuild_all_content_projections_if_stale(conn: &Connection) -> anyhow::Result<bool> {
+    // Guard FIRST on the V070 `content_projected_*` tables existing: on a pre-V070 store
+    // mid-migration there is no projection to rebuild (and nothing to stamp against). Reuses the
+    // #683 guard the refold/settle reprojects carry. It also runs before the `oplog_meta` read,
+    // so a bare mid-migration DB missing both never errors here.
+    if !content_projected_tables_exist(conn)? {
+        return Ok(false);
+    }
+    match stored_content_projector_version(conn)? {
+        Some(version) if version >= CONTENT_PROJECTOR_VERSION => Ok(false),
+        _ => {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            // The stale check above already excludes a newer stamp; assert again inside the write
+            // txn so this fn stays honest if the arm above ever changes (mirrors
+            // [`crate::store::rebuild_projection`]).
+            assert_content_projector_not_newer(&tx)?;
+            reproject_all_accepted_content_streams(&tx)?;
+            stamp_content_projector_version(&tx)?;
+            tx.commit()?;
+            Ok(true)
+        },
+    }
+}
+
+/// Re-fold EVERY `/2` stream holding accepted `/3` content wholesale: clear BOTH projection tables
+/// first so a row whose stream's accepted set emptied since its last reproject (a full
+/// retro-condemn) cannot linger, then fold each stream (mirrors [`crate::store`]'s
+/// `reproject_all_streams`). Runs inside the caller's txn; the caller stamps after.
+fn reproject_all_accepted_content_streams(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM content_projected_nodes", [])?;
+    tx.execute("DELETE FROM content_projected_edges", [])?;
+    for stream_id in accepted_content_streams(tx)? {
+        reproject_stream_projection(tx, stream_id)?;
+    }
+    Ok(())
+}
+
+/// Every distinct `/2` stream the log currently holds ACCEPTED `/3` content for — the rebuild set
+/// for a projector upgrade (mirrors [`crate::store`]'s `streams_present`).
+fn accepted_content_streams(conn: &Connection) -> anyhow::Result<Vec<StreamId>> {
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT stream_id FROM content_entries WHERE accepted = 1")?;
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut streams = Vec::new();
+    for row in rows {
+        let bytes = row?;
+        let hash: [u8; 32] =
+            bytes.try_into().map_err(|_| anyhow::anyhow!("stored /3 stream_id is not 32 bytes"))?;
+        streams.push(StreamId::from_bytes(hash));
+    }
+    Ok(streams)
+}
+
+/// The full-replay fold for ONE stream: load its accepted entries, `project`, and rewrite its rows
+/// in BOTH `/3` projection tables — another stream's projection is never touched. Carries NO
+/// version logic; the callers own the stamp discipline.
+fn reproject_stream_projection(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::Result<()> {
     let entries = load_accepted_entries(tx, stream_id)?;
     let state = project::project(&entries);
-    write_projection(tx, stream_id, &state)?;
-    // This stamps the STORE-GLOBAL version but rebuilt only THIS stream. Safe only while
-    // `CONTENT_PROJECTOR_VERSION` is never bumped: the stored version is then only ever unset or
-    // current, so there is no stale store to falsely mark done. BEFORE the first bump, add a
-    // store-global rebuild-on-upgrade (rebuild every `/3` stream, THEN stamp — mirroring `/1`'s
-    // `store::reproject_if_projector_stale`), or the first per-stream reproject on an
-    // old-version store would mark every OTHER (still-old) stream's projection current and the
-    // reconcile anti-join would trust a stale projection. Tracked in #688.
-    stamp_content_projector_version(tx)?;
-    Ok(())
+    write_projection(tx, stream_id, &state)
 }
 
 /// Error if a NEWER `/3` projector already folded this store's content projection — an older binary
@@ -87,6 +168,10 @@ fn assert_content_projector_not_newer(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write the store-global `/3` projector stamp. Two callers, two roles (#688):
+/// [`rebuild_all_content_projections_if_stale`] UPGRADES it (after rebuilding every stream), and
+/// [`reproject_accepted_content_stream`] only MAINTAINS it (called solely when the stored stamp
+/// is already current).
 fn stamp_content_projector_version(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO oplog_meta(key, value) VALUES (?1, ?2)

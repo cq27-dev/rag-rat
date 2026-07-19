@@ -111,6 +111,14 @@ impl IndexDatabase {
                 &crate::index::migration_hooks(),
             )?;
         }
+        // #688: the `/3` content projection's two-part projector-version discipline. Its
+        // per-stream reproject only ever MAINTAINS an already-current store-global stamp, so a
+        // store folded by an older `/3` projector is rebuilt HERE — the open/migrate seam, after
+        // migrations, so a store that just gained the V070 tables has them — BEFORE any
+        // per-stream write. A no-op when the stamp is current or the store is pre-V070 (the
+        // V070-tables guard inside skips cleanly); idempotent and serialized by its own
+        // IMMEDIATE txn, so racing openers converge.
+        rag_rat_oplog::rebuild_all_content_projections_if_stale(storage.connection())?;
         Ok(storage)
     }
 

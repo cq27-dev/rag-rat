@@ -800,9 +800,11 @@ fn list_streams_pending_refold(conn: &Connection) -> anyhow::Result<Vec<[u8; 32]
 
 /// Whether the V070 `content_projected_*` tables exist yet — false on a DB upgrading past a
 /// pre-V070 ledger, where the reproject would target absent tables. `sqlite_master` is served from
-/// SQLite's in-memory schema, so this is cheap; mirrors [`content_entries_exists`].
-fn content_projected_tables_exist(tx: &Transaction<'_>) -> rusqlite::Result<bool> {
-    tx.query_row(
+/// SQLite's in-memory schema, so this is cheap; mirrors [`content_entries_exists`]. Takes a
+/// `&Connection` (a `&Transaction` derefs to it) so the open-path upgrade re-fold
+/// ([`content_projection::rebuild_all_content_projections_if_stale`], #688) shares the one guard.
+pub(crate) fn content_projected_tables_exist(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'content_projected_nodes'",
         [],
         |_| Ok(()),

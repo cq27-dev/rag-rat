@@ -1124,6 +1124,160 @@ mod tests {
         assert_eq!(node_count, 1, "only the decodable node projects; the bad body is skipped");
     }
 
+    // ── #688: the /3 projector-version two-part discipline ──
+
+    /// The stored `/3` content-projector stamp, as the raw string `oplog_meta` holds.
+    fn stored_stamp(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM oplog_meta WHERE key = 'content_projector_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn projected_node_count(conn: &Connection, stream: StreamId) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM content_projected_nodes WHERE stream_id = ?1",
+            params![stream.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_upgrade_refold_rebuilds_every_stream_then_stamps_once() {
+        let conn = db();
+        let stream_a = StreamId::from_bytes(STREAM_A);
+        let stream_b = StreamId::from_bytes(STREAM_B);
+        let account = owned_stream_account(&conn, stream_a);
+        author_committed(&conn, stream_a, &[node_create("na", "on a")]);
+        seed_ownership(&conn, stream_b, account);
+        author_committed(&conn, stream_b, &[node_create("nb", "on b")]);
+        assert_eq!(projected_node_count(&conn, stream_a), 1);
+        assert_eq!(projected_node_count(&conn, stream_b), 1);
+
+        // Simulate an old binary's fold: stale projection rows everywhere, an older stamp, plus a
+        // stray row on a stream whose accepted set is now empty (it must not linger).
+        conn.execute_batch(
+            "DELETE FROM content_projected_nodes;
+             DELETE FROM content_projected_edges;
+             INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
+              VALUES(X'99', 'ghost', '{}', 'active');
+             INSERT INTO oplog_meta(key, value) VALUES ('content_projector_version', '0')
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+        )
+        .unwrap();
+
+        assert!(
+            content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap(),
+            "a stale stamp re-folds"
+        );
+        assert_eq!(projected_node_count(&conn, stream_a), 1, "stream A rebuilt");
+        assert_eq!(projected_node_count(&conn, stream_b), 1, "stream B rebuilt");
+        let ghost: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM content_projected_nodes WHERE node_id = 'ghost'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ghost, 0, "the wholesale clear dropped the row with no accepted content");
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("1"), "the store-global stamp upgraded");
+
+        assert!(
+            !content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap(),
+            "a current stamp is a no-op"
+        );
+    }
+
+    #[test]
+    fn the_per_stream_reproject_maintains_but_never_upgrades_the_stamp() {
+        let conn = db();
+        let stream = StreamId::from_bytes(STREAM_A);
+        owned_stream_account(&conn, stream);
+
+        // On a store the open-path trigger never ran (a raw connection), authoring reprojects the
+        // stream but leaves the MISSING stamp untouched — the rebuild-all path is the only
+        // upgrader.
+        author_committed(&conn, stream, &[node_create("n1", "first")]);
+        assert_eq!(projected_node_count(&conn, stream), 1);
+        assert_eq!(
+            stored_stamp(&conn),
+            None,
+            "a per-stream reproject never writes the first stamp"
+        );
+
+        // An OLDER stamp is left untouched too: the per-stream path rebuilds this stream's rows
+        // but does not mark the (possibly stale) store current.
+        conn.execute(
+            "INSERT INTO oplog_meta(key, value) VALUES ('content_projector_version', '0')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("DELETE FROM content_projected_nodes;").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        content_projection::reproject_accepted_content_stream(&tx, stream).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(projected_node_count(&conn, stream), 1, "the stream's rows are rebuilt");
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("0"), "the stale stamp is NOT upgraded");
+
+        // The upgrade re-fold makes the store current; from then on per-stream reprojects
+        // maintain the stamp.
+        assert!(content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap());
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("1"));
+        author_committed(&conn, stream, &[node_create("n2", "second")]);
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("1"), "a current store stays current");
+        assert_eq!(projected_node_count(&conn, stream), 2);
+    }
+
+    #[test]
+    fn the_per_stream_reproject_still_refuses_a_newer_stamp() {
+        let conn = db();
+        let stream = StreamId::from_bytes(STREAM_A);
+        owned_stream_account(&conn, stream);
+        author_committed(&conn, stream, &[node_create("n1", "first")]);
+
+        // Simulate a NEWER binary having folded + stamped a higher content-projector version.
+        conn.execute(
+            "INSERT INTO oplog_meta(key, value) VALUES ('content_projector_version', '999')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(
+            content_projection::reproject_accepted_content_stream(&tx, stream).is_err(),
+            "an older projector must not reproject a newer-folded store"
+        );
+        drop(tx);
+        // The upgrade re-fold also leaves the newer projection intact (never downgrades).
+        assert!(
+            !content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap(),
+            "a newer stamp is not re-folded"
+        );
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("999"), "the newer stamp stands");
+    }
+
+    #[test]
+    fn the_upgrade_refold_skips_a_store_before_the_projected_tables_exist() {
+        // The pre-V070 mid-migration window: `content_projected_*` do not exist yet, so there is
+        // nothing to rebuild and nothing to stamp against — skip cleanly (the #683 guard, reused).
+        let conn = db();
+        conn.execute_batch(
+            "DROP TABLE content_projected_nodes; DROP TABLE content_projected_edges;",
+        )
+        .unwrap();
+        assert!(
+            !content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap(),
+            "a pre-V070 store is skipped"
+        );
+        assert_eq!(stored_stamp(&conn), None, "no stamp is written against absent tables");
+    }
+
     #[test]
     fn the_chain_tail_reader_reports_genesis_for_an_empty_chain_and_the_head_when_populated() {
         let conn = db();

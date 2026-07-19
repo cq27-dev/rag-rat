@@ -103,6 +103,10 @@ pub use account::{
     rotate_stream_key_in_tx, select_current_sealing_wrap, stream_key_rotation_needed,
     stream_owner_effective,
 };
+// The `/3` content projection's store-global upgrade re-fold (#688): wired into the index
+// open/migrate seam by rag-rat-core, so a stale store is rebuilt (every stream, then the one
+// stamp) before any per-stream write.
+pub use content_projection::rebuild_all_content_projections_if_stale;
 // The op-log's first crate-internal API surface (#524): the MINTING primitives + the op
 // vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through

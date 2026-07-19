@@ -37,6 +37,10 @@ pub use envelope::{
     reason = "C5a sealed envelope is unwired until C5b consumes it (#608)"
 )]
 pub use envelope::{seal_and_sign_content_entry, sign_sealed_content_entry};
+// The V070 `content_projected_*` table-existence guard: shared crate-wide with the `/3`
+// projection's open-path upgrade re-fold (#688) so there is ONE guard, reused per the #683
+// doctrine.
+pub(crate) use storage::content_projected_tables_exist;
 #[allow(unused_imports, reason = "C2 storage seam is frozen before C3 wiring lands")]
 pub use storage::{
     ContentCapacityScope, ContentIngestOutcome, content_ingest, settle_pending_content_refolds,

@@ -1447,18 +1447,20 @@ mod tests {
     #[test]
     fn a_failed_author_rolls_back_the_memory_write() {
         let conn = scoped_conn();
-        // One good create so the account + owner stream are established and the first create
-        // stamped the `/3` content projector version (the second create's backfill
-        // fast-paths, isolating the failure to the live author's reproject).
+        // One good create so the account + owner stream are established and the second create's
+        // backfill fast-paths, isolating the failure to the live author's reproject.
         create_concept(&conn, "first").unwrap();
         let before: i64 =
             conn.query_row("SELECT COUNT(*) FROM repo_memories", [], |r| r.get(0)).unwrap();
         // Poison the `/3` projector guard: pretend a NEWER binary already folded this store's `/3`
         // projection, so `reproject_accepted_content_stream`'s `assert_content_projector_not_newer`
         // errors and the second create's `/3` author fails (this doubles as the #664 `/3`
-        // projector-stamp poison test).
+        // projector-stamp poison test). UPSERT: on this raw-connection store the stamp may be
+        // absent — the per-stream reproject only MAINTAINS an already-current stamp (#688); the
+        // open-path trigger (`rebuild_all_content_projections_if_stale`) is what writes it first.
         conn.execute(
-            "UPDATE oplog_meta SET value = '999' WHERE key = 'content_projector_version'",
+            "INSERT INTO oplog_meta(key, value) VALUES ('content_projector_version', '999')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
         .unwrap();

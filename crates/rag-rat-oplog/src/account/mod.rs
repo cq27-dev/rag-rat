@@ -44,6 +44,9 @@ pub use authoring::{
     ensure_owned_stream_v2_in_tx, established_owned_stream_v2, owned_stream_v2_id,
 };
 pub use bootstrap::local_account;
+// The V070 projection-table guard, reused by the memory-layer content projection's upgrade
+// re-fold (#688).
+pub(crate) use content::content_projected_tables_exist;
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, SignedContentEntry,
