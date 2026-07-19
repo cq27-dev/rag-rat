@@ -38,6 +38,7 @@ const VERSION_FILES = [
   ".claude-plugin/marketplace.json",
   "plugin/.claude-plugin/plugin.json",
   "plugin/.codex-plugin/plugin.json",
+  "plugin/opencode/package.json",
 ];
 const versionRe = /("version"\s*:\s*)"[^"]*"/;
 for (const file of VERSION_FILES) {

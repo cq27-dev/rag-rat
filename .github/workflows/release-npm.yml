@@ -13,6 +13,8 @@
 #                       workflow.)
 #   @rag-rat/skills   — the agent-skills installer (a thin wrapper; the skills are fetched from GitHub).
 #   @rag-rat/cookbook — the ephemeral-provisioning recipes.
+#   @rag-rat/plugin-opencode — the opencode plugin (plugin/opencode/); versions in lockstep with the
+#                       crate via tools/sync-plugin-version.mjs, like @rag-rat/bin.
 #
 # @rag-rat/skills and @rag-rat/cookbook are versioned INDEPENDENTLY of the crate, so each publishes
 # only when its package.json version is not already on npm — a re-run, or a release that didn't bump
@@ -113,6 +115,19 @@ jobs:
           fi
 
       # ── @rag-rat/skills + @rag-rat/cookbook: publish only when their version is new ───────────────
+      - name: Publish @rag-rat/plugin-opencode (only if this version is new)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./plugin/opencode/package.json').name")"
+          ver="$(node -p "require('./plugin/opencode/package.json').version")"
+          if npm view "$name@$ver" version >/dev/null 2>&1; then
+            echo "$name@$ver already on npm — skipping"
+          else
+            echo "publishing $name@$ver"
+            (cd plugin/opencode && npm publish --access public)
+          fi
       - name: Publish @rag-rat/skills (only if this version is new)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

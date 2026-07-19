@@ -1,0 +1,32 @@
+{
+  "name": "@rag-rat/plugin-opencode",
+  "version": "0.19.0",
+  "description": "opencode plugin for rag-rat: self-registers the rag-rat MCP server (semantic search, symbol/graph navigation, impact-surface preflight, repo memory) and wires session/grep/edit hooks through the shared agent-hook.",
+  "license": "MIT",
+  "type": "module",
+  "main": "rag-rat.ts",
+  "exports": {
+    ".": "./rag-rat.ts"
+  },
+  "files": [
+    "rag-rat.ts"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cq27-dev/rag-rat.git",
+    "directory": "plugin/opencode"
+  },
+  "homepage": "https://github.com/cq27-dev/rag-rat",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "mcp",
+    "code-intelligence",
+    "semantic-search",
+    "code-graph",
+    "repo-memory"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

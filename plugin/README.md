@@ -91,7 +91,15 @@ output.
 
 ### Installing in opencode
 
-Two options:
+Three options:
+- **npm (recommended):** the plugin ships as `@rag-rat/plugin-opencode` (source of truth:
+  `plugin/opencode/`, version synced with the release). Add it to `opencode.json`:
+  ```json
+  { "plugin": ["@rag-rat/plugin-opencode"] }
+  ```
+  opencode installs it with bun at startup. The entry is the TS source itself (`main:
+  rag-rat.ts`) — opencode's bun runtime loads TS directly, so no build step can drift; the
+  type-only `@opencode-ai/plugin` import is erased at compile time.
 - **Whole bundle** (keeps the shared launcher): copy or symlink the repo's `plugin/` tree
   somewhere stable and symlink `plugin/opencode/rag-rat.ts` into `~/.config/opencode/plugins/`
   (global) or `.opencode/plugins/` (project). The shim finds `../scripts/launch.js` relative to
@@ -99,8 +107,7 @@ Two options:
 - **Single file**: drop `opencode/rag-rat.ts` alone into the plugins dir. The shim then resolves
   the binary itself with the launcher's `--no-install` policy (`$RAG_RAT_BIN` → managed cache →
   npx cache → version-matched `PATH`); hooks no-op until the MCP server's first `npx` run has
-  installed the binary. Its type-only `@opencode-ai/plugin` import is erased at compile time, so
-  no `node_modules` is needed.
+  installed the binary.
 
 ### Still to verify on-device
 
