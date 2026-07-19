@@ -11,7 +11,9 @@ pub(crate) fn strip_schema_metadata(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.remove("$schema");
-            map.remove("title");
+            if map.get("title").is_some_and(Value::is_string) {
+                map.remove("title");
+            }
             for child in map.values_mut() {
                 strip_schema_metadata(child);
             }

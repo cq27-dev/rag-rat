@@ -177,6 +177,19 @@ fn list_tools_exposes_complete_typed_schemas() {
         assert!(names.contains(&expected), "missing MCP tool {expected}");
     }
 
+    for tool in tools {
+        let name = tool["name"].as_str().expect("tool name");
+        let schema = tool_schema(tools, name);
+        let properties = schema["properties"].as_object();
+        for required in schema["required"].as_array().into_iter().flatten() {
+            let required = required.as_str().expect("required property name");
+            assert!(
+                properties.is_some_and(|properties| properties.contains_key(required)),
+                "{name} requires `{required}` but does not define it"
+            );
+        }
+    }
+
     assert_schema_requires(tools, "semantic_search", "query");
     assert_schema_has_property(tools, "semantic_search", "include_graph");
     assert_schema_property_enum(tools, "semantic_search", "include_graph", &[
@@ -292,6 +305,7 @@ fn list_tools_exposes_complete_typed_schemas() {
     ]);
     assert_schema_has_property(tools, "heal_index", "limit");
     assert_schema_requires(tools, "memory_create", "kind");
+    assert_schema_has_property(tools, "memory_create", "title");
     // `bind` is OPTIONAL (#463): omitting it creates an unanchored Concept/Task node.
     assert_schema_has_property(tools, "memory_create", "bind");
     assert_schema_has_property(tools, "memory_create", "confidence");
