@@ -18,10 +18,12 @@
 //!     `repo_id` column that are nonetheless owned by a repo, reached only through a
 //!     `repo_id`-bearing parent (`files.id` → `chunks`/`symbols`, `chunks.id` → the chunk-child +
 //!     FTS rows, `repo_memories.id` → the memory children, `clone_graph_generations.generation` →
-//!     the clone postings). Every child is also `ON DELETE CASCADE` from its parent, so the sweep
-//!     would reach them with `foreign_keys = ON` — but they are purged EXPLICITLY here (id sets
-//!     captured up front) so the purge is correct even with FK enforcement off, and so the tripwire
-//!     can assert each is emptied by name.
+//!     the clone postings). `edges_data` also has a legacy/malformed NULL-source escape hatch:
+//!     those rows are reached by either symbol endpoint in the captured victim-symbol set. Every
+//!     child is also `ON DELETE CASCADE` from its parent, so the sweep would reach them with
+//!     `foreign_keys = ON` — but they are purged EXPLICITLY here (id sets captured up front) so the
+//!     purge is correct even with FK enforcement off, and so the tripwire can assert each is
+//!     emptied by name.
 //!  3. **FTS / external-content fixups** — `chunk_fts` is a contentless FTS5 index keyed by
 //!     `chunk.id` (no FK, no `repo_id`): its rows are deleted by rowid from the captured chunk set.
 //!     `commit_fts` is external-content on `git_commits`, so deleting the repo's commits desyncs
@@ -218,6 +220,22 @@ pub fn count_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<RepoR
         )?;
         counts.record(transitive.table, count);
     }
+    // `edges_data.source_file_id` is nullable. Normal index writers always stamp it, but legacy /
+    // manually-created rows can carry NULL and therefore evade `NULL IN (victim file ids)`. Count
+    // exactly the NULL-source rows whose FROM or TO endpoint is a captured victim symbol; a
+    // non-NULL sibling-source cross-repo edge remains owned by that sibling and is not included.
+    if crate::schema::table_exists(conn, "edges_data")? {
+        let null_source_edges: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM edges_data WHERE source_file_id IS NULL AND (from_symbol_id \
+                 IN ({symbols}) OR to_symbol_id IN ({symbols}))",
+                symbols = parent_id_select(purge_ids::SYMBOLS),
+            ),
+            params![repo_id],
+            |row| row.get(0),
+        )?;
+        counts.record("edges_data", null_source_edges);
+    }
     // chunk_fts (contentless FTS, keyed by chunk.id) — counted like the other chunk children.
     if crate::schema::table_exists(conn, "chunk_fts")? {
         let chunk_fts: i64 = conn.query_row(
@@ -264,6 +282,19 @@ fn parent_id_select(parent_ids: &str) -> &'static str {
 ///  5. Drop the temp id tables.
 pub fn purge_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
     capture_purge_ids(conn, repo_id)?;
+
+    // #782: `source_file_id` is nullable. Delete legacy / malformed NULL-source edges by either
+    // endpoint BEFORE symbols are removed (the captured set makes this correct with foreign keys
+    // both ON and OFF). Restricting this special case to NULL preserves a valid cross-repo edge
+    // whose non-NULL source file belongs to a sibling.
+    conn.execute(
+        &format!(
+            "DELETE FROM edges_data WHERE source_file_id IS NULL AND (from_symbol_id IN (SELECT \
+             id FROM {symbols}) OR to_symbol_id IN (SELECT id FROM {symbols}))",
+            symbols = purge_ids::SYMBOLS,
+        ),
+        [],
+    )?;
 
     // Transitive children first (each keyed by a captured id set, so ordering vs. the sweep is
     // irrelevant — the temp tables decouple them from whether the parent rows still exist).

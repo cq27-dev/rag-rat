@@ -70,9 +70,11 @@ pub struct RemoveOutcome {
 /// repo" the way the read-path resolver does: for a destructive `rm <path>`, resolving an arbitrary
 /// unregistered path to the only registered repo would offer to delete the wrong repo. Routes, in
 /// order:
-///  1. by derived git IDENTITY — if `path` is a git worktree whose content-derived id is a
-///     registered repo, that id (this also resolves a LINKED worktree, whose path is not the
-///     recorded root but derives the same id);
+///  1. by derived git IDENTITY — only when `path` is the discovered WORKTREE TOP and its
+///     content-derived id is a registered repo (this also resolves a LINKED worktree top, whose
+///     path is not the recorded root but derives the same id). Restricting identity discovery to
+///     the top is the destructive-target guard: git discovery walks upward, so an arbitrary child
+///     (`repo/src`) must not silently select the enclosing repo under `--yes`;
 ///  2. by EXACT `repo_roots` match on the canonical path, then the path as given — so a repo whose
 ///     working tree was DELETED / moved / is non-git (identity underivable), or was registered
 ///     under a pinned `[index] repo_id`, still resolves by its recorded root.
@@ -91,12 +93,14 @@ pub fn resolve_removable_repo(
         .or_else(|_| std::path::absolute(path).map(|path| lexically_normalize(&path)))
         .unwrap_or_else(|_| path.to_path_buf());
 
-    // Route 1: a derivable git identity that is a REGISTERED repo. Try the GOVERNING config's
-    // `[index] repo_id` override first when the path is a live checkout with a config, so pinned
-    // repos with `[index] root = "src"` resolve from the checkout top (not only the indexed
-    // subdir). Fall back to the content-derived identity when no override applies or it does not
-    // match a registered repo.
-    if canonical.is_dir() {
+    // Route 1: a derivable git identity that is a REGISTERED repo, but ONLY when the argument is
+    // the discovered worktree top. `discover_repo` walks upward, so running `rm --yes repo/src`
+    // must not silently select and deconfigure `repo`; an exact configured subroot remains valid
+    // through route 2's recorded-root match. Try the GOVERNING config's `[index] repo_id` override
+    // first, so pinned repos with `[index] root = "src"` resolve from the checkout top (not only
+    // the indexed subdir). Fall back to the content-derived identity when no override applies or
+    // it does not match a registered repo.
+    if path_is_worktree_top(&canonical) {
         let config_path = rag_rat_base::config::discover_config_path(&canonical);
         if let Ok(config) = rag_rat_base::config::Config::load(&config_path)
             && let Some(override_id) = config.repo_id_override.as_deref()
@@ -106,14 +110,13 @@ pub fn resolve_removable_repo(
         {
             return Ok(Some(load_resolved_repo(conn, identity.repo_id, canonical)?));
         }
-    }
-
-    // Route 1b: content-derived identity for the path itself. Still unambiguous because it is
-    // derived from the git content AT this path; no sole-repo guessing.
-    if let Ok(identity) = rag_rat_base::repo_identity::resolve_repo_identity(&canonical, None)
-        && schema::repo_id_is_registered(conn, &identity.repo_id)?
-    {
-        return Ok(Some(load_resolved_repo(conn, identity.repo_id, canonical)?));
+        // Route 1b: content-derived identity for the worktree top itself. Still unambiguous
+        // because it is derived from the git content AT this worktree; no sole-repo guessing.
+        if let Ok(identity) = rag_rat_base::repo_identity::resolve_repo_identity(&canonical, None)
+            && schema::repo_id_is_registered(conn, &identity.repo_id)?
+        {
+            return Ok(Some(load_resolved_repo(conn, identity.repo_id, canonical)?));
+        }
     }
 
     // Route 2: an exact recorded-root match — a physical path belongs to exactly one repo, and
@@ -129,6 +132,18 @@ pub fn resolve_removable_repo(
         }
     }
     Ok(None)
+}
+
+/// Whether `path` is exactly the worktree top discovered from it, not merely a child for which git
+/// discovery walked upward. Both sides are canonicalized because gix may return a symlinked or
+/// relative work directory while the removal argument was canonicalized above. Bare repositories
+/// have no work directory and therefore use only the exact recorded-root route.
+fn path_is_worktree_top(path: &Path) -> bool {
+    rag_rat_base::repo_discover::discover_repo(path)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .and_then(|work_dir| work_dir.canonicalize().ok())
+        .is_some_and(|work_dir| work_dir == path)
 }
 
 /// Remove `.` / `..` components WITHOUT touching the filesystem. Used only after
@@ -349,6 +364,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn identity_resolution_accepts_the_worktree_top_but_rejects_an_arbitrary_child() {
+        let (root, config) = poison_test_config("rm_identity_target");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        drop(db);
+        let storage = IndexConnection::open(&config.database).unwrap();
+        let conn = storage.connection();
+
+        let top = super::resolve_removable_repo(conn, &root)
+            .unwrap()
+            .expect("the worktree top resolves by identity");
+        let child = root.join("src");
+        assert!(
+            super::resolve_removable_repo(conn, &child).unwrap().is_none(),
+            "an arbitrary existing child must not select its enclosing repo"
+        );
+
+        // A configured `[index] root = "src"` records that exact subroot. Route 2 must continue to
+        // accept it even though route 1 correctly rejects child-path identity discovery.
+        conn.execute("UPDATE repo_roots SET root = ?1 WHERE repo_id = ?2", rusqlite::params![
+            child.to_string_lossy(),
+            top.repo_id
+        ])
+        .unwrap();
+        assert_eq!(
+            super::resolve_removable_repo(conn, &child).unwrap().unwrap().repo_id,
+            top.repo_id,
+            "an exact recorded config root remains a valid destructive target"
+        );
+        drop(storage);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// The one REAL fixture repo (neither the `__unassigned__` placeholder nor the poison sibling).
     fn fixture_repo_id(conn: &rusqlite::Connection) -> String {
         conn.query_row(
@@ -377,7 +425,7 @@ mod tests {
         tag: &str,
         chunk_id: i64,
         symbol_id: i64,
-    ) {
+    ) -> i64 {
         // OR IGNORE: a real fixture chunk already carries a chunk_text row (leave it); the poison
         // chunk carries none (seed one so the purge has a chunk_text row to remove).
         conn.execute(
@@ -421,6 +469,19 @@ mod tests {
             params![symbol_id, format!("baseline_{tag}")],
         )
         .unwrap();
+        // #782: a legacy/malformed edge with no source_file_id. Normal index writers stamp the
+        // source file, but the nullable schema permits this shape; purge must reach it through a
+        // victim symbol endpoint. Reusing the symbol's interned qualified-name id satisfies every
+        // required interned-id column without adding unrelated fixture state.
+        conn.execute(
+            "INSERT INTO edges_data(source_file_id, from_symbol_id, to_symbol_id, from_name_id, \
+             to_name_id, edge_kind_id, confidence_id, resolution_id) SELECT NULL, s.id, s.id, \
+             n.id, n.id, n.id, n.id, n.id FROM symbols s CROSS JOIN (SELECT id FROM name_strings \
+             ORDER BY id LIMIT 1) n WHERE s.id = ?1",
+            params![symbol_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
     }
 
     /// Seed the memory- and clone-generation transitive children the poison harness does not seed,
@@ -479,6 +540,7 @@ mod tests {
         let file_in = in_clause(files);
         let chunk_in = in_clause(chunks);
         let symbol_in = in_clause(symbols);
+        let null_edge_symbol_in = symbol_in.clone();
         let generation_in = generation.map(|g| g.to_string()).unwrap_or_else(|| "NULL".to_string());
         // (table, keyed column, IN-body) for every transitive child + the contentless chunk_fts.
         let checks: Vec<(&str, &str, String)> = vec![
@@ -514,6 +576,21 @@ mod tests {
                  IN the removed repo's ids) — add it to TRANSITIVE_SCOPED_TABLES",
             );
         }
+        let null_source_edges: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM edges_data WHERE source_file_id IS NULL AND \
+                     (from_symbol_id IN ({null_edge_symbol_in}) OR to_symbol_id IN \
+                     ({null_edge_symbol_in}))"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            null_source_edges, 0,
+            "purge left NULL-source edge row(s) attached to the removed repo's symbols"
+        );
     }
 
     #[test]
@@ -564,7 +641,7 @@ mod tests {
 
         // Seed B's derived + memory + clone transitive children (the ones the poison harness does
         // not seed) so purging B exercises — and the orphan check pins — every transitive child.
-        seed_chunk_symbol_children(conn, "b", b_chunk, b_symbol);
+        let b_null_source_edge = seed_chunk_symbol_children(conn, "b", b_chunk, b_symbol);
         seed_memory_and_clone_children(conn, &b_memory, b_generation);
 
         // Seed the fixture A's chunk/symbol children too, so A HAS rows in those transitive tables
@@ -586,7 +663,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        seed_chunk_symbol_children(conn, "a", a_chunk, a_symbol);
+        let a_null_source_edge = seed_chunk_symbol_children(conn, "a", a_chunk, a_symbol);
 
         // The full class-level table set, captured from the LIVE schema. A subset here would
         // silently narrow the guarantee, so pin a floor on its breadth.
@@ -637,6 +714,20 @@ mod tests {
             &b_symbols,
             &b_memory,
             Some(b_generation),
+        );
+        let edge_exists = |id: i64| -> bool {
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM edges_data WHERE id = ?1)", [id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert!(
+            !edge_exists(b_null_source_edge),
+            "the victim's exact NULL-source edge row must be deleted, not merely endpoint-nulled"
+        );
+        assert!(
+            edge_exists(a_null_source_edge),
+            "the sibling's NULL-source edge row must survive the scoped purge"
         );
         // The read-side counter agrees: nothing left for B.
         assert_eq!(schema::count_repo_rows(conn, POISON_REPO_ID).unwrap().total_rows, 0);
