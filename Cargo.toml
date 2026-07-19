@@ -53,13 +53,13 @@ anyhow = "1.0"
 # features (incl. `zeroize`, which zeroizes a `SigningKey`'s seed on drop) are kept; the `rand_core`
 # CSPRNG-keygen feature stays OFF — device keys derive deterministically from a seed via
 # `SigningKey::from_bytes`. Verification uses `verify_strict` (rejects malleable / small-order sigs).
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 # X25519 device ENCRYPTION keypair beside the ed25519 signing key (sync phase C, §5). Shares
-# curve25519-dalek 4 with ed25519-dalek 2 (no second curve impl in the tree). `static_secrets`
+# curve25519-dalek 5 with ed25519-dalek 3 (no second curve impl in the tree). `static_secrets`
 # enables the persistable `StaticSecret`, reconstructed from the stored 32-byte secret exactly as the
 # ed25519 key is rebuilt from its seed; the default `zeroize` scrubs it on drop. C1 only mints,
 # persists, and validates the key (rejecting small-order / identity public keys); ECDH + HKDF is C4.
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 # XChaCha20-Poly1305 AEAD for content-key wrapping (sync phase C4, #607). Wraps the audited RustCrypto
 # stream/MAC primitives (`chacha20`, `poly1305`) — constant-time (`subtle`) tag comparison and
 # zeroize-on-drop of the cipher key. `default-features = false` drops the `getrandom`/`rand_core` nonce
@@ -72,7 +72,7 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 # line that rag-rat-core's own SHA-256 (`sha2` 0.11, used by oplog::cbor + oplog::device) already
 # links, so it adds NO second sha2/digest stack — `Hkdf::<sha2::Sha256>` reuses the existing hash.
 hkdf = "0.13"
-fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+fastembed = { version = "5.17.3", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 # Cross-platform mtime setter, used only by `test_scratch`'s sweep test to age a fixture dir past
 # the sweep threshold (already in the tree transitively; a dev-dependency, not shipped).
 filetime = "0.2"
@@ -82,7 +82,7 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 # OS CSPRNG for the op-log device key: fills a 32-byte ed25519 seed at first use, which then flows
 # through the existing deterministic `SigningKey::from_bytes`. The lowest-level entropy source (no
 # `rand`/`rand_core` pulled in for this), keeping `from_seed` the sole key constructor.
-getrandom = "0.3"
+getrandom = "0.4"
 gix = { version = "0.85.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
 httpdate = "1.0"
 libc = "0.2"
@@ -96,10 +96,11 @@ path-slash = "0.2"
 # the pull parser + `Options` are used. No `getrandom`/`simd` features.
 pulldown-cmark = { version = "0.13", default-features = false }
 # Async HTTP for the papertrail provider clients (#589). rustls (no system OpenSSL), no default
-# features — the transport is driven on the papertrail module's private runtime at the sync
-# boundary, so nothing else in the tree grows an async dependency.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-rmcp = { version = "1.8.0", features = ["transport-io"] }
+# features. Reqwest 0.13's `rustls` feature uses platform trust roots, so enterprise forge CAs work
+# when installed in the OS store; minimal Linux images must include a CA bundle. The transport is
+# driven on the papertrail module's private runtime at the sync boundary.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rmcp = { version = "2.2.0", features = ["transport-io"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rayon = "1.12"
 regex = "1.12"
@@ -110,10 +111,10 @@ sha2 = "0.11"
 # Sourcegraph SCIP protobuf types for the SCIP-oracle pass (#61/#68). Normal dependency — the
 # size budget is explicitly waived for SCIP; do NOT feature-gate or hand-copy the proto.
 # `protobuf` is scip's own transitive dep, pulled in directly so we can call `Message::parse_*`
-# on the generated SCIP types; pinned to the version scip 0.8 generates against.
+# on the generated SCIP types; pinned to the version scip 0.9 generates against.
 minicbor = { version = "2.2.2", features = ["alloc"] }
-protobuf = "3.7"
-scip = "0.8.1"
+protobuf = "=3.7.2"
+scip = "0.9.0"
 unicode-normalization = "0.1.25"
 # On-demand stack growth for the tree-sitter descent helpers. A hostile source file (a callee that
 # is thousands of nested parens, a thousands-deep generic type) parses within budget but recursing

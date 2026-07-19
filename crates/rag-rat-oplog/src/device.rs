@@ -111,7 +111,7 @@ pub(super) struct DeviceX25519Secret(StaticSecret);
 
 impl DeviceX25519Secret {
     /// Rebuild the X25519 secret from its persisted 32-byte scalar. `StaticSecret::from` and
-    /// `to_bytes` are inverses — x25519-dalek 2 stores the scalar VERBATIM (clamping happens at DH
+    /// `to_bytes` are inverses — x25519-dalek 3 stores the scalar VERBATIM (clamping happens at DH
     /// / public derivation, not construction) — so the round-trip through
     /// [`secret_bytes`](Self::secret_bytes) re-derives the SAME key. Deterministic (the backfill
     /// tests rely on it).

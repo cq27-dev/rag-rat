@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use ::protobuf::Message;
-use ::scip::types::{Index, PositionEncoding, SymbolInformation};
+use ::scip::types::{self, Index, Occurrence, PositionEncoding, SymbolInformation};
 
 /// A SCIP occurrence reduced to what the join needs: the **byte** range of the identifier token on
 /// its line and the SCIP symbol it refers to. Byte offsets are absolute within the file (not
@@ -194,7 +194,7 @@ impl ScipIndex {
                 if is_local_symbol(&occ.symbol) {
                     continue;
                 }
-                let Some((start_byte, end_byte)) = mapper.byte_range(&occ.range) else {
+                let Some((start_byte, end_byte)) = mapper.byte_range_for_occurrence(occ) else {
                     continue;
                 };
                 let is_definition = has_definition_role(occ.symbol_roles);
@@ -358,9 +358,8 @@ pub(crate) fn stabilize_moniker_version(
     Cow::Owned(::scip::symbol::format_symbol(parsed))
 }
 
-/// Converts a SCIP `Occurrence.range` (`[start_line, start_char, end_char]` for single-line, or
-/// `[start_line, start_char, end_line, end_char]` for multi-line) — whose char columns are in a
-/// document's `position_encoding` — into an absolute **byte** range within the file.
+/// Converts a SCIP occurrence range — typed when present, otherwise the deprecated packed vector —
+/// whose char columns are in a document's `position_encoding` into an absolute **byte** range.
 ///
 /// Precomputes, per line, the byte offset of the line start, so a `(line, char)` lookup is a walk
 /// from the line start advancing one code unit at a time in the declared encoding. This is the
@@ -383,6 +382,25 @@ impl<'a> LineColumnToByte<'a> {
         Self { source, encoding, line_starts }
     }
 
+    fn byte_range_for_occurrence(&self, occurrence: &Occurrence) -> Option<(usize, usize)> {
+        match &occurrence.typed_range {
+            Some(types::occurrence::Typed_range::SingleLineRange(range)) => self.byte_range_coords(
+                range.line,
+                range.start_character,
+                range.line,
+                range.end_character,
+            ),
+            Some(types::occurrence::Typed_range::MultiLineRange(range)) => self.byte_range_coords(
+                range.start_line,
+                range.start_character,
+                range.end_line,
+                range.end_character,
+            ),
+            None => self.byte_range(&occurrence.range),
+            Some(_) => None,
+        }
+    }
+
     /// Byte range for a SCIP occurrence range vector. Returns `None` for malformed ranges or
     /// positions past end-of-file.
     fn byte_range(&self, range: &[i32]) -> Option<(usize, usize)> {
@@ -391,6 +409,16 @@ impl<'a> LineColumnToByte<'a> {
             [sl, sc, el, ec] => (*sl, *sc, *el, *ec),
             _ => return None,
         };
+        self.byte_range_coords(start_line, start_char, end_line, end_char)
+    }
+
+    fn byte_range_coords(
+        &self,
+        start_line: i32,
+        start_char: i32,
+        end_line: i32,
+        end_char: i32,
+    ) -> Option<(usize, usize)> {
         let start = self.byte_at(start_line, start_char)?;
         let end = self.byte_at(end_line, end_char)?;
         if end < start {

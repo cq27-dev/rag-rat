@@ -26,7 +26,7 @@ clap = { version = "4.6", features = ["derive"] }
 dialoguer = "0.12"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 tui-tree-widget = "0.24"
-toml_edit = "0.22"
+toml_edit = "0.25"
 gix.workspace = true
 rag-rat-core = { workspace = true }
 rag-rat-oracle.workspace = true
@@ -50,8 +50,8 @@ libc.workspace = true
 # Android isn't the long-lived-server idle-RSS case, so the system allocator is the right fallback).
 # The `#[global_allocator]` cfg in main.rs matches this exactly.
 [target.'cfg(all(not(target_env = "msvc"), not(target_os = "android")))'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
-tikv-jemalloc-ctl = "0.6"
+tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
+tikv-jemalloc-ctl = "0.7"
 
 [dev-dependencies]
 # MCP tool results render as TOON; integration tests decode them back to JSON Values to assert.

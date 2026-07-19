@@ -109,6 +109,61 @@ fn parse_multi_line_occurrence_range() {
     assert_eq!((occs[0].start_byte, occs[0].end_byte), (3, 10));
 }
 
+#[test]
+fn parse_typed_single_line_occurrence_range() {
+    let source = b"fn typed() {}\n".to_vec();
+    let mut occ =
+        Occurrence { symbol: "scip-rust crate v1 `typed`().".to_string(), ..Default::default() };
+    occ.set_single_line_range(::scip::types::SingleLineRange {
+        line: 0,
+        start_character: 3,
+        end_character: 8,
+        ..Default::default()
+    });
+    let bytes = scip_bytes("a.rs", PositionEncoding::UTF8CodeUnitOffsetFromLineStart, vec![occ]);
+    let idx = ScipIndex::parse(&bytes, move |_| Some(source.clone())).unwrap();
+    let parsed = &idx.occurrences_by_path.get("a.rs").unwrap()[0];
+    assert_eq!((parsed.start_byte, parsed.end_byte), (3, 8));
+}
+
+#[test]
+fn parse_typed_multi_line_occurrence_range() {
+    let source = b"fn a(\n   b) {}\n".to_vec();
+    let mut occ =
+        Occurrence { symbol: "scip-rust crate v1 `span`().".to_string(), ..Default::default() };
+    occ.set_multi_line_range(::scip::types::MultiLineRange {
+        start_line: 0,
+        start_character: 3,
+        end_line: 1,
+        end_character: 4,
+        ..Default::default()
+    });
+    let bytes = scip_bytes("a.rs", PositionEncoding::UTF8CodeUnitOffsetFromLineStart, vec![occ]);
+    let idx = ScipIndex::parse(&bytes, move |_| Some(source.clone())).unwrap();
+    let parsed = &idx.occurrences_by_path.get("a.rs").unwrap()[0];
+    assert_eq!((parsed.start_byte, parsed.end_byte), (3, 10));
+}
+
+#[test]
+fn typed_occurrence_range_takes_precedence_over_legacy_range() {
+    let source = b"fn typed() {}\n".to_vec();
+    let mut occ = Occurrence {
+        range: vec![0, 0, 2],
+        symbol: "scip-rust crate v1 `typed`().".to_string(),
+        ..Default::default()
+    };
+    occ.set_single_line_range(::scip::types::SingleLineRange {
+        line: 0,
+        start_character: 3,
+        end_character: 8,
+        ..Default::default()
+    });
+    let bytes = scip_bytes("a.rs", PositionEncoding::UTF8CodeUnitOffsetFromLineStart, vec![occ]);
+    let idx = ScipIndex::parse(&bytes, move |_| Some(source.clone())).unwrap();
+    let parsed = &idx.occurrences_by_path.get("a.rs").unwrap()[0];
+    assert_eq!((parsed.start_byte, parsed.end_byte), (3, 8));
+}
+
 /// An unspecified `position_encoding` falls back to one-byte-per-code-unit on ASCII (it behaves
 /// like UTF-32: one unit per scalar), so an ASCII identifier resolves to the same span a UTF-8
 /// document would.

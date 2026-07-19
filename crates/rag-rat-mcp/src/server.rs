@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rag_rat_base::config::Config;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
@@ -109,9 +109,9 @@ impl RagRatService {
         // a tool result is never lost. JSON is reachable by launching `rag-rat mcp --json`
         // (the format is chosen once at launch; MCP has no per-call flag).
         let text = rag_rat_core::render(&value, self.output_format);
-        let mut content = vec![Content::text(text)];
+        let mut content = vec![ContentBlock::text(text)];
         if let Some(nudge) = self.stale_memory_nudge(name) {
-            content.push(Content::text(nudge));
+            content.push(ContentBlock::text(nudge));
         }
         Ok(CallToolResult::success(content))
     }
@@ -201,7 +201,7 @@ impl RagRatService {
                        against the new index.",
         });
         let text = rag_rat_core::render(&payload, self.output_format);
-        CallToolResult::success(vec![Content::text(text)])
+        CallToolResult::success(vec![ContentBlock::text(text)])
     }
 }
 
@@ -441,7 +441,7 @@ mod tests {
     }
 
     fn ok_result() -> CallToolResult {
-        CallToolResult::success(vec![Content::text("ok")])
+        CallToolResult::success(vec![ContentBlock::text("ok")])
     }
 
     fn test_tool_workers(permits: usize) -> Arc<Semaphore> {

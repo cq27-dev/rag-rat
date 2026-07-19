@@ -75,7 +75,7 @@ const BOX_MAX_LIFETIME_MS = 1_800_000; // 30 minutes
  * RECLAIM TIME, stated honestly: Modal restarts the idle countdown on EVERY activity, so a box
  * orphaned mid-serve is reclaimed after the FULL window elapses from its last request — i.e.
  * `provisionTimeoutMs + this margin`, NOT just this margin. That is minutes-to-low-tens-of-minutes
- * (well under the 30-min max-lifetime cap), the price of a single static value: SDK 0.8.1 has no
+ * (well under the 30-min max-lifetime cap), the price of a single static value: the SDK has no
  * post-create setter to tighten the idle timeout once the box is past boot and serving.
  */
 const SERVING_IDLE_GRACE_MS = 180_000; // 3 minutes past the provisioning budget
