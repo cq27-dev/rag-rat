@@ -1,9 +1,10 @@
-# Claude Code grep augmentation
+# Grep augmentation
 
-`rag-rat` augments Claude Code's `Grep` tool calls and `grep`/`rg`/`ag` Bash commands with symbol
-and repo-memory context via the PreToolUse hook mechanism. When a grep pattern matches a known
-symbol or a bound repo memory, the hook injects an `additionalContext` digest before the tool runs.
-The hook never blocks a grep — it always exits 0.
+`rag-rat` augments an agent's search calls — Claude Code's `Grep` tool and `grep`/`rg`/`ag` Bash
+commands, Codex's `^Bash$`, opencode's `grep`/`bash` tools — with symbol and repo-memory context
+via the coding-agent hook mechanism. When a grep pattern matches a known symbol or a bound repo
+memory, the hook injects an `additionalContext` digest. The hook never blocks a grep — it always
+exits 0.
 
 ## What gets injected
 
@@ -38,14 +39,22 @@ codex plugin marketplace add cq27-dev/rag-rat
 codex plugin add rag-rat@rag-rat
 ```
 
-The plugin registers `PreToolUse` hooks on `Grep`/`Bash` (Claude Code) / `^Bash$` (Codex), each
-invoking `rag-rat agent-hook` with a 10-second timeout. When invoked, `agent-hook` walks up from the
-reported `cwd` looking for a `rag-rat.toml`. If none is found, the hook exits immediately without
-printing anything — a silent no-op for repositories that are not indexed by rag-rat.
+```jsonc
+// opencode — opencode.json
+{ "plugin": ["@rag-rat/plugin-opencode"] }
+```
+
+The plugin routes every search through `rag-rat agent-hook` with a 10-second timeout:
+`PreToolUse` on `Grep`/`Bash` (Claude Code), `PreToolUse` on `^Bash$` (Codex), and
+`tool.execute.after` on `grep`/`bash` (opencode, whose pre-tool hook has no context channel — the
+digest rides **on the tool result** there instead of preceding it). When invoked, `agent-hook`
+walks up from the reported `cwd` looking for a `rag-rat.toml`. If none is found, the hook exits
+immediately without printing anything — a silent no-op for repositories that are not indexed by
+rag-rat.
 
 ## How it serves
 
-When `rag-rat mcp` is running (the normal configuration for Claude Code), its process also holds the
+When `rag-rat mcp` is running (the normal plugin configuration), its process also holds the
 socket election for the current worktree. One listener wins per worktree and binds a Unix domain
 socket. The hook client connects to that socket, sends the pattern and session ID in a
 newline-delimited JSON request, and gets a reply within its 250 ms budget.
@@ -56,8 +65,8 @@ without per-session dedupe.
 
 ## Dedupe
 
-The listener tracks per-session state: once a memory or symbol has been injected for a given Claude
-Code session ID, it will not be injected again for the same session. The session map is in-memory;
+The listener tracks per-session state: once a memory or symbol has been injected for a given agent
+session ID, it will not be injected again for the same session. The session map is in-memory;
 dedupe resets when the listener restarts. The fallback path is stateless — the same content can be
 injected on every grep when no listener is running.
 
