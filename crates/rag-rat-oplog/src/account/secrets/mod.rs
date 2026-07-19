@@ -33,7 +33,7 @@ pub(in crate::account) use ops::validate_storable_secrets_payload;
 // the CLI "what key is current" surface. Nothing calls them in C4.3b (machinery ships one
 // slice ahead of its consumer).
 pub use sealing::{
-    SealingKeyOutcome, SelectedWrap, current_sealing_key, select_current_sealing_wrap,
-    stream_key_rotation_needed,
+    ContentKeyring, SealingKeyOutcome, SelectedWrap, current_sealing_key,
+    historical_content_keyring, select_current_sealing_wrap, stream_key_rotation_needed,
 };
 pub(in crate::account) use storage::refold_secrets_log;

@@ -114,9 +114,9 @@ const CONTENT_SEALED_OP_BODY_MAX_BYTES: usize =
     CONTENT_OP_BODY_MAX_BYTES - CONTENT_SEALED_AEAD_OVERHEAD_BYTES;
 
 /// The sealed-path twin of [`content_op_is_authorable`]: whether `op` fits a signed suite-1 `/3`
-/// entry once the AEAD nonce + tag are added to its body (S2, #608). C5b's live reconcile uses this
-/// to QUARANTINE an un-authorable op on a sealed stream — exactly as the suite-0 predicate does on
-/// a plaintext one — instead of `bail!`ing the whole batch at sign time.
+/// entry once the AEAD nonce + tag are added to its body (S2, #608). A future live reconcile uses
+/// this to QUARANTINE an un-authorable op on a sealed stream — exactly as the suite-0 predicate
+/// does on a plaintext one — instead of `bail!`ing the whole batch at sign time.
 pub fn content_op_is_sealed_authorable(op: &MemoryOp) -> bool {
     op::encode(op).len() <= CONTENT_SEALED_OP_BODY_MAX_BYTES
 }
@@ -226,11 +226,9 @@ pub fn author_content_batch_in_tx(
 /// stream's accepted-wrap set can legitimately empty under sync lag or a retro-condemn, and
 /// treating "no wrap ⇒ public" would author plaintext on a private stream (a confidentiality leak).
 ///
-/// UNWIRED in C5a: the live memory path still authors through [`author_content_batch_in_tx`]
-/// (suite 0). This policy-aware, self-transacting seam is exercised only by tests until C5b lands
-/// decrypt-at-projection, the read-side keyring, and the `sync enable` intent source. Authoring a
-/// sealed entry into the live path before C5b's decrypt exists triggers the reconcile anti-join
-/// duplication loop `content_projection` documents, which is why nothing live calls this yet.
+/// UNWIRED: the live memory path still authors through [`author_content_batch_in_tx`] (suite 0).
+/// The read-side can project sealed entries, but no live intent source selects this policy-aware,
+/// self-transacting seam yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealPolicy {
     /// Author plaintext suite-0 entries — REFUSED on a stream that has ratcheted to sealed.
@@ -458,12 +456,8 @@ fn mint_first_key_then_resolve(
 }
 
 /// The `SealPolicy::Sealed` txn B core — mirrors [`author_content_batch_in_tx`] but SEALS each op
-/// under `key` (suite 1). VERIFY-ACCEPTED reads `content_entry_status` ONLY, NEVER "the projection
-/// contains my nodes" (false for a sealed entry until C5b's decrypt-at-projection lands —
-/// `op::decode` fails on ciphertext). For the same reason the plaintext seam's
-/// `reproject_accepted_content_stream` call is INTENTIONALLY omitted: reprojecting a sealed stream
-/// pre-C5b would skip every sealed entry, and wiring that into the live reconcile is the anti-join
-/// duplication trap C5a avoids by staying unwired.
+/// under `key` (suite 1). VERIFY-ACCEPTED reads `content_entry_status` ONLY, never projection rows;
+/// after acceptance changes, the stream is reprojected in the same transaction just like suite 0.
 fn seal_and_author_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
@@ -528,6 +522,7 @@ fn seal_and_author_in_tx(
             ),
         }
     }
+    content_projection::reproject_accepted_content_stream(tx, stream_id)?;
     Ok(authored)
 }
 
@@ -921,6 +916,31 @@ mod tests {
         envelope::decode_content_signed(&signed_bytes).unwrap().header
     }
 
+    fn insert_accepted_signed(conn: &Connection, signed: &envelope::SignedContentEntry) {
+        let header = &signed.header;
+        conn.execute(
+            "INSERT INTO content_entries(
+                 entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, 0)",
+            params![
+                signed.entry_hash.as_slice(),
+                header.stream_id.to_bytes().as_slice(),
+                header.author_account_id.to_bytes().as_slice(),
+                header.device_fingerprint.to_bytes().as_slice(),
+                header.seq.to_be_bytes().as_slice(),
+                header.prev_hash.as_ref().map(|hash| hash.as_slice()),
+                header.grant_id.as_ref().map(|hash| hash.as_slice()),
+                header.roster_ref.as_slice(),
+                header.owner_auth_len.to_be_bytes().as_slice(),
+                header.author_auth_len.to_be_bytes().as_slice(),
+                signed.signed_bytes.as_slice(),
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn a_batch_authors_owner_content_that_folds_accepted_with_dense_seqs_and_lamport_eq_seq() {
         let conn = db();
@@ -1165,7 +1185,7 @@ mod tests {
              DELETE FROM content_projected_edges;
              INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
               VALUES(X'99', 'ghost', '{}', 'active');
-             INSERT INTO oplog_meta(key, value) VALUES ('content_projector_version', '0')
+             INSERT INTO oplog_meta(key, value) VALUES ('content_projector_version', '1')
               ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
         )
         .unwrap();
@@ -1184,7 +1204,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ghost, 0, "the wholesale clear dropped the row with no accepted content");
-        assert_eq!(stored_stamp(&conn).as_deref(), Some("1"), "the store-global stamp upgraded");
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("2"), "the store-global stamp upgraded");
 
         assert!(
             !content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap(),
@@ -1212,7 +1232,7 @@ mod tests {
         // An OLDER stamp is left untouched too: the per-stream path rebuilds this stream's rows
         // but does not mark the (possibly stale) store current.
         conn.execute(
-            "INSERT INTO oplog_meta(key, value) VALUES ('content_projector_version', '0')
+            "INSERT INTO oplog_meta(key, value) VALUES ('content_projector_version', '1')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -1222,14 +1242,14 @@ mod tests {
         content_projection::reproject_accepted_content_stream(&tx, stream).unwrap();
         tx.commit().unwrap();
         assert_eq!(projected_node_count(&conn, stream), 1, "the stream's rows are rebuilt");
-        assert_eq!(stored_stamp(&conn).as_deref(), Some("0"), "the stale stamp is NOT upgraded");
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("1"), "the v1 stamp is NOT upgraded");
 
         // The upgrade re-fold makes the store current; from then on per-stream reprojects
         // maintain the stamp.
         assert!(content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap());
-        assert_eq!(stored_stamp(&conn).as_deref(), Some("1"));
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("2"));
         author_committed(&conn, stream, &[node_create("n2", "second")]);
-        assert_eq!(stored_stamp(&conn).as_deref(), Some("1"), "a current store stays current");
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("2"), "a current store stays current");
         assert_eq!(projected_node_count(&conn, stream), 2);
     }
 
@@ -1474,6 +1494,253 @@ mod tests {
             secrets::select_current_sealing_wrap(&conn, account, stream).unwrap().is_some(),
             "a content key was minted for the stream",
         );
+        let projected: String = conn
+            .query_row(
+                "SELECT content_json FROM content_projected_nodes
+                 WHERE stream_id = ?1 AND node_id = 'n1'",
+                [stream.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("suite-1 content decrypts during projection");
+        assert!(projected.contains("second"), "the decrypted update wins the LWW register");
+    }
+
+    #[test]
+    fn mixed_plaintext_and_sealed_entries_project_together() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        author_committed(&conn, stream, &[node_create("public", "plain")]);
+        author_content_batch(
+            &conn,
+            stream,
+            &[node_create("private", "sealed")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .unwrap();
+        let ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT node_id FROM content_projected_nodes
+                     WHERE stream_id = ?1 ORDER BY node_id",
+                )
+                .unwrap();
+            stmt.query_map([stream.to_bytes().as_slice()], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(ids, vec!["private".to_string(), "public".to_string()]);
+    }
+
+    #[test]
+    fn projection_keeps_prior_epoch_content_after_rotation() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        author_content_batch(
+            &conn,
+            stream,
+            &[node_create("old", "epoch zero")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        secrets::rotate_stream_key_in_tx(&tx, stream, NOW + 1).unwrap();
+        tx.commit().unwrap();
+        author_content_batch(
+            &conn,
+            stream,
+            &[node_create("new", "epoch one")],
+            SealPolicy::Sealed,
+            NOW + 2,
+        )
+        .unwrap();
+        assert_eq!(projected_node_count(&conn, stream), 2, "both historical keys are available");
+    }
+
+    #[test]
+    fn decrypted_nodes_follow_retro_condemn_and_accept_reprojection() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        let hashes = author_content_batch(
+            &conn,
+            stream,
+            &[node_create("sealed", "visible")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(projected_node_count(&conn, stream), 1);
+
+        conn.execute("UPDATE content_entries SET accepted = 0 WHERE entry_hash = ?1", [
+            hashes[0].as_slice()
+        ])
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        content_projection::reproject_accepted_content_stream(&tx, stream).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(projected_node_count(&conn, stream), 0, "retro-condemn removes decrypted state");
+
+        conn.execute("UPDATE content_entries SET accepted = 1 WHERE entry_hash = ?1", [
+            hashes[0].as_slice()
+        ])
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        content_projection::reproject_accepted_content_stream(&tx, stream).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(projected_node_count(&conn, stream), 1, "retro-accept restores decrypted state");
+    }
+
+    #[test]
+    fn projection_resolves_the_stream_owner_not_the_content_author() {
+        let conn = db();
+        let (owner, stream) = owned_v2(&conn);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        secrets::mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW).unwrap();
+        tx.commit().unwrap();
+        let device = local_device(&conn, NOW).unwrap();
+        let key = match secrets::current_sealing_key(&conn, owner, stream, &device, NOW).unwrap() {
+            SealingKeyOutcome::Ready(key) => key,
+            _ => panic!("owner key must resolve"),
+        };
+        let granted_author = AccountId::from_bytes([0x91; 32]);
+        let header = ContentEntryHeader {
+            stream_id: stream,
+            author_account_id: granted_author,
+            device_fingerprint: device.fingerprint(),
+            seq: 0,
+            lamport: 0,
+            prev_hash: None,
+            grant_id: Some([0x92; 32]),
+            roster_ref: [0x93; 32],
+            owner_auth_len: 0,
+            author_auth_len: 0,
+            crypto_suite: 0,
+            key_id: None,
+        };
+        let signed = envelope::seal_and_sign_content_entry(
+            device.secret(),
+            &header,
+            &op::encode(&node_create("granted", "writer")),
+            &key,
+        )
+        .unwrap();
+        insert_accepted_signed(&conn, &signed);
+        let tx = conn.unchecked_transaction().unwrap();
+        content_projection::reproject_accepted_content_stream(&tx, stream).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(projected_node_count(&conn, stream), 1);
+    }
+
+    #[test]
+    fn malformed_tampered_and_unknown_suite_entries_do_not_suppress_valid_content() {
+        let conn = db();
+        let (owner, stream) = owned_v2(&conn);
+        author_content_batch(
+            &conn,
+            stream,
+            &[node_create("good", "survives")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .unwrap();
+        let device = local_device(&conn, NOW).unwrap();
+        let key = match secrets::current_sealing_key(&conn, owner, stream, &device, NOW).unwrap() {
+            SealingKeyOutcome::Ready(key) => key,
+            _ => panic!("owner key must resolve"),
+        };
+        let base = ContentEntryHeader {
+            stream_id: stream,
+            author_account_id: AccountId::from_bytes([0xa1; 32]),
+            device_fingerprint: device.fingerprint(),
+            seq: 0,
+            lamport: 1,
+            prev_hash: None,
+            grant_id: Some([0xa2; 32]),
+            roster_ref: [0xa3; 32],
+            owner_auth_len: 0,
+            author_auth_len: 0,
+            crypto_suite: 1,
+            key_id: Some(key.key_id().to_bytes()),
+        };
+        let short = envelope::sign_opaque_content_entry_for_test(
+            device.secret(),
+            &base,
+            &[0; envelope::SEALED_NONCE_LEN],
+        )
+        .unwrap();
+        insert_accepted_signed(&conn, &short);
+
+        let mut tampered = envelope::seal_and_sign_content_entry(
+            device.secret(),
+            &ContentEntryHeader {
+                author_account_id: AccountId::from_bytes([0xb1; 32]),
+                grant_id: Some([0xb2; 32]),
+                ..base.clone()
+            },
+            &op::encode(&node_create("bad", "tag")),
+            &key,
+        )
+        .unwrap();
+        *tampered.payload.last_mut().unwrap() ^= 1;
+        let tampered = envelope::sign_opaque_content_entry_for_test(
+            device.secret(),
+            &tampered.header,
+            &tampered.payload,
+        )
+        .unwrap();
+        insert_accepted_signed(&conn, &tampered);
+
+        let unknown = envelope::sign_opaque_content_entry_for_test(
+            device.secret(),
+            &ContentEntryHeader {
+                author_account_id: AccountId::from_bytes([0xc1; 32]),
+                grant_id: Some([0xc2; 32]),
+                crypto_suite: 99,
+                ..base
+            },
+            &[0xde, 0xad],
+        )
+        .unwrap();
+        insert_accepted_signed(&conn, &unknown);
+
+        let tx = conn.unchecked_transaction().unwrap();
+        content_projection::reproject_accepted_content_stream(&tx, stream)
+            .expect("bad local payloads skip without aborting the stream");
+        tx.commit().unwrap();
+        assert_eq!(projected_node_count(&conn, stream), 1, "the valid node remains projected");
+        let accepted: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
+                [stream.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accepted, 4, "all malformed/unknown entries remain accepted and retained");
+    }
+
+    #[test]
+    fn corrupt_stored_signed_envelope_is_a_loud_projection_error() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        let hashes = author_content_batch(
+            &conn,
+            stream,
+            &[node_create("sealed", "valid")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .unwrap();
+        conn.execute("UPDATE content_entries SET signed_bytes = X'00' WHERE entry_hash = ?1", [
+            hashes[0].as_slice(),
+        ])
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(
+            content_projection::reproject_accepted_content_stream(&tx, stream).is_err(),
+            "corruption of the stored signed envelope must not be downgraded to a local skip",
+        );
     }
 
     #[test]
@@ -1549,6 +1816,15 @@ mod tests {
             ("accepted", 1),
             "the sealed entry folds accepted on a peer with no content key",
         );
+        assert_eq!(
+            projected_node_count(&peer, stream),
+            0,
+            "keyless accepted content is unprojected"
+        );
+        let identity_rows: i64 = peer
+            .query_row("SELECT count(*) FROM oplog_device_identity", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(identity_rows, 0, "projection must not mint a peer identity");
     }
 
     #[test]

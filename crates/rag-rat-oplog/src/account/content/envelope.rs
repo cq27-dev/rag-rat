@@ -4,11 +4,12 @@
 //! the future C5 AEAD AAD. The payload stays opaque here so plaintext and sealed entries have the
 //! same chain and signature semantics.
 
-use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::aead::{Aead, AeadInOut, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
+use zeroize::Zeroizing;
 
 use super::super::AccountId;
 use super::super::keywrap::ContentKey;
@@ -151,7 +152,7 @@ pub fn sign_sealed_content_entry(
 
     // The op body is the plaintext that becomes the ciphertext; require it canonical up front. The
     // suite-1 wire payload is opaque, so `decode_body`'s suite-0 payload-canonicity check cannot
-    // cover it — but the decrypt side (C5b) recovers exactly these bytes for `op::decode`, so a
+    // cover it — but decrypt-at-projection recovers exactly these bytes for `op::decode`, so a
     // non-canonical op body would round-trip into an un-decodable projection input.
     cbor::require_canonical_cbor(op_bytes)
         .map_err(|error| anyhow::anyhow!("sealed op payload is not canonical CBOR: {error}"))?;
@@ -207,6 +208,35 @@ pub fn seal_and_sign_content_entry(
     key: &ContentKey,
 ) -> anyhow::Result<SignedContentEntry> {
     sign_sealed_content_entry(secret, header, op_bytes, key, sample_wire_nonce()?)
+}
+
+/// Test-only constructor for structurally valid signed envelopes carrying arbitrary opaque suite
+/// payloads. Production authoring must use the suite-specific constructors above.
+#[cfg(test)]
+pub(super) fn sign_opaque_content_entry_for_test(
+    secret: &DeviceSecret,
+    header: &ContentEntryHeader,
+    payload: &[u8],
+) -> anyhow::Result<SignedContentEntry> {
+    let mut header = header.clone();
+    header.device_fingerprint = secret.public().fingerprint();
+    if let Some(message) = header_nullity_error(&header) {
+        anyhow::bail!(message);
+    }
+    let header_bytes = encode_header(&header);
+    let body_bytes = encode_body(&header_bytes, payload);
+    let signature = secret.sign(&body_bytes);
+    let signed_bytes = encode_signed(&body_bytes, &signature);
+    let entry_hash = cbor::sha256(&body_bytes);
+    Ok(SignedContentEntry {
+        header,
+        payload: payload.to_vec(),
+        signature,
+        header_bytes,
+        body_bytes,
+        signed_bytes,
+        entry_hash,
+    })
 }
 
 /// Sample a fresh 192-bit XChaCha wire nonce straight from the OS CSPRNG, returned BY VALUE. A
@@ -307,6 +337,29 @@ fn seal_op_bytes(
         .map_err(|_| anyhow::anyhow!("content AEAD sealing failed"))
 }
 
+/// Open a suite-1 `nonce[24] || ciphertext` payload under `key`, authenticating the exact retained
+/// signed header bytes as AAD. The plaintext buffer is scrubbed on drop.
+pub fn open_sealed_payload(
+    key: &ContentKey,
+    payload: &[u8],
+    aad: &[u8],
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    if payload.len() < SEALED_NONCE_LEN + SEALED_AEAD_TAG_LEN {
+        anyhow::bail!("sealed content payload is shorter than nonce + tag");
+    }
+    let (nonce, ciphertext) = payload.split_at(SEALED_NONCE_LEN);
+    let nonce: [u8; SEALED_NONCE_LEN] = nonce
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("sealed content nonce has the wrong length"))?;
+    let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
+        .map_err(|_| anyhow::anyhow!("content key has the wrong length"))?;
+    let mut plaintext = Zeroizing::new(ciphertext.to_vec());
+    cipher
+        .decrypt_in_place(&XNonce::from(nonce), aad, &mut *plaintext)
+        .map_err(|_| anyhow::anyhow!("sealed payload AEAD open failed"))?;
+    Ok(plaintext)
+}
+
 fn encode_opt_hash(encoder: &mut Encoder<&mut Vec<u8>>, hash: Option<[u8; 32]>) {
     match hash {
         Some(hash) => encoder.bytes(&hash).expect(INFALLIBLE),
@@ -400,9 +453,6 @@ fn decode_opt_hash(decoder: &mut Decoder<'_>, field: &str) -> Result<Option<[u8;
 
 #[cfg(test)]
 mod tests {
-    use chacha20poly1305::aead::{Aead, Payload};
-    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
-
     use super::*;
 
     fn secret() -> DeviceSecret {
@@ -659,24 +709,6 @@ mod tests {
         ContentKey::from_seed(&[0x20; 32])
     }
 
-    /// Open a `nonce[24] || ciphertext` sealed payload under `key` with AAD `aad` — the read-side
-    /// inverse of the seal, kept in the test so C5a exposes only the seal side (the projection
-    /// decrypt is C5b). A genuine encrypt-then-decrypt round trip: the AEAD is a vetted library, so
-    /// recovering the original op bytes exercises the seal's key + nonce + AAD binding, not the
-    /// cipher.
-    fn open_sealed_payload(
-        key: &ContentKey,
-        payload: &[u8],
-        aad: &[u8],
-    ) -> anyhow::Result<Vec<u8>> {
-        let (nonce, ciphertext) = payload.split_at(SEALED_NONCE_LEN);
-        let nonce: [u8; SEALED_NONCE_LEN] = nonce.try_into().unwrap();
-        let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice()).unwrap();
-        cipher
-            .decrypt(&XNonce::from(nonce), Payload { msg: ciphertext, aad })
-            .map_err(|_| anyhow::anyhow!("sealed payload AEAD open failed"))
-    }
-
     #[test]
     fn sealed_content_wire_is_golden_pinned_under_an_injected_nonce() {
         // Deterministic: a seed-fixed content key + an injected nonce freeze the suite-1 payload
@@ -720,7 +752,11 @@ mod tests {
         let signed = seal_and_sign_content_entry(&secret(), &header(), &op, &key).unwrap();
         // AAD = the FINAL signed header content bytes (`header_bytes`), never a re-encode.
         let recovered = open_sealed_payload(&key, &signed.payload, &signed.header_bytes).unwrap();
-        assert_eq!(recovered, op, "decrypt under the same key + header AAD recovers the op bytes");
+        assert_eq!(
+            recovered.as_slice(),
+            op,
+            "decrypt under the same key + header AAD recovers the op bytes"
+        );
     }
 
     #[test]
@@ -741,6 +777,17 @@ mod tests {
         let tampered_aad = encode_header(&tampered);
         assert_ne!(tampered_aad, signed.header_bytes);
         assert!(open_sealed_payload(&key, &signed.payload, &tampered_aad).is_err());
+    }
+
+    #[test]
+    fn sealed_open_rejects_a_short_or_tampered_payload() {
+        let key = content_key();
+        assert!(open_sealed_payload(&key, &[0; SEALED_NONCE_LEN], b"aad").is_err());
+        let signed =
+            seal_and_sign_content_entry(&secret(), &header(), &[0x81, 0x01], &key).unwrap();
+        let mut tampered = signed.payload.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(open_sealed_payload(&key, &tampered, &signed.header_bytes).is_err());
     }
 
     #[test]
@@ -766,15 +813,19 @@ mod tests {
             "a fresh nonce yields different ciphertext for the same op"
         );
         // Freshness must not cost recoverability: both open to the original op.
-        assert_eq!(open_sealed_payload(&key, &a.payload, &a.header_bytes).unwrap(), [0x81, 0x01]);
-        assert_eq!(open_sealed_payload(&key, &b.payload, &b.header_bytes).unwrap(), [0x81, 0x01]);
+        assert_eq!(open_sealed_payload(&key, &a.payload, &a.header_bytes).unwrap().as_slice(), [
+            0x81, 0x01
+        ],);
+        assert_eq!(open_sealed_payload(&key, &b.payload, &b.header_bytes).unwrap().as_slice(), [
+            0x81, 0x01
+        ],);
     }
 
     #[test]
     fn a_sealed_entry_decodes_and_verifies_with_an_opaque_suite_one_payload() {
         // The already-sealed-ready ingest/decode path treats a suite-1 payload as opaque: it
         // decodes + verifies (signature + fingerprint) without touching the ciphertext, and the AAD
-        // unit (`header_bytes`) round-trips for the eventual C5b decrypt.
+        // unit (`header_bytes`) round-trips for projection decrypt.
         let key = content_key();
         // The nonce value is not load-bearing here, so use the random-nonce production entry point.
         let signed =

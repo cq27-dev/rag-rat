@@ -97,6 +97,15 @@ pub fn local_device_fingerprint(conn: &Connection) -> anyhow::Result<Option<Devi
         .transpose()
 }
 
+/// Load this store's complete persisted device identity WITHOUT minting a row or backfilling a
+/// pre-V058 row. Projection is a read-side operation: merely opening accepted sealed content must
+/// never create cryptographic identity state. `None` therefore means either no identity has been
+/// persisted or the persisted legacy identity has no X25519 key yet. Corrupt stored key material
+/// remains a loud error.
+pub fn load_local_device(conn: &Connection) -> anyhow::Result<Option<LocalDevice>> {
+    Ok(read_identity(conn)?.and_then(StoredIdentity::into_local))
+}
+
 /// The identity row as stored: the ed25519 device (always present) plus the X25519 encryption key
 /// IF it has been minted/backfilled yet (a pre-V058 row carries neither X25519 column).
 struct StoredIdentity {
@@ -323,6 +332,39 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM oplog_device_identity", [], |r| r.get(0))
             .expect("count rows");
         assert_eq!(rows, 1, "re-reading must not mint a second identity");
+    }
+
+    #[test]
+    fn read_only_load_neither_mints_nor_backfills_an_identity() {
+        let conn = conn();
+        assert!(load_local_device(&conn).unwrap().is_none());
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM oplog_device_identity", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0, "a projection read must not mint an identity");
+
+        let ed = DeviceSecret::from_seed(&[0x31; 32]);
+        let public = ed.public();
+        conn.execute(
+            "INSERT INTO oplog_device_identity(
+                 id, seed, public_key, fingerprint, created_at_ms, x25519_secret, x25519_public)
+             VALUES(0, ?1, ?2, ?3, ?4, NULL, NULL)",
+            params![
+                ed.seed().as_slice(),
+                public.to_bytes().as_slice(),
+                public.fingerprint().to_bytes().as_slice(),
+                now(),
+            ],
+        )
+        .unwrap();
+        assert!(load_local_device(&conn).unwrap().is_none());
+        let x25519: (Option<Vec<u8>>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT x25519_secret, x25519_public FROM oplog_device_identity WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(x25519, (None, None), "a projection read must not backfill X25519");
     }
 
     #[test]

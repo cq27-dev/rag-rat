@@ -44,9 +44,6 @@ pub use authoring::{
     ensure_owned_stream_v2_in_tx, established_owned_stream_v2, owned_stream_v2_id,
 };
 pub use bootstrap::local_account;
-// The V070 projection-table guard, reused by the memory-layer content projection's upgrade
-// re-fold (#688).
-pub(crate) use content::content_projected_tables_exist;
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, SignedContentEntry,
@@ -56,11 +53,12 @@ pub use content::{
 // The C5a sealed-authoring surface (#608): the envelope-layer seal
 // (`sign_sealed_content_entry` + its OS-nonce wrapper `seal_and_sign_content_entry`), the
 // policy-aware self-transacting author (`author_content_batch` + `SealPolicy`), and the
-// sealed-op size predicate. UNWIRED — C5b + tests are the only consumers, so the group keeps
-// the unused-import allowance.
+// sealed-op size predicate. UNWIRED — tests consume it, but no live privacy-intent source
+// does, so the group keeps the unused-import allowance.
 #[allow(
     unused_imports,
-    reason = "C5a sealed authoring is unwired until C5b consumes it (#608)"
+    reason = "sealed authoring remains unwired until a live privacy-intent source consumes it \
+              (#608)"
 )]
 pub use content::{
     SealPolicy, author_content_batch, content_op_is_sealed_authorable, seal_and_sign_content_entry,
@@ -69,6 +67,9 @@ pub use content::{
 // The in-tx `/3` content-author seam + its genesis-detection reader (C3.4b-i, #663): #664
 // retargets the live memory path onto them, so they are plain re-exports.
 pub use content::{author_content_batch_in_tx, content_op_is_authorable, content_stream_is_empty};
+// The V070 projection-table guard, reused by the memory-layer content projection's upgrade
+// re-fold (#688).
+pub(crate) use content::{content_projected_tables_exist, open_sealed_payload};
 pub use fold::{
     AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, GrantAuthority,
     GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,
@@ -83,10 +84,12 @@ pub use ops::{DeviceCut, DeviceRole, GrantRole};
 // side (derive-on-read sealing-key selection + the key_id adoption cross-check), and the C4.4
 // lazy rotation-on-removal entry points (#607).
 pub use secrets::{
-    RotationOutcome, SealingKeyOutcome, SelectedWrap, current_sealing_key,
-    ensure_stream_key_current_in_tx, mint_and_author_stream_key_wrap_in_tx,
-    rotate_stream_key_in_tx, select_current_sealing_wrap, stream_key_rotation_needed,
+    ContentKeyring, RotationOutcome, SealingKeyOutcome, SelectedWrap, current_sealing_key,
+    ensure_stream_key_current_in_tx, historical_content_keyring,
+    mint_and_author_stream_key_wrap_in_tx, rotate_stream_key_in_tx, select_current_sealing_wrap,
+    stream_key_rotation_needed,
 };
+pub(crate) use storage::stream_owner_account;
 pub use storage::{
     CapacityScope, IngestOutcome, account_ingest, auth_len_freshness,
     backfill_authority_projection, grant_effective_for_device, owner_control_authority,
