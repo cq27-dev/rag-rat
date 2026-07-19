@@ -331,7 +331,7 @@ fn render_units(out: &mut String, units: &[PromptUnit], max_bytes: usize) -> Vec
         let text_written = before_text - remaining;
         // Materialization maps one citation to the unit's FULL source span. Expose the ID only when
         // the full display text rendered; otherwise the model could cite unseen trailing content.
-        if label_is_complete && text_written == texts[idx].len() {
+        if label_is_complete && !unit.text.trim().is_empty() && text_written == texts[idx].len() {
             visible_ids.push(idx);
         }
         push_capped(out, &mut remaining, "\n");
@@ -838,6 +838,17 @@ mod tests {
         let budget = PromptBudget { units: full_unit, ..PromptBudget::default() };
         let schema = record_schema(&input, &budget);
         assert_eq!(schema["properties"]["decision_units"]["items"]["enum"][0], 0);
+    }
+
+    #[test]
+    fn citation_schema_rejects_an_empty_unit_even_when_its_label_renders() {
+        let mut input = base_input();
+        input.units = vec![unit("s", "")];
+        let schema = record_schema(&input, &PromptBudget::default());
+        assert_eq!(
+            schema["properties"]["decision_units"]["maxItems"], 0,
+            "an empty unit carries no citeable evidence"
+        );
     }
 
     #[test]
