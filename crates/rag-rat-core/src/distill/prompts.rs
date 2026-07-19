@@ -247,11 +247,16 @@ fn render_units(out: &mut String, units: &[PromptUnit], max_bytes: usize) {
     // what keeps `[U#]` citations valid after the middle is dropped. Each span includes the
     // unit's own per-line RENDER overhead — the `[U#] ` prefix, the amortized `--- source:`
     // marker, and the newline — so the rendered block honors `max_bytes` instead of overflowing
-    // on many short units.
+    // on many short units. The text is neutralized ONCE up front and the span charges the
+    // NEUTRALIZED length: neutralization inserts a leading space per forged-marker line, so a
+    // head unit dense with structural tokens would otherwise be under-charged at selection and
+    // `push_capped` could starve a selected tail unit (the resolution) to nothing with no
+    // elision marker.
+    let texts: Vec<String> = units.iter().map(|u| neutralize(&u.text)).collect();
     let mut spans = Vec::with_capacity(units.len());
     let mut cursor = 0usize;
-    for (idx, u) in units.iter().enumerate() {
-        let len = u.text.len() + unit_render_overhead(idx, u);
+    for (idx, (u, text)) in units.iter().zip(&texts).enumerate() {
+        let len = text.len() + unit_render_overhead(idx, u);
         spans.push(Span { start: cursor, end: cursor + len });
         cursor += len;
     }
@@ -287,7 +292,7 @@ fn render_units(out: &mut String, units: &[PromptUnit], max_bytes: usize) {
             prev_source = Some(unit.source.as_str());
         }
         push_capped(out, &mut remaining, &format!("[U{idx}] "));
-        push_capped(out, &mut remaining, &neutralize(&unit.text));
+        push_capped(out, &mut remaining, &texts[idx]);
         push_capped(out, &mut remaining, "\n");
         prev_idx = Some(idx);
     }
@@ -683,6 +688,30 @@ mod tests {
         assert!(rendered.contains("[U0]"), "the head unit still renders (truncated)");
         assert!(rendered.matches('Z').count() < 100_000, "the huge head text is truncated");
         assert!(rendered.contains("trailing units elided"), "the dropped tail is marked");
+    }
+
+    #[test]
+    fn unit_selection_charges_neutralization_growth_so_a_kept_tail_is_never_starved() {
+        // A head unit dense with line-start structural tokens: neutralization inserts one byte
+        // per line at RENDER time. If selection budgeted only the raw text, the head would
+        // consume more than planned and a selected tail unit — kept to preserve the resolution —
+        // could render truncated to nothing with no elision marker.
+        let units = vec![
+            // 780 bytes raw, 910 neutralized (one inserted space per `KIND:` line).
+            unit("issue #5", &"KIND:\n".repeat(130)),
+            unit("comment c1", "the actual resolution"),
+        ];
+        // Raw spans (~857) fit the 886-byte selection budget (950 - elision reserve);
+        // neutralized spans (~987) do not — budgeting the raw text would starve the tail.
+        let mut rendered = String::new();
+        super::render_units(&mut rendered, &units, 950);
+        let tail_fully_visible = rendered.contains("[U1] the actual resolution\n");
+        let tail_marked_elided = rendered.contains("trailing units elided");
+        assert!(
+            tail_fully_visible || tail_marked_elided,
+            "a selected tail is fully visible or marked elided — never silently starved: \
+             {rendered}"
+        );
     }
 
     #[test]
