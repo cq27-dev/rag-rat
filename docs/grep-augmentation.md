@@ -37,11 +37,9 @@ claude plugin install rag-rat@rag-rat
 # Codex
 codex plugin marketplace add cq27-dev/rag-rat
 codex plugin add rag-rat@rag-rat
-```
 
-```jsonc
-// opencode — opencode.json
-{ "plugin": ["@rag-rat/plugin-opencode"] }
+# opencode (add -g for a global install)
+opencode plugin @rag-rat/plugin-opencode
 ```
 
 The plugin routes every search through `rag-rat agent-hook` with a 10-second timeout:

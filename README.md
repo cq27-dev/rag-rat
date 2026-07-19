@@ -64,11 +64,9 @@ claude plugin install rag-rat@rag-rat
 # Codex
 codex plugin marketplace add cq27-dev/rag-rat
 codex plugin add rag-rat@rag-rat
-```
 
-```jsonc
-// opencode — add to opencode.json
-{ "plugin": ["@rag-rat/plugin-opencode"] }
+# opencode (add -g for a global install)
+opencode plugin @rag-rat/plugin-opencode
 ```
 
 After installing, approve the plugin so its tools and hooks run (opencode loads plugins without an

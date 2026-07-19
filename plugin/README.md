@@ -93,13 +93,14 @@ output.
 
 Three options:
 - **npm (recommended):** the plugin ships as `@rag-rat/plugin-opencode` (source of truth:
-  `plugin/opencode/`, version synced with the release). Add it to `opencode.json`:
-  ```json
-  { "plugin": ["@rag-rat/plugin-opencode"] }
+  `plugin/opencode/`, version synced with the release). Install with the opencode CLI, which adds
+  it to the config for you (`-g` targets the global config instead of the project):
+  ```bash
+  opencode plugin @rag-rat/plugin-opencode    # add -g for a global install
   ```
-  opencode installs it with bun at startup. The entry is the TS source itself (`main:
-  rag-rat.ts`) — opencode's bun runtime loads TS directly, so no build step can drift; the
-  type-only `@opencode-ai/plugin` import is erased at compile time.
+  The entry is the TS source itself (`main: rag-rat.ts`) — opencode's bun runtime loads TS
+  directly, so no build step can drift; the type-only `@opencode-ai/plugin` import is erased at
+  compile time.
 - **Whole bundle** (keeps the shared launcher): copy or symlink the repo's `plugin/` tree
   somewhere stable and symlink `plugin/opencode/rag-rat.ts` into `~/.config/opencode/plugins/`
   (global) or `.opencode/plugins/` (project). The shim finds `../scripts/launch.js` relative to
