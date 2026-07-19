@@ -147,7 +147,7 @@ pub(crate) fn record_schema() -> serde_json::Value {
                             "type": "object",
                             "properties": {
                                 "alternative": { "type": "string" },
-                                "reason": { "type": "string" }
+                                "reason": { "type": ["string", "null"] }
                             },
                             "required": ["alternative", "reason"],
                             "additionalProperties": false
@@ -634,6 +634,22 @@ mod tests {
         assert!(
             types.contains(&"null") && types.contains(&"string"),
             "chosen allows null: {chosen}"
+        );
+    }
+
+    #[test]
+    fn rejected_alternative_reason_is_nullable_when_no_reason_was_stated() {
+        // A thread may reject an alternative without giving a rationale — the storage column is
+        // nullable and the rules promise honest null, so the schema must permit it, or guided
+        // decoding forces the model to invent a reason or drop a known rejected alternative.
+        let schema = record_schema();
+        let reason = &schema["properties"]["decision"]["properties"]["rejected"]["items"]
+            ["properties"]["reason"]["type"];
+        let types: Vec<&str> =
+            reason.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            types.contains(&"null") && types.contains(&"string"),
+            "rejected.reason allows null: {reason}"
         );
     }
 
