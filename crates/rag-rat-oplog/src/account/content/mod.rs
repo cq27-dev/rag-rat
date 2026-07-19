@@ -15,6 +15,13 @@ pub use acceptance::{
     ContentParkReason, ContentRejectReason, SubjectAuthorityHold, UnknownAncestry,
     evaluate_content_acceptance,
 };
+// The C5a sealed-authoring seam (#608): the policy-aware self-transacting author, its
+// sealed-op size predicate, and the seal policy. UNWIRED — C5b + tests are the only consumers.
+#[allow(
+    unused_imports,
+    reason = "C5a sealed authoring is unwired until C5b consumes it (#608)"
+)]
+pub use author::{SealPolicy, author_content_batch, content_op_is_sealed_authorable};
 // The in-tx `/3` local-authoring seam + its genesis-detection reader (C3.4b-i, #663): live
 // callers in `query::memory` land with #664, so these are plain (un-frozen) re-exports.
 pub use author::{author_content_batch_in_tx, content_op_is_authorable, content_stream_is_empty};
@@ -22,6 +29,14 @@ pub use envelope::{
     ContentEntryHeader, SignedContentEntry, VerifiedContentEntry, decode_content_signed,
     sign_content_entry, verify_content_signed,
 };
+// The C5a envelope-layer seal + sign (#608): the injected-nonce core (goldens) and the
+// OS-nonce production wrapper. UNWIRED — the sealed author seam and C5b's tests are the only
+// consumers.
+#[allow(
+    unused_imports,
+    reason = "C5a sealed envelope is unwired until C5b consumes it (#608)"
+)]
+pub use envelope::{seal_and_sign_content_entry, sign_sealed_content_entry};
 #[allow(unused_imports, reason = "C2 storage seam is frozen before C3 wiring lands")]
 pub use storage::{
     ContentCapacityScope, ContentIngestOutcome, content_ingest, settle_pending_content_refolds,

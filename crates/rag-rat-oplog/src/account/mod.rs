@@ -50,6 +50,19 @@ pub use content::{
     VerifiedContentEntry, content_ingest, decode_content_signed, settle_pending_content_refolds,
     sign_content_entry, verify_content_signed,
 };
+// The C5a sealed-authoring surface (#608): the envelope-layer seal
+// (`sign_sealed_content_entry` + its OS-nonce wrapper `seal_and_sign_content_entry`), the
+// policy-aware self-transacting author (`author_content_batch` + `SealPolicy`), and the
+// sealed-op size predicate. UNWIRED — C5b + tests are the only consumers, so the group keeps
+// the unused-import allowance.
+#[allow(
+    unused_imports,
+    reason = "C5a sealed authoring is unwired until C5b consumes it (#608)"
+)]
+pub use content::{
+    SealPolicy, author_content_batch, content_op_is_sealed_authorable, seal_and_sign_content_entry,
+    sign_sealed_content_entry,
+};
 // The in-tx `/3` content-author seam + its genesis-detection reader (C3.4b-i, #663): #664
 // retargets the live memory path onto them, so they are plain re-exports.
 pub use content::{author_content_batch_in_tx, content_op_is_authorable, content_stream_is_empty};

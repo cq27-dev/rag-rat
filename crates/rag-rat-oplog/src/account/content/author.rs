@@ -28,16 +28,18 @@
 //! minting from the plain candidate tail (below) is the accepted tail.
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::super::bootstrap::{self, LocalAccountRef};
+use super::super::keywrap::ContentKey;
 use super::super::limits::CONTENT_ENVELOPE_MAX_BYTES;
+use super::super::secrets::{self, SealingKeyOutcome};
 use super::super::{AccountId, storage as account_storage};
 use super::envelope::{self, ContentEntryHeader, VerifiedContentEntry};
 use super::storage as content_storage;
 use crate::op::{self, DeviceFingerprint, MemoryOp};
 use crate::stream::StreamId;
-use crate::{content_projection, local_device};
+use crate::{LocalDevice, content_projection, local_device};
 
 type EntryHash = [u8; 32];
 
@@ -95,6 +97,28 @@ const CONTENT_OP_BODY_MAX_BYTES: usize =
 /// already reserves for.
 pub fn content_op_is_authorable(op: &MemoryOp) -> bool {
     op::encode(op).len() <= CONTENT_OP_BODY_MAX_BYTES
+}
+
+/// The AEAD expansion a suite-1 seal adds to the op body on the wire: the 24-byte XChaCha nonce +
+/// the 16-byte Poly1305 tag ([`envelope::SEALED_NONCE_LEN`] + [`envelope::SEALED_AEAD_TAG_LEN`]).
+/// [`CONTENT_OP_BODY_MAX_BYTES`] reserves ZERO AEAD overhead (it mirrors the suite-0 sign check),
+/// so the sealed body bound subtracts this — otherwise a sealed op between the two bounds would
+/// pass [`content_op_is_sealed_authorable`] yet `bail!` the batch at sign time (the #680 wedge, on
+/// sealed streams).
+const CONTENT_SEALED_AEAD_OVERHEAD_BYTES: usize =
+    envelope::SEALED_NONCE_LEN + envelope::SEALED_AEAD_TAG_LEN;
+
+/// The largest op BODY (canonical CBOR) that always fits inside a signed SUITE-1 `/3` entry: the
+/// plaintext body bound ([`CONTENT_OP_BODY_MAX_BYTES`]) minus the sealed AEAD expansion.
+const CONTENT_SEALED_OP_BODY_MAX_BYTES: usize =
+    CONTENT_OP_BODY_MAX_BYTES - CONTENT_SEALED_AEAD_OVERHEAD_BYTES;
+
+/// The sealed-path twin of [`content_op_is_authorable`]: whether `op` fits a signed suite-1 `/3`
+/// entry once the AEAD nonce + tag are added to its body (S2, #608). C5b's live reconcile uses this
+/// to QUARANTINE an un-authorable op on a sealed stream — exactly as the suite-0 predicate does on
+/// a plaintext one — instead of `bail!`ing the whole batch at sign time.
+pub fn content_op_is_sealed_authorable(op: &MemoryOp) -> bool {
+    op::encode(op).len() <= CONTENT_SEALED_OP_BODY_MAX_BYTES
 }
 
 /// The `/3` chain tail for one `(stream, author, device)` coordinate: its highest-`seq` entry.
@@ -197,6 +221,316 @@ pub fn author_content_batch_in_tx(
     Ok(authored)
 }
 
+/// The privacy intent for a `/3` content batch (sync phase C5, #608). The caller states it
+/// EXPLICITLY — wrap presence is a downgrade-ratchet INPUT, never the privacy oracle: a private
+/// stream's accepted-wrap set can legitimately empty under sync lag or a retro-condemn, and
+/// treating "no wrap ⇒ public" would author plaintext on a private stream (a confidentiality leak).
+///
+/// UNWIRED in C5a: the live memory path still authors through [`author_content_batch_in_tx`]
+/// (suite 0). This policy-aware, self-transacting seam is exercised only by tests until C5b lands
+/// decrypt-at-projection, the read-side keyring, and the `sync enable` intent source. Authoring a
+/// sealed entry into the live path before C5b's decrypt exists triggers the reconcile anti-join
+/// duplication loop `content_projection` documents, which is why nothing live calls this yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealPolicy {
+    /// Author plaintext suite-0 entries — REFUSED on a stream that has ratcheted to sealed.
+    Plaintext,
+    /// Author sealed suite-1 entries under the stream's current content key; fail closed (bail the
+    /// whole batch) if no key can be resolved — never plaintext-fallback, never a plaintext park.
+    Sealed,
+}
+
+/// Author `ops` as owner-authored `/3` content on `stream_id` under an explicit [`SealPolicy`],
+/// managing its OWN transactions — unlike [`author_content_batch_in_tx`], which runs inside a
+/// caller's txn. `Sealed` acquires the stream's content key across THREE transactions (lazy
+/// rotation; then a key resolve whose security-event writes autocommit; then seal + author +
+/// verify-accepted), so it cannot nest inside a caller txn. Returns the authored entry hashes in
+/// authoring order. Requires the store's local account to be minted already.
+///
+/// UNWIRED (C5a): nothing live calls this — see [`SealPolicy`].
+pub fn author_content_batch(
+    conn: &Connection,
+    stream_id: StreamId,
+    ops: &[MemoryOp],
+    policy: SealPolicy,
+    now_ms: i64,
+) -> anyhow::Result<Vec<EntryHash>> {
+    // An empty batch authors nothing, so it must run NO key management: the `Sealed` arm would
+    // otherwise rotate or mint + commit the stream's first `StreamKeyWrap`, and on an unkeyed owned
+    // stream that committed wrap arms the downgrade ratchet — permanently blocking later plaintext
+    // authoring after a call that looked like a no-op. Short-circuit before EITHER arm's
+    // ratchet-affecting side effects.
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    match policy {
+        SealPolicy::Plaintext => author_plaintext_batch_ratcheted(conn, stream_id, ops, now_ms),
+        SealPolicy::Sealed => author_sealed_batch(conn, stream_id, ops, now_ms),
+    }
+}
+
+/// The `SealPolicy::Plaintext` arm: refuse if the stream has ratcheted to sealed, then author
+/// suite-0 through the existing in-tx seam — all in ONE self-owned txn so the ratchet gate and the
+/// authoring commit atomically (a concurrent wrap/seal cannot slip between them).
+fn author_plaintext_batch_ratcheted(
+    conn: &Connection,
+    stream_id: StreamId,
+    ops: &[MemoryOp],
+    now_ms: i64,
+) -> anyhow::Result<Vec<EntryHash>> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Downgrade ratchet: once a stream carries an accepted StreamKeyWrap (any epoch) OR an accepted
+    // suite-1 entry, plaintext authoring is a silent downgrade — refuse it.
+    let account_id = require_local_account_id(&tx)?;
+    if stream_has_sealed_ratchet(&tx, account_id, stream_id)? {
+        anyhow::bail!(
+            "refusing plaintext /3 authoring on a stream that has ratcheted to sealed (an \
+             accepted key wrap or a sealed entry exists)"
+        );
+    }
+    let authored = author_content_batch_in_tx(&tx, stream_id, ops, now_ms)?;
+    tx.commit()?;
+    Ok(authored)
+}
+
+/// The `SealPolicy::Sealed` arm: the S4 three-txn key acquisition, then seal + author. Fail-closed
+/// — if no content key resolves, the whole batch bails, NEVER plaintext-fallback and NEVER a
+/// plaintext park (the row simply never enters the tables; the reconcile anti-join is the retry
+/// once this device gains a key).
+fn author_sealed_batch(
+    conn: &Connection,
+    stream_id: StreamId,
+    ops: &[MemoryOp],
+    now_ms: i64,
+) -> anyhow::Result<Vec<EntryHash>> {
+    // Authoring needs a local device, so minting it here is fine; `current_sealing_key` must NOT
+    // mint (a read API), so we resolve it once and hand it in.
+    let device = local_device(conn, now_ms)?;
+    let account_id = require_local_account_id(conn)?;
+
+    // (txn A) Lazy rotation on device removal, committed on its OWN txn so a rotation (a fresh
+    // higher-epoch wrap) survives a later authoring failure. Every RotationOutcome is non-error: an
+    // owner rotates, a member sees StaleButNotOwner and seals under the current key — only an
+    // infra/DB failure is `Err`, so the outcome is intentionally discarded.
+    {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        secrets::ensure_stream_key_current_in_tx(&tx, stream_id, now_ms)?;
+        tx.commit()?;
+    }
+
+    // (autocommit) Resolve the content key. `current_sealing_key`'s `sync_security_events` INSERTs
+    // autocommit on `&Connection`, so it MUST run outside any txn that could roll back.
+    let key = match secrets::current_sealing_key(conn, account_id, stream_id, &device, now_ms)? {
+        SealingKeyOutcome::Ready(key) => key,
+        // Never keyed: an owner mints the first key (its own txn) and re-resolves; a non-owner's
+        // mint bails (owner-gated), fail-closing the whole mutation.
+        SealingKeyOutcome::NoCurrentKey =>
+            mint_first_key_then_resolve(conn, stream_id, account_id, &device, now_ms)?,
+        // Fail closed on a Sealed-intent stream: bail, never author plaintext.
+        SealingKeyOutcome::NotRecipient | SealingKeyOutcome::FailedClosed => anyhow::bail!(
+            "cannot seal /3 content: no resolvable content key for this device (fail-closed)"
+        ),
+    };
+
+    // The `(key_epoch, key_id)` the resolved key names — the baseline txn B re-validates under its
+    // write lock. Read via `select_current_sealing_wrap` (a PURE read), never `current_sealing_key`
+    // (whose adoption cross-check autocommits a security-event row and so must stay here, pre-txn).
+    let resolved = secrets::select_current_sealing_wrap(conn, account_id, stream_id)?.context(
+        "sealed /3 authoring: a content key resolved but the current sealing wrap is empty",
+    )?;
+    // Close the resolution window itself: a rotation committed between `current_sealing_key` and
+    // this read would leave `resolved` naming a key this device did NOT recover, so require the
+    // selection to still name the resolved key before adopting it as the baseline.
+    anyhow::ensure!(
+        resolved.key_id == key.key_id(),
+        "sealed /3 authoring: the sealing selection changed during key resolution (retry)",
+    );
+
+    // (txn B) Seal + author + verify-accepted, re-validating the selection under the write lock so
+    // a rotation that committed after resolution can never make us seal under the stale key.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    revalidate_sealing_selection(&tx, account_id, stream_id, &resolved)?;
+    let authored = seal_and_author_in_tx(&tx, stream_id, ops, &key, &device, now_ms)?;
+    tx.commit()?;
+    Ok(authored)
+}
+
+/// Re-confirm, under txn B's IMMEDIATE write lock, that `stream_id`'s current sealing selection is
+/// STILL the `(key_epoch, key_id)` the pre-txn resolution named.
+///
+/// A `DeviceRemove` + rotation can commit a fresh higher-epoch `StreamKeyWrap` in the autocommit
+/// window between resolving the key ([`author_sealed_batch`]) and opening this txn. Sealing under
+/// the now-stale key would let a device that rotation revoked decrypt this post-removal entry — a
+/// confidentiality regression, and NOT the §15 sync-lag window, because the removal is LOCALLY
+/// committed. Because txn B holds the write lock, no rotation can commit until it ends, so a
+/// selection that still matches here is authoritative for the seal that follows. On mismatch, bail
+/// so the caller retries under the fresh key. A PURE read (never `current_sealing_key`).
+fn revalidate_sealing_selection(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    stream_id: StreamId,
+    resolved: &secrets::SelectedWrap,
+) -> anyhow::Result<()> {
+    let current = secrets::select_current_sealing_wrap(tx, account_id, stream_id)?.context(
+        "sealed /3 authoring: the stream's sealing wrap vanished under the authoring lock (a \
+         concurrent condemn); retry",
+    )?;
+    anyhow::ensure!(
+        current.key_epoch == resolved.key_epoch && current.key_id == resolved.key_id,
+        "sealed /3 authoring: the stream's sealing key rotated between resolution and sealing \
+         (was epoch {}, now epoch {}); retry with the fresh key",
+        resolved.key_epoch,
+        current.key_epoch,
+    );
+    Ok(())
+}
+
+/// A stream that has never been keyed: mint the first content key in its OWN txn, then re-resolve.
+/// `mint_and_author_stream_key_wrap_in_tx` is owner-gated + verify-accepted, so a non-owner (or a
+/// stream this account does not own) makes it `Err` here — which fail-closes the sealed mutation (a
+/// non-owner `NoCurrentKey` bails, never plaintext).
+fn mint_first_key_then_resolve(
+    conn: &Connection,
+    stream_id: StreamId,
+    account_id: AccountId,
+    device: &LocalDevice,
+    now_ms: i64,
+) -> anyhow::Result<ContentKey> {
+    {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        secrets::mint_and_author_stream_key_wrap_in_tx(&tx, stream_id, now_ms)?;
+        tx.commit()?;
+    }
+    match secrets::current_sealing_key(conn, account_id, stream_id, device, now_ms)? {
+        SealingKeyOutcome::Ready(key) => Ok(key),
+        _ => anyhow::bail!(
+            "sealed /3 authoring: the freshly minted content key did not resolve to Ready \
+             (fail-closed)"
+        ),
+    }
+}
+
+/// The `SealPolicy::Sealed` txn B core — mirrors [`author_content_batch_in_tx`] but SEALS each op
+/// under `key` (suite 1). VERIFY-ACCEPTED reads `content_entry_status` ONLY, NEVER "the projection
+/// contains my nodes" (false for a sealed entry until C5b's decrypt-at-projection lands —
+/// `op::decode` fails on ciphertext). For the same reason the plaintext seam's
+/// `reproject_accepted_content_stream` call is INTENTIONALLY omitted: reprojecting a sealed stream
+/// pre-C5b would skip every sealed entry, and wiring that into the live reconcile is the anti-join
+/// duplication trap C5a avoids by staying unwired.
+fn seal_and_author_in_tx(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    ops: &[MemoryOp],
+    key: &ContentKey,
+    device: &LocalDevice,
+    now_ms: i64,
+) -> anyhow::Result<Vec<EntryHash>> {
+    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?
+        .context("cannot author sealed /3 content before the store's local account is minted")?;
+    let fingerprint = device.fingerprint();
+    let auth_len = account_storage::account_effective_count(tx, account_id)?;
+
+    let mut authored = Vec::with_capacity(ops.len());
+    for op in ops {
+        let (seq, prev_hash) = match content_chain_tail(tx, stream_id, account_id, fingerprint)? {
+            Some(tail) => (
+                tail.seq
+                    .checked_add(1)
+                    .context("/3 content chain tail is at u64::MAX seq; cannot extend")?,
+                Some(tail.entry_hash),
+            ),
+            None => (0, None),
+        };
+        // `crypto_suite`/`key_id` stay 0/None here — `seal_and_sign_content_entry` finalizes them
+        // to suite 1 + the key's id, so a suite-1-over-plaintext header is unconstructible.
+        let header = ContentEntryHeader {
+            stream_id,
+            author_account_id: account_id,
+            device_fingerprint: fingerprint,
+            seq,
+            lamport: seq,
+            prev_hash,
+            grant_id: None,
+            roster_ref: genesis_hash,
+            owner_auth_len: auth_len,
+            author_auth_len: auth_len,
+            crypto_suite: 0,
+            key_id: None,
+        };
+        let op_bytes = op::encode(op);
+        let signed =
+            envelope::seal_and_sign_content_entry(device.secret(), &header, &op_bytes, key)?;
+        let verified = VerifiedContentEntry {
+            header: signed.header,
+            payload: signed.payload,
+            header_bytes: signed.header_bytes,
+            entry_hash: signed.entry_hash,
+        };
+        content_storage::insert_candidate(tx, &verified, &signed.signed_bytes, now_ms)?;
+        authored.push(verified.entry_hash);
+    }
+
+    content_storage::refold_content_stream(tx, stream_id)?;
+
+    for entry_hash in &authored {
+        match content_status(tx, entry_hash)?.as_deref() {
+            Some("accepted") => {},
+            other => anyhow::bail!(
+                "sealed /3 content entry did not fold accepted (status {other:?}); rolling back \
+                 the batch",
+            ),
+        }
+    }
+    Ok(authored)
+}
+
+/// The store's local account id, resolved WITHOUT minting — it must already exist (the caller mints
+/// it before the sealed author path, exactly as [`author_content_batch_in_tx`] requires).
+fn require_local_account_id(conn: &Connection) -> anyhow::Result<AccountId> {
+    Ok(bootstrap::local_account_ref(conn)?
+        .context("cannot author /3 content before the store's local account is minted")?
+        .account_id)
+}
+
+/// Whether `stream_id` has ratcheted to sealed: it has an accepted `StreamKeyWrap` (any epoch) OR
+/// an accepted suite-1 `/3` entry. Either makes plaintext authoring a silent downgrade. DERIVED ON
+/// READ (no sticky flag), so it converges: a retro-condemn that empties the wrap set still sees
+/// surviving sealed entries, and a re-minted wrap re-arms the gate. Wrap presence is one ratchet
+/// INPUT, never the sole privacy oracle.
+fn stream_has_sealed_ratchet(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    stream_id: StreamId,
+) -> anyhow::Result<bool> {
+    if secrets::select_current_sealing_wrap(tx, account_id, stream_id)?.is_some() {
+        return Ok(true);
+    }
+    stream_has_accepted_sealed_entry(tx, stream_id)
+}
+
+/// Whether any accepted `/3` entry on `stream_id` is suite-1 (sealed). There is no `crypto_suite`
+/// column, so each accepted entry's header is decoded from its stored signed bytes; a row whose
+/// bytes fail to decode cannot be a valid suite-1 entry and is skipped. Early-returns on the first
+/// match.
+fn stream_has_accepted_sealed_entry(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+) -> anyhow::Result<bool> {
+    let mut stmt = tx.prepare(
+        "SELECT signed_bytes FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
+    )?;
+    let mut rows = stmt.query(params![stream_id.to_bytes().as_slice()])?;
+    while let Some(row) = rows.next()? {
+        let signed_bytes: Vec<u8> = row.get(0)?;
+        if let Ok(signed) = envelope::decode_content_signed(&signed_bytes)
+            && signed.header.crypto_suite != 0
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether the `/2` stream's `/3` content chain is EMPTY — no `content_entries` row on it at all.
 /// Under the single local writer the store's own account+device are the only chain on the stream,
 /// so "no rows for this stream" is the whole chain: the genesis case where the memory reconcile
@@ -265,6 +599,7 @@ mod tests {
     use rusqlite::{Connection, TransactionBehavior};
 
     use super::*;
+    use crate::account::{account_ingest, ensure_owned_stream_v2_in_tx, local_account};
     use crate::op::{EdgeSpec, NodeContent, NodeId};
 
     const NOW: i64 = 1_700_000_000_000;
@@ -757,5 +1092,410 @@ mod tests {
         let head = tail(&conn, stream, account).expect("populated chain has a tail");
         assert_eq!(head.seq, 1, "the tail seq is the highest authored seq");
         assert_eq!(head.entry_hash, hashes[1], "the tail names the highest-seq entry");
+    }
+
+    // ── C5a: the sealed suite-1 author seam (UNWIRED) ──
+
+    /// Mint the store's local account and publish an owned `/2` stream via the REAL ownership seam
+    /// (`ensure_owned_stream_v2_in_tx`) — the sealed mint needs a genuine effective `StreamOwn`,
+    /// not the direct-seeded `account_stream_ownership` shortcut the plaintext acceptance tests
+    /// use.
+    fn owned_v2(conn: &Connection) -> (AccountId, StreamId) {
+        let account = local_account(conn, NOW).expect("mint local account");
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let stream =
+            ensure_owned_stream_v2_in_tx(&tx, "repo-a", NOW).expect("publish owned /2 stream");
+        tx.commit().unwrap();
+        (account, stream)
+    }
+
+    #[test]
+    fn a_sealed_batch_authors_suite_1_entries_that_fold_accepted_locally() {
+        let conn = db();
+        let (account, stream) = owned_v2(&conn);
+        let hashes = author_content_batch(
+            &conn,
+            stream,
+            &[node_create("n1", "first"), node_update("n1", "second")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .expect("seal + author");
+        assert_eq!(hashes.len(), 2, "two ops author two sealed entries");
+        for entry_hash in &hashes {
+            assert_eq!(
+                stored_status(&conn, entry_hash).as_deref(),
+                Some("accepted"),
+                "a sealed entry folds accepted locally (acceptance is key-independent)",
+            );
+            let header = header_of(&conn, entry_hash);
+            assert_eq!(header.crypto_suite, 1, "authored as suite 1");
+            assert!(header.key_id.is_some(), "a sealed entry carries a key_id");
+        }
+        // The first-key mint left an accepted content-key wrap on the secrets log.
+        assert!(
+            secrets::select_current_sealing_wrap(&conn, account, stream).unwrap().is_some(),
+            "a content key was minted for the stream",
+        );
+    }
+
+    #[test]
+    fn a_sealed_entry_folds_accepted_through_content_ingest_on_a_keyless_peer() {
+        // S3 FOLD-FIREWALL TRIPWIRE: acceptance of a sealed `/3` entry is header/citation-level, so
+        // a peer that replicated the account roster but never received the content key still folds
+        // it `accepted`. This is the coverage the account-log and decode-only sealed tests don't
+        // provide — a suite-1 entry driven through `content_ingest` + refold.
+        let author = db();
+        let (account, stream) = owned_v2(&author);
+        let hashes = author_content_batch(
+            &author,
+            stream,
+            &[node_create("n1", "secret")],
+            SealPolicy::Sealed,
+            NOW,
+        )
+        .expect("seal + author");
+        let sealed_bytes: Vec<u8> = author
+            .query_row(
+                "SELECT signed_bytes FROM content_entries WHERE entry_hash = ?1",
+                [hashes[0].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            envelope::decode_content_signed(&sealed_bytes).unwrap().header.crypto_suite,
+            1,
+            "the authored entry is sealed",
+        );
+
+        // The author's CONTROL log (genesis + StreamOwn) is the public roster a peer replicates.
+        // The secrets-log StreamKeyWrap is deliberately NOT replicated: the peer holds no
+        // content key.
+        let control: Vec<Vec<u8>> = {
+            let mut stmt = author
+                .prepare(
+                    "SELECT signed_bytes FROM account_entries
+                     WHERE account_id = ?1 AND log_id = 0 ORDER BY seq",
+                )
+                .unwrap();
+            stmt.query_map([account.to_bytes().as_slice()], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+
+        let peer = db();
+        for bytes in &control {
+            account_ingest(&peer, bytes, NOW).expect("replicate the account control log");
+        }
+        // The peer cannot resolve the content key — no wrap was replicated.
+        assert!(
+            secrets::select_current_sealing_wrap(&peer, account, stream).unwrap().is_none(),
+            "the keyless peer has no content key for the stream",
+        );
+
+        // Ingest the sealed content entry and settle its deferred acceptance fold.
+        content_storage::content_ingest(&peer, &sealed_bytes, NOW).expect("ingest sealed entry");
+        content_storage::settle_pending_content_refolds(&peer).expect("settle the refold");
+
+        let (status, accepted): (String, i64) = peer
+            .query_row(
+                "SELECT s.status, e.accepted FROM content_entries e
+                 JOIN content_entry_status s ON s.entry_hash = e.entry_hash
+                 WHERE e.entry_hash = ?1",
+                [hashes[0].as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), accepted),
+            ("accepted", 1),
+            "the sealed entry folds accepted on a peer with no content key",
+        );
+    }
+
+    #[test]
+    fn sealing_a_stream_the_account_does_not_own_bails_and_leaks_no_row() {
+        // A Sealed-intent stream the account does NOT own: NoCurrentKey → try to mint the first
+        // key, but the mint is owner-gated on an effective StreamOwn, so it bails → the
+        // whole sealed batch fails closed. NO plaintext-fallback, and no row leaked into
+        // any projectable state.
+        let conn = db();
+        local_account(&conn, NOW).expect("mint local account");
+        let unowned = StreamId::from_bytes([0x99; 32]);
+        let result = author_content_batch(
+            &conn,
+            unowned,
+            &[node_create("n1", "x")],
+            SealPolicy::Sealed,
+            NOW,
+        );
+        assert!(result.is_err(), "a keyless Sealed stream fails closed");
+        let entries: i64 =
+            conn.query_row("SELECT count(*) FROM content_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(entries, 0, "no /3 content row survives the fail-closed bail");
+        let projected: i64 = conn
+            .query_row("SELECT count(*) FROM content_projected_nodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(projected, 0, "no projection row leaks from the bailed sealed batch");
+    }
+
+    #[test]
+    fn plaintext_authoring_is_refused_after_a_stream_has_sealed() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        // Sealing mints a wrap AND authors a suite-1 entry — both downgrade-ratchet inputs.
+        author_content_batch(&conn, stream, &[node_create("n1", "x")], SealPolicy::Sealed, NOW)
+            .expect("seal");
+        let before: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM content_entries WHERE stream_id = ?1",
+                [stream.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Plaintext authoring on the now-sealed stream is refused — no silent downgrade to
+        // cleartext.
+        let result = author_content_batch(
+            &conn,
+            stream,
+            &[node_create("n2", "y")],
+            SealPolicy::Plaintext,
+            NOW,
+        );
+        assert!(result.is_err(), "plaintext authoring is refused after the stream sealed");
+        let after: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM content_entries WHERE stream_id = ?1",
+                [stream.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after, "the refused plaintext batch stored no row");
+    }
+
+    #[test]
+    fn the_downgrade_ratchet_fires_on_an_accepted_wrap_or_an_accepted_sealed_entry() {
+        let conn = db();
+        let (account, stream) = owned_v2(&conn);
+
+        // A fresh owned stream (plaintext-only) does not ratchet.
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            assert!(
+                !stream_has_sealed_ratchet(&tx, account, stream).unwrap(),
+                "a fresh owned stream is not sealed",
+            );
+        }
+
+        // The WRAP branch: mint a wrap only (no content) → the ratchet fires on wrap presence.
+        {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            secrets::mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW).unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            assert!(
+                stream_has_sealed_ratchet(&tx, account, stream).unwrap(),
+                "an accepted StreamKeyWrap ratchets the stream",
+            );
+        }
+
+        // The SEALED-ENTRY branch, independent of any wrap: a different stream with an accepted
+        // suite-1 row but NO wrap still ratchets (proves the OR clause, not just wrap-presence).
+        let other = StreamId::from_bytes([0x7a; 32]);
+        let device = local_device(&conn, NOW).unwrap();
+        let key = ContentKey::from_seed(&[0x40; 32]);
+        let header = ContentEntryHeader {
+            stream_id: other,
+            author_account_id: account,
+            device_fingerprint: device.fingerprint(),
+            seq: 0,
+            lamport: 0,
+            prev_hash: None,
+            grant_id: None,
+            roster_ref: genesis_ref(&conn),
+            owner_auth_len: 0,
+            author_auth_len: 0,
+            crypto_suite: 0,
+            key_id: None,
+        };
+        // The nonce value is not load-bearing here (only suite-1 presence arms the ratchet), so
+        // seal via the random-nonce production entry point rather than a fixed injected
+        // nonce.
+        let signed =
+            envelope::seal_and_sign_content_entry(device.secret(), &header, &[0x01], &key).unwrap();
+        conn.execute(
+            "INSERT INTO content_entries(
+                 entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?7, 1, ?8, 0)",
+            params![
+                signed.entry_hash.as_slice(),
+                other.to_bytes().as_slice(),
+                account.to_bytes().as_slice(),
+                device.fingerprint().to_bytes().as_slice(),
+                0_u64.to_be_bytes().as_slice(),
+                genesis_ref(&conn).as_slice(),
+                0_u64.to_be_bytes().as_slice(),
+                signed.signed_bytes,
+            ],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(
+            secrets::select_current_sealing_wrap(&tx, account, other).unwrap().is_none(),
+            "the other stream has no wrap",
+        );
+        assert!(
+            stream_has_sealed_ratchet(&tx, account, other).unwrap(),
+            "an accepted sealed entry ratchets the stream even with no wrap",
+        );
+    }
+
+    #[test]
+    fn plaintext_policy_authors_suite_0_on_a_fresh_stream_unchanged() {
+        // `SealPolicy::Plaintext` on a never-sealed owned stream authors suite-0 through the
+        // existing in-tx seam — public authoring is unchanged.
+        let conn = db();
+        let stream = StreamId::from_bytes(STREAM_A);
+        owned_stream_account(&conn, stream);
+        let hashes = author_content_batch(
+            &conn,
+            stream,
+            &[node_create("n1", "x")],
+            SealPolicy::Plaintext,
+            NOW,
+        )
+        .expect("plaintext author");
+        assert_eq!(stored_status(&conn, &hashes[0]).as_deref(), Some("accepted"));
+        let header = header_of(&conn, &hashes[0]);
+        assert_eq!(header.crypto_suite, 0, "the Plaintext policy authors suite 0");
+        assert!(header.key_id.is_none(), "a suite-0 entry has no key_id");
+    }
+
+    #[test]
+    fn content_op_is_sealed_authorable_reserves_the_aead_overhead() {
+        // The sealed body bound is exactly 40 bytes (24 nonce + 16 tag) tighter than the plaintext
+        // one, so a sealed op can never mint an un-signable entry.
+        assert_eq!(CONTENT_SEALED_OP_BODY_MAX_BYTES, CONTENT_OP_BODY_MAX_BYTES - 40);
+        let at = node_create_sized("mem_at", CONTENT_SEALED_OP_BODY_MAX_BYTES);
+        assert_eq!(op::encode(&at).len(), CONTENT_SEALED_OP_BODY_MAX_BYTES, "sized on the nose");
+        assert!(content_op_is_sealed_authorable(&at), "an op at the sealed bound is authorable");
+        let over = node_create_sized("mem_over", CONTENT_SEALED_OP_BODY_MAX_BYTES + 1);
+        assert!(
+            !content_op_is_sealed_authorable(&over),
+            "one byte over the sealed bound is quarantined",
+        );
+
+        // Drift guard: a body at the sealed bound, sealed under the WIDEST header, signs at or
+        // under the §18a envelope cap — the reserve is enough (mirrors the plaintext
+        // overhead guard).
+        let secret = crate::device::DeviceSecret::from_seed(&[9; 32]);
+        let key = ContentKey::from_seed(&[0x20; 32]);
+        let header = ContentEntryHeader {
+            stream_id: StreamId::from_bytes([0x11; 32]),
+            author_account_id: AccountId::from_bytes([0x22; 32]),
+            device_fingerprint: secret.public().fingerprint(),
+            seq: u64::MAX,
+            lamport: u64::MAX,
+            prev_hash: Some([0x33; 32]),
+            grant_id: Some([0x44; 32]),
+            roster_ref: [0x55; 32],
+            owner_auth_len: u64::MAX,
+            author_auth_len: u64::MAX,
+            crypto_suite: 0,
+            key_id: None,
+        };
+        let mut op_body = vec![0x5a];
+        op_body.extend_from_slice(&((CONTENT_SEALED_OP_BODY_MAX_BYTES - 5) as u32).to_be_bytes());
+        op_body.resize(CONTENT_SEALED_OP_BODY_MAX_BYTES, 0);
+        // The nonce value is not load-bearing here (the size is nonce-width-independent), so seal
+        // via the random-nonce production entry point rather than a fixed injected nonce.
+        let signed =
+            envelope::seal_and_sign_content_entry(&secret, &header, &op_body, &key).unwrap();
+        assert!(
+            signed.signed_bytes.len() <= CONTENT_ENVELOPE_MAX_BYTES,
+            "the sealed reserve keeps the signed envelope within the §18a cap ({} > {})",
+            signed.signed_bytes.len(),
+            CONTENT_ENVELOPE_MAX_BYTES,
+        );
+    }
+
+    #[test]
+    fn a_rotation_in_the_resolution_window_makes_txn_b_bail_not_seal_stale() {
+        // P1: the sealed author resolves the content key in an autocommit window between txn A and
+        // txn B. A DeviceRemove + rotation committing a fresh higher-epoch wrap in that window
+        // would otherwise let txn B seal under the STALE key — acceptance is
+        // key-independent, so it folds accepted — and a device the rotation revoked could
+        // decrypt this post-removal entry. `revalidate_sealing_selection` re-reads the
+        // selection under txn B's write lock and bails when it no longer names the resolved
+        // key. Simulated directly: resolve, rotate the accepted wrap set to a higher epoch,
+        // then assert the re-validation bails on the stale baseline.
+        let conn = db();
+        let (account, stream) = owned_v2(&conn);
+        // Establish the epoch-0 sealing wrap the resolution would name (the stale baseline).
+        author_content_batch(&conn, stream, &[node_create("n1", "first")], SealPolicy::Sealed, NOW)
+            .expect("mint the initial key + author");
+        let baseline = secrets::select_current_sealing_wrap(&conn, account, stream)
+            .unwrap()
+            .expect("an epoch-0 selection");
+        assert_eq!(baseline.key_epoch, 0, "the initial mint is epoch 0");
+
+        // The concurrent rotation: commit a fresh epoch-1 wrap (what a DeviceRemove-driven rotation
+        // authors), so the current selection no longer names the resolved epoch-0 key.
+        {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            secrets::rotate_stream_key_in_tx(&tx, stream, NOW).expect("rotate to epoch 1");
+            tx.commit().unwrap();
+        }
+        let rotated = secrets::select_current_sealing_wrap(&conn, account, stream)
+            .unwrap()
+            .expect("an epoch-1 selection");
+        assert_eq!(rotated.key_epoch, 1, "the rotation advanced the selection to epoch 1");
+
+        // Under txn B's write lock the stale epoch-0 baseline no longer matches → bail (retry).
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = revalidate_sealing_selection(&tx, account, stream, &baseline).unwrap_err();
+        drop(tx);
+        assert!(
+            err.to_string().contains("rotated between resolution and sealing"),
+            "the re-validation bails on a rotation in the resolution window: {err}",
+        );
+
+        // The guard is not a blanket refusal: the fresh selection still validates.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        revalidate_sealing_selection(&tx, account, stream, &rotated)
+            .expect("the current selection re-validates");
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn an_empty_sealed_batch_is_a_noop_and_does_not_arm_the_ratchet() {
+        // P2: an empty Sealed batch must run NO key management. Minting the stream's first
+        // StreamKeyWrap would arm the downgrade ratchet, permanently refusing later plaintext
+        // authoring after a call that authored nothing.
+        let conn = db();
+        let (account, stream) = owned_v2(&conn);
+        let hashes = author_content_batch(&conn, stream, &[], SealPolicy::Sealed, NOW)
+            .expect("an empty sealed batch is a no-op");
+        assert!(hashes.is_empty(), "an empty batch authors no entries");
+        // No wrap was minted → the stream never sealed.
+        assert!(
+            secrets::select_current_sealing_wrap(&conn, account, stream).unwrap().is_none(),
+            "the empty sealed batch minted no content key",
+        );
+        // Plaintext authoring still works — the downgrade ratchet was never armed.
+        let authored = author_content_batch(
+            &conn,
+            stream,
+            &[node_create("n1", "x")],
+            SealPolicy::Plaintext,
+            NOW,
+        )
+        .expect("plaintext authoring still works after an empty sealed batch");
+        assert_eq!(authored.len(), 1, "the empty sealed batch did not arm the downgrade ratchet");
     }
 }
