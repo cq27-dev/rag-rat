@@ -24,12 +24,15 @@ pub(crate) fn rm(config: &Config, args: &RmArgs) -> anyhow::Result<()> {
     // Nothing to remove without an index — the friendly hint before any open.
     ensure_index_exists(config)?;
 
-    // Resolve the path to a registered repo + count what removal would delete, on a read
-    // connection. NOTE: the store is NOT migrated yet — `count_repo_rows` tolerates a table an
-    // older schema lacks, so the preview / `--dry-run` reads an old DB without writing to it.
-    // The schema migration happens only on the destructive path below.
+    // Resolve the path to a registered repo + count what removal would delete on a GENUINELY
+    // read-only connection. `IndexConnection::open` is not read-only: setup persists
+    // `journal_mode=WAL` and may create WAL sidecars, violating `--dry-run` (and an aborted
+    // prompt's "nothing was deleted" promise) on an older DELETE-journal store. The blocking RO
+    // seam skips setup, pragma writes, directory/file creation, and migration. `count_repo_rows`
+    // tolerates tables an older schema lacks, so planning stays compatible without writing; the
+    // migration happens only on the destructive path below.
     let plan = {
-        let storage = IndexConnection::open(&config.database)?;
+        let storage = IndexConnection::open_read_only_blocking(&config.database)?;
         let conn = storage.connection();
         let Some(repo) = remove::resolve_removable_repo(conn, &args.path)? else {
             anyhow::bail!("{}", unregistered_path_message(&storage, &args.path)?);

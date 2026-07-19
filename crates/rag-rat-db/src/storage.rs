@@ -232,6 +232,36 @@ mod tests {
     }
 
     #[test]
+    fn open_read_only_blocking_does_not_persist_wal_mode_or_create_sidecars() {
+        let dir = std::env::temp_dir().join(format!(
+            "ragrat-ro-journal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = DELETE; CREATE TABLE t(v INTEGER);").unwrap();
+        }
+
+        {
+            let ro = IndexConnection::open_read_only_blocking(&db).unwrap();
+            let mode: String =
+                ro.connection().query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+            assert_eq!(mode, "delete", "a planning read must not switch the DB to WAL");
+        }
+        let mode: String = Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete", "journal mode must remain DELETE after the RO open");
+        assert!(!db.with_extension("db-wal").exists(), "RO planning must not create a WAL file");
+        assert!(!db.with_extension("db-shm").exists(), "RO planning must not create a SHM file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn is_readonly_violation_flags_only_sqlite_readonly_errors() {
         let dir = std::env::temp_dir().join(format!("ragrat-roviol-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
