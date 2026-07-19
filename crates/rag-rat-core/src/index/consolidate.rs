@@ -282,6 +282,12 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
     let counts = import_from_source(source_storage.connection(), target_conn, &repo_id)?;
     drop(source_storage);
 
+    // The schema-only open above deliberately bypasses the normal open/migrate hook. Bring the
+    // store-global `/3` projection current before reconcile's anti-join trusts it; otherwise a
+    // missing/older projector stamp can make already-authored rows look absent and append duplicate
+    // immutable content ops. This uses the existing connection and the rebuild's own IMMEDIATE txn.
+    rag_rat_oplog::rebuild_all_content_projections_if_stale(target_conn)?;
+
     // Author the freshly-imported (remapped) rows into the TARGET's owner stream so the
     // consolidated store's signed history is complete under its OWN device identity (#541). The
     // per-chain backfill gate would otherwise skip them (the target chain is already

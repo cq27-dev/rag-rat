@@ -575,3 +575,97 @@ fn consolidate_from_a_linked_worktree_uses_the_main_config_and_legacy() {
     let _ = fs::remove_dir_all(&data_dir);
     let _ = fs::remove_dir_all(&model_cache);
 }
+
+/// Consolidation opens its target through the schema-only path, so it must explicitly run the
+/// store-global `/3` projector upgrade before reconcile's projection anti-join. A retry after the
+/// import committed but the legacy rename did not is the dangerous shape: the immutable content
+/// op already exists, and stale/missing projection rows would make reconcile append it again.
+#[test]
+fn consolidate_rebuilds_stale_content_projection_before_reconcile() {
+    let root = fixture_repo();
+    let data_dir = unique_dir("projectordata");
+    let model_cache = unique_dir("projectorcache");
+    let legacy = root.join(".rag-rat/index.sqlite");
+    let imported = root.join(".rag-rat/index.sqlite.imported");
+    let global = data_dir.join("rag-rat.sqlite");
+
+    let out = run(&root, &data_dir, &model_cache, &["index", "--full"]);
+    assert!(out.status.success(), "index --full failed: {}", String::from_utf8_lossy(&out.stderr));
+    {
+        let conn = rusqlite::Connection::open(&legacy).unwrap();
+        let repo_id: String = conn
+            .query_row(
+                "SELECT repo_id FROM repos WHERE repo_id != '__unassigned__' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms, \
+             updated_at_ms, source, memory_version, repo_id) VALUES ('projector-memory', \
+             'Invariant', 'projector', 'body', 'high', 'active', 0, 0, 'test', 'v1', ?1)",
+            [&repo_id],
+        )
+        .unwrap();
+    }
+
+    fs::write(
+        root.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \"none\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
+    )
+    .unwrap();
+    let out = run(&root, &data_dir, &model_cache, &["consolidate"]);
+    assert!(
+        out.status.success(),
+        "first consolidate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Emulate the import-committed/rename-not-landed retry window, then doctor the target into an
+    // old projector's state: accepted content remains authoritative, but its projection and stamp
+    // are missing. Without the pre-reconcile rebuild, the anti-join authors a second NodeCreate.
+    fs::rename(&imported, &legacy).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&global).unwrap();
+        let before: i64 =
+            conn.query_row("SELECT COUNT(*) FROM content_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(before, 1, "the first consolidate authored exactly one content op");
+        conn.execute_batch(
+            "DELETE FROM content_projected_nodes WHERE node_id = 'projector-memory';
+             DELETE FROM oplog_meta WHERE key = 'content_projector_version';",
+        )
+        .unwrap();
+    }
+
+    let out = run(&root, &data_dir, &model_cache, &["consolidate"]);
+    assert!(
+        out.status.success(),
+        "retry consolidate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let conn = rusqlite::Connection::open(&global).unwrap();
+    let content_entries: i64 =
+        conn.query_row("SELECT COUNT(*) FROM content_entries", [], |row| row.get(0)).unwrap();
+    assert_eq!(content_entries, 1, "stale projection must not cause duplicate content authoring");
+    let projected: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM content_projected_nodes WHERE node_id = 'projector-memory'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(projected, 1, "consolidate rebuilt the missing content projection");
+    let stamp: String = conn
+        .query_row(
+            "SELECT value FROM oplog_meta WHERE key = 'content_projector_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stamp, "1", "consolidate upgraded the store-global projector stamp");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = fs::remove_dir_all(&model_cache);
+}
