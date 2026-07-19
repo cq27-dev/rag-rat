@@ -97,6 +97,7 @@ impl ThreadShape {
     Deserialize,
     strum::EnumString,
     strum::IntoStaticStr,
+    strum::VariantArray,
 )]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
