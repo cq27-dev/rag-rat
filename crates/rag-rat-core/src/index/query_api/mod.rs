@@ -521,7 +521,9 @@ impl IndexDatabase {
             Ok(text) => text,
             Err(_) => {
                 let path = chunk.path.clone();
-                self.mark_file_deleted(Path::new(&path))?;
+                // #767 review: the gated variant — a stale-scope read path must not stamp a
+                // `kind='deleted'` row for a repo `rag-rat rm` already purged.
+                self.mark_file_deleted_if_not_removed(Path::new(&path))?;
                 self.sync_fts()?;
                 anyhow::bail!(IndexError::Gone { chunk_id });
             },
@@ -586,10 +588,12 @@ impl IndexDatabase {
             anyhow::bail!("heal_index requires source_root metadata; run `rag-rat index` first");
         };
         // #767 review: fail closed when the active repo was `rag-rat rm`-removed after this
-        // connection resolved its scope (a stale MCP `heal_index` writer) — the per-file heals /
-        // deletions below would otherwise re-insert rows for the purged `repo_id` after the
-        // removal reported success. (`heal_file` gates the single-file path too; this stops the
-        // batch before any per-file work.)
+        // connection resolved its scope (a stale MCP `heal_index` writer). This is the PREFLIGHT
+        // that stops the batch before any per-file work; the AUTHORITATIVE checks live at each
+        // per-file write boundary — `heal_file` and `mark_file_deleted_if_not_removed` re-check
+        // the tombstone inside their IMMEDIATE mutation transactions, which serialize with rm's
+        // purge on the SQLite write lock (the heal path deliberately stays flock-free so it can
+        // run alongside a mid-flight rebuild).
         let conn = self.storage.connection();
         let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
         crate::index::remove::assert_repo_not_removed(conn, &active_repo_id)?;
@@ -618,7 +622,7 @@ impl IndexDatabase {
                         Some("limit reached; rerun heal_index to continue".to_string());
                     break;
                 }
-                self.mark_file_deleted(path)?;
+                self.mark_file_deleted_if_not_removed(path)?;
                 report.removed_files += 1;
                 continue;
             };

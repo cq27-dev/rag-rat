@@ -31,32 +31,45 @@ impl IndexDatabase {
         if self.active_scope_is_linked_overlay() {
             return Ok(());
         }
-        // #767 review: fail closed when the active repo was `rag-rat rm`-removed after this
-        // connection resolved its scope (a stale MCP `heal_index` / lazy-heal writer). Otherwise
-        // the reindex below inserts fresh `files`/chunk/graph rows stamped with the removed
-        // `repo_id` — `files.repo_id` has no FK to `repos`, so they would survive a removal that
-        // already reported success.
-        let conn = self.storage.connection();
-        let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-        super::remove::assert_repo_not_removed(conn, &active_repo_id)?;
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("index has no source_root metadata; rebuild required");
         };
         let row = self.file_row(path)?;
         let full_path = root.join(path);
+        // Read the file bytes + git status BEFORE opening the mutation transaction: pure I/O
+        // holds no SQLite write lock, keeping the write window short.
         let text = match fs::read_to_string(&full_path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // File deleted on disk since indexing — drop it from the index rather than
-                // hard-erroring the whole search. The caller (search_with_heal) re-runs
-                // search without it. Mirrors read_chunk_current's deletion handling.
-                self.mark_file_deleted(path)?;
-                return Ok(());
-            },
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-
         let changes = git_changed_paths(root).unwrap_or_default();
+
+        // #767 review: run the whole heal mutation in ONE IMMEDIATE transaction with the removal
+        // tombstone re-checked INSIDE it. A preflight-only check leaves a gap between the check
+        // and the delete/reinsert below in which `rag-rat rm` could purge + tombstone, letting a
+        // stale MCP/lazy heal recreate `files`/chunk/graph rows for the removed `repo_id` after
+        // rm reported success (`files.repo_id` has no FK to `repos`). This transaction and rm's
+        // purge are both IMMEDIATE, so they serialize on the SQLite write lock and the tombstone
+        // state read here is stable for the whole heal: set → rm committed first, fail closed;
+        // unset → rm's purge waits for this commit and sweeps the re-inserted rows itself. The
+        // heal deliberately stays LOCKLESS at the flock level — it must run alongside a
+        // mid-flight rebuild (`a_lockless_heal_mid_rebuild_does_not_remove_the_staged_row`).
+        let conn = self.storage.connection();
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let active_repo_id = rag_rat_db::schema::active_repo_id(&tx)?;
+        super::remove::assert_repo_not_removed(&tx, &active_repo_id)?;
+
+        let Some(text) = text else {
+            // File deleted on disk since indexing — drop it from the index rather than
+            // hard-erroring the whole search. The caller (search_with_heal) re-runs
+            // search without it. Mirrors read_chunk_current's deletion handling.
+            self.mark_file_deleted(path)?;
+            tx.commit()?;
+            return Ok(());
+        };
+
         let is_dirty = changes.changed.contains(path);
         let has_base_commit = !self.active_commit_sha.is_empty();
         let scope = if !has_base_commit || is_dirty {
@@ -77,7 +90,25 @@ impl IndexDatabase {
         // Defer: a single-file heal must not stamp the logical-key version — every other file's
         // drift is still in the future (#493).
         self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
-        self.resolve_edges()
+        self.resolve_edges()?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The deletion half of a heal, gated exactly like [`Self::heal_file`] (#767 review): the
+    /// `kind='deleted'` tombstone is itself an INSERT stamped with the active `repo_id`, so a
+    /// stale writer must not write it for a repo `rag-rat rm` already purged. Wraps the deletion
+    /// in an IMMEDIATE transaction with the removal tombstone re-checked inside (the transaction
+    /// serializes with rm's purge on the SQLite write lock — see `heal_file`).
+    pub(crate) fn mark_file_deleted_if_not_removed(&self, path: &Path) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let active_repo_id = rag_rat_db::schema::active_repo_id(&tx)?;
+        super::remove::assert_repo_not_removed(&tx, &active_repo_id)?;
+        self.mark_file_deleted(path)?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn index_file(

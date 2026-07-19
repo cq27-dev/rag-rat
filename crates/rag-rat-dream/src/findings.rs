@@ -337,6 +337,26 @@ pub(super) fn sync(
     // (busy_timeout, then the MCP call-level busy-retry) until the first commits, after which
     // its SELECT sees the row and refreshes — no duplicate insert.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // #767 review: re-check the `rag-rat rm` removal tombstone AT the write boundary, inside this
+    // IMMEDIATE transaction. The preflight in `IndexDatabase::dream_run` runs BEFORE the finding
+    // computation; a removal committing in that gap would otherwise let this sync INSERT fresh
+    // `dream_findings` rows for the removed repo after rm reported success (the table has no FK
+    // to `repos`). This transaction and rm's purge are both IMMEDIATE, so they serialize on the
+    // SQLite write lock and the tombstone state read here is stable for the whole sync: set → rm
+    // committed first, refuse; unset → rm's purge waits for this commit and sweeps the
+    // just-written rows itself. Unscoped (legacy single-repo) connections have no repo scope to
+    // guard — the check skips them.
+    if let Some(repo_id) = dream_repo_scope(&tx)?
+        && rag_rat_db::schema::is_repo_removed(&tx, &repo_id)?
+    {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(format!(
+                "repo {repo_id} was removed with `rag-rat rm` — refusing the dream findings sync; \
+                 run `rag-rat init` in the repo to re-add it"
+            )),
+        ));
+    }
     let counts = sync_in_tx(&tx, findings, now_ms, resolve_kinds)?;
     tx.commit()?;
     Ok(counts)

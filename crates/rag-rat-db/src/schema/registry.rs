@@ -268,7 +268,9 @@ fn register_repo_inner(
     // repo — and a read-only open is NOT harmless when it is write-capable: a manual
     // `papertrail sync` registers read-only, then commits `papertrail_*` rows. A
     // genuinely-removed repo has no surviving config to reach here (rm deletes it); `rag-rat
-    // init` / `consolidate` clear the tombstone for a deliberate re-add.
+    // init` / `consolidate` clear the tombstone for a deliberate re-add. This is the cheap
+    // PRE-FILTER; the AUTHORITATIVE check re-runs inside the adoption transaction below (this
+    // read races rm's tombstone commit — the in-transaction one cannot).
     if is_repo_removed(conn, trimmed_id)? {
         return Err(registry_refusal(format!(
             "repo {trimmed_id} was removed with `rag-rat rm` — run `rag-rat init` in the repo to \
@@ -435,6 +437,20 @@ fn register_repo_inner(
     // serializes registrations against each other; IMMEDIATE covers contention with NON-registry
     // writers (an index pass on a sibling repo).
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // #767 review: re-check the removal tombstone INSIDE the adoption transaction. The pre-filter
+    // above reads the tombstone BEFORE the registry lock and any transaction, and `rm` takes
+    // neither — so without this re-check a stale (preloaded-config) registration could pass the
+    // pre-filter, have rm purge + tombstone in the gap, and then INSERT the `repos` row after rm
+    // reported success. This transaction and rm's purge are both IMMEDIATE, so they serialize on
+    // the SQLite write lock and the tombstone state read here is stable for the whole adoption:
+    // set → rm committed first, refuse; unset → rm's purge waits for this commit and removes the
+    // just-registered repo itself.
+    if is_repo_removed(&tx, trimmed_id)? {
+        return Err(registry_refusal(format!(
+            "repo {trimmed_id} was removed with `rag-rat rm` — run `rag-rat init` in the repo to \
+             re-add it"
+        )));
+    }
     let placeholder_present = tx
         .query_row("SELECT 1 FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID], |_| Ok(()))
         .optional()?

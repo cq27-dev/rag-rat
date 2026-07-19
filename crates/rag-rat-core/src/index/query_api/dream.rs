@@ -11,9 +11,12 @@ impl IndexDatabase {
     pub fn dream_run(&self, opts: DreamOptions) -> anyhow::Result<DreamReport> {
         let conn = self.storage.connection();
         // #767 review: fail closed when the active repo was `rag-rat rm`-removed after this
-        // connection resolved its scope (a stale MCP `dream` writer). The findings sync below
-        // would otherwise INSERT fresh `dream_findings` rows for the removed `repo_id` after the
-        // purge reported success — the table intentionally carries no FK to `repos`.
+        // connection resolved its scope (a stale MCP `dream` writer). This is the PREFLIGHT — it
+        // keeps a removed repo from paying the finding computation (and, in
+        // `dream_run_with_passes`, the model/provisioning side effects); the AUTHORITATIVE check
+        // lives inside the findings sync's IMMEDIATE transaction (`findings::sync`), which
+        // serializes with rm's purge on the SQLite write lock so a removal landing mid-run cannot
+        // let the sync re-insert `dream_findings` rows for the removed `repo_id`.
         let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
         crate::index::remove::assert_repo_not_removed(conn, &active_repo_id)?;
         rag_rat_dream::dream_run(conn, opts)
