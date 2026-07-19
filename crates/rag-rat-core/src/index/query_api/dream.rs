@@ -9,7 +9,14 @@ use super::*;
 
 impl IndexDatabase {
     pub fn dream_run(&self, opts: DreamOptions) -> anyhow::Result<DreamReport> {
-        rag_rat_dream::dream_run(self.storage.connection(), opts)
+        let conn = self.storage.connection();
+        // #767 review: fail closed when the active repo was `rag-rat rm`-removed after this
+        // connection resolved its scope (a stale MCP `dream` writer). The findings sync below
+        // would otherwise INSERT fresh `dream_findings` rows for the removed `repo_id` after the
+        // purge reported success — the table intentionally carries no FK to `repos`.
+        let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+        crate::index::remove::assert_repo_not_removed(conn, &active_repo_id)?;
+        rag_rat_dream::dream_run(conn, opts)
     }
 
     /// [`Self::dream_run`] plus the phase-B model verdict pass and the phase-C model compaction

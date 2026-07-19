@@ -585,6 +585,14 @@ impl IndexDatabase {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("heal_index requires source_root metadata; run `rag-rat index` first");
         };
+        // #767 review: fail closed when the active repo was `rag-rat rm`-removed after this
+        // connection resolved its scope (a stale MCP `heal_index` writer) — the per-file heals /
+        // deletions below would otherwise re-insert rows for the purged `repo_id` after the
+        // removal reported success. (`heal_file` gates the single-file path too; this stops the
+        // batch before any per-file work.)
+        let conn = self.storage.connection();
+        let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+        crate::index::remove::assert_repo_not_removed(conn, &active_repo_id)?;
         let indexed_files = self.indexed_files()?;
         let max_repairs = limit.map(usize::try_from).transpose()?.unwrap_or(usize::MAX);
         let mut report = HealIndexReport {

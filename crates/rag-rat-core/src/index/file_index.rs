@@ -31,6 +31,14 @@ impl IndexDatabase {
         if self.active_scope_is_linked_overlay() {
             return Ok(());
         }
+        // #767 review: fail closed when the active repo was `rag-rat rm`-removed after this
+        // connection resolved its scope (a stale MCP `heal_index` / lazy-heal writer). Otherwise
+        // the reindex below inserts fresh `files`/chunk/graph rows stamped with the removed
+        // `repo_id` — `files.repo_id` has no FK to `repos`, so they would survive a removal that
+        // already reported success.
+        let conn = self.storage.connection();
+        let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+        super::remove::assert_repo_not_removed(conn, &active_repo_id)?;
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("index has no source_root metadata; rebuild required");
         };

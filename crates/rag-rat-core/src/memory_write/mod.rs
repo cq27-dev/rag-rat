@@ -24,24 +24,8 @@ pub(crate) use authoring::backfill_memory_oplog;
 pub(crate) use authoring::reconcile_owner_stream_for_repo;
 pub(crate) use edges::{add_edge, remove_edge};
 
-/// #767 review: fail a repo-scoped memory mutation CLOSED when the active repo was removed by
-/// `rag-rat rm`. The removal tombstone is normally enforced at connection-registration time, but
-/// an MCP connection that opened (and resolved its active repo scope) BEFORE `rm` acquired the
-/// repo lock keeps that stale scope; without this re-check its `create_memory` / `add_edge` would
-/// INSERT fresh `repo_memories` / `repo_node_edges` rows stamped with the removed `repo_id` (and
-/// author op-log state) AFTER `rm`'s purge committed and reported success. Call INSIDE the write
-/// transaction, immediately before the INSERT, so the tombstone read shares the transaction's
-/// snapshot: an `rm` that committed first is seen (fail closed); an `rm` that commits after purges
-/// the just-written row itself (also consistent). The reverse-order hazard is the one this closes.
-pub(crate) fn assert_repo_not_removed(
-    conn: &rusqlite::Connection,
-    repo_id: &str,
-) -> anyhow::Result<()> {
-    if rag_rat_db::schema::is_repo_removed(conn, repo_id)? {
-        anyhow::bail!(
-            "repo {repo_id} was removed with `rag-rat rm` — refusing the write; run `rag-rat \
-             init` in the repo to re-add it"
-        );
-    }
-    Ok(())
-}
+// The `rag-rat rm` removal-tombstone guard (#767 review) the memory mutations call inside
+// their write transactions, immediately before the INSERT — defined beside the removal
+// orchestration in `index::remove` (the dream + heal writers gate on it too), re-exported here
+// so the `super::` call sites read unchanged.
+pub(crate) use crate::index::remove::assert_repo_not_removed;

@@ -277,6 +277,27 @@ pub fn remove_write_lock_path(database: &Path, repo_id: &str) -> PathBuf {
     locks::write_lock_path(database, repo_id)
 }
 
+/// #767 review: fail a repo-scoped write CLOSED when the active repo was removed by `rag-rat rm`.
+/// The removal tombstone is normally enforced at connection-registration time, but a connection
+/// that opened (and resolved its active repo scope) BEFORE `rm` acquired the repo lock keeps that
+/// stale scope; without this re-check its write would INSERT fresh rows stamped with the removed
+/// `repo_id` AFTER `rm`'s purge committed and reported success (the repo-scoped tables
+/// intentionally carry no FK to `repos`). The guarded paths: the MCP memory mutations
+/// (`memory_write`), the dream findings sync (`dream_run`), and the MCP/lazy heal writers
+/// (`heal_file` / `heal_index`). Call INSIDE the write transaction (or immediately before the
+/// write) so the tombstone read shares the transaction's snapshot: an `rm` that committed first is
+/// seen (fail closed); an `rm` that commits after purges the just-written rows itself (also
+/// consistent). The reverse-order hazard is the one this closes.
+pub(crate) fn assert_repo_not_removed(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
+    if schema::is_repo_removed(conn, repo_id)? {
+        anyhow::bail!(
+            "repo {repo_id} was removed with `rag-rat rm` — refusing the write; run `rag-rat \
+             init` in the repo to re-add it"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! The purge-completeness TRIPWIRE. It builds a real fixture repo A alongside the
