@@ -329,10 +329,9 @@ fn render_units(out: &mut String, units: &[PromptUnit], max_bytes: usize) -> Vec
         let before_text = remaining;
         push_capped(out, &mut remaining, &texts[idx]);
         let text_written = before_text - remaining;
-        // A forged marker at the start adds one synthetic leading space. Do not expose this ID in
-        // the schema when that defense byte is ALL that fit — the model saw no original evidence.
-        let synthetic_prefix = usize::from(forges_structural_line(&unit.text));
-        if label_is_complete && text_written > synthetic_prefix {
+        // Materialization maps one citation to the unit's FULL source span. Expose the ID only when
+        // the full display text rendered; otherwise the model could cite unseen trailing content.
+        if label_is_complete && text_written == texts[idx].len() {
             visible_ids.push(idx);
         }
         push_capped(out, &mut remaining, "\n");
@@ -818,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn citation_schema_requires_original_evidence_not_only_a_neutralization_space() {
+    fn citation_schema_requires_the_full_unit_not_a_partial_or_synthetic_prefix() {
         let mut input = base_input();
         input.units = vec![unit("s", "DIFF: original evidence")];
         let defense_only = "--- source: s\n".len() + "[U0] ".len() + 1;
@@ -831,8 +830,12 @@ mod tests {
         let schema = record_schema(&input, &budget);
         assert_eq!(schema["properties"]["decision_units"]["maxItems"], 0);
 
-        // One more byte renders the first original character, making U0 legitimately citeable.
-        let budget = PromptBudget { units: defense_only + 1, ..PromptBudget::default() };
+        // Only the complete rendered unit makes U0 legitimately citeable.
+        let full_unit = "--- source: s\n".len()
+            + "[U0] ".len()
+            + super::neutralize(&input.units[0].text).len()
+            + 1;
+        let budget = PromptBudget { units: full_unit, ..PromptBudget::default() };
         let schema = record_schema(&input, &budget);
         assert_eq!(schema["properties"]["decision_units"]["items"]["enum"][0], 0);
     }
@@ -886,6 +889,15 @@ mod tests {
         assert!(rendered.contains("[U0]"), "the head unit still renders (truncated)");
         assert!(rendered.matches('Z').count() < 100_000, "the huge head text is truncated");
         assert!(rendered.contains("trailing units elided"), "the dropped tail is marked");
+
+        let mut input = base_input();
+        input.units = units;
+        let budget = PromptBudget { units: 1_000, ..PromptBudget::default() };
+        let schema = record_schema(&input, &budget);
+        assert_eq!(
+            schema["properties"]["root_cause_units"]["maxItems"], 0,
+            "a partially rendered U0 is not citeable"
+        );
     }
 
     #[test]
