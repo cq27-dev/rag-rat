@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use super::{
-    self as config, Config, ConfigError, LlmConfig, LogConfig, MemoryConfig, PapertrailConfig,
-    RawConfig, RawTarget, ResolvedTarget, TargetKind, TrackerConfig,
+    self as config, Config, ConfigError, DistillLlmConfig, DreamLlmConfig, EmbeddingConfig,
+    LlmConfig, LogConfig, MemoryConfig, OracleConfig, PapertrailConfig, RawConfig, RawTarget,
+    ResolvedTarget, SearchConfig, TargetKind, TrackerConfig, VersionCheckConfig, WatchConfig,
 };
 use crate::language::Language;
 
@@ -304,6 +305,35 @@ impl Config {
             source_root_reanchored_from,
             allow_empty: false,
         })
+    }
+
+    /// A minimal config for commands that only need a database path and a working root, used when
+    /// no `rag-rat.toml` is present (e.g., `rag-rat rm` on a deleted checkout). Most fields are set
+    /// to their defaults; the command is expected to only use `database`, `root`, and
+    /// `repo_id_override`.
+    pub fn minimal_for_database(database: PathBuf, root: PathBuf) -> Self {
+        Self {
+            root,
+            database,
+            targets: Vec::new(),
+            llm: LlmConfig {
+                embedding: EmbeddingConfig::default(),
+                dream: DreamLlmConfig::default(),
+                distill: DistillLlmConfig::default(),
+            },
+            watch: WatchConfig::default(),
+            log: LogConfig::default(),
+            version_check: VersionCheckConfig::default(),
+            oracle: OracleConfig::default(),
+            search: SearchConfig::default(),
+            memory: MemoryConfig::default(),
+            trackers: Vec::new(),
+            papertrail: PapertrailConfig::default(),
+            repo_id_override: None,
+            database_key_pinned: false,
+            source_root_reanchored_from: None,
+            allow_empty: false,
+        }
     }
 }
 

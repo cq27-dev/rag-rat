@@ -198,8 +198,14 @@ pub fn count_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<RepoR
         counts.record(&table, count);
     }
     // Transitive children: count through the live parent scope (the parents still exist at count
-    // time — this is the read path).
+    // time — this is the read path). An older schema may predate a table (e.g. `clone_df_epoch`,
+    // V051); this count runs BEFORE `rm` migrates (so `--dry-run` never writes), so a table that
+    // does not exist is skipped — its row count is 0, and the destructive purge runs post-migration
+    // where every listed table exists.
     for transitive in TRANSITIVE_SCOPED_TABLES {
+        if !crate::schema::table_exists(conn, transitive.table)? {
+            continue;
+        }
         let count: i64 = conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM \"{}\" WHERE {} IN ({})",
@@ -213,15 +219,17 @@ pub fn count_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<RepoR
         counts.record(transitive.table, count);
     }
     // chunk_fts (contentless FTS, keyed by chunk.id) — counted like the other chunk children.
-    let chunk_fts: i64 = conn.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM chunk_fts WHERE rowid IN ({})",
-            parent_id_select(purge_ids::CHUNKS)
-        ),
-        params![repo_id],
-        |row| row.get(0),
-    )?;
-    counts.record("chunk_fts", chunk_fts);
+    if crate::schema::table_exists(conn, "chunk_fts")? {
+        let chunk_fts: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM chunk_fts WHERE rowid IN ({})",
+                parent_id_select(purge_ids::CHUNKS)
+            ),
+            params![repo_id],
+            |row| row.get(0),
+        )?;
+        counts.record("chunk_fts", chunk_fts);
+    }
     Ok(counts)
 }
 

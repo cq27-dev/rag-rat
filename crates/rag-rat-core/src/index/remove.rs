@@ -91,10 +91,25 @@ pub fn resolve_removable_repo(
         .or_else(|_| std::path::absolute(path))
         .unwrap_or_else(|_| path.to_path_buf());
 
-    // Route 1: a derivable git identity that is a REGISTERED repo. The identity is content-derived
-    // from the git repo AT this path, so a match is unambiguous — no sole-repo guessing. A pinned
-    // `[index] repo_id` is intentionally NOT read here (we have no config for an arbitrary path);
-    // route 2's recorded-root match covers a pinned registration.
+    // Route 1: a derivable git identity that is a REGISTERED repo. Try the GOVERNING config's
+    // `[index] repo_id` override first when the path is a live checkout with a config, so pinned
+    // repos with `[index] root = "src"` resolve from the checkout top (not only the indexed
+    // subdir). Fall back to the content-derived identity when no override applies or it does not
+    // match a registered repo.
+    if canonical.is_dir() {
+        let config_path = rag_rat_base::config::discover_config_path(&canonical);
+        if let Ok(config) = rag_rat_base::config::Config::load(&config_path)
+            && let Some(override_id) = config.repo_id_override.as_deref()
+            && let Ok(identity) =
+                rag_rat_base::repo_identity::resolve_repo_identity(&canonical, Some(override_id))
+            && schema::repo_id_is_registered(conn, &identity.repo_id)?
+        {
+            return Ok(Some(load_resolved_repo(conn, identity.repo_id, canonical)?));
+        }
+    }
+
+    // Route 1b: content-derived identity for the path itself. Still unambiguous because it is
+    // derived from the git content AT this path; no sole-repo guessing.
     if let Ok(identity) = rag_rat_base::repo_identity::resolve_repo_identity(&canonical, None)
         && schema::repo_id_is_registered(conn, &identity.repo_id)?
     {
@@ -683,8 +698,10 @@ mod tests {
             format!("{err}").contains("rag-rat rm") || format!("{err}").contains("removed"),
             "the refusal must name the removal remedy, got: {err}"
         );
-        // The READ-ONLY adoption path is NOT gated (a read of a now-empty repo is harmless).
-        schema::register_repo_read_only(conn, &identity, tv_root, 4, &hooks).unwrap();
+        // The read-only adoption path is ALSO gated: it is write-capable (a stale `papertrail sync`
+        // registers read-only, then commits rows), so a tombstoned repo must refuse there too.
+        schema::register_repo_read_only(conn, &identity, tv_root, 4, &hooks)
+            .expect_err("a tombstoned repo must refuse read-only re-registration too");
         // `rag-rat init`'s clear lifts the tombstone → the indexing path works again.
         schema::clear_repo_removed(conn, &identity.repo_id).unwrap();
         assert!(!schema::is_repo_removed(conn, &identity.repo_id).unwrap());

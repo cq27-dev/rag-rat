@@ -78,8 +78,10 @@ fn main() -> anyhow::Result<()> {
 
     // These commands must tolerate the ABSENCE of a config: `init` creates one; `agent-hook`
     // reads its event from stdin; `mcp` serves a dormant server so a globally-registered MCP stays
-    // alive outside a rag-rat repo (#603); `doctor` reports the machine-global store. Everything
-    // else needs a resolved config and fails with a friendly hint when there isn't one.
+    // alive outside a rag-rat repo (#603); `doctor` reports the machine-global store; `rm` targets
+    // the global store by path and must work even when the checkout it removes was the only
+    // configured one. Everything else needs a resolved config and fails with a friendly hint when
+    // there isn't one.
     match &cli.command {
         Cmd::Init(args) => return init::run(args, cli.config.as_deref().unwrap_or("rag-rat.toml")),
         Cmd::AgentHook => return agent_hook::run(),
@@ -93,6 +95,9 @@ fn main() -> anyhow::Result<()> {
         // tolerates config absence: outside a rag-rat repo it still reports the machine-global
         // store.
         Cmd::Status => return run_status(cli.config.as_deref()),
+        // `rm` is a global-store writer keyed by the path argument; it must tolerate the absence of
+        // a live config so a deleted/moved last checkout can still be purged.
+        Cmd::Rm(args) => return run_rm(args, cli.config.as_deref()),
         _ => {},
     }
 
@@ -112,7 +117,8 @@ fn main() -> anyhow::Result<()> {
         | Cmd::EditReindex(_)
         | Cmd::Mcp
         | Cmd::Doctor(_)
-        | Cmd::Status => unreachable!("handled before the config load above"),
+        | Cmd::Status
+        | Cmd::Rm(_) => unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
         Cmd::Query(args) => query(&config, &args)?,
         Cmd::Brief(args) => brief(&config, &args)?,
@@ -150,7 +156,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::DumpVerifyPacks(args) => dump_verify_packs(&config, &args)?,
         Cmd::Oracle(args) => oracle(&config, &args)?,
         Cmd::Consolidate => consolidate(&config)?,
-        Cmd::Rm(args) => rm(&config, &args)?,
         Cmd::DumpConfig => dump_config(&config)?,
         Cmd::VersionCheck => version_check(&config)?,
     }
@@ -486,6 +491,37 @@ fn run_status(explicit: Option<&str>) -> anyhow::Result<()> {
         },
     };
     status(&database)
+}
+
+/// Run `rm`, tolerating the ABSENCE of a live config: `rm` targets the consolidated global store by
+/// the path argument, so a deleted/moved checkout that was the only configured one can still be
+/// purged. With a discovered config we use its `database` and any `repo_id` override; without one
+/// we fall back to the machine-global store. Only when this platform resolves no data dir at all do
+/// we fall back to the friendly "run `rag-rat init`" hint.
+fn run_rm(args: &crate::cli::RmArgs, explicit: Option<&str>) -> anyhow::Result<()> {
+    let config = match discover_config_optional(explicit)? {
+        Some(config) => config,
+        None => {
+            let database = rag_rat_base::data_dir::global_database_path().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No rag-rat config found at `{}`, and this platform has no data directory for \
+                     a machine-global store.\nRun `rag-rat init` to create a config, or pass \
+                     --config <path>.",
+                    rag_rat_base::config::discover_config_path(Path::new(".")).display()
+                )
+            })?;
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            Config::minimal_for_database(database, root)
+        },
+    };
+
+    apply_embedding_runtime_env(&config.llm.embedding.runtime);
+    let _log = rag_rat_base::logging::init_logging(
+        &config,
+        rag_rat_base::logging::Role::Cli("rm".to_string()),
+    );
+
+    rm(&config, args)
 }
 
 /// Map the invoked subcommand to a debug-log [`Role`](rag_rat_base::logging::Role) (drives the log

@@ -323,9 +323,15 @@ pub(crate) fn setup_index(config: &Config) -> anyhow::Result<IndexDatabase> {
     }
     // #767: init is the deliberate re-add a `rag-rat rm` removal tombstone allows — lift it before
     // the config-bearing index open below calls `register_repo`, which refuses a tombstoned repo.
-    clear_removal_tombstone(config)?;
+    // The returned lock is held across `index_discover_with_progress` so the clear and the re-
+    // registration stay under ONE serialization boundary; otherwise another `rm` could acquire the
+    // lock in the gap and remove the repo init is about to re-register.
+    let tombstone_lock = clear_removal_tombstone(config)?;
     eprintln!("init: indexing discovered files");
-    IndexDatabase::index_discover_with_progress(config, render_index_progress)
+    let db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
+    // The lock, if held, is released here AFTER the indexing pass that re-registers the repo.
+    drop(tombstone_lock);
+    Ok(db)
 }
 
 /// Lift any `rag-rat rm` removal tombstone for the repo `init` is (re-)initializing, so the ensuing
@@ -335,19 +341,23 @@ pub(crate) fn setup_index(config: &Config) -> anyhow::Result<IndexDatabase> {
 /// refused for the still-tombstoned repo, and print the confusing "run `rag-rat init`" remedy while
 /// the user is already running init. Surfacing the clear failure lets them retry once the store is
 /// quiet.
-fn clear_removal_tombstone(config: &Config) -> anyhow::Result<()> {
+fn clear_removal_tombstone(
+    config: &Config,
+) -> anyhow::Result<Option<rag_rat_base::locks::WriteLock>> {
     let Ok(identity) = rag_rat_base::repo_identity::resolve_repo_identity(
         &config.root,
         config.repo_id_override.as_deref(),
     ) else {
-        return Ok(());
+        return Ok(None);
     };
     // Clear UNDER the repo write lock so it SERIALIZES with a concurrent `rag-rat rm`: without the
     // lock, init could lift the tombstone in the window between rm's committed purge and rm's lock
     // release, and the ensuing index register would repopulate the just-removed repo after rm
     // reported success. rm holds this lock across its whole purge→deconfigure→VACUUM sequence, so
-    // the clear waits for rm to fully finish before lifting the marker.
-    let Some(_lock) = rag_rat_base::locks::WriteLock::acquire_timeout(
+    // the clear waits for rm to fully finish before lifting the marker. RETURN the guard so the
+    // caller can keep the lock through the re-registration, closing the gap between clear and
+    // index.
+    let Some(lock) = rag_rat_base::locks::WriteLock::acquire_timeout(
         &config.database,
         &identity.repo_id,
         std::time::Duration::from_secs(30),
@@ -360,7 +370,7 @@ fn clear_removal_tombstone(config: &Config) -> anyhow::Result<()> {
     };
     let storage = rag_rat_db::storage::IndexConnection::open(&config.database)?;
     rag_rat_db::schema::clear_repo_removed(storage.connection(), &identity.repo_id)?;
-    Ok(())
+    Ok(Some(lock))
 }
 pub(crate) fn setup_model_and_reconcile(
     config: &Config,

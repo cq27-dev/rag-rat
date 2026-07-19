@@ -262,15 +262,17 @@ fn register_repo_inner(
         )));
     }
 
-    // #767: refuse to re-register a repo tombstoned by `rag-rat rm`. ONLY the root-recording
-    // (indexing) path is gated — a writer that queued behind the removal lock resumes with a stale
-    // in-memory config and would otherwise silently repopulate the just-purged repo. A read-only
-    // adoption (`register_repo_read_only`) of the now-empty repo is harmless and stays allowed;
-    // `rag-rat init` clears the tombstone for a deliberate re-add.
-    if record_root && is_repo_removed(conn, trimmed_id)? {
+    // #767: refuse to (re-)register a repo tombstoned by `rag-rat rm`, on BOTH the indexing
+    // (`record_root`) AND the read-only adoption paths. A writer that queued behind the removal
+    // lock resumes with a stale in-memory config and would otherwise repopulate the just-purged
+    // repo — and a read-only open is NOT harmless when it is write-capable: a manual
+    // `papertrail sync` registers read-only, then commits `papertrail_*` rows. A
+    // genuinely-removed repo has no surviving config to reach here (rm deletes it); `rag-rat
+    // init` / `consolidate` clear the tombstone for a deliberate re-add.
+    if is_repo_removed(conn, trimmed_id)? {
         return Err(registry_refusal(format!(
             "repo {trimmed_id} was removed with `rag-rat rm` — run `rag-rat init` in the repo to \
-             re-add it before indexing"
+             re-add it"
         )));
     }
 

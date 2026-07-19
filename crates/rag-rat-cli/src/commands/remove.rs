@@ -24,18 +24,10 @@ pub(crate) fn rm(config: &Config, args: &RmArgs) -> anyhow::Result<()> {
     // Nothing to remove without an index — the friendly hint before any open.
     ensure_index_exists(config)?;
 
-    // Bring the store to the CURRENT schema before querying purge tables. `count_repo_rows` reads a
-    // hand-listed set of transitive tables (e.g. `clone_df_epoch`, V051), so a database written by
-    // an OLDER rag-rat that predates one of them would otherwise fail with `no such table`.
-    // Schema-only + additive; the purge then runs on the current schema. (The write commands `init`
-    // / `consolidate` migrate first for the same reason.)
-    let migration = rag_rat_core::index::IndexDatabase::migrate_schema_only(&config.database)?;
-    if migration.state != schema::SchemaState::Compatible {
-        anyhow::bail!("{}", migration.message);
-    }
-
     // Resolve the path to a registered repo + count what removal would delete, on a read
-    // connection.
+    // connection. NOTE: the store is NOT migrated yet — `count_repo_rows` tolerates a table an
+    // older schema lacks, so the preview / `--dry-run` reads an old DB without writing to it.
+    // The schema migration happens only on the destructive path below.
     let plan = {
         let storage = IndexConnection::open(&config.database)?;
         let conn = storage.connection();
@@ -67,6 +59,14 @@ pub(crate) fn rm(config: &Config, args: &RmArgs) -> anyhow::Result<()> {
             "status": "aborted",
             "repo_id": plan.repo.repo_id,
         }));
+    }
+
+    // Bring the store to the CURRENT schema before the destructive purge — an older DB may lack a
+    // transitive table `purge_repo_rows` deletes (e.g. `clone_df_epoch`, V051). AFTER the
+    // `--dry-run` / abort returns above, so a preview never writes. Schema-only + additive.
+    let migration = rag_rat_core::index::IndexDatabase::migrate_schema_only(&config.database)?;
+    if migration.state != schema::SchemaState::Compatible {
+        anyhow::bail!("{}", migration.message);
     }
 
     // The destructive step, all under the repo's write lock: purge in one transaction, deconfigure
@@ -278,16 +278,32 @@ fn clean_on_disk_footprint(roots: &[String], removed_repo_id: &str) -> CleanupRe
     result
 }
 
-/// Whether `dir` is a PRESENT git worktree whose content-derived identity is the repo being
-/// removed — the ownership gate for [`clean_on_disk_footprint`]. A gone / reused / foreign /
-/// non-git dir returns false and is left untouched (an under-deletion the removal tombstone
-/// backstops). `None` override: identity comes purely from the git content at `dir`, never a pinned
-/// id.
+/// Whether `dir` is a PRESENT checkout whose effective repo identity equals the repo being removed
+/// — the ownership gate for [`clean_on_disk_footprint`]. A gone / reused / foreign / non-git dir
+/// returns false and is left untouched (an under-deletion the removal tombstone backstops). The
+/// GOVERNING config's `[index] repo_id` pin is honored: the removed repo_id may be a pinned id, so
+/// a present checkout of the same repo resolves through its discovered config rather than the raw
+/// content-derived identity (which would differ). If config discovery/loading fails, we fall back
+/// to the content-derived identity.
 fn dir_belongs_to_removed_repo(dir: &Path, removed_repo_id: &str) -> bool {
-    dir.is_dir()
-        && rag_rat_base::repo_identity::resolve_repo_identity(dir, None)
-            .map(|identity| identity.repo_id == removed_repo_id)
-            .unwrap_or(false)
+    if !dir.is_dir() {
+        return false;
+    }
+
+    // Honor pinned repo IDs: discover the governing config for this dir and use its override, so a
+    // pinned repo's checkout still passes the ownership gate. A config load failure is not fatal —
+    // we fall back to the content-derived identity, which is correct for non-pinned repos and for
+    // a reused path whose config is gone.
+    let config_path = rag_rat_base::config::discover_config_path(dir);
+    let override_id = rag_rat_base::config::Config::load(&config_path)
+        .ok()
+        .and_then(|config| config.repo_id_override);
+    let identity = match override_id.as_deref() {
+        Some(override_id) =>
+            rag_rat_base::repo_identity::resolve_repo_identity(dir, Some(override_id)),
+        None => rag_rat_base::repo_identity::resolve_repo_identity(dir, None),
+    };
+    identity.map(|identity| identity.repo_id == removed_repo_id).unwrap_or(false)
 }
 
 /// `root` itself plus every git worktree linked to it (`git worktree list --porcelain`).
