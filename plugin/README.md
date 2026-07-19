@@ -101,6 +101,9 @@ Three options:
   The entry is the TS source itself (`main: rag-rat.ts`) — opencode's bun runtime loads TS
   directly, so no build step can drift; the type-only `@opencode-ai/plugin` import is erased at
   compile time.
+  The package registers the MCP server and the hooks; it does **not** carry the agent skills
+  (opencode has no plugin-bundled-skills mechanism — they live in `.opencode/skills/` /
+  `~/.config/opencode/skills/`). Add them with the shared installer: `npx @rag-rat/skills`.
 - **Whole bundle** (keeps the shared launcher): copy or symlink the repo's `plugin/` tree
   somewhere stable and symlink `plugin/opencode/rag-rat.ts` into `~/.config/opencode/plugins/`
   (global) or `.opencode/plugins/` (project). The shim finds `../scripts/launch.js` relative to

@@ -26,8 +26,8 @@ through the symbol lane.
 ## Install
 
 The grep-augmentation hook ships with the **rag-rat plugin** — installing the plugin registers it in
-one step (along with the MCP server, the agent skills, and the write-time clone-check and
-session-digest hooks):
+one step (along with the MCP server and the write-time clone-check and session-digest hooks; the
+Claude Code and Codex bundles also add the agent skills):
 
 ```bash
 # Claude Code

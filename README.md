@@ -54,7 +54,8 @@ sequenceDiagram
 ## Quickstart
 
 For Claude Code, Codex, and opencode, install the plugin. It registers the MCP server, adds the
-skills and hooks, and installs a version-matched `rag-rat` binary on first run:
+hooks, and installs a version-matched `rag-rat` binary on first run (the Claude Code and Codex
+bundles also add the skills; on opencode add them with `npx @rag-rat/skills`):
 
 ```bash
 # Claude Code
