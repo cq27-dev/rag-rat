@@ -140,6 +140,21 @@ pub struct ImportSummary {
 /// `Config::load` already made — so the refusal and the `database` resolution can never disagree (a
 /// linked worktree's branch-local toml is not authoritative for either).
 pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
+    run_inner(config, None)
+}
+
+/// CLI consolidation with the EXACT config path that produced `config`. Unlike [`run`] (the
+/// programmatic/test seam, whose callers may construct a Config without a file), this rechecks the
+/// file after acquiring the source-side repo locks so a concurrent `rag-rat rm` that deleted it
+/// wins cleanly rather than letting consolidation continue from stale in-memory configuration.
+pub fn run_with_config_path(
+    config: &Config,
+    config_path: &Path,
+) -> anyhow::Result<ConsolidateOutcome> {
+    run_inner(config, Some(config_path))
+}
+
+fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<ConsolidateOutcome> {
     let target = data_dir::global_database_path().context(
         "cannot resolve the global database path: no data directory is available (set \
          RAG_RAT_DATA_DIR, XDG_DATA_HOME, or HOME)",
@@ -231,6 +246,22 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
     let mut _source_locks = Vec::with_capacity(source_side_ids.len());
     for id in &source_side_ids {
         _source_locks.push(acquire_consolidate_lock(&source, id, "legacy")?);
+    }
+
+    // #767 review: `rm` holds this same source-side repo lock while deleting the governing config.
+    // If consolidate loaded Config first and then waited here, it would otherwise resume from that
+    // stale clone, clear/register in the global DB, and import the now-empty legacy source AFTER rm
+    // reported success. Recheck the exact path the CLI loaded only after all source locks are held;
+    // if rm won, abort before migrating/clearing/registering anything. The lock keeps it present
+    // for the rest of this run once observed.
+    if let Some(config_path) = config_path
+        && !config_path.is_file()
+    {
+        anyhow::bail!(
+            "the governing config ({}) was removed while consolidate waited for the repo write \
+             lock — a concurrent `rag-rat rm` won; aborting without re-registering the repo",
+            config_path.display()
+        );
     }
 
     // Bring the global DB to current schema (creating it under the shared schema lock), then open

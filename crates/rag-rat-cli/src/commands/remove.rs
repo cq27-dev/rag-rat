@@ -86,6 +86,7 @@ pub(crate) fn rm(config: &Config, args: &RmArgs) -> anyhow::Result<()> {
     let (outcome, cleanup) = remove::purge_and_vacuum(
         &config.database,
         &plan.repo.repo_id,
+        plan.repo.removal_generation,
         rag_rat_base::time::now_ms(),
         || clean_on_disk_footprint(&cleanup_dirs, &plan.repo.repo_id),
     )?;

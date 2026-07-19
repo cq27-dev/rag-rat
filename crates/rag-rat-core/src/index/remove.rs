@@ -35,6 +35,9 @@ pub struct ResolvedRepo {
     /// Every recorded working-tree root for the repo (a repo can be checked out in several
     /// worktrees), so the caller can report exactly what it is about to remove.
     pub roots: Vec<String>,
+    /// Monotonic count of completed removals for this id at planning time. Revalidated under the
+    /// write lock before purge so an intervening remove → init cycle invalidates a stale plan.
+    pub removal_generation: i64,
     /// The path the removal resolved through — canonicalized when it exists, else the path as
     /// given (a deleted / moved working tree resolved by its recorded root). Informational only
     /// (reported in `--dry-run`); the on-disk deconfigure targets `roots` (the recorded governing
@@ -178,7 +181,7 @@ fn load_resolved_repo(
     conn: &Connection,
     repo_id: String,
     resolved_root: PathBuf,
-) -> rusqlite::Result<ResolvedRepo> {
+) -> anyhow::Result<ResolvedRepo> {
     let display_name: Option<String> = conn
         .query_row("SELECT display_name FROM repos WHERE repo_id = ?1", [&repo_id], |row| {
             row.get::<_, String>(0)
@@ -189,7 +192,8 @@ fn load_resolved_repo(
     let roots = roots_stmt
         .query_map([&repo_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(ResolvedRepo { repo_id, display_name, roots, resolved_root })
+    let removal_generation = schema::repo_removal_generation(conn, &repo_id)?;
+    Ok(ResolvedRepo { repo_id, display_name, roots, removal_generation, resolved_root })
 }
 
 /// Build the read-only removal plan: the resolved repo + the per-table count of what the purge
@@ -220,6 +224,7 @@ pub fn plan_remove(conn: &Connection, repo: ResolvedRepo) -> anyhow::Result<Remo
 pub fn purge_and_vacuum<C>(
     database: &Path,
     repo_id: &str,
+    expected_removal_generation: i64,
     now_ms: i64,
     deconfigure: impl FnOnce() -> C,
 ) -> anyhow::Result<(RemoveOutcome, C)> {
@@ -257,6 +262,14 @@ pub fn purge_and_vacuum<C>(
     let (purged_rows, display_name) = {
         let storage = IndexConnection::open(database)?;
         let conn = storage.connection();
+        let current_removal_generation = schema::repo_removal_generation(conn, repo_id)?;
+        anyhow::ensure!(
+            current_removal_generation == expected_removal_generation,
+            "the removal plan for repo {repo_id} is stale: another `rag-rat rm` completed after \
+             planning (expected generation {expected_removal_generation}, current generation \
+             {current_removal_generation}). Re-run `rag-rat rm` to review the newly registered \
+             repo before deleting it"
+        );
         let display_name: Option<String> = conn
             .query_row("SELECT display_name FROM repos WHERE repo_id = ?1", [repo_id], |row| {
                 row.get::<_, String>(0)
@@ -768,15 +781,20 @@ mod tests {
         let db = IndexDatabase::rebuild(&config).unwrap();
         // Read the fixture repo id, then DROP the rebuilt db so it releases the repo's write lock
         // before `purge_and_vacuum` tries to acquire it.
-        let repo_a = {
+        let (repo_a, removal_generation) = {
             let storage = IndexConnection::open(&config.database).unwrap();
-            fixture_repo_id(storage.connection())
+            let repo_id = fixture_repo_id(storage.connection());
+            let generation =
+                schema::repo_removal_generation(storage.connection(), &repo_id).unwrap();
+            (repo_id, generation)
         };
         drop(db);
 
         let (outcome, cleanup) =
-            purge_and_vacuum(&config.database, &repo_a, 12_345, || "deconfigured".to_string())
-                .unwrap();
+            purge_and_vacuum(&config.database, &repo_a, removal_generation, 12_345, || {
+                "deconfigured".to_string()
+            })
+            .unwrap();
         assert!(outcome.purged_rows > 0, "the fixture repo had rows to purge");
         assert_eq!(cleanup, "deconfigured", "the deconfigure closure result must thread back");
 
@@ -796,6 +814,11 @@ mod tests {
             schema::is_repo_removed(conn, &repo_a).unwrap(),
             "the removed repo must be tombstoned"
         );
+        assert_eq!(
+            schema::repo_removal_generation(conn, &repo_a).unwrap(),
+            removal_generation + 1,
+            "a completed purge advances the durable removal generation"
+        );
         for table in repo_scoped_table_names(conn).unwrap() {
             let count: i64 = conn
                 .query_row(
@@ -806,6 +829,47 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "rows for the purged repo remain in `{table}`");
         }
+    }
+
+    #[test]
+    fn purge_refuses_a_plan_from_before_an_intervening_remove_and_readd() {
+        use std::cell::Cell;
+
+        let (root, config) = poison_test_config("rm_stale_plan");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let (repo_id, planned_generation) = {
+            let storage = IndexConnection::open(&config.database).unwrap();
+            let repo_id = fixture_repo_id(storage.connection());
+            let generation =
+                schema::repo_removal_generation(storage.connection(), &repo_id).unwrap();
+            (repo_id, generation)
+        };
+        drop(db);
+
+        purge_and_vacuum(&config.database, &repo_id, planned_generation, 10, || ()).unwrap();
+        {
+            let storage = IndexConnection::open(&config.database).unwrap();
+            let conn = storage.connection();
+            schema::clear_repo_removed(conn, &repo_id).unwrap();
+            let identity = rag_rat_base::repo_identity::resolve_repo_identity(&root, None).unwrap();
+            schema::register_repo(conn, &identity, &root, 11, &crate::index::migration_hooks())
+                .unwrap();
+        }
+
+        let deconfigured = Cell::new(false);
+        let err = purge_and_vacuum(&config.database, &repo_id, planned_generation, 12, || {
+            deconfigured.set(true);
+        })
+        .expect_err("a plan from before remove/re-add must be rejected");
+        assert!(err.to_string().contains("stale"), "unexpected refusal: {err}");
+        assert!(!deconfigured.get(), "stale removal must not deconfigure the re-added repo");
+        let storage = IndexConnection::open(&config.database).unwrap();
+        assert!(
+            schema::repo_id_is_registered(storage.connection(), &repo_id).unwrap(),
+            "the newly re-added repo must survive the stale removal attempt"
+        );
+        drop(storage);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The removal tombstone gates re-registration: once a repo is marked removed, the indexing

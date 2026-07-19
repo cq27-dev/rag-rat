@@ -2,13 +2,15 @@
 //! (memory-sync phase A7). The logic lives in `rag_rat_core::index::consolidate`; this is the thin
 //! CLI shim that renders the outcome (a pinned `database` key is refused inside `run` with the
 //! remove-the-key remedy, so every rendered import is a completed import + rename).
+use std::path::Path;
+
 use rag_rat_base::config::Config;
 use rag_rat_core::index::consolidate::{self, ConsolidateOutcome};
 
 use crate::render::print_output;
 
-pub(crate) fn consolidate(config: &Config) -> anyhow::Result<()> {
-    let outcome = consolidate::run(config)?;
+pub(crate) fn consolidate(config: &Config, config_path: &Path) -> anyhow::Result<()> {
+    let outcome = consolidate::run_with_config_path(config, config_path)?;
     match &outcome {
         ConsolidateOutcome::AlreadyGlobal { database } => print_output(&serde_json::json!({
             "status": "already_global",

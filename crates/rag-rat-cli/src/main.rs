@@ -155,7 +155,14 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "eval")]
         Cmd::DumpVerifyPacks(args) => dump_verify_packs(&config, &args)?,
         Cmd::Oracle(args) => oracle(&config, &args)?,
-        Cmd::Consolidate => consolidate(&config)?,
+        Cmd::Consolidate => {
+            let config_path = cli
+                .config
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| rag_rat_base::config::discover_config_path(Path::new(".")));
+            consolidate(&config, &config_path)?;
+        },
         Cmd::DumpConfig => dump_config(&config)?,
         Cmd::VersionCheck => version_check(&config)?,
     }
@@ -495,24 +502,20 @@ fn run_status(explicit: Option<&str>) -> anyhow::Result<()> {
 
 /// Run `rm`, tolerating the ABSENCE of a live config: `rm` targets the consolidated global store by
 /// the path argument, so a deleted/moved checkout that was the only configured one can still be
-/// purged. With a discovered config we use its `database` and any `repo_id` override; without one
-/// we fall back to the machine-global store. Only when this platform resolves no data dir at all do
-/// we fall back to the friendly "run `rag-rat init`" hint.
+/// purged. Config precedence is explicit `--config`, then the cwd's governing config, then the
+/// EXISTING target checkout's governing config (so `rm /repos/foo` from `/tmp` honors foo's custom
+/// `[index] database`), then the machine-global store. A gone target cannot safely discover upward
+/// — it may cross into an unrelated parent checkout — so it goes directly to the global fallback.
+/// Only when this platform resolves no data dir at all do we fall back to the friendly "run
+/// `rag-rat init`" hint.
 fn run_rm(args: &crate::cli::RmArgs, explicit: Option<&str>) -> anyhow::Result<()> {
     let config = match discover_config_optional(explicit)? {
         Some(config) => config,
-        None => {
-            let database = rag_rat_base::data_dir::global_database_path().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No rag-rat config found at `{}`, and this platform has no data directory for \
-                     a machine-global store.\nRun `rag-rat init` to create a config, or pass \
-                     --config <path>.",
-                    rag_rat_base::config::discover_config_path(Path::new(".")).display()
-                )
-            })?;
-            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            Config::minimal_for_database(database, root)
+        None if args.path.is_dir() => match discover_target_config_optional(&args.path)? {
+            Some(config) => config,
+            None => configless_rm_config()?,
         },
+        None => configless_rm_config()?,
     };
 
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
@@ -522,6 +525,27 @@ fn run_rm(args: &crate::cli::RmArgs, explicit: Option<&str>) -> anyhow::Result<(
     );
 
     rm(&config, args)
+}
+
+fn discover_target_config_optional(target: &Path) -> anyhow::Result<Option<Config>> {
+    let config_path = rag_rat_base::config::discover_config_path(target);
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(Config::load(config_path)?))
+}
+
+fn configless_rm_config() -> anyhow::Result<Config> {
+    let database = rag_rat_base::data_dir::global_database_path().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No rag-rat config found at `{}`, and this platform has no data directory for a \
+             machine-global store.\nRun `rag-rat init` to create a config, or pass --config \
+             <path>.",
+            rag_rat_base::config::discover_config_path(Path::new(".")).display()
+        )
+    })?;
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    Ok(Config::minimal_for_database(database, root))
 }
 
 /// Map the invoked subcommand to a debug-log [`Role`](rag_rat_base::logging::Role) (drives the log
@@ -585,7 +609,7 @@ pub(crate) struct GitPaths {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{load_config_or_hint, progress_percent};
+    use super::{discover_target_config_optional, load_config_or_hint, progress_percent};
 
     static TMP: AtomicU64 = AtomicU64::new(0);
 
@@ -605,5 +629,25 @@ mod tests {
         let err = load_config_or_hint(Some(missing.to_str().unwrap())).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("rag-rat init"), "expected init hint, got: {message}");
+    }
+
+    #[test]
+    fn rm_target_config_discovery_honors_its_custom_database() {
+        let n = TMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("rag-rat-rm-target-config-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\ndatabase = \"custom/index.sqlite\"\nrepo_id = \
+             \"target-config-test\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+
+        let config = discover_target_config_optional(&root)
+            .unwrap()
+            .expect("the existing target checkout's governing config should load");
+        assert_eq!(config.database, root.join("custom/index.sqlite"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

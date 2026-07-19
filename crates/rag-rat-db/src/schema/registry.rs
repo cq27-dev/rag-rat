@@ -189,6 +189,23 @@ fn removed_repo_key(repo_id: &str) -> String {
     format!("removed_repo:{repo_id}")
 }
 
+fn repo_removal_generation_key(repo_id: &str) -> String {
+    format!("removed_repo_generation:{repo_id}")
+}
+
+/// Monotonic count of completed `rag-rat rm` purges for `repo_id`. Unlike the active removal
+/// tombstone, this is NEVER cleared by `init`: a removal plan captures it before confirmation and
+/// rechecks it under the repo write lock, so an intervening remove → deliberate re-init cycle makes
+/// the stale plan fail closed instead of deleting the newly re-added repo. Missing means generation
+/// zero for stores created before #767.
+pub fn repo_removal_generation(conn: &Connection, repo_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1), 0)",
+        [repo_removal_generation_key(repo_id)],
+        |row| row.get(0),
+    )
+}
+
 /// Tombstone `repo_id` as removed-via-`rm` at `removed_at_ms`. Written INSIDE the purge transaction
 /// so it commits atomically with the deletion; [`register_repo`] then refuses to re-register the id
 /// until [`clear_repo_removed`] (via `rag-rat init`) lifts it — the durable guard against a writer
@@ -199,7 +216,13 @@ pub fn mark_repo_removed(
     repo_id: &str,
     removed_at_ms: i64,
 ) -> anyhow::Result<()> {
-    crate::meta::set_meta(conn, &removed_repo_key(repo_id), &removed_at_ms.to_string())
+    crate::meta::set_meta(conn, &removed_repo_key(repo_id), &removed_at_ms.to_string())?;
+    conn.execute(
+        "INSERT INTO index_meta(key, value) VALUES (?1, '1') ON CONFLICT(key) DO UPDATE SET value \
+         = CAST(CAST(index_meta.value AS INTEGER) + 1 AS TEXT)",
+        [repo_removal_generation_key(repo_id)],
+    )?;
+    Ok(())
 }
 
 /// Whether `repo_id` is tombstoned as removed-via-`rm`. A direct `index_meta` read (rusqlite-typed
