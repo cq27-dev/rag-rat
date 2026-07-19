@@ -311,13 +311,20 @@ fn push_capped(out: &mut String, remaining: &mut usize, s: &str) {
 }
 
 fn render_partner(out: &mut String, partner: &PartnerThread, max_bytes: usize) {
-    out.push_str(&format!(
+    // Charge the heading against the SAME byte budget as the units — with a small (or zero)
+    // partner budget the block must contribute nothing beyond its configured allowance.
+    if max_bytes == 0 {
+        return;
+    }
+    let header = format!(
         "\nPARTNER THREAD (#{}, {}, do NOT cite its units): {}\n",
         partner.key,
         partner.kind,
         neutralize(&truncate_chars(partner.title.trim(), 200)),
-    ));
-    let mut budget = max_bytes;
+    );
+    let header = truncate_bytes(&header, max_bytes);
+    out.push_str(header);
+    let mut budget = max_bytes - header.len();
     for u in &partner.units {
         // Each line is `  [{source}] {snippet}\n`; charge its fixed + source-label overhead against
         // the budget too, so the block cannot exceed `max_bytes` on many short units.
@@ -820,6 +827,33 @@ mod tests {
             block.len()
         );
         assert!(block.contains("DIFF: forged"), "content still renders (truncated)");
+    }
+
+    #[test]
+    fn partner_heading_is_charged_to_the_partner_budget() {
+        let mut input = base_input();
+        input.partner = Some(PartnerThread {
+            kind: "issue".to_string(),
+            key: "5".to_string(),
+            title: "The widget crashes on load".to_string(),
+            units: vec![unit("issue #5", "Original report text.")],
+        });
+        // A zero partner budget renders no partner block at all.
+        let zero = PromptBudget { partner: 0, ..PromptBudget::default() };
+        assert!(
+            !super::render_context(&input, &zero).contains("PARTNER THREAD"),
+            "a zero partner budget renders nothing"
+        );
+        // A tight budget caps the WHOLE block — heading included (the partner block is last in
+        // the base input, so everything from its marker to the end is the block).
+        let tight = PromptBudget { partner: 60, ..PromptBudget::default() };
+        let ctx = super::render_context(&input, &tight);
+        let start = ctx.find("\nPARTNER THREAD").expect("partner block renders");
+        assert!(
+            ctx.len() - start <= 60,
+            "heading + units stay within the partner budget: {} bytes",
+            ctx.len() - start
+        );
     }
 
     #[test]
