@@ -630,11 +630,12 @@ fn content_of(memory: &RepoMemory) -> NodeContent {
 /// an old binary, or pre-existing `/1` history left behind (#541, #664). Reuses the memory
 /// subsystem's own tag reader (the op encoder sorts + dedupes anyway).
 ///
-/// This trusts `content_projected_nodes` to mirror the `accepted` flag exactly. That holds
-/// pre-transport because no path flips an accepted set without reprojecting: the authoring seam
-/// reprojects, and the account refold (`refold_streams_for_account`) only re-derives an unchanged
-/// accepted set locally (StreamOwn precedes content; no local revoke). Phase-D transport must keep
-/// that projection fresh at the refold boundary or this anti-join re-authors/skips rows — #683.
+/// This trusts `content_projected_nodes` to mirror the `accepted` flag exactly. Every writer of
+/// `accepted` refreshes the projection in the same txn: the local authoring seam reprojects, the
+/// account refold (`refold_streams_for_account`) reprojects each stream it folds (guarded on the
+/// V070 tables existing — #683), and the deferred-refold settle reprojects before clearing its
+/// mark. A future acceptance writer must uphold the same coupling or this anti-join
+/// re-authors/skips rows.
 fn read_unauthored_memory_rows(
     conn: &Connection,
     repo_id: &str,

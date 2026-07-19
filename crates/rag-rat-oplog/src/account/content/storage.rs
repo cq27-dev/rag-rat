@@ -628,19 +628,22 @@ pub(in crate::account) fn refold_streams_for_account(
             streams.insert(fixed::<32>(&stream_bytes)?);
         }
     }
-    // This re-derives `accepted` but deliberately does NOT refresh the accepted-`/3` → memory
-    // projection (`content_projected_*`). That is safe ONLY while no path here can FLIP an accepted
-    // set: pre-transport the reconcile publishes a stream's `StreamOwn` before authoring its
-    // content (no retro-accept) and there is no local revoke/demote op (no retro-condemn), so
-    // this loop re-derives the identical accepted set the authoring path already reprojected.
-    // When transport (or any retro-accept/declassify op) lands, a flip here would leave
-    // `content_projected_*` stale and the memory reconcile's anti-join would mass-duplicate or
-    // skip rows — so phase-D must call `content_projection::reproject_accepted_content_stream`
-    // for each stream below, GUARDED on the V070 `content_projected_*` tables existing (this fn
-    // also runs in the pre-V070 V064/V065 authority backfill; mirror the
-    // `content_entries_exists` guard above). Tracked in #683.
+    // This re-derives `accepted`, and a retro-accept/declassify here (a late `StreamOwn`
+    // re-blessing parked content, a revocation retro-condemning accepted content) FLIPS the
+    // accepted set. The memory reconcile's anti-join trusts `content_projected_*` to mirror
+    // `accepted` exactly, so every refolded stream is reprojected in the SAME txn — a flip that
+    // skipped the reproject would leave the projection stale and the anti-join would
+    // mass-duplicate or skip rows (#683). The layer concedes the body-agnostic →
+    // `content_projection` dependency per #663. Guarded on the V070 `content_projected_*` tables
+    // existing: this fn also runs in the pre-V070 V064/V065 authority backfill (mirrors the
+    // `content_entries_exists` guard above).
+    let reproject = content_projected_tables_exist(tx)?;
     for stream in streams {
-        refold_content_stream(tx, StreamId::from_bytes(stream))?;
+        let stream_id = StreamId::from_bytes(stream);
+        refold_content_stream(tx, stream_id)?;
+        if reproject {
+            content_projection::reproject_accepted_content_stream(tx, stream_id)?;
+        }
     }
     Ok(())
 }
@@ -666,13 +669,13 @@ pub(super) fn refold_content_stream(
     tx: &Transaction<'_>,
     stream_id: StreamId,
 ) -> anyhow::Result<()> {
-    // NOTE: this seam does NOT clear the deferred-refold mark (#652). It re-derives `accepted` but
-    // does NOT refresh `content_projected_*`, and the account-fold path
-    // (`refold_streams_for_account`) reaches it WITHOUT a following reproject. Clearing the
-    // mark here would let an account fold that touches a still-pending foreign stream drop the
-    // mark while leaving the projection stale, so a later settle would skip it and the stale
-    // projection would persist. Only `settle_one_pending_refold` clears the mark — after it
-    // reprojects. The owner is inside the stream identity (`stream_id = sha256(cbor([.., owner,
+    // NOTE: this seam does NOT clear the deferred-refold mark (#652). It re-derives `accepted`
+    // but never reprojects itself; both callers pair it with a reproject
+    // (`refold_streams_for_account` reprojects per stream, guarded on the V070 tables;
+    // `settle_one_pending_refold` reprojects then clears the mark). The mark still belongs to
+    // settle alone: it means "this stream owes settle a refold+reproject", and only settle's own
+    // committed fold discharges that debt. The owner is inside the stream identity
+    // (`stream_id = sha256(cbor([.., owner,
     // ..]))`, §14) but not invertible, so it is resolved through the owner's `StreamOwn` fact.
     // No fact ⇒ authority cannot be evaluated: the entries revert to their structural state.
     // This is a DECLASSIFY, not a skip — if ownership was dropped by a later fold (owner
@@ -775,8 +778,9 @@ fn mark_stream_pending_refold(tx: &Transaction<'_>, stream_id: StreamId) -> rusq
 
 /// Drop a stream's deferred-refold mark. The sole caller is [`settle_one_pending_refold`], which
 /// clears the mark ONLY after it has both refolded AND reprojected the stream — so the mark always
-/// means "this stream still owes a refold+reproject". An account-fold refold updates `accepted`
-/// without reprojecting and must therefore leave the mark standing for settle to finish.
+/// means "this stream still owes settle a refold+reproject". An account-fold refold also
+/// reprojects now (#683), but the mark's debt is settle's own fold, so the mark stands until
+/// settle discharges it.
 fn clear_pending_content_refold(tx: &Transaction<'_>, stream_id: StreamId) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM content_streams_pending_refold WHERE stream_id = ?1", [stream_id
         .to_bytes()
@@ -819,16 +823,16 @@ fn settle_one_pending_refold(conn: &Connection, stream_id: StreamId) -> anyhow::
     // stale-projection hole here: an accepted-set flip that skipped the reproject would leave
     // `content_projected_*` stale, and the memory reconcile's anti-join would then mass-duplicate
     // the dropped rows into the immutable `/3` log (#683). Guarded on the V070 tables existing,
-    // mirroring the account-fold path's table-existence guard. (The account-fold path's OWN
-    // reproject is the incidental refold #683 still defers — this seam does not fix that
-    // sibling path.)
+    // mirroring the account-fold path's table-existence guard (the account-fold path reprojects
+    // under the same guard — #683).
     if content_projected_tables_exist(&tx)? {
         content_projection::reproject_accepted_content_stream(&tx, stream_id)?;
     }
     // Clear the mark ONLY here — after the refold AND the reproject — so the queue entry means
-    // "this stream still owes a refold+reproject". An account-fold refold that ran meanwhile
-    // updated `accepted` but not the projection, so the mark must survive it and be cleared here.
-    // On any error above, the txn rolls back and the mark is preserved for retry.
+    // "this stream still owes settle a refold+reproject". An account-fold refold that ran meanwhile
+    // also refolded and reprojected (#683), but discharging the mark is settle's job alone, so the
+    // mark survives it. On any error above, the txn rolls back and the mark is preserved for
+    // retry.
     clear_pending_content_refold(&tx, stream_id)?;
     tx.commit()?;
     Ok(())
@@ -2219,6 +2223,60 @@ mod tests {
         envelope::sign_content_entry(secret, &header, &[spec.body]).unwrap()
     }
 
+    /// Sign a content entry carrying a real memory-op body, so the accepted-`/3` projection has
+    /// something to fold — the `authored` helper's single-byte body never decodes to an op.
+    fn authored_op(
+        secret: &DeviceSecret,
+        author: AccountId,
+        roster_ref: EntryHash,
+        spec: ContentSpec,
+        memory_op: &crate::op::MemoryOp,
+    ) -> SignedContentEntry {
+        let header = ContentEntryHeader {
+            stream_id: StreamId::from_bytes(STREAM),
+            author_account_id: author,
+            device_fingerprint: secret.public().fingerprint(),
+            seq: spec.seq,
+            lamport: spec.seq.saturating_add(1),
+            prev_hash: spec.previous,
+            grant_id: spec.grant_id,
+            roster_ref,
+            owner_auth_len: spec.auth_len,
+            author_auth_len: spec.auth_len,
+            crypto_suite: 0,
+            key_id: None,
+        };
+        envelope::sign_content_entry(secret, &header, &crate::op::encode(memory_op)).unwrap()
+    }
+
+    fn node_create(id: &str) -> crate::op::MemoryOp {
+        crate::op::MemoryOp::NodeCreate {
+            node_id: crate::op::NodeId::from(id),
+            content: crate::op::NodeContent {
+                kind: "Invariant".to_string(),
+                title: id.to_string(),
+                body: "body".to_string(),
+                confidence: "high".to_string(),
+                source: "agent".to_string(),
+                tags: Vec::new(),
+                payload: None,
+            },
+        }
+    }
+
+    /// The node ids the accepted-`/3` projection holds for [`STREAM`], sorted.
+    fn projected_node_ids(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT node_id FROM content_projected_nodes WHERE stream_id = ?1 ORDER BY node_id",
+            )
+            .unwrap();
+        stmt.query_map([STREAM.as_slice()], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
     fn seed_ownership(conn: &Connection, owner: AccountId) {
         conn.execute(
             "INSERT INTO account_stream_ownership(stream_id, account_id, own_id, effective_at)
@@ -2837,6 +2895,93 @@ mod tests {
     }
 
     #[test]
+    fn the_account_trigger_skips_the_reproject_before_the_projected_tables_exist() {
+        // The V064/V065 authority backfill can also fold accounts AFTER the `/3` candidate tables
+        // exist but BEFORE V070 creates `content_projected_*`: a content refold runs (so
+        // `content_entries_exists` passes) but the reproject targets absent tables. Simulate that
+        // window by dropping the V070 tables; the trigger must still refold cleanly.
+        let conn = db();
+        conn.execute_batch(
+            "DROP TABLE content_projected_nodes; DROP TABLE content_projected_edges;",
+        )
+        .unwrap();
+        let secret = DeviceSecret::from_seed(&[0xe3; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
+        run_account_trigger(&conn, owner);
+        assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
+    }
+
+    #[test]
+    fn an_account_fold_that_retro_condemns_content_drops_it_from_the_projection() {
+        // #683: the account→content trigger re-derives `accepted` — and a revocation can FLIP it.
+        // The reconcile's anti-join trusts `content_projected_*` to mirror `accepted`, so the
+        // trigger must reproject every stream it refolds.
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0xe4; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // A dense chain seq 0 → 1 carrying real ops; both accept and project on settle.
+        let s0 =
+            authored_op(&secret, owner, genesis, ContentSpec::default(), &node_create("mem_a"));
+        content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
+        let s1 = authored_op(
+            &secret,
+            owner,
+            genesis,
+            ContentSpec { seq: 1, previous: Some(s0.entry_hash), ..ContentSpec::default() },
+            &node_create("mem_b"),
+        );
+        content_ingest(&conn, &s1.signed_bytes, 2).unwrap();
+        settle_pending_content_refolds(&conn).unwrap();
+        assert_eq!(verdict(&conn, &s1.entry_hash), ("accepted".into(), 1));
+        assert_eq!(projected_node_ids(&conn), vec!["mem_a".to_string(), "mem_b".to_string()]);
+
+        // A revocation bounds the coordinate at seq 0: the account fold retro-condemns seq 1, and
+        // the same txn must drop its node from the projection — a stale row here would make the
+        // reconcile's anti-join treat mem_b as still authored.
+        seed_roster_content_cut(&conn, genesis, owner, 0, s0.entry_hash);
+        run_account_trigger(&conn, owner);
+        assert_eq!(verdict(&conn, &s1.entry_hash), ("condemned{beyond_cut}".into(), 0));
+        assert_eq!(
+            projected_node_ids(&conn),
+            vec!["mem_a".to_string()],
+            "the retro-condemned entry's node leaves the projection in the refold txn",
+        );
+    }
+
+    #[test]
+    fn an_account_fold_that_accepts_parked_content_projects_it() {
+        // #683, the other direction: content arrives BEFORE its owner fact, so it cannot accept
+        // yet; when the authority facts fold, the trigger flips it to accepted — and the node
+        // must APPEAR in the projection in the same txn, or the reconcile would re-author it.
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0xe5; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+
+        let entry =
+            authored_op(&secret, owner, genesis, ContentSpec::default(), &node_create("mem_a"));
+        assert_eq!(verdict_after_ingest(&conn, &entry), ("retained_unfolded".into(), 0));
+        assert_eq!(projected_node_ids(&conn), Vec::<String>::new());
+
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        run_account_trigger(&conn, owner);
+        assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
+        assert_eq!(
+            projected_node_ids(&conn),
+            vec!["mem_a".to_string()],
+            "the newly-accepted entry's node enters the projection in the refold txn",
+        );
+    }
+
+    #[test]
     fn a_reader_grants_revoke_cut_cannot_steer_writer_content_branch_selection() {
         let conn = db();
         let owner_secret = DeviceSecret::from_seed(&[0xf3; 32]);
@@ -3145,16 +3290,15 @@ mod tests {
         );
 
         // The account-fold path refolds the stream (an authority change triggers it): it updates
-        // `accepted` but does NOT refresh `content_projected_*`. So it must NOT clear the dirty
-        // mark — clearing it here (a prior bug) would let settle skip the stream and leave its
-        // projection permanently stale. The mark survives the account fold; settle still owes the
-        // reproject.
+        // `accepted` AND reprojects (#683), but the dirty mark is settle's debt to discharge, so
+        // the account fold must NOT clear it — the mark means "settle owes this stream its own
+        // refold+reproject", and only settle's committed fold clears it.
         run_account_trigger(&conn, owner);
         assert_eq!(verdict(&conn, &s0.entry_hash), ("accepted".into(), 1), "it folds the stream");
         assert_eq!(
             pending_refold_count(&conn),
             1,
-            "the account fold did NOT reproject, so it must NOT clear the mark",
+            "the mark survives the account fold — only settle clears it",
         );
 
         // Settle refolds AND reprojects, then clears the mark — the only path that may.
