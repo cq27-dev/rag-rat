@@ -823,7 +823,7 @@ fn clear_pending_content_refold(tx: &Transaction<'_>, stream_id: StreamId) -> ru
     Ok(())
 }
 
-/// One queued stream's current settle cost. The cost comes from the V079 `content_stream_stats`
+/// One queued stream's current settle cost. The cost comes from the V080 `content_stream_stats`
 /// aggregate (counts and `length(signed_bytes) + 32` per row, trigger-maintained) — never a
 /// `COUNT(*)`/`SUM` over the stream's candidate rows, which would make admission itself
 /// attacker-triggered O(stream).
@@ -989,7 +989,7 @@ fn settle_one_pending_refold(
 /// REMAINING budget on every axis, so one call's cost stays bounded and the queue resumes where
 /// the budget ran out.
 ///
-/// Counts and bytes are the V079 `content_stream_stats` fold-cost units: a candidate row and
+/// Counts and bytes are the V080 `content_stream_stats` fold-cost units: a candidate row and
 /// `length(signed_bytes) + 32` bytes per row (the payload a full refold's `load_stream_headers`
 /// copies out of SQLite).
 ///
