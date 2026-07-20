@@ -267,7 +267,14 @@ async function provision(ctx: ProvisionContext<ModalHandle>): Promise<Provisione
     const pendingCreate = createRef.promise;
     if (pendingCreate !== undefined) {
       void pendingCreate.then(
-        (lateSandbox: Sandbox) => terminateOrphanSandbox(modal, lateSandbox, sandboxName, "late create"),
+        (lateSandbox: Sandbox) =>
+          terminateOrphanSandbox(
+            modal,
+            lateSandbox,
+            sandboxName,
+            "late create",
+            Date.now() + TEARDOWN_TIMEOUT_MS,
+          ),
         (lateCause: unknown) => {
           log(
             "info",
@@ -457,22 +464,23 @@ async function sweepOrphanByName(
   sandboxName: string,
   expectedOwnerId: string,
 ): Promise<void> {
+  const deadline = Date.now() + TEARDOWN_TIMEOUT_MS;
   try {
     const orphan = await raceWithTimeout(
       () => modal.sandboxes.fromName(APP_NAME, sandboxName),
-      TEARDOWN_TIMEOUT_MS,
+      remainingBudgetMs(deadline),
       "sandboxes.fromName(orphan sweep)",
     );
     const tags = await raceWithTimeout(
       () => orphan.getTags(),
-      TEARDOWN_TIMEOUT_MS,
+      remainingBudgetMs(deadline),
       "orphan.getTags",
     );
     if (tags[OWNER_TAG] !== expectedOwnerId) {
       log("info", `orphan sweep: sandbox "${sandboxName}" belongs to another invocation; leaving it running`);
       return;
     }
-    await terminateOrphanSandbox(modal, orphan, sandboxName, "orphan sweep");
+    await terminateOrphanSandbox(modal, orphan, sandboxName, "orphan sweep", deadline);
   } catch (cause) {
     // fromName raises NotFoundError when no sandbox with that name exists — the common case (create
     // never made one). Distinguish it from a real failure so the log isn't alarming.
@@ -490,9 +498,10 @@ async function terminateOrphanSandbox(
   orphan: Sandbox,
   sandboxName: string,
   source: string,
+  deadline: number,
 ): Promise<void> {
   try {
-    await terminateAndWait(modal, orphan, `${source}.terminate`);
+    await terminateAndWait(modal, orphan, `${source}.terminate`, deadline);
     log("warn", `${source}: terminated leaked sandbox "${sandboxName}" (${orphan.sandboxId})`);
   } catch (cause) {
     log("error", `${source}: could not terminate leaked sandbox "${sandboxName}": ${errorMessage(cause)}`);
@@ -506,10 +515,17 @@ async function terminateAndWait(
   deadline = Date.now() + TEARDOWN_TIMEOUT_MS,
 ): Promise<void> {
   const sandboxId = sandbox.sandboxId;
-  await withBudget(deadline, label, () => sandbox.terminate());
-  const attached = await withBudget(deadline, `${label}.reattach`, () => modal.sandboxes.fromId(sandboxId));
-  while ((await withBudget(deadline, `${label}.poll`, () => attached.poll())) === null) {
-    await new Promise((resolve) => setTimeout(resolve, Math.min(250, assertBudgetRemaining(deadline, label))));
+  await withBudget(deadline, label, () => sandbox.terminate(), 1);
+  const attached = await withBudget(
+    deadline,
+    `${label}.reattach`,
+    () => modal.sandboxes.fromId(sandboxId),
+    1,
+  );
+  while ((await withBudget(deadline, `${label}.poll`, () => attached.poll(), 1)) === null) {
+    const remainingMs = remainingBudgetMs(deadline);
+    if (remainingMs <= 0) throw new Error(`"${label}" exceeded its teardown budget while polling`);
+    await new Promise((resolve) => setTimeout(resolve, Math.min(250, remainingMs)));
   }
 }
 
