@@ -5,8 +5,8 @@
 //! key, seals it to every roster-EFFECTIVE device, and authors a `StreamKeyWrap` onto the account's
 //! secrets chain inside the caller's IMMEDIATE transaction — verify-accepted-or-rollback, mirroring
 //! [`super::super::content::author_content_batch_in_tx`]. It authors wraps that fold `accepted`;
-//! nothing consumes the key for content SEALING yet (that is C5), and the `key_id` adoption
-//! cross-check + the derived sealing-key projection + `sync enable` are C4.3b.
+//! the ephemeral key is later recovered for content sealing through C4.3b's `key_id` adoption
+//! cross-check and derived sealing-key projection.
 //!
 //! C4.4 (#607) adds LAZY rotation on device removal: [`rotate_stream_key_in_tx`] mints a fresh key
 //! at a HIGHER epoch re-sealed only to the remaining effective devices — rotation is exactly a mint
@@ -15,7 +15,10 @@
 //! trigger the seal path calls: it rotates only when a removed device still holds the current key,
 //! and returns a typed [`RotationOutcome`] (never an error) so a MEMBER device — which cannot
 //! author a rotation but may legitimately seal — does not roll its seal txn back. Nothing calls the
-//! C4.4 entry points yet (machinery one slice ahead of its consumer).
+//! C4.4 entry points are consumed by sealed content authoring. New-device read catch-up is a
+//! separate same-key fan-out: [`catch_up_stream_keys_for_device_in_tx`] authors one-recipient
+//! siblings for [`super::sealing::live_stream_key_targets_for_device`]'s exact live targets
+//! without minting, rotating, or advancing epochs.
 //!
 //! Three load-bearing invariants the fold alone does NOT enforce:
 //!
@@ -46,6 +49,7 @@ use super::super::{AccountId, authoring};
 use super::ops::{self, StreamKeyWrap, WrapEntry};
 use crate::identity::LocalDevice;
 use crate::local_device;
+use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
 
 type EntryHash = [u8; 32];
@@ -87,9 +91,19 @@ pub enum RotationOutcome {
     Current,
     /// Rotation IS needed but this device holds no live owner incarnation, so it cannot author one.
     /// A member device still seals under the CURRENT key — roster membership is READ access, not
-    /// authoring authority — so the caller must proceed with the seal, NOT fail it. (An additive
-    /// `CatchUp` arm belongs here when new-device catch-up ships.)
+    /// authoring authority — so the caller must proceed with the seal, NOT fail it. New-device
+    /// catch-up is a separate owner-authored same-key fan-out, not a rotation outcome.
     StaleButNotOwner,
+}
+
+/// The exact live key groups handled by one catch-up pass. `authored` contains groups for which
+/// this call wrote a same-key sibling; `already_covered` were no-ops because an accepted sibling
+/// already named the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchUpReport {
+    pub target: DeviceFingerprint,
+    pub authored: Vec<super::sealing::LiveKeyEpoch>,
+    pub already_covered: Vec<super::sealing::LiveKeyEpoch>,
 }
 
 /// Rotate `stream_id`'s content key: mint a FRESH key at `current_max_accepted_epoch + 1` and
@@ -177,6 +191,69 @@ pub fn ensure_stream_key_current_in_tx(
     Ok(RotationOutcome::Rotated(rotate_stream_key_in_tx(tx, stream_id, now_ms)?))
 }
 
+/// Re-wrap every live content key not already available to `target`, inside the caller's IMMEDIATE
+/// transaction. This is same-key fan-out only: it never mints a key, advances an epoch, or invokes
+/// rotation, and acceptance depends only on owner authority rather than local key possession.
+///
+/// All target/authority reads, exact historical recovery, sealing, inserts, refold, and acceptance
+/// verification use this transaction snapshot. Every required key is recovered and sealed before
+/// the first insert, so an unavailable or corrupt key cannot produce a partial fan-out.
+pub fn catch_up_stream_keys_for_device_in_tx(
+    tx: &Transaction<'_>,
+    target: DeviceFingerprint,
+    now_ms: i64,
+) -> anyhow::Result<CatchUpReport> {
+    let LocalAccountRef { account_id, .. } = bootstrap::local_account_ref(tx)?
+        .context("cannot catch up stream keys before the store's local account is minted")?;
+    let device = local_device(tx, now_ms)?;
+    storage::effective_owner_incarnation_for_device(tx, account_id, device.fingerprint())?
+        .context(
+            "the local device holds no live owner incarnation; cannot author catch-up \
+             StreamKeyWraps",
+        )?;
+    let target_public = storage::effective_roster_x25519_pubkey(tx, account_id, target)?.context(
+        "stream-key catch-up target is not currently roster-effective in the local account",
+    )?;
+    let targets = super::sealing::live_stream_key_targets_for_device(tx, target)?;
+
+    let mut authored_wraps = Vec::with_capacity(targets.required.len());
+    for live in &targets.required {
+        let key =
+            super::sealing::recover_exact_historical_content_key(tx, account_id, *live, &device)?
+                .with_context(|| {
+                format!(
+                    "cannot recover required live content key for stream {:?} epoch {}",
+                    live.stream_id.to_bytes(),
+                    live.key_epoch,
+                )
+            })?;
+        anyhow::ensure!(
+            key.key_id() == live.key_id,
+            "recovered catch-up key does not match its exact signed key_id",
+        );
+        let ctx = WrapContext {
+            account_id: account_id.to_bytes(),
+            stream_id: live.stream_id.to_bytes(),
+            key_epoch: live.key_epoch,
+            recipient_pub: target_public.to_bytes(),
+        };
+        let sealed = keywrap::seal_content_key(&key, &ctx, &target_public)?;
+        authored_wraps.push(StreamKeyWrap {
+            stream_id: live.stream_id,
+            key_id: live.key_id.to_bytes(),
+            key_epoch: live.key_epoch,
+            wraps: vec![WrapEntry { recipient_fp: target, sealed }],
+        });
+    }
+
+    author_stream_key_wrap_batch_in_tx(tx, &authored_wraps, now_ms)?;
+    Ok(CatchUpReport {
+        target,
+        authored: targets.required,
+        already_covered: targets.already_covered,
+    })
+}
+
 /// The mint core with the content key and epoch injected, so a test can pin the key
 /// (confidentiality checks) and drive a NONZERO epoch (the `WrapContext.key_epoch == op.key_epoch`
 /// invariant is invisible at epoch 0). The caller owns the key's lifetime; it drops (and zeroizes)
@@ -188,12 +265,11 @@ fn author_stream_key_wrap_in_tx(
     key_epoch: u64,
     now_ms: i64,
 ) -> anyhow::Result<EntryHash> {
-    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
+    let LocalAccountRef { account_id, .. } = bootstrap::local_account_ref(tx)?.context(
         "cannot author a StreamKeyWrap before the store's local account is minted (call \
          local_account first)",
     )?;
     let device = local_device(tx, now_ms)?;
-    let fingerprint = device.fingerprint();
 
     // Recipients = the roster-EFFECTIVE devices (SHOULD-FIX-1). Sealing a fresh key to a REMOVED
     // device would re-grant it read access and defeat rotation-on-removal, so
@@ -221,11 +297,32 @@ fn author_stream_key_wrap_in_tx(
 
     let wrap = StreamKeyWrap { stream_id, key_id: key.key_id().to_bytes(), key_epoch, wraps };
 
+    Ok(author_stream_key_wrap_batch_in_tx(tx, &[wrap], now_ms)?[0])
+}
+
+/// Sign, store, refold, and verify one batch of already-sealed wraps. The secrets chain is shared
+/// across streams, so the tail is read once and advanced in memory; one refold classifies the whole
+/// batch.
+fn author_stream_key_wrap_batch_in_tx(
+    tx: &Transaction<'_>,
+    wraps: &[StreamKeyWrap],
+    now_ms: i64,
+) -> anyhow::Result<Vec<EntryHash>> {
+    if wraps.is_empty() {
+        return Ok(Vec::new());
+    }
+    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
+        "cannot author a StreamKeyWrap before the store's local account is minted (call \
+         local_account first)",
+    )?;
+    let device = local_device(tx, now_ms)?;
+    let fingerprint = device.fingerprint();
+
     // Dense seq from the shared `(account, device)` secrets tail across ALL streams (BLOCKER-1).
     // The secrets log has no genesis, so an empty chain is the legitimate first-wrap case (seq
     // 0, no predecessor) — unlike the control chain, where an empty tail is a programming
     // error.
-    let (seq, prev_hash) =
+    let (mut seq, mut prev_hash) =
         match authoring::account_chain_tail(tx, account_id, fingerprint, SECRETS_LOG)? {
             Some((tail_seq, tail_hash)) => (
                 tail_seq
@@ -247,43 +344,45 @@ fn author_stream_key_wrap_in_tx(
              (owner-only authority)",
         )?;
 
-    let header = AccountEntryHeader {
-        account_id,
-        log_id: SECRETS_LOG,
-        device_fingerprint: fingerprint,
-        seq,
-        prev_hash,
-        // `parent_ref = genesis_hash` is authoring convention only (the secrets evaluator does not
-        // gate on it); it mirrors the control convention.
-        parent_ref: Some(genesis_hash),
-        entry_type: ops::entry_type_of(&wrap),
-        op_version: SUPPORTED_OP_VERSION,
-        crypto_suite: 0,
-        // A secrets header's `auth_len` asserts the author's CONTROL-fold effective count (there is
-        // no "secrets fold length"); cited as-of now so our own entry never parks `auth_len_ahead`
-        // against our own fold. Read in THIS snapshot.
-        auth_len: storage::account_effective_count(tx, account_id)?,
-        // The header `key_id` selects a `/3` content key; a secrets op carries its own key_id
-        // inside the payload, so the header field is null.
-        key_id: None,
-        // The local device's LIVE owner incarnation, resolved above from the current fold (the
-        // founder's is its genesis, but any current owner works — not pinned to the founder).
-        authority_ref: Some(authority_ref),
-    };
-    let payload = ops::encode(&wrap)
-        .map_err(|err| anyhow::anyhow!("encoding the StreamKeyWrap op failed: {err}"))?;
-    let signed = sign_account_entry(device.secret(), &header, &payload)?;
-    let verified = VerifiedAccountEntry {
-        header: signed.header,
-        payload: signed.payload,
-        entry_hash: signed.entry_hash,
-    };
-    match storage::insert_candidate(tx, &verified, &signed.signed_bytes, now_ms)? {
-        CandidateInsert::Inserted | CandidateInsert::AlreadyPresent => {},
-        CandidateInsert::AtCapacity(scope) => anyhow::bail!(
-            "the account candidate store is at capacity ({scope:?}); cannot author the \
-             StreamKeyWrap",
-        ),
+    let auth_len = storage::account_effective_count(tx, account_id)?;
+    let mut authored = Vec::with_capacity(wraps.len());
+    for (index, wrap) in wraps.iter().enumerate() {
+        let header = AccountEntryHeader {
+            account_id,
+            log_id: SECRETS_LOG,
+            device_fingerprint: fingerprint,
+            seq,
+            prev_hash,
+            parent_ref: Some(genesis_hash),
+            entry_type: ops::entry_type_of(wrap),
+            op_version: SUPPORTED_OP_VERSION,
+            crypto_suite: 0,
+            auth_len,
+            key_id: None,
+            authority_ref: Some(authority_ref),
+        };
+        let payload = ops::encode(wrap)
+            .map_err(|err| anyhow::anyhow!("encoding the StreamKeyWrap op failed: {err}"))?;
+        let signed = sign_account_entry(device.secret(), &header, &payload)?;
+        let verified = VerifiedAccountEntry {
+            header: signed.header,
+            payload: signed.payload,
+            entry_hash: signed.entry_hash,
+        };
+        match storage::insert_candidate(tx, &verified, &signed.signed_bytes, now_ms)? {
+            CandidateInsert::Inserted | CandidateInsert::AlreadyPresent => {},
+            CandidateInsert::AtCapacity(scope) => anyhow::bail!(
+                "the account candidate store is at capacity ({scope:?}); cannot author the \
+                 StreamKeyWrap",
+            ),
+        }
+        authored.push(verified.entry_hash);
+        prev_hash = Some(verified.entry_hash);
+        if index + 1 < wraps.len() {
+            seq = seq
+                .checked_add(1)
+                .context("secrets chain tail is at u64::MAX seq; cannot extend batch")?;
+        }
     }
 
     // ONE account-scoped refold (its secrets pass classifies the wrap), then verify-accepted. NEVER
@@ -293,13 +392,15 @@ fn author_stream_key_wrap_in_tx(
     // `StreamOwn`, a stale `auth_len`, a contested account) and the whole caller mutation must
     // roll back.
     let statuses = storage::refold_in_tx(tx, account_id)?;
-    match statuses.get(&verified.entry_hash).map(String::as_str) {
-        Some("accepted") => {},
-        other => anyhow::bail!(
-            "authored StreamKeyWrap did not fold accepted (status {other:?}); rolling back",
-        ),
+    for entry_hash in &authored {
+        match statuses.get(entry_hash).map(String::as_str) {
+            Some("accepted") => {},
+            other => anyhow::bail!(
+                "authored StreamKeyWrap did not fold accepted (status {other:?}); rolling back",
+            ),
+        }
     }
-    Ok(verified.entry_hash)
+    Ok(authored)
 }
 
 /// Prove the minting device recovers the key from its OWN wrap in the fan-out, under the exact
@@ -344,6 +445,9 @@ mod tests {
     use rusqlite::{Connection, TransactionBehavior};
 
     use super::*;
+    use crate::account::content::{
+        ContentEntryHeader, open_sealed_payload, sign_sealed_content_entry,
+    };
     use crate::account::cut::Cut;
     use crate::account::fold::CONTROL_LOG;
     use crate::account::keywrap::unwrap_content_key;
@@ -353,6 +457,7 @@ mod tests {
     };
     use crate::account::{select_current_sealing_wrap, stream_key_rotation_needed};
     use crate::device::DeviceX25519Secret;
+    use crate::op::{self, MemoryOp};
 
     const NOW: i64 = 1_700_000_000_000;
 
@@ -418,6 +523,126 @@ mod tests {
             )
             .unwrap();
         crate::account::envelope::decode_account_signed(&signed_bytes).unwrap().header
+    }
+
+    fn insert_accepted_sealed_content(
+        conn: &Connection,
+        account: AccountId,
+        stream: StreamId,
+        key: &ContentKey,
+    ) -> crate::account::content::SignedContentEntry {
+        let device = local_device(conn, NOW).unwrap();
+        let genesis_hash = bootstrap::local_account_ref(conn).unwrap().unwrap().genesis_hash;
+        let header = ContentEntryHeader {
+            stream_id: stream,
+            author_account_id: account,
+            device_fingerprint: device.fingerprint(),
+            seq: 0,
+            lamport: 0,
+            prev_hash: None,
+            grant_id: None,
+            roster_ref: genesis_hash,
+            owner_auth_len: 0,
+            author_auth_len: 0,
+            crypto_suite: 0,
+            key_id: None,
+        };
+        let signed = sign_sealed_content_entry(
+            device.secret(),
+            &header,
+            &op::encode(&MemoryOp::Snapshot),
+            key,
+            [0x55; 24],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_entries(
+                 entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?7, 1, ?8, ?9)",
+            rusqlite::params![
+                signed.entry_hash.as_slice(),
+                stream.to_bytes().as_slice(),
+                account.to_bytes().as_slice(),
+                device.fingerprint().to_bytes().as_slice(),
+                0u64.to_be_bytes().as_slice(),
+                genesis_hash.as_slice(),
+                0u64.to_be_bytes().as_slice(),
+                signed.signed_bytes,
+                NOW,
+            ],
+        )
+        .unwrap();
+        signed
+    }
+
+    fn accepted_wraps_for_target(
+        conn: &Connection,
+        target: DeviceFingerprint,
+    ) -> Vec<StreamKeyWrap> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT signed_bytes FROM account_entries
+                 WHERE log_id = ?1 AND accepted = 1 ORDER BY seq",
+            )
+            .unwrap();
+        stmt.query_map([SECRETS_LOG], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .filter_map(|row| {
+                let signed = crate::account::envelope::decode_account_signed(&row.unwrap()).ok()?;
+                let DecodedSecretsOp::Known(wrap) =
+                    decode(secrets_entry_type::STREAM_KEY_WRAP, &signed.payload).ok()?
+                else {
+                    return None;
+                };
+                wrap.wraps.iter().any(|entry| entry.recipient_fp == target).then_some(wrap)
+            })
+            .collect()
+    }
+
+    fn author_remote_stream_key_wrap(
+        conn: &Connection,
+        account: AccountId,
+        signer: &crate::device::DeviceSecret,
+        authority_ref: EntryHash,
+        wrap: &StreamKeyWrap,
+    ) -> EntryHash {
+        let LocalAccountRef { genesis_hash, .. } =
+            bootstrap::local_account_ref(conn).unwrap().unwrap();
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let signer_fp = signer.public().fingerprint();
+        let (seq, prev_hash) =
+            match authoring::account_chain_tail(&tx, account, signer_fp, SECRETS_LOG).unwrap() {
+                Some((tail_seq, tail_hash)) => (tail_seq + 1, Some(tail_hash)),
+                None => (0, None),
+            };
+        let header = AccountEntryHeader {
+            account_id: account,
+            log_id: SECRETS_LOG,
+            device_fingerprint: signer_fp,
+            seq,
+            prev_hash,
+            parent_ref: Some(genesis_hash),
+            entry_type: ops::entry_type_of(wrap),
+            op_version: SUPPORTED_OP_VERSION,
+            crypto_suite: 0,
+            auth_len: storage::account_effective_count(&tx, account).unwrap(),
+            key_id: None,
+            authority_ref: Some(authority_ref),
+        };
+        let payload = ops::encode(wrap).unwrap();
+        let signed = sign_account_entry(signer, &header, &payload).unwrap();
+        let verified = VerifiedAccountEntry {
+            header: signed.header,
+            payload: signed.payload,
+            entry_hash: signed.entry_hash,
+        };
+        storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
+        let statuses = storage::refold_in_tx(&tx, account).unwrap();
+        assert_eq!(statuses.get(&verified.entry_hash).map(String::as_str), Some("accepted"));
+        tx.commit().unwrap();
+        verified.entry_hash
     }
 
     #[test]
@@ -498,6 +723,306 @@ mod tests {
         };
         unwrap_content_key(&member_wrap.sealed, &member_x, &ctx)
             .expect("the member unwraps its wrap under the reproducible WrapContext");
+    }
+
+    #[test]
+    fn catch_up_rewraps_exact_historical_and_current_keys_and_is_idempotent() {
+        let conn = db();
+        let (account, stream) = account_with_owned_stream(&conn, "repo-x");
+        let key0 = ContentKey::from_seed(&[0x60; 32]);
+        let key1 = ContentKey::from_seed(&[0x61; 32]);
+        {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            author_stream_key_wrap_in_tx(&tx, stream, &key0, 0, NOW).unwrap();
+            author_stream_key_wrap_in_tx(&tx, stream, &key1, 1, NOW).unwrap();
+            tx.commit().unwrap();
+        }
+        let historical_content = insert_accepted_sealed_content(&conn, account, stream, &key0);
+        let before = select_current_sealing_wrap(&conn, account, stream).unwrap().unwrap();
+        let member_x = DeviceX25519Secret::from_seed(&[0x5c; 32]);
+        let member = add_member_device(&conn, account, &member_x);
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let report = catch_up_stream_keys_for_device_in_tx(&tx, member, NOW).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(report.authored, vec![
+            super::super::sealing::LiveKeyEpoch {
+                stream_id: stream,
+                key_epoch: 0,
+                key_id: key0.key_id(),
+            },
+            super::super::sealing::LiveKeyEpoch {
+                stream_id: stream,
+                key_epoch: 1,
+                key_id: key1.key_id(),
+            },
+        ]);
+        assert!(report.already_covered.is_empty());
+
+        let target_wraps = accepted_wraps_for_target(&conn, member);
+        assert_eq!(target_wraps.len(), 2, "one same-key sibling per exact live group");
+        let historical_wrap = target_wraps
+            .iter()
+            .find(|wrap| wrap.key_epoch == 0 && wrap.key_id == key0.key_id().to_bytes())
+            .unwrap();
+        let ctx = WrapContext {
+            account_id: account.to_bytes(),
+            stream_id: stream.to_bytes(),
+            key_epoch: 0,
+            recipient_pub: member_x.public().to_bytes(),
+        };
+        let imported =
+            unwrap_content_key(&historical_wrap.wraps[0].sealed, &member_x, &ctx).unwrap();
+        assert_eq!(imported.key_id(), key0.key_id());
+        assert_eq!(
+            open_sealed_payload(
+                &imported,
+                &historical_content.payload,
+                &historical_content.header_bytes,
+            )
+            .unwrap()
+            .as_slice(),
+            op::encode(&MemoryOp::Snapshot).as_slice(),
+            "the post-enrollment sibling decrypts pre-enrollment content",
+        );
+
+        let after = select_current_sealing_wrap(&conn, account, stream).unwrap().unwrap();
+        assert_eq!(after.key_id, before.key_id, "catch-up never changes the selected key");
+        assert_eq!(after.key_epoch, before.key_epoch, "catch-up never advances the epoch");
+        assert!(!stream_key_rotation_needed(&conn, account, stream).unwrap());
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let rerun = catch_up_stream_keys_for_device_in_tx(&tx, member, NOW).unwrap();
+        tx.commit().unwrap();
+        assert!(rerun.authored.is_empty());
+        assert_eq!(rerun.already_covered, report.authored);
+        assert_eq!(accepted_wraps_for_target(&conn, member).len(), 2);
+
+        for key in [&key0, &key1] {
+            let raw = key.as_slice();
+            let leaked: bool = conn
+                .prepare("SELECT signed_bytes FROM account_entries")
+                .unwrap()
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .any(|blob| blob.windows(raw.len()).any(|window| window == raw));
+            assert!(!leaked, "catch-up never stores plaintext content-key bytes");
+        }
+    }
+
+    #[test]
+    fn catch_up_recovers_every_key_before_writing_any_sibling() {
+        let conn = db();
+        let (account, stream_a) = account_with_owned_stream(&conn, "repo-a");
+        let stream_b = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let stream = authoring::ensure_owned_stream_v2_in_tx(&tx, "repo-b", NOW).unwrap();
+            tx.commit().unwrap();
+            stream
+        };
+        let recoverable = ContentKey::from_seed(&[0x70; 32]);
+        let unavailable = ContentKey::from_seed(&[0x71; 32]);
+        let other_x = DeviceX25519Secret::from_seed(&[0x72; 32]);
+        let other = add_member_device(&conn, account, &other_x);
+        {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            author_stream_key_wrap_in_tx(&tx, stream_a, &recoverable, 0, NOW).unwrap();
+            let ctx = WrapContext {
+                account_id: account.to_bytes(),
+                stream_id: stream_b.to_bytes(),
+                key_epoch: 0,
+                recipient_pub: other_x.public().to_bytes(),
+            };
+            let unavailable_wrap = StreamKeyWrap {
+                stream_id: stream_b,
+                key_id: unavailable.key_id().to_bytes(),
+                key_epoch: 0,
+                wraps: vec![WrapEntry {
+                    recipient_fp: other,
+                    sealed: keywrap::seal_content_key(&unavailable, &ctx, &other_x.public())
+                        .unwrap(),
+                }],
+            };
+            author_stream_key_wrap_batch_in_tx(&tx, &[unavailable_wrap], NOW).unwrap();
+            tx.commit().unwrap();
+        }
+        let target_x = DeviceX25519Secret::from_seed(&[0x73; 32]);
+        let target = add_member_device_with_seed(&conn, account, &target_x, 0x2d);
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE log_id = ?1",
+                [SECRETS_LOG],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        assert!(catch_up_stream_keys_for_device_in_tx(&tx, target, NOW).is_err());
+        let during: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE log_id = ?1",
+                [SECRETS_LOG],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(during, before, "failure before inserts leaves no partial fan-out");
+        tx.rollback().unwrap();
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE log_id = ?1",
+                [SECRETS_LOG],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before, "the caller-owned rollback preserves all-or-nothing catch-up");
+    }
+
+    #[test]
+    fn catch_up_noops_when_a_remote_owner_sibling_already_covers_the_target() {
+        let conn = db();
+        let (account, stream) = account_with_owned_stream(&conn, "repo-x");
+        let key = ContentKey::from_seed(&[0x76; 32]);
+        {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            author_stream_key_wrap_in_tx(&tx, stream, &key, 0, NOW).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let remote_owner = crate::device::DeviceSecret::from_seed(&[0x77; 32]);
+        let remote_owner_x = DeviceX25519Secret::from_seed(&[0x78; 32]);
+        let remote_authority = author_control_op(&conn, account, &AccountOp::DeviceAdd {
+            device_fingerprint: remote_owner.public().fingerprint(),
+            ed25519_pubkey: remote_owner.public().to_bytes(),
+            x25519_pubkey: remote_owner_x.public().to_bytes(),
+            role: DeviceRole::Owner,
+            label: None,
+        });
+        let target_x = DeviceX25519Secret::from_seed(&[0x79; 32]);
+        let target = add_member_device_with_seed(&conn, account, &target_x, 0x7a);
+        let ctx = WrapContext {
+            account_id: account.to_bytes(),
+            stream_id: stream.to_bytes(),
+            key_epoch: 0,
+            recipient_pub: target_x.public().to_bytes(),
+        };
+        let remote_wrap = StreamKeyWrap {
+            stream_id: stream,
+            key_id: key.key_id().to_bytes(),
+            key_epoch: 0,
+            wraps: vec![WrapEntry {
+                recipient_fp: target,
+                sealed: keywrap::seal_content_key(&key, &ctx, &target_x.public()).unwrap(),
+            }],
+        };
+        let remote_hash = author_remote_stream_key_wrap(
+            &conn,
+            account,
+            &remote_owner,
+            remote_authority,
+            &remote_wrap,
+        );
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE log_id = ?1",
+                [SECRETS_LOG],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let report = catch_up_stream_keys_for_device_in_tx(&tx, target, NOW).unwrap();
+        tx.commit().unwrap();
+        assert!(report.authored.is_empty());
+        assert_eq!(report.already_covered, vec![super::super::sealing::LiveKeyEpoch {
+            stream_id: stream,
+            key_epoch: 0,
+            key_id: key.key_id(),
+        }]);
+        assert_eq!(status(&conn, &remote_hash), Some(("accepted".to_string(), None)));
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE log_id = ?1",
+                [SECRETS_LOG],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before, "accepted remote coverage is an idempotent no-op");
+    }
+
+    #[test]
+    fn catch_up_batch_advances_the_shared_secrets_chain_across_streams() {
+        let conn = db();
+        let (account, stream_a) = account_with_owned_stream(&conn, "repo-a");
+        let stream_b = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let stream = authoring::ensure_owned_stream_v2_in_tx(&tx, "repo-b", NOW).unwrap();
+            tx.commit().unwrap();
+            stream
+        };
+        let a = mint_committed(&conn, stream_a);
+        let b = mint_committed(&conn, stream_b);
+        let target_x = DeviceX25519Secret::from_seed(&[0x75; 32]);
+        let target = add_member_device(&conn, account, &target_x);
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let report = catch_up_stream_keys_for_device_in_tx(&tx, target, NOW).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(report.authored.len(), 2);
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, prev_hash, entry_hash FROM account_entries
+                 WHERE log_id = ?1 AND device_fingerprint = ?2 AND seq >= 2 ORDER BY seq",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    SECRETS_LOG,
+                    local_device(&conn, NOW).unwrap().fingerprint().to_bytes().as_slice()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 2);
+        assert_eq!(rows[0].1, b.to_vec(), "the batch starts at the shared pre-batch tail");
+        assert_eq!(rows[1].0, 3);
+        assert_eq!(rows[1].1, rows[0].2, "the second stream chains from the first sibling");
+        assert_eq!(header_of(&conn, &a).seq, 0);
+    }
+
+    #[test]
+    fn catch_up_rejects_a_removed_target() {
+        let conn = db();
+        let (account, stream) = account_with_owned_stream(&conn, "repo-x");
+        mint_committed(&conn, stream);
+        let target_x = DeviceX25519Secret::from_seed(&[0x74; 32]);
+        let target = add_member_device(&conn, account, &target_x);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let report = catch_up_stream_keys_for_device_in_tx(&tx, target, NOW).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(report.authored.len(), 1, "the no-content current key is caught up");
+        author_control_op(&conn, account, &AccountOp::DeviceRemove {
+            device_fingerprint: target,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "removed".into(),
+        });
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        assert!(catch_up_stream_keys_for_device_in_tx(&tx, target, NOW).is_err());
+        tx.rollback().unwrap();
     }
 
     #[test]
@@ -923,6 +1448,13 @@ mod tests {
             matches!(ensure_committed(&conn, stream), RotationOutcome::StaleButNotOwner),
             "a member that finds rotation needed is StaleButNotOwner — no rotate, no error",
         );
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        assert!(
+            catch_up_stream_keys_for_device_in_tx(&tx, owner_b_ed.public().fingerprint(), NOW,)
+                .is_err(),
+            "a non-owner cannot author catch-up siblings even when the target is effective",
+        );
+        tx.rollback().unwrap();
 
         // StaleButNotOwner authored nothing: only the original mint is on the secrets log.
         let secrets_rows: i64 = conn
@@ -1056,9 +1588,18 @@ mod tests {
         account: AccountId,
         member_x: &DeviceX25519Secret,
     ) -> crate::op::DeviceFingerprint {
+        add_member_device_with_seed(conn, account, member_x, 0x2c)
+    }
+
+    fn add_member_device_with_seed(
+        conn: &Connection,
+        account: AccountId,
+        member_x: &DeviceX25519Secret,
+        ed_seed: u8,
+    ) -> crate::op::DeviceFingerprint {
         use crate::device::DeviceSecret;
 
-        let member_pub = DeviceSecret::from_seed(&[0x2c; 32]).public();
+        let member_pub = DeviceSecret::from_seed(&[ed_seed; 32]).public();
         let member_fp = member_pub.fingerprint();
         author_control_op(conn, account, &AccountOp::DeviceAdd {
             device_fingerprint: member_fp,

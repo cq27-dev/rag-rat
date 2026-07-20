@@ -91,12 +91,13 @@ mod stream;
 // root, or they would leak the `pub(crate)` `DeviceSecret` past its visibility).
 pub use account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
-    CapacityScope, ContentKey, ContentKeyring, DeviceCut, DeviceRole, GrantAuthority,
-    GrantDeviceAuthority, GrantDeviceBoundary, GrantRole, IngestOutcome, KeyId, LiveKeyEpoch,
-    LiveKeyTargets, OwnerAuthority, OwnerChainAuthority, PreparedContentAuthoring,
+    CapacityScope, CatchUpReport, ContentKey, ContentKeyring, DeviceCut, DeviceRole,
+    GrantAuthority, GrantDeviceAuthority, GrantDeviceBoundary, GrantRole, IngestOutcome, KeyId,
+    LiveKeyEpoch, LiveKeyTargets, OwnerAuthority, OwnerChainAuthority, PreparedContentAuthoring,
     RosterContentAuthority, RotationOutcome, SealPolicy, SealingKeyOutcome, SelectedWrap,
     account_ingest, auth_len_freshness, author_content_batch, author_content_batch_in_tx,
-    author_prepared_content_batch_in_tx, backfill_authority_projection, content_op_is_authorable,
+    author_prepared_content_batch_in_tx, backfill_authority_projection,
+    catch_up_stream_keys_for_device_in_tx, content_op_is_authorable,
     content_op_is_sealed_authorable, content_stream_has_sealed_ratchet, content_stream_is_empty,
     current_sealing_key, decode_content_signed, ensure_owned_stream_v2_in_tx,
     ensure_stream_key_current_in_tx, established_owned_stream_v2, grant_effective_for_device,

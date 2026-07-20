@@ -370,6 +370,22 @@ pub fn historical_content_keyring(
     Ok(ContentKeyring(keys))
 }
 
+/// Recover one exact historical `(stream, epoch, key_id)` group for same-key fan-out authoring.
+/// Unlike [`ContentKeyring`], epoch remains part of the lookup because the wrap context
+/// authenticates it even when a key id appears at more than one epoch.
+pub(super) fn recover_exact_historical_content_key(
+    conn: &Connection,
+    account_id: AccountId,
+    live: LiveKeyEpoch,
+    device: &LocalDevice,
+) -> anyhow::Result<Option<ContentKey>> {
+    let wraps = list_accepted_stream_key_wraps(conn, account_id, live.stream_id)?;
+    Ok(match recover_key(&wraps, account_id, live.stream_id, live.key_epoch, live.key_id, device) {
+        KeyRecovery::Ready(key) => Some(key),
+        KeyRecovery::NotRecipient | KeyRecovery::Failed(_) => None,
+    })
+}
+
 /// Shared cryptographic recovery for current sealing and historical projection reads.
 fn recover_key(
     wraps: &[AcceptedStreamWrap],
