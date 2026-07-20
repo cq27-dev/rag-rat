@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.19.0...rag-rat-base-v0.20.0) - 2026-07-20
+
+### Added
+
+- *(cli)* rag-rat rm <path> — remove a repo from the global index (purge + VACUUM), config, and hooks ([#778](https://github.com/cq27-dev/rag-rat/pull/778))
+- *(plugin)* opencode plugin bundle — @rag-rat/plugin-opencode (MCP + hooks) ([#785](https://github.com/cq27-dev/rag-rat/pull/785))
+- *(config)* add [llm.distill] config with a model-size-aware provision timeout ([#779](https://github.com/cq27-dev/rag-rat/pull/779))
+- *(agent-hook)* augment the Read tool with file/dir memories + load-bearing symbols ([#756](https://github.com/cq27-dev/rag-rat/pull/756)) ([#761](https://github.com/cq27-dev/rag-rat/pull/761))
+- *(agent-hook)* PostToolUse edit trigger — scoped reindex, watcher-aware, detached ([#738](https://github.com/cq27-dev/rag-rat/pull/738))
+- *(papertrail)* closing-edge substrate — provider-neutral schema, gated text tier, item/comment ref mining ([#702](https://github.com/cq27-dev/rag-rat/pull/702)) ([#722](https://github.com/cq27-dev/rag-rat/pull/722))
+
+### Fixed
+
+- *(tests)* route test scratch through a shared self-healing helper (fixes #726) ([#732](https://github.com/cq27-dev/rag-rat/pull/732))
+
+### Other
+
+- *(readme)* link the rag-rat.cq27.dev site ([#749](https://github.com/cq27-dev/rag-rat/pull/749))
+- *(locks)* shared content-carrying single-flight coalescing primitive ([#736](https://github.com/cq27-dev/rag-rat/pull/736))
+- *(workspace)* [**breaking**] extract rag-rat-query — the read layer: graph/impact/symbol/tree queries, memory reads + evidence, pagerank (#706 phase 6) ([#719](https://github.com/cq27-dev/rag-rat/pull/719))
+- *(workspace)* [**breaking**] extract the rag-rat-clones crate (#706 phase 4) ([#717](https://github.com/cq27-dev/rag-rat/pull/717))
+- *(workspace)* [**breaking**] extract rag-rat-papertrail — mirror, providers, transport, evidence (#706 phase 2) ([#715](https://github.com/cq27-dev/rag-rat/pull/715))
+- *(workspace)* [**breaking**] extract the rag-rat-db database layer with an explicit MigrationHooks seam (#706 phase 1) ([#714](https://github.com/cq27-dev/rag-rat/pull/714))
+
 ## [0.19.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.18.0...rag-rat-core-v0.19.0) - 2026-07-16
 
 ### Added
