@@ -448,7 +448,7 @@ mod tests {
 
     use super::*;
     use crate::account::content::{
-        ContentEntryHeader, open_sealed_payload, sign_sealed_content_entry,
+        ContentEntryHeader, open_sealed_payload, seal_and_sign_content_entry,
     };
     use crate::account::cut::Cut;
     use crate::account::fold::CONTROL_LOG;
@@ -549,12 +549,11 @@ mod tests {
             crypto_suite: 0,
             key_id: None,
         };
-        let signed = sign_sealed_content_entry(
+        let signed = seal_and_sign_content_entry(
             device.secret(),
             &header,
             &op::encode(&MemoryOp::Snapshot),
             key,
-            [0x55; 24],
         )
         .unwrap();
         conn.execute(

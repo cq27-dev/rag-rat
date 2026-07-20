@@ -560,7 +560,7 @@ mod tests {
         select_current_sealing_wrap, stream_key_rotation_needed,
     };
     use crate::account::content::{
-        ContentEntryHeader, sign_content_entry, sign_sealed_content_entry,
+        ContentEntryHeader, seal_and_sign_content_entry, sign_content_entry,
     };
     use crate::account::cut::Cut;
     use crate::account::envelope::{AccountEntryHeader, sign_account_entry};
@@ -802,8 +802,7 @@ mod tests {
         let payload = op::encode(&MemoryOp::Snapshot);
         let signed = match key {
             Some(key) =>
-                sign_sealed_content_entry(&author.secret, &header, &payload, key, [seq as u8; 24])
-                    .unwrap(),
+                seal_and_sign_content_entry(&author.secret, &header, &payload, key).unwrap(),
             None => sign_content_entry(&author.secret, &header, &payload).unwrap(),
         };
         conn.execute(
