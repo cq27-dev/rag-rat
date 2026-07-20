@@ -601,7 +601,7 @@ fn stream_has_sealed_ratchet(
     account_id: AccountId,
     stream_id: StreamId,
 ) -> anyhow::Result<bool> {
-    if secrets::select_current_sealing_wrap(conn, account_id, stream_id)?.is_some() {
+    if secrets::accepted_stream_key_wrap_exists_strict(conn, account_id, stream_id)? {
         return Ok(true);
     }
     stream_has_accepted_sealed_entry(conn, stream_id)
@@ -2109,6 +2109,52 @@ mod tests {
         let after: i64 =
             conn.query_row("SELECT count(*) FROM content_entries", [], |row| row.get(0)).unwrap();
         assert_eq!(before, after, "the failed plaintext batch leaked no content row");
+    }
+
+    #[test]
+    fn corrupt_accepted_wrap_aborts_prepared_plaintext_authoring_without_sealed_content() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        let wrap_hash = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let wrap_hash =
+                secrets::mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW).unwrap();
+            tx.commit().unwrap();
+            wrap_hash
+        };
+        conn.execute("UPDATE account_entries SET signed_bytes = X'00' WHERE entry_hash = ?1", [
+            wrap_hash.as_slice(),
+        ])
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM content_entries", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "the malformed accepted wrap is the only sealing evidence",
+        );
+
+        let prepared = prepare_content_authoring(&conn, stream, SealPolicy::Plaintext, NOW)
+            .expect("plaintext preparation defers the ratchet check to the authoring transaction");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = author_prepared_content_batch_in_tx(
+            &tx,
+            stream,
+            &[node_create("plaintext", "must-not-leak")],
+            &prepared,
+            NOW,
+        )
+        .expect_err("accepted wrap corruption must fail closed for downgrade evidence");
+        drop(tx);
+        assert!(
+            err.to_string().contains("sealed-ratchet wrap evidence"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM content_entries", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "the failed plaintext authoring leaked no content row",
+        );
     }
 
     #[test]

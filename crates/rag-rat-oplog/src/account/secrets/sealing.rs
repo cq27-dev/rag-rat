@@ -13,6 +13,7 @@
 //! device-independent. A local mismatch / unwrap failure is therefore LOCAL evidence only, written
 //! to `sync_security_events` and nothing else.
 
+use anyhow::Context;
 use rusqlite::{Connection, params};
 
 use super::super::keywrap::{self, ContentKey, KeyId, WrapContext};
@@ -82,6 +83,12 @@ struct AcceptedStreamWrap {
     wrap: StreamKeyWrap,
 }
 
+#[derive(Clone, Copy)]
+enum AcceptedWrapDecodeMode {
+    Tolerant,
+    StrictEvidence,
+}
+
 /// The stream's current sealing selection, derived on read from the accepted wrap set — no cached
 /// table, no refold pass, convergent by construction. `None` when no accepted wrap exists. This is
 /// the CLI "what key is current" surface; the secret-recovering counterpart is
@@ -92,6 +99,24 @@ pub fn select_current_sealing_wrap(
     stream_id: StreamId,
 ) -> anyhow::Result<Option<SelectedWrap>> {
     Ok(select_from_wraps(&list_accepted_stream_key_wraps(conn, account_id, stream_id)?))
+}
+
+/// Whether an accepted `StreamKeyWrap` exists for `stream_id`. Unlike local key recovery, this is
+/// downgrade evidence: corruption of any accepted secrets row must fail closed rather than make a
+/// previously keyed stream appear eligible for plaintext. Presence does not require a local
+/// recipient wrap or a successful unwrap.
+pub(in crate::account) fn accepted_stream_key_wrap_exists_strict(
+    conn: &Connection,
+    account_id: AccountId,
+    stream_id: StreamId,
+) -> anyhow::Result<bool> {
+    Ok(!list_accepted_stream_key_wraps_with_mode(
+        conn,
+        account_id,
+        stream_id,
+        AcceptedWrapDecodeMode::StrictEvidence,
+    )?
+    .is_empty())
 }
 
 /// Whether `stream_id`'s content key must be ROTATED (sync phase C4.4, #607): TRUE iff some
@@ -302,12 +327,26 @@ fn select_from_wraps(wraps: &[AcceptedStreamWrap]) -> Option<SelectedWrap> {
 /// naming `stream_id`, decoding each from the stored, already-signature-verified bytes. `accepted =
 /// 1` IS the effective marker (the C4.2b evaluator set it); B-2 slot-eligibility guarantees an
 /// accepted log-1 row decodes as a Known `StreamKeyWrap`, so an undecodable/unknown accepted row is
-/// corruption — skipped (fail-safe: it just can't contribute a key) rather than aborting the read,
-/// mirroring `storage::load_secrets_headers`.
+/// corruption. Local key selection/recovery skips such rows (fail-safe: they cannot contribute a
+/// key), while downgrade evidence uses strict mode and fails closed.
 fn list_accepted_stream_key_wraps(
     conn: &Connection,
     account_id: AccountId,
     stream_id: StreamId,
+) -> anyhow::Result<Vec<AcceptedStreamWrap>> {
+    list_accepted_stream_key_wraps_with_mode(
+        conn,
+        account_id,
+        stream_id,
+        AcceptedWrapDecodeMode::Tolerant,
+    )
+}
+
+fn list_accepted_stream_key_wraps_with_mode(
+    conn: &Connection,
+    account_id: AccountId,
+    stream_id: StreamId,
+    mode: AcceptedWrapDecodeMode,
 ) -> anyhow::Result<Vec<AcceptedStreamWrap>> {
     let mut stmt = conn.prepare(
         "SELECT entry_hash, signed_bytes FROM account_entries
@@ -322,20 +361,43 @@ fn list_accepted_stream_key_wraps(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::new();
     for (entry_hash, signed_bytes) in rows {
-        let Ok(entry_hash) = <[u8; 32]>::try_from(entry_hash.as_slice()) else {
-            continue;
+        let entry_hash = match <[u8; 32]>::try_from(entry_hash.as_slice()) {
+            Ok(entry_hash) => entry_hash,
+            Err(_) if matches!(mode, AcceptedWrapDecodeMode::Tolerant) => continue,
+            Err(_) => anyhow::bail!(
+                "stored accepted secrets entry_hash is not 32 bytes while checking sealed-ratchet \
+                 wrap evidence"
+            ),
         };
-        let Ok(signed) = envelope::decode_account_signed(&signed_bytes) else {
-            continue;
+        let signed = match envelope::decode_account_signed(&signed_bytes) {
+            Ok(signed) => signed,
+            Err(_) if matches!(mode, AcceptedWrapDecodeMode::Tolerant) => continue,
+            Err(err) =>
+                return Err(err).context(
+                    "stored accepted secrets envelope failed to decode while checking \
+                     sealed-ratchet wrap evidence",
+                ),
         };
         if signed.entry_hash != entry_hash {
-            continue;
+            if matches!(mode, AcceptedWrapDecodeMode::Tolerant) {
+                continue;
+            }
+            anyhow::bail!(
+                "stored accepted secrets envelope does not match its entry_hash row while \
+                 checking sealed-ratchet wrap evidence"
+            );
         }
         match ops::decode(signed.header.entry_type, &signed.payload) {
             Ok(DecodedSecretsOp::Known(wrap)) if wrap.stream_id == stream_id => {
                 out.push(AcceptedStreamWrap { entry_hash, wrap });
             },
-            _ => continue,
+            Ok(_) => {},
+            Err(_) if matches!(mode, AcceptedWrapDecodeMode::Tolerant) => continue,
+            Err(err) =>
+                return Err(err).context(
+                    "stored accepted secrets payload failed to decode while checking \
+                     sealed-ratchet wrap evidence",
+                ),
         }
     }
     Ok(out)
@@ -747,6 +809,26 @@ mod tests {
         );
         assert!(keyring.get(claimed_id).is_none(), "unwrap/key-id mismatch fails closed");
         assert_eq!(security_event_count(&conn), 0, "projection recovery does not mutate evidence");
+    }
+
+    #[test]
+    fn historical_keyring_tolerates_a_corrupt_accepted_wrap() {
+        let conn = db();
+        let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
+        let device = local_device(&conn, NOW).unwrap();
+        let key = ContentKey::from_seed(&[0x20; 32]);
+        let wrap =
+            honest_wrap(account, stream_id, device.fingerprint(), &device.x25519_public(), &key, 0);
+        let (bytes, entry_hash) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
+        ingest(&conn, &bytes);
+        conn.execute("UPDATE account_entries SET signed_bytes = X'00' WHERE entry_hash = ?1", [
+            entry_hash.as_slice(),
+        ])
+        .unwrap();
+
+        let keyring = historical_content_keyring(&conn, account, stream_id, &device)
+            .expect("projection key recovery remains tolerant of an unusable local wrap");
+        assert!(keyring.get(key.key_id()).is_none(), "a corrupt wrap recovers no key");
     }
 
     // ── The adoption cross-check ──
