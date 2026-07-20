@@ -37,8 +37,8 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { ModalClient, Probe } from "modal";
-import type { Sandbox } from "modal";
+import { AlreadyExistsError, ModalClient, NotFoundError, Probe } from "modal";
+import type { Logger as ModalLogger, Sandbox } from "modal";
 
 import {
   type ProvisionContext,
@@ -54,6 +54,17 @@ import {
   withBudget,
 } from "../src/contract.js";
 import { assertCapabilitySupported, selectBackendSpec } from "./backends.mjs";
+import {
+  HF_CACHE_MOUNT_PATH,
+  type SandboxOutputCapture,
+  modalCacheEnvironment,
+  modalCacheSandboxName,
+  modalCacheVolumeName,
+  modalHfReadyMarkerName,
+  safeDiagnostic,
+  startSandboxOutputCapture,
+  vllmCachePlan,
+} from "./modal-support.mjs";
 
 /** Provider-side max-lifetime backstop in ms — a leaked box self-destructs after this. */
 const BOX_MAX_LIFETIME_MS = 1_800_000; // 30 minutes
@@ -102,9 +113,31 @@ const MODAL_DEFAULT_GPU = "A10G";
  * hung terminate would otherwise leak a billed box until Modal's `timeoutMs` backstop fires.
  */
 const TEARDOWN_TIMEOUT_MS = 8_000;
+/** Briefly allow final startup diagnostics to arrive after readiness rejects. */
+const FAILURE_LOG_SETTLE_MS = 250;
+/** Keeps the complete JSON-escaped error event below Rust's 16 KiB line cap. */
+const READINESS_DIAGNOSTIC_BYTES = 7 * 1024;
+/** Bound stream cancellation after the remote box has terminated. */
+const OUTPUT_STOP_TIMEOUT_MS = 500;
+/** Marker publication is metadata-only and must not consume the Rust teardown grace. */
+const CACHE_MARKER_TIMEOUT_MS = 1_000;
+const OWNER_TAG = "rag-rat-owner";
+
+interface CachePublication {
+  readonly modal: ModalClient;
+  readonly markerNames: readonly string[];
+  verified: boolean;
+}
+
+interface ModalHandle {
+  readonly modal: ModalClient;
+  readonly sandbox: Sandbox;
+  readonly output: SandboxOutputCapture;
+  readonly cachePublication: CachePublication | null;
+}
 
 /** Provision an embedding box serving `input.model` on the selected backend; return its endpoint. */
-async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sandbox>> {
+async function provision(ctx: ProvisionContext<ModalHandle>): Promise<Provisioned<ModalHandle>> {
   const { input, provisionTimeoutMs } = ctx;
   const spec = selectBackendSpec(input.backend ?? "ollama");
   // What the box should SERVE (embeddings vs chat). Absent → embed (back-compat). Fail loudly NOW,
@@ -128,7 +161,9 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   );
 
   // Creds resolve from env (MODAL_TOKEN_ID/MODAL_TOKEN_SECRET) or ~/.modal.toml.
-  const modal = new ModalClient();
+  // Modal's default logger writes non-JSON text to stdout/stderr and honors ambient config. Route
+  // SDK warnings through typed cookbook events instead so the JSONL wire contract cannot be broken.
+  const modal = new ModalClient({ logger: modalSdkLogger(), logLevel: "warn" });
   const app = await withBudget(deadline, "apps.fromName", () =>
     modal.apps.fromName(APP_NAME, { createIfMissing: true }),
   );
@@ -143,23 +178,76 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   // is `withBudget`-bounded, but Modal can REACH the backend and CREATE the sandbox and then have the
   // SDK call stall past the budget — `withBudget` throws BEFORE `ctx.onBox(sb)`, so `runRecipe` tears
   // down "nothing" while the created sandbox bills until Modal's `timeoutMs` backstop (30 min). We
-  // give the sandbox a recoverable UNIQUE name; on ANY create throw, look it up by name and terminate
-  // it before rethrowing. (Unlike RunPod, Modal HAS a provider backstop, so this only shortens the
-  // worst case — but a leaked GPU box for up to 30 min is still real money.)
-  const sandboxName = `${APP_NAME}-${Date.now()}-${randomUUID().slice(0, 8)}`;
-
+  // give the sandbox a recoverable name and owner tag; on ANY create throw, look it up by name and
+  // terminate it only when that tag proves this invocation created it. (Unlike RunPod, Modal HAS a
+  // provider backstop, so this only shortens the worst case — but a leaked GPU box for up to 30 min
+  // is still real money.)
   // The backend spec supplies the entrypoint ARGS (never the entrypoint) + env + the served port.
   // Resolve the args first — the vLLM chat path is async (it sizes --max-model-len from the model's
   // HF context).
-  const entrypointArgs = await spec.entrypointArgs(input);
+  const entrypointArgs = await withBudget(deadline, "entrypointArgs", () =>
+    Promise.resolve(spec.entrypointArgs(input)),
+  );
+  const cacheVolumeName = modalCacheVolumeName(input.model);
+  const cacheVolume =
+    spec.modelLoad === "in-launch"
+      ? await withBudget(deadline, "volumes.fromName", () =>
+          modal.volumes.fromName(cacheVolumeName, { createIfMissing: true }),
+        )
+      : null;
+  if (cacheVolume !== null) {
+    log("info", `using persistent Hugging Face cache volume at ${HF_CACHE_MOUNT_PATH}`);
+  }
+  const hfMarkerName = modalHfReadyMarkerName(input.model, cacheVolume?.volumeId ?? "uncached");
+  const hfReady =
+    cacheVolume !== null && (await cacheMarkerExists(modal, hfMarkerName, deadline, "Hugging Face"));
+  const compilePlan =
+    spec.backend === "vllm"
+      ? vllmCachePlan(
+          input.model,
+          resolvedImage,
+          gpu ?? "cpu",
+          capability,
+          entrypointArgs,
+          cacheVolume?.volumeId ?? "uncached",
+        )
+      : null;
+  const compileReady =
+    compilePlan !== null &&
+    (await cacheMarkerExists(modal, compilePlan.markerName, deadline, "vLLM compile"));
+  const cachePublication: CachePublication | null =
+    cacheVolume === null
+      ? null
+      : {
+          modal,
+          markerNames: [
+            ...(!hfReady ? [hfMarkerName] : []),
+            ...(compilePlan !== null && !compileReady ? [compilePlan.markerName] : []),
+          ],
+          verified: false,
+        };
+  const cacheEnv = cacheVolume === null ? {} : modalCacheEnvironment(compilePlan);
+  // Every cache-backed Sandbox can update HF metadata or compiler artifacts. Modal v1 commits are
+  // last-writer-wins across the whole Volume, so exclude concurrent mounts for this model even after
+  // markers exist. The owner tag makes timeout cleanup safe despite the shared deterministic name.
+  const ownerId = randomUUID();
+  const sandboxName =
+    cacheVolume === null
+      ? `${APP_NAME}-${Date.now()}-${randomUUID().slice(0, 8)}`
+      : modalCacheSandboxName(cacheVolumeName);
   let sb: Sandbox;
   const createRef: { promise?: Promise<Sandbox> } = {};
   try {
     sb = await withBudget(deadline, "sandboxes.create", () => {
       createRef.promise = modal.sandboxes.create(app, image, {
         name: sandboxName,
+        tags: { [OWNER_TAG]: ownerId },
         command: [...entrypointArgs],
-        env: spec.env(input),
+        env: {
+          ...spec.env(input),
+          ...cacheEnv,
+        },
+        ...(cacheVolume !== null ? { volumes: { [HF_CACHE_MOUNT_PATH]: cacheVolume } } : {}),
         encryptedPorts: [port],
         readinessProbe: Probe.withTcp(port, { intervalMs: 1000 }),
         timeoutMs: BOX_MAX_LIFETIME_MS,
@@ -169,10 +257,16 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
       return createRef.promise;
     });
   } catch (cause) {
+    if (cacheVolume !== null && cause instanceof AlreadyExistsError) {
+      throw new Error(
+        `model cache ${cacheVolumeName} is already mounted by another cookbook Sandbox; retry after it finishes`,
+        { cause },
+      );
+    }
     const pendingCreate = createRef.promise;
     if (pendingCreate !== undefined) {
       void pendingCreate.then(
-        (lateSandbox: Sandbox) => terminateOrphanSandbox(lateSandbox, sandboxName, "late create"),
+        (lateSandbox: Sandbox) => terminateOrphanSandbox(modal, lateSandbox, sandboxName, "late create"),
         (lateCause: unknown) => {
           log(
             "info",
@@ -181,20 +275,44 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
         },
       );
     }
-    await sweepOrphanByName(modal, sandboxName);
+    await sweepOrphanByName(modal, sandboxName, ownerId);
     throw cause;
   }
+  // Start draining before readiness: model-download failures are emitted by the main process, and
+  // waiting to attach until after readiness would lose the exact diagnostics needed when boot fails.
+  const output = startSandboxOutputCapture(sb.stdout, sb.stderr, log);
+  const handle = { modal, sandbox: sb, output, cachePublication };
   // Report the box NOW so runRecipe tears it down if readiness, pull, or verify throws.
-  ctx.onBox(sb);
+  ctx.onBox(handle);
   log("info", `sandbox created: ${sb.sandboxId ?? "(id unavailable)"}`);
 
   ctx.status("provisioning", `waiting for ${spec.backend} to listen on port ${port}`);
   const readinessTimeoutMs = assertBudgetRemaining(deadline, "sandbox readiness");
-  await raceWithTimeout(
-    () => sb.waitUntilReady(readinessTimeoutMs),
-    readinessTimeoutMs,
-    "sandbox.waitUntilReady",
-  );
+  try {
+    await raceWithTimeout(
+      () => sb.waitUntilReady(readinessTimeoutMs),
+      readinessTimeoutMs,
+      "sandbox.waitUntilReady",
+    );
+  } catch (cause) {
+    const diagnosticMs = Math.min(FAILURE_LOG_SETTLE_MS, Math.max(0, deadline - Date.now()));
+    const [, exitCode] = await Promise.all([
+      output.settle(diagnosticMs),
+      diagnosticMs > 0
+        ? raceWithTimeout(() => sb.poll(), diagnosticMs, "sandbox.poll").catch(() => undefined)
+        : Promise.resolve(undefined),
+    ]);
+    const tail = output.failureTail();
+    const diagnostic = safeDiagnostic(
+      `${errorMessage(cause)}${tail === "" ? "" : `\nrecent sandbox output:\n${tail}`}`,
+      READINESS_DIAGNOSTIC_BYTES,
+    );
+    throw new Error(
+      `sandbox readiness failed (exit code ${exitCode === undefined ? "unavailable" : exitCode ?? "not exited"}): ` +
+        diagnostic,
+      { cause },
+    );
+  }
   log("info", `${spec.backend} is listening`);
 
   // Load the model. infinity/vLLM auto-download on boot (nothing to do); ollama boots empty, so pull
@@ -225,9 +343,10 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
     await verifyEmbed(endpoint, { model: input.model, embedPath: servePath, budgetMs: verifyBudgetMs });
   }
   log("info", `${capability} verification passed; box is serving`);
+  if (cachePublication !== null) cachePublication.verified = true;
 
   // Open tunnel via encryptedPorts → no per-request token needed. auth_token stays null.
-  return { handle: sb, endpoint, auth_token: null };
+  return { handle, endpoint, auth_token: null };
 }
 
 /**
@@ -239,7 +358,7 @@ async function pullOllamaModel(
   sb: Sandbox,
   model: string,
   deadline: number,
-  ctx: ProvisionContext<Sandbox>,
+  ctx: ProvisionContext<ModalHandle>,
 ): Promise<void> {
   ctx.status("pulling", `pulling model "${model}" (cold-start cost)`);
   const pull = await withBudget(deadline, "exec(ollama pull)", () =>
@@ -257,26 +376,90 @@ async function pullOllamaModel(
  * Destroy the box, bounded so a hung `terminate()` can't run past the Rust teardown grace and leak
  * a billed box. Idempotent enough — terminate on an already-gone box is a no-op/soft error.
  */
-async function teardown(sb: Sandbox): Promise<void> {
-  await raceWithTimeout(() => sb.terminate(), TEARDOWN_TIMEOUT_MS, "sb.terminate");
+async function teardown(handle: ModalHandle): Promise<void> {
+  try {
+    await terminateAndWait(handle.modal, handle.sandbox, "sb.terminate");
+    await publishCacheMarkers(handle.cachePublication);
+  } finally {
+    await raceWithTimeout(() => handle.output.stop(), OUTPUT_STOP_TIMEOUT_MS, "sandbox output stop").catch(
+      (cause) => log("warn", `sandbox output cleanup did not finish: ${errorMessage(cause)}`),
+    );
+  }
+}
+
+async function cacheMarkerExists(
+  modal: ModalClient,
+  markerName: string,
+  deadline: number,
+  label: string,
+): Promise<boolean> {
+  try {
+    await withBudget(deadline, `volumes.fromName(${label} marker)`, () =>
+      modal.volumes.fromName(markerName),
+    );
+    log("info", `${label} cache marker found: ${markerName}`);
+    return true;
+  } catch (cause) {
+    if (cause instanceof NotFoundError || /not\s*found/i.test(errorMessage(cause))) {
+      log("info", `${label} cache marker absent; this run will publish it after verified teardown`);
+      return false;
+    }
+    throw cause;
+  }
+}
+
+async function publishCacheMarkers(publication: CachePublication | null): Promise<void> {
+  if (publication === null || !publication.verified || publication.markerNames.length === 0) return;
+  try {
+    await raceWithTimeout(
+      () =>
+        Promise.all(
+          publication.markerNames.map((name) =>
+            publication.modal.volumes.fromName(name, { createIfMissing: true }),
+          ),
+        ),
+      CACHE_MARKER_TIMEOUT_MS,
+      "cache marker publication",
+    );
+    log("info", `published cache markers: ${publication.markerNames.join(", ")}`);
+  } catch (cause) {
+    // The billed box is already gone. A missing marker only costs another conservative warmup;
+    // never turn successful teardown into a process failure for optional metadata publication.
+    log("warn", `cache marker publication failed; cache remains conservative: ${errorMessage(cause)}`);
+  }
 }
 
 /**
  * Best-effort orphan sweep for the create-timeout race (#330-1): if `sandboxes.create` threw but
- * Modal actually created the sandbox, that sandbox carries our unique `sandboxName`. Look it up by
- * name within the cookbook App and terminate it. Bounded (`TEARDOWN_TIMEOUT_MS`) and fully swallowed
- * — it must NEVER throw (the caller is about to rethrow the original create error, which is the
- * signal rag-rat acts on); it only logs. A `NotFoundError` from `fromName` is the EXPECTED happy
- * case (create never actually made a box) and is logged as info, not an error.
+ * Modal actually created the sandbox, that sandbox carries our `sandboxName` and owner tag. Look it
+ * up by name within the cookbook App and terminate it only when the tag matches this invocation.
+ * This matters for deterministic cache-lock names: an unrelated active owner must survive our
+ * failed create. The sweep is bounded (`TEARDOWN_TIMEOUT_MS`) and fully swallowed — it must NEVER
+ * throw (the caller is about to rethrow the original create error, which is the signal rag-rat acts
+ * on); it only logs. A `NotFoundError` from `fromName` is the EXPECTED happy case (create never
+ * actually made a box) and is logged as info, not an error.
  */
-async function sweepOrphanByName(modal: ModalClient, sandboxName: string): Promise<void> {
+async function sweepOrphanByName(
+  modal: ModalClient,
+  sandboxName: string,
+  expectedOwnerId: string,
+): Promise<void> {
   try {
     const orphan = await raceWithTimeout(
       () => modal.sandboxes.fromName(APP_NAME, sandboxName),
       TEARDOWN_TIMEOUT_MS,
       "sandboxes.fromName(orphan sweep)",
     );
-    await terminateOrphanSandbox(orphan, sandboxName, "orphan sweep");
+    const tags = await raceWithTimeout(
+      () => orphan.getTags(),
+      TEARDOWN_TIMEOUT_MS,
+      "orphan.getTags",
+    );
+    if (tags[OWNER_TAG] !== expectedOwnerId) {
+      log("info", `orphan sweep: sandbox "${sandboxName}" belongs to another invocation; leaving it running`);
+      return;
+    }
+    await terminateOrphanSandbox(modal, orphan, sandboxName, "orphan sweep");
   } catch (cause) {
     // fromName raises NotFoundError when no sandbox with that name exists — the common case (create
     // never made one). Distinguish it from a real failure so the log isn't alarming.
@@ -290,23 +473,46 @@ async function sweepOrphanByName(modal: ModalClient, sandboxName: string): Promi
 }
 
 async function terminateOrphanSandbox(
+  modal: ModalClient,
   orphan: Sandbox,
   sandboxName: string,
   source: string,
 ): Promise<void> {
   try {
-    await raceWithTimeout(
-      () => orphan.terminate(),
-      TEARDOWN_TIMEOUT_MS,
-      `${source}.terminate`,
-    );
+    await terminateAndWait(modal, orphan, `${source}.terminate`);
     log("warn", `${source}: terminated leaked sandbox "${sandboxName}" (${orphan.sandboxId})`);
   } catch (cause) {
     log("error", `${source}: could not terminate leaked sandbox "${sandboxName}": ${errorMessage(cause)}`);
   }
 }
 
-const recipe: Recipe<Sandbox> = {
+async function terminateAndWait(modal: ModalClient, sandbox: Sandbox, label: string): Promise<void> {
+  const deadline = Date.now() + TEARDOWN_TIMEOUT_MS;
+  const sandboxId = sandbox.sandboxId;
+  await withBudget(deadline, label, () => sandbox.terminate());
+  const attached = await withBudget(deadline, `${label}.reattach`, () => modal.sandboxes.fromId(sandboxId));
+  while ((await withBudget(deadline, `${label}.poll`, () => attached.poll())) === null) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(250, assertBudgetRemaining(deadline, label))));
+  }
+}
+
+function modalSdkLogger(): ModalLogger {
+  const emit = (level: "info" | "warn" | "error", message: string, args: unknown[]): void => {
+    const details = args
+      .slice(0, 8)
+      .map((value) => (value instanceof Error ? value.message : String(value)))
+      .join(" ");
+    log(level, safeDiagnostic(`Modal SDK: ${message}${details === "" ? "" : ` ${details}`}`));
+  };
+  return {
+    debug: (message, ...args) => emit("info", message, args),
+    info: (message, ...args) => emit("info", message, args),
+    warn: (message, ...args) => emit("warn", message, args),
+    error: (message, ...args) => emit("error", message, args),
+  };
+}
+
+const recipe: Recipe<ModalHandle> = {
   provider: "modal",
   defaultProvisionTimeoutS: DEFAULT_PROVISION_TIMEOUT_S,
   provision,

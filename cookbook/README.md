@@ -208,6 +208,27 @@ Provider gotchas baked into the recipe (each one cost real time to find):
 - **GPU is off by default for ollama/infinity** (and, for ollama, must attach before its discovery
   watchdog times out or the box dies exit 137 at cold start). vLLM's image is CUDA-only, so when the
   backend `requiresGpu` and the caller passed none, the recipe defaults a GPU in.
+- infinity and vLLM mount a persistent, model-scoped Modal Volume at `HF_HOME`. Later Sandboxes for
+  the same model reuse downloaded Hugging Face weights instead of paying the full cold-download cost.
+  Modal commits Volume changes in the background and on Sandbox shutdown. Because the Modal v1
+  Volume API has last-writer-wins semantics, the recipe excludes concurrent mounts of one model Volume.
+  infinity CPU boxes explicitly use the torch engine: the image's optimum/OpenVINO default writes
+  generated `infinity_onnx` artifacts into the Hub cache that are not safe to reuse across Sandboxes.
+- A successful load is published as an empty deterministic marker Volume only after verified serving
+  and termination is confirmed through a reattached polling handle, so a marker cannot outrun the
+  model Volume's final commit. Markers are advisory: Hugging Face keeps its normal metadata and cache
+  recovery behavior, so a moving `main` revision or damaged cache can still refresh.
+- vLLM's AOT/Inductor cache is persisted under a namespace keyed by model, pinned image digest, GPU,
+  capability, and launch args. A separately published compile marker records a completed cache; vLLM
+  still retains its normal recompile fallback so moving model revisions or damaged artifacts self-heal.
+  A deterministic, owner-tagged Sandbox name excludes concurrent writable mounts of the same model
+  Volume; a concurrent request fails with an explicit retry message instead of risking a v1 lost update.
+  Marker names include Modal's opaque Volume ID, so deleting and recreating a cache cannot leave a
+  stale marker attached to the replacement Volume.
+- The Sandbox main process's stdout/stderr is drained from creation through teardown. A bounded,
+  redacted prefix is forwarded as typed `log` events, and readiness failures include a bounded recent
+  tail plus the Sandbox exit code when available. Raw container output never bypasses the JSONL event
+  contract.
 - `timeoutMs: 1_800_000` (30 min) is the provider-side lifetime backstop.
 
 Auth comes from the ambient env (`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`) or `~/.modal.toml` —

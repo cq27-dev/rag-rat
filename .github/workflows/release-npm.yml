@@ -152,6 +152,6 @@ jobs:
             echo "$name@$ver already on npm — skipping"
           else
             echo "publishing $name@$ver"
-            # `npm ci` restores devDeps (typescript/tsx) so the prepack `tsc` can build dist/.
-            (cd cookbook && npm ci && npm publish --access public)
+            # Validate the recipe contract before prepack builds dist/ and publishes it.
+            (cd cookbook && npm ci && npm run typecheck && npm test && npm publish --access public)
           fi

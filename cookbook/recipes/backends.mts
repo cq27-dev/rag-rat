@@ -186,7 +186,17 @@ const INFINITY_SPEC: BackendServerSpec = {
   // binds 0.0.0.0 by default, so no host flag is needed. server_concurrency is intentionally NOT
   // mapped: infinity's async engine batches dynamically, so there's no concurrent-request knob —
   // rag-rat's client-side fan-out tune still applies.
-  entrypointArgs: (input) => ["v2", "--model-id", input.model, "--port", String(INFINITY_PORT)],
+  entrypointArgs: (input) => [
+    "v2",
+    "--model-id",
+    input.model,
+    // The CPU image defaults to optimum/OpenVINO and writes generated `infinity_onnx` artifacts
+    // under HF_HUB_CACHE. Those artifacts can fail on the next Sandbox even when generation fell
+    // back successfully (#690 cold→warm test). Torch caches only the portable downloaded model.
+    ...(input.gpu == null ? ["--engine", "torch", "--device", "cpu"] : []),
+    "--port",
+    String(INFINITY_PORT),
+  ],
   env: () => ({}),
   // infinity's OpenAI shape lives at `/embeddings` (it also mounts `/v1/embeddings`, but `/embeddings`
   // is canonical and is what `RemoteBackend::embed_path` uses). Chat is unsupported → throw.
