@@ -3006,6 +3006,15 @@ fn migration_077_builds_the_distill_record_store() {
 
 #[test]
 fn migration_078_is_the_tip_and_distinguishes_candidates_from_selections() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct UpgradedAnchor {
+        item_key: String,
+        candidate_ordinal: i64,
+        selected: i64,
+        logical_symbol_id: Option<String>,
+        file_path: Option<String>,
+    }
+
     assert_eq!(schema::LATEST_SCHEMA_VERSION, 78, "move this pin with the next schema migration");
 
     // Exercise the real V077 -> V078 upgrade with existing rows. Row-id order is the deterministic
@@ -3039,22 +3048,48 @@ fn migration_078_is_the_tip_and_distinguishes_candidates_from_selections() {
         .unwrap();
     schema::apply_distill_anchor_selection(&legacy).unwrap();
 
-    let upgraded: Vec<(String, i64, i64, Option<String>, Option<String>)> = legacy
+    let upgraded: Vec<UpgradedAnchor> = legacy
         .prepare(
             "SELECT item_key, candidate_ordinal, selected, logical_symbol_id, file_path
              FROM papertrail_distill_anchors ORDER BY id",
         )
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        .query_map([], |row| {
+            Ok(UpgradedAnchor {
+                item_key: row.get(0)?,
+                candidate_ordinal: row.get(1)?,
+                selected: row.get(2)?,
+                logical_symbol_id: row.get(3)?,
+                file_path: row.get(4)?,
+            })
+        })
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(
         upgraded,
         vec![
-            ("5".into(), 0, 0, None, Some("src/widget.rs".into())),
-            ("5".into(), 1, 0, Some("sym_3e7".into()), Some("src/widget.rs".into()),),
-            ("6".into(), 0, 0, None, Some("src/other.rs".into())),
+            UpgradedAnchor {
+                item_key: "5".into(),
+                candidate_ordinal: 0,
+                selected: 0,
+                logical_symbol_id: None,
+                file_path: Some("src/widget.rs".into()),
+            },
+            UpgradedAnchor {
+                item_key: "5".into(),
+                candidate_ordinal: 1,
+                selected: 0,
+                logical_symbol_id: Some("sym_3e7".into()),
+                file_path: Some("src/widget.rs".into()),
+            },
+            UpgradedAnchor {
+                item_key: "6".into(),
+                candidate_ordinal: 0,
+                selected: 0,
+                logical_symbol_id: None,
+                file_path: Some("src/other.rs".into()),
+            },
         ],
         "backfill is per-thread, deterministic, unselected, and preserves exact anchors",
     );
