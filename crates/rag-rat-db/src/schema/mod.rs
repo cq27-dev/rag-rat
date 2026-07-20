@@ -11,10 +11,10 @@ pub use migrations::{
     apply_account_candidate_dag, apply_clone_delta_maintenance, apply_clone_df_epoch,
     apply_clone_fingerprint_tables, apply_clone_graph_tables, apply_content_candidate_dag,
     apply_content_projected_tables, apply_content_streams_pending_refold,
-    apply_distill_anchor_selection, apply_distill_record_store, apply_dream_findings,
-    apply_edge_string_interning, apply_edge_target_qname_index, apply_external_symbols,
-    apply_files_generation, apply_files_has_test_code, apply_git_change_couplings,
-    apply_github_child_key_widening, apply_github_repo_id_scoping,
+    apply_distill_anchor_selection, apply_distill_record_store, apply_distill_safe_input_snapshot,
+    apply_dream_findings, apply_edge_string_interning, apply_edge_target_qname_index,
+    apply_external_symbols, apply_files_generation, apply_files_has_test_code,
+    apply_git_change_couplings, apply_github_child_key_widening, apply_github_repo_id_scoping,
     apply_memory_model_failures_table, apply_memory_verification_tables, apply_move_per_repo_meta,
     apply_oplog_device_identity, apply_oplog_device_x25519, apply_oplog_local_account,
     apply_oplog_storage, apply_oplog_stream_scoping, apply_oracle_tables,
@@ -44,7 +44,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 78;
+pub const LATEST_SCHEMA_VERSION: u32 = 79;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -576,6 +576,14 @@ const MIGRATION_078_DESCRIPTION: &str =
      deterministically backfill V077 rows in insertion order per thread; enforce ordinal \
      uniqueness and boolean selected values; index selected anchors. Additive; existing anchor \
      identity/path columns are unchanged";
+const MIGRATION_079_ID: &str = "079_distill_safe_input_snapshot";
+const MIGRATION_079_CHECKSUM: &str = "sha256:rag-rat-distill-safe-input-snapshot-v79";
+const MIGRATION_079_DESCRIPTION: &str =
+    "Add extraction-owned safe-input snapshots for distillation (issue #704): exact ordered \
+     title/body/comment sources with full thread and partner identity, provenance, timestamps, \
+     and every deterministic block-unit byte span; add prompt_version/model_input_hash \
+     model-output stamps. Additive and intentionally does not backfill snapshots from the mutable \
+     mirror";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1235,6 +1243,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_078_CHECKSUM,
         description: MIGRATION_078_DESCRIPTION,
         apply: MigrationFn::Plain(apply_distill_anchor_selection),
+    },
+    Migration {
+        id: MIGRATION_079_ID,
+        checksum: MIGRATION_079_CHECKSUM,
+        description: MIGRATION_079_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_distill_safe_input_snapshot),
     },
 ];
 

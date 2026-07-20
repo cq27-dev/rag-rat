@@ -214,6 +214,24 @@ fn register_repo_repoints_distill_rows_from_the_placeholder() {
         [LEGACY_REPO_ID],
     )
     .unwrap();
+    conn.execute(
+        "INSERT INTO papertrail_distill_sources
+             (tracker, project, item_kind, item_key, source_ordinal, role, partner_ordinal,
+              source_item_kind, source_item_key, source_kind, source_part, source_id, exact_text,
+              repo_id)
+         VALUES \
+         ('github','o/r','issue','5',0,'primary',NULL,'issue','5','item','body','5','body',?1)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO papertrail_distill_units
+             (tracker, project, item_kind, item_key, unit_ordinal, source_ordinal, byte_start,
+              byte_end, repo_id)
+         VALUES ('github','o/r','issue','5',0,0,0,4,?1)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
 
     register_repo(
         &conn,
@@ -228,6 +246,16 @@ fn register_repo_repoints_distill_rows_from_the_placeholder() {
         .query_row("SELECT repo_id FROM papertrail_distill WHERE item_key='5'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(repo_id, "repo-abc", "the distill row is re-pointed to the adopted repo id");
+    for table in ["papertrail_distill_sources", "papertrail_distill_units"] {
+        let adopted: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE repo_id='repo-abc'"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(adopted, 1, "the snapshot table `{table}` is re-pointed too");
+    }
 }
 
 /// Re-applying the full schema AFTER adoption must NOT resurrect the `__unassigned__` placeholder.

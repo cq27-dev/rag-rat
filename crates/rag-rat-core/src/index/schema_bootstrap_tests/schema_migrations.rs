@@ -2930,6 +2930,8 @@ fn migration_077_builds_the_distill_record_store() {
         "item_key",
         "distill_input_hash",
         "pipeline_version",
+        "prompt_version",
+        "model_input_hash",
         "root_issue",
         "root_cause",
         "root_cause_class",
@@ -3005,7 +3007,7 @@ fn migration_077_builds_the_distill_record_store() {
 }
 
 #[test]
-fn migration_078_is_the_tip_and_distinguishes_candidates_from_selections() {
+fn migration_078_distinguishes_candidates_from_selections() {
     #[derive(Debug, PartialEq, Eq)]
     struct UpgradedAnchor {
         item_key: String,
@@ -3014,8 +3016,6 @@ fn migration_078_is_the_tip_and_distinguishes_candidates_from_selections() {
         logical_symbol_id: Option<String>,
         file_path: Option<String>,
     }
-
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 78, "move this pin with the next schema migration");
 
     // Exercise the real V077 -> V078 upgrade with existing rows. Row-id order is the deterministic
     // tie-break within each thread; a second thread starts its own zero-based ordinal sequence.
@@ -3128,7 +3128,7 @@ fn migration_078_is_the_tip_and_distinguishes_candidates_from_selections() {
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 78);
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let v78_recorded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM schema_version WHERE id = '078_distill_anchor_selection'",
@@ -3149,4 +3149,108 @@ fn migration_078_is_the_tip_and_distinguishes_candidates_from_selections() {
             .unwrap();
         assert_eq!(present, 1, "V078 index `{index}` exists");
     }
+}
+
+#[test]
+fn migration_079_is_the_tip_and_builds_safe_input_snapshots() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 79, "move this pin with the next schema migration");
+
+    let legacy = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_distill_record_store(&legacy).unwrap();
+    schema::apply_distill_anchor_selection(&legacy).unwrap();
+    assert!(!conn_table_columns(&legacy, "papertrail_distill").contains(&"prompt_version".into()));
+    assert!(!schema::table_exists(&legacy, "papertrail_distill_sources").unwrap());
+
+    schema::apply_distill_safe_input_snapshot(&legacy).unwrap();
+    let distill_columns = conn_table_columns(&legacy, "papertrail_distill");
+    assert!(distill_columns.contains(&"prompt_version".into()));
+    assert!(distill_columns.contains(&"model_input_hash".into()));
+    for table in ["papertrail_distill_sources", "papertrail_distill_units"] {
+        assert!(schema::table_exists(&legacy, table).unwrap(), "V079 table `{table}` exists");
+    }
+
+    legacy
+        .execute(
+            "INSERT INTO papertrail_distill_sources
+                 (tracker, project, item_kind, item_key, source_ordinal, role, partner_ordinal,
+                  source_item_kind, source_item_key, source_kind, source_part, source_id,
+                  exact_text, repo_id)
+             VALUES ('github','o/r','issue','5',0,'primary',NULL,'issue','5','item','title','5',
+                     'same','repoA')",
+            [],
+        )
+        .unwrap();
+    legacy
+        .execute(
+            "INSERT INTO papertrail_distill_sources
+                 (tracker, project, item_kind, item_key, source_ordinal, role, partner_ordinal,
+                  source_item_kind, source_item_key, source_kind, source_part, source_id,
+                  exact_text, repo_id)
+             VALUES ('github','o/r','issue','5',0,'primary',NULL,'issue','5','item','title','5',
+                     'same','repoB')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        legacy
+            .execute(
+                "INSERT INTO papertrail_distill_sources
+                     (tracker, project, item_kind, item_key, source_ordinal, role, partner_ordinal,
+                      source_item_kind, source_item_key, source_kind, source_part, source_id,
+                      exact_text, repo_id)
+                 VALUES ('github','o/r','issue','5',0,'primary',NULL,'issue','5','item','body','5',
+                         'same','repoA')",
+                [],
+            )
+            .is_err(),
+        "source ordinals are unique only inside the full repo-scoped record identity",
+    );
+    assert!(
+        legacy
+            .execute(
+                "INSERT INTO papertrail_distill_sources
+                     (tracker, project, item_kind, item_key, source_ordinal, role, partner_ordinal,
+                      source_item_kind, source_item_key, source_kind, source_part, source_id,
+                      exact_text, repo_id)
+                 VALUES ('github','o/r','issue','5',1,'partner',NULL,'change_request','6','item',
+                         'body','6','x','repoA')",
+                [],
+            )
+            .is_err(),
+        "partner sources require a partner ordinal",
+    );
+    assert!(
+        legacy
+            .execute(
+                "INSERT INTO papertrail_distill_units
+                     (tracker, project, item_kind, item_key, unit_ordinal, source_ordinal,
+                      byte_start, byte_end, repo_id)
+                 VALUES ('github','o/r','issue','5',0,0,4,4,'repoA')",
+                [],
+            )
+            .is_err(),
+        "unit spans are non-empty half-open byte ranges",
+    );
+
+    // Torn replay: both columns and the source table survived, while the unit table/index did not.
+    // The additive applier must converge without touching existing source rows.
+    legacy.execute_batch("DROP TABLE papertrail_distill_units;").unwrap();
+    schema::apply_distill_safe_input_snapshot(&legacy).unwrap();
+    assert!(schema::table_exists(&legacy, "papertrail_distill_units").unwrap());
+    let sources: i64 = legacy
+        .query_row("SELECT COUNT(*) FROM papertrail_distill_sources", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(sources, 2, "replay preserves existing snapshots");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, 79);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '079_distill_safe_input_snapshot'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V079");
 }

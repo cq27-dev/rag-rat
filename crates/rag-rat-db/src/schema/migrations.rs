@@ -1327,6 +1327,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_076_ID => Some(76),
             MIGRATION_077_ID => Some(77),
             MIGRATION_078_ID => Some(78),
+            MIGRATION_079_ID => Some(79),
             _ => None,
         })
         .max()
@@ -1414,6 +1415,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_076_ID
             | MIGRATION_077_ID
             | MIGRATION_078_ID
+            | MIGRATION_079_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1498,6 +1500,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_076_ID => migration.checksum != MIGRATION_076_CHECKSUM,
         MIGRATION_077_ID => migration.checksum != MIGRATION_077_CHECKSUM,
         MIGRATION_078_ID => migration.checksum != MIGRATION_078_CHECKSUM,
+        MIGRATION_079_ID => migration.checksum != MIGRATION_079_CHECKSUM,
         _ => false,
     }
 }
@@ -5473,6 +5476,75 @@ pub fn apply_distill_anchor_selection(conn: &Connection) -> rusqlite::Result<()>
             ON papertrail_distill_anchors(
                 repo_id, tracker, project, item_kind, item_key, candidate_ordinal
             ) WHERE selected = 1;
+        ",
+    )
+}
+
+/// V079 — extraction-owned, immutable-for-one-input source and unit snapshots (#704).
+///
+/// There is deliberately no SQL backfill: old derived records must regenerate under the bumped
+/// extraction pipeline and snapshot the mirror rows read in that same transaction. Backfilling
+/// here would falsely attach today's mutable mirror text to an older `distill_input_hash`.
+pub fn apply_distill_safe_input_snapshot(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "papertrail_distill", "prompt_version", "INTEGER")?;
+    add_column_if_missing(conn, "papertrail_distill", "model_input_hash", "TEXT")?;
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS papertrail_distill_sources(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL,
+            project TEXT NOT NULL,
+            item_kind TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            source_ordinal INTEGER NOT NULL CHECK(source_ordinal >= 0),
+            role TEXT NOT NULL CHECK(role IN ('primary', 'partner')),
+            partner_ordinal INTEGER CHECK(partner_ordinal >= 0),
+            source_item_kind TEXT NOT NULL,
+            source_item_key TEXT NOT NULL,
+            source_kind TEXT NOT NULL CHECK(source_kind IN ('item', 'comment')),
+            source_part TEXT NOT NULL CHECK(source_part IN ('title', 'body', 'comment')),
+            source_id TEXT NOT NULL,
+            exact_text TEXT NOT NULL,
+            author TEXT,
+            author_kind TEXT,
+            author_association TEXT,
+            created_at_ms INTEGER,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            CHECK((role = 'primary' AND partner_ordinal IS NULL) OR
+                  (role = 'partner' AND partner_ordinal IS NOT NULL)),
+            CHECK((source_kind = 'item' AND source_part IN ('title', 'body')) OR
+                  (source_kind = 'comment' AND source_part = 'comment'))
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_distill_sources_ordinal
+            ON papertrail_distill_sources(
+                repo_id, tracker, project, item_kind, item_key, source_ordinal
+            );
+        CREATE INDEX IF NOT EXISTS idx_papertrail_distill_sources_identity
+            ON papertrail_distill_sources(
+                repo_id, tracker, project, source_item_kind, source_item_key, source_kind, \
+         source_id
+            );
+
+        CREATE TABLE IF NOT EXISTS papertrail_distill_units(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL,
+            project TEXT NOT NULL,
+            item_kind TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            unit_ordinal INTEGER NOT NULL CHECK(unit_ordinal >= 0),
+            source_ordinal INTEGER NOT NULL CHECK(source_ordinal >= 0),
+            byte_start INTEGER NOT NULL CHECK(byte_start >= 0),
+            byte_end INTEGER NOT NULL CHECK(byte_end > byte_start),
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_distill_units_ordinal
+            ON papertrail_distill_units(
+                repo_id, tracker, project, item_kind, item_key, unit_ordinal
+            );
+        CREATE INDEX IF NOT EXISTS idx_papertrail_distill_units_source
+            ON papertrail_distill_units(
+                repo_id, tracker, project, item_kind, item_key, source_ordinal, unit_ordinal
+            );
         ",
     )
 }

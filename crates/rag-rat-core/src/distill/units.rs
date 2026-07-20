@@ -7,8 +7,8 @@
 //! range — so a fenced code block (which contains blank lines) stays ONE unit instead of shattering
 //! the way a naive blank-line split would.
 //!
-//! This module is deterministic and model-free: it is exercised in Phase 1 to compute the
-//! regeneration hash over ordered spans, and reused at drain time (#704) to build the LLM input.
+//! This module is deterministic and model-free: extraction snapshots every ordered span, and drain
+//! time (#704) applies the prompt budget to those durable units.
 
 use pulldown_cmark::{Event, Options, Parser};
 
@@ -23,10 +23,12 @@ pub(crate) struct Span {
 impl Span {
     /// The exact source substring this span selects. Callers materialize quotes through here so the
     /// "quote == source substring" invariant holds by construction.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the drain materializes snapshot quotes"))]
     pub(crate) fn slice(self, text: &str) -> &str {
         &text[self.start..self.end]
     }
 
+    #[cfg_attr(not(test), allow(dead_code, reason = "the drain applies the unit budget"))]
     fn len(self) -> usize {
         self.end - self.start
     }
@@ -109,6 +111,7 @@ fn push_trimmed(spans: &mut Vec<Span>, text: &str, start: usize, end: usize) {
 /// is kept past the limit (we never split a unit — that would break the span→quote invariant); any
 /// other over-budget set is trimmed, so even a two-unit thread (a short title + a huge body) cannot
 /// smuggle an arbitrarily large input past the budget.
+#[cfg_attr(not(test), allow(dead_code, reason = "the drain applies the unit budget"))]
 pub(crate) fn tail_aware_budget(spans: &[Span], max_total: usize) -> BudgetPlan {
     let total: usize = spans.iter().map(|s| s.len()).sum();
     if total <= max_total {
@@ -141,6 +144,7 @@ pub(crate) fn tail_aware_budget(spans: &[Span], max_total: usize) -> BudgetPlan 
     BudgetPlan { dropped: n - kept.len(), kept_bytes, kept }
 }
 
+#[cfg_attr(not(test), allow(dead_code, reason = "the drain applies the unit budget"))]
 fn try_grow(spans: &[Span], idx: usize, kept_bytes: &mut usize, max_total: usize) -> Option<()> {
     let next = *kept_bytes + spans[idx].len();
     if next <= max_total {

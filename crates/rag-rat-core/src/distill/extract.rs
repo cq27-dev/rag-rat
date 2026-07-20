@@ -22,25 +22,17 @@ use crate::distill::{units, validate};
 
 /// Bumped whenever the extraction/prompt contract changes in a way that invalidates existing
 /// records — part of the regeneration identity alongside `distill_input_hash`.
-pub(crate) const PIPELINE_VERSION: i64 = 1;
-
-/// Default byte budget for a thread's assembled units (head+tail retained, middle dropped).
-const DEFAULT_MAX_THREAD_BYTES: usize = 26_000;
+pub(crate) const PIPELINE_VERSION: i64 = 2;
 
 /// Knobs for one extraction pass.
 pub(crate) struct ExtractOptions {
     pub pipeline_version: i64,
-    pub max_thread_bytes: usize,
     pub anchor_caps: AnchorCaps,
 }
 
 impl Default for ExtractOptions {
     fn default() -> Self {
-        Self {
-            pipeline_version: PIPELINE_VERSION,
-            max_thread_bytes: DEFAULT_MAX_THREAD_BYTES,
-            anchor_caps: AnchorCaps::default(),
-        }
+        Self { pipeline_version: PIPELINE_VERSION, anchor_caps: AnchorCaps::default() }
     }
 }
 
@@ -320,6 +312,114 @@ struct WriteOutcome {
     mechanical_status: OutcomeStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceRole {
+    Primary,
+    Partner,
+}
+
+impl SourceRole {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Partner => "partner",
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "the drain will hydrate persisted snapshots"))]
+    fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "primary" => Ok(Self::Primary),
+            "partner" => Ok(Self::Partner),
+            other => anyhow::bail!("unknown distill source role `{other}`"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceKind {
+    Item,
+    Comment,
+}
+
+impl SourceKind {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Item => "item",
+            Self::Comment => "comment",
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "the drain will hydrate persisted snapshots"))]
+    fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "item" => Ok(Self::Item),
+            "comment" => Ok(Self::Comment),
+            other => anyhow::bail!("unknown distill source kind `{other}`"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourcePart {
+    Title,
+    Body,
+    Comment,
+}
+
+impl SourcePart {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Body => "body",
+            Self::Comment => "comment",
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "the drain will hydrate persisted snapshots"))]
+    fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "title" => Ok(Self::Title),
+            "body" => Ok(Self::Body),
+            "comment" => Ok(Self::Comment),
+            other => anyhow::bail!("unknown distill source part `{other}`"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ThreadSnapshot {
+    sources: Vec<SnapshotSource>,
+    units: Vec<SnapshotUnit>,
+}
+
+#[derive(Debug)]
+struct SnapshotSource {
+    ordinal: usize,
+    role: SourceRole,
+    partner_ordinal: Option<usize>,
+    item_kind: ItemKind,
+    item_key: String,
+    kind: SourceKind,
+    part: SourcePart,
+    /// Item sources use their item key; comment sources use the provider-qualified comment id.
+    /// Together with `(source_item_kind, source_item_key, source_kind, source_part)` this is an
+    /// unambiguous identity even when title and body text are byte-identical.
+    id: String,
+    exact_text: String,
+    author: Option<String>,
+    author_kind: Option<String>,
+    author_association: Option<String>,
+    created_at_ms: Option<i64>,
+}
+
+#[derive(Debug)]
+struct SnapshotUnit {
+    ordinal: usize,
+    source_ordinal: usize,
+    span: units::Span,
+}
+
 /// Assemble and persist one record: units → hash, fixing commits, coalesced edges, anchor
 /// candidates, status floors, the skeleton row, and the queue entry.
 fn write_record(
@@ -338,18 +438,10 @@ fn write_record(
             anyhow::anyhow!("record item {}#{} vanished mid-pass", plan.kind.as_db_str(), plan.key)
         })?;
 
-    // --- Text assembly: record TITLE + body + comments, then each partner's title + body +
-    // comments, in order. The title leads because for a thin/empty-body thread it IS the problem
-    // statement, and it must ride the regeneration hash so a title-only edit re-distills. Alongside
-    // the text we collect an ordered provenance stream (source id + author association): #704
-    // snapshots per-unit provenance and gates the decision floor on maintainer authorship, so a
-    // provenance-only change (a new comment, a re-associated author) must regenerate even when
-    // the text is identical.
-    let mut blobs: Vec<String> = vec![item.title.clone(), item.body.clone()];
-    let mut provenance: Vec<(String, Option<String>)> = vec![(
-        format!("{}/{}#item", plan.kind.as_db_str(), plan.key),
-        item.author_association.clone(),
-    )];
+    // Snapshot exact source rows before deriving anything lossy. The snapshot, its hash, and the
+    // skeleton are committed in this extraction transaction, so later mirror LWW edits cannot make
+    // a model citation point at different bytes.
+    let snapshot = build_thread_snapshot(conn, repo_id, plan, item, by_key)?;
     // Body length spans the whole coalesced thread (issue + partner PRs), so a thin issue body with
     // a substantial partner PR is not misclassified `thin`.
     let mut body_len = item.body.len();
@@ -357,10 +449,6 @@ fn write_record(
         load_comments(conn, repo_id, &plan.tracker, &plan.project, plan.kind, &plan.key)?;
     let mut total_comments = record_comments.len();
     let mut review_comments = record_comments.iter().filter(|c| c.is_review).count();
-    for comment in &record_comments {
-        blobs.push(comment.body.clone());
-        provenance.push((comment.comment_id.clone(), comment.author_association.clone()));
-    }
     for partner in &plan.partners {
         let partner_id = (
             plan.tracker.clone(),
@@ -369,12 +457,6 @@ fn write_record(
             partner.clone(),
         );
         if let Some(pr) = by_key.get(&partner_id) {
-            blobs.push(pr.title.clone());
-            blobs.push(pr.body.clone());
-            provenance.push((
-                format!("{}/{partner}#item", ItemKind::ChangeRequest.as_db_str()),
-                pr.author_association.clone(),
-            ));
             body_len += pr.body.len();
         }
         let partner_comments = load_comments(
@@ -387,13 +469,7 @@ fn write_record(
         )?;
         total_comments += partner_comments.len();
         review_comments += partner_comments.iter().filter(|c| c.is_review).count();
-        for comment in &partner_comments {
-            blobs.push(comment.body.clone());
-            provenance.push((comment.comment_id.clone(), comment.author_association.clone()));
-        }
     }
-    // Segment every blob into units, budget the concatenation head+tail, keep the retained texts.
-    let unit_texts = budgeted_unit_texts(&blobs, opts.max_thread_bytes);
 
     let changed_paths = changed_paths_for(conn, repo_id, repo, &plan.fix_shas)?;
     // The closing-keyword floor comes from the canonical parser's text-tier closing edge
@@ -452,10 +528,11 @@ fn write_record(
 
     let input_hash = compute_input_hash(&HashInputs {
         pipeline_version: opts.pipeline_version,
+        repo_id,
         plan,
-        unit_texts: &unit_texts,
+        snapshot: &snapshot,
         changed_paths: &changed_paths,
-        provenance: &provenance,
+        thread_shape: thread_shape.as_db_str(),
         revert_override,
         closing_keyword,
         anchors: &anchors,
@@ -484,6 +561,9 @@ fn write_record(
         revert_override,
         closing_keyword,
     })?;
+    if state != RecordState::Unchanged {
+        replace_snapshot(conn, repo_id, plan, &snapshot)?;
+    }
     write_commits(conn, repo_id, plan, &plan.fix_shas)?;
     write_coalesced_edges(conn, repo_id, now, plan)?;
     if rebuild_anchor_candidates {
@@ -497,117 +577,219 @@ fn write_record(
     Ok(WriteOutcome { queued, mechanical_status })
 }
 
-/// Segment each blob into block units, then apply the tail-aware budget across the concatenation,
-/// returning the retained unit texts in source order.
-fn budgeted_unit_texts(blobs: &[String], max_total: usize) -> Vec<String> {
-    let mut texts: Vec<String> = Vec::new();
-    for blob in blobs {
-        for span in units::segment_blocks(blob) {
-            texts.push(span.slice(blob).to_string());
-        }
-    }
-    let spans: Vec<units::Span> = {
-        // Re-express the retained texts as contiguous spans purely to reuse the budget planner.
-        let mut offset = 0usize;
-        texts
-            .iter()
-            .map(|t| {
-                let s = units::Span { start: offset, end: offset + t.len() };
-                offset += t.len();
-                s
-            })
-            .collect()
-    };
-    let plan = units::tail_aware_budget(&spans, max_total);
-    plan.kept.into_iter().map(|i| texts[i].clone()).collect()
-}
-
 /// Everything that folds into a record's regeneration identity.
 struct HashInputs<'a> {
     pipeline_version: i64,
+    repo_id: &'a str,
     plan: &'a RecordPlan,
-    unit_texts: &'a [String],
+    snapshot: &'a ThreadSnapshot,
     changed_paths: &'a [String],
-    provenance: &'a [(String, Option<String>)],
+    thread_shape: &'a str,
     revert_override: bool,
     closing_keyword: Option<&'a str>,
     anchors: &'a [candidates::AnchorCandidate],
 }
 
-/// The regeneration identity: pipeline version, the record's kind/key, coalesce partners, retained
-/// unit texts, per-source provenance, sorted changed-file selection, fix-edge source + SHAs, and
-/// the computed mechanical status floors. Any change re-derives a new hash, which the natural-key
-/// upsert treats as a fresh record — so a floor that flips later (a landed revert ref arrives, or a
-/// fix commit's message becomes available and yields a closing keyword) re-queues the record for
-/// #704.
+/// The regeneration identity: pipeline version, full record identity, the complete exact source
+/// snapshot and every unit span, sorted changed-file selection, fix-edge source + SHAs, and the
+/// computed mechanical status floors. Prompt budgeting is deliberately absent: truncation cannot
+/// hide a mutable source edit from regeneration.
 fn compute_input_hash(inputs: &HashInputs<'_>) -> String {
     let HashInputs {
         pipeline_version,
+        repo_id,
         plan,
-        unit_texts,
+        snapshot,
         changed_paths,
-        provenance,
+        thread_shape,
         revert_override,
         closing_keyword,
         anchors,
     } = inputs;
     let mut hasher = Sha256::new();
+    hash_str(&mut hasher, "rag-rat-distill-input-v2");
     hasher.update(pipeline_version.to_le_bytes());
-    hasher
-        .update([plan.kind.as_db_str().as_bytes(), b"\x1f", plan.key.as_bytes(), b"\x1e"].concat());
-    for partner in &plan.partners {
-        hasher.update(partner.as_bytes());
-        hasher.update(b"\x1f");
+    hash_str(&mut hasher, repo_id);
+    hash_str(&mut hasher, &plan.tracker);
+    hash_str(&mut hasher, &plan.project);
+    hash_str(&mut hasher, plan.kind.as_db_str());
+    hash_str(&mut hasher, &plan.key);
+    hash_str(&mut hasher, "sources");
+    hasher.update((snapshot.sources.len() as u64).to_le_bytes());
+    for source in &snapshot.sources {
+        hasher.update((source.ordinal as u64).to_le_bytes());
+        hash_str(&mut hasher, source.role.as_db_str());
+        hash_optional_u64(&mut hasher, source.partner_ordinal.map(|value| value as u64));
+        hash_str(&mut hasher, source.item_kind.as_db_str());
+        hash_str(&mut hasher, &source.item_key);
+        hash_str(&mut hasher, source.kind.as_db_str());
+        hash_str(&mut hasher, source.part.as_db_str());
+        hash_str(&mut hasher, &source.id);
+        hash_str(&mut hasher, &source.exact_text);
+        hash_optional_str(&mut hasher, source.author.as_deref());
+        hash_optional_str(&mut hasher, source.author_kind.as_deref());
+        hash_optional_str(&mut hasher, source.author_association.as_deref());
+        hash_optional_i64(&mut hasher, source.created_at_ms);
     }
-    hasher.update(b"\x1e");
-    for text in *unit_texts {
-        hasher.update(text.as_bytes());
-        hasher.update(b"\x1f");
+    hash_str(&mut hasher, "units");
+    hasher.update((snapshot.units.len() as u64).to_le_bytes());
+    for unit in &snapshot.units {
+        hasher.update((unit.ordinal as u64).to_le_bytes());
+        hasher.update((unit.source_ordinal as u64).to_le_bytes());
+        hasher.update((unit.span.start as u64).to_le_bytes());
+        hasher.update((unit.span.end as u64).to_le_bytes());
     }
-    // Ordered source identity + author association: a new/removed comment or a re-associated author
-    // (which #704 snapshots and gates the decision floor on) regenerates even with identical text.
-    hasher.update(b"\x1e");
-    for (source_id, association) in *provenance {
-        hasher.update(source_id.as_bytes());
-        hasher.update(b"\x1f");
-        hasher.update(association.as_deref().unwrap_or("").as_bytes());
-        hasher.update(b"\x1f");
-    }
-    hasher.update(b"\x1e");
+    hash_str(&mut hasher, "changed_paths");
     let mut sorted = changed_paths.to_vec();
     sorted.sort();
+    hasher.update((sorted.len() as u64).to_le_bytes());
     for path in sorted {
-        hasher.update(path.as_bytes());
-        hasher.update(b"\x1f");
+        hash_str(&mut hasher, &path);
     }
     // Mechanical fix-edge inputs + computed status floors: a changed closing edge / merge SHA (same
     // files), a flipped provenance tier, or a floor that flips later must invalidate the model's
     // decision/outcome even when the thread text is identical.
-    hasher.update(b"\x1e");
-    hasher.update(plan.fix_edge_source.as_db_str().as_bytes());
+    hash_str(&mut hasher, "status_inputs");
+    hash_str(&mut hasher, plan.fix_edge_source.as_db_str());
+    hash_str(&mut hasher, thread_shape);
     hasher.update([*revert_override as u8]);
-    hasher.update(closing_keyword.unwrap_or("").as_bytes());
-    hasher.update(b"\x1e");
+    hash_optional_str(&mut hasher, *closing_keyword);
+    hash_str(&mut hasher, "fix_commits");
     let mut shas = plan.fix_shas.clone();
     shas.sort();
+    hasher.update((shas.len() as u64).to_le_bytes());
     for sha in shas {
-        hasher.update(sha.as_bytes());
-        hasher.update(b"\x1f");
+        hash_str(&mut hasher, &sha);
     }
     // Anchor candidate set: #704 selects anchors from this pool, so a reindex that resolves new
     // logical symbols (candidates absent at first extraction, present after) must re-queue the
     // record. Hash each candidate's identity; mining order is already deterministic.
-    hasher.update(b"\x1e");
+    hash_str(&mut hasher, "anchors");
+    hasher.update((anchors.len() as u64).to_le_bytes());
     for anchor in *anchors {
-        hasher.update(anchor.kind.as_db_str().as_bytes());
-        hasher.update(b"\x1f");
-        hasher.update(anchor.logical_symbol_id.as_deref().unwrap_or("").as_bytes());
-        hasher.update(b"\x1f");
-        hasher.update(anchor.name.as_bytes());
-        hasher.update(b"\x1f");
+        hash_str(&mut hasher, anchor.kind.as_db_str());
+        hash_optional_str(&mut hasher, anchor.logical_symbol_id.as_deref());
+        hash_optional_str(&mut hasher, anchor.file_path.as_deref());
+        hash_str(&mut hasher, &anchor.name);
+        hasher.update([anchor.resolved as u8]);
     }
     let hex: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
     format!("sha256:{hex}")
+}
+
+fn hash_str(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn hash_optional_str(hasher: &mut Sha256, value: Option<&str>) {
+    hasher.update([u8::from(value.is_some())]);
+    if let Some(value) = value {
+        hash_str(hasher, value);
+    }
+}
+
+fn hash_optional_i64(hasher: &mut Sha256, value: Option<i64>) {
+    hasher.update([u8::from(value.is_some())]);
+    if let Some(value) = value {
+        hasher.update(value.to_le_bytes());
+    }
+}
+
+fn hash_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
+    hasher.update([u8::from(value.is_some())]);
+    if let Some(value) = value {
+        hasher.update(value.to_le_bytes());
+    }
+}
+
+fn build_thread_snapshot(
+    conn: &Connection,
+    repo_id: &str,
+    plan: &RecordPlan,
+    primary: &ItemRow,
+    by_key: &BTreeMap<(String, String, &'static str, String), &ItemRow>,
+) -> anyhow::Result<ThreadSnapshot> {
+    let mut snapshot = ThreadSnapshot { sources: Vec::new(), units: Vec::new() };
+    append_item_snapshot(
+        &mut snapshot,
+        SourceRole::Primary,
+        None,
+        primary,
+        load_comments(conn, repo_id, &plan.tracker, &plan.project, primary.kind, &primary.key)?,
+    );
+    for (partner_ordinal, partner_key) in plan.partners.iter().enumerate() {
+        let partner_identity = (
+            plan.tracker.clone(),
+            plan.project.clone(),
+            ItemKind::ChangeRequest.as_db_str(),
+            partner_key.clone(),
+        );
+        let partner = by_key.get(&partner_identity).copied().ok_or_else(|| {
+            anyhow::anyhow!("coalesced partner change_request#{partner_key} vanished mid-pass")
+        })?;
+        append_item_snapshot(
+            &mut snapshot,
+            SourceRole::Partner,
+            Some(partner_ordinal),
+            partner,
+            load_comments(conn, repo_id, &plan.tracker, &plan.project, partner.kind, &partner.key)?,
+        );
+    }
+    Ok(snapshot)
+}
+
+fn append_item_snapshot(
+    snapshot: &mut ThreadSnapshot,
+    role: SourceRole,
+    partner_ordinal: Option<usize>,
+    item: &ItemRow,
+    comments: Vec<CommentRow>,
+) {
+    for (part, exact_text) in
+        [(SourcePart::Title, item.title.clone()), (SourcePart::Body, item.body.clone())]
+    {
+        append_snapshot_source(snapshot, SnapshotSource {
+            ordinal: snapshot.sources.len(),
+            role,
+            partner_ordinal,
+            item_kind: item.kind,
+            item_key: item.key.clone(),
+            kind: SourceKind::Item,
+            part,
+            id: item.key.clone(),
+            exact_text,
+            author: item.author.clone(),
+            author_kind: item.author_kind.clone(),
+            author_association: item.author_association.clone(),
+            created_at_ms: item.created_at_ms,
+        });
+    }
+    for comment in comments {
+        append_snapshot_source(snapshot, SnapshotSource {
+            ordinal: snapshot.sources.len(),
+            role,
+            partner_ordinal,
+            item_kind: item.kind,
+            item_key: item.key.clone(),
+            kind: SourceKind::Comment,
+            part: SourcePart::Comment,
+            id: comment.comment_id,
+            exact_text: comment.body,
+            author: comment.author,
+            author_kind: comment.author_kind,
+            author_association: comment.author_association,
+            created_at_ms: comment.created_at_ms,
+        });
+    }
+}
+
+fn append_snapshot_source(snapshot: &mut ThreadSnapshot, source: SnapshotSource) {
+    let source_ordinal = source.ordinal;
+    for span in units::segment_blocks(&source.exact_text) {
+        snapshot.units.push(SnapshotUnit { ordinal: snapshot.units.len(), source_ordinal, span });
+    }
+    snapshot.sources.push(source);
 }
 
 // ── Loaders ────────────────────────────────────────────────────────────────────────────────────
@@ -621,13 +803,20 @@ struct ItemRow {
     body: String,
     state_normalized: String,
     merge_commit_sha: Option<String>,
+    author: Option<String>,
+    author_kind: Option<String>,
     author_association: Option<String>,
+    created_at_ms: Option<i64>,
 }
 
 fn load_items(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<ItemRow>> {
     let mut stmt = conn.prepare(
         "SELECT item_kind, item_key, tracker, project, title, body, state_normalized,
-                merge_commit_sha, author_association
+                merge_commit_sha, author, author_kind, author_association,
+                CASE WHEN created_at IS NULL THEN NULL ELSE
+                    CAST(strftime('%s', created_at) AS INTEGER) * 1000 +
+                    CAST(substr(strftime('%f', created_at), 4, 3) AS INTEGER)
+                END
          FROM papertrail_items WHERE repo_id = ?1",
     )?;
     let rows = stmt.query_map([repo_id], |row| {
@@ -641,7 +830,10 @@ fn load_items(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<ItemRow>> 
             body: row.get(5)?,
             state_normalized: row.get(6)?,
             merge_commit_sha: row.get(7)?,
-            author_association: row.get(8)?,
+            author: row.get(8)?,
+            author_kind: row.get(9)?,
+            author_association: row.get(10)?,
+            created_at_ms: row.get(11)?,
         })
     })?;
     let mut out = Vec::new();
@@ -688,7 +880,10 @@ struct CommentRow {
     comment_id: String,
     body: String,
     is_review: bool,
+    author: Option<String>,
+    author_kind: Option<String>,
     author_association: Option<String>,
+    created_at_ms: Option<i64>,
 }
 
 fn load_comments(
@@ -700,7 +895,12 @@ fn load_comments(
     key: &str,
 ) -> anyhow::Result<Vec<CommentRow>> {
     let mut stmt = conn.prepare(
-        "SELECT comment_id, body, review_state, author_association FROM papertrail_comments
+        "SELECT comment_id, body, review_state, author, author_kind, author_association,
+                CASE WHEN created_at IS NULL THEN NULL ELSE
+                    CAST(strftime('%s', created_at) AS INTEGER) * 1000 +
+                    CAST(substr(strftime('%f', created_at), 4, 3) AS INTEGER)
+                END
+         FROM papertrail_comments
          WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5
          ORDER BY created_at, comment_id",
     )?;
@@ -710,7 +910,10 @@ fn load_comments(
                 comment_id: row.get(0)?,
                 body: row.get(1)?,
                 is_review: row.get::<_, Option<String>>(2)?.is_some(),
-                author_association: row.get(3)?,
+                author: row.get(3)?,
+                author_kind: row.get(4)?,
+                author_association: row.get(5)?,
+                created_at_ms: row.get(6)?,
             })
         })?;
     let mut out = Vec::new();
@@ -891,6 +1094,8 @@ fn delete_record(conn: &Connection, repo_id: &str, record: &RecordKey) -> anyhow
         "papertrail_distill_evidence",
         "papertrail_distill_alternatives",
         "papertrail_distill_queue",
+        "papertrail_distill_sources",
+        "papertrail_distill_units",
     ] {
         conn.execute(
             &format!(
@@ -987,8 +1192,10 @@ fn upsert_skeleton(
              epistemic_status_outcome = CASE WHEN ?14 THEN NULL ELSE epistemic_status_outcome END,
              quotes_materialized = CASE WHEN ?14 THEN 0 ELSE quotes_materialized END,
              outcome_claim_verified = CASE WHEN ?14 THEN 0 ELSE outcome_claim_verified END,
-             decision_provenance_verified =
-                 CASE WHEN ?14 THEN 0 ELSE decision_provenance_verified END",
+              decision_provenance_verified =
+                  CASE WHEN ?14 THEN 0 ELSE decision_provenance_verified END,
+              prompt_version = CASE WHEN ?14 THEN NULL ELSE prompt_version END,
+              model_input_hash = CASE WHEN ?14 THEN NULL ELSE model_input_hash END",
         params![
             plan.tracker,
             plan.project,
@@ -1058,6 +1265,73 @@ fn clear_model_junctions(
                  item_kind = ?4 AND item_key = ?5"
             ),
             params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_snapshot(
+    conn: &Connection,
+    repo_id: &str,
+    plan: &RecordPlan,
+    snapshot: &ThreadSnapshot,
+) -> anyhow::Result<()> {
+    for table in ["papertrail_distill_units", "papertrail_distill_sources"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table} WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND \
+                 item_kind = ?4 AND item_key = ?5"
+            ),
+            params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        )?;
+    }
+    for source in &snapshot.sources {
+        conn.execute(
+            "INSERT INTO papertrail_distill_sources
+                 (tracker, project, item_kind, item_key, source_ordinal, role, partner_ordinal,
+                  source_item_kind, source_item_key, source_kind, source_part, source_id,
+                  exact_text, author, author_kind, author_association, created_at_ms, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17, ?18)",
+            params![
+                plan.tracker,
+                plan.project,
+                plan.kind.as_db_str(),
+                plan.key,
+                source.ordinal as i64,
+                source.role.as_db_str(),
+                source.partner_ordinal.map(|value| value as i64),
+                source.item_kind.as_db_str(),
+                source.item_key,
+                source.kind.as_db_str(),
+                source.part.as_db_str(),
+                source.id,
+                source.exact_text,
+                source.author,
+                source.author_kind,
+                source.author_association,
+                source.created_at_ms,
+                repo_id,
+            ],
+        )?;
+    }
+    for unit in &snapshot.units {
+        conn.execute(
+            "INSERT INTO papertrail_distill_units
+                 (tracker, project, item_kind, item_key, unit_ordinal, source_ordinal, byte_start,
+                  byte_end, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                plan.tracker,
+                plan.project,
+                plan.kind.as_db_str(),
+                plan.key,
+                unit.ordinal as i64,
+                unit.source_ordinal as i64,
+                unit.span.start as i64,
+                unit.span.end as i64,
+                repo_id,
+            ],
         )?;
     }
     Ok(())
@@ -1213,7 +1487,7 @@ mod tests {
     use rag_rat_db::schema;
     use rusqlite::{Connection, params};
 
-    use super::{ExtractOptions, enqueue_eligible, extract};
+    use super::{ExtractOptions, SourceKind, SourcePart, SourceRole, enqueue_eligible, extract};
 
     /// A fully-migrated in-memory DB scoped to `repo`, via the same `temp.connection_context` write
     /// `install_scope_view` uses (the multi-repo-scope test convention).
@@ -1364,6 +1638,15 @@ mod tests {
 
     fn distill_count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn input_hash(conn: &Connection, key: &str) -> String {
+        conn.query_row(
+            "SELECT distill_input_hash FROM papertrail_distill WHERE item_key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1674,6 +1957,26 @@ mod tests {
         seed_item(&conn, "repoA", "issue", "5", "A's bug.", "closed", None);
         seed_item(&conn, "repoB", "issue", "5", "B's bug.", "closed", None);
         seed_item(&conn, "repoB", "change_request", "6", "B's PR.", "merged", Some("beef"));
+        // Poison an identically-keyed sibling snapshot: A's replacement/clear paths must scope by
+        // the complete record identity, not merely tracker/project/kind/key.
+        conn.execute(
+            "INSERT INTO papertrail_distill_sources
+                 (tracker, project, item_kind, item_key, source_ordinal, role, partner_ordinal,
+                  source_item_kind, source_item_key, source_kind, source_part, source_id,
+                  exact_text, repo_id)
+             VALUES ('github','o/r','issue','5',0,'primary',NULL,'issue','5','item','body','5',
+                     'B poison','repoB')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_units
+                 (tracker, project, item_kind, item_key, unit_ordinal, source_ordinal, byte_start,
+                  byte_end, repo_id)
+             VALUES ('github','o/r','issue','5',0,0,0,8,'repoB')",
+            [],
+        )
+        .unwrap();
 
         let report = extract(&conn, None, &ExtractOptions::default()).unwrap();
         assert_eq!(report.records_written, 1, "only repo A's single item");
@@ -1690,6 +1993,209 @@ mod tests {
             ),
             0,
         );
+        let sibling_text: String = conn
+            .query_row(
+                "SELECT exact_text FROM papertrail_distill_sources WHERE repo_id='repoB'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sibling_text, "B poison", "the sibling snapshot survives A extraction");
+        assert_eq!(
+            distill_count(
+                &conn,
+                "SELECT COUNT(*) FROM papertrail_distill_units WHERE repo_id='repoB'"
+            ),
+            1,
+            "the sibling unit span survives A extraction",
+        );
+    }
+
+    #[test]
+    fn snapshot_source_enums_round_trip_only_their_closed_tokens() {
+        for role in [SourceRole::Primary, SourceRole::Partner] {
+            assert_eq!(SourceRole::from_db_str(role.as_db_str()).unwrap(), role);
+        }
+        for kind in [SourceKind::Item, SourceKind::Comment] {
+            assert_eq!(SourceKind::from_db_str(kind.as_db_str()).unwrap(), kind);
+        }
+        for part in [SourcePart::Title, SourcePart::Body, SourcePart::Comment] {
+            assert_eq!(SourcePart::from_db_str(part.as_db_str()).unwrap(), part);
+        }
+        assert!(SourcePart::from_db_str("summary").is_err());
+    }
+
+    #[test]
+    fn snapshots_distinguish_identical_title_and_body_and_unicode_units_quote_exact_bytes() {
+        let conn = scoped_conn("repoA");
+        let text = "Intro 🦀.\n\n尾 paragraph.";
+        seed_item(&conn, "repoA", "issue", "5", text, "closed", None);
+        conn.execute(
+            "UPDATE papertrail_items SET title=?1, author='alice', author_kind='user',
+                    author_association='member', created_at='2026-01-01T00:00:00.123Z'
+             WHERE repo_id='repoA' AND item_key='5'",
+            [text],
+        )
+        .unwrap();
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+
+        let sources: Vec<(i64, String, String, String)> = conn
+            .prepare(
+                "SELECT source_ordinal, source_part, source_id, exact_text
+                 FROM papertrail_distill_sources WHERE repo_id='repoA' ORDER BY source_ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(&sources[0], &(0, "title".into(), "5".into(), text.into()));
+        assert_eq!(&sources[1], &(1, "body".into(), "5".into(), text.into()));
+
+        let units: Vec<(i64, i64, i64)> = conn
+            .prepare(
+                "SELECT source_ordinal, byte_start, byte_end FROM papertrail_distill_units
+                 WHERE repo_id='repoA' ORDER BY unit_ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(units.len(), 4, "two markdown blocks for each distinct source part");
+        for (source_ordinal, start, end) in units {
+            let source_ordinal = source_ordinal as usize;
+            let start = start as usize;
+            let end = end as usize;
+            let exact = &sources[source_ordinal].3;
+            let quote = &exact[start..end];
+            assert_eq!(quote.as_bytes(), &exact.as_bytes()[start..end]);
+            assert!(std::str::from_utf8(quote.as_bytes()).is_ok(), "span is on UTF-8 boundaries");
+        }
+    }
+
+    #[test]
+    fn every_source_text_or_provenance_edit_changes_the_full_snapshot_hash() {
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "issue", "5", "body one", "closed", None);
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let initial = input_hash(&conn, "5");
+
+        conn.execute("UPDATE papertrail_items SET title='new title' WHERE item_key='5'", [])
+            .unwrap();
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let title_edit = input_hash(&conn, "5");
+        assert_ne!(initial, title_edit, "title-only edits regenerate");
+
+        conn.execute("UPDATE papertrail_items SET body='body two' WHERE item_key='5'", []).unwrap();
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let body_edit = input_hash(&conn, "5");
+        assert_ne!(title_edit, body_edit, "body-only edits regenerate");
+
+        seed_comment(&conn, "repoA", "issue", "5", "c1", false);
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let comment_added = input_hash(&conn, "5");
+        assert_ne!(body_edit, comment_added, "comments are full snapshot inputs");
+
+        conn.execute(
+            "UPDATE papertrail_comments SET body='edited comment' WHERE comment_id='c1'",
+            [],
+        )
+        .unwrap();
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let comment_edit = input_hash(&conn, "5");
+        assert_ne!(comment_added, comment_edit, "comment text edits regenerate");
+
+        conn.execute(
+            "UPDATE papertrail_comments SET author_association='maintainer' WHERE comment_id='c1'",
+            [],
+        )
+        .unwrap();
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let provenance_edit = input_hash(&conn, "5");
+        assert_ne!(comment_edit, provenance_edit, "provenance-only edits regenerate");
+    }
+
+    #[test]
+    fn all_partners_are_snapshotted_in_deterministic_key_order() {
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "issue", "5", "issue", "closed", None);
+        seed_item(&conn, "repoA", "change_request", "8", "later", "merged", Some("m8"));
+        seed_item(&conn, "repoA", "change_request", "6", "earlier", "merged", Some("m6"));
+        seed_closing_edge(&conn, "repoA", "5", "8", Some("m8"), "provider");
+        seed_closing_edge(&conn, "repoA", "5", "6", Some("m6"), "provider");
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+
+        let partners: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT partner_ordinal, source_item_key FROM papertrail_distill_sources
+                 WHERE repo_id='repoA' AND role='partner' AND source_part='title'
+                 ORDER BY source_ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(partners, vec![(0, "6".into()), (1, "8".into())]);
+    }
+
+    #[test]
+    fn regeneration_replaces_snapshots_while_unchanged_reruns_leave_them_stable() {
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "issue", "5", "first\n\nsecond", "closed", None);
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let first_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM papertrail_distill_sources ORDER BY source_ordinal")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let first_hash = input_hash(&conn, "5");
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let unchanged_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM papertrail_distill_sources ORDER BY source_ordinal")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(first_ids, unchanged_ids, "unchanged snapshots are left untouched");
+        assert_eq!(first_hash, input_hash(&conn, "5"));
+
+        conn.execute("UPDATE papertrail_items SET body='replacement' WHERE item_key='5'", [])
+            .unwrap();
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let body: String = conn
+            .query_row(
+                "SELECT exact_text FROM papertrail_distill_sources WHERE source_part='body'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "replacement");
+        assert_ne!(first_hash, input_hash(&conn, "5"));
+        assert_eq!(
+            distill_count(
+                &conn,
+                "SELECT COUNT(*) FROM papertrail_distill_units WHERE source_ordinal=1"
+            ),
+            1,
+            "old body spans are replaced rather than appended",
+        );
+    }
+
+    #[test]
+    fn otherwise_identical_snapshots_have_repo_isolated_hashes() {
+        let conn_a = scoped_conn("repoA");
+        seed_item(&conn_a, "repoA", "issue", "5", "same", "closed", None);
+        extract(&conn_a, None, &ExtractOptions::default()).unwrap();
+        let conn_b = scoped_conn("repoB");
+        seed_item(&conn_b, "repoB", "issue", "5", "same", "closed", None);
+        extract(&conn_b, None, &ExtractOptions::default()).unwrap();
+        assert_ne!(input_hash(&conn_a, "5"), input_hash(&conn_b, "5"));
     }
 
     #[test]
@@ -2172,7 +2678,8 @@ mod tests {
         // Simulate the #704 pass filling model columns + model junctions on this record.
         conn.execute(
             "UPDATE papertrail_distill SET root_cause='the cause', outcome_status_model='landed',
-                 quotes_materialized=3 WHERE item_key='9'",
+                 quotes_materialized=3, prompt_version=7, model_input_hash='sha256:model'
+             WHERE item_key='9'",
             [],
         )
         .unwrap();
@@ -2209,6 +2716,15 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cause.as_deref(), Some("the cause"), "identical rerun keeps model output");
+        let stamps: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT prompt_version, model_input_hash FROM papertrail_distill WHERE \
+                 item_key='9'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamps, (Some(7), Some("sha256:model".into())));
         assert_eq!(distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_evidence"), 1);
         assert_eq!(
             distill_count(
@@ -2229,6 +2745,15 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cause_after, None, "regeneration NULLs the stale model columns");
+        let stamps_after: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT prompt_version, model_input_hash FROM papertrail_distill WHERE \
+                 item_key='9'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamps_after, (None, None), "regeneration clears model-input stamps");
         assert_eq!(
             distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_evidence"),
             0,
