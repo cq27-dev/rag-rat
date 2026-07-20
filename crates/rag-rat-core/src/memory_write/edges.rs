@@ -172,6 +172,11 @@ pub(crate) fn unauthored_edges(
     repo_id: &str,
     stream: StreamId,
 ) -> anyhow::Result<Vec<NodeEdge>> {
+    anyhow::ensure!(
+        !rag_rat_oplog::content_stream_has_pending_refold(conn, stream)?,
+        "owner stream has a pending content refold; settle pending content refolds before reading \
+         edge completeness"
+    );
     let mut stmt = conn.prepare(&format!(
         "{EDGE_SELECT} e
          WHERE e.repo_id = ?1

@@ -354,6 +354,11 @@ fn read_reconcile_work(
     stream: StreamId,
     policy: StreamSealPolicy,
 ) -> anyhow::Result<ReconcileWork> {
+    anyhow::ensure!(
+        !rag_rat_oplog::content_stream_has_pending_refold(conn, stream)?,
+        "owner stream has a pending content refold; settle pending content refolds before \
+         reconciling memory completeness"
+    );
     let (authorable_nodes, quarantined_nodes): (Vec<MemoryRow>, Vec<MemoryRow>) =
         read_unauthored_memory_rows(conn, repo_id, stream)?
             .into_iter()
@@ -881,6 +886,11 @@ fn read_unauthored_memory_rows(
     repo_id: &str,
     stream: StreamId,
 ) -> anyhow::Result<Vec<MemoryRow>> {
+    anyhow::ensure!(
+        !rag_rat_oplog::content_stream_has_pending_refold(conn, stream)?,
+        "owner stream has a pending content refold; settle pending content refolds before reading \
+         memory completeness"
+    );
     let mut stmt = conn.prepare(
         "SELECT m.id, m.kind, m.title, m.body, m.confidence, m.status, m.source, m.payload_json
          FROM repo_memories m
@@ -1017,6 +1027,22 @@ mod tests {
             params![key, REPO, source, relation, target],
         )
         .unwrap();
+    }
+
+    fn queue_pending_refold(conn: &Connection, stream: StreamId) {
+        conn.execute("INSERT INTO content_streams_pending_refold(stream_id) VALUES (?1)", [stream
+            .to_bytes()
+            .as_slice()])
+            .unwrap();
+    }
+
+    fn settle_pending_refolds(conn: &Connection) {
+        let report = rag_rat_oplog::settle_pending_content_refolds(
+            conn,
+            &rag_rat_oplog::ContentRefoldBudget::unbounded(),
+        )
+        .unwrap();
+        assert!(report.failures.is_empty(), "pending refold settlement failed: {report:?}");
     }
 
     /// Author a BARE `/3` NodeStatus for a node with NO `NodeCreate` — the `/3` analog of the INERT
@@ -1290,6 +1316,72 @@ mod tests {
         let before = entry_count(&conn);
         backfill_memory_oplog(&conn, 9_000).unwrap();
         assert_eq!(entry_count(&conn), before, "no ghost → no new /3 entry");
+    }
+
+    #[test]
+    fn pending_owner_refold_blocks_node_reconcile_and_mutation_until_settled() {
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap();
+        let stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
+        insert_memory(&conn, "mem_ghost", "active", 500);
+        queue_pending_refold(&conn, stream);
+        let entries_before = entry_count(&conn);
+        let memories_before: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repo_memories", [], |row| row.get(0)).unwrap();
+
+        let reconcile_err = backfill_memory_oplog(&conn, 9_000).unwrap_err();
+        assert!(reconcile_err.to_string().contains("settle pending content refolds"));
+        let mutation_err = create_concept(&conn, "blocked mutation").unwrap_err();
+        assert!(mutation_err.to_string().contains("settle pending content refolds"));
+        assert_eq!(entry_count(&conn), entries_before, "the barrier authors no content rows");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM repo_memories", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            memories_before,
+            "the blocked mutation persists no memory row"
+        );
+
+        settle_pending_refolds(&conn);
+        create_concept(&conn, "after settlement").unwrap();
+        assert!(is_projected(&conn, "mem_ghost"), "the settled reconcile authors the ghost");
+        let entries_after = entry_count(&conn);
+        backfill_memory_oplog(&conn, 10_000).unwrap();
+        assert_eq!(entry_count(&conn), entries_after, "the retry authors no duplicates");
+    }
+
+    #[test]
+    fn pending_owner_refold_blocks_edge_reconcile_until_settled() {
+        let conn = scoped_conn();
+        let a = create_concept(&conn, "a").unwrap().memory.memory_id;
+        let b = create_concept(&conn, "b").unwrap().memory.memory_id;
+        insert_raw_node_edge(&conn, &a, "relates_to", &b);
+        let stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
+        queue_pending_refold(&conn, stream);
+        let entries_before = entry_count(&conn);
+
+        let err = backfill_memory_oplog(&conn, 9_000).unwrap_err();
+        assert!(err.to_string().contains("settle pending content refolds"));
+        assert_eq!(entry_count(&conn), entries_before, "the barrier authors no edge row");
+
+        settle_pending_refolds(&conn);
+        backfill_memory_oplog(&conn, 10_000).unwrap();
+        assert_eq!(projected_edge_count(&conn), 1, "the settled retry authors the edge");
+        let entries_after = entry_count(&conn);
+        backfill_memory_oplog(&conn, 11_000).unwrap();
+        assert_eq!(entry_count(&conn), entries_after, "the retry authors no duplicate edge");
+    }
+
+    #[test]
+    fn pending_unrelated_stream_does_not_block_owner_reconcile() {
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap();
+        insert_memory(&conn, "mem_ghost", "active", 500);
+        let unrelated = StreamId::from_bytes([0x51; 32]);
+        queue_pending_refold(&conn, unrelated);
+
+        backfill_memory_oplog(&conn, 9_000).unwrap();
+        assert!(is_projected(&conn, "mem_ghost"));
+        assert!(rag_rat_oplog::content_stream_has_pending_refold(&conn, unrelated).unwrap());
     }
 
     #[test]

@@ -48,8 +48,8 @@ pub use bootstrap::local_account;
 pub use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, ContentRefoldBudget,
     ContentSettleReport, ContentStreamSettleFailure, SignedContentEntry, VerifiedContentEntry,
-    content_ingest, decode_content_signed, settle_pending_content_refolds, sign_content_entry,
-    verify_content_signed,
+    content_ingest, content_stream_has_pending_refold, decode_content_signed,
+    settle_pending_content_refolds, sign_content_entry, verify_content_signed,
 };
 // The C5a sealed-authoring surface (#608): the envelope-layer seal
 // (`sign_sealed_content_entry` + its OS-nonce wrapper `seal_and_sign_content_entry`), the

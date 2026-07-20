@@ -889,6 +889,24 @@ fn pending_refold_table_exists(conn: &Connection) -> rusqlite::Result<bool> {
     .map(|row| row.is_some())
 }
 
+/// Whether this exact stream still owes deferred acceptance folding and reprojection. Stores being
+/// upgraded from before the queue table was introduced have no deferred debt, so they return false.
+pub fn content_stream_has_pending_refold(
+    conn: &Connection,
+    stream_id: StreamId,
+) -> rusqlite::Result<bool> {
+    if !pending_refold_table_exists(conn)? {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT 1 FROM content_streams_pending_refold WHERE stream_id = ?1",
+        [stream_id.to_bytes().as_slice()],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+}
+
 /// Settle ONE dirty stream in its OWN IMMEDIATE transaction: fold its acceptance verdict, reproject
 /// the accepted set into the memory projection, and drop its queue mark. Its own txn is what
 /// isolates a poisoned stream:
@@ -1580,6 +1598,14 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
+    }
+
+    #[test]
+    fn pending_refold_guard_is_false_before_the_queue_table_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(
+            !content_stream_has_pending_refold(&conn, StreamId::from_bytes([0x41; 32])).unwrap()
+        );
     }
 
     fn roster(
