@@ -1326,6 +1326,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_075_ID => Some(75),
             MIGRATION_076_ID => Some(76),
             MIGRATION_077_ID => Some(77),
+            MIGRATION_078_ID => Some(78),
             _ => None,
         })
         .max()
@@ -1412,6 +1413,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_075_ID
             | MIGRATION_076_ID
             | MIGRATION_077_ID
+            | MIGRATION_078_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1495,6 +1497,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_075_ID => migration.checksum != MIGRATION_075_CHECKSUM,
         MIGRATION_076_ID => migration.checksum != MIGRATION_076_CHECKSUM,
         MIGRATION_077_ID => migration.checksum != MIGRATION_077_CHECKSUM,
+        MIGRATION_078_ID => migration.checksum != MIGRATION_078_CHECKSUM,
         _ => false,
     }
 }
@@ -5328,7 +5331,8 @@ pub fn apply_distill_record_store(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_papertrail_distill_evidence_thread
             ON papertrail_distill_evidence(repo_id, tracker, project, item_kind, item_key);
 
-        -- Anchors: index-validated SELECTIONS, born as sym_<hex> bindings; EXACT file paths only.
+        -- Anchor candidates: index-validated, born as sym_<hex> bindings; EXACT file paths only.
+        -- V078 adds their stable candidate ordinals and model-selection state.
         CREATE TABLE IF NOT EXISTS papertrail_distill_anchors(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tracker TEXT NOT NULL, project TEXT NOT NULL,
@@ -5413,6 +5417,62 @@ pub fn apply_distill_record_store(conn: &Connection) -> rusqlite::Result<()> {
             stats_json TEXT,
             repo_id TEXT NOT NULL DEFAULT '__unassigned__'
         ) STRICT;
+        ",
+    )
+}
+
+/// V078 — separate mechanically mined anchor CANDIDATES from model SELECTED anchors (#704).
+/// Existing V077 rows receive deterministic zero-based ordinals in row-id order within each
+/// thread. The exact-path and `sym_<hex>` identity columns are deliberately untouched.
+pub fn apply_distill_anchor_selection(conn: &Connection) -> rusqlite::Result<()> {
+    // Key the backfill guard to its completion artifact, not merely column presence. If a process
+    // dies after ADD COLUMN (whose default makes every legacy row ordinal 0) but before the
+    // backfill/index, replay must backfill again rather than fail forever on duplicate ordinals.
+    let candidate_index_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_papertrail_distill_anchors_candidate'",
+        [],
+        |row| row.get(0),
+    )?;
+    add_column_if_missing(
+        conn,
+        "papertrail_distill_anchors",
+        "candidate_ordinal",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(candidate_ordinal >= 0)",
+    )?;
+    add_column_if_missing(
+        conn,
+        "papertrail_distill_anchors",
+        "selected",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(selected IN (0, 1))",
+    )?;
+    if candidate_index_exists == 0 {
+        conn.execute_batch(
+            "
+        UPDATE papertrail_distill_anchors AS anchor
+        SET candidate_ordinal = (
+            SELECT COUNT(*)
+            FROM papertrail_distill_anchors AS earlier
+            WHERE earlier.repo_id = anchor.repo_id
+              AND earlier.tracker = anchor.tracker
+              AND earlier.project = anchor.project
+              AND earlier.item_kind = anchor.item_kind
+              AND earlier.item_key = anchor.item_key
+              AND earlier.id < anchor.id
+        );
+        ",
+        )?;
+    }
+    conn.execute_batch(
+        "
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_distill_anchors_candidate
+            ON papertrail_distill_anchors(
+                repo_id, tracker, project, item_kind, item_key, candidate_ordinal
+            );
+        CREATE INDEX IF NOT EXISTS idx_papertrail_distill_anchors_selected
+            ON papertrail_distill_anchors(
+                repo_id, tracker, project, item_kind, item_key, candidate_ordinal
+            ) WHERE selected = 1;
         ",
     )
 }

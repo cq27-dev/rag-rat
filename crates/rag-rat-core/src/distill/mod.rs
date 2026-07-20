@@ -1,9 +1,7 @@
-//! Deterministic distillation substrate (#703): the model-free half of the distilled-record
-//! pipeline. It reads the papertrail mirror (items, comments, provider/text closing edges) and the
-//! git-history file changes, decides which threads are eligible, assembles their numbered text-unit
-//! input, mines mechanical fix commits / issue↔PR coalescing edges / anchor candidates, and
-//! enqueues the eligible threads for the later LLM pass (#704). Everything here is deterministic
-//! and testable without a model; the LLM never runs from this module.
+//! Distilled-record pipeline substrate. The deterministic extraction half (#703) reads the
+//! papertrail mirror and git history, assembles numbered units, mines mechanical fix/anchor data,
+//! and enqueues eligible threads. The model boundary (#704) is isolated behind a strict typed
+//! output contract and an explicit, observable response ladder; no queue drain runs implicitly.
 //!
 //! Crate placement: this lives in `rag-rat-core` (not `rag-rat-papertrail`) because anchor mining
 //! reads the symbol index, and `rag-rat-query` — where symbol reads live — depends on
@@ -13,9 +11,20 @@
 
 mod candidates;
 mod extract;
+// Registered ahead of the separate queue-drain slice, which will consume this contract.
+#[allow(dead_code)]
+mod output;
 mod prompts;
+#[allow(dead_code)] // Curated seam for the separate queue-drain slice.
+mod run_stats;
 mod units;
 mod validate;
 
 pub use extract::ExtractReport;
 pub(crate) use extract::{enqueue_eligible, extract};
+// This is the curated crate-internal seam for the separate queue-drain slice.
+#[allow(unused_imports)]
+pub(crate) use output::{
+    CitationId, DecisionOutput, LadderFailure, LadderResult, LadderStats, OutcomeOutput,
+    OutputRung, RecordOutput, RejectedAlternativeOutput, run_output_ladder,
+};

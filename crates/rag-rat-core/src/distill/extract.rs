@@ -471,7 +471,8 @@ fn write_record(
 
     // --- Persist: rebuild this thread's mechanical junctions, upsert the skeleton row (clearing
     // model columns on regeneration), rewrite junctions, queue.
-    clear_mechanical_junctions(conn, repo_id, plan)?;
+    let rebuild_anchor_candidates = state != RecordState::Unchanged;
+    clear_mechanical_junctions(conn, repo_id, plan, rebuild_anchor_candidates)?;
     if regenerated {
         clear_model_junctions(conn, repo_id, plan)?;
     }
@@ -485,7 +486,9 @@ fn write_record(
     })?;
     write_commits(conn, repo_id, plan, &plan.fix_shas)?;
     write_coalesced_edges(conn, repo_id, now, plan)?;
-    write_anchors(conn, repo_id, plan, &anchors)?;
+    if rebuild_anchor_candidates {
+        write_anchors(conn, repo_id, plan, &anchors)?;
+    }
     let queued = if matches!(state, RecordState::New | RecordState::Regenerated) {
         enqueue_one(conn, repo_id, now, item, regenerated)?
     } else {
@@ -1006,20 +1009,25 @@ fn upsert_skeleton(
     Ok(())
 }
 
-/// Clear the MECHANICAL junctions this pass rebuilds deterministically (fixing commits, anchor
-/// candidates, thread-keyed edges), scoped to the full thread identity so a same-numbered thread in
-/// another project is untouched.
+/// Clear the MECHANICAL junctions this pass rebuilds deterministically, scoped to the full thread
+/// identity. Anchor candidates are rebuilt only for new/regenerated inputs: an unchanged rerun must
+/// preserve the model's `selected` flags because it is not requeued.
 fn clear_mechanical_junctions(
     conn: &Connection,
     repo_id: &str,
     plan: &RecordPlan,
+    clear_anchor_candidates: bool,
 ) -> anyhow::Result<()> {
-    for table in ["papertrail_distill_record_commits", "papertrail_distill_anchors"] {
+    conn.execute(
+        "DELETE FROM papertrail_distill_record_commits
+         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
+        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+    )?;
+    if clear_anchor_candidates {
         conn.execute(
-            &format!(
-                "DELETE FROM {table} WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND \
-                 item_kind = ?4 AND item_key = ?5"
-            ),
+            "DELETE FROM papertrail_distill_anchors
+             WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3
+               AND item_kind = ?4 AND item_key = ?5",
             params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
         )?;
     }
@@ -1104,12 +1112,12 @@ fn write_anchors(
     plan: &RecordPlan,
     anchors: &[candidates::AnchorCandidate],
 ) -> anyhow::Result<()> {
-    for anchor in anchors {
+    for (candidate_ordinal, anchor) in anchors.iter().enumerate() {
         conn.execute(
             "INSERT INTO papertrail_distill_anchors
                  (tracker, project, item_kind, item_key, anchor_kind, logical_symbol_id, file_path,
-                  name, resolved, repo_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                   name, resolved, candidate_ordinal, selected, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)",
             params![
                 plan.tracker,
                 plan.project,
@@ -1120,6 +1128,7 @@ fn write_anchors(
                 anchor.file_path,
                 anchor.name,
                 anchor.resolved as i64,
+                candidate_ordinal as i64,
                 repo_id,
             ],
         )?;
@@ -1434,16 +1443,19 @@ mod tests {
             ),
             1
         );
-        let sym: (String, i64) = conn
+        let sym: (String, i64, i64, i64) = conn
             .query_row(
-                "SELECT logical_symbol_id, resolved FROM papertrail_distill_anchors
-                 WHERE anchor_kind='symbol' AND name='render_widget'",
+                "SELECT logical_symbol_id, resolved, candidate_ordinal, selected
+                 FROM papertrail_distill_anchors
+                  WHERE anchor_kind='symbol' AND name='render_widget'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert_eq!(sym.0, "sym_3e7", "999 == 0x3e7"); // format_sym_handle(999)
         assert_eq!(sym.1, 1);
+        assert_eq!(sym.2, 1, "file A0 is followed deterministically by symbol A1");
+        assert_eq!(sym.3, 0, "extraction mines candidates; only the model selects them");
         // Queue holds the issue record (the coalesced PR is not its own record).
         assert_eq!(distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_queue"), 1);
         assert_eq!(
@@ -2179,6 +2191,15 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, anchor_kind, file_path, name, resolved,
+                  candidate_ordinal, selected, repo_id)
+             VALUES ('github','o/r','change_request','9','file','src/lib.rs','src/lib.rs',1,
+                     0,1,'repoA')",
+            [],
+        )
+        .unwrap();
 
         // An IDENTICAL rerun preserves the model's work (same input hash + pipeline version).
         extract(&conn, None, &ExtractOptions::default()).unwrap();
@@ -2189,6 +2210,14 @@ mod tests {
             .unwrap();
         assert_eq!(cause.as_deref(), Some("the cause"), "identical rerun keeps model output");
         assert_eq!(distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_evidence"), 1);
+        assert_eq!(
+            distill_count(
+                &conn,
+                "SELECT COUNT(*) FROM papertrail_distill_anchors WHERE selected = 1"
+            ),
+            1,
+            "identical rerun keeps model-selected anchors",
+        );
 
         // Changing the input (a new comment shifts the assembled units → a new hash) INVALIDATES
         // the model columns and clears the model junctions.
@@ -2209,6 +2238,14 @@ mod tests {
             distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_alternatives"),
             0,
             "regeneration clears stale alternatives",
+        );
+        assert_eq!(
+            distill_count(
+                &conn,
+                "SELECT COUNT(*) FROM papertrail_distill_anchors WHERE selected = 1"
+            ),
+            0,
+            "regeneration clears stale anchor selections",
         );
     }
 }
