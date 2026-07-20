@@ -48,6 +48,7 @@ import {
   errorMessage,
   log,
   raceWithTimeout,
+  remainingBudgetMs,
   runRecipe,
   verifyChat,
   verifyEmbed,
@@ -108,19 +109,19 @@ const APP_NAME = "rag-rat-cookbook";
 /** GPU attached when a backend REQUIRES one (vLLM) and the caller passed no `gpu`. */
 const MODAL_DEFAULT_GPU = "A10G";
 /**
- * Bound on the teardown `sb.terminate()` — kept under the Rust side's ~10s teardown grace (like
- * RunPod's `TEARDOWN_TIMEOUT_MS`) so terminate completes-or-aborts BEFORE rag-rat SIGKILLs us; a
- * hung terminate would otherwise leak a billed box until Modal's `timeoutMs` backstop fires.
+ * Bound on the recipe-side teardown path (terminate + shutdown poll + optional marker publication +
+ * stream cleanup), kept under Rust's 10s SIGTERM→SIGKILL grace so all of it completes-or-aborts
+ * before the process group is killed.
  */
-const TEARDOWN_TIMEOUT_MS = 8_000;
+const TEARDOWN_TIMEOUT_MS = 9_000;
 /** Briefly allow final startup diagnostics to arrive after readiness rejects. */
 const FAILURE_LOG_SETTLE_MS = 250;
 /** Keeps the complete JSON-escaped error event below Rust's 16 KiB line cap. */
 const READINESS_DIAGNOSTIC_BYTES = 7 * 1024;
 /** Bound stream cancellation after the remote box has terminated. */
-const OUTPUT_STOP_TIMEOUT_MS = 500;
-/** Marker publication is metadata-only and must not consume the Rust teardown grace. */
-const CACHE_MARKER_TIMEOUT_MS = 1_000;
+const OUTPUT_STOP_TIMEOUT_MS = 250;
+/** Marker publication is metadata-only and must fit in the post-termination teardown remainder. */
+const CACHE_MARKER_TIMEOUT_MS = 500;
 const OWNER_TAG = "rag-rat-owner";
 
 interface CachePublication {
@@ -377,13 +378,17 @@ async function pullOllamaModel(
  * a billed box. Idempotent enough — terminate on an already-gone box is a no-op/soft error.
  */
 async function teardown(handle: ModalHandle): Promise<void> {
+  const deadline = Date.now() + TEARDOWN_TIMEOUT_MS;
   try {
-    await terminateAndWait(handle.modal, handle.sandbox, "sb.terminate");
-    await publishCacheMarkers(handle.cachePublication);
+    await terminateAndWait(handle.modal, handle.sandbox, "sb.terminate", deadline);
+    await publishCacheMarkers(handle.cachePublication, deadline);
   } finally {
-    await raceWithTimeout(() => handle.output.stop(), OUTPUT_STOP_TIMEOUT_MS, "sandbox output stop").catch(
-      (cause) => log("warn", `sandbox output cleanup did not finish: ${errorMessage(cause)}`),
-    );
+    const stopMs = Math.min(OUTPUT_STOP_TIMEOUT_MS, remainingBudgetMs(deadline));
+    if (stopMs > 0) {
+      await raceWithTimeout(() => handle.output.stop(), stopMs, "sandbox output stop").catch(
+        (cause) => log("warn", `sandbox output cleanup did not finish: ${errorMessage(cause)}`),
+      );
+    }
   }
 }
 
@@ -408,8 +413,16 @@ async function cacheMarkerExists(
   }
 }
 
-async function publishCacheMarkers(publication: CachePublication | null): Promise<void> {
+async function publishCacheMarkers(
+  publication: CachePublication | null,
+  deadline: number,
+): Promise<void> {
   if (publication === null || !publication.verified || publication.markerNames.length === 0) return;
+  const budgetMs = Math.min(CACHE_MARKER_TIMEOUT_MS, remainingBudgetMs(deadline));
+  if (budgetMs === 0) {
+    log("warn", "cache marker publication skipped: teardown grace exhausted");
+    return;
+  }
   try {
     await raceWithTimeout(
       () =>
@@ -418,7 +431,7 @@ async function publishCacheMarkers(publication: CachePublication | null): Promis
             publication.modal.volumes.fromName(name, { createIfMissing: true }),
           ),
         ),
-      CACHE_MARKER_TIMEOUT_MS,
+      budgetMs,
       "cache marker publication",
     );
     log("info", `published cache markers: ${publication.markerNames.join(", ")}`);
@@ -486,8 +499,12 @@ async function terminateOrphanSandbox(
   }
 }
 
-async function terminateAndWait(modal: ModalClient, sandbox: Sandbox, label: string): Promise<void> {
-  const deadline = Date.now() + TEARDOWN_TIMEOUT_MS;
+async function terminateAndWait(
+  modal: ModalClient,
+  sandbox: Sandbox,
+  label: string,
+  deadline = Date.now() + TEARDOWN_TIMEOUT_MS,
+): Promise<void> {
   const sandboxId = sandbox.sandboxId;
   await withBudget(deadline, label, () => sandbox.terminate());
   const attached = await withBudget(deadline, `${label}.reattach`, () => modal.sandboxes.fromId(sandboxId));
