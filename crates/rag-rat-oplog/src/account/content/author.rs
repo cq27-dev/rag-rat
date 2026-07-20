@@ -621,9 +621,10 @@ pub fn content_stream_has_sealed_ratchet(
 }
 
 /// Whether any accepted `/3` entry on `stream_id` is suite-1 (sealed). There is no `crypto_suite`
-/// column, so each accepted entry's header is decoded from its stored signed bytes; a row whose
-/// bytes fail to decode cannot be a valid suite-1 entry and is skipped. Early-returns on the first
-/// match.
+/// column, so each accepted entry's header is decoded from its stored signed bytes. Decode failure
+/// is corruption at rest and must abort the authoring decision: treating it as "not sealed" could
+/// downgrade a corrupt accepted suite-1 row to plaintext. Every row is decoded even after finding
+/// a sealed entry, so unrelated accepted-row corruption cannot be hidden by query order.
 fn stream_has_accepted_sealed_entry(
     conn: &Connection,
     stream_id: StreamId,
@@ -632,15 +633,16 @@ fn stream_has_accepted_sealed_entry(
         "SELECT signed_bytes FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
     )?;
     let mut rows = stmt.query(params![stream_id.to_bytes().as_slice()])?;
+    let mut has_sealed_entry = false;
     while let Some(row) = rows.next()? {
         let signed_bytes: Vec<u8> = row.get(0)?;
-        if let Ok(signed) = envelope::decode_content_signed(&signed_bytes)
-            && signed.header.crypto_suite != 0
-        {
-            return Ok(true);
+        let signed = envelope::decode_content_signed(&signed_bytes)
+            .context("stored accepted /3 entry failed to decode while checking sealed ratchet")?;
+        if signed.header.crypto_suite != 0 {
+            has_sealed_entry = true;
         }
     }
-    Ok(false)
+    Ok(has_sealed_entry)
 }
 
 /// Whether the `/2` stream's `/3` content chain is EMPTY — no `content_entries` row on it at all.
@@ -1874,6 +1876,45 @@ mod tests {
     }
 
     #[test]
+    fn a_valid_envelope_substituted_into_another_accepted_row_is_a_loud_projection_error() {
+        let conn = db();
+        let stream_a = StreamId::from_bytes(STREAM_A);
+        let stream_b = StreamId::from_bytes(STREAM_B);
+        let account = owned_stream_account(&conn, stream_a);
+        seed_ownership(&conn, stream_b, account);
+        let hash_a = author_committed(&conn, stream_a, &[node_create("a", "stream-a")])[0];
+        let hash_b =
+            author_committed(&conn, stream_b, &[node_create("substituted", "stream-b")])[0];
+        let signed_b: Vec<u8> = conn
+            .query_row(
+                "SELECT signed_bytes FROM content_entries WHERE entry_hash = ?1",
+                [hash_b.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE content_entries SET signed_bytes = ?1 WHERE entry_hash = ?2",
+            params![signed_b, hash_a.as_slice()],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM content_projected_nodes WHERE stream_id = ?1", [stream_a
+            .to_bytes()
+            .as_slice()])
+            .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let err = content_projection::reproject_accepted_content_stream(&tx, stream_a)
+            .expect_err("a valid envelope from another row must not project");
+        drop(tx);
+        assert!(err.to_string().contains("entry_hash row"), "unexpected error: {err:#}");
+        assert_eq!(
+            projected_node_count(&conn, stream_a),
+            0,
+            "the substituted stream-b op was not projected under stream A",
+        );
+    }
+
+    #[test]
     fn a_sealed_entry_folds_accepted_through_content_ingest_on_a_keyless_peer() {
         // S3 FOLD-FIREWALL TRIPWIRE: acceptance of a sealed `/3` entry is header/citation-level, so
         // a peer that replicated the account roster but never received the content key still folds
@@ -2015,6 +2056,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(before, after, "the refused plaintext batch stored no row");
+    }
+
+    #[test]
+    fn corrupt_accepted_sealed_envelope_aborts_plaintext_authoring_without_a_wrap() {
+        let conn = db();
+        let stream = StreamId::from_bytes(STREAM_A);
+        let account = owned_stream_account(&conn, stream);
+        let device = local_device(&conn, NOW).unwrap();
+        let key = ContentKey::from_seed(&[0x40; 32]);
+        let signed = envelope::seal_and_sign_content_entry(
+            device.secret(),
+            &ContentEntryHeader {
+                stream_id: stream,
+                author_account_id: account,
+                device_fingerprint: device.fingerprint(),
+                seq: 0,
+                lamport: 0,
+                prev_hash: None,
+                grant_id: None,
+                roster_ref: genesis_ref(&conn),
+                owner_auth_len: 0,
+                author_auth_len: 0,
+                crypto_suite: 0,
+                key_id: None,
+            },
+            &op::encode(&node_create("sealed", "must-stay-private")),
+            &key,
+        )
+        .unwrap();
+        insert_accepted_signed(&conn, &signed);
+        conn.execute("UPDATE content_entries SET signed_bytes = X'00' WHERE entry_hash = ?1", [
+            signed.entry_hash.as_slice(),
+        ])
+        .unwrap();
+        assert!(
+            secrets::select_current_sealing_wrap(&conn, account, stream).unwrap().is_none(),
+            "the corrupt accepted suite-1 row is the only ratchet input",
+        );
+        let before: i64 =
+            conn.query_row("SELECT count(*) FROM content_entries", [], |row| row.get(0)).unwrap();
+
+        let err = author_content_batch(
+            &conn,
+            stream,
+            &[node_create("plaintext", "must-not-leak")],
+            SealPolicy::Plaintext,
+            NOW,
+        )
+        .expect_err("stored envelope corruption must abort plaintext authoring");
+        assert!(err.to_string().contains("sealed ratchet"), "unexpected error: {err:#}");
+        let after: i64 =
+            conn.query_row("SELECT count(*) FROM content_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(before, after, "the failed plaintext batch leaked no content row");
     }
 
     #[test]

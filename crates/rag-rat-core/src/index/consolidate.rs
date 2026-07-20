@@ -76,6 +76,9 @@ use crate::index::{IndexDatabase, schema};
 ///        CONVERT an auto-selected model into a confirmed one and `seed_active_embedding_model`
 ///        could no longer override/clear it from config. ABSENCE-HAS-MEANING keys like this need
 ///        the absent state classified too, not just the value.
+///      * `memory_stream_seal_policy` — the one-way privacy intent for the repo's owner stream.
+///        Unlike model-state keys it is MERGED monotonically: `sealed` on either side wins, absence
+///        never clears it, and unknown values abort consolidation before reconciliation.
 ///
 ///  (b) DB-LOCAL STATE — never copied; each entry states why:
 ///      * freshness/progress cursors that would make a fresh 0-row index falsely report itself
@@ -93,7 +96,10 @@ const CARRIED_META_KEYS: &[&str] = &[
     "embedding_active_model_version",
     "active_embedding_remote_config",
     "active_embedding_model_provisional",
+    "memory_stream_seal_policy",
 ];
+
+const MEMORY_STREAM_SEAL_POLICY_META_KEY: &str = "memory_stream_seal_policy";
 
 /// How long consolidate waits for the repo's per-repo write locks (global-side and legacy-side)
 /// before refusing — an in-flight index/maintenance pass finishes well within it, and an explicit
@@ -555,10 +561,12 @@ struct ImportCounts {
 ///  * `repo_memory_fts`                  — re-derived for the WHOLE repo at the end
 ///    ([`rebuild_memory_fts_for_repo`]); covers refreshed same-repo AND remapped rows alike (both
 ///    are stamped `repo_id` = ours by the copy).
-///  * `repo_meta` model-state unit       — per-key MIRROR ([`copy_model_state`]): value-gated
-///    upsert for keys present in the source, DELETE for carried keys absent there (a model switch
-///    in the window may legitimately remove a key, e.g. the remote config when moving to a local
-///    model — keeping it would tear the unit).
+///  * `repo_meta` portable state         — model-state keys use per-key MIRROR
+///    ([`copy_model_state`]); the seal policy uses a monotonic merge so privacy intent cannot be
+///    downgraded by an absent or unsafe source value.
+///  * model-state mirror details: upsert for keys present in the source, DELETE for carried keys
+///    absent there (a model switch in the window may legitimately remove a key, e.g. the remote
+///    config when moving to a local model — keeping it would tear the unit).
 ///  * `ai_models` readiness              — restore-style carry ([`carry_active_model_readiness`]),
 ///    re-derived from the SOURCE's active model each run, so a window model change restores the NEW
 ///    model's readiness on retry; an explicit machine-level `disabled` is never overridden.
@@ -1196,6 +1204,9 @@ fn copy_model_state(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
     let mut count = 0u64;
     let mut active_model: Option<String> = None;
     for key in CARRIED_META_KEYS {
+        if *key == MEMORY_STREAM_SEAL_POLICY_META_KEY {
+            continue;
+        }
         let value: Option<String> = source
             .query_row("SELECT value FROM repo_meta WHERE key = ?1 LIMIT 1", [key], |row| {
                 row.get(0)
@@ -1223,10 +1234,60 @@ fn copy_model_state(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
         };
         count += changed as u64;
     }
+    count += merge_stream_seal_policy(source, tx, repo_id)?;
     if let Some(model_id) = active_model {
         carry_active_model_readiness(source, tx, &model_id)?;
     }
     Ok(count)
+}
+
+/// Merge the owner-stream seal policy as a one-way ratchet. The only persisted value this binary
+/// understands is `sealed`; absence means no explicit intent. A sealed source must seal the target,
+/// while a target already sealed remains sealed across retries even if the legacy source is absent.
+/// Unknown values on either side fail closed before consolidation's reconciliation authoring.
+fn merge_stream_seal_policy(
+    source: &Connection,
+    tx: &Connection,
+    repo_id: &str,
+) -> anyhow::Result<u64> {
+    let source_value: Option<String> = source
+        .query_row(
+            "SELECT value FROM repo_meta WHERE key = ?1 LIMIT 1",
+            [MEMORY_STREAM_SEAL_POLICY_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let target_value: Option<String> = tx
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
+            params![repo_id, MEMORY_STREAM_SEAL_POLICY_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+
+    for (side, value) in
+        [("legacy source", source_value.as_deref()), ("target", target_value.as_deref())]
+    {
+        if let Some(value) = value
+            && value != "sealed"
+        {
+            anyhow::bail!(
+                "{side} repo `{repo_id}` has unknown memory stream seal policy `{value}`; \
+                 refusing to consolidate"
+            );
+        }
+    }
+
+    if source_value.is_some() && target_value.is_none() {
+        Ok(tx.execute(
+            "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, 'sealed')",
+            params![repo_id, MEMORY_STREAM_SEAL_POLICY_META_KEY],
+        )? as u64)
+    } else {
+        Ok(0)
+    }
 }
 
 /// Carry the active model's `ai_models` READINESS onto the target when the legacy DB holds it
@@ -1995,6 +2056,105 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value, "model-a", "the authoritative legacy value replaces the stale copy");
+    }
+
+    #[test]
+    fn sealed_policy_survives_import_and_reconcile_authors_only_suite_1() {
+        let source = seeded_source();
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', ?1, \
+                 'sealed')",
+                [MEMORY_STREAM_SEAL_POLICY_META_KEY],
+            )
+            .unwrap();
+        let target = fresh_target();
+
+        import_from_source(&source, &target, "global-repo").unwrap();
+        crate::memory_write::reconcile_owner_stream_for_repo(
+            &target,
+            "global-repo",
+            rag_rat_base::time::now_ms(),
+        )
+        .unwrap();
+
+        let policy: String = target
+            .query_row(
+                "SELECT value FROM repo_meta WHERE repo_id = 'global-repo' AND key = ?1",
+                [MEMORY_STREAM_SEAL_POLICY_META_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(policy, "sealed", "consolidation carries the explicit privacy intent");
+        let mut stmt = target.prepare("SELECT signed_bytes FROM content_entries").unwrap();
+        let signed: Vec<Vec<u8>> =
+            stmt.query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(!signed.is_empty(), "reconcile authored the imported memories");
+        assert!(
+            signed.iter().all(|bytes| {
+                rag_rat_oplog::decode_content_signed(bytes).unwrap().header.crypto_suite == 1
+            }),
+            "every reconciled content row is suite 1",
+        );
+    }
+
+    #[test]
+    fn unknown_source_seal_policy_aborts_import_before_any_authoring() {
+        let source = seeded_source();
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', ?1, \
+                 'future-policy')",
+                [MEMORY_STREAM_SEAL_POLICY_META_KEY],
+            )
+            .unwrap();
+        let target = fresh_target();
+
+        let err = import_from_source(&source, &target, "global-repo")
+            .err()
+            .expect("an unknown policy must fail closed");
+        assert!(err.to_string().contains("unknown memory stream seal policy"));
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 0);
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM content_entries"), 0);
+    }
+
+    #[test]
+    fn sealed_target_wins_retries_and_rejects_a_conflicting_unsafe_source() {
+        let source = seeded_source();
+        let target = fresh_target();
+        target
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('global-repo', ?1, 'sealed')",
+                [MEMORY_STREAM_SEAL_POLICY_META_KEY],
+            )
+            .unwrap();
+
+        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo").unwrap();
+        let policy = || -> String {
+            target
+                .query_row(
+                    "SELECT value FROM repo_meta WHERE repo_id = 'global-repo' AND key = ?1",
+                    [MEMORY_STREAM_SEAL_POLICY_META_KEY],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(policy(), "sealed", "an absent source never clears a sealed target");
+
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', ?1, \
+                 'plaintext')",
+                [MEMORY_STREAM_SEAL_POLICY_META_KEY],
+            )
+            .unwrap();
+        let err = import_from_source(&source, &target, "global-repo")
+            .err()
+            .expect("plaintext must not override a sealed target");
+        assert!(err.to_string().contains("unknown memory stream seal policy"));
+        assert_eq!(policy(), "sealed", "the conflicting import cannot downgrade the target");
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM content_entries"), 0);
     }
 
     /// The `repo_meta` classification (see [`CARRIED_META_KEYS`]): repo-PORTABLE configuration is

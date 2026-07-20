@@ -259,20 +259,36 @@ fn load_accepted_entries(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::R
         _ => None,
     };
     let mut stmt = tx.prepare(
-        "SELECT signed_bytes FROM content_entries
+        "SELECT entry_hash, stream_id, signed_bytes FROM content_entries
          WHERE stream_id = ?1 AND accepted = 1
          ORDER BY entry_hash", /* deterministic load order (the projector sorts internally
                                 * regardless) */
     )?;
-    let rows =
-        stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
+    let rows = stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
+    })?;
     let mut entries = Vec::new();
     for row in rows {
-        let signed_bytes = row?;
+        let (stored_entry_hash, stored_stream_id, signed_bytes) = row?;
+        let stored_entry_hash: [u8; 32] = stored_entry_hash
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("stored accepted /3 entry_hash is not 32 bytes"))?;
+        let stored_stream_id: [u8; 32] = stored_stream_id
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("stored accepted /3 stream_id is not 32 bytes"))?;
         // The signed ENVELOPE decoded at ingest to become a candidate, so a failure here is
         // corruption at rest — surface it loudly.
         let signed = decode_content_signed(&signed_bytes)
             .context("stored accepted /3 entry failed to decode")?;
+        anyhow::ensure!(
+            signed.entry_hash == stored_entry_hash,
+            "stored accepted /3 signed envelope does not match its entry_hash row"
+        );
+        anyhow::ensure!(
+            signed.header.stream_id.to_bytes() == stored_stream_id
+                && signed.header.stream_id == stream_id,
+            "stored accepted /3 signed envelope does not match its stream_id row"
+        );
         // Payload/key failures are LOCAL projection failures, not acceptance failures. Unknown
         // suites, absent exact keys, malformed sealed payloads, tag failures, and undecodable
         // plaintext all remain retained+accepted and skip only this entry.
