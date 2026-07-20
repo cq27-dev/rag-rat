@@ -45,7 +45,8 @@ pub use envelope::{seal_and_sign_content_entry, sign_sealed_content_entry};
 pub(crate) use storage::content_projected_tables_exist;
 #[allow(unused_imports, reason = "C2 storage seam is frozen before C3 wiring lands")]
 pub use storage::{
-    ContentCapacityScope, ContentIngestOutcome, content_ingest, settle_pending_content_refolds,
+    ContentCapacityScope, ContentIngestOutcome, ContentRefoldBudget, ContentSettleReport,
+    ContentStreamSettleFailure, content_ingest, settle_pending_content_refolds,
 };
 pub(super) use storage::{
     ContentPromotionOutcome, affected_streams_for_account, finalize_affected_streams,

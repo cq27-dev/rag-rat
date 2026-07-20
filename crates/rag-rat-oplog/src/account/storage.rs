@@ -1915,7 +1915,8 @@ mod tests {
 
     use super::*;
     use crate::account::content::{
-        ContentEntryHeader, content_ingest, settle_pending_content_refolds, sign_content_entry,
+        ContentEntryHeader, ContentRefoldBudget, content_ingest, settle_pending_content_refolds,
+        sign_content_entry,
     };
     use crate::account::envelope::sign_account_entry;
     use crate::account::ops::{ContentCut, DeviceCut, DeviceRole, GrantRole};
@@ -2613,7 +2614,12 @@ mod tests {
 
         let content = signed_member_content(&member, account_id, stream_id, add_hash, 3);
         content_ingest(&conn, &content.signed_bytes, NOW + 3).unwrap();
-        assert_eq!(settle_pending_content_refolds(&conn).unwrap(), 1);
+        assert_eq!(
+            settle_pending_content_refolds(&conn, &ContentRefoldBudget::unbounded())
+                .unwrap()
+                .settled_streams,
+            1
+        );
         assert_eq!(content_verdict(&conn, &content.entry_hash), ("accepted".into(), 1));
         assert_eq!(projected_nodes(&conn, stream_id), vec!["remote-node".to_string()]);
 
@@ -2641,7 +2647,12 @@ mod tests {
             .unwrap();
         assert_eq!(reason, 2, "the revoke queues ACCOUNT_CHANGE");
 
-        assert_eq!(settle_pending_content_refolds(&conn).unwrap(), 1);
+        assert_eq!(
+            settle_pending_content_refolds(&conn, &ContentRefoldBudget::unbounded())
+                .unwrap()
+                .settled_streams,
+            1
+        );
         let (status, accepted) = content_verdict(&conn, &content.entry_hash);
         assert_eq!(accepted, 0);
         assert!(status.starts_with("condemned{"), "unexpected settled verdict: {status}");
@@ -2670,7 +2681,7 @@ mod tests {
         account_ingest(&conn, &add_bytes, NOW + 2).unwrap();
         let content = signed_member_content(&member, account_id, stream_id, add_hash, 3);
         content_ingest(&conn, &content.signed_bytes, NOW + 3).unwrap();
-        settle_pending_content_refolds(&conn).unwrap();
+        settle_pending_content_refolds(&conn, &ContentRefoldBudget::unbounded()).unwrap();
 
         conn.execute_batch(
             "CREATE TRIGGER fail_content_reproject
