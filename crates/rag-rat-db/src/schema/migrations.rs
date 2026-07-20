@@ -1330,6 +1330,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_079_ID => Some(79),
             MIGRATION_080_ID => Some(80),
             MIGRATION_081_ID => Some(81),
+            MIGRATION_082_ID => Some(82),
             _ => None,
         })
         .max()
@@ -1420,6 +1421,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_079_ID
             | MIGRATION_080_ID
             | MIGRATION_081_ID
+            | MIGRATION_082_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1507,6 +1509,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_079_ID => migration.checksum != MIGRATION_079_CHECKSUM,
         MIGRATION_080_ID => migration.checksum != MIGRATION_080_CHECKSUM,
         MIGRATION_081_ID => migration.checksum != MIGRATION_081_CHECKSUM,
+        MIGRATION_082_ID => migration.checksum != MIGRATION_082_CHECKSUM,
         _ => false,
     }
 }
@@ -4614,8 +4617,9 @@ pub fn apply_content_projected_tables(conn: &Connection) -> rusqlite::Result<()>
 /// an attacker amplifies by varying cited `auth_len` to defeat the per-refold freshness cache. It
 /// now records structural classification and enqueues the stream here instead; the settle seam
 /// (`settle_pending_content_refolds`) folds each dirty stream ONCE.
-/// INVARIANT: a `stream_id` is present iff it has ingested candidates not yet folded to their
-/// acceptance verdict — every successful refold (ingest-settle or account fold) deletes its row.
+/// INVARIANT: a `stream_id` is present while settle still owes that stream a refold + reproject.
+/// Only settle clears the row, after both steps succeed; an account fold may refold and reproject
+/// the same stream but deliberately leaves this independent settle debt intact.
 /// Purely additive; `CREATE ... IF NOT EXISTS`, so a torn replay reconverges without a wrapping
 /// transaction; nothing pre-existing to backfill.
 pub fn apply_content_streams_pending_refold(conn: &Connection) -> rusqlite::Result<()> {
@@ -4624,6 +4628,109 @@ pub fn apply_content_streams_pending_refold(conn: &Connection) -> rusqlite::Resu
              stream_id BLOB PRIMARY KEY CHECK (length(stream_id) = 32)
          ) STRICT;",
     )
+}
+
+/// V082 (#698): reasoned/ordered content-refold work and O(1) per-stream fold-cost accounting.
+///
+/// `candidate_bytes` matches the payload that a full refold's `load_stream_headers` query copies
+/// out of SQLite: `length(signed_bytes) + 32` for the separately materialized `entry_hash` on every
+/// row. It deliberately does not guess at allocator/container overhead after decode. The source
+/// rows remain authoritative: this migration rebuilds the aggregate once, and database triggers
+/// maintain it for every writer thereafter. The update trigger covers direct mutation of
+/// `stream_id` or `signed_bytes`; runtime writers currently treat both as immutable, but the schema
+/// does not rely on every present or future caller remembering the accounting invariant.
+///
+/// Existing V072 queue rows predate enqueue timestamps. Their first/last times derive
+/// deterministically from the stream's minimum/maximum candidate `received_at_ms`; an orphan queue
+/// row with no remaining candidate receives `0` for both. Timestamp defaults remain zero in this
+/// schema-only slice so the existing enqueue helper continues to work until the runtime slice
+/// begins stamping and merging queue metadata.
+pub fn apply_content_refold_queue_and_stats(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+
+    if !column_exists(&tx, "content_streams_pending_refold", "reason_mask")? {
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS content_streams_pending_refold_v082;
+             CREATE TABLE content_streams_pending_refold_v082(
+                 stream_id           BLOB    PRIMARY KEY CHECK(length(stream_id) = 32),
+                 reason_mask         INTEGER NOT NULL DEFAULT 1 CHECK(reason_mask BETWEEN 1 AND 3),
+                 first_enqueued_at_ms INTEGER NOT NULL DEFAULT 0,
+                 last_enqueued_at_ms  INTEGER NOT NULL DEFAULT 0
+             ) STRICT;
+             INSERT INTO content_streams_pending_refold_v082(
+                 stream_id, reason_mask, first_enqueued_at_ms, last_enqueued_at_ms)
+             SELECT q.stream_id,
+                    1,
+                    COALESCE(MIN(e.received_at_ms), 0),
+                    COALESCE(MAX(e.received_at_ms), 0)
+             FROM content_streams_pending_refold q
+             LEFT JOIN content_entries e ON e.stream_id = q.stream_id
+             GROUP BY q.stream_id;
+             DROP TABLE content_streams_pending_refold;
+             ALTER TABLE content_streams_pending_refold_v082
+                 RENAME TO content_streams_pending_refold;",
+        )?;
+    }
+
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS content_streams_pending_refold_order
+             ON content_streams_pending_refold(first_enqueued_at_ms, stream_id);
+
+         CREATE TABLE IF NOT EXISTS content_stream_stats(
+             stream_id       BLOB    PRIMARY KEY CHECK(length(stream_id) = 32),
+             candidate_count INTEGER NOT NULL CHECK(candidate_count >= 0),
+             candidate_bytes INTEGER NOT NULL CHECK(candidate_bytes >= 0)
+         ) STRICT;
+
+         DROP TRIGGER IF EXISTS content_stream_stats_after_insert;
+         DROP TRIGGER IF EXISTS content_stream_stats_after_delete;
+         DROP TRIGGER IF EXISTS content_stream_stats_after_update;
+
+         DELETE FROM content_stream_stats;
+         INSERT INTO content_stream_stats(stream_id, candidate_count, candidate_bytes)
+         SELECT stream_id, count(*), sum(length(signed_bytes) + 32)
+         FROM content_entries
+         GROUP BY stream_id;
+
+         CREATE TRIGGER content_stream_stats_after_insert
+         AFTER INSERT ON content_entries
+         BEGIN
+             INSERT INTO content_stream_stats(stream_id, candidate_count, candidate_bytes)
+             VALUES (NEW.stream_id, 1, length(NEW.signed_bytes) + 32)
+             ON CONFLICT(stream_id) DO UPDATE SET
+                 candidate_count = candidate_count + 1,
+                 candidate_bytes = candidate_bytes + length(NEW.signed_bytes) + 32;
+         END;
+
+         CREATE TRIGGER content_stream_stats_after_delete
+         AFTER DELETE ON content_entries
+         BEGIN
+             UPDATE content_stream_stats
+             SET candidate_count = candidate_count - 1,
+                 candidate_bytes = candidate_bytes - length(OLD.signed_bytes) - 32
+             WHERE stream_id = OLD.stream_id;
+             DELETE FROM content_stream_stats
+             WHERE stream_id = OLD.stream_id AND candidate_count = 0;
+         END;
+
+         CREATE TRIGGER content_stream_stats_after_update
+         AFTER UPDATE OF stream_id, signed_bytes ON content_entries
+         BEGIN
+             UPDATE content_stream_stats
+             SET candidate_count = candidate_count - 1,
+                 candidate_bytes = candidate_bytes - length(OLD.signed_bytes) - 32
+             WHERE stream_id = OLD.stream_id;
+             DELETE FROM content_stream_stats
+             WHERE stream_id = OLD.stream_id AND candidate_count = 0;
+             INSERT INTO content_stream_stats(stream_id, candidate_count, candidate_bytes)
+             VALUES (NEW.stream_id, 1, length(NEW.signed_bytes) + 32)
+             ON CONFLICT(stream_id) DO UPDATE SET
+                 candidate_count = candidate_count + 1,
+                 candidate_bytes = candidate_bytes + length(NEW.signed_bytes) + 32;
+         END;",
+    )?;
+
+    tx.commit()
 }
 
 /// V076 (sync phase C4.3b, #607): the sealing-key adoption audit log. A recipient device records a

@@ -3153,7 +3153,7 @@ fn migration_078_distinguishes_candidates_from_selections() {
 
 #[test]
 fn migration_079_builds_safe_input_snapshots() {
-    // `LATEST_SCHEMA_VERSION` pin moved to `migration_080_*`, the new tip; this uses only the
+    // `LATEST_SCHEMA_VERSION` pin moved to `migration_082_*`, the new tip; this uses only the
     // symbolic checks (the hardcoded-LATEST footgun).
     let legacy = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply_distill_record_store(&legacy).unwrap();
@@ -3257,8 +3257,8 @@ fn migration_079_builds_safe_input_snapshots() {
 
 #[test]
 fn migration_080_builds_enriched_context_snapshots() {
-    // `LATEST_SCHEMA_VERSION` pin moved to `migration_081_*`, the new tip; this uses only the
-    // symbolic checks (the hardcoded-LATEST footgun).
+    // The `LATEST_SCHEMA_VERSION` pin lives on `migration_082_*`, the current tip; this uses
+    // only the symbolic checks (the hardcoded-LATEST footgun).
     let legacy = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply_distill_record_store(&legacy).unwrap();
     schema::apply_distill_anchor_selection(&legacy).unwrap();
@@ -3362,8 +3362,8 @@ fn migration_080_builds_enriched_context_snapshots() {
 }
 
 #[test]
-fn migration_081_is_the_tip_and_adds_evidence_source_part() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 81, "move this pin with the next schema migration");
+fn migration_081_adds_evidence_source_part() {
+    // The `LATEST_SCHEMA_VERSION` pin lives on `migration_082_*`, the current tip.
 
     // The evidence table predates the column: build the record store (V077) without V081, then
     // apply V081 and confirm the column appears.
@@ -3424,7 +3424,7 @@ fn migration_081_is_the_tip_and_adds_evidence_source_part() {
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 81);
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM schema_version WHERE id = '081_distill_evidence_source_part'",
@@ -3433,4 +3433,188 @@ fn migration_081_is_the_tip_and_adds_evidence_source_part() {
         )
         .unwrap();
     assert_eq!(recorded, 1, "the forward migration records V081");
+}
+
+#[test]
+fn migration_082_is_the_tip_and_accounts_for_content_refold_work() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 82, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    let insert_candidate =
+        |conn: &rusqlite::Connection, hash: u8, stream: u8, signed_bytes: &[u8], received_at_ms| {
+            conn.execute(
+                "INSERT INTO content_entries(
+                     entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
+                     grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
+                     received_at_ms)
+                 VALUES(?1, ?2, zeroblob(32), zeroblob(32), zeroblob(8), NULL, NULL, zeroblob(32),
+                        zeroblob(8), zeroblob(8), 0, ?3, ?4)",
+                rusqlite::params![vec![hash; 32], vec![stream; 32], signed_bytes, received_at_ms],
+            )
+        };
+
+    // Reconstruct the previous tip: retain the V079 distill snapshot migration and its data, but
+    // restore the V072 queue shape and remove every V080 object before replaying only V080.
+    conn.execute_batch(
+        "DROP TRIGGER content_stream_stats_after_insert;
+         DROP TRIGGER content_stream_stats_after_delete;
+         DROP TRIGGER content_stream_stats_after_update;
+         DROP TABLE content_stream_stats;
+         DROP INDEX content_streams_pending_refold_order;
+         DROP TABLE content_streams_pending_refold;
+         CREATE TABLE content_streams_pending_refold(
+             stream_id BLOB PRIMARY KEY CHECK(length(stream_id) = 32)
+         ) STRICT;",
+    )
+    .unwrap();
+    insert_candidate(&conn, 1, 0x11, b"abc", 300).unwrap();
+    insert_candidate(&conn, 2, 0x11, b"12345", 100).unwrap();
+    insert_candidate(&conn, 3, 0x22, b"payload", 200).unwrap();
+    conn.execute(
+        "INSERT INTO content_streams_pending_refold(stream_id) VALUES (?1), (?2)",
+        rusqlite::params![vec![0x11u8; 32], vec![0x33u8; 32]],
+    )
+    .unwrap();
+    truncate_schema_to(&conn, 79);
+
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, 80);
+
+    let queued: Vec<(Vec<u8>, i64, i64, i64)> = conn
+        .prepare(
+            "SELECT stream_id, reason_mask, first_enqueued_at_ms, last_enqueued_at_ms
+             FROM content_streams_pending_refold ORDER BY stream_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        queued,
+        vec![(vec![0x11u8; 32], 1, 100, 300), (vec![0x33u8; 32], 1, 0, 0)],
+        "legacy rows become content-candidate work with deterministic source-derived times",
+    );
+
+    let stats: Vec<(Vec<u8>, i64, i64)> = conn
+        .prepare(
+            "SELECT stream_id, candidate_count, candidate_bytes
+             FROM content_stream_stats ORDER BY stream_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        stats,
+        vec![(vec![0x11u8; 32], 2, 72), (vec![0x22u8; 32], 1, 39)],
+        "candidate_bytes is signed_bytes plus the separately loaded 32-byte entry hash per row",
+    );
+
+    let ordered_index: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master
+              WHERE type = 'index' AND name = 'content_streams_pending_refold_order'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ordered_index, 1, "ordered pending selection has its composite index");
+
+    // Insert, ignored duplicate, failed duplicate, signed-byte update, stream move, and deletes all
+    // flow through database-owned accounting. Removing the final candidate removes the sparse stats
+    // row rather than retaining a zero-work stream.
+    insert_candidate(&conn, 4, 0x22, b"xx", 400).unwrap();
+    let duplicate_ignored = conn
+        .execute(
+            "INSERT OR IGNORE INTO content_entries(
+                 entry_hash, stream_id, author_account_id, device_fingerprint, seq, roster_ref,
+                 owner_auth_len, author_auth_len, signed_bytes, received_at_ms)
+             SELECT entry_hash, ?1, author_account_id, device_fingerprint, seq, roster_ref,
+                    owner_auth_len, author_auth_len, x'00', received_at_ms
+             FROM content_entries WHERE entry_hash = ?2",
+            rusqlite::params![vec![0x44u8; 32], vec![4u8; 32]],
+        )
+        .unwrap();
+    assert_eq!(duplicate_ignored, 0);
+    assert!(insert_candidate(&conn, 4, 0x44, b"different", 401).is_err());
+    conn.execute(
+        "UPDATE content_entries SET signed_bytes = ?1, stream_id = ?2 WHERE entry_hash = ?3",
+        rusqlite::params![b"updated", vec![0x44u8; 32], vec![4u8; 32]],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM content_entries WHERE stream_id = ?1", [vec![0x44u8; 32]]).unwrap();
+    let stream_44_stats: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM content_stream_stats WHERE stream_id = ?1",
+            [vec![0x44u8; 32]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stream_44_stats, 0, "last-row deletion removes the stats row");
+    let stream_22_stats: (i64, i64) = conn
+        .query_row(
+            "SELECT candidate_count, candidate_bytes FROM content_stream_stats WHERE stream_id = \
+             ?1",
+            [vec![0x22u8; 32]],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stream_22_stats, (1, 39), "move/delete and duplicate attempts do not drift peers");
+
+    for sql in [
+        "INSERT INTO content_stream_stats VALUES(zeroblob(31), 0, 0)",
+        "INSERT INTO content_stream_stats VALUES(zeroblob(32), -1, 0)",
+        "INSERT INTO content_stream_stats VALUES(zeroblob(32), 0, -1)",
+        "INSERT INTO content_streams_pending_refold VALUES(zeroblob(31), 1, 0, 0)",
+        "INSERT INTO content_streams_pending_refold VALUES(randomblob(32), 0, 0, 0)",
+        "INSERT INTO content_streams_pending_refold VALUES(randomblob(32), 4, 0, 0)",
+    ] {
+        assert!(conn.execute_batch(sql).is_err(), "constraint must reject `{sql}`");
+    }
+
+    // A full-ladder replay recomputes the same source-derived stats and leaves queue metadata
+    // intact.
+    schema::apply_content_refold_queue_and_stats(&conn).unwrap();
+    schema::apply_content_refold_queue_and_stats(&conn).unwrap();
+    let replay_stats: Vec<(Vec<u8>, i64, i64)> = conn
+        .prepare(
+            "SELECT stream_id, candidate_count, candidate_bytes
+             FROM content_stream_stats ORDER BY stream_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(replay_stats, vec![(vec![0x11u8; 32], 2, 72), (vec![0x22u8; 32], 1, 39)]);
+    assert_eq!(
+        conn.query_row(
+            "SELECT first_enqueued_at_ms, last_enqueued_at_ms
+             FROM content_streams_pending_refold WHERE stream_id = ?1",
+            [vec![0x11u8; 32]],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap(),
+        (100, 300),
+        "replay does not rebuild or overwrite the upgraded queue",
+    );
+    let v81_recorded: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM schema_version WHERE id = '081_distill_evidence_source_part'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v81_recorded, 1, "the previous-tip V081 migration remains recorded");
+    let v82_recorded: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM schema_version WHERE id = '082_content_refold_queue_and_stats'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v82_recorded, 1, "forward migration records V082");
 }
