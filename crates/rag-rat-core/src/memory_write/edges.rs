@@ -89,6 +89,7 @@ pub(crate) fn add_edge(
     // Backfill the pre-existing history (idempotent) + the edge INSERT + the EdgeAdd op in ONE
     // transaction (strict-atomic); the write via `conn` participates in the open txn.
     authoring::backfill_memory_oplog(conn, now)?;
+    let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // Authored write: the EdgeAdd op is signed op-log content, so commit durably (#560).
     let _durability = authoring::AuthoredDurability::begin(conn)?;
     let tx = conn.unchecked_transaction()?;
@@ -137,6 +138,7 @@ pub(crate) fn add_edge(
             target_kind,
             &target_anchor,
             &owner_repo_id,
+            prepared.as_ref(),
             now,
         )?;
     }
@@ -149,6 +151,7 @@ pub(crate) fn remove_edge(conn: &Connection, edge_key: &str) -> anyhow::Result<b
     let repo_clause = periphery_edge_scope_clause(&scope);
     let now = now_ms();
     authoring::backfill_memory_oplog(conn, now)?;
+    let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // Authored write: the EdgeRemove tombstone is signed op-log content, so commit durably (#560).
     let _durability = authoring::AuthoredDurability::begin(conn)?;
     let tx = conn.unchecked_transaction()?;
@@ -158,7 +161,7 @@ pub(crate) fn remove_edge(conn: &Connection, edge_key: &str) -> anyhow::Result<b
         ])?;
     if n > 0 {
         // Author an EdgeRemove tombstone ONLY when a row was actually removed, in the same txn.
-        authoring::author_edge_remove(&tx, edge_key, now)?;
+        authoring::author_edge_remove(&tx, edge_key, prepared.as_ref(), now)?;
     }
     tx.commit()?;
     Ok(n > 0)

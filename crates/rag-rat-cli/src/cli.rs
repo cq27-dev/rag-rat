@@ -85,6 +85,9 @@ pub(crate) enum Command {
     /// Inspect and re-anchor source-anchored repo memories.
     Memory(MemoryArgs),
 
+    /// Configure local memory-stream authoring. This does not configure transport or peers.
+    Sync(SyncArgs),
+
     /// Dream-mode memory-maintenance worklist (#122): deterministic coverage-gap + stale-reference
     /// findings written to `dream_findings`. Surfaces findings ABOUT memories; never mutates them.
     Dream(DreamArgs),
@@ -178,6 +181,18 @@ pub(crate) struct InitArgs {
     /// leave `.git/hooks` untouched (e.g. an agent that asks for hook consent separately).
     #[arg(long)]
     pub no_hooks: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SyncArgs {
+    #[command(subcommand)]
+    pub command: SyncCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SyncCommand {
+    /// Permanently enable sealed authoring for subsequent local memory changes.
+    Enable,
 }
 
 #[derive(Debug, Args)]

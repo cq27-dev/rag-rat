@@ -10,8 +10,8 @@
 //! repo's owner-bound `/2` stream, under the store's single local account (minted once, store-
 //! global). Each reconcile/mutation ensures the repo's `/2` stream is owned (publishing a
 //! `StreamOwn` account op) and authors its ops as owner-authored `/3` content
-//! ([`rag_rat_oplog::author_content_batch_in_tx`]), which verify-accepts and reprojects into
-//! `content_projected_nodes` / `content_projected_edges`. The completeness predicate is an
+//! ([`rag_rat_oplog::author_prepared_content_batch_in_tx`]), which verify-accepts and reprojects
+//! into `content_projected_nodes` / `content_projected_edges`. The completeness predicate is an
 //! anti-join against that accepted-`/3` projection; the pre-existing `/1` history is retained but
 //! no longer written by the live path (existing `/1` rows are adopted into `/3` by the reconcile).
 //!
@@ -67,7 +67,10 @@ impl Drop for AuthoredDurability<'_> {
         let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL;");
     }
 }
-use rag_rat_oplog::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, StreamId};
+use rag_rat_oplog::{
+    EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, PreparedContentAuthoring,
+    SealPolicy, StreamId,
+};
 use rag_rat_query::memory::{EdgeRelation, NodeEdge, RepoMemory, memory_repo_scope};
 
 /// One memory's projectable content — the columns the op model carries (NOT the identity / anchor /
@@ -82,6 +85,57 @@ struct MemoryRow {
     source: String,
     payload_json: Option<String>,
     tags: Vec<String>,
+}
+
+const STREAM_SEAL_POLICY_META_KEY: &str = "memory_stream_seal_policy";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamSealPolicy {
+    Plaintext,
+    Sealed,
+}
+
+impl StreamSealPolicy {
+    fn seal_policy(self) -> SealPolicy {
+        match self {
+            Self::Plaintext => SealPolicy::Plaintext,
+            Self::Sealed => SealPolicy::Sealed,
+        }
+    }
+}
+
+pub(crate) struct PreparedOwnerAuthoring {
+    repo_id: String,
+    stream: StreamId,
+    policy: StreamSealPolicy,
+    prepared: PreparedContentAuthoring,
+}
+
+fn explicit_stream_seal_policy(
+    conn: &Connection,
+    repo_id: &str,
+) -> anyhow::Result<Option<StreamSealPolicy>> {
+    match rag_rat_db::meta::repo_meta(conn, repo_id, STREAM_SEAL_POLICY_META_KEY)?.as_deref() {
+        None => Ok(None),
+        Some("sealed") => Ok(Some(StreamSealPolicy::Sealed)),
+        Some(other) => anyhow::bail!(
+            "repo `{repo_id}` has unknown memory stream seal policy `{other}`; refusing to author"
+        ),
+    }
+}
+
+fn stream_seal_policy(
+    conn: &Connection,
+    repo_id: &str,
+    stream: StreamId,
+) -> anyhow::Result<StreamSealPolicy> {
+    if explicit_stream_seal_policy(conn, repo_id)? == Some(StreamSealPolicy::Sealed)
+        || rag_rat_oplog::content_stream_has_sealed_ratchet(conn, stream)?
+    {
+        Ok(StreamSealPolicy::Sealed)
+    } else {
+        Ok(StreamSealPolicy::Plaintext)
+    }
 }
 
 /// Build the op model's content register from a memory's projectable columns — shared by the
@@ -208,7 +262,7 @@ fn build_reconcile_ops(
 /// only a raw writer / import / pre-cap ghost with an oversized body or payload can fail this, and
 /// such a row is QUARANTINED rather than allowed to wedge the whole batch (#680). The status/edge
 /// ops are tiny and never oversized, so the `NodeCreate` alone decides a node's authorability.
-fn node_is_authorable(row: &MemoryRow) -> bool {
+fn node_is_authorable(row: &MemoryRow, policy: StreamSealPolicy) -> bool {
     let op = MemoryOp::NodeCreate {
         node_id: NodeId::from(row.memory_id.as_str()),
         content: node_content(
@@ -221,7 +275,7 @@ fn node_is_authorable(row: &MemoryRow) -> bool {
             row.payload_json.as_deref(),
         ),
     };
-    rag_rat_oplog::content_op_is_authorable(&op)
+    content_op_is_authorable(&op, policy)
 }
 
 /// Whether `edge`'s `EdgeAdd` fits the signed `/3` content envelope. The edge twin of
@@ -233,10 +287,17 @@ fn node_is_authorable(row: &MemoryRow) -> bool {
 /// DIFFERENT (forward-compat) failure — [`build_reconcile_ops`] surfaces it loudly via
 /// [`edge_add_op`], exactly as an unknown node status does — so a build error counts as authorable
 /// here and defers to that path rather than silently quarantining it.
-fn edge_is_authorable(edge: &NodeEdge, owner_repo_id: &str) -> bool {
+fn edge_is_authorable(edge: &NodeEdge, owner_repo_id: &str, policy: StreamSealPolicy) -> bool {
     match edge_add_op(edge, owner_repo_id) {
-        Ok(op) => rag_rat_oplog::content_op_is_authorable(&op),
+        Ok(op) => content_op_is_authorable(&op, policy),
         Err(_) => true,
+    }
+}
+
+fn content_op_is_authorable(op: &MemoryOp, policy: StreamSealPolicy) -> bool {
+    match policy {
+        StreamSealPolicy::Plaintext => rag_rat_oplog::content_op_is_authorable(op),
+        StreamSealPolicy::Sealed => rag_rat_oplog::content_op_is_sealed_authorable(op),
     }
 }
 
@@ -291,11 +352,12 @@ fn read_reconcile_work(
     conn: &Connection,
     repo_id: &str,
     stream: StreamId,
+    policy: StreamSealPolicy,
 ) -> anyhow::Result<ReconcileWork> {
     let (authorable_nodes, quarantined_nodes): (Vec<MemoryRow>, Vec<MemoryRow>) =
         read_unauthored_memory_rows(conn, repo_id, stream)?
             .into_iter()
-            .partition(node_is_authorable);
+            .partition(|row| node_is_authorable(row, policy));
     // An edge whose source node is quarantined has no authored `NodeCreate` to hang off, so drop it
     // WITH its source (the source node's quarantine warning is the actionable one — it never
     // reaches `quarantined_edges`).
@@ -310,7 +372,7 @@ fn read_reconcile_work(
         super::edges::unauthored_edges(conn, repo_id, stream)?
             .into_iter()
             .filter(|edge| !quarantined_node_ids.contains(edge.source_node_id.as_str()))
-            .partition(|edge| edge_is_authorable(edge, repo_id));
+            .partition(|edge| edge_is_authorable(edge, repo_id, policy));
     Ok(ReconcileWork { authorable_nodes, live_edges, quarantined_nodes, quarantined_edges })
 }
 
@@ -334,43 +396,34 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     {
         return Ok(());
     }
-    // Cheap autocommit fast-path: return WITHOUT the write lock only when the `/3` log is fully
-    // ESTABLISHED (the local account is minted AND its `StreamOwn` folded effective) AND nothing is
-    // missing. `established_owned_stream_v2` returns `None` for a fresh repo that has never
-    // published ownership — even one with an empty anti-join — so such a repo FALLS THROUGH to
-    // the slow path to mint + publish ownership rather than early-returning on an empty set it
-    // could not yet author into. `established_owned_stream_v2` is autocommit-only (it opens its
-    // own read txn), so it runs here, not under the write lock.
-    if let Some(stream) = rag_rat_oplog::established_owned_stream_v2(conn, repo_id)? {
-        let work = read_reconcile_work(conn, repo_id, stream)?;
-        if !work.has_authorable_work() {
-            // Nothing AUTHORABLE is missing. A quarantined (un-authorable) row can still be present
-            // here — it never becomes authorable on its own — so it is deliberately NOT "work":
-            // early-return on it too, or a single oversized ghost would force the write-locked slow
-            // path on every mutation forever (#680). Emit the per-row quarantine warning from the
-            // already-read work BEFORE returning (no write lock needed to warn) so a
-            // silently-skipped row surfaces its actionable warning on this cheap path
-            // exactly as the slow path does — otherwise the fast path skips the row on
-            // every reconcile with no signal at all.
-            work.warn_quarantined(repo_id);
-            return Ok(());
-        }
-    }
-
-    // Slow path. Mint the store's local account BEFORE the durability guard: the mint
+    // Mint the store's local account BEFORE the durability guard: the mint
     // self-transacts and holds its OWN durability guard that restores `synchronous = NORMAL` on
     // drop — beginning our guard first would let the mint's drop downgrade our authored commit
     // below NORMAL, silently losing the #560 durability. The mint is store-global and
     // idempotent (a re-mint returns the same account).
     rag_rat_oplog::local_account(conn, now_ms)?;
-    // Authored, irreplaceable data → durable (#560). FULL for this txn only, restored on drop; set
-    // OUTSIDE the txn (SQLite applies a `synchronous` change to SUBSEQUENT transactions only).
+    let stream = ensure_owner_stream(conn, repo_id, now_ms)?;
+    let policy = stream_seal_policy(conn, repo_id, stream)?;
+    let work = read_reconcile_work(conn, repo_id, stream, policy)?;
+    if !work.has_authorable_work() {
+        work.warn_quarantined(repo_id);
+        return Ok(());
+    }
+    let ops = build_reconcile_ops(
+        &work.authorable_nodes,
+        &work.live_edges,
+        repo_id,
+        rag_rat_oplog::content_stream_is_empty(conn, stream)?,
+    )?;
+    let prepared = prepare_owner_authoring(conn, repo_id, stream, policy, &ops, now_ms)?
+        .context("reconcile work unexpectedly prepared as an empty batch")?;
+
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    // Publish ownership of the repo's `/2` stream and resolve its id. Idempotent +
-    // check-fact-first: a re-ensure (or a racer serialized on this IMMEDIATE lock) authors no
-    // second `StreamOwn`.
-    let stream = rag_rat_oplog::ensure_owned_stream_v2_in_tx(&tx, repo_id, now_ms)?;
+    anyhow::ensure!(
+        stream_seal_policy(&tx, repo_id, stream)? == policy,
+        "memory stream seal policy changed while preparing reconcile; retry"
+    );
     // Authoritative re-read UNDER the write lock (TOCTOU): a concurrent author may have healed or
     // added rows between the probe and the lock, so re-read the missing set and re-derive `genesis`
     // here. `genesis` decides the status-elision: an empty `/3` content chain ⇒ no stale registers
@@ -383,7 +436,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // signed `/3` envelope exceeds the §18a cap cannot make the whole batch `bail!` and wedge every
     // other memory write. The authorable rows are signed; the quarantined ones are logged and left
     // for the public API to shrink or delete.
-    let work = read_reconcile_work(&tx, repo_id, stream)?;
+    let work = read_reconcile_work(&tx, repo_id, stream, policy)?;
     work.warn_quarantined(repo_id);
     let ops = build_reconcile_ops(&work.authorable_nodes, &work.live_edges, repo_id, genesis)?;
     // Skip the author when there is nothing to author: a fresh repo whose anti-join was empty only
@@ -394,18 +447,142 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
         // (#680), so the `/3` author's §18a size check cannot fire on this batch. `with_context`
         // still names the repo so any OTHER authoring failure (a stale `auth_len`, a contested
         // account) is attributable rather than surfacing as a bare rollback.
-        rag_rat_oplog::author_content_batch_in_tx(&tx, stream, &ops, now_ms).with_context(
-            || {
-                format!(
-                    "reconciling the /3 owner log for repo `{repo_id}` failed while authoring {} \
-                     pre-existing memory op(s)",
-                    ops.len()
-                )
-            },
-        )?;
+        rag_rat_oplog::author_prepared_content_batch_in_tx(
+            &tx,
+            stream,
+            &ops,
+            &prepared.prepared,
+            now_ms,
+        )
+        .with_context(|| {
+            format!(
+                "reconciling the /3 owner log for repo `{repo_id}` failed while authoring {} \
+                 pre-existing memory op(s)",
+                ops.len()
+            )
+        })?;
     }
     tx.commit()?;
     Ok(())
+}
+
+fn ensure_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::Result<StreamId> {
+    if let Some(stream) = rag_rat_oplog::established_owned_stream_v2(conn, repo_id)? {
+        return Ok(stream);
+    }
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let stream = rag_rat_oplog::ensure_owned_stream_v2_in_tx(&tx, repo_id, now_ms)?;
+    tx.commit()?;
+    Ok(stream)
+}
+
+fn prepare_owner_authoring(
+    conn: &Connection,
+    repo_id: &str,
+    stream: StreamId,
+    policy: StreamSealPolicy,
+    ops: &[MemoryOp],
+    now_ms: i64,
+) -> anyhow::Result<Option<PreparedOwnerAuthoring>> {
+    if ops.is_empty() {
+        return Ok(None);
+    }
+    for op in ops {
+        reject_unauthorable_content_op(op, policy)?;
+    }
+    let prepared =
+        rag_rat_oplog::prepare_content_authoring(conn, stream, policy.seal_policy(), now_ms)?;
+    Ok(Some(PreparedOwnerAuthoring { repo_id: repo_id.to_string(), stream, policy, prepared }))
+}
+
+pub(crate) fn prepare_live_authoring(
+    conn: &Connection,
+    ops: &[MemoryOp],
+    now_ms: i64,
+) -> anyhow::Result<Option<PreparedOwnerAuthoring>> {
+    if ops.is_empty() {
+        return Ok(None);
+    }
+    let Some(repo_id) = memory_repo_scope(conn)? else {
+        for op in ops {
+            reject_unauthorable_content_op(op, StreamSealPolicy::Plaintext)?;
+        }
+        return Ok(None);
+    };
+    let Some(stream) = stable_owner_stream_for_repo(conn, &repo_id)? else {
+        for op in ops {
+            reject_unauthorable_content_op(op, StreamSealPolicy::Plaintext)?;
+        }
+        return Ok(None);
+    };
+    let policy = stream_seal_policy(conn, &repo_id, stream)?;
+    prepare_owner_authoring(conn, &repo_id, stream, policy, ops, now_ms)
+}
+
+pub(crate) fn prepare_live_content_authoring(
+    conn: &Connection,
+    now_ms: i64,
+) -> anyhow::Result<Option<PreparedOwnerAuthoring>> {
+    let sentinel = MemoryOp::EdgeRemove { edge_key: EdgeKey::from("live-authoring-preparation") };
+    prepare_live_authoring(conn, &[sentinel], now_ms)
+}
+
+pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow::Result<bool> {
+    let repo_id = memory_repo_scope(conn)?.context("sync enable requires an active repo scope")?;
+    if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
+        || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
+    {
+        anyhow::bail!("sync enable requires a stable repo identity (not legacy or local-only)");
+    }
+    rag_rat_oplog::local_account(conn, now_ms)?;
+    let stream = ensure_owner_stream(conn, &repo_id, now_ms)?;
+    let was_enabled =
+        explicit_stream_seal_policy(conn, &repo_id)? == Some(StreamSealPolicy::Sealed);
+
+    // A non-empty sentinel is required because preparation deliberately makes empty batches
+    // side-effect-free. The sentinel is never authored; it only drives the three-transaction key
+    // protocol before the final intent+reconcile transaction.
+    let sentinel = MemoryOp::EdgeRemove { edge_key: EdgeKey::from("sync-enable-key-preparation") };
+    let prepared = prepare_owner_authoring(
+        conn,
+        &repo_id,
+        stream,
+        StreamSealPolicy::Sealed,
+        &[sentinel],
+        now_ms,
+    )?
+    .context("sealed enable preparation unexpectedly returned empty")?;
+
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Unknown or malformed persisted policy was already rejected above. The only writable token is
+    // `sealed`; there is deliberately no plaintext writer, and the derived ratchet keeps this
+    // one-way even if external tooling deletes the intent row.
+    anyhow::ensure!(
+        stream_seal_policy(&tx, &repo_id, stream)? == StreamSealPolicy::Sealed,
+        "sealed enable key preparation did not arm the stream ratchet"
+    );
+    rag_rat_db::meta::set_repo_meta(&tx, &repo_id, STREAM_SEAL_POLICY_META_KEY, "sealed")?;
+    let work = read_reconcile_work(&tx, &repo_id, stream, StreamSealPolicy::Sealed)?;
+    work.warn_quarantined(&repo_id);
+    let ops = build_reconcile_ops(
+        &work.authorable_nodes,
+        &work.live_edges,
+        &repo_id,
+        rag_rat_oplog::content_stream_is_empty(&tx, stream)?,
+    )?;
+    if !ops.is_empty() {
+        rag_rat_oplog::author_prepared_content_batch_in_tx(
+            &tx,
+            stream,
+            &ops,
+            &prepared.prepared,
+            now_ms,
+        )?;
+    }
+    tx.commit()?;
+    Ok(!was_enabled)
 }
 
 /// Reconcile the ACTIVE repo's owner stream (scope read from the connection) — the idempotent call
@@ -444,12 +621,19 @@ fn stable_owner_stream(conn: &Connection) -> anyhow::Result<Option<StreamId>> {
     let Some(repo_id) = memory_repo_scope(conn)? else {
         return Ok(None);
     };
+    stable_owner_stream_for_repo(conn, &repo_id)
+}
+
+fn stable_owner_stream_for_repo(
+    conn: &Connection,
+    repo_id: &str,
+) -> anyhow::Result<Option<StreamId>> {
     if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
         || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
     {
         return Ok(None);
     }
-    rag_rat_oplog::owned_stream_v2_id(conn, &repo_id)
+    rag_rat_oplog::owned_stream_v2_id(conn, repo_id)
 }
 
 /// Reject a live content op whose ASSEMBLED signed `/3` envelope would exceed the §18a 256 KiB cap
@@ -463,8 +647,8 @@ fn stable_owner_stream(conn: &Connection) -> anyhow::Result<Option<StreamId>> {
 /// reconcile can later author. Without it an "otherwise valid" create/update assembles an
 /// un-authorable op that the #680 reconcile quarantine then SILENTLY skips — the user never learns
 /// at write time.
-fn reject_unauthorable_content_op(op: &MemoryOp) -> anyhow::Result<()> {
-    if rag_rat_oplog::content_op_is_authorable(op) {
+fn reject_unauthorable_content_op(op: &MemoryOp, policy: StreamSealPolicy) -> anyhow::Result<()> {
+    if content_op_is_authorable(op, policy) {
         return Ok(());
     }
     // The per-field caps have already passed, so the culprit is an aggregate (or a future uncapped
@@ -493,7 +677,7 @@ fn reject_unauthorable_content_op(op: &MemoryOp) -> anyhow::Result<()> {
 
 /// Author `ops` as owner-authored `/3` content on the active repo's owner-bound `/2` stream WITHIN
 /// the caller's mutation txn — the strict-atomic live seam.
-/// [`rag_rat_oplog::author_content_batch_in_tx`] mints, inserts, refolds, and verify-accepts the
+/// [`rag_rat_oplog::author_prepared_content_batch_in_tx`] inserts, refolds, and verify-accepts the
 /// batch (no open/commit), so an authoring error propagates via `?` and the caller's txn rolls the
 /// table write back with it. A NO-OP under an unstable scope or before the local account is minted.
 /// The caller MUST have run `backfill_memory_oplog` first, so the store's account plus `StreamOwn`
@@ -502,6 +686,7 @@ fn reject_unauthorable_content_op(op: &MemoryOp) -> anyhow::Result<()> {
 fn author_in_owner_stream(
     tx: &Transaction<'_>,
     ops: &[MemoryOp],
+    prepared: Option<&PreparedOwnerAuthoring>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
     // Whole-op write-boundary guard (#680): every live mutation
@@ -511,19 +696,35 @@ fn author_in_owner_stream(
     // individually-valid tags) and any future uncapped field. Runs BEFORE the scope gate so an
     // un-authorable op is rejected consistently even on a not-yet-owned stream (the reconcile does
     // NOT pass through here, so its pre-cap/imported-row quarantine is unaffected).
-    for op in ops {
-        reject_unauthorable_content_op(op)?;
-    }
-    let Some(stream) = stable_owner_stream(tx)? else {
-        return Ok(());
-    };
     // Skip a no-op mutation: an empty batch would still refold + reproject the whole stream for no
     // change. (The four live seams only reach here with non-empty ops today, but the guard keeps a
     // change-free `author_update` from doing O(chain) work.)
     if ops.is_empty() {
         return Ok(());
     }
-    rag_rat_oplog::author_content_batch_in_tx(tx, stream, ops, now_ms)?;
+    let Some(prepared) = prepared else {
+        // Scope-less and unstable-scope callers intentionally do not author.
+        anyhow::ensure!(stable_owner_stream(tx)?.is_none(), "missing prepared owner authoring");
+        return Ok(());
+    };
+    anyhow::ensure!(
+        memory_repo_scope(tx)?.as_deref() == Some(prepared.repo_id.as_str()),
+        "prepared /3 authoring belongs to a different repo scope"
+    );
+    anyhow::ensure!(
+        stream_seal_policy(tx, &prepared.repo_id, prepared.stream)? == prepared.policy,
+        "memory stream seal policy changed while preparing live authoring; retry"
+    );
+    for op in ops {
+        reject_unauthorable_content_op(op, prepared.policy)?;
+    }
+    rag_rat_oplog::author_prepared_content_batch_in_tx(
+        tx,
+        prepared.stream,
+        ops,
+        &prepared.prepared,
+        now_ms,
+    )?;
     Ok(())
 }
 
@@ -532,13 +733,14 @@ fn author_in_owner_stream(
 pub(crate) fn author_create(
     tx: &Transaction<'_>,
     memory: &RepoMemory,
+    prepared: Option<&PreparedOwnerAuthoring>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
     let op = MemoryOp::NodeCreate {
         node_id: NodeId::from(memory.memory_id.as_str()),
         content: content_of(memory),
     };
-    author_in_owner_stream(tx, &[op], now_ms)
+    author_in_owner_stream(tx, &[op], prepared, now_ms)
 }
 
 /// Author a live memory UPDATE inside the caller's mutation txn: a `NodeUpdate` ONLY when the
@@ -553,6 +755,7 @@ pub(crate) fn author_update(
     memory: &RepoMemory,
     content_changed: bool,
     status_changed: bool,
+    prepared: Option<&PreparedOwnerAuthoring>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
     let node_id = NodeId::from(memory.memory_id.as_str());
@@ -569,7 +772,7 @@ pub(crate) fn author_update(
         })?;
         ops.push(MemoryOp::NodeStatus { node_id, status });
     }
-    author_in_owner_stream(tx, &ops, now_ms)
+    author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
 /// Author a live edge ADD (`EdgeAdd`) inside the caller's mutation txn — presence + the durable
@@ -583,6 +786,7 @@ pub(crate) fn author_edge_add(
     target_kind: &str,
     target_anchor: &str,
     owner_repo_id: &str,
+    prepared: Option<&PreparedOwnerAuthoring>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
     let op = MemoryOp::EdgeAdd {
@@ -595,18 +799,20 @@ pub(crate) fn author_edge_add(
             owner_repo_id: owner_repo_id.to_string(),
         },
     };
-    author_in_owner_stream(tx, &[op], now_ms)
+    author_in_owner_stream(tx, &[op], prepared, now_ms)
 }
 
 /// Author a live edge REMOVE (`EdgeRemove` tombstone) inside the caller's mutation txn.
 pub(crate) fn author_edge_remove(
     tx: &Transaction<'_>,
     edge_key: &str,
+    prepared: Option<&PreparedOwnerAuthoring>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
     author_in_owner_stream(
         tx,
         &[MemoryOp::EdgeRemove { edge_key: EdgeKey::from(edge_key) }],
+        prepared,
         now_ms,
     )
 }
@@ -806,6 +1012,18 @@ mod tests {
         conn.query_row("SELECT COUNT(*) FROM content_entries", [], |r| r.get(0)).unwrap()
     }
 
+    fn content_suites(conn: &Connection) -> Vec<u64> {
+        let mut stmt = conn
+            .prepare("SELECT signed_bytes FROM content_entries WHERE accepted = 1 ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|bytes| {
+                rag_rat_oplog::decode_content_signed(&bytes.unwrap()).unwrap().header.crypto_suite
+            })
+            .collect()
+    }
+
     fn projected_node_count(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM content_projected_nodes", [], |r| r.get(0)).unwrap()
     }
@@ -932,6 +1150,39 @@ mod tests {
         // default.
         let err = node_ops(&op_row("future_status_from_a_newer_binary"), true).unwrap_err();
         assert!(err.to_string().contains("unknown status"), "an unknown status fails authoring");
+    }
+
+    #[test]
+    fn sealed_authorability_reserves_the_aead_overhead() {
+        let mut row = op_row("active");
+        let mut found = false;
+        for len in 261_000..262_500 {
+            row.body = "x".repeat(len);
+            if node_is_authorable(&row, StreamSealPolicy::Plaintext)
+                && !node_is_authorable(&row, StreamSealPolicy::Sealed)
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "the sealed policy rejects an op in the 40-byte AEAD overhead window");
+    }
+
+    #[test]
+    fn empty_preparation_mints_no_key_and_arms_no_policy() {
+        let conn = scoped_conn();
+        backfill_memory_oplog(&conn, 1_000).unwrap();
+        assert!(prepare_live_authoring(&conn, &[], 2_000).unwrap().is_none());
+        let secret_entries: i64 = conn
+            .query_row("SELECT COUNT(*) FROM account_entries WHERE log_id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(secret_entries, 0);
+        assert_eq!(
+            rag_rat_db::meta::repo_meta(&conn, REPO, STREAM_SEAL_POLICY_META_KEY).unwrap(),
+            None
+        );
     }
 
     /// #541/#664: the reconcile's memory reader anti-joins `repo_memories` against the accepted-`/3`
@@ -1183,6 +1434,111 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1, "the created memory is a projected /3 node");
         assert_eq!(projected_node_count(&conn), 1);
+        assert_eq!(content_suites(&conn), [0], "plaintext remains the default for existing repos");
+    }
+
+    #[test]
+    fn enable_is_idempotent_and_subsequent_live_authoring_is_sealed_and_projected() {
+        let conn = scoped_conn();
+        assert!(enable_sealed_authoring(&conn, 1_000).unwrap());
+        assert!(!enable_sealed_authoring(&conn, 2_000).unwrap());
+        assert_eq!(
+            rag_rat_db::meta::repo_meta(&conn, REPO, STREAM_SEAL_POLICY_META_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("sealed")
+        );
+        let accepted_wraps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE log_id = 1 AND accepted = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accepted_wraps, 1, "enable establishes exactly one accepted first-key wrap");
+
+        let first = create_concept(&conn, "sealed one").unwrap().memory.memory_id;
+        let second = create_concept(&conn, "sealed two").unwrap().memory.memory_id;
+        assert_eq!(content_suites(&conn), [1, 1]);
+        assert!(is_projected(&conn, &first));
+        assert!(is_projected(&conn, &second));
+
+        crate::memory_write::update_memory(&conn, rag_rat_query::memory::RepoMemoryUpdate {
+            memory_id: first.clone(),
+            kind: None,
+            title: None,
+            body: Some("sealed update".to_string()),
+            confidence: None,
+            status: Some("obsolete".to_string()),
+            tags: None,
+            payload_json: None,
+        })
+        .unwrap();
+        let edge = crate::memory_write::add_edge(
+            &conn,
+            &second,
+            EdgeRelation::RelatesTo,
+            &rag_rat_query::memory::EdgeTarget::Node { repo_id: None, node_id: first },
+        )
+        .unwrap();
+        crate::memory_write::remove_edge(&conn, &edge.edge_key).unwrap();
+        assert!(content_suites(&conn).into_iter().all(|suite| suite == 1));
+    }
+
+    #[test]
+    fn sealed_reconcile_authors_a_ghost_once() {
+        let conn = scoped_conn();
+        enable_sealed_authoring(&conn, 1_000).unwrap();
+        insert_memory(&conn, "sealed-ghost", "active", 100);
+        backfill_memory_oplog(&conn, 2_000).unwrap();
+        assert_eq!(content_suites(&conn), [1]);
+        assert!(is_projected(&conn, "sealed-ghost"));
+        backfill_memory_oplog(&conn, 3_000).unwrap();
+        assert_eq!(
+            content_suites(&conn),
+            [1],
+            "repeat reconcile does not duplicate sealed history"
+        );
+    }
+
+    #[test]
+    fn sealed_policy_is_repo_scoped_and_the_ratchet_survives_deleted_intent() {
+        let conn = scoped_conn();
+        enable_sealed_authoring(&conn, 1_000).unwrap();
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-b', \
+             'repo-b', 0)",
+            [],
+        )
+        .unwrap();
+        set_scope(&conn, "repo-b");
+        let b = create_concept(&conn, "repo b plaintext").unwrap().memory.memory_id;
+        assert!(is_projected(&conn, &b));
+        assert_eq!(content_suites(&conn), [0], "a sibling repo remains plaintext by default");
+
+        set_scope(&conn, REPO);
+        conn.execute("DELETE FROM repo_meta WHERE repo_id = ?1 AND key = ?2", params![
+            REPO,
+            STREAM_SEAL_POLICY_META_KEY
+        ])
+        .unwrap();
+        create_concept(&conn, "ratcheted sealed").unwrap();
+        assert_eq!(content_suites(&conn), [0, 1], "a wrap prevents plaintext downgrade");
+    }
+
+    #[test]
+    fn policy_revalidation_failure_rolls_back_the_table_mutation() {
+        let conn = scoped_conn();
+        backfill_memory_oplog(&conn, 1_000).unwrap();
+        let prepared = prepare_live_content_authoring(&conn, 2_000).unwrap().unwrap();
+        rag_rat_db::meta::set_repo_meta(&conn, REPO, STREAM_SEAL_POLICY_META_KEY, "sealed")
+            .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_memory(&tx, "must-roll-back", "active", 100);
+        let memory = rag_rat_query::memory::memory_by_id(&tx, "must-roll-back").unwrap().unwrap();
+        assert!(author_create(&tx, &memory, Some(&prepared), 2_000).is_err());
+        drop(tx);
+        assert!(rag_rat_query::memory::memory_by_id(&conn, "must-roll-back").unwrap().is_none());
     }
 
     #[test]

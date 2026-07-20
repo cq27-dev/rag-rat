@@ -52,18 +52,12 @@ pub use content::{
 };
 // The C5a sealed-authoring surface (#608): the envelope-layer seal
 // (`sign_sealed_content_entry` + its OS-nonce wrapper `seal_and_sign_content_entry`), the
-// policy-aware prepared authoring surface, and the sealed-op size predicate. UNWIRED — tests
-// consume it, but no live privacy-intent source does, so the group keeps the unused-import
-// allowance.
-#[allow(
-    unused_imports,
-    reason = "sealed authoring remains unwired until a live privacy-intent source consumes it \
-              (#608)"
-)]
+// policy-aware prepared authoring surface, sealed-op size predicate, and downgrade-ratchet
+// reader.
 pub use content::{
     PreparedContentAuthoring, SealPolicy, author_content_batch,
     author_prepared_content_batch_in_tx, content_op_is_sealed_authorable,
-    prepare_content_authoring, seal_and_sign_content_entry, sign_sealed_content_entry,
+    content_stream_has_sealed_ratchet, prepare_content_authoring,
 };
 // The in-tx `/3` content-author seam + its genesis-detection reader (C3.4b-i, #663): #664
 // retargets the live memory path onto them, so they are plain re-exports.
@@ -71,6 +65,8 @@ pub use content::{author_content_batch_in_tx, content_op_is_authorable, content_
 // The V070 projection-table guard, reused by the memory-layer content projection's upgrade
 // re-fold (#688).
 pub(crate) use content::{content_projected_tables_exist, open_sealed_payload};
+#[allow(unused_imports, reason = "envelope tests consume these crate-internal signing seams")]
+pub use content::{seal_and_sign_content_entry, sign_sealed_content_entry};
 pub use fold::{
     AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, GrantAuthority,
     GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,

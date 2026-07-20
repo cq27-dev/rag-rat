@@ -70,6 +70,7 @@ pub(crate) fn create_memory(
     // chain exists), then do the table writes + the op-append in ONE transaction so they commit —
     // or roll back — together (strict-atomic). Writes via `conn` participate in the open txn.
     authoring::backfill_memory_oplog(conn, now)?;
+    let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // Authored write: commit durably so a `memory_create` that returned success survives power loss
     // (#560). FULL for this transaction only; the connection restores NORMAL on drop.
     let _durability = authoring::AuthoredDurability::begin(conn)?;
@@ -124,7 +125,7 @@ pub(crate) fn create_memory(
     let memory = memory_by_id(conn, &id)?
         .ok_or_else(|| anyhow::anyhow!("created memory `{id}` could not be read back"))?;
     // Author the NodeCreate in the SAME txn; an authoring error drops `tx` → the INSERT rolls back.
-    authoring::author_create(&tx, &memory, now)?;
+    authoring::author_create(&tx, &memory, prepared.as_ref(), now)?;
     tx.commit()?;
     Ok(RepoMemoryCreateResult { memory, duplicate: false })
 }
@@ -138,6 +139,7 @@ pub(crate) fn update_memory(
     // READ and the UPDATE are ONE atomic unit — a racing writer cannot flip the status between the
     // read and the write and desync the table from the op-log projection.
     authoring::backfill_memory_oplog(conn, now)?;
+    let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // Authored write (content / status / obsolete): commit durably (#560), NORMAL restored on drop.
     let _durability = authoring::AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
@@ -230,7 +232,14 @@ pub(crate) fn update_memory(
     })?;
     // Author NodeUpdate (+ NodeStatus on a status change) in the SAME txn; an authoring error drops
     // `tx` → the UPDATE rolls back.
-    authoring::author_update(&tx, &memory, content_changed, status_changed, now)?;
+    authoring::author_update(
+        &tx,
+        &memory,
+        content_changed,
+        status_changed,
+        prepared.as_ref(),
+        now,
+    )?;
     tx.commit()?;
     Ok(memory)
 }

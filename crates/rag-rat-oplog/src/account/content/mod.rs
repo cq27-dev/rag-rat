@@ -16,17 +16,12 @@ pub use acceptance::{
     evaluate_content_acceptance,
 };
 // The C5 sealed-authoring seam (#608): policy-aware preparation plus caller-owned-txn and
-// convenience authoring, the sealed-op size predicate, and the seal policy. UNWIRED — tests
-// consume it, but no live privacy-intent source does.
-#[allow(
-    unused_imports,
-    reason = "sealed authoring remains unwired until a live privacy-intent source consumes it \
-              (#608)"
-)]
+// convenience authoring, the sealed-op size predicate, downgrade-ratchet reader, and seal
+// policy.
 pub use author::{
     PreparedContentAuthoring, SealPolicy, author_content_batch,
     author_prepared_content_batch_in_tx, content_op_is_sealed_authorable,
-    prepare_content_authoring,
+    content_stream_has_sealed_ratchet, prepare_content_authoring,
 };
 // The in-tx `/3` local-authoring seam + its genesis-detection reader (C3.4b-i, #663): live
 // callers in `query::memory` land with #664, so these are plain (un-frozen) re-exports.

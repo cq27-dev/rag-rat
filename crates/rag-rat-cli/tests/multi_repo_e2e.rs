@@ -128,6 +128,28 @@ fn run_ok(root: &Path, data_dir: &Path, model_cache: &Path, args: &[&str]) -> St
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+#[test]
+fn sync_enable_is_narrow_idempotent_and_help_is_honest() {
+    let root = keyless_repo("sync-enable", &[("lib.rs", "pub fn indexed() {}\n".to_string())]);
+    let data_dir = unique_dir("sync-enable-data");
+    let model_cache = unique_dir("sync-enable-models");
+    run_ok(&root, &data_dir, &model_cache, &["index"]);
+
+    let help = run_ok(&root, &data_dir, &model_cache, &["sync", "--help"]);
+    assert!(help.contains("enable"));
+    assert!(help.contains("does not configure transport or peers"));
+    assert!(!help.contains("disable"));
+    assert!(!help.contains("pair"));
+    assert!(!help.contains("push"));
+    assert!(!help.contains("pull"));
+
+    let enabled = run_ok(&root, &data_dir, &model_cache, &["--json", "sync", "enable"]);
+    assert!(enabled.contains("\"status\": \"enabled\""));
+    assert!(enabled.contains("\"transport_configured\": false"));
+    let repeated = run_ok(&root, &data_dir, &model_cache, &["--json", "sync", "enable"]);
+    assert!(repeated.contains("\"status\": \"already_enabled\""));
+}
+
 fn global_db(data_dir: &Path) -> PathBuf {
     data_dir.join("rag-rat.sqlite")
 }

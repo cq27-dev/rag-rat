@@ -114,7 +114,7 @@ const CONTENT_SEALED_OP_BODY_MAX_BYTES: usize =
     CONTENT_OP_BODY_MAX_BYTES - CONTENT_SEALED_AEAD_OVERHEAD_BYTES;
 
 /// The sealed-path twin of [`content_op_is_authorable`]: whether `op` fits a signed suite-1 `/3`
-/// entry once the AEAD nonce + tag are added to its body (S2, #608). A future live reconcile uses
+/// entry once the AEAD nonce + tag are added to its body (S2, #608). The live reconcile uses
 /// this to QUARANTINE an un-authorable op on a sealed stream — exactly as the suite-0 predicate
 /// does on a plaintext one — instead of `bail!`ing the whole batch at sign time.
 pub fn content_op_is_sealed_authorable(op: &MemoryOp) -> bool {
@@ -225,10 +225,6 @@ pub fn author_content_batch_in_tx(
 /// EXPLICITLY — wrap presence is a downgrade-ratchet INPUT, never the privacy oracle: a private
 /// stream's accepted-wrap set can legitimately empty under sync lag or a retro-condemn, and
 /// treating "no wrap ⇒ public" would author plaintext on a private stream (a confidentiality leak).
-///
-/// UNWIRED: the live memory path still authors through [`author_content_batch_in_tx`] (suite 0).
-/// The read-side can project sealed entries, but no live intent source selects this policy-aware,
-/// self-transacting seam yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealPolicy {
     /// Author plaintext suite-0 entries — REFUSED on a stream that has ratcheted to sealed.
@@ -334,8 +330,6 @@ pub fn author_prepared_content_batch_in_tx(
 /// [`author_prepared_content_batch_in_tx`] with an owned IMMEDIATE transaction. Returns the
 /// authored entry hashes in authoring order. Requires the store's local account to be minted
 /// already.
-///
-/// UNWIRED (C5a): nothing live calls this — see [`SealPolicy`].
 pub fn author_content_batch(
     conn: &Connection,
     stream_id: StreamId,
@@ -603,14 +597,27 @@ fn require_local_account_id(conn: &Connection) -> anyhow::Result<AccountId> {
 /// surviving sealed entries, and a re-minted wrap re-arms the gate. Wrap presence is one ratchet
 /// INPUT, never the sole privacy oracle.
 fn stream_has_sealed_ratchet(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     account_id: AccountId,
     stream_id: StreamId,
 ) -> anyhow::Result<bool> {
-    if secrets::select_current_sealing_wrap(tx, account_id, stream_id)?.is_some() {
+    if secrets::select_current_sealing_wrap(conn, account_id, stream_id)?.is_some() {
         return Ok(true);
     }
-    stream_has_accepted_sealed_entry(tx, stream_id)
+    stream_has_accepted_sealed_entry(conn, stream_id)
+}
+
+/// Whether a stream has irreversibly ratcheted to sealed authoring through an accepted key wrap or
+/// accepted suite-1 content. This is a downgrade guard, not the privacy-intent source: callers must
+/// persist intent separately because a private stream can temporarily have no accepted wraps.
+pub fn content_stream_has_sealed_ratchet(
+    conn: &Connection,
+    stream_id: StreamId,
+) -> anyhow::Result<bool> {
+    let Some(local) = bootstrap::local_account_ref(conn)? else {
+        return Ok(false);
+    };
+    stream_has_sealed_ratchet(conn, local.account_id, stream_id)
 }
 
 /// Whether any accepted `/3` entry on `stream_id` is suite-1 (sealed). There is no `crypto_suite`
@@ -618,10 +625,10 @@ fn stream_has_sealed_ratchet(
 /// bytes fail to decode cannot be a valid suite-1 entry and is skipped. Early-returns on the first
 /// match.
 fn stream_has_accepted_sealed_entry(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     stream_id: StreamId,
 ) -> anyhow::Result<bool> {
-    let mut stmt = tx.prepare(
+    let mut stmt = conn.prepare(
         "SELECT signed_bytes FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
     )?;
     let mut rows = stmt.query(params![stream_id.to_bytes().as_slice()])?;
@@ -1378,7 +1385,7 @@ mod tests {
         assert_eq!(head.entry_hash, hashes[1], "the tail names the highest-seq entry");
     }
 
-    // ── C5a: the sealed suite-1 author seam (UNWIRED) ──
+    // ── C5a: the sealed suite-1 author seam ──
 
     /// Mint the store's local account and publish an owned `/2` stream via the REAL ownership seam
     /// (`ensure_owned_stream_v2_in_tx`) — the sealed mint needs a genuine effective `StreamOwn`,

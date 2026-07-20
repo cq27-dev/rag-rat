@@ -127,6 +127,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Clones(args) => clones(&config, &args)?,
         Cmd::ClonesFor(args) => clones_for(&config, &args)?,
         Cmd::Memory(args) => memory(&config, &args)?,
+        Cmd::Sync(args) => sync(&config, &args)?,
         Cmd::Dream(args) => dream(&config, &args)?,
         Cmd::Papertrail(args) => papertrail(&config, &args)?,
         Cmd::Distill(args) => distill(&config, &args)?,

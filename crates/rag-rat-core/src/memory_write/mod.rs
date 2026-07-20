@@ -19,6 +19,7 @@ pub(crate) use api::{create_memory, mark_obsolete, rebind_memory, update_memory}
 // Re-exported so the index reconcile path (the idle-repo ghost backstop, #583) can name it
 // across the private module.
 pub(crate) use authoring::backfill_memory_oplog;
+pub(crate) use authoring::enable_sealed_authoring;
 // The scope-explicit reconcile entry (#541): `authoring` is a PRIVATE module, so
 // `index::consolidate` names this through this re-export (Task 5 of #541).
 pub(crate) use authoring::reconcile_owner_stream_for_repo;

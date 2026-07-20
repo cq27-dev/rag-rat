@@ -4,6 +4,15 @@
 use super::*;
 
 impl IndexDatabase {
+    /// Permanently enable sealed local memory authoring for this repo. Existing suite-0 history is
+    /// retained; subsequent live and reconcile entries use suite 1.
+    pub fn sync_enable(&self) -> anyhow::Result<bool> {
+        crate::memory_write::enable_sealed_authoring(
+            self.storage.connection(),
+            rag_rat_base::time::now_ms(),
+        )
+    }
+
     pub fn memory_create(
         &self,
         request: rag_rat_query::memory::RepoMemoryCreate,
