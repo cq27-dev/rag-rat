@@ -393,7 +393,7 @@ fn author_stream_key_wrap_batch_in_tx(
     // own owned stream accepts, so anything else is an authority gap (missing/uneffective
     // `StreamOwn`, a stale `auth_len`, a contested account) and the whole caller mutation must
     // roll back.
-    let statuses = storage::refold_in_tx(tx, account_id)?;
+    let statuses = storage::refold_in_tx(tx, account_id, now_ms)?;
     for entry_hash in &authored {
         match statuses.get(entry_hash).map(String::as_str) {
             Some("accepted") => {},
@@ -487,6 +487,11 @@ mod tests {
         let hash = mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW).expect("mint + author");
         tx.commit().unwrap();
         hash
+    }
+
+    fn pending_content_refolds(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM content_streams_pending_refold", [], |row| row.get(0))
+            .unwrap()
     }
 
     fn status(conn: &Connection, hash: &EntryHash) -> Option<(String, Option<String>)> {
@@ -640,7 +645,7 @@ mod tests {
             entry_hash: signed.entry_hash,
         };
         storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
-        let statuses = storage::refold_in_tx(&tx, account).unwrap();
+        let statuses = storage::refold_in_tx(&tx, account, NOW).unwrap();
         assert_eq!(statuses.get(&verified.entry_hash).map(String::as_str), Some("accepted"));
         tx.commit().unwrap();
         verified.entry_hash
@@ -665,6 +670,7 @@ mod tests {
         assert_eq!(header.prev_hash, None, "the first secrets entry has no predecessor");
         assert_eq!(header.entry_type, secrets_entry_type::STREAM_KEY_WRAP);
         assert!(header.authority_ref.is_some(), "cites the founder owner incarnation");
+        assert_eq!(pending_content_refolds(&conn), 0, "local key mint finalizes immediately");
         let _ = account;
     }
 
@@ -798,6 +804,7 @@ mod tests {
         assert!(rerun.authored.is_empty());
         assert_eq!(rerun.already_covered, report.authored);
         assert_eq!(accepted_wraps_for_target(&conn, member).len(), 2);
+        assert_eq!(pending_content_refolds(&conn), 0, "#763 catch-up leaves no deferred residue");
 
         for key in [&key0, &key1] {
             let raw = key.as_slice();
@@ -1328,6 +1335,7 @@ mod tests {
             matches!(ensure_committed(&conn, stream), RotationOutcome::Current),
             "a second ensure is a noop — the current wrap is fresh",
         );
+        assert_eq!(pending_content_refolds(&conn), 0, "local rotation finalizes immediately");
     }
 
     #[test]
@@ -1547,7 +1555,7 @@ mod tests {
             entry_hash: signed.entry_hash,
         };
         storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
-        storage::refold_in_tx(&tx, account).unwrap();
+        storage::refold_in_tx(&tx, account, NOW).unwrap();
         tx.commit().unwrap();
         verified.entry_hash
     }
@@ -1586,7 +1594,7 @@ mod tests {
             entry_hash: signed.entry_hash,
         };
         storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
-        storage::refold_in_tx(&tx, account).unwrap();
+        storage::refold_in_tx(&tx, account, NOW).unwrap();
         tx.commit().unwrap();
         verified.entry_hash
     }

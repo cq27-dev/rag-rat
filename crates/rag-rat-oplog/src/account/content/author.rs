@@ -1446,7 +1446,7 @@ mod tests {
             entry_hash: signed.entry_hash,
         };
         account_storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
-        account_storage::refold_in_tx(&tx, account).unwrap();
+        account_storage::refold_in_tx(&tx, account, NOW).unwrap();
         tx.commit().unwrap();
         verified.entry_hash
     }
@@ -1499,7 +1499,7 @@ mod tests {
             entry_hash: signed.entry_hash,
         };
         account_storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
-        account_storage::refold_in_tx(&tx, account).unwrap();
+        account_storage::refold_in_tx(&tx, account, NOW).unwrap();
         tx.commit().unwrap();
         verified.entry_hash
     }

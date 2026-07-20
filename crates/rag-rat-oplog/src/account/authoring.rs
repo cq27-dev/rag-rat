@@ -193,7 +193,7 @@ fn author_account_op_in_tx(
             "the account candidate store is at capacity ({scope:?}); cannot author the account op",
         ),
     }
-    storage::refold_in_tx(tx, account_id)?;
+    storage::refold_in_tx(tx, account_id, now_ms)?;
     Ok(verified.entry_hash)
 }
 

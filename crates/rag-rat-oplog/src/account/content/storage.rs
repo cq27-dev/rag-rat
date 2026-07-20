@@ -29,6 +29,9 @@ use crate::{cbor, content_projection, identity};
 
 type EntryHash = [u8; 32];
 
+const PENDING_REFOLD_CONTENT_CANDIDATE: i64 = 1;
+const PENDING_REFOLD_ACCOUNT_CHANGE: i64 = 2;
+
 const PRE_VERIFY_PER_AUTHOR_MAX: i64 = 64;
 const PRE_VERIFY_GLOBAL_MAX: i64 = 256;
 const CANDIDATES_PER_AUTHOR_MAX: i64 = 4_096;
@@ -84,8 +87,8 @@ pub(in crate::account) struct ContentPromotionOutcome {
 /// re-evaluates the O(stream) authority + branch-selection pass once per entry, so building an
 /// n-entry stream one candidate at a time is O(n^2) under the writer lock — and an attacker varying
 /// cited `auth_len` down the chain defeats the per-refold freshness cache, keeping each pass O(n).
-/// Instead this marks the stream owing a refold; [`settle_pending_content_refolds`] (or an account
-/// fold that touches the stream) runs it ONCE. The returned `Ingested { status }` therefore reports
+/// Instead this marks the stream owing a refold; [`settle_pending_content_refolds`] runs it ONCE.
+/// The returned `Ingested { status }` therefore reports
 /// the STRUCTURAL verdict, not the acceptance verdict: a caller that needs foreign acceptance MUST
 /// settle first. Nothing reads foreign acceptance before transport lands (#691), so the deferral is
 /// invisible today; the local author path is unaffected (it never routes through here).
@@ -132,9 +135,14 @@ pub fn content_ingest(
     reclassify_chain(&tx, &verified)?;
     // Structural classification is done; the authority + branch-selection fold (the pass that sets
     // `accepted`) is deferred off this per-entry path (#652) by marking the stream as owing a
-    // refold. `settle_pending_content_refolds`, or an account fold that touches the stream, folds
-    // it once. So the returned status is the STRUCTURAL verdict, not the acceptance verdict.
-    mark_stream_pending_refold(&tx, verified.header.stream_id)?;
+    // refold. `settle_pending_content_refolds` folds it once. So the returned status is the
+    // STRUCTURAL verdict, not the acceptance verdict.
+    mark_stream_pending_refold(
+        &tx,
+        verified.header.stream_id,
+        PENDING_REFOLD_CONTENT_CANDIDATE,
+        now_ms,
+    )?;
     let status = status_for(&tx, &verified.entry_hash)?
         .unwrap_or_else(|| ContentStatus::RetainedUnfolded.as_db_str().to_string());
     tx.commit()?;
@@ -320,6 +328,11 @@ pub(in crate::account) fn promote_pre_verify_for_account(
     account_id: super::super::AccountId,
     now_ms: i64,
 ) -> anyhow::Result<ContentPromotionOutcome> {
+    // V064/V065 authority backfill predates the V066 content tables. Account-state folding is also
+    // used by that migration, where there cannot be content pre-verify work yet.
+    if !content_entries_exists(tx)? {
+        return Ok(ContentPromotionOutcome::default());
+    }
     let mut outcome = ContentPromotionOutcome::default();
     loop {
         let rows = {
@@ -377,12 +390,12 @@ pub(in crate::account) fn promote_pre_verify_for_account(
             }
             insert_candidate(tx, &verified, &raw, now_ms)?;
             reclassify_chain(tx, &verified)?;
-            // Mark the stream for a deferred settle, exactly as the direct ingest path does (#652).
-            // The account fold that follows this promotion sets `accepted` but does NOT reproject,
-            // so without this mark a promoted (out-of-order, pre-verify) entry would become
-            // accepted with no queue row — settle would skip it and its `/3` projection
-            // would stay stale.
-            mark_stream_pending_refold(tx, verified.header.stream_id)?;
+            mark_stream_pending_refold(
+                tx,
+                verified.header.stream_id,
+                PENDING_REFOLD_CONTENT_CANDIDATE,
+                now_ms,
+            )?;
             delete_pre_verify(tx, &signed_hash)?;
             progressed = true;
         }
@@ -587,28 +600,22 @@ struct ResolvedEntry {
 /// a concurrent account refold committing mid-evaluation could otherwise pair an old grant with a
 /// new cut. Nothing is ever mutated in the log — a late control or ancestry arrival simply refolds
 /// the same candidates to a new classification (retro-condemn or re-bless), never rewrites history.
-/// Re-evaluate every content stream whose acceptance THIS account's authority can change, after its
-/// control fold rewrote the authority projection. This is the account→content trigger: a grant
-/// revocation, roster cut, ownership arrival, or contested flip retro-classifies already-stored
-/// content in the SAME account-refold txn — otherwise a revocation would not take effect until an
-/// unrelated content entry happened to land on the stream (L2/I5 would be unenforceable).
-///
 /// A stream is reachable from this account two ways: the account OWNS it (its ownership/grant/cut
 /// facts bound the stream), or the account AUTHORS content on it (its roster/contested state gates
 /// that content). The union covers every cross-account case — a `StreamRevoke` folds in the OWNER's
 /// log and reaches the grantee's content through the ownership branch; a roster change folds in the
 /// AUTHOR's log and reaches it through the author branch.
-pub(in crate::account) fn refold_streams_for_account(
+pub(in crate::account) fn affected_streams_for_account(
     tx: &Transaction<'_>,
     account_id: AccountId,
     previously_owned: &[[u8; 32]],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<StreamId>> {
     // The `/3` tables are created by a LATER migration than the account authority projection, and
     // the V064/V065 authority backfill folds every existing account inside its own migration — so
     // this runs before `content_entries` exists on an upgrading database. There is no content to
     // classify then; skip until the table is present.
     if !content_entries_exists(tx)? {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // `previously_owned` is the account's owned-stream set captured BEFORE this fold rewrote the
     // projection. A fold that DROPS a `StreamOwn` fact must still refold that stream (to declassify
@@ -628,22 +635,47 @@ pub(in crate::account) fn refold_streams_for_account(
             streams.insert(fixed::<32>(&stream_bytes)?);
         }
     }
-    // This re-derives `accepted`, and a retro-accept/declassify here (a late `StreamOwn`
-    // re-blessing parked content, a revocation retro-condemning accepted content) FLIPS the
-    // accepted set. The memory reconcile's anti-join trusts `content_projected_*` to mirror
-    // `accepted` exactly, so every refolded stream is reprojected in the SAME txn — a flip that
-    // skipped the reproject would leave the projection stale and the anti-join would
-    // mass-duplicate or skip rows (#683). The layer concedes the body-agnostic →
-    // `content_projection` dependency per #663. Guarded on the V070 `content_projected_*` tables
-    // existing: this fn also runs in the pre-V070 V064/V065 authority backfill (mirrors the
-    // `content_entries_exists` guard above).
-    let reproject = content_projected_tables_exist(tx)?;
-    for stream in streams {
-        let stream_id = StreamId::from_bytes(stream);
-        refold_content_stream(tx, stream_id)?;
-        if reproject {
-            content_projection::reproject_accepted_content_stream(tx, stream_id)?;
-        }
+    let mut streams = streams.into_iter().map(StreamId::from_bytes).collect::<Vec<_>>();
+    streams.sort_by_key(|stream| stream.to_bytes());
+    Ok(streams)
+}
+
+/// Finish one stream after either trusted/local account-state work or deferred remote work.
+/// Reprojection is mandatory even when the accepted set did not change: an account change can make
+/// a previously unprojectable sealed body projectable (C5). The queue row is cleared only after all
+/// current finalization duties succeed. Add the future transport notification hook (#691) here,
+/// before the clear, so a failed hook cannot lose the wakeup.
+pub(super) fn refold_and_project_stream_in_tx(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+) -> anyhow::Result<()> {
+    refold_content_stream(tx, stream_id)?;
+    if content_projected_tables_exist(tx)? {
+        content_projection::reproject_accepted_content_stream(tx, stream_id)?;
+    }
+    if pending_refold_table_exists(tx)? {
+        clear_pending_content_refold(tx, stream_id)?;
+    }
+    Ok(())
+}
+
+pub(in crate::account) fn finalize_affected_streams(
+    tx: &Transaction<'_>,
+    streams: &[StreamId],
+) -> anyhow::Result<()> {
+    for &stream_id in streams {
+        refold_and_project_stream_in_tx(tx, stream_id)?;
+    }
+    Ok(())
+}
+
+pub(in crate::account) fn queue_account_changed_streams(
+    tx: &Transaction<'_>,
+    streams: &[StreamId],
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    for &stream_id in streams {
+        mark_stream_pending_refold(tx, stream_id, PENDING_REFOLD_ACCOUNT_CHANGE, now_ms)?;
     }
     Ok(())
 }
@@ -669,12 +701,9 @@ pub(super) fn refold_content_stream(
     tx: &Transaction<'_>,
     stream_id: StreamId,
 ) -> anyhow::Result<()> {
-    // NOTE: this seam does NOT clear the deferred-refold mark (#652). It re-derives `accepted`
-    // but never reprojects itself; both callers pair it with a reproject
-    // (`refold_streams_for_account` reprojects per stream, guarded on the V070 tables;
-    // `settle_one_pending_refold` reprojects then clears the mark). The mark still belongs to
-    // settle alone: it means "this stream owes settle a refold+reproject", and only settle's own
-    // committed fold discharges that debt. The owner is inside the stream identity
+    // This body only derives acceptance. Callers that finalize observable content must pair it with
+    // reprojection; [`refold_and_project_stream_in_tx`] is the shared queue-discharging seam. The
+    // owner is inside the stream identity
     // (`stream_id = sha256(cbor([.., owner,
     // ..]))`, §14) but not invertible, so it is resolved through the owner's `StreamOwn` fact.
     // No fact ⇒ authority cannot be evaluated: the entries revert to their structural state.
@@ -765,22 +794,28 @@ pub(super) fn refold_content_stream(
     Ok(())
 }
 
-/// Enqueue a `/2` stream as owing a deferred acceptance refold (#652). `content_ingest` records
-/// structural classification on its per-entry hot path and marks the stream here instead of folding
-/// inline, so a batch of ingests costs one refold per stream at settle rather than one per entry.
-/// `INSERT OR IGNORE` dedups repeat ingests to one stream into a single queued refold.
-fn mark_stream_pending_refold(tx: &Transaction<'_>, stream_id: StreamId) -> rusqlite::Result<()> {
-    tx.execute("INSERT OR IGNORE INTO content_streams_pending_refold(stream_id) VALUES (?1)", [
-        stream_id.to_bytes().as_slice(),
-    ])?;
+/// Merge deferred work for one stream. `IMMEDIATE` transaction serialization plus the single UPSERT
+/// prevents a concurrent settle/enqueue lost wakeup: reasons accumulate, the first timestamp is
+/// stable, and the latest enqueue refreshes the last timestamp.
+fn mark_stream_pending_refold(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    reason_mask: i64,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO content_streams_pending_refold(
+             stream_id, reason_mask, first_enqueued_at_ms, last_enqueued_at_ms)
+         VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(stream_id) DO UPDATE SET
+             reason_mask = content_streams_pending_refold.reason_mask | excluded.reason_mask,
+             last_enqueued_at_ms = excluded.last_enqueued_at_ms",
+        params![stream_id.to_bytes().as_slice(), reason_mask, now_ms],
+    )?;
     Ok(())
 }
 
-/// Drop a stream's deferred-refold mark. The sole caller is [`settle_one_pending_refold`], which
-/// clears the mark ONLY after it has both refolded AND reprojected the stream — so the mark always
-/// means "this stream still owes settle a refold+reproject". An account-fold refold also
-/// reprojects now (#683), but the mark's debt is settle's own fold, so the mark stands until
-/// settle discharges it.
+/// Drop a stream's deferred-refold mark after shared finalization completed all duties.
 fn clear_pending_content_refold(tx: &Transaction<'_>, stream_id: StreamId) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM content_streams_pending_refold WHERE stream_id = ?1", [stream_id
         .to_bytes()
@@ -792,7 +827,10 @@ fn clear_pending_content_refold(tx: &Transaction<'_>, stream_id: StreamId) -> ru
 /// their acceptance verdict.
 fn list_streams_pending_refold(conn: &Connection) -> anyhow::Result<Vec<[u8; 32]>> {
     let raw: Vec<Vec<u8>> = {
-        let mut stmt = conn.prepare("SELECT stream_id FROM content_streams_pending_refold")?;
+        let mut stmt = conn.prepare(
+            "SELECT stream_id FROM content_streams_pending_refold
+             ORDER BY first_enqueued_at_ms, stream_id",
+        )?;
         stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
     };
     raw.iter().map(|bytes| fixed::<32>(bytes)).collect()
@@ -813,29 +851,25 @@ pub(crate) fn content_projected_tables_exist(conn: &Connection) -> rusqlite::Res
     .map(|row| row.is_some())
 }
 
+fn pending_refold_table_exists(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master
+         WHERE type = 'table' AND name = 'content_streams_pending_refold'",
+        [],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+}
+
 /// Settle ONE dirty stream in its OWN IMMEDIATE transaction: fold its acceptance verdict, reproject
-/// the accepted set into the memory projection, and drop its queue mark (the refold clears the mark
-/// on every path — see [`refold_content_stream`]). Its own txn is what isolates a poisoned stream:
+/// the accepted set into the memory projection, and drop its queue mark. Its own txn is what
+/// isolates a poisoned stream:
 /// a failure here rolls back only this stream, leaving its mark intact for a later retry while the
 /// rest of the batch still settles.
 fn settle_one_pending_refold(conn: &Connection, stream_id: StreamId) -> anyhow::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    refold_content_stream(&tx, stream_id)?;
-    // Settle is the DELIBERATE fold boundary where foreign acceptance flips, so it closes the
-    // stale-projection hole here: an accepted-set flip that skipped the reproject would leave
-    // `content_projected_*` stale, and the memory reconcile's anti-join would then mass-duplicate
-    // the dropped rows into the immutable `/3` log (#683). Guarded on the V070 tables existing,
-    // mirroring the account-fold path's table-existence guard (the account-fold path reprojects
-    // under the same guard — #683).
-    if content_projected_tables_exist(&tx)? {
-        content_projection::reproject_accepted_content_stream(&tx, stream_id)?;
-    }
-    // Clear the mark ONLY here — after the refold AND the reproject — so the queue entry means
-    // "this stream still owes settle a refold+reproject". An account-fold refold that ran meanwhile
-    // also refolded and reprojected (#683), but discharging the mark is settle's job alone, so the
-    // mark survives it. On any error above, the txn rolls back and the mark is preserved for
-    // retry.
-    clear_pending_content_refold(&tx, stream_id)?;
+    refold_and_project_stream_in_tx(&tx, stream_id)?;
     tx.commit()?;
     Ok(())
 }
@@ -851,12 +885,8 @@ fn settle_one_pending_refold(conn: &Connection, stream_id: StreamId) -> anyhow::
 /// caller, not here. Nothing reads foreign acceptance before transport lands (#691), so
 /// pre-transport a queue that is never settled is harmless.
 ///
-/// RESIDUAL DoS (honest scope, #652): this bounds ONLY the `content_ingest` per-entry refold. The
-/// account-ingest → `refold_streams_for_account` path is an equally-remote sibling — a whole-stream
-/// content refold per `/1` account entry — that this change does NOT batch, and because C1 keeps
-/// the local owner's big stream outside the caps, a single foreign candidate on it still makes one
-/// refold O(local history). Extending defer/batch to the account→content trigger is tracked
-/// separately (retro-condemn atomicity must survive there).
+/// Remote account ingests enqueue the same settle debt with `ACCOUNT_CHANGE`; trusted/local account
+/// folds still finalize immediately in their caller's transaction.
 pub fn settle_pending_content_refolds(conn: &Connection) -> anyhow::Result<usize> {
     let mut settled = 0usize;
     let mut failures = 0usize;
@@ -1476,6 +1506,18 @@ mod tests {
         account_id: super::super::super::AccountId,
         genesis_hash: EntryHash,
     ) -> super::super::super::envelope::SignedAccountEntry {
+        signed_device_add_at(founder, member, account_id, 1, genesis_hash, genesis_hash, 1)
+    }
+
+    fn signed_device_add_at(
+        founder: &DeviceSecret,
+        member: &DeviceSecret,
+        account_id: super::super::super::AccountId,
+        seq: u64,
+        previous: EntryHash,
+        genesis_hash: EntryHash,
+        auth_len: u64,
+    ) -> super::super::super::envelope::SignedAccountEntry {
         let op = AccountOp::DeviceAdd {
             device_fingerprint: member.public().fingerprint(),
             ed25519_pubkey: member.public().to_bytes(),
@@ -1488,13 +1530,13 @@ mod tests {
             account_id,
             log_id: 0,
             device_fingerprint: founder.public().fingerprint(),
-            seq: 1,
-            prev_hash: Some(genesis_hash),
+            seq,
+            prev_hash: Some(previous),
             parent_ref: None,
             entry_type: entry_type::DEVICE_ADD,
             op_version: 1,
             crypto_suite: 0,
-            auth_len: 1,
+            auth_len,
             key_id: None,
             authority_ref: Some(genesis_hash),
         };
@@ -2637,7 +2679,8 @@ mod tests {
         previously_owned: &[[u8; 32]],
     ) {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
-        refold_streams_for_account(&tx, account, previously_owned).unwrap();
+        let streams = affected_streams_for_account(&tx, account, previously_owned).unwrap();
+        finalize_affected_streams(&tx, &streams).unwrap();
         tx.commit().unwrap();
     }
 
@@ -2892,7 +2935,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let owner = signed_roster(&DeviceSecret::from_seed(&[0xe2; 32])).0;
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        refold_streams_for_account(&tx, owner, &[]).unwrap();
+        let streams = affected_streams_for_account(&tx, owner, &[]).unwrap();
+        finalize_affected_streams(&tx, &streams).unwrap();
         tx.commit().unwrap();
     }
 
@@ -3096,6 +3140,16 @@ mod tests {
             .unwrap()
     }
 
+    fn pending_refold_state(conn: &Connection) -> (i64, i64, i64) {
+        conn.query_row(
+            "SELECT reason_mask, first_enqueued_at_ms, last_enqueued_at_ms
+             FROM content_streams_pending_refold",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn deferred_settle_matches_per_entry_refold_on_an_honest_chain() {
         let secret = DeviceSecret::from_seed(&[0xa1; 32]);
@@ -3267,7 +3321,99 @@ mod tests {
     }
 
     #[test]
-    fn an_account_fold_refold_does_not_clear_the_mark_so_settle_still_reprojects() {
+    fn remote_account_ingests_dedupe_account_change_and_defer_content_until_settle() {
+        let conn = db();
+        let founder = DeviceSecret::from_seed(&[0xb5; 32]);
+        let member_a = DeviceSecret::from_seed(&[0xb6; 32]);
+        let member_b = DeviceSecret::from_seed(&[0xb7; 32]);
+        let (account, genesis) = roster(&conn, &founder);
+        seed_ownership(&conn, account);
+        seed_roster_fact(&conn, genesis, account, &founder, "owner");
+
+        let entry = authored(&founder, account, genesis, ContentSpec::default());
+        content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
+        assert_eq!(settle_pending_content_refolds(&conn).unwrap(), 1);
+        assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
+
+        let add_a = signed_device_add_at(&founder, &member_a, account, 1, genesis, genesis, 1);
+        super::super::super::storage::account_ingest(&conn, &add_a.signed_bytes, 10).unwrap();
+        let add_b =
+            signed_device_add_at(&founder, &member_b, account, 2, add_a.entry_hash, genesis, 2);
+        super::super::super::storage::account_ingest(&conn, &add_b.signed_bytes, 20).unwrap();
+
+        assert_eq!(
+            verdict(&conn, &entry.entry_hash),
+            ("accepted".into(), 1),
+            "remote account folds leave the last completed content verdict untouched",
+        );
+        assert_eq!(pending_refold_count(&conn), 1, "N account ingests dedupe per stream");
+        assert_eq!(pending_refold_state(&conn), (PENDING_REFOLD_ACCOUNT_CHANGE, 10, 20));
+
+        assert_eq!(settle_pending_content_refolds(&conn).unwrap(), 1);
+        assert_eq!(pending_refold_count(&conn), 0);
+        assert_eq!(
+            verdict(&conn, &entry.entry_hash),
+            ("retained_unfolded".into(), 0),
+            "one settle performs the deferred content fold once",
+        );
+    }
+
+    #[test]
+    fn pending_refold_merges_content_and_account_reasons_without_moving_first_timestamp() {
+        let conn = db();
+        let founder = DeviceSecret::from_seed(&[0xb8; 32]);
+        let member = DeviceSecret::from_seed(&[0xb9; 32]);
+        let (account, genesis) = roster(&conn, &founder);
+        seed_ownership(&conn, account);
+        seed_roster_fact(&conn, genesis, account, &founder, "owner");
+
+        let entry = authored(&founder, account, genesis, ContentSpec::default());
+        content_ingest(&conn, &entry.signed_bytes, 5).unwrap();
+        assert_eq!(pending_refold_state(&conn), (PENDING_REFOLD_CONTENT_CANDIDATE, 5, 5),);
+
+        let add = signed_device_add(&founder, &member, account, genesis);
+        super::super::super::storage::account_ingest(&conn, &add.signed_bytes, 11).unwrap();
+        assert_eq!(
+            pending_refold_state(&conn),
+            (PENDING_REFOLD_CONTENT_CANDIDATE | PENDING_REFOLD_ACCOUNT_CHANGE, 5, 11),
+            "reason bits OR, first enqueue stays stable, and last enqueue refreshes",
+        );
+    }
+
+    #[test]
+    fn account_change_settle_reprojects_even_when_acceptance_is_unchanged() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0xba; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        let entry = authored_op(
+            &secret,
+            owner,
+            genesis,
+            ContentSpec::default(),
+            &node_create("sealed-later"),
+        );
+        content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
+        settle_pending_content_refolds(&conn).unwrap();
+        assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
+        assert_eq!(projected_node_ids(&conn), vec!["sealed-later".to_string()]);
+
+        // Model a body that was accepted while locally unprojectable, then became projectable when
+        // account-side key material arrived. ACCOUNT_CHANGE must reproject even though acceptance
+        // itself remains unchanged.
+        conn.execute("DELETE FROM content_projected_nodes", []).unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        queue_account_changed_streams(&tx, &[entry.header.stream_id], 2).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(settle_pending_content_refolds(&conn).unwrap(), 1);
+        assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
+        assert_eq!(projected_node_ids(&conn), vec!["sealed-later".to_string()]);
+    }
+
+    #[test]
+    fn a_trusted_account_fold_finalizes_and_clears_existing_queue_debt() {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[0xb2; 32]);
         let (owner, genesis) = roster(&conn, &secret);
@@ -3291,28 +3437,22 @@ mod tests {
             "a second ingest dedups onto the same queue row"
         );
 
-        // The account-fold path refolds the stream (an authority change triggers it): it updates
-        // `accepted` AND reprojects (#683), but the dirty mark is settle's debt to discharge, so
-        // the account fold must NOT clear it — the mark means "settle owes this stream its own
-        // refold+reproject", and only settle's committed fold clears it.
+        // The trusted account-fold path finalizes the stream in this transaction: it updates
+        // `accepted`, reprojects (#683/C5), and clears the already-satisfied queue debt only after
+        // both duties succeed.
         run_account_trigger(&conn, owner);
         assert_eq!(verdict(&conn, &s0.entry_hash), ("accepted".into(), 1), "it folds the stream");
         assert_eq!(
             pending_refold_count(&conn),
-            1,
-            "the mark survives the account fold — only settle clears it",
+            0,
+            "trusted finalization clears the queue after refold and reproject",
         );
 
-        // Settle refolds AND reprojects, then clears the mark — the only path that may.
+        // The queue is already discharged, so settle has no duplicate work.
         assert_eq!(
             settle_pending_content_refolds(&conn).unwrap(),
-            1,
-            "settle processes the still-marked stream and clears it after reprojecting",
-        );
-        assert_eq!(
-            pending_refold_count(&conn),
             0,
-            "the mark is cleared only once settle reprojects"
+            "settle does not repeat trusted finalization",
         );
     }
 

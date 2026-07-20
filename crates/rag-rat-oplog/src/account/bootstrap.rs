@@ -146,7 +146,7 @@ fn mint_local_account_in_tx(tx: &Transaction<'_>, now_ms: i64) -> anyhow::Result
             "the account candidate store is at capacity ({scope:?}); cannot mint the local account",
         ),
     }
-    let statuses = storage::refold_in_tx(tx, account_id)?;
+    let statuses = storage::refold_in_tx(tx, account_id, now_ms)?;
     // Verify the genesis folded EFFECTIVE (accepted), not merely inserted — never return a wedged
     // account.
     match statuses.get(&verified.entry_hash).map(String::as_str) {

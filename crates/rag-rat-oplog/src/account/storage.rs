@@ -45,6 +45,12 @@ struct AccountProjection {
     forked: HashSet<EntryHash>,
 }
 
+struct AccountStateFold {
+    statuses: HashMap<EntryHash, String>,
+    affected_streams: Vec<StreamId>,
+    rejected_content_promotions: content::ContentPromotionOutcome,
+}
+
 /// The outcome of an `INSERT OR IGNORE` into the candidate DAG. `pub(super)` so the account
 /// [`super::bootstrap`] seam can reuse [`insert_candidate`] directly when minting the local-account
 /// genesis (it MUST NOT go through the self-transacting [`account_ingest`]).
@@ -117,7 +123,8 @@ pub enum IngestOutcome {
 
 /// Ingest one signed account entry: structural decode → content-addressed device resolution →
 /// signature verify → genesis self-hash → `INSERT OR IGNORE` into the candidate DAG → promote any
-/// pre-verify rows this entry now resolves → `refold_account`. Opens its own IMMEDIATE transaction.
+/// pre-verify rows this entry now resolves → fold account state and queue affected content streams.
+/// Opens its own IMMEDIATE transaction; content finalization is deferred to settle.
 pub fn account_ingest(
     conn: &Connection,
     signed_bytes: &[u8],
@@ -208,22 +215,18 @@ pub fn account_ingest(
     } else {
         PromotionOutcome::default()
     };
-    let rejected_content_promotions = if is_genesis(&verified.header) || is_device_add(&verified) {
-        content::promote_pre_verify_for_account(&tx, account_id, now_ms)?
-    } else {
-        Default::default()
-    };
-    let status = refold_in_tx(&tx, account_id)?;
+    let state = refold_untrusted_ingest_in_tx(&tx, account_id, now_ms)?;
     tx.commit()?;
-    let status = status.get(&verified.entry_hash).cloned().unwrap_or_else(|| "unknown".into());
-    Ok(match (rejected_promotions.scope, rejected_content_promotions.scope) {
+    let status =
+        state.statuses.get(&verified.entry_hash).cloned().unwrap_or_else(|| "unknown".into());
+    Ok(match (rejected_promotions.scope, state.rejected_content_promotions.scope) {
         (Some(account_scope), Some(content_scope)) =>
             IngestOutcome::IngestedWithRejectedAccountAndContentPromotions {
                 status,
                 account_scope,
                 account_entry_hashes: rejected_promotions.entry_hashes,
                 content_scope,
-                content_entry_hashes: rejected_content_promotions.entry_hashes,
+                content_entry_hashes: state.rejected_content_promotions.entry_hashes,
             },
         (Some(scope), None) => IngestOutcome::IngestedWithRejectedPromotions {
             status,
@@ -233,7 +236,7 @@ pub fn account_ingest(
         (None, Some(scope)) => IngestOutcome::IngestedWithRejectedContentPromotions {
             status,
             scope,
-            entry_hashes: rejected_content_promotions.entry_hashes,
+            entry_hashes: state.rejected_content_promotions.entry_hashes,
         },
         (None, None) => IngestOutcome::Ingested { status },
     })
@@ -273,7 +276,12 @@ fn stored_status_for_exact_envelope(
 /// slot.
 pub fn refold_account(conn: &Connection, account_id: AccountId) -> anyhow::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    refold_in_tx(&tx, account_id)?;
+    let now_ms = tx.query_row(
+        "SELECT coalesce(max(received_at_ms), 0) FROM account_entries WHERE account_id = ?1",
+        [account_id.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    refold_in_tx(&tx, account_id, now_ms)?;
     tx.commit()?;
     Ok(())
 }
@@ -290,7 +298,7 @@ pub fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::Result<(
     for account_bytes in account_ids {
         let result = fixed(&account_bytes)
             .map(AccountId::from_bytes)
-            .and_then(|account_id| refold_in_tx(tx, account_id));
+            .and_then(|account_id| refold_in_tx(tx, account_id, 0));
         if let Err(err) = result {
             return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
                 format!("V064 authority backfill failed: {err:#}"),
@@ -946,7 +954,33 @@ fn decode_stored_boundary(
 pub(super) fn refold_in_tx(
     tx: &Transaction<'_>,
     account_id: AccountId,
+    now_ms: i64,
 ) -> anyhow::Result<HashMap<[u8; 32], String>> {
+    let state = fold_account_state_in_tx(tx, account_id, now_ms)?;
+    super::content::finalize_affected_streams(tx, &state.affected_streams)?;
+    Ok(state.statuses)
+}
+
+/// Remote account ingest commits account/authority/secrets state and durable content wakeups, but
+/// leaves content acceptance and projection at the last completed finalization until settle.
+fn refold_untrusted_ingest_in_tx(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    now_ms: i64,
+) -> anyhow::Result<AccountStateFold> {
+    let state = fold_account_state_in_tx(tx, account_id, now_ms)?;
+    super::content::queue_account_changed_streams(tx, &state.affected_streams, now_ms)?;
+    Ok(state)
+}
+
+/// Fold account-owned state and return the exact content streams whose acceptance or projection
+/// may depend on it. Content finalization is deliberately absent: trusted/local and untrusted
+/// remote wrappers choose immediate finalization or durable queueing structurally.
+fn fold_account_state_in_tx(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    now_ms: i64,
+) -> anyhow::Result<AccountStateFold> {
     let rows = load_candidates(tx, account_id)?;
     let projection = derive_account_projection(&rows);
 
@@ -998,12 +1032,11 @@ pub(super) fn refold_in_tx(
     // what makes a control fold that condemns a device's secrets chain retro-condemn its wraps
     // atomically.
     super::secrets::refold_secrets_log(tx, account_id, &mut statuses)?;
-    // Authority just changed, so content acceptance can change with it: re-evaluate every stream
-    // this account's authority reaches (§13). Same txn as the projection rewrite ⇒ a revocation
-    // retro-condemns accepted content atomically, and content that arrived before its owner's
-    // `StreamOwn` is classified the moment that fact folds.
-    super::content::refold_streams_for_account(tx, account_id, &previously_owned)?;
-    Ok(statuses)
+    let rejected_content_promotions =
+        super::content::promote_pre_verify_for_account(tx, account_id, now_ms)?;
+    let affected_streams =
+        super::content::affected_streams_for_account(tx, account_id, &previously_owned)?;
+    Ok(AccountStateFold { statuses, affected_streams, rejected_content_promotions })
 }
 
 /// The streams this account currently owns, per the projection — captured before a refold rewrites
@@ -1881,6 +1914,9 @@ mod tests {
     use rag_rat_db::schema;
 
     use super::*;
+    use crate::account::content::{
+        ContentEntryHeader, content_ingest, settle_pending_content_refolds, sign_content_entry,
+    };
     use crate::account::envelope::sign_account_entry;
     use crate::account::ops::{ContentCut, DeviceCut, DeviceRole, GrantRole};
     use crate::device::{DeviceSecret, DeviceX25519Secret};
@@ -2053,6 +2089,66 @@ mod tests {
             content_cuts: Vec::new(),
             reason: "revoked".to_string(),
         }
+    }
+
+    fn projected_nodes(conn: &Connection, stream_id: StreamId) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT node_id FROM content_projected_nodes
+                 WHERE stream_id = ?1 ORDER BY node_id",
+            )
+            .unwrap();
+        stmt.query_map([stream_id.to_bytes().as_slice()], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn content_verdict(conn: &Connection, entry_hash: &[u8; 32]) -> (String, i64) {
+        conn.query_row(
+            "SELECT s.status, e.accepted FROM content_entries e
+             JOIN content_entry_status s ON s.entry_hash = e.entry_hash
+             WHERE e.entry_hash = ?1",
+            [entry_hash.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn signed_member_content(
+        member: &Dev,
+        account_id: AccountId,
+        stream_id: StreamId,
+        roster_ref: [u8; 32],
+        auth_len: u64,
+    ) -> crate::account::content::SignedContentEntry {
+        let header = ContentEntryHeader {
+            stream_id,
+            author_account_id: account_id,
+            device_fingerprint: member.fp,
+            seq: 0,
+            lamport: 1,
+            prev_hash: None,
+            grant_id: None,
+            roster_ref,
+            owner_auth_len: auth_len,
+            author_auth_len: auth_len,
+            crypto_suite: 0,
+            key_id: None,
+        };
+        let op = crate::op::MemoryOp::NodeCreate {
+            node_id: crate::op::NodeId::from("remote-node"),
+            content: crate::op::NodeContent {
+                kind: "Invariant".into(),
+                title: "remote node".into(),
+                body: "body".into(),
+                confidence: "high".into(),
+                source: "agent".into(),
+                tags: Vec::new(),
+                payload: None,
+            },
+        };
+        sign_content_entry(&member.secret, &header, &crate::op::encode(&op)).unwrap()
     }
 
     fn owner_demote(dev: &Dev, owner_id: EntryHash) -> AccountOp {
@@ -2491,6 +2587,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!(effective_count, 1, "the prior shadow projection survived intact");
+    }
+
+    #[test]
+    fn remote_revoke_updates_authority_now_but_content_and_projection_only_at_settle() {
+        let conn = db();
+        let founder = Dev::new(0x31);
+        let member = Dev::new(0x32);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        let (stream_id, own) = stream_own(account_id);
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
+        let (add_bytes, add_hash) = op(
+            account_id,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(genesis_hash),
+            &device_add(&member, DeviceRole::Member),
+        );
+        account_ingest(&conn, &add_bytes, NOW + 2).unwrap();
+
+        let content = signed_member_content(&member, account_id, stream_id, add_hash, 3);
+        content_ingest(&conn, &content.signed_bytes, NOW + 3).unwrap();
+        assert_eq!(settle_pending_content_refolds(&conn).unwrap(), 1);
+        assert_eq!(content_verdict(&conn, &content.entry_hash), ("accepted".into(), 1));
+        assert_eq!(projected_nodes(&conn, stream_id), vec!["remote-node".to_string()]);
+
+        let remove = device_remove(&member, super::super::cut::Cut::Empty);
+        let (remove_bytes, _) =
+            op(account_id, &founder, 3, Some(add_hash), Some(genesis_hash), &remove);
+        account_ingest(&conn, &remove_bytes, NOW + 4).unwrap();
+
+        assert!(matches!(
+            roster_ref_effective(&conn, account_id, add_hash, member.fp).unwrap(),
+            fold::AuthorityQuery::Invalid(_),
+        ));
+        assert_eq!(
+            content_verdict(&conn, &content.entry_hash),
+            ("accepted".into(), 1),
+            "remote account ingest leaves content at the last completed fold",
+        );
+        assert_eq!(projected_nodes(&conn, stream_id), vec!["remote-node".to_string()]);
+        let reason: i64 = conn
+            .query_row(
+                "SELECT reason_mask FROM content_streams_pending_refold WHERE stream_id = ?1",
+                [stream_id.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, 2, "the revoke queues ACCOUNT_CHANGE");
+
+        assert_eq!(settle_pending_content_refolds(&conn).unwrap(), 1);
+        let (status, accepted) = content_verdict(&conn, &content.entry_hash);
+        assert_eq!(accepted, 0);
+        assert!(status.starts_with("condemned{"), "unexpected settled verdict: {status}");
+        assert!(projected_nodes(&conn, stream_id).is_empty());
+    }
+
+    #[test]
+    fn trusted_revoke_projection_failure_rolls_back_authority_content_and_projection() {
+        let conn = db();
+        let founder = Dev::new(0x33);
+        let member = Dev::new(0x34);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (stream_id, own) = stream_own(account_id);
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
+        let (add_bytes, add_hash) = op(
+            account_id,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(genesis_hash),
+            &device_add(&member, DeviceRole::Member),
+        );
+        account_ingest(&conn, &add_bytes, NOW + 2).unwrap();
+        let content = signed_member_content(&member, account_id, stream_id, add_hash, 3);
+        content_ingest(&conn, &content.signed_bytes, NOW + 3).unwrap();
+        settle_pending_content_refolds(&conn).unwrap();
+
+        conn.execute_batch(
+            "CREATE TRIGGER fail_content_reproject
+             BEFORE DELETE ON content_projected_nodes
+             BEGIN SELECT RAISE(ABORT, 'injected content projection failure'); END;",
+        )
+        .unwrap();
+        let remove = device_remove(&member, super::super::cut::Cut::Empty);
+        let (remove_bytes, remove_hash) =
+            op(account_id, &founder, 3, Some(add_hash), Some(genesis_hash), &remove);
+        let signed =
+            envelope::verify_account_signed(&remove_bytes, &founder.secret.public()).unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        insert_candidate(&tx, &signed, &remove_bytes, NOW + 4).unwrap();
+        assert!(refold_in_tx(&tx, account_id, NOW + 4).is_err());
+        drop(tx);
+
+        assert_eq!(status(&conn, &remove_hash), None, "the trusted candidate rolled back");
+        assert!(matches!(
+            roster_ref_effective(&conn, account_id, add_hash, member.fp).unwrap(),
+            fold::AuthorityQuery::Effective(_),
+        ));
+        assert_eq!(content_verdict(&conn, &content.entry_hash), ("accepted".into(), 1));
+        assert_eq!(projected_nodes(&conn, stream_id), vec!["remote-node".to_string()]);
     }
 
     #[test]

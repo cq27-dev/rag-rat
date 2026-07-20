@@ -872,11 +872,10 @@ fn content_of(memory: &RepoMemory) -> NodeContent {
 /// subsystem's own tag reader (the op encoder sorts + dedupes anyway).
 ///
 /// This trusts `content_projected_nodes` to mirror the `accepted` flag exactly. Every writer of
-/// `accepted` refreshes the projection in the same txn: the local authoring seam reprojects, the
-/// account refold (`refold_streams_for_account`) reprojects each stream it folds (guarded on the
-/// V070 tables existing — #683), and the deferred-refold settle reprojects before clearing its
-/// mark. A future acceptance writer must uphold the same coupling or this anti-join
-/// re-authors/skips rows.
+/// `accepted` refreshes the projection in the same txn: local authoring reprojects, trusted/local
+/// account folds finalize each affected stream immediately, and deferred remote content/account
+/// work reprojects at settle before clearing its mark. A future acceptance writer must uphold the
+/// same coupling or this anti-join re-authors/skips rows.
 fn read_unauthored_memory_rows(
     conn: &Connection,
     repo_id: &str,
