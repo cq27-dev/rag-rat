@@ -1326,6 +1326,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_075_ID => Some(75),
             MIGRATION_076_ID => Some(76),
             MIGRATION_077_ID => Some(77),
+            MIGRATION_078_ID => Some(78),
             _ => None,
         })
         .max()
@@ -1412,6 +1413,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_075_ID
             | MIGRATION_076_ID
             | MIGRATION_077_ID
+            | MIGRATION_078_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1495,6 +1497,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_075_ID => migration.checksum != MIGRATION_075_CHECKSUM,
         MIGRATION_076_ID => migration.checksum != MIGRATION_076_CHECKSUM,
         MIGRATION_077_ID => migration.checksum != MIGRATION_077_CHECKSUM,
+        MIGRATION_078_ID => migration.checksum != MIGRATION_078_CHECKSUM,
         _ => false,
     }
 }
@@ -5413,6 +5416,53 @@ pub fn apply_distill_record_store(conn: &Connection) -> rusqlite::Result<()> {
             stats_json TEXT,
             repo_id TEXT NOT NULL DEFAULT '__unassigned__'
         ) STRICT;
+        ",
+    )
+}
+
+/// V078 — encode the active removal tombstone in the sign of its durable generation and erase the
+/// legacy identity-bearing marker key. The migration runner commits this conversion and its ledger
+/// stamp atomically; a later full schema apply sees the ledger row and must not reinterpret the
+/// signed format as legacy marker-less state.
+pub fn apply_signed_repo_removal_generation(conn: &Connection) -> rusqlite::Result<()> {
+    if conn
+        .query_row("SELECT 1 FROM schema_version WHERE id = ?1", [MIGRATION_078_ID], |_| Ok(()))
+        .optional()?
+        .is_some()
+    {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        INSERT OR IGNORE INTO index_meta(key, value)
+        SELECT 'removed_repo_generation:' || substr(key, length('removed_repo:') + 1), '1'
+        FROM index_meta
+        WHERE key GLOB 'removed_repo:*';
+
+        UPDATE index_meta AS generation
+        SET value = CAST(
+            CASE ABS(CAST(value AS INTEGER))
+                WHEN 0 THEN 1
+                ELSE ABS(CAST(value AS INTEGER))
+            END AS TEXT
+        )
+        WHERE key GLOB 'removed_repo_generation:*'
+          AND EXISTS (
+              SELECT 1 FROM index_meta AS marker
+              WHERE marker.key = 'removed_repo:' ||
+                  substr(generation.key, length('removed_repo_generation:') + 1)
+          );
+
+        UPDATE index_meta AS generation
+        SET value = CAST(-ABS(CAST(value AS INTEGER)) AS TEXT)
+        WHERE key GLOB 'removed_repo_generation:*'
+          AND NOT EXISTS (
+              SELECT 1 FROM index_meta AS marker
+              WHERE marker.key = 'removed_repo:' ||
+                  substr(generation.key, length('removed_repo_generation:') + 1)
+          );
+
+        DELETE FROM index_meta WHERE key GLOB 'removed_repo:*';
         ",
     )
 }

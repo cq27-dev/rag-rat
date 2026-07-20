@@ -228,6 +228,26 @@ pub fn purge_and_vacuum<C>(
     now_ms: i64,
     deconfigure: impl FnOnce() -> C,
 ) -> anyhow::Result<(RemoveOutcome, C)> {
+    purge_and_vacuum_with_wait(
+        database,
+        repo_id,
+        expected_removal_generation,
+        now_ms,
+        || {},
+        deconfigure,
+    )
+}
+
+/// [`purge_and_vacuum`] with an observable papertrail drain. `on_papertrail_wait` runs exactly once
+/// only when a flight lock is already held, immediately before the blocking foreground wait.
+pub fn purge_and_vacuum_with_wait<C>(
+    database: &Path,
+    repo_id: &str,
+    expected_removal_generation: i64,
+    now_ms: i64,
+    on_papertrail_wait: impl FnOnce(),
+    deconfigure: impl FnOnce() -> C,
+) -> anyhow::Result<(RemoveOutcome, C)> {
     // One lock for the whole operation. Acquired FIRST (per-repo before the global schema lock the
     // VACUUM takes — the per-repo → global ordering rule).
     let _lock =
@@ -246,16 +266,14 @@ pub fn purge_and_vacuum<C>(
     // the deconfigure below (a new flight can't reload a deleted config), the repo's papertrail
     // stays purged. The two lock sets are disjoint (autosync never takes the write lock;
     // index/rm never take the flight lock), so acquiring both cannot deadlock.
-    let _papertrail_lock = locks::FileLock::acquire_timeout(
-        &locks::papertrail_lock_path(database, repo_id),
-        REMOVE_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "timed out waiting for a papertrail sync flight to finish — re-run `rag-rat rm` once \
-             it drains"
-        )
-    })?;
+    let papertrail_lock_path = locks::papertrail_lock_path(database, repo_id);
+    let _papertrail_lock = match locks::FileLock::try_acquire(&papertrail_lock_path)? {
+        Some(lock) => lock,
+        None => {
+            on_papertrail_wait();
+            locks::FileLock::acquire_blocking(&papertrail_lock_path)?
+        },
+    };
 
     // Recount + purge under the lock so the reported `purged_rows` is exact and nothing appends to
     // the repo between the count and the delete.
@@ -832,6 +850,54 @@ mod tests {
     }
 
     #[test]
+    fn purge_reports_and_waits_for_a_running_papertrail_flight() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_root, config) = poison_test_config("rm_waits_for_papertrail");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let (repo_id, removal_generation) = {
+            let storage = IndexConnection::open(&config.database).unwrap();
+            let repo_id = fixture_repo_id(storage.connection());
+            let generation =
+                schema::repo_removal_generation(storage.connection(), &repo_id).unwrap();
+            (repo_id, generation)
+        };
+        drop(db);
+
+        let lock_path = rag_rat_base::locks::papertrail_lock_path(&config.database, &repo_id);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lock = rag_rat_base::locks::FileLock::acquire_blocking(&lock_path).unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let database = config.database.clone();
+        let (wait_tx, wait_rx) = mpsc::channel();
+        let remover = std::thread::spawn(move || {
+            super::purge_and_vacuum_with_wait(
+                &database,
+                &repo_id,
+                removal_generation,
+                12_345,
+                || wait_tx.send(()).unwrap(),
+                || (),
+            )
+        });
+
+        wait_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the contention callback runs before blocking");
+        assert!(!remover.is_finished(), "purge must wait until the flight lock drains");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        remover.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn purge_refuses_a_plan_from_before_an_intervening_remove_and_readd() {
         use std::cell::Cell;
 
@@ -897,6 +963,14 @@ mod tests {
         schema::register_repo(conn, &identity, tv_root, 1, &hooks).unwrap();
         // Tombstone it → the indexing (root-recording) path refuses.
         schema::mark_repo_removed(conn, &identity.repo_id, 2).unwrap();
+        let raw_generation: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1",
+                [format!("removed_repo_generation:{}", identity.repo_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_generation, 1, "mark stores an active positive generation");
         let err = schema::register_repo(conn, &identity, tv_root, 3, &hooks)
             .expect_err("a tombstoned repo must refuse re-registration");
         assert!(
@@ -910,6 +984,35 @@ mod tests {
         // `rag-rat init`'s clear lifts the tombstone → the indexing path works again.
         schema::clear_repo_removed(conn, &identity.repo_id).unwrap();
         assert!(!schema::is_repo_removed(conn, &identity.repo_id).unwrap());
+        let raw_generation: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1",
+                [format!("removed_repo_generation:{}", identity.repo_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_generation, -1, "clear preserves generation with an inactive sign");
+        assert_eq!(schema::repo_removal_generation(conn, &identity.repo_id).unwrap(), 1);
         schema::register_repo(conn, &identity, tv_root, 5, &hooks).unwrap();
+
+        schema::mark_repo_removed(conn, &identity.repo_id, 6).unwrap();
+        let raw_generation: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1",
+                [format!("removed_repo_generation:{}", identity.repo_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_generation, 2, "mark advances the absolute generation after a re-add");
+
+        schema::clear_repo_removed(conn, "never-removed").unwrap();
+        let absent_generation: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM index_meta WHERE key = ?1)",
+                ["removed_repo_generation:never-removed"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!absent_generation, "clearing an absent generation remains a no-op");
     }
 }

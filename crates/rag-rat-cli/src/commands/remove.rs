@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use dialoguer::Confirm;
 use rag_rat_base::config::Config;
 use rag_rat_core::index::remove::{self, RemovePlan};
@@ -83,11 +84,17 @@ pub(crate) fn rm(config: &Config, args: &RmArgs) -> anyhow::Result<()> {
     // so adding it never widens what gets deleted to a foreign repo.
     let mut cleanup_dirs = plan.repo.roots.clone();
     cleanup_dirs.push(plan.repo.resolved_root.to_string_lossy().into_owned());
-    let (outcome, cleanup) = remove::purge_and_vacuum(
+    let (outcome, cleanup) = remove::purge_and_vacuum_with_wait(
         &config.database,
         &plan.repo.repo_id,
         plan.repo.removal_generation,
         rag_rat_base::time::now_ms(),
+        || {
+            eprintln!(
+                "rm: a papertrail sync flight is running; waiting for it to drain (Ctrl-C to \
+                 abort)…"
+            );
+        },
         || clean_on_disk_footprint(&cleanup_dirs, &plan.repo.repo_id),
     )?;
 
@@ -208,9 +215,24 @@ fn clean_on_disk_footprint(roots: &[String], removed_repo_id: &str) -> CleanupRe
 
     // Candidate dirs: each recorded root plus every git worktree linked to it, deduplicated…
     let mut seen_dirs = std::collections::BTreeSet::new();
-    let dirs: Vec<PathBuf> = roots
-        .iter()
-        .flat_map(|root| worktree_dirs_for(Path::new(root)))
+    let mut candidate_dirs = Vec::new();
+    for root in roots {
+        match worktree_dirs_for(Path::new(root)) {
+            Ok(worktrees) => {
+                candidate_dirs.extend(worktrees.dirs);
+                result.warnings.extend(worktrees.warnings);
+            },
+            Err(err) => {
+                result.warnings.push(format!(
+                    "could not enumerate git worktrees from {root}; falling back to that root: \
+                     {err}"
+                ));
+                candidate_dirs.push(PathBuf::from(root));
+            },
+        }
+    }
+    let dirs: Vec<PathBuf> = candidate_dirs
+        .into_iter()
         .filter(|dir| seen_dirs.insert(dir.clone()))
         // …then the OWNERSHIP GUARD: only touch a dir that STILL belongs to the repo being removed —
         // a PRESENT git worktree whose content-derived identity equals `removed_repo_id`. This is
@@ -310,27 +332,40 @@ fn dir_belongs_to_removed_repo(dir: &Path, removed_repo_id: &str) -> bool {
     identity.map(|identity| identity.repo_id == removed_repo_id).unwrap_or(false)
 }
 
-/// `root` itself plus every git worktree linked to it (`git worktree list --porcelain`).
-/// Best-effort: a non-git / missing / erroring `root` yields just `[root]`. Deconfiguration walks
-/// these so a linked worktree's branch-local `rag-rat.toml` is removed too, not only the main
-/// worktree's.
-fn worktree_dirs_for(root: &Path) -> Vec<PathBuf> {
+/// `root` itself plus the discovered current and main workdirs and every linked-worktree proxy
+/// base. Discovery/enumeration errors are returned honestly; the cleanup caller owns the
+/// best-effort root-only fallback and warning.
+struct WorktreeDirs {
+    dirs: Vec<PathBuf>,
+    warnings: Vec<String>,
+}
+
+fn worktree_dirs_for(root: &Path) -> anyhow::Result<WorktreeDirs> {
     let mut dirs = vec![root.to_path_buf()];
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["worktree", "list", "--porcelain"])
-        .output();
-    if let Ok(out) = output
-        && out.status.success()
-    {
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if let Some(path) = line.strip_prefix("worktree ") {
-                dirs.push(PathBuf::from(path));
-            }
+    let mut warnings = Vec::new();
+    let repo = rag_rat_base::repo_discover::discover_repo(root)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("discovering git repository from {}", root.display()))?;
+    if let Some(workdir) = repo.workdir() {
+        dirs.push(workdir.to_path_buf());
+    }
+
+    let main = gix::open(repo.common_dir()).with_context(|| {
+        format!("opening main worktree through git common dir {}", repo.common_dir().display())
+    })?;
+    if let Some(workdir) = main.workdir() {
+        dirs.push(workdir.to_path_buf());
+    }
+
+    for proxy in repo.worktrees().context("enumerating linked git worktrees")? {
+        match proxy.base() {
+            Ok(base) => dirs.push(base),
+            Err(err) => warnings.push(format!("could not read a linked git worktree base: {err}")),
         }
     }
-    dirs
+    dirs.sort();
+    dirs.dedup();
+    Ok(WorktreeDirs { dirs, warnings })
 }
 
 /// The actionable error when a path resolves to no registered repo: name the path and list the
@@ -360,6 +395,43 @@ fn unregistered_path_message(storage: &IndexConnection, path: &Path) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn worktree_dirs_include_main_current_and_linked_checkouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let linked_a = temp.path().join("linked-a");
+        let linked_b = temp.path().join("linked-b");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init"]);
+        git(&main, &["config", "user.email", "test@example.com"]);
+        git(&main, &["config", "user.name", "Test"]);
+        std::fs::write(main.join("tracked"), "x\n").unwrap();
+        git(&main, &["add", "tracked"]);
+        git(&main, &["commit", "-m", "fixture"]);
+        git(&main, &["worktree", "add", linked_a.to_str().unwrap(), "-b", "linked-a"]);
+        git(&main, &["worktree", "add", linked_b.to_str().unwrap(), "-b", "linked-b"]);
+
+        let worktrees = worktree_dirs_for(&linked_a).unwrap();
+        let dirs = worktrees.dirs;
+        assert!(worktrees.warnings.is_empty());
+        assert!(dirs.contains(&main));
+        assert!(dirs.contains(&linked_a));
+        assert!(dirs.contains(&linked_b));
+        assert_eq!(dirs.len(), 3, "overlapping root/current/proxy paths are deduplicated");
+    }
 
     /// The P1 data-loss guard: removing a repo whose tree is GONE must NOT let
     /// `discover_config_path` climb out of the missing git boundary and delete an UNRELATED
@@ -392,6 +464,10 @@ mod tests {
         assert!(
             result.configs_removed.is_empty(),
             "a gone tree owns no reachable config to remove"
+        );
+        assert!(
+            result.warnings.iter().any(|warning| warning.contains("falling back")),
+            "enumeration failure must be surfaced while cleanup falls back to the root"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

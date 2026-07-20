@@ -2912,8 +2912,7 @@ fn migration_076_adds_sync_security_events() {
 }
 
 #[test]
-fn migration_077_is_the_tip_and_builds_the_distill_record_store() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 77, "move this pin with the next schema migration");
+fn migration_077_builds_the_distill_record_store() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
@@ -3003,4 +3002,59 @@ fn migration_077_is_the_tip_and_builds_the_distill_record_store() {
         )
         .unwrap();
     assert_eq!(v77_recorded, 1, "the forward migration records V077");
+}
+
+#[test]
+fn migration_078_is_the_tip_and_folds_repo_removal_state_into_the_generation_sign() {
+    use rusqlite::OptionalExtension;
+
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 78, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    truncate_schema_to(&conn, 77);
+    conn.execute_batch(
+        "
+        INSERT INTO index_meta(key, value) VALUES
+            ('removed_repo:marker-and-generation', '123'),
+            ('removed_repo_generation:marker-and-generation', '7'),
+            ('removed_repo_generation:generation-only', '4'),
+            ('removed_repo:marker-only', '456');
+        ",
+    )
+    .unwrap();
+
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
+
+    let raw_generation = |repo_id: &str| {
+        conn.query_row(
+            "SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = 'removed_repo_generation:' \
+             || ?1",
+            [repo_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .unwrap()
+    };
+    assert_eq!(raw_generation("marker-and-generation"), Some(7));
+    assert_eq!(raw_generation("generation-only"), Some(-4));
+    assert_eq!(raw_generation("marker-only"), Some(1));
+    assert_eq!(raw_generation("never-removed"), None);
+    let legacy_markers: i64 = conn
+        .query_row("SELECT COUNT(*) FROM index_meta WHERE key GLOB 'removed_repo:*'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(legacy_markers, 0, "V078 erases every legacy marker key");
+    assert_eq!(schema::repo_removal_generation(&conn, "generation-only").unwrap(), 4);
+    assert!(!schema::is_repo_removed(&conn, "generation-only").unwrap());
+    assert!(schema::is_repo_removed(&conn, "marker-only").unwrap());
+    assert_eq!(schema::status(&conn).unwrap().current_version, 78);
+
+    // Full rebuilds replay the additive ladder. Once V078 is recorded, replay must preserve the
+    // signed state rather than treating every marker-less positive value as legacy-cleared state.
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(raw_generation("marker-and-generation"), Some(7));
+    assert_eq!(raw_generation("generation-only"), Some(-4));
+    assert_eq!(raw_generation("marker-only"), Some(1));
+    assert!(schema::is_repo_removed(&conn, "marker-only").unwrap());
 }
