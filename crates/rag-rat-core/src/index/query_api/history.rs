@@ -230,6 +230,28 @@ impl IndexDatabase {
         )
     }
 
+    /// Drain up to `limit` prepared distill snapshots through `model`. Database reads and writes
+    /// are separate from model calls, so no SQLite transaction spans inference.
+    pub fn distill_drain(
+        &self,
+        model: &dyn rag_rat_llm::chat::ChatModel,
+        limit: u32,
+    ) -> anyhow::Result<crate::distill::DistillDrainReport> {
+        crate::distill::drain(
+            self.storage.connection(),
+            self.storage.database_path(),
+            &self.active_repo_id,
+            model,
+            usize::try_from(limit)?,
+            rag_rat_base::time::now_ms(),
+        )
+    }
+
+    /// Count queue rows whose deterministic source snapshot is prepared for model inference.
+    pub fn distill_pending_count(&self) -> anyhow::Result<u64> {
+        crate::distill::pending_count(self.storage.connection(), &self.active_repo_id)
+    }
+
     pub fn papertrail_issue_search(
         &self,
         query: &str,
