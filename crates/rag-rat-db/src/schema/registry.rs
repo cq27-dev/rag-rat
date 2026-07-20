@@ -181,25 +181,32 @@ pub fn register_repo(
     register_repo_inner(conn, identity, root, now_ms, true, hooks)
 }
 
+/// The `index_meta` key that TOMBSTONES a repo removed via `rag-rat rm` (#767). GLOBAL scope on
+/// purpose: the removal purge deletes every repo-scoped row, so a marker meant to OUTLIVE the
+/// removal must live outside that sweep — `index_meta` carries no `repo_id` column and is never
+/// swept.
+fn removed_repo_key(repo_id: &str) -> String {
+    format!("removed_repo:{repo_id}")
+}
+
 fn repo_removal_generation_key(repo_id: &str) -> String {
     format!("removed_repo_generation:{repo_id}")
 }
 
-/// Monotonic count of completed `rag-rat rm` purges for `repo_id`. The stored sign also carries the
-/// active state: positive means removed, negative means deliberately re-added, and absent/zero
-/// means never removed. This public value hides that state and returns the absolute generation. A
-/// removal plan captures it before confirmation and rechecks it under the repo write lock, so an
-/// intervening remove → deliberate re-init cycle makes the stale plan fail closed.
+/// Monotonic count of completed `rag-rat rm` purges for `repo_id`. Unlike the active removal
+/// tombstone, this is NEVER cleared by `init`: a removal plan captures it before confirmation and
+/// rechecks it under the repo write lock, so an intervening remove → deliberate re-init cycle makes
+/// the stale plan fail closed instead of deleting the newly re-added repo. Missing means generation
+/// zero for stores created before #767.
 pub fn repo_removal_generation(conn: &Connection, repo_id: &str) -> rusqlite::Result<i64> {
     conn.query_row(
-        "SELECT ABS(COALESCE((SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1), 0))",
+        "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1), 0)",
         [repo_removal_generation_key(repo_id)],
         |row| row.get(0),
     )
 }
 
-/// Tombstone `repo_id` as removed-via-`rm`. `removed_at_ms` is retained for API stability but is no
-/// longer persisted: active state is the generation's sign. Written INSIDE the purge transaction
+/// Tombstone `repo_id` as removed-via-`rm` at `removed_at_ms`. Written INSIDE the purge transaction
 /// so it commits atomically with the deletion; [`register_repo`] then refuses to re-register the id
 /// until [`clear_repo_removed`] (via `rag-rat init`) lifts it — the durable guard against a writer
 /// that queued behind the removal lock with a STALE in-memory config silently repopulating the repo
@@ -207,34 +214,31 @@ pub fn repo_removal_generation(conn: &Connection, repo_id: &str) -> rusqlite::Re
 pub fn mark_repo_removed(
     conn: &Connection,
     repo_id: &str,
-    _removed_at_ms: i64,
+    removed_at_ms: i64,
 ) -> anyhow::Result<()> {
+    crate::meta::set_meta(conn, &removed_repo_key(repo_id), &removed_at_ms.to_string())?;
     conn.execute(
         "INSERT INTO index_meta(key, value) VALUES (?1, '1') ON CONFLICT(key) DO UPDATE SET value \
-         = CAST(ABS(CAST(index_meta.value AS INTEGER)) + 1 AS TEXT)",
+         = CAST(CAST(index_meta.value AS INTEGER) + 1 AS TEXT)",
         [repo_removal_generation_key(repo_id)],
     )?;
     Ok(())
 }
 
-/// Whether `repo_id` is tombstoned as removed-via-`rm`. Positive generation means actively removed.
+/// Whether `repo_id` is tombstoned as removed-via-`rm`. A direct `index_meta` read (rusqlite-typed
+/// so [`register_repo_inner`] can gate on it without an error-type conversion).
 pub fn is_repo_removed(conn: &Connection, repo_id: &str) -> rusqlite::Result<bool> {
     conn.query_row(
-        "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1), 0) > 0",
-        [repo_removal_generation_key(repo_id)],
+        "SELECT EXISTS(SELECT 1 FROM index_meta WHERE key = ?1)",
+        [removed_repo_key(repo_id).as_str()],
         |row| row.get(0),
     )
 }
 
 /// Lift the removed-via-`rm` tombstone for `repo_id` — `rag-rat init`'s deliberate re-add, the ONE
-/// path allowed to bring a removed repo back. The generation remains durable but becomes negative;
-/// clearing an absent generation is a no-op.
+/// path allowed to bring a removed repo back. Idempotent (clearing an absent tombstone is a no-op).
 pub fn clear_repo_removed(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
-    conn.execute(
-        "UPDATE index_meta SET value = CAST(-ABS(CAST(value AS INTEGER)) AS TEXT) WHERE key = ?1",
-        [repo_removal_generation_key(repo_id)],
-    )?;
-    Ok(())
+    crate::meta::delete_meta(conn, &removed_repo_key(repo_id))
 }
 
 /// Register/adopt `identity` WITHOUT recording the working-tree `root` in `repo_roots` — the

@@ -43,7 +43,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 78;
+pub const LATEST_SCHEMA_VERSION: u32 = 77;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -567,14 +567,6 @@ const MIGRATION_077_DESCRIPTION: &str =
      alternatives, mechanical fixing-commits), thread-keyed edges (survive record regeneration), \
      the distill work queue, and per-run stats. Additive; CREATE IF NOT EXISTS, nothing \
      pre-existing to backfill";
-const MIGRATION_078_ID: &str = "078_signed_repo_removal_generation";
-const MIGRATION_078_CHECKSUM: &str = "sha256:rag-rat-signed-repo-removal-generation-v78";
-const MIGRATION_078_DESCRIPTION: &str =
-    "Fold the active rm tombstone into the sign of removed_repo_generation:<repo_id>: positive is \
-     actively removed and negative is deliberately re-added. Backfill marker-only rows at \
-     generation 1, normalize marker+generation positive and generation-only negative, then delete \
-     every legacy removed_repo:<repo_id> marker";
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemaState {
@@ -759,15 +751,6 @@ fn apply_and_record_migration(
     step: &Migration,
     hooks: &MigrationHooks,
 ) -> rusqlite::Result<()> {
-    // V078 converts two legacy keys into one signed value. Its conversion and ledger stamp must be
-    // atomic: a crash after deleting the legacy marker but before recording the migration would
-    // make a retry misread an active positive generation as a cleared legacy generation.
-    if step.id == MIGRATION_078_ID {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        step.apply.run(&tx, hooks)?;
-        record_migration(&tx, step.id, step.checksum, step.description)?;
-        return tx.commit();
-    }
     if !matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID) {
         step.apply.run(conn, hooks)?;
         return record_migration(conn, step.id, step.checksum, step.description);
@@ -1236,12 +1219,6 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_077_CHECKSUM,
         description: MIGRATION_077_DESCRIPTION,
         apply: MigrationFn::Plain(apply_distill_record_store),
-    },
-    Migration {
-        id: MIGRATION_078_ID,
-        checksum: MIGRATION_078_CHECKSUM,
-        description: MIGRATION_078_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_signed_repo_removal_generation),
     },
 ];
 

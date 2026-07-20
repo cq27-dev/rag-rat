@@ -963,14 +963,6 @@ mod tests {
         schema::register_repo(conn, &identity, tv_root, 1, &hooks).unwrap();
         // Tombstone it → the indexing (root-recording) path refuses.
         schema::mark_repo_removed(conn, &identity.repo_id, 2).unwrap();
-        let raw_generation: i64 = conn
-            .query_row(
-                "SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1",
-                [format!("removed_repo_generation:{}", identity.repo_id)],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(raw_generation, 1, "mark stores an active positive generation");
         let err = schema::register_repo(conn, &identity, tv_root, 3, &hooks)
             .expect_err("a tombstoned repo must refuse re-registration");
         assert!(
@@ -984,35 +976,6 @@ mod tests {
         // `rag-rat init`'s clear lifts the tombstone → the indexing path works again.
         schema::clear_repo_removed(conn, &identity.repo_id).unwrap();
         assert!(!schema::is_repo_removed(conn, &identity.repo_id).unwrap());
-        let raw_generation: i64 = conn
-            .query_row(
-                "SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1",
-                [format!("removed_repo_generation:{}", identity.repo_id)],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(raw_generation, -1, "clear preserves generation with an inactive sign");
-        assert_eq!(schema::repo_removal_generation(conn, &identity.repo_id).unwrap(), 1);
         schema::register_repo(conn, &identity, tv_root, 5, &hooks).unwrap();
-
-        schema::mark_repo_removed(conn, &identity.repo_id, 6).unwrap();
-        let raw_generation: i64 = conn
-            .query_row(
-                "SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1",
-                [format!("removed_repo_generation:{}", identity.repo_id)],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(raw_generation, 2, "mark advances the absolute generation after a re-add");
-
-        schema::clear_repo_removed(conn, "never-removed").unwrap();
-        let absent_generation: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM index_meta WHERE key = ?1)",
-                ["removed_repo_generation:never-removed"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!absent_generation, "clearing an absent generation remains a no-op");
     }
 }
