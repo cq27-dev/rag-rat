@@ -11,16 +11,17 @@ pub use migrations::{
     apply_account_candidate_dag, apply_clone_delta_maintenance, apply_clone_df_epoch,
     apply_clone_fingerprint_tables, apply_clone_graph_tables, apply_content_candidate_dag,
     apply_content_projected_tables, apply_content_streams_pending_refold,
-    apply_distill_record_store, apply_dream_findings, apply_edge_string_interning,
-    apply_edge_target_qname_index, apply_external_symbols, apply_files_generation,
-    apply_files_has_test_code, apply_git_change_couplings, apply_github_child_key_widening,
-    apply_github_repo_id_scoping, apply_memory_model_failures_table,
-    apply_memory_verification_tables, apply_move_per_repo_meta, apply_oplog_device_identity,
-    apply_oplog_device_x25519, apply_oplog_local_account, apply_oplog_storage,
-    apply_oplog_stream_scoping, apply_oracle_tables, apply_papertrail_binding_health,
-    apply_papertrail_distill_substrate, apply_papertrail_mirror_resume_state,
-    apply_papertrail_provider_neutral_schema, apply_repo_id_core_scoping,
-    apply_repo_id_periphery_scoping, apply_repos_registry, apply_scip_moniker_anchors,
+    apply_distill_anchor_selection, apply_distill_record_store, apply_dream_findings,
+    apply_edge_string_interning, apply_edge_target_qname_index, apply_external_symbols,
+    apply_files_generation, apply_files_has_test_code, apply_git_change_couplings,
+    apply_github_child_key_widening, apply_github_repo_id_scoping,
+    apply_memory_model_failures_table, apply_memory_verification_tables, apply_move_per_repo_meta,
+    apply_oplog_device_identity, apply_oplog_device_x25519, apply_oplog_local_account,
+    apply_oplog_storage, apply_oplog_stream_scoping, apply_oracle_tables,
+    apply_papertrail_binding_health, apply_papertrail_distill_substrate,
+    apply_papertrail_mirror_resume_state, apply_papertrail_provider_neutral_schema,
+    apply_repo_id_core_scoping, apply_repo_id_periphery_scoping, apply_repos_registry,
+    apply_scip_moniker_anchors,
 };
 pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_exists};
 pub use purge::{RepoRowCounts, count_repo_rows, purge_repo_rows, repo_scoped_table_names};
@@ -43,7 +44,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 77;
+pub const LATEST_SCHEMA_VERSION: u32 = 78;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -567,6 +568,15 @@ const MIGRATION_077_DESCRIPTION: &str =
      alternatives, mechanical fixing-commits), thread-keyed edges (survive record regeneration), \
      the distill work queue, and per-run stats. Additive; CREATE IF NOT EXISTS, nothing \
      pre-existing to backfill";
+const MIGRATION_078_ID: &str = "078_distill_anchor_selection";
+const MIGRATION_078_CHECKSUM: &str = "sha256:rag-rat-distill-anchor-selection-v78";
+const MIGRATION_078_DESCRIPTION: &str =
+    "Distinguish mined anchor candidates from model selections (issue #704): add a stable, \
+     zero-based candidate ordinal and selected state to papertrail_distill_anchors; \
+     deterministically backfill V077 rows in insertion order per thread; enforce ordinal \
+     uniqueness and boolean selected values; index selected anchors. Additive; existing anchor \
+     identity/path columns are unchanged";
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemaState {
@@ -1219,6 +1229,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_077_CHECKSUM,
         description: MIGRATION_077_DESCRIPTION,
         apply: MigrationFn::Plain(apply_distill_record_store),
+    },
+    Migration {
+        id: MIGRATION_078_ID,
+        checksum: MIGRATION_078_CHECKSUM,
+        description: MIGRATION_078_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_distill_anchor_selection),
     },
 ];
 

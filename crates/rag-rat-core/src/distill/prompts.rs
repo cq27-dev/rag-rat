@@ -20,7 +20,7 @@ use super::units::BudgetPlan;
 
 /// Bumped when the prompt text or schema changes in a way that should re-distill existing records.
 /// The drain folds this into the regeneration hash so a prompt edit re-runs the model. Start at 1.
-pub(crate) const PROMPT_VERSION: u32 = 1;
+pub(crate) const PROMPT_VERSION: u32 = 2;
 
 // Output bounds are shared contract constants so the later strict/fallback parser can enforce the
 // same limits as guided decoding rather than trusting the backend alone.
@@ -29,6 +29,7 @@ pub(crate) const MAX_NARRATIVE_CHARS: usize = 1_000;
 pub(crate) const MAX_CAUSE_CLASS_CHARS: usize = 100;
 pub(crate) const MAX_REJECTED_ALTERNATIVES: usize = 20;
 pub(crate) const MAX_ALTERNATIVE_CHARS: usize = 500;
+pub(crate) const MAX_ANCHOR_INDICES: usize = 40;
 
 /// The system instructions (role + plain-prose + cite-by-unit rules). Authored as markdown in
 /// `prompts/system.md` and embedded at build time (the dream passes use the same pattern) so prompt
@@ -54,6 +55,8 @@ pub(crate) struct PromptBudget {
     pub max_xrefs: usize,
     /// Max changed-file symbols rendered — the grounding list, capped as the spike did.
     pub max_symbols: usize,
+    /// Max mechanically mined anchor candidates exposed for model selection.
+    pub max_anchor_candidates: usize,
 }
 
 impl Default for PromptBudget {
@@ -65,6 +68,7 @@ impl Default for PromptBudget {
             commits: 8_000,
             max_xrefs: 20,
             max_symbols: 60,
+            max_anchor_candidates: MAX_ANCHOR_INDICES,
         }
     }
 }
@@ -104,12 +108,25 @@ pub(crate) struct FixCommit {
 }
 
 /// A symbol defined in the fix's changed files, from the index — grounds the model's prose in real
-/// identifiers. Presented as context; anchors themselves are mined mechanically, not selected here.
+/// identifiers. Presented as supplemental context; anchor selection uses the separately numbered
+/// mechanically mined candidates.
 #[derive(Debug, Clone)]
 pub(crate) struct SymbolContext {
     pub name: String,
     pub kind: String,
     pub file: String,
+}
+
+/// One mechanically mined anchor candidate. `index` is the persisted zero-based candidate ordinal;
+/// the model may select only indices that are rendered in the bounded candidate block.
+#[derive(Debug, Clone)]
+pub(crate) struct AnchorContext {
+    pub index: usize,
+    pub kind: String,
+    pub name: String,
+    pub file: Option<String>,
+    /// A resolved symbol's opaque `sym_<hex>` handle. It is display-only here and never parsed.
+    pub logical_symbol_id: Option<String>,
 }
 
 /// Everything the prompt renders, already assembled from the mirror + index by the drain pass.
@@ -126,6 +143,7 @@ pub(crate) struct PromptInput {
     pub xrefs: Vec<Xref>,
     pub fix_commits: Vec<FixCommit>,
     pub symbols: Vec<SymbolContext>,
+    pub anchor_candidates: Vec<AnchorContext>,
     pub diff: Option<String>,
 }
 
@@ -133,13 +151,15 @@ pub(crate) struct PromptInput {
 /// `$ref`s (best for backend guided decoding), `additionalProperties: false` everywhere. The
 /// `outcome.status` enum is built from [`OutcomeStatus`] so it can never drift from the persisted
 /// token set. Fields map to the model-owned `papertrail_distill` columns + junctions; mechanical
-/// facets (fixing commits, anchors, the status floors) are NOT model-emitted and are absent here.
+/// facets (fixing commits, mined anchor values, the status floors) are NOT model-emitted. The model
+/// emits only indices selecting from the bounded, mechanically mined anchor candidate list.
 /// Every caller MUST pass the decoded reply through [`validate_record_output`]: supported guided
 /// backends do not enforce cross-field dependencies or citation uniqueness.
 pub(crate) fn record_schema(input: &PromptInput, budget: &PromptBudget) -> serde_json::Value {
     let statuses: Vec<&'static str> =
         OutcomeStatus::VARIANTS.iter().map(|s| s.as_db_str()).collect();
     let visible_unit_ids = visible_unit_ids(input, budget);
+    let visible_anchor_indices = visible_anchor_indices(input, budget);
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -194,6 +214,7 @@ pub(crate) fn record_schema(input: &PromptInput, budget: &PromptBudget) -> serde
                 "additionalProperties": false
             },
             "outcome_units": citation_array_schema(&visible_unit_ids),
+            "anchor_indices": anchor_array_schema(&visible_anchor_indices),
             "outcome": {
                 "type": "object",
                 "properties": {
@@ -210,9 +231,22 @@ pub(crate) fn record_schema(input: &PromptInput, budget: &PromptBudget) -> serde
         },
         "required": [
             "root_issue", "root_cause_units", "root_cause", "root_cause_class",
-            "decision_units", "decision", "outcome_units", "outcome"
+            "decision_units", "decision", "outcome_units", "anchor_indices", "outcome"
         ],
         "additionalProperties": false
+    })
+}
+
+fn anchor_array_schema(visible_anchor_indices: &[usize]) -> serde_json::Value {
+    let items = if visible_anchor_indices.is_empty() {
+        serde_json::json!({ "type": "integer" })
+    } else {
+        serde_json::json!({ "type": "integer", "enum": visible_anchor_indices })
+    };
+    serde_json::json!({
+        "type": "array",
+        "items": items,
+        "maxItems": visible_anchor_indices.len().min(MAX_ANCHOR_INDICES)
     })
 }
 
@@ -248,6 +282,7 @@ pub(crate) fn validate_record_output(
             "decision_units",
             "decision",
             "outcome_units",
+            "anchor_indices",
             "outcome",
         ],
         "record",
@@ -257,6 +292,7 @@ pub(crate) fn validate_record_output(
     let root_cause_units = validate_citations(object, "root_cause_units", &visible)?;
     let decision_units = validate_citations(object, "decision_units", &visible)?;
     validate_citations(object, "outcome_units", &visible)?;
+    validate_anchor_indices(object, input, budget)?;
 
     validate_nullable_text(object.get("root_issue"), "root_issue", MAX_NARRATIVE_CHARS)?;
     let has_root_cause =
@@ -323,6 +359,37 @@ pub(crate) fn validate_record_output(
         return Err(format!("outcome.status has unknown value `{status}`"));
     }
     validate_nullable_text(outcome.get("summary"), "outcome.summary", MAX_NARRATIVE_CHARS)?;
+    Ok(())
+}
+
+fn validate_anchor_indices(
+    object: &serde_json::Map<String, serde_json::Value>,
+    input: &PromptInput,
+    budget: &PromptBudget,
+) -> Result<(), String> {
+    let indices = object
+        .get("anchor_indices")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "anchor_indices must be an array".to_string())?;
+    if indices.len() > MAX_ANCHOR_INDICES {
+        return Err(format!("anchor_indices exceeds {MAX_ANCHOR_INDICES} items"));
+    }
+    let visible: std::collections::HashSet<usize> =
+        visible_anchor_indices(input, budget).into_iter().collect();
+    let mut seen = std::collections::HashSet::with_capacity(indices.len());
+    for value in indices {
+        let raw = value
+            .as_u64()
+            .ok_or_else(|| "anchor_indices must contain non-negative integers".to_string())?;
+        let index = usize::try_from(raw)
+            .map_err(|_| "anchor_indices contains an out-of-range index".to_string())?;
+        if !visible.contains(&index) {
+            return Err(format!("anchor index A{index} was not rendered"));
+        }
+        if !seen.insert(index) {
+            return Err(format!("anchor_indices contains duplicate index A{index}"));
+        }
+    }
     Ok(())
 }
 
@@ -398,7 +465,113 @@ fn validate_text(text: &str, field: &str, max_chars: usize) -> Result<(), String
     if text.chars().count() > max_chars {
         return Err(format!("{field} exceeds {max_chars} characters"));
     }
+    if let Some(markdown) = forbidden_markdown(text) {
+        return Err(format!("{field} must be plain prose (found {markdown})"));
+    }
     Ok(())
+}
+
+fn forbidden_markdown(text: &str) -> Option<&'static str> {
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            return Some("a code fence");
+        }
+        if line.starts_with('#') && line.trim_start_matches('#').starts_with(char::is_whitespace) {
+            return Some("a heading");
+        }
+        if matches!(line.as_bytes(), [b'-' | b'*' | b'+', whitespace, ..] if whitespace.is_ascii_whitespace())
+            || line.split_once(char::is_whitespace).is_some_and(|(marker, _)| {
+                marker.strip_suffix('.').or_else(|| marker.strip_suffix(')')).is_some_and(
+                    |digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+                )
+            })
+        {
+            return Some("a list item");
+        }
+        if (line.starts_with('|') && line.ends_with('|')) || markdown_table_separator(line) {
+            return Some("a table");
+        }
+        if line.starts_with('>') {
+            return Some("a blockquote");
+        }
+        let Some(outside_code) = outside_inline_code(line) else {
+            return Some("an invalid inline-code span");
+        };
+        if outside_code.contains("**") || outside_code.contains("__") {
+            return Some("bold formatting");
+        }
+        if outside_code.contains("~~") {
+            return Some("strikethrough formatting");
+        }
+        if outside_code.contains("](") || outside_code.contains("![") {
+            return Some("a link or image");
+        }
+        if has_markdown_emphasis(&outside_code, b'*') || has_markdown_emphasis(&outside_code, b'_')
+        {
+            return Some("italic formatting");
+        }
+    }
+    None
+}
+
+fn outside_inline_code(line: &str) -> Option<String> {
+    let mut in_code = false;
+    let mut code_has_content = false;
+    let mut outside = String::with_capacity(line.len());
+    for character in line.chars() {
+        if character == '`' {
+            if in_code && !code_has_content {
+                return None;
+            }
+            in_code = !in_code;
+            code_has_content = false;
+            outside.push(' ');
+        } else if in_code {
+            if character.is_whitespace() || character.is_control() {
+                return None;
+            }
+            code_has_content = true;
+            outside.push(' ');
+        } else {
+            outside.push(character);
+        }
+    }
+    (!in_code).then_some(outside)
+}
+
+fn has_markdown_emphasis(text: &str, marker: u8) -> bool {
+    let bytes = text.as_bytes();
+    for start in 0..bytes.len() {
+        if bytes[start] != marker
+            || bytes.get(start + 1).is_none_or(u8::is_ascii_whitespace)
+            || start > 0 && !emphasis_boundary(bytes[start - 1])
+        {
+            continue;
+        }
+        for end in (start + 2)..bytes.len() {
+            if bytes[end] == marker
+                && !bytes[end - 1].is_ascii_whitespace()
+                && bytes.get(end + 1).is_none_or(|next| emphasis_boundary(*next))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn emphasis_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || byte.is_ascii_punctuation()
+}
+
+fn markdown_table_separator(line: &str) -> bool {
+    let cells: Vec<&str> = line.split('|').map(str::trim).filter(|cell| !cell.is_empty()).collect();
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            let cell = cell.trim_matches(':');
+            cell.len() >= 3 && cell.bytes().all(|byte| byte == b'-')
+        })
 }
 
 /// The TRUSTED instruction contract: system head + field rules. This is the only part authored by
@@ -447,6 +620,7 @@ pub(crate) fn render_context(input: &PromptInput, budget: &PromptBudget) -> Stri
     // block renders when its own data is present, so supplying a diff or symbols without a fix
     // commit still grounds the model.
     render_fix_context(&mut out, input, budget);
+    render_anchor_candidates(&mut out, input, budget);
     out
 }
 
@@ -596,6 +770,15 @@ fn visible_unit_ids(input: &PromptInput, budget: &PromptBudget) -> Vec<usize> {
     render_units(&mut rendered, &input.units, budget.units)
 }
 
+fn visible_anchor_indices(input: &PromptInput, budget: &PromptBudget) -> Vec<usize> {
+    input
+        .anchor_candidates
+        .iter()
+        .take(budget.max_anchor_candidates.min(MAX_ANCHOR_INDICES))
+        .map(|anchor| anchor.index)
+        .collect()
+}
+
 /// Append `s` to `out`, truncated so at most `*remaining` bytes are written, and debit `remaining`.
 /// The single point that enforces the units block's hard byte cap.
 fn push_capped(out: &mut String, remaining: &mut usize, s: &str) {
@@ -718,6 +901,28 @@ fn render_fix_context(out: &mut String, input: &PromptInput, budget: &PromptBudg
     }
 }
 
+fn render_anchor_candidates(out: &mut String, input: &PromptInput, budget: &PromptBudget) {
+    let visible =
+        input.anchor_candidates.iter().take(budget.max_anchor_candidates.min(MAX_ANCHOR_INDICES));
+    let mut rendered_heading = false;
+    for anchor in visible {
+        if !rendered_heading {
+            out.push_str("\nANCHOR CANDIDATES (select only these [A#] indices):\n");
+            rendered_heading = true;
+        }
+        let file = anchor.file.as_deref().unwrap_or("-");
+        let logical = anchor.logical_symbol_id.as_deref().unwrap_or("-");
+        out.push_str(&format!(
+            "  [A{}] {}  {}  (path: {}, symbol: {})\n",
+            anchor.index,
+            bounded_untrusted(&anchor.kind, 40),
+            bounded_untrusted(&anchor.name, 160),
+            bounded_untrusted(file, 240),
+            bounded_untrusted(logical, 80),
+        ));
+    }
+}
+
 /// First 12 characters of a sha for display, bounded and neutralized defensively because the
 /// prompt input boundary is stringly even though real provider SHAs are ASCII hex.
 fn short_sha(sha: &str) -> String {
@@ -738,6 +943,7 @@ const STRUCTURAL_MARKERS: &[&str] = &[
     "REFERENCED ITEMS:",
     "FIX COMMITS:",
     "SYMBOLS DEFINED",
+    "ANCHOR CANDIDATES",
     "DIFF:",
     "[... ",
     // The single-message trust-boundary delimiters — forged copies could prematurely close the
@@ -772,7 +978,9 @@ fn neutralized_len(s: &str) -> usize {
 fn forges_structural_line(line: &str) -> bool {
     let t = line.trim_start();
     STRUCTURAL_MARKERS.iter().any(|m| t.starts_with(m))
-        || (t.starts_with("[U") && t.as_bytes().get(2).is_some_and(u8::is_ascii_digit))
+        || (["[U", "[A"].iter().any(|prefix| {
+            t.starts_with(prefix) && t.as_bytes().get(2).is_some_and(u8::is_ascii_digit)
+        }))
 }
 
 fn bounded_untrusted(s: &str, max_chars: usize) -> String {
@@ -804,8 +1012,8 @@ mod tests {
     use rag_rat_papertrail::OutcomeStatus;
 
     use super::{
-        FixCommit, PartnerThread, PromptBudget, PromptInput, PromptUnit, SymbolContext, Xref,
-        record_schema, render_prompt,
+        AnchorContext, FixCommit, PartnerThread, PromptBudget, PromptInput, PromptUnit,
+        SymbolContext, Xref, record_schema, render_prompt,
     };
 
     fn unit(source: &str, text: &str) -> PromptUnit {
@@ -827,6 +1035,7 @@ mod tests {
             xrefs: vec![],
             fix_commits: vec![],
             symbols: vec![],
+            anchor_candidates: vec![],
             diff: None,
         }
     }
@@ -840,6 +1049,7 @@ mod tests {
             "decision_units": [1],
             "decision": { "chosen": "Guard the render path.", "rejected": [] },
             "outcome_units": [1],
+            "anchor_indices": [],
             "outcome": { "status": "landed", "summary": "The guard landed." }
         })
     }
@@ -849,7 +1059,7 @@ mod tests {
         // Starts at 1; the drain folds it into the record's regeneration hash so a prompt edit
         // re-distills. Bump it (and this expectation) whenever `system.md`/`rules.md`/the schema
         // change in a way that should invalidate existing model output.
-        assert_eq!(super::PROMPT_VERSION, 1);
+        assert_eq!(super::PROMPT_VERSION, 2);
     }
 
     #[test]
@@ -997,6 +1207,35 @@ mod tests {
     }
 
     #[test]
+    fn anchor_candidates_are_bounded_numbered_and_schema_constrained() {
+        let mut input = base_input();
+        input.anchor_candidates = (0..5)
+            .map(|index| AnchorContext {
+                index,
+                kind: "symbol".to_string(),
+                name: format!("symbol_{index}"),
+                file: Some(format!("src/{index}.rs")),
+                logical_symbol_id: Some(format!("sym_{index:x}")),
+            })
+            .collect();
+        let budget = PromptBudget { max_anchor_candidates: 2, ..PromptBudget::default() };
+        let context = super::render_context(&input, &budget);
+        assert!(context.contains("[A0] symbol  symbol_0"));
+        assert!(context.contains("[A1] symbol  symbol_1"));
+        assert!(!context.contains("[A2]"), "candidate block is count-bounded");
+
+        let schema = record_schema(&input, &budget);
+        let indices: Vec<u64> = schema["properties"]["anchor_indices"]["items"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap())
+            .collect();
+        assert_eq!(indices, [0, 1]);
+        assert_eq!(schema["properties"]["anchor_indices"]["maxItems"], 2);
+    }
+
+    #[test]
     fn output_validation_requires_unique_evidence_for_claims_and_nonempty_text() {
         let input = base_input();
         let budget = PromptBudget::default();
@@ -1044,6 +1283,41 @@ mod tests {
                 .contains("must not be empty")
         );
 
+        for markdown in [
+            "# Heading",
+            "- bullet",
+            "-\tbullet",
+            "1. numbered",
+            "**bold**",
+            "_italic_",
+            "Use *italic* text.",
+            "> quoted",
+            ">quoted",
+            ">\tquoted",
+            "[link](https://example.invalid)",
+            "![image](https://example.invalid/image.png)",
+            "~~removed~~",
+            "`an entire formatted sentence`",
+            "unclosed `identifier",
+            "```rust\ncode\n```",
+            "name | value\n--- | ---",
+        ] {
+            let mut record = valid_record();
+            record["root_issue"] = serde_json::json!(markdown);
+            assert!(
+                super::validate_record_output(&record, &input, &budget)
+                    .unwrap_err()
+                    .contains("plain prose"),
+                "reject markdown form {markdown:?}"
+            );
+        }
+        let mut code_identifier = valid_record();
+        code_identifier["root_issue"] = serde_json::json!("Call `foo_bar` with `Vec<T>`.");
+        assert!(
+            super::validate_record_output(&code_identifier, &input, &budget).is_ok(),
+            "inline code identifiers are the one permitted formatting form"
+        );
+
         let mut record = valid_record();
         record["outcome"]["status"] = serde_json::json!("bogus");
         assert!(
@@ -1059,17 +1333,49 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown field")
         );
+
+        let mut input = base_input();
+        input.anchor_candidates = vec![AnchorContext {
+            index: 7,
+            kind: "file".to_string(),
+            name: "src/widget.rs".to_string(),
+            file: Some("src/widget.rs".to_string()),
+            logical_symbol_id: None,
+        }];
+        let mut record = valid_record();
+        record["anchor_indices"] = serde_json::json!(vec![7; super::MAX_ANCHOR_INDICES + 1]);
+        assert!(
+            super::validate_record_output(&record, &input, &budget)
+                .unwrap_err()
+                .contains("exceeds")
+        );
+        record["anchor_indices"] = serde_json::json!([7, 7]);
+        assert!(
+            super::validate_record_output(&record, &input, &budget)
+                .unwrap_err()
+                .contains("duplicate index")
+        );
+        record["anchor_indices"] = serde_json::json!([8]);
+        assert!(
+            super::validate_record_output(&record, &input, &budget)
+                .unwrap_err()
+                .contains("was not rendered")
+        );
     }
 
     #[test]
     fn schema_omits_mechanical_and_absent_fields() {
         let schema = record_schema(&base_input(), &PromptBudget::default());
         let props = schema["properties"].as_object().unwrap();
-        // Anchors + fixing commits are mechanical (#703); no `implementation_delta` column exists;
-        // `epistemic_status` is honest-NULL in v1 — none of these are model-emitted.
-        for absent in ["anchors", "anchor_indices", "implementation_delta", "epistemic_status"] {
+        // Anchor VALUES + fixing commits are mechanical (#703); only candidate indices are emitted.
+        // No `implementation_delta` column exists; `epistemic_status` is honest-NULL in v1.
+        for absent in ["anchors", "implementation_delta", "epistemic_status"] {
             assert!(!props.contains_key(absent), "schema must not ask the model for `{absent}`");
         }
+        assert!(
+            props.contains_key("anchor_indices"),
+            "the model selects mined candidates by index"
+        );
         assert!(
             schema["properties"]["outcome"]["properties"].get("commits").is_none(),
             "outcome.commits is mechanical, never model-emitted"

@@ -2912,8 +2912,7 @@ fn migration_076_adds_sync_security_events() {
 }
 
 #[test]
-fn migration_077_is_the_tip_and_builds_the_distill_record_store() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 77, "move this pin with the next schema migration");
+fn migration_077_builds_the_distill_record_store() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
@@ -3003,4 +3002,151 @@ fn migration_077_is_the_tip_and_builds_the_distill_record_store() {
         )
         .unwrap();
     assert_eq!(v77_recorded, 1, "the forward migration records V077");
+}
+
+#[test]
+fn migration_078_is_the_tip_and_distinguishes_candidates_from_selections() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct UpgradedAnchor {
+        item_key: String,
+        candidate_ordinal: i64,
+        selected: i64,
+        logical_symbol_id: Option<String>,
+        file_path: Option<String>,
+    }
+
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 78, "move this pin with the next schema migration");
+
+    // Exercise the real V077 -> V078 upgrade with existing rows. Row-id order is the deterministic
+    // tie-break within each thread; a second thread starts its own zero-based ordinal sequence.
+    let legacy = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_distill_record_store(&legacy).unwrap();
+    legacy
+        .execute_batch(
+            "
+            INSERT INTO papertrail_distill_anchors
+                (tracker, project, item_kind, item_key, anchor_kind, logical_symbol_id, file_path,
+                 name, resolved, repo_id)
+            VALUES
+                ('github', 'o/r', 'issue', '5', 'file', NULL, 'src/widget.rs',
+                 'src/widget.rs', 1, 'r'),
+                ('github', 'o/r', 'issue', '5', 'symbol', 'sym_3e7', 'src/widget.rs',
+                 'render_widget', 1, 'r'),
+                ('github', 'o/r', 'issue', '6', 'file', NULL, 'src/other.rs',
+                 'src/other.rs', 1, 'r');
+            ",
+        )
+        .unwrap();
+    // Simulate a crash after V078's first ADD COLUMN but before its backfill/index. The migration
+    // must recognize the missing completion index and reconverge rather than keep three ordinal-0
+    // rows and fail unique-index creation forever.
+    legacy
+        .execute_batch(
+            "ALTER TABLE papertrail_distill_anchors ADD COLUMN candidate_ordinal
+                 INTEGER NOT NULL DEFAULT 0 CHECK(candidate_ordinal >= 0);",
+        )
+        .unwrap();
+    schema::apply_distill_anchor_selection(&legacy).unwrap();
+
+    let upgraded: Vec<UpgradedAnchor> = legacy
+        .prepare(
+            "SELECT item_key, candidate_ordinal, selected, logical_symbol_id, file_path
+             FROM papertrail_distill_anchors ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok(UpgradedAnchor {
+                item_key: row.get(0)?,
+                candidate_ordinal: row.get(1)?,
+                selected: row.get(2)?,
+                logical_symbol_id: row.get(3)?,
+                file_path: row.get(4)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        upgraded,
+        vec![
+            UpgradedAnchor {
+                item_key: "5".into(),
+                candidate_ordinal: 0,
+                selected: 0,
+                logical_symbol_id: None,
+                file_path: Some("src/widget.rs".into()),
+            },
+            UpgradedAnchor {
+                item_key: "5".into(),
+                candidate_ordinal: 1,
+                selected: 0,
+                logical_symbol_id: Some("sym_3e7".into()),
+                file_path: Some("src/widget.rs".into()),
+            },
+            UpgradedAnchor {
+                item_key: "6".into(),
+                candidate_ordinal: 0,
+                selected: 0,
+                logical_symbol_id: None,
+                file_path: Some("src/other.rs".into()),
+            },
+        ],
+        "backfill is per-thread, deterministic, unselected, and preserves exact anchors",
+    );
+
+    assert!(
+        legacy
+            .execute_batch(
+                "UPDATE papertrail_distill_anchors SET candidate_ordinal = -1 WHERE id = 1",
+            )
+            .is_err(),
+        "candidate ordinals are non-negative",
+    );
+    assert!(
+        legacy
+            .execute("UPDATE papertrail_distill_anchors SET selected = 2 WHERE id = 1", [])
+            .is_err(),
+        "selected is a checked SQLite boolean",
+    );
+    assert!(
+        legacy
+            .execute(
+                "UPDATE papertrail_distill_anchors SET candidate_ordinal = 0 WHERE id = 2",
+                [],
+            )
+            .is_err(),
+        "candidate ordinals are unique within a thread",
+    );
+    legacy.execute("UPDATE papertrail_distill_anchors SET selected = 1 WHERE id = 2", []).unwrap();
+    schema::apply_distill_anchor_selection(&legacy).unwrap();
+    let selected: i64 = legacy
+        .query_row("SELECT selected FROM papertrail_distill_anchors WHERE id = 2", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(selected, 1, "replaying V078 does not erase a later model selection");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, 78);
+    let v78_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '078_distill_anchor_selection'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(v78_recorded, 1, "the forward migration records V078");
+    for index in
+        ["idx_papertrail_distill_anchors_candidate", "idx_papertrail_distill_anchors_selected"]
+    {
+        let present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "V078 index `{index}` exists");
+    }
 }
