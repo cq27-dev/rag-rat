@@ -585,6 +585,41 @@ pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow:
     Ok(!was_enabled)
 }
 
+pub(crate) fn catch_up_enrolled_device_keys(
+    conn: &Connection,
+    target: rag_rat_oplog::DeviceFingerprint,
+    now_ms: i64,
+) -> anyhow::Result<rag_rat_oplog::CatchUpReport> {
+    let repo_id =
+        memory_repo_scope(conn)?.context("sync catch-up requires an active repo scope")?;
+    if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
+        || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
+    {
+        anyhow::bail!("sync catch-up requires a stable repo identity (not legacy or local-only)");
+    }
+    let stream =
+        rag_rat_oplog::established_owned_stream_v2(conn, &repo_id)?.with_context(|| {
+            format!(
+                "sync catch-up requires an established owner stream for active repo `{repo_id}`"
+            )
+        })?;
+
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        memory_repo_scope(&tx)?.as_deref() == Some(repo_id.as_str()),
+        "active repo scope changed while starting sync catch-up; retry"
+    );
+    anyhow::ensure!(
+        rag_rat_oplog::owned_stream_v2_id(&tx, &repo_id)? == Some(stream),
+        "active repo owner stream changed while starting sync catch-up; retry"
+    );
+    let report =
+        rag_rat_oplog::catch_up_stream_keys_for_device_in_tx(&tx, target, &[stream], now_ms)?;
+    tx.commit()?;
+    Ok(report)
+}
+
 /// Reconcile the ACTIVE repo's owner stream (scope read from the connection) — the idempotent call
 /// every live memory/edge mutation makes before authoring (#532), now self-healing per node/edge (a
 /// ghost row is authored on the next mutation, so no later lifecycle op on it is inert). A no-op on
@@ -1483,6 +1518,58 @@ mod tests {
         .unwrap();
         crate::memory_write::remove_edge(&conn, &edge.edge_key).unwrap();
         assert!(content_suites(&conn).into_iter().all(|suite| suite == 1));
+    }
+
+    #[test]
+    fn catch_up_is_idempotent_for_an_already_covered_effective_device() {
+        let conn = scoped_conn();
+        enable_sealed_authoring(&conn, 1_000).unwrap();
+        let target = rag_rat_oplog::local_device(&conn, 1_000).unwrap().fingerprint();
+
+        let first = catch_up_enrolled_device_keys(&conn, target, 2_000).unwrap();
+        assert!(first.authored.is_empty());
+        assert_eq!(first.already_covered.len(), 1);
+        let second = catch_up_enrolled_device_keys(&conn, target, 3_000).unwrap();
+        assert!(second.authored.is_empty());
+        assert_eq!(second.already_covered, first.already_covered);
+    }
+
+    #[test]
+    fn catch_up_rejects_a_non_effective_target_without_partial_rows() {
+        let conn = scoped_conn();
+        enable_sealed_authoring(&conn, 1_000).unwrap();
+        let before = entry_count(&conn);
+
+        let err = catch_up_enrolled_device_keys(
+            &conn,
+            rag_rat_oplog::DeviceFingerprint::from_bytes([0xff; 32]),
+            2_000,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not currently roster-effective"));
+        assert_eq!(entry_count(&conn), before);
+        let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        assert_eq!(synchronous, 1, "the durability guard restores NORMAL after rollback");
+    }
+
+    #[test]
+    fn catch_up_only_reports_the_active_repos_owner_stream() {
+        let conn = scoped_conn();
+        enable_sealed_authoring(&conn, 1_000).unwrap();
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-b', \
+             'repo-b', 0)",
+            [],
+        )
+        .unwrap();
+        set_scope(&conn, "repo-b");
+        enable_sealed_authoring(&conn, 2_000).unwrap();
+        let target = rag_rat_oplog::local_device(&conn, 2_000).unwrap().fingerprint();
+
+        set_scope(&conn, REPO);
+        let report = catch_up_enrolled_device_keys(&conn, target, 3_000).unwrap();
+        assert!(report.authored.is_empty());
+        assert_eq!(report.already_covered.len(), 1, "repo-b's live key is outside repo-a scope");
     }
 
     #[test]

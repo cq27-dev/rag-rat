@@ -78,8 +78,9 @@ pub use query_api::{
     DatabaseFileHealth, FindClonesOptions, FindClonesResult, FreelistReclaim,
     FreelistReclaimReport, GcReport, GlobalFtsStatus, GlobalStatus, ImportantSymbolsRequest,
     MemoryCounts, MemoryKindCounts, OracleShaSnapshots, PapertrailCursor, RepoContent,
-    RepoFreshness, RepoPapertrail, RepoStatus, RoiFactors, SearchRequest, TextCloneMatch,
-    WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay, reclaim_freelist_at,
+    RepoFreshness, RepoPapertrail, RepoStatus, RoiFactors, SearchRequest, SyncCatchUpReport,
+    TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay,
+    reclaim_freelist_at,
 };
 pub use schema::RegisteredRepo;
 pub(crate) use util::*;

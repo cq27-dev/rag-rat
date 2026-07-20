@@ -116,7 +116,10 @@ pub use content_projection::rebuild_all_content_projections_if_stale;
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
 // — and the only direction of the dependency (`oplog` never depends back on `query::memory`).
 pub use identity::{LocalDevice, load_local_device, local_device};
-pub use op::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
+pub use op::{
+    DeviceFingerprint, EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus,
+    ParseDeviceFingerprintError,
+};
 // The `/1` shadow-projection read seams (`ProjectedState` / `load_projection`) and the
 // standalone (own-txn) `/1` authoring wrappers (`author_batch` / `author_op`) — test-only
 // scaffolding for the retained `/1` store. The live memory path now authors owner-bound `/3`

@@ -3667,6 +3667,7 @@ dependencies = [
  "rag-rat-dream",
  "rag-rat-llm",
  "rag-rat-mcp",
+ "rag-rat-oplog",
  "rag-rat-oracle",
  "rag-rat-papertrail",
  "rag-rat-query",

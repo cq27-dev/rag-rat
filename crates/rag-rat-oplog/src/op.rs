@@ -27,6 +27,9 @@
 //! uses, and is treated as an opaque identity here (its canonical-CBOR form is a separate §5.5
 //! increment).
 
+use std::fmt;
+use std::str::FromStr;
+
 use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
@@ -89,6 +92,28 @@ impl From<String> for EdgeKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceFingerprint([u8; 32]);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseDeviceFingerprintError {
+    Length { actual: usize },
+    InvalidHex { index: usize },
+}
+
+impl fmt::Display for ParseDeviceFingerprintError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Length { actual } => write!(
+                f,
+                "invalid device fingerprint: expected exactly 64 hexadecimal characters, got \
+                 {actual}"
+            ),
+            Self::InvalidHex { index } =>
+                write!(f, "invalid device fingerprint: non-hexadecimal character at byte {index}"),
+        }
+    }
+}
+
+impl std::error::Error for ParseDeviceFingerprintError {}
+
 impl DeviceFingerprint {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -97,6 +122,43 @@ impl DeviceFingerprint {
     /// The raw 32 bytes — the signed entry body encodes the fingerprint verbatim (`super::entry`).
     pub fn to_bytes(self) -> [u8; 32] {
         self.0
+    }
+}
+
+impl FromStr for DeviceFingerprint {
+    type Err = ParseDeviceFingerprintError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 {
+            return Err(ParseDeviceFingerprintError::Length { actual: value.len() });
+        }
+        let mut bytes = [0u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_nibble(pair[0])
+                .ok_or(ParseDeviceFingerprintError::InvalidHex { index: index * 2 })?;
+            let low = hex_nibble(pair[1])
+                .ok_or(ParseDeviceFingerprintError::InvalidHex { index: index * 2 + 1 })?;
+            bytes[index] = high << 4 | low;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Display for DeviceFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -522,6 +584,19 @@ fn decode_opt_str(d: &mut Decoder<'_>) -> Result<Option<String>, CborError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_fingerprint_hex_is_exact_and_canonical() {
+        let expected = DeviceFingerprint::from_bytes([0xab; 32]);
+        assert_eq!(expected.to_string(), "ab".repeat(32));
+        assert_eq!("AB".repeat(32).parse::<DeviceFingerprint>().unwrap(), expected);
+
+        let short = "ab".repeat(31).parse::<DeviceFingerprint>().unwrap_err();
+        assert!(short.to_string().contains("exactly 64 hexadecimal characters"));
+        let malformed = format!("{}az", "ab".repeat(31));
+        let malformed = malformed.parse::<DeviceFingerprint>().unwrap_err();
+        assert!(malformed.to_string().contains("non-hexadecimal character at byte 63"));
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()

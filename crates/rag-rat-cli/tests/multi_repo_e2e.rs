@@ -150,6 +150,52 @@ fn sync_enable_is_narrow_idempotent_and_help_is_honest() {
     assert!(repeated.contains("\"status\": \"already_enabled\""));
 }
 
+#[test]
+fn sync_catch_up_reports_scoped_idempotent_counts_and_clear_input_failures() {
+    let root = keyless_repo("sync-catch-up", &[("lib.rs", "pub fn indexed() {}\n".to_string())]);
+    let data_dir = unique_dir("sync-catch-up-data");
+    let model_cache = unique_dir("sync-catch-up-models");
+    run_ok(&root, &data_dir, &model_cache, &["index"]);
+    run_ok(&root, &data_dir, &model_cache, &["--json", "sync", "enable"]);
+
+    let help = run_ok(&root, &data_dir, &model_cache, &["sync", "catch-up", "--help"]);
+    assert!(help.contains("must already be enrolled and effective"));
+    assert!(help.contains("without rotating"));
+
+    let conn = rusqlite::Connection::open(global_db(&data_dir)).unwrap();
+    let fingerprint: Vec<u8> = conn
+        .query_row("SELECT fingerprint FROM oplog_device_identity WHERE id = 0", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let fingerprint: String = fingerprint.iter().map(|byte| format!("{byte:02x}")).collect();
+
+    let first =
+        run_ok(&root, &data_dir, &model_cache, &["--json", "sync", "catch-up", &fingerprint]);
+    assert!(first.contains("\"required\": 0"));
+    assert!(first.contains("\"already_covered\": 1"));
+    assert!(first.contains("\"authored\": 0"));
+    assert!(first.contains("\"keys_rotated\": false"));
+    assert!(first.contains("\"pairing_performed\": false"));
+    let repeated =
+        run_ok(&root, &data_dir, &model_cache, &["--json", "sync", "catch-up", &fingerprint]);
+    assert!(repeated.contains("\"already_covered\": 1"));
+    assert!(repeated.contains("\"authored\": 0"));
+
+    let malformed = run(&root, &data_dir, &model_cache, &["sync", "catch-up", "not-a-fingerprint"]);
+    assert!(!malformed.status.success());
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr)
+            .contains("invalid device fingerprint: expected exactly 64 hexadecimal characters")
+    );
+    let unknown = "ff".repeat(32);
+    let non_effective = run(&root, &data_dir, &model_cache, &["sync", "catch-up", &unknown]);
+    assert!(!non_effective.status.success());
+    assert!(
+        String::from_utf8_lossy(&non_effective.stderr).contains("not currently roster-effective")
+    );
+}
+
 fn global_db(data_dir: &Path) -> PathBuf {
     data_dir.join("rag-rat.sqlite")
 }

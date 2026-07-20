@@ -30,6 +30,7 @@ toml_edit = "0.25"
 gix.workspace = true
 rag-rat-core = { workspace = true }
 rag-rat-oracle.workspace = true
+rag-rat-oplog.workspace = true
 rag-rat-query.workspace = true
 rag-rat-mcp = { workspace = true }
 serde.workspace = true

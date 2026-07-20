@@ -46,6 +46,7 @@ pub use global_status::{
     RepoFreshness, RepoPapertrail, RepoStatus, WorktreeOverlay,
 };
 pub use importance::ImportantSymbolsRequest;
+pub use memory::SyncCatchUpReport;
 pub use oracle_runs::OracleShaSnapshots;
 pub use search::SearchRequest;
 

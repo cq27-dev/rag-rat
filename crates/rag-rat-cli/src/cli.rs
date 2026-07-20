@@ -193,6 +193,15 @@ pub(crate) struct SyncArgs {
 pub(crate) enum SyncCommand {
     /// Permanently enable sealed authoring for subsequent local memory changes.
     Enable,
+    /// Re-wrap existing live keys to an effective device without rotating them.
+    #[command(long_about = "The target device must already be enrolled and effective. Re-wraps \
+                            existing live keys without rotating them; this does not enroll the \
+                            target or perform transport.")]
+    CatchUp {
+        /// Exact 64-hex-character fingerprint of a device that is already enrolled and effective.
+        #[arg(value_name = "DEVICE_FINGERPRINT")]
+        target: rag_rat_oplog::DeviceFingerprint,
+    },
 }
 
 #[derive(Debug, Args)]

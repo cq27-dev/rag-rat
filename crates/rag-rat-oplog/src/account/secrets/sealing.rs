@@ -119,9 +119,10 @@ pub fn select_current_sealing_wrap(
     Ok(select_from_wraps(&list_accepted_stream_key_wraps(conn, account_id, stream_id)?))
 }
 
-/// Derive every live exact key group for streams currently owned by the local account and classify
-/// whether accepted siblings already cover `target`. The whole read uses the caller's connection
-/// snapshot; callers needing atomic authoring pass their IMMEDIATE transaction.
+/// Derive every live exact key group in the requested streams and classify whether accepted
+/// siblings already cover `target`. Every requested stream must currently be owned by the local
+/// account. The whole read uses the caller's connection snapshot; callers needing atomic authoring
+/// pass their IMMEDIATE transaction.
 ///
 /// Live means either referenced by currently accepted suite-1 content, or selected for current
 /// sealing on an owned stream. This deliberately excludes plaintext content, condemned-only wraps,
@@ -130,6 +131,7 @@ pub fn select_current_sealing_wrap(
 pub fn live_stream_key_targets_for_device(
     conn: &Connection,
     target: crate::op::DeviceFingerprint,
+    streams: &[StreamId],
 ) -> anyhow::Result<LiveKeyTargets> {
     let account_id = bootstrap::local_account_ref(conn)?
         .context("cannot derive stream-key catch-up targets before the local account is minted")?
@@ -144,11 +146,19 @@ pub fn live_stream_key_targets_for_device(
     )?;
     let owned_streams = stmt
         .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|raw| Ok(StreamId::from_bytes(fixed::<32>(&raw)?)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    for stream in streams {
+        anyhow::ensure!(
+            owned_streams.contains(stream),
+            "requested catch-up stream is not currently owned by the local account"
+        );
+    }
 
     let mut live = Vec::new();
-    for raw_stream_id in owned_streams {
-        let stream_id = StreamId::from_bytes(fixed::<32>(&raw_stream_id)?);
+    for stream_id in streams.iter().copied() {
         let wraps = list_accepted_stream_key_wraps(conn, account_id, stream_id)?;
 
         let mut content_stmt = conn.prepare(
@@ -972,7 +982,7 @@ mod tests {
             Some(&condemned_only),
         );
 
-        let targets = live_stream_key_targets_for_device(&conn, founder.fp).unwrap();
+        let targets = live_stream_key_targets_for_device(&conn, founder.fp, &[stream_id]).unwrap();
         assert!(targets.required.is_empty());
         assert_eq!(
             targets.already_covered,
@@ -1059,7 +1069,7 @@ mod tests {
         )
         .unwrap();
 
-        let targets = live_stream_key_targets_for_device(&conn, target.fp).unwrap();
+        let targets = live_stream_key_targets_for_device(&conn, target.fp, &[stream_id]).unwrap();
         assert_eq!(targets.required, vec![LiveKeyEpoch {
             stream_id,
             key_epoch: 0,
@@ -1073,7 +1083,7 @@ mod tests {
             rusqlite::params![account.to_bytes().as_slice(), target.fp.to_bytes().as_slice()],
         )
         .unwrap();
-        assert!(live_stream_key_targets_for_device(&conn, target.fp).is_err());
+        assert!(live_stream_key_targets_for_device(&conn, target.fp, &[stream_id]).is_err());
     }
 
     #[test]

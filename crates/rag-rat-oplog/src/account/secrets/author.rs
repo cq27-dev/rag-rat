@@ -191,8 +191,9 @@ pub fn ensure_stream_key_current_in_tx(
     Ok(RotationOutcome::Rotated(rotate_stream_key_in_tx(tx, stream_id, now_ms)?))
 }
 
-/// Re-wrap every live content key not already available to `target`, inside the caller's IMMEDIATE
-/// transaction. This is same-key fan-out only: it never mints a key, advances an epoch, or invokes
+/// Re-wrap every live content key in `streams` not already available to `target`, inside the
+/// caller's IMMEDIATE transaction. Every requested stream must currently be owned by the local
+/// account. This is same-key fan-out only: it never mints a key, advances an epoch, or invokes
 /// rotation, and acceptance depends only on owner authority rather than local key possession.
 ///
 /// All target/authority reads, exact historical recovery, sealing, inserts, refold, and acceptance
@@ -201,6 +202,7 @@ pub fn ensure_stream_key_current_in_tx(
 pub fn catch_up_stream_keys_for_device_in_tx(
     tx: &Transaction<'_>,
     target: DeviceFingerprint,
+    streams: &[StreamId],
     now_ms: i64,
 ) -> anyhow::Result<CatchUpReport> {
     let LocalAccountRef { account_id, .. } = bootstrap::local_account_ref(tx)?
@@ -214,7 +216,7 @@ pub fn catch_up_stream_keys_for_device_in_tx(
     let target_public = storage::effective_roster_x25519_pubkey(tx, account_id, target)?.context(
         "stream-key catch-up target is not currently roster-effective in the local account",
     )?;
-    let targets = super::sealing::live_stream_key_targets_for_device(tx, target)?;
+    let targets = super::sealing::live_stream_key_targets_for_device(tx, target, streams)?;
 
     let mut authored_wraps = Vec::with_capacity(targets.required.len());
     for live in &targets.required {
@@ -743,7 +745,7 @@ mod tests {
         let member = add_member_device(&conn, account, &member_x);
 
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        let report = catch_up_stream_keys_for_device_in_tx(&tx, member, NOW).unwrap();
+        let report = catch_up_stream_keys_for_device_in_tx(&tx, member, &[stream], NOW).unwrap();
         tx.commit().unwrap();
         assert_eq!(report.authored, vec![
             super::super::sealing::LiveKeyEpoch {
@@ -792,7 +794,7 @@ mod tests {
         assert!(!stream_key_rotation_needed(&conn, account, stream).unwrap());
 
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        let rerun = catch_up_stream_keys_for_device_in_tx(&tx, member, NOW).unwrap();
+        let rerun = catch_up_stream_keys_for_device_in_tx(&tx, member, &[stream], NOW).unwrap();
         tx.commit().unwrap();
         assert!(rerun.authored.is_empty());
         assert_eq!(rerun.already_covered, report.authored);
@@ -858,7 +860,9 @@ mod tests {
             .unwrap();
 
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        assert!(catch_up_stream_keys_for_device_in_tx(&tx, target, NOW).is_err());
+        assert!(
+            catch_up_stream_keys_for_device_in_tx(&tx, target, &[stream_a, stream_b], NOW).is_err()
+        );
         let during: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM account_entries WHERE log_id = ?1",
@@ -931,7 +935,7 @@ mod tests {
             .unwrap();
 
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        let report = catch_up_stream_keys_for_device_in_tx(&tx, target, NOW).unwrap();
+        let report = catch_up_stream_keys_for_device_in_tx(&tx, target, &[stream], NOW).unwrap();
         tx.commit().unwrap();
         assert!(report.authored.is_empty());
         assert_eq!(report.already_covered, vec![super::super::sealing::LiveKeyEpoch {
@@ -966,7 +970,8 @@ mod tests {
         let target = add_member_device(&conn, account, &target_x);
 
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        let report = catch_up_stream_keys_for_device_in_tx(&tx, target, NOW).unwrap();
+        let report =
+            catch_up_stream_keys_for_device_in_tx(&tx, target, &[stream_a, stream_b], NOW).unwrap();
         tx.commit().unwrap();
         assert_eq!(report.authored.len(), 2);
 
@@ -1009,7 +1014,7 @@ mod tests {
         let target_x = DeviceX25519Secret::from_seed(&[0x74; 32]);
         let target = add_member_device(&conn, account, &target_x);
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        let report = catch_up_stream_keys_for_device_in_tx(&tx, target, NOW).unwrap();
+        let report = catch_up_stream_keys_for_device_in_tx(&tx, target, &[stream], NOW).unwrap();
         tx.commit().unwrap();
         assert_eq!(report.authored.len(), 1, "the no-content current key is caught up");
         author_control_op(&conn, account, &AccountOp::DeviceRemove {
@@ -1021,7 +1026,7 @@ mod tests {
         });
 
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        assert!(catch_up_stream_keys_for_device_in_tx(&tx, target, NOW).is_err());
+        assert!(catch_up_stream_keys_for_device_in_tx(&tx, target, &[stream], NOW).is_err());
         tx.rollback().unwrap();
     }
 
@@ -1450,8 +1455,13 @@ mod tests {
         );
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         assert!(
-            catch_up_stream_keys_for_device_in_tx(&tx, owner_b_ed.public().fingerprint(), NOW,)
-                .is_err(),
+            catch_up_stream_keys_for_device_in_tx(
+                &tx,
+                owner_b_ed.public().fingerprint(),
+                &[stream],
+                NOW,
+            )
+            .is_err(),
             "a non-owner cannot author catch-up siblings even when the target is effective",
         );
         tx.rollback().unwrap();

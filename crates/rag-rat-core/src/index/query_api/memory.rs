@@ -3,6 +3,14 @@
 
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncCatchUpReport {
+    pub target: rag_rat_oplog::DeviceFingerprint,
+    pub required: u64,
+    pub already_covered: u64,
+    pub authored: u64,
+}
+
 impl IndexDatabase {
     /// Permanently enable sealed local memory authoring for this repo. Existing suite-0 history is
     /// retained; subsequent live and reconcile entries use suite 1.
@@ -11,6 +19,25 @@ impl IndexDatabase {
             self.storage.connection(),
             rag_rat_base::time::now_ms(),
         )
+    }
+
+    /// Re-wrap the active repo stream's existing live keys to an already-effective enrolled device.
+    /// This authors same-key siblings only; it does not enroll, pair, transport, or rotate keys.
+    pub fn sync_catch_up(
+        &self,
+        target: rag_rat_oplog::DeviceFingerprint,
+    ) -> anyhow::Result<SyncCatchUpReport> {
+        let report = crate::memory_write::catch_up_enrolled_device_keys(
+            self.storage.connection(),
+            target,
+            rag_rat_base::time::now_ms(),
+        )?;
+        Ok(SyncCatchUpReport {
+            target: report.target,
+            required: report.authored.len() as u64,
+            already_covered: report.already_covered.len() as u64,
+            authored: report.authored.len() as u64,
+        })
     }
 
     pub fn memory_create(
