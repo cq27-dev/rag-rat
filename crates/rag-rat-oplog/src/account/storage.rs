@@ -1505,6 +1505,29 @@ pub(super) fn list_effective_roster_x25519_pubkeys(
     Ok(out)
 }
 
+/// The x25519 key certified by the exact enrollment that currently makes `fingerprint`
+/// roster-effective. `None` means the device is not currently effective; rejected and forked
+/// enrollment candidates are never consulted because the lookup follows the projected
+/// `roster_ref` into one accepted entry.
+pub(super) fn effective_roster_x25519_pubkey(
+    conn: &Connection,
+    account_id: AccountId,
+    fingerprint: DeviceFingerprint,
+) -> anyhow::Result<Option<DeviceX25519Public>> {
+    let roster_ref: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT roster_ref FROM account_roster_history
+             WHERE account_id = ?1 AND device_fingerprint = ?2 AND closed_at IS NULL
+             ORDER BY roster_ref LIMIT 1",
+            params![account_id.to_bytes().as_slice(), fingerprint.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    roster_ref
+        .map(|roster_ref| enrollment_x25519(conn, account_id, &fixed(&roster_ref)?, fingerprint))
+        .transpose()
+}
+
 /// The FINGERPRINTS of every roster-effective device on `account_id` — the cheap counterpart to
 /// [`list_effective_roster_x25519_pubkeys`] for a per-seal boolean (the C4.4 rotation-needed
 /// predicate in `secrets::sealing`). `DISTINCT` because one device can key more than one open

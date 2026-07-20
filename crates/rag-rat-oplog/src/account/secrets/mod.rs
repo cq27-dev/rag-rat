@@ -34,7 +34,8 @@ pub(in crate::account) use sealing::accepted_stream_key_wrap_exists_strict;
 // the CLI "what key is current" surface. Nothing calls them in C4.3b (machinery ships one
 // slice ahead of its consumer).
 pub use sealing::{
-    ContentKeyring, SealingKeyOutcome, SelectedWrap, current_sealing_key,
-    historical_content_keyring, select_current_sealing_wrap, stream_key_rotation_needed,
+    ContentKeyring, LiveKeyEpoch, LiveKeyTargets, SealingKeyOutcome, SelectedWrap,
+    current_sealing_key, historical_content_keyring, live_stream_key_targets_for_device,
+    select_current_sealing_wrap, stream_key_rotation_needed,
 };
 pub(in crate::account) use storage::refold_secrets_log;

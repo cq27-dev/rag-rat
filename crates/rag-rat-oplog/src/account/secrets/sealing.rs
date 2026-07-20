@@ -17,7 +17,7 @@ use anyhow::Context;
 use rusqlite::{Connection, params};
 
 use super::super::keywrap::{self, ContentKey, KeyId, WrapContext};
-use super::super::{AccountId, envelope, fold, storage};
+use super::super::{AccountId, bootstrap, content, envelope, fold, storage};
 use super::ops::{self, DecodedSecretsOp, StreamKeyWrap};
 use super::security_event::{self, SyncSecurityEvent, SyncSecurityEventKind};
 use crate::identity::LocalDevice;
@@ -32,6 +32,24 @@ pub struct SelectedWrap {
     pub key_id: KeyId,
     pub key_epoch: u64,
     pub minting_entry_hash: [u8; 32],
+}
+
+/// One exact live content-key group that a newly enrolled device may need. Epoch is part of the
+/// identity because it is authenticated by [`WrapContext`], even when one key id was reused at
+/// multiple epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveKeyEpoch {
+    pub stream_id: StreamId,
+    pub key_epoch: u64,
+    pub key_id: KeyId,
+}
+
+/// Snapshot-derived catch-up targets for one effective device. `required` needs a new same-key
+/// sibling; `already_covered` has at least one accepted sibling naming the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveKeyTargets {
+    pub required: Vec<LiveKeyEpoch>,
+    pub already_covered: Vec<LiveKeyEpoch>,
 }
 
 /// The outcome of resolving the content key a device would seal a stream under right now. Every
@@ -99,6 +117,105 @@ pub fn select_current_sealing_wrap(
     stream_id: StreamId,
 ) -> anyhow::Result<Option<SelectedWrap>> {
     Ok(select_from_wraps(&list_accepted_stream_key_wraps(conn, account_id, stream_id)?))
+}
+
+/// Derive every live exact key group for streams currently owned by the local account and classify
+/// whether accepted siblings already cover `target`. The whole read uses the caller's connection
+/// snapshot; callers needing atomic authoring pass their IMMEDIATE transaction.
+///
+/// Live means either referenced by currently accepted suite-1 content, or selected for current
+/// sealing on an owned stream. This deliberately excludes plaintext content, condemned-only wraps,
+/// and accepted unused loser keys. Target enrollment is resolved through the current authority
+/// projection's exact accepted `roster_ref`; a removed or never-effective target fails.
+pub fn live_stream_key_targets_for_device(
+    conn: &Connection,
+    target: crate::op::DeviceFingerprint,
+) -> anyhow::Result<LiveKeyTargets> {
+    let account_id = bootstrap::local_account_ref(conn)?
+        .context("cannot derive stream-key catch-up targets before the local account is minted")?
+        .account_id;
+    storage::effective_roster_x25519_pubkey(conn, account_id, target)?.context(
+        "stream-key catch-up target is not currently roster-effective in the local account",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT stream_id FROM account_stream_ownership
+         WHERE account_id = ?1 ORDER BY stream_id",
+    )?;
+    let owned_streams = stmt
+        .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut live = Vec::new();
+    for raw_stream_id in owned_streams {
+        let stream_id = StreamId::from_bytes(fixed::<32>(&raw_stream_id)?);
+        let wraps = list_accepted_stream_key_wraps(conn, account_id, stream_id)?;
+
+        let mut content_stmt = conn.prepare(
+            "SELECT signed_bytes FROM content_entries
+             WHERE stream_id = ?1 AND accepted = 1 ORDER BY entry_hash",
+        )?;
+        let content_rows = content_stmt
+            .query_map([stream_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for signed_bytes in content_rows {
+            let signed = content::decode_content_signed(&signed_bytes)
+                .context("stored accepted /3 entry failed to decode while deriving live keys")?;
+            if signed.header.crypto_suite != 1 {
+                continue;
+            }
+            let key_id = KeyId::from_bytes(
+                signed
+                    .header
+                    .key_id
+                    .context("accepted suite-1 /3 entry has no key_id while deriving live keys")?,
+            );
+            live.extend(
+                wraps
+                    .iter()
+                    .filter(|accepted| KeyId::from_bytes(accepted.wrap.key_id) == key_id)
+                    .map(|accepted| LiveKeyEpoch {
+                        stream_id,
+                        key_epoch: accepted.wrap.key_epoch,
+                        key_id,
+                    }),
+            );
+        }
+
+        if let Some(selected) = select_from_wraps(&wraps) {
+            live.push(LiveKeyEpoch {
+                stream_id,
+                key_epoch: selected.key_epoch,
+                key_id: selected.key_id,
+            });
+        }
+    }
+
+    live.sort_by_key(|key| (key.stream_id.to_bytes(), key.key_epoch, key.key_id.to_bytes()));
+    live.dedup();
+
+    let mut required = Vec::new();
+    let mut already_covered = Vec::new();
+    for key in live {
+        let covered = list_accepted_stream_key_wraps(conn, account_id, key.stream_id)?
+            .iter()
+            .filter(|accepted| {
+                accepted.wrap.key_epoch == key.key_epoch
+                    && KeyId::from_bytes(accepted.wrap.key_id) == key.key_id
+            })
+            .flat_map(|accepted| &accepted.wrap.wraps)
+            .any(|wrap| wrap.recipient_fp == target);
+        if covered {
+            already_covered.push(key);
+        } else {
+            required.push(key);
+        }
+    }
+    Ok(LiveKeyTargets { required, already_covered })
+}
+
+fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
+    bytes.try_into().map_err(|_| anyhow::anyhow!("stored blob is {} bytes, not {N}", bytes.len()))
 }
 
 /// Whether an accepted `StreamKeyWrap` exists for `stream_id`. Unlike local key recovery, this is
@@ -412,8 +529,12 @@ mod tests {
         DecodedSecretsOp, StreamKeyWrap, WrapEntry, decode, entry_type as secrets_entry_type,
     };
     use super::{
-        SealingKeyOutcome, SelectedWrap, current_sealing_key, historical_content_keyring,
+        LiveKeyEpoch, SealingKeyOutcome, SelectedWrap, current_sealing_key,
+        historical_content_keyring, live_stream_key_targets_for_device,
         select_current_sealing_wrap, stream_key_rotation_needed,
+    };
+    use crate::account::content::{
+        ContentEntryHeader, sign_content_entry, sign_sealed_content_entry,
     };
     use crate::account::cut::Cut;
     use crate::account::envelope::{AccountEntryHeader, sign_account_entry};
@@ -427,7 +548,7 @@ mod tests {
     };
     use crate::device::{DeviceSecret, DeviceX25519Public, DeviceX25519Secret};
     use crate::identity::local_device;
-    use crate::op::DeviceFingerprint;
+    use crate::op::{self, DeviceFingerprint, MemoryOp};
     use crate::stream::{self, StreamId, StreamSpec, StreamSpecV2};
 
     const NOW: i64 = 1_700_000_000_000;
@@ -619,6 +740,67 @@ mod tests {
         account_ingest(conn, bytes, NOW).unwrap()
     }
 
+    fn mark_as_local_account(conn: &Connection, genesis_hash: [u8; 32]) {
+        conn.execute(
+            "INSERT INTO oplog_local_account(id, genesis_entry_hash, created_at_ms)
+             VALUES(0, ?1, ?2)",
+            rusqlite::params![genesis_hash.as_slice(), NOW],
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_accepted_content(
+        conn: &Connection,
+        account: AccountId,
+        stream: StreamId,
+        author: &Dev,
+        roster_ref: [u8; 32],
+        seq: u64,
+        key: Option<&ContentKey>,
+    ) {
+        let header = ContentEntryHeader {
+            stream_id: stream,
+            author_account_id: account,
+            device_fingerprint: author.fp,
+            seq,
+            lamport: seq,
+            prev_hash: (seq != 0).then_some([seq as u8; 32]),
+            grant_id: None,
+            roster_ref,
+            owner_auth_len: 0,
+            author_auth_len: 0,
+            crypto_suite: 0,
+            key_id: None,
+        };
+        let payload = op::encode(&MemoryOp::Snapshot);
+        let signed = match key {
+            Some(key) =>
+                sign_sealed_content_entry(&author.secret, &header, &payload, key, [seq as u8; 24])
+                    .unwrap(),
+            None => sign_content_entry(&author.secret, &header, &payload).unwrap(),
+        };
+        conn.execute(
+            "INSERT INTO content_entries(
+                 entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?7, 1, ?8, ?9)",
+            rusqlite::params![
+                signed.entry_hash.as_slice(),
+                stream.to_bytes().as_slice(),
+                account.to_bytes().as_slice(),
+                author.fp.to_bytes().as_slice(),
+                seq.to_be_bytes().as_slice(),
+                roster_ref.as_slice(),
+                0u64.to_be_bytes().as_slice(),
+                signed.signed_bytes,
+                NOW,
+            ],
+        )
+        .unwrap();
+    }
+
     fn security_event_count(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM sync_security_events", [], |row| row.get(0)).unwrap()
     }
@@ -691,6 +873,191 @@ mod tests {
         assert_eq!(key.key_id(), selected.key_id, "the recovered key matches the selected key_id");
         assert_eq!(selected.key_epoch, 0, "the initial mint is epoch 0");
         assert_eq!(security_event_count(&conn), 0, "an honest mint records no security events");
+    }
+
+    #[test]
+    fn live_key_targets_include_referenced_history_and_no_content_current_only() {
+        let conn = db();
+        let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
+        mark_as_local_account(&conn, genesis_hash);
+        let historical = ContentKey::from_seed(&[0x30; 32]);
+        let unused = ContentKey::from_seed(&[0x31; 32]);
+        let current = ContentKey::from_seed(&[0x32; 32]);
+        let same_epoch_other = ContentKey::from_seed(&[0x33; 32]);
+        let condemned_only = ContentKey::from_seed(&[0x34; 32]);
+        let keys = [(&historical, 0), (&unused, 1), (&same_epoch_other, 0), (&current, 2)];
+        let mut prev = None;
+        for (seq, (key, epoch)) in keys.into_iter().enumerate() {
+            let wrap = honest_wrap(
+                account,
+                stream_id,
+                founder.fp,
+                &DeviceX25519Public::from_bytes(&founder.x).unwrap(),
+                key,
+                epoch,
+            );
+            let (bytes, hash) =
+                wrap_entry(account, &founder, seq as u64, prev, Some(genesis_hash), &wrap);
+            ingest(&conn, &bytes);
+            prev = Some(hash);
+        }
+        insert_accepted_content(
+            &conn,
+            account,
+            stream_id,
+            &founder,
+            genesis_hash,
+            0,
+            Some(&historical),
+        );
+        insert_accepted_content(
+            &conn,
+            account,
+            stream_id,
+            &founder,
+            genesis_hash,
+            1,
+            Some(&same_epoch_other),
+        );
+        insert_accepted_content(&conn, account, stream_id, &founder, genesis_hash, 2, None);
+        let condemned_wrap = honest_wrap(
+            account,
+            stream_id,
+            founder.fp,
+            &DeviceX25519Public::from_bytes(&founder.x).unwrap(),
+            &condemned_only,
+            9,
+        );
+        let (condemned_bytes, condemned_hash) =
+            wrap_entry(account, &founder, 99, prev, Some(genesis_hash), &condemned_wrap);
+        conn.execute(
+            "INSERT INTO account_entries(entry_hash, account_id, log_id, device_fingerprint, seq,
+                 prev_hash, parent_ref, authority_ref, entry_type, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, 1, ?3, 99, ?4, NULL, NULL, ?5, 0, ?6, ?7)",
+            rusqlite::params![
+                condemned_hash.as_slice(),
+                account.to_bytes().as_slice(),
+                founder.fp.to_bytes().as_slice(),
+                prev.unwrap().as_slice(),
+                secrets_entry_type::STREAM_KEY_WRAP,
+                condemned_bytes,
+                NOW,
+            ],
+        )
+        .unwrap();
+        insert_accepted_content(
+            &conn,
+            account,
+            stream_id,
+            &founder,
+            genesis_hash,
+            3,
+            Some(&condemned_only),
+        );
+
+        let targets = live_stream_key_targets_for_device(&conn, founder.fp).unwrap();
+        assert!(targets.required.is_empty());
+        assert_eq!(
+            targets.already_covered,
+            vec![
+                LiveKeyEpoch { stream_id, key_epoch: 0, key_id: historical.key_id() },
+                LiveKeyEpoch { stream_id, key_epoch: 0, key_id: same_epoch_other.key_id() },
+                LiveKeyEpoch { stream_id, key_epoch: 2, key_id: current.key_id() },
+            ],
+            "referenced same-epoch ids and the no-content current key are live; plaintext and the \
+             unused loser are not",
+        );
+    }
+
+    #[test]
+    fn live_key_targets_require_an_effective_target_and_union_sibling_coverage() {
+        let conn = db();
+        let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
+        mark_as_local_account(&conn, genesis_hash);
+        let target = Dev::new(9);
+        let mut shadow = Dev::new(9);
+        shadow.x = Dev::new(10).x;
+        let key = ContentKey::from_seed(&[0x40; 32]);
+        let founder_x = DeviceX25519Public::from_bytes(&founder.x).unwrap();
+        let first = honest_wrap(account, stream_id, founder.fp, &founder_x, &key, 0);
+        let (first_bytes, first_hash) =
+            wrap_entry(account, &founder, 0, None, Some(genesis_hash), &first);
+        ingest(&conn, &first_bytes);
+
+        let (add_bytes, add_hash) = control_op(
+            account,
+            &founder,
+            2,
+            Some(first_hash),
+            Some(genesis_hash),
+            &device_add(&target, DeviceRole::Member),
+        );
+        // The read follows the effective projection's exact enrollment ref. A same-fingerprint
+        // decoy candidate is irrelevant because it is not the projected roster_ref.
+        conn.execute(
+            "INSERT INTO account_entries(entry_hash, account_id, log_id, device_fingerprint, seq,
+                 prev_hash, parent_ref, authority_ref, entry_type, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, 0, ?3, 2, NULL, NULL, NULL, 2, 0, ?4, ?5)",
+            rusqlite::params![
+                add_hash.as_slice(),
+                account.to_bytes().as_slice(),
+                founder.fp.to_bytes().as_slice(),
+                add_bytes,
+                NOW,
+            ],
+        )
+        .unwrap();
+        let (shadow_bytes, shadow_hash) = control_op(
+            account,
+            &founder,
+            3,
+            Some(add_hash),
+            Some(genesis_hash),
+            &device_add(&shadow, DeviceRole::Member),
+        );
+        conn.execute(
+            "INSERT INTO account_entries(entry_hash, account_id, log_id, device_fingerprint, seq,
+                 prev_hash, parent_ref, authority_ref, entry_type, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, 0, ?3, 3, NULL, NULL, NULL, 2, 0, ?4, ?5)",
+            rusqlite::params![
+                shadow_hash.as_slice(),
+                account.to_bytes().as_slice(),
+                founder.fp.to_bytes().as_slice(),
+                shadow_bytes,
+                NOW,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_roster_history(
+                 account_id, device_fingerprint, role, roster_ref, effective_at, closed_at)
+             VALUES(?1, ?2, 'member', ?3, 3, NULL)",
+            rusqlite::params![
+                account.to_bytes().as_slice(),
+                target.fp.to_bytes().as_slice(),
+                add_hash.as_slice(),
+            ],
+        )
+        .unwrap();
+
+        let targets = live_stream_key_targets_for_device(&conn, target.fp).unwrap();
+        assert_eq!(targets.required, vec![LiveKeyEpoch {
+            stream_id,
+            key_epoch: 0,
+            key_id: key.key_id()
+        }]);
+        assert!(targets.already_covered.is_empty());
+
+        conn.execute(
+            "UPDATE account_roster_history SET closed_at = 4
+             WHERE account_id = ?1 AND device_fingerprint = ?2",
+            rusqlite::params![account.to_bytes().as_slice(), target.fp.to_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(live_stream_key_targets_for_device(&conn, target.fp).is_err());
     }
 
     #[test]
