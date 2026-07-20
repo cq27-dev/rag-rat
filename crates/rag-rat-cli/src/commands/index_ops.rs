@@ -13,7 +13,9 @@ use crate::commands::output_format;
 use crate::render::{
     print_output, print_reconcile_plan, render_index_progress, render_reconcile_progress,
 };
-use crate::{DEFAULT_MAINTENANCE_SECONDS, open_index};
+use crate::{
+    DEFAULT_MAINTENANCE_SECONDS, acquire_cli_write_lock, open_index, report_pending_schema_upgrade,
+};
 
 pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     // The empty-index refusal is enforced ONCE, in the core `rebuild_with_progress` (#427); the CLI
@@ -35,8 +37,8 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     // Serialize with the background watcher / other writers OF THIS REPO (busy_timeout backstops
     // any heal on the query path). The write lock is per-repo (A6), so a rebuild here never
     // blocks an unrelated repo's writer in a shared global DB.
-    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
-    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let _lock = acquire_cli_write_lock(config, "index")?;
+    report_pending_schema_upgrade("index", config);
     // `--worktree`: index a linked worktree's branch overlay on top of the existing base index
     // (#219). A distinct mode — the delta vs the base, not a base (re)build — so handle it before
     // the full/discover/changed branches.

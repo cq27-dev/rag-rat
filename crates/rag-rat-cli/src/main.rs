@@ -143,9 +143,8 @@ fn main() -> anyhow::Result<()> {
             // abandoned, not in-progress — and every rebuild entry now takes the flock
             // too (batch 6), so a gc racing a mid-flight rebuild serializes with it
             // instead of sweeping the staged generation out from under it.
-            let lock_repo = rag_rat_base::locks::write_lock_repo_id(&config);
-            let _lock =
-                rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+            let _lock = acquire_cli_write_lock(&config, "gc")?;
+            report_pending_schema_upgrade("gc", &config);
             let db = open_index(&config)?;
             print_output(&db.garbage_collect()?)?;
         },
@@ -591,6 +590,44 @@ pub(crate) fn ensure_index_exists(config: &Config) -> anyhow::Result<()> {
 pub(crate) fn open_index(config: &Config) -> anyhow::Result<IndexDatabase> {
     ensure_index_exists(config)?;
     IndexDatabase::open_config(config)
+}
+
+/// Tell an interactive CLI user about the potentially long, one-time work that otherwise happens
+/// before a command can emit its normal progress. Best-effort: the real open still owns validation
+/// and error reporting, so a diagnostic probe must never make an otherwise-valid command fail.
+pub(crate) fn report_pending_schema_upgrade(operation: &str, config: &Config) {
+    // `migration_check` opens read-write and would create an absent DB. Leave first-time `index`
+    // creation to the rebuild path, which owns its empty-index checks and lock ordering.
+    if !config.database.exists() {
+        return;
+    }
+    let Ok(status) = IndexDatabase::migration_check(&config.database) else {
+        return;
+    };
+    if status.state == rag_rat_db::schema::SchemaState::Older {
+        eprintln!(
+            "{operation}: shared index schema upgrade v{} -> v{} required (may wait for another \
+             upgrader; large indexes may take several minutes)",
+            status.current_version, status.latest_version
+        );
+    }
+}
+
+/// Acquire a CLI writer lock without looking hung when a watcher or another command owns it.
+pub(crate) fn acquire_cli_write_lock(
+    config: &Config,
+    operation: &str,
+) -> anyhow::Result<rag_rat_base::locks::WriteLock> {
+    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
+    if let Some(lock) = rag_rat_base::locks::WriteLock::acquire_timeout(
+        &config.database,
+        &lock_repo,
+        std::time::Duration::from_millis(250),
+    )? {
+        return Ok(lock);
+    }
+    eprintln!("{operation}: waiting for another rag-rat writer to finish");
+    rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)
 }
 
 pub(crate) const MANAGED_HOOKS: &[&str] =
