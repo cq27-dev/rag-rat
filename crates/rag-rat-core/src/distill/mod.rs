@@ -10,21 +10,18 @@
 //! share).
 
 mod candidates;
+mod drain;
 mod extract;
-// Registered ahead of the separate queue-drain slice, which will consume this contract.
+// Stable rung tokens are also the durable run-column vocabulary; not every conversion is needed by
+// the runtime yet, but the round-trip contract remains tested.
 #[allow(dead_code)]
 mod output;
 mod prompts;
-#[allow(dead_code)] // Curated seam for the separate queue-drain slice.
 mod run_stats;
 mod units;
 mod validate;
 
+pub use drain::DistillDrainReport;
+pub(crate) use drain::{drain, pending_count};
 pub use extract::ExtractReport;
 pub(crate) use extract::{enqueue_eligible, extract};
-// This is the curated crate-internal seam for the separate queue-drain slice.
-#[allow(unused_imports)]
-pub(crate) use output::{
-    CitationId, DecisionOutput, LadderFailure, LadderResult, LadderStats, OutcomeOutput,
-    OutputRung, RecordOutput, RejectedAlternativeOutput, run_output_ladder,
-};

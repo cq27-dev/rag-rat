@@ -327,6 +327,14 @@ pub fn papertrail_marker_lock_path(database: &Path, repo_id: &str) -> PathBuf {
         .join(format!("rag-rat-papertrail-{}.pending.lock", lock_discriminator(repo_id)))
 }
 
+/// Per-DB, PER-REPO distill drain flight lock, held across one whole model-bound drain including
+/// ephemeral provisioning and inference. Separate from [`write_lock_path`]: the ordinary write
+/// lock covers only short extraction, preparation, and per-result persistence phases, so a model
+/// call never blocks unrelated repo writers.
+pub fn distill_lock_path(database: &Path, repo_id: &str) -> PathBuf {
+    lock_dir(database).join(format!("rag-rat-distill-{}.lock", lock_discriminator(repo_id)))
+}
+
 /// Per-DB, PER-REPO edit-driven reindex flight lock (#661), held by the one detached
 /// `rag-rat edit-reindex` runner for its whole scoped pass so a burst of PostToolUse edit hooks
 /// coalesces into a single scoped reindex instead of N serialized multi-second processes. Keyed by
@@ -810,6 +818,18 @@ mod tests {
         assert!(schema_lock_path(db).to_string_lossy().ends_with("rag-rat-schema.lock"));
         // A `local:`-prefixed id sanitizes to alphanumerics (the `:` is dropped), still per-repo.
         assert_eq!(write_lock_path(db, "local:abcdef01"), write_lock_path(db, "local:abcdef01"));
+    }
+
+    #[test]
+    fn distill_flight_lock_path_is_per_repo_and_distinct_from_sibling_locks() {
+        let db = Path::new("/repo/.rag-rat/index.sqlite");
+        let distill = distill_lock_path(db, "aaaa11112222");
+        assert_ne!(distill, distill_lock_path(db, "bbbb33334444"));
+        assert_eq!(distill, distill_lock_path(db, "aaaa11112222"));
+        assert!(distill.to_string_lossy().ends_with("rag-rat-distill-aaaa11112222.lock"));
+        assert_ne!(distill, write_lock_path(db, "aaaa11112222"));
+        assert_ne!(distill, papertrail_lock_path(db, "aaaa11112222"));
+        assert_ne!(distill, edit_reindex_lock_path(db, "aaaa11112222"));
     }
 
     #[cfg(unix)]

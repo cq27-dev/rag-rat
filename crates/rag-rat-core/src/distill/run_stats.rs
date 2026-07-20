@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, params};
 
-use super::LadderStats;
+use super::output::LadderStats;
 
 /// Persist one completed run. `rung_guided` is cumulative (every thread starts guided); the other
 /// rung counters plus `failed` are mutually exclusive terminal outcomes.
@@ -57,7 +57,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::record_distill_run;
-    use crate::distill::LadderStats;
+    use crate::distill::output::LadderStats;
 
     fn fixture() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

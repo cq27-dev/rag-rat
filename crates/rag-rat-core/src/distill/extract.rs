@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::distill::candidates::{self, AnchorCaps};
-use crate::distill::{units, validate};
+use crate::distill::{prompts, units, validate};
 
 /// Bumped whenever the extraction/prompt contract changes in a way that invalidates existing
 /// records — part of the regeneration identity alongside `distill_input_hash`.
@@ -538,22 +538,29 @@ fn write_record(
         anchors: &anchors,
     });
 
-    // Record state drives model-invalidation + enqueue: a New or Regenerated record is enqueued for
-    // #704; an Unchanged one is NOT (re-enqueuing after a drain would re-pay the LLM cost). On
-    // regeneration the model columns + model junctions (evidence, alternatives) are cleared so a
-    // consumer never sees an old decision/outcome pinned to new input; an identical rerun preserves
-    // the model's work.
+    // Record state drives model invalidation + enqueue. New/regenerated records need inference; an
+    // unchanged record keeps its result unless the prompt contract changed. Input or prompt changes
+    // clear every model-owned field before requeueing so stale findings never remain visible.
     let state = record_state(conn, repo_id, plan, &input_hash, opts.pipeline_version)?;
     let regenerated = state == RecordState::Regenerated;
+    let prompt_changed = state == RecordState::Unchanged
+        && match stored_prompt_version(conn, repo_id, plan)? {
+            Some(version) => version != prompts::PROMPT_VERSION,
+            // A queued NULL-stamped row is pending or previously failed, not legacy completed
+            // output. Preserve its attempt diagnostics; the drain always renders the current
+            // prompt. A NULL-stamped row with no queue entry needs recovery/reprocessing.
+            None => !queue_entry_exists(conn, repo_id, plan)?,
+        };
+    let invalidate_model = regenerated || prompt_changed;
 
     // --- Persist: rebuild this thread's mechanical junctions, upsert the skeleton row (clearing
     // model columns on regeneration), rewrite junctions, queue.
     let rebuild_anchor_candidates = state != RecordState::Unchanged;
     clear_mechanical_junctions(conn, repo_id, plan, rebuild_anchor_candidates)?;
-    if regenerated {
+    if invalidate_model {
         clear_model_junctions(conn, repo_id, plan)?;
     }
-    upsert_skeleton(conn, repo_id, now, opts, plan, regenerated, &SkeletonFacets {
+    upsert_skeleton(conn, repo_id, now, opts, plan, invalidate_model, &SkeletonFacets {
         input_hash: &input_hash,
         fix_edge_source: plan.fix_edge_source,
         anchors_qualified,
@@ -569,12 +576,39 @@ fn write_record(
     if rebuild_anchor_candidates {
         write_anchors(conn, repo_id, plan, &anchors)?;
     }
-    let queued = if matches!(state, RecordState::New | RecordState::Regenerated) {
-        enqueue_one(conn, repo_id, now, item, regenerated)?
+    let queued = if matches!(state, RecordState::New | RecordState::Regenerated) || prompt_changed {
+        enqueue_one(conn, repo_id, now, item, invalidate_model)?
     } else {
         0
     };
     Ok(WriteOutcome { queued, mechanical_status })
+}
+
+fn stored_prompt_version(
+    conn: &Connection,
+    repo_id: &str,
+    plan: &RecordPlan,
+) -> anyhow::Result<Option<u32>> {
+    let version = conn.query_row(
+        "SELECT prompt_version FROM papertrail_distill
+         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
+        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    version.map(u32::try_from).transpose().map_err(Into::into)
+}
+
+fn queue_entry_exists(conn: &Connection, repo_id: &str, plan: &RecordPlan) -> anyhow::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM papertrail_distill_queue
+             WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3
+               AND item_kind = ?4 AND item_key = ?5
+         )",
+        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 /// Everything that folds into a record's regeneration identity.
@@ -1159,13 +1193,13 @@ fn upsert_skeleton(
     now: i64,
     opts: &ExtractOptions,
     plan: &RecordPlan,
-    regenerated: bool,
+    invalidate_model: bool,
     facets: &SkeletonFacets<'_>,
 ) -> anyhow::Result<()> {
     // A fresh row inserts the model columns as NULL (honest nulls) for #704 to fill on this natural
     // key. On conflict the mechanical facets are always (re)written; the model columns are
-    // PRESERVED for an identical rerun and NULLED when the input regenerated (`?14`), so a
-    // stale decision/ outcome never rides new input.
+    // PRESERVED for an identical rerun and NULLED when input or prompt identity changed (`?14`), so
+    // a stale decision/outcome never rides current model inputs.
     conn.execute(
         "INSERT INTO papertrail_distill
              (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
@@ -1210,7 +1244,7 @@ fn upsert_skeleton(
             facets.closing_keyword,
             now,
             repo_id,
-            regenerated,
+            invalidate_model,
         ],
     )?;
     Ok(())
@@ -1250,9 +1284,9 @@ fn clear_mechanical_junctions(
     Ok(())
 }
 
-/// Clear the MODEL junctions (#704 output: evidence units and rejected alternatives) — only on
-/// regeneration, so an identical rerun keeps the model's work but a changed input never leaves
-/// stale evidence pinned to a fresh record.
+/// Clear model-owned junction state when extraction or prompt identity changes. An identical rerun
+/// keeps the model's work; a requeued record exposes no stale evidence, alternatives, or
+/// selections.
 fn clear_model_junctions(
     conn: &Connection,
     repo_id: &str,
@@ -1267,6 +1301,11 @@ fn clear_model_junctions(
             params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
         )?;
     }
+    conn.execute(
+        "UPDATE papertrail_distill_anchors SET selected = 0
+         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
+        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+    )?;
     Ok(())
 }
 
@@ -2457,6 +2496,11 @@ mod tests {
         seed_commit(&conn, "repoA", "cafe", "refactor: x");
         extract(&conn, None, &ExtractOptions::default()).unwrap();
         // Simulate the #704 drain removing the completed queue row.
+        conn.execute(
+            "UPDATE papertrail_distill SET prompt_version = ?1, model_input_hash = 'sha256:model'",
+            [i64::from(crate::distill::prompts::PROMPT_VERSION)],
+        )
+        .unwrap();
         conn.execute("DELETE FROM papertrail_distill_queue", []).unwrap();
         // An identical re-extract must NOT re-enqueue the completed, unchanged record.
         extract(&conn, None, &ExtractOptions::default()).unwrap();
@@ -2464,6 +2508,41 @@ mod tests {
             distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_queue"),
             0,
             "an unchanged record is not re-queued after a drain",
+        );
+    }
+
+    #[test]
+    fn a_prompt_version_change_invalidates_model_output_and_requeues() {
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "change_request", "9", "A PR.", "merged", Some("cafe"));
+        seed_commit(&conn, "repoA", "cafe", "refactor: x");
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        conn.execute_batch(
+            "UPDATE papertrail_distill SET
+                 root_cause = 'old result', prompt_version = 0, model_input_hash = 'sha256:old';
+             UPDATE papertrail_distill_anchors SET selected = 1;
+             DELETE FROM papertrail_distill_queue;",
+        )
+        .unwrap();
+
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+
+        let row: (Option<String>, Option<i64>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT root_cause, prompt_version, model_input_hash,
+                        (SELECT COUNT(*) FROM papertrail_distill_queue)
+                 FROM papertrail_distill WHERE repo_id = 'repoA' AND item_key = '9'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, None, 1));
+        assert_eq!(
+            distill_count(
+                &conn,
+                "SELECT COUNT(*) FROM papertrail_distill_anchors WHERE selected=1"
+            ),
+            0,
         );
     }
 
@@ -2669,6 +2748,33 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_pending_work_preserves_failure_attempt_state() {
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "change_request", "9", "A PR.", "merged", Some("cafe"));
+        seed_commit(&conn, "repoA", "cafe", "feat: x");
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        conn.execute(
+            "UPDATE papertrail_distill_queue
+             SET attempts = 2, last_error = 'bad reply', raw_reply = 'raw', enqueued_at_ms = 7
+             WHERE item_key = '9'",
+            [],
+        )
+        .unwrap();
+
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+
+        let row: (i64, Option<String>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT attempts, last_error, raw_reply, enqueued_at_ms
+                 FROM papertrail_distill_queue WHERE item_key = '9'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (2, Some("bad reply".into()), Some("raw".into()), 7));
+    }
+
+    #[test]
     fn regeneration_clears_stale_model_output_but_an_identical_rerun_preserves_it() {
         let conn = scoped_conn("repoA");
         seed_item(&conn, "repoA", "change_request", "9", "A PR body.", "merged", Some("cafe"));
@@ -2678,9 +2784,9 @@ mod tests {
         // Simulate the #704 pass filling model columns + model junctions on this record.
         conn.execute(
             "UPDATE papertrail_distill SET root_cause='the cause', outcome_status_model='landed',
-                 quotes_materialized=3, prompt_version=7, model_input_hash='sha256:model'
+                 quotes_materialized=3, prompt_version=?1, model_input_hash='sha256:model'
              WHERE item_key='9'",
-            [],
+            [i64::from(crate::distill::prompts::PROMPT_VERSION)],
         )
         .unwrap();
         conn.execute(
@@ -2724,7 +2830,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(stamps, (Some(7), Some("sha256:model".into())));
+        assert_eq!(
+            stamps,
+            (Some(i64::from(crate::distill::prompts::PROMPT_VERSION)), Some("sha256:model".into()))
+        );
         assert_eq!(distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_evidence"), 1);
         assert_eq!(
             distill_count(

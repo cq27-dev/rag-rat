@@ -732,6 +732,12 @@ pub(crate) enum DistillCommand {
     /// Run the deterministic extraction pass over the mirror: skeleton records, fixing commits,
     /// coalesced edges, anchor candidates, and the distill queue (model columns left for #704).
     Extract,
+    /// Run deterministic extraction, then drain prepared snapshots through the configured model.
+    Drain {
+        /// Maximum prepared threads to process in this run.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -873,6 +879,32 @@ mod tests {
             },
             other => panic!("expected hooks, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn distill_drain_limit_defaults_to_twenty_and_accepts_an_override() {
+        let default = Cli::try_parse_from(["rag-rat", "distill", "drain"]).expect("parse");
+        match default.command {
+            Command::Distill(DistillArgs { command: DistillCommand::Drain { limit } }) => {
+                assert_eq!(limit, 20);
+            },
+            other => panic!("expected distill drain, got {other:?}"),
+        }
+
+        let overridden =
+            Cli::try_parse_from(["rag-rat", "distill", "drain", "--limit", "7"]).expect("parse");
+        match overridden.command {
+            Command::Distill(DistillArgs { command: DistillCommand::Drain { limit } }) => {
+                assert_eq!(limit, 7);
+            },
+            other => panic!("expected distill drain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distill_drain_rejects_a_zero_limit() {
+        let err = Cli::try_parse_from(["rag-rat", "distill", "drain", "--limit", "0"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
