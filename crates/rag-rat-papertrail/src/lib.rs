@@ -6,6 +6,8 @@
 
 mod api;
 mod distill;
+mod distill_read;
+mod distill_status;
 mod evidence;
 mod github;
 mod gitlab;
@@ -25,6 +27,10 @@ pub use api::{sync_from_refs, sync_from_refs_with_progress, *};
 pub use distill::{
     AnchorKind, DistillEdgeKind, EpistemicStatus, FixEdgeSource, OutcomeStatus, ThreadShape,
 };
+pub use distill_read::{
+    CoalescedThread, DistilledRecord, RecordKey, RejectedAlternative, distilled_record_for_thread,
+};
+pub use distill_status::{EffectiveStatusInputs, effective_status, no_fix_edge};
 pub use evidence::{refs, *};
 pub(crate) use github::*;
 pub(crate) use gitlab::*;

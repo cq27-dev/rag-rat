@@ -546,13 +546,15 @@ fn write_record(
 
     let thread_shape = validate::classify_thread_shape(total_comments, review_comments, body_len);
 
-    // The mechanical effective status (model absent) — a floors-only preview for the report.
-    let mechanical_status = validate::effective_status(&validate::EffectiveStatusInputs {
-        revert_override,
-        closing_keyword: closing_keyword.is_some(),
-        fix_edge_source: plan.fix_edge_source,
-        model_status: None,
-    });
+    // The mechanical effective status (model absent) — a floors-only preview for the report. The
+    // resolver lives in the read layer (`rag_rat_papertrail`, #705); extraction reuses it here.
+    let mechanical_status =
+        rag_rat_papertrail::effective_status(&rag_rat_papertrail::EffectiveStatusInputs {
+            revert_override,
+            closing_keyword: closing_keyword.is_some(),
+            fix_edge_source: plan.fix_edge_source,
+            model_status: None,
+        });
 
     let input_hash = compute_input_hash(&HashInputs {
         pipeline_version: opts.pipeline_version,

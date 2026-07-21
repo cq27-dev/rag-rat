@@ -1,15 +1,13 @@
 //! Mechanical status floors and provenance checks for distilled records (#703).
 //!
-//! Every function here is PURE and deterministic — no DB, no model. The floors are the guardrails
-//! that keep a model's outcome/decision claims honest: the EFFECTIVE outcome status is computed
-//! from mechanical facts (was it reverted? does a closing keyword link the fix? is there any fix
-//! edge at all?) with fixed precedence, so the model can never over-claim "landed" on a thread that
-//! has no landing evidence. Phase 1 computes the mechanical inputs (revert / closing-keyword /
-//! fix-edge) and stores them raw; the LLM pass (#704) supplies `model_status` and the provenance
-//! evidence, and the read layer (#705) applies [`effective_status`]. All of it is implemented and
-//! tested here so the floor logic exists before either consumer does.
+//! Every function here is PURE and deterministic — no DB, no model. These are the WRITE-side
+//! guardrails: the extraction pass stores the raw mechanical floors (revert / closing-keyword /
+//! fix-edge) and the provenance verdicts, so a later model claim can be checked against them. The
+//! EFFECTIVE outcome status is resolved READ-side, over those floors, in
+//! `rag_rat_papertrail::effective_status` (#705) — it lives there because the read layer sits below
+//! `rag-rat-core` and cannot reach into it.
 
-use rag_rat_papertrail::{FixEdgeSource, OutcomeStatus, ThreadShape};
+use rag_rat_papertrail::{OutcomeStatus, ThreadShape};
 
 // NOTE: the closing-keyword floor is NOT derived by re-scanning commit text here. Reproducing the
 // reference grammar (provider-aware keyword sets incl. GitLab gerunds, project scoping, issue-vs-PR
@@ -20,11 +18,6 @@ use rag_rat_papertrail::{FixEdgeSource, OutcomeStatus, ThreadShape};
 // NOTE: the `revert_override` floor is computed in `extract` (a downstream landed commit whose body
 // reverts one of the record's CURRENT fix SHAs), not here. It deliberately does NOT key on the fix
 // commit itself being a `Revert` — intentional revert work that landed is `landed`, not `reverted`.
-
-/// The `no-fix-edge` floor: no closing edge and no merge commit establish that anything landed.
-pub(crate) fn no_fix_edge(fix_edge_source: FixEdgeSource) -> bool {
-    fix_edge_source == FixEdgeSource::None
-}
 
 /// A commenter/author association that denotes a maintainer (repo owner, org member, or invited
 /// collaborator). Case-insensitive; anything else (CONTRIBUTOR / NONE / bots / unknown) is not.
@@ -61,35 +54,6 @@ pub(crate) fn outcome_claim_verified(
     }
 }
 
-/// Inputs to the effective-status resolver: the mechanical floors plus the (optional) model status.
-pub(crate) struct EffectiveStatusInputs {
-    pub revert_override: bool,
-    pub closing_keyword: bool,
-    pub fix_edge_source: FixEdgeSource,
-    pub model_status: Option<OutcomeStatus>,
-}
-
-/// Resolve the EFFECTIVE outcome status with fixed precedence: revert > closing-keyword >
-/// no-fix-edge > model. A revert wins outright; a closing keyword forces `landed` (the fix
-/// mechanically closed the work); with no fix edge the record can never be `landed` (a model
-/// `landed`/absent collapses to `unclear`, while an honest `descoped`/`superseded` stands);
-/// otherwise the model's status is authoritative, defaulting to `unclear` when the model is silent.
-pub(crate) fn effective_status(inputs: &EffectiveStatusInputs) -> OutcomeStatus {
-    if inputs.revert_override {
-        return OutcomeStatus::Reverted;
-    }
-    if inputs.closing_keyword {
-        return OutcomeStatus::Landed;
-    }
-    if no_fix_edge(inputs.fix_edge_source) {
-        return match inputs.model_status {
-            Some(OutcomeStatus::Landed) | None => OutcomeStatus::Unclear,
-            Some(other) => other,
-        };
-    }
-    inputs.model_status.unwrap_or(OutcomeStatus::Unclear)
-}
-
 /// Mechanical thread-shape classification from discussion structure. `Thin` = little discussion (a
 /// short body and at most one comment); `ReviewStream` = review-dominated back-and-forth (review
 /// events are at least half of a non-trivial comment set); otherwise `Investigation`.
@@ -109,19 +73,12 @@ pub(crate) fn classify_thread_shape(
 
 #[cfg(test)]
 mod tests {
-    use rag_rat_papertrail::{FixEdgeSource, OutcomeStatus, ThreadShape};
+    use rag_rat_papertrail::{OutcomeStatus, ThreadShape};
 
     use super::{
-        EffectiveStatusInputs, classify_thread_shape, decision_provenance_verified,
-        effective_status, is_maintainer_association, no_fix_edge, outcome_claim_verified,
+        classify_thread_shape, decision_provenance_verified, is_maintainer_association,
+        outcome_claim_verified,
     };
-
-    #[test]
-    fn no_fix_edge_floor_fires_only_on_none() {
-        assert!(no_fix_edge(FixEdgeSource::None));
-        assert!(!no_fix_edge(FixEdgeSource::Provider));
-        assert!(!no_fix_edge(FixEdgeSource::Text));
-    }
 
     #[test]
     fn maintainer_and_decision_provenance() {
@@ -145,75 +102,6 @@ mod tests {
         // Non-landed claims are self-consistent without a fix edge.
         assert!(outcome_claim_verified(OutcomeStatus::Descoped, false, false));
         assert!(outcome_claim_verified(OutcomeStatus::Unclear, false, false));
-    }
-
-    #[test]
-    fn effective_status_precedence_revert_beats_everything() {
-        let status = effective_status(&EffectiveStatusInputs {
-            revert_override: true,
-            closing_keyword: true,
-            fix_edge_source: FixEdgeSource::Provider,
-            model_status: Some(OutcomeStatus::Landed),
-        });
-        assert_eq!(status, OutcomeStatus::Reverted);
-    }
-
-    #[test]
-    fn effective_status_closing_keyword_forces_landed_over_model() {
-        let status = effective_status(&EffectiveStatusInputs {
-            revert_override: false,
-            closing_keyword: true,
-            fix_edge_source: FixEdgeSource::Text,
-            model_status: Some(OutcomeStatus::Unclear),
-        });
-        assert_eq!(status, OutcomeStatus::Landed);
-    }
-
-    #[test]
-    fn effective_status_no_fix_edge_cannot_be_landed() {
-        // Model over-claims landed with no fix edge → collapses to unclear.
-        assert_eq!(
-            effective_status(&EffectiveStatusInputs {
-                revert_override: false,
-                closing_keyword: false,
-                fix_edge_source: FixEdgeSource::None,
-                model_status: Some(OutcomeStatus::Landed),
-            }),
-            OutcomeStatus::Unclear,
-        );
-        // An honest descoped stands.
-        assert_eq!(
-            effective_status(&EffectiveStatusInputs {
-                revert_override: false,
-                closing_keyword: false,
-                fix_edge_source: FixEdgeSource::None,
-                model_status: Some(OutcomeStatus::Descoped),
-            }),
-            OutcomeStatus::Descoped,
-        );
-    }
-
-    #[test]
-    fn effective_status_defers_to_model_when_a_fix_edge_exists() {
-        assert_eq!(
-            effective_status(&EffectiveStatusInputs {
-                revert_override: false,
-                closing_keyword: false,
-                fix_edge_source: FixEdgeSource::Provider,
-                model_status: Some(OutcomeStatus::Superseded),
-            }),
-            OutcomeStatus::Superseded,
-        );
-        // Silent model with a fix edge → unclear (not a fabricated landed).
-        assert_eq!(
-            effective_status(&EffectiveStatusInputs {
-                revert_override: false,
-                closing_keyword: false,
-                fix_edge_source: FixEdgeSource::Provider,
-                model_status: None,
-            }),
-            OutcomeStatus::Unclear,
-        );
     }
 
     #[test]
