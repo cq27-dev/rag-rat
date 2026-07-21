@@ -1882,9 +1882,14 @@ fn is_current_annex_plaintext(header: &AccountEntryHeader) -> bool {
 /// Scoped to the snapshot TAG, not the annex log: `crypto_suite` is in the clear header, and a
 /// later annex artifact class may legitimately be sealed. Blanket-rejecting every sealed annex
 /// entry would spend that option for nothing.
+///
+/// Deliberately NOT scoped to the current `op_version`. "A snapshot is plaintext" is a property of
+/// the artifact class, not of one version's encoding, so a future-version sealed snapshot is just
+/// as uninterpretable as a current one. If a later version ever wants a sealed coverage artifact it
+/// is a different class and takes a different annex tag — tags 1.. are free, and that is cheaper
+/// than leaving a grow-only hole here that no verifier could ever evaluate.
 fn is_sealed_snapshot(header: &AccountEntryHeader) -> bool {
     header.log_id == fold::ANNEX_LOG
-        && header.op_version == fold::SUPPORTED_OP_VERSION
         && header.entry_type == snapshot::ops::entry_type::SNAPSHOT
         && header.crypto_suite != 0
 }
@@ -3296,6 +3301,22 @@ mod tests {
         );
         assert_eq!(status(&conn, &sealed.entry_hash), None, "and never became a chain link");
 
+        // "A snapshot is plaintext" is a property of the artifact CLASS, not of one version's
+        // encoding, so a future-op_version sealed snapshot is refused just the same — it would be
+        // exactly as uninterpretable, and retaining it would leave a grow-only hole no verifier
+        // could ever evaluate.
+        let future_version = sign_account_entry(
+            &founder.secret,
+            &AccountEntryHeader { op_version: 2, ..header },
+            &[0x81, 0x01],
+        )
+        .unwrap();
+        let outcome = account_ingest(&conn, &future_version.signed_bytes, NOW + 2).unwrap();
+        assert!(
+            matches!(&outcome, IngestOutcome::Rejected(err) if err.contains("plaintext-signed")),
+            "a sealed snapshot at a future op_version is refused too: {outcome:?}",
+        );
+
         // The rejection is scoped to the SNAPSHOT tag, not the annex log: a future annex artifact
         // class may legitimately be sealed, and that option must survive this slice.
         let other_tag = sign_account_entry(
@@ -3305,7 +3326,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            account_ingest(&conn, &other_tag.signed_bytes, NOW + 2).unwrap(),
+            account_ingest(&conn, &other_tag.signed_bytes, NOW + 3).unwrap(),
             IngestOutcome::Ingested { status: "retained_unfolded".into() },
             "a sealed NON-snapshot annex entry is still retained",
         );

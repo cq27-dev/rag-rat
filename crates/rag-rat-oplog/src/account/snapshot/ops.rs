@@ -117,11 +117,12 @@ pub(in crate::account) fn encode(op: &SnapshotOp) -> Result<Vec<u8>, CborError> 
 fn canonicalize(op: &SnapshotOp) -> Result<SnapshotOp, CborError> {
     match op {
         SnapshotOp::Snapshot { state_format_version, moderation_epoch, targets } => {
+            check_state_format(*state_format_version)?;
             check_reserved_epoch(*state_format_version, *moderation_epoch)?;
             Ok(SnapshotOp::Snapshot {
                 state_format_version: *state_format_version,
                 moderation_epoch: *moderation_epoch,
-                targets: canonical_targets(targets)?,
+                targets: canonical_targets(*state_format_version, targets)?,
             })
         },
     }
@@ -134,6 +135,17 @@ fn canonicalize(op: &SnapshotOp) -> Result<SnapshotOp, CborError> {
 /// Scoped to the version that reserves it: a future format version defines its own rules, and a
 /// binary that does not know that version must still be able to decode and retain the entry rather
 /// than hard-rejecting a legitimate future manifest.
+fn check_state_format(state_format_version: u32) -> Result<(), CborError> {
+    // Below the first defined format there are no projection semantics at all, so such a manifest
+    // could never be verified or refuted by any implementation, present or future. Reserve it.
+    // Versions ABOVE the current one are a different case entirely — they are legitimately newer
+    // and must be retained, not rejected.
+    if state_format_version < SNAPSHOT_STATE_FORMAT_V1 {
+        return Err(CborError::message("snapshot state_format_version 0 is reserved"));
+    }
+    Ok(())
+}
+
 fn check_reserved_epoch(state_format_version: u32, moderation_epoch: u64) -> Result<(), CborError> {
     if state_format_version == SNAPSHOT_STATE_FORMAT_V1 && moderation_epoch != 0 {
         return Err(CborError::message(
@@ -149,13 +161,17 @@ fn check_reserved_epoch(state_format_version: u32, moderation_epoch: u64) -> Res
 /// target may name a device once, and the target list may name a `(log_id, stream_id, account_id)`
 /// once. A byte-identical repeat is the SAME claim and canonicalizes away; two DIFFERENT claims
 /// about one coordinate are contradictory and are refused rather than silently resolved.
-fn canonical_targets(targets: &[SnapshotTarget]) -> Result<Vec<SnapshotTarget>, CborError> {
+fn canonical_targets(
+    state_format_version: u32,
+    targets: &[SnapshotTarget],
+) -> Result<Vec<SnapshotTarget>, CborError> {
     if targets.len() > SNAPSHOT_TARGETS_MAX {
         return Err(CborError::message("snapshot targets exceeds the §18a bound"));
     }
     let mut sorted = Vec::with_capacity(targets.len());
     for target in targets {
         check_qualification(
+            state_format_version,
             target.log_id,
             target.stream_id.is_some(),
             target.subject_account_id.is_some(),
@@ -185,7 +201,12 @@ fn canonical_targets(targets: &[SnapshotTarget]) -> Result<Vec<SnapshotTarget>, 
 /// here on purpose: an unknown log has no defined folded projection, so a manifest claiming one
 /// would be a coverage claim no implementation could ever verify or refute. Extending the set is a
 /// deliberate `state_format_version` change, not something a peer may assert into existence.
-fn check_qualification(log_id: u8, has_stream: bool, has_account: bool) -> Result<(), CborError> {
+fn check_qualification(
+    state_format_version: u32,
+    log_id: u8,
+    has_stream: bool,
+    has_account: bool,
+) -> Result<(), CborError> {
     match log_id {
         CONTROL_LOG_ID | SECRETS_LOG_ID =>
             if has_stream || has_account {
@@ -199,7 +220,16 @@ fn check_qualification(log_id: u8, has_stream: bool, has_account: bool) -> Resul
                     "snapshot target for the content log requires stream_id and account_id",
                 ));
             },
-        _ => return Err(CborError::message("snapshot target names an undefined log_id")),
+        // Closing the set is a rule OF FORMAT 1, not a structural one: a later format may define
+        // another targetable log, and an older binary must retain that manifest (it simply cannot
+        // verify it) rather than structurally reject a legitimate newer artifact. Same scoping as
+        // the reserved epoch above — applying it unconditionally here would contradict it.
+        _ =>
+            if state_format_version == SNAPSHOT_STATE_FORMAT_V1 {
+                return Err(CborError::message(
+                    "snapshot target names a log undefined at state format 1",
+                ));
+            },
     }
     Ok(())
 }
@@ -277,6 +307,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotOp, CborError> {
     // Enforced on BOTH sides: `canonicalize` guards authoring, but decode reaches
     // `encode_canonical` (the raw writer) directly for its canonicity compare, so a peer's bytes
     // would otherwise slip past the reserved-field rule.
+    check_state_format(state_format_version)?;
     check_reserved_epoch(state_format_version, moderation_epoch)?;
     let len = cbor::expect_definite_len(&mut d)?;
     if len > SNAPSHOT_TARGETS_MAX as u64 {
@@ -291,7 +322,12 @@ fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotOp, CborError> {
             decode_opt_b32(&mut d, "snapshot target stream_id")?.map(StreamId::from_bytes);
         let subject_account_id =
             decode_opt_b32(&mut d, "snapshot target account_id")?.map(AccountId::from_bytes);
-        check_qualification(log_id, stream_id.is_some(), subject_account_id.is_some())?;
+        check_qualification(
+            state_format_version,
+            log_id,
+            stream_id.is_some(),
+            subject_account_id.is_some(),
+        )?;
         let folded_state_hash = cbor::fixed_bytes::<32>(d.bytes()?, "folded_state_hash")?;
         let covered = decode_covered(&mut d)?;
         let target =
@@ -559,10 +595,10 @@ mod tests {
     }
 
     #[test]
-    fn a_target_naming_an_undefined_log_is_refused() {
-        // The log set is CLOSED: an unknown log has no defined folded projection, so a coverage
-        // claim about it could never be verified or refuted by any implementation. Notably this
-        // includes the annex log itself — a snapshot does not cover snapshots.
+    fn an_undefined_target_log_is_refused_at_format_1_but_retained_at_a_future_format() {
+        // At format 1 the log set is CLOSED: an unknown log has no defined folded projection, so a
+        // coverage claim about it could never be verified or refuted. That includes the annex log
+        // itself — a snapshot does not cover snapshots.
         for undefined in [fold_annex_log(), 4, 200] {
             let target = SnapshotTarget {
                 log_id: undefined,
@@ -572,9 +608,44 @@ mod tests {
             };
             assert!(
                 encode(&snapshot(vec![target])).is_err(),
-                "log {undefined} has no defined projection to claim coverage of",
+                "log {undefined} has no projection defined at format 1",
             );
         }
+
+        // But closing the set is a rule OF FORMAT 1. A later format may define another targetable
+        // log, and this binary must RETAIN that manifest rather than structurally reject a
+        // legitimate newer artifact it merely cannot verify — the same scoping as the reserved
+        // epoch. Rejecting here unconditionally would contradict that.
+        let future = SnapshotOp::Snapshot {
+            state_format_version: SNAPSHOT_STATE_FORMAT_V1 + 1,
+            moderation_epoch: 0,
+            targets: vec![SnapshotTarget {
+                log_id: 200,
+                stream_id: Some(stream(0x44)),
+                subject_account_id: Some(account(0x55)),
+                ..account_target(0, &[0x11])
+            }],
+        };
+        let bytes = encode(&future).expect("a future format may name a log this one does not know");
+        assert_eq!(decode(entry_type::SNAPSHOT, &bytes).unwrap(), DecodedSnapshotOp::Known(future));
+    }
+
+    #[test]
+    fn state_format_version_zero_is_reserved() {
+        // Below the first defined format there are no projection semantics at all, so a version-0
+        // manifest is a signed claim nothing could ever evaluate. Reserved on both paths — and
+        // distinct from a FUTURE version, which is legitimately newer and must be retained.
+        let undefined = SnapshotOp::Snapshot {
+            state_format_version: 0,
+            moderation_epoch: 0,
+            targets: vec![account_target(0, &[0x11])],
+        };
+        assert!(encode(&undefined).is_err(), "authoring refuses the reserved version");
+
+        let mut bytes = encode(&snapshot(vec![account_target(0, &[0x11])])).unwrap();
+        assert_eq!(bytes[1], 0x01, "state_format_version is the second header item");
+        bytes[1] = 0x00;
+        assert!(decode(entry_type::SNAPSHOT, &bytes).is_err(), "decoding refuses it too");
     }
 
     /// The annex log's own id, spelled locally so this module stays free of a `fold` dependency.
