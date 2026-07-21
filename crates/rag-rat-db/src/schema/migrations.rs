@@ -4617,9 +4617,11 @@ pub fn apply_content_projected_tables(conn: &Connection) -> rusqlite::Result<()>
 /// an attacker amplifies by varying cited `auth_len` to defeat the per-refold freshness cache. It
 /// now records structural classification and enqueues the stream here instead; the settle seam
 /// (`settle_pending_content_refolds`) folds each dirty stream ONCE.
-/// INVARIANT: a `stream_id` is present while settle still owes that stream a refold + reproject.
-/// Only settle clears the row, after both steps succeed; an account fold may refold and reproject
-/// the same stream but deliberately leaves this independent settle debt intact.
+/// INVARIANT: a `stream_id` is present while a refold + reproject is still owed. The row is
+/// discharged ONLY by `refold_and_project_stream_in_tx` — reached either from the settle seam or
+/// from a TRUSTED/local account fold (`finalize_affected_streams`) — and only after both steps
+/// succeed. The untrusted remote account-ingest path never clears it here; it only ADDS debt
+/// (`ACCOUNT_CHANGE`) for settle to drain.
 /// Purely additive; `CREATE ... IF NOT EXISTS`, so a torn replay reconverges without a wrapping
 /// transaction; nothing pre-existing to backfill.
 pub fn apply_content_streams_pending_refold(conn: &Connection) -> rusqlite::Result<()> {

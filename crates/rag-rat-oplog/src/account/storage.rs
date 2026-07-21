@@ -958,6 +958,10 @@ pub(super) fn refold_in_tx(
 ) -> anyhow::Result<HashMap<[u8; 32], String>> {
     let state = fold_account_state_in_tx(tx, account_id, now_ms)?;
     super::content::finalize_affected_streams(tx, &state.affected_streams)?;
+    // `state.rejected_content_promotions` is deliberately DISCARDED here: this trusted/local path
+    // has no remote caller to signal evicted promotions to (the ingest outcome variants carry it
+    // only on the untrusted remote path), and the evicted set is bounded by the per-author
+    // pre-verify cap, so it can never grow into unbounded silent loss.
     Ok(state.statuses)
 }
 

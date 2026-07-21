@@ -344,6 +344,33 @@ impl ReconcileWork {
     }
 }
 
+/// The pending-fold barrier (#698): memory completeness may not be read while the owner stream
+/// owes a deferred content refold, because the accepted-`/3` projection is stale until settle.
+/// A tripped barrier does NOT hard-fail outright (#798 adversarial review: a remote ingest
+/// enqueueing owner-stream debt would otherwise wedge every local mutation behind a settle no
+/// local caller schedules): on an AUTOCOMMIT connection it first attempts ONE inline, targeted,
+/// single-stream settle of the owner stream (`settle_pending_content_refold_for_stream` — cheap,
+/// non-recursive, its own IMMEDIATE transaction), then re-checks. Inside an already-open
+/// transaction (the TOCTOU re-reads) no inline settle is possible, so a tripped barrier there
+/// still errors. Only a STILL-pending stream (a failed inline settle, or an in-txn trip) errors.
+pub(crate) fn ensure_owner_stream_settled(
+    conn: &Connection,
+    stream: StreamId,
+    action: &str,
+) -> anyhow::Result<()> {
+    if !rag_rat_oplog::content_stream_has_pending_refold(conn, stream)? {
+        return Ok(());
+    }
+    if conn.is_autocommit() {
+        let _settled = rag_rat_oplog::settle_pending_content_refold_for_stream(conn, stream)?;
+    }
+    anyhow::ensure!(
+        !rag_rat_oplog::content_stream_has_pending_refold(conn, stream)?,
+        "owner stream has a pending content refold; settle pending content refolds before {action}"
+    );
+    Ok(())
+}
+
 /// Read the repo's unauthored nodes + edges and partition out the un-authorable (#680): the fast
 /// path calls it to decide whether real work remains, the slow path to build the batch from the
 /// AUTHORABLE half. Scope-independent like its two readers, so it runs on either an autocommit
@@ -354,11 +381,7 @@ fn read_reconcile_work(
     stream: StreamId,
     policy: StreamSealPolicy,
 ) -> anyhow::Result<ReconcileWork> {
-    anyhow::ensure!(
-        !rag_rat_oplog::content_stream_has_pending_refold(conn, stream)?,
-        "owner stream has a pending content refold; settle pending content refolds before \
-         reconciling memory completeness"
-    );
+    ensure_owner_stream_settled(conn, stream, "reconciling memory completeness")?;
     let (authorable_nodes, quarantined_nodes): (Vec<MemoryRow>, Vec<MemoryRow>) =
         read_unauthored_memory_rows(conn, repo_id, stream)?
             .into_iter()
@@ -1036,15 +1059,6 @@ mod tests {
             .unwrap();
     }
 
-    fn settle_pending_refolds(conn: &Connection) {
-        let report = rag_rat_oplog::settle_pending_content_refolds(
-            conn,
-            &rag_rat_oplog::ContentRefoldBudget::unbounded(),
-        )
-        .unwrap();
-        assert!(report.failures.is_empty(), "pending refold settlement failed: {report:?}");
-    }
-
     /// Author a BARE `/3` NodeStatus for a node with NO `NodeCreate` — the `/3` analog of the INERT
     /// op a pre-fix (#532) binary authored when it `mark_obsolete`'d a still-ghost memory. The
     /// shared projector emits no node without content, so this leaves a stale status register
@@ -1318,54 +1332,91 @@ mod tests {
         assert_eq!(entry_count(&conn), before, "no ghost → no new /3 entry");
     }
 
+    /// Abort the queue-clear DELETE for `stream`, poisoning its settle so an inline barrier settle
+    /// cannot clear the mark — the row's refold debt is retained and the barrier stays tripped.
+    fn poison_owner_stream_settle(conn: &Connection, stream: StreamId) {
+        let hex: String = stream.to_bytes().iter().map(|byte| format!("{byte:02x}")).collect();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER poison_owner_queue_clear
+             BEFORE DELETE ON content_streams_pending_refold
+             WHEN OLD.stream_id = X'{hex}'
+             BEGIN SELECT RAISE(ABORT, 'injected queue-clear failure'); END;"
+        ))
+        .unwrap();
+    }
+
     #[test]
-    fn pending_owner_refold_blocks_node_reconcile_and_mutation_until_settled() {
+    fn pending_owner_refold_inline_settles_on_the_mutation_path() {
+        // #798 finding 5: a tripped barrier on the AUTOCOMMIT mutation path no longer hard-fails —
+        // it attempts ONE inline, targeted settle of the owner stream and, when that clears the
+        // debt, PROCEEDS. A remote ingest enqueuing owner-stream debt must not wedge every local
+        // mutation behind a settle no local caller schedules.
         let conn = scoped_conn();
         create_concept(&conn, "seed").unwrap();
         let stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
         insert_memory(&conn, "mem_ghost", "active", 500);
         queue_pending_refold(&conn, stream);
-        let entries_before = entry_count(&conn);
-        let memories_before: i64 =
-            conn.query_row("SELECT COUNT(*) FROM repo_memories", [], |row| row.get(0)).unwrap();
 
-        let reconcile_err = backfill_memory_oplog(&conn, 9_000).unwrap_err();
-        assert!(reconcile_err.to_string().contains("settle pending content refolds"));
-        let mutation_err = create_concept(&conn, "blocked mutation").unwrap_err();
-        assert!(mutation_err.to_string().contains("settle pending content refolds"));
-        assert_eq!(entry_count(&conn), entries_before, "the barrier authors no content rows");
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM repo_memories", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            memories_before,
-            "the blocked mutation persists no memory row"
+        // The reconcile trips the barrier, inline-settles the settle-able owner stream, and then
+        // authors the ghost — no manual settle needed.
+        backfill_memory_oplog(&conn, 9_000).unwrap();
+        assert!(is_projected(&conn, "mem_ghost"), "the inline-settled reconcile authors the ghost");
+        assert!(
+            !rag_rat_oplog::content_stream_has_pending_refold(&conn, stream).unwrap(),
+            "the inline settle cleared the owner stream's refold debt",
         );
 
-        settle_pending_refolds(&conn);
-        create_concept(&conn, "after settlement").unwrap();
-        assert!(is_projected(&conn, "mem_ghost"), "the settled reconcile authors the ghost");
+        // A subsequent mutation on the same clean stream also succeeds and authors no duplicates.
+        create_concept(&conn, "after inline settle").unwrap();
         let entries_after = entry_count(&conn);
         backfill_memory_oplog(&conn, 10_000).unwrap();
         assert_eq!(entry_count(&conn), entries_after, "the retry authors no duplicates");
     }
 
     #[test]
-    fn pending_owner_refold_blocks_edge_reconcile_until_settled() {
+    fn a_still_pending_owner_refold_errors_after_a_failed_inline_settle() {
+        // #798 finding 5: the barrier only self-heals when the inline settle actually clears the
+        // debt. A stream whose settle keeps failing (poisoned) stays pending, so the barrier still
+        // errors rather than reading a stale accepted-/3 projection.
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap();
+        let stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
+        insert_memory(&conn, "mem_ghost", "active", 500);
+        queue_pending_refold(&conn, stream);
+        poison_owner_stream_settle(&conn, stream);
+        let entries_before = entry_count(&conn);
+
+        let reconcile_err = backfill_memory_oplog(&conn, 9_000).unwrap_err();
+        assert!(reconcile_err.to_string().contains("settle pending content refolds"));
+        let mutation_err = create_concept(&conn, "blocked mutation").unwrap_err();
+        assert!(mutation_err.to_string().contains("settle pending content refolds"));
+        assert_eq!(entry_count(&conn), entries_before, "the still-tripped barrier authors nothing");
+        assert!(
+            rag_rat_oplog::content_stream_has_pending_refold(&conn, stream).unwrap(),
+            "the poisoned settle retained the refold debt",
+        );
+        assert!(
+            !is_projected(&conn, "mem_ghost"),
+            "the ghost is not authored while the barrier trips",
+        );
+    }
+
+    #[test]
+    fn pending_owner_refold_inline_settles_on_the_edge_reconcile_path() {
+        // #798 finding 5, edge path: the same inline settle unblocks a ghost EDGE reconcile.
         let conn = scoped_conn();
         let a = create_concept(&conn, "a").unwrap().memory.memory_id;
         let b = create_concept(&conn, "b").unwrap().memory.memory_id;
         insert_raw_node_edge(&conn, &a, "relates_to", &b);
         let stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
         queue_pending_refold(&conn, stream);
-        let entries_before = entry_count(&conn);
 
-        let err = backfill_memory_oplog(&conn, 9_000).unwrap_err();
-        assert!(err.to_string().contains("settle pending content refolds"));
-        assert_eq!(entry_count(&conn), entries_before, "the barrier authors no edge row");
-
-        settle_pending_refolds(&conn);
-        backfill_memory_oplog(&conn, 10_000).unwrap();
-        assert_eq!(projected_edge_count(&conn), 1, "the settled retry authors the edge");
+        backfill_memory_oplog(&conn, 9_000).unwrap();
+        assert_eq!(projected_edge_count(&conn), 1, "the inline-settled reconcile authors the edge");
+        assert!(
+            !rag_rat_oplog::content_stream_has_pending_refold(&conn, stream).unwrap(),
+            "the inline settle cleared the owner stream's refold debt",
+        );
         let entries_after = entry_count(&conn);
         backfill_memory_oplog(&conn, 11_000).unwrap();
         assert_eq!(entry_count(&conn), entries_after, "the retry authors no duplicate edge");
