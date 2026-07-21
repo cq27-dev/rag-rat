@@ -33,6 +33,12 @@ pub(crate) const MAX_REJECTED_ALTERNATIVES: usize = 20;
 pub(crate) const MAX_ALTERNATIVE_CHARS: usize = 500;
 pub(crate) const MAX_ANCHOR_INDICES: usize = 40;
 
+/// Max chars of a cross-referenced item's title and opening the prompt renders. The extraction
+/// snapshot caps the STORED (and hashed) text to this same width, so a referenced item's edit
+/// beyond what the model can see never regenerates the record — the length-dimension partner of
+/// the `max_xrefs` count invariant (see `xref_snapshot_cap_matches_the_prompt_xref_budget`).
+pub(crate) const XREF_TEXT_RENDER_CHARS: usize = 200;
+
 /// The system instructions (role + plain-prose + cite-by-unit rules). Authored as markdown in
 /// `prompts/system.md` and embedded at build time (the dream passes use the same pattern) so prompt
 /// edits are a documentation-shaped diff, not a Rust string literal.
@@ -626,11 +632,14 @@ pub(crate) fn render_context(input: &PromptInput, budget: &PromptBudget) -> Stri
                 bounded_untrusted(&x.kind, 50),
                 bounded_untrusted(&x.key, 100),
                 bounded_untrusted(&x.ref_kind, 50),
-                neutralize(&truncate_chars(x.title.trim(), 200))
+                neutralize(&truncate_chars(x.title.trim(), XREF_TEXT_RENDER_CHARS))
             ));
             let opening = x.opening.trim();
             if !opening.is_empty() {
-                out.push_str(&format!(" — {}", neutralize(&truncate_chars(opening, 200))));
+                out.push_str(&format!(
+                    " — {}",
+                    neutralize(&truncate_chars(opening, XREF_TEXT_RENDER_CHARS))
+                ));
             }
             out.push('\n');
         }
@@ -1007,7 +1016,9 @@ fn bounded_untrusted(s: &str, max_chars: usize) -> String {
 }
 
 /// Truncate to at most `max` chars (not bytes) on a char boundary — for human-facing snippets.
-fn truncate_chars(s: &str, max: usize) -> String {
+/// Idempotent: re-truncating an already-truncated value returns the same string, so the extraction
+/// snapshot can store `truncate_chars(text, N)` and the render re-apply it without drift.
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((byte_idx, _)) => format!("{}…", &s[..byte_idx]),
         None => s.to_string(),

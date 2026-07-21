@@ -1370,6 +1370,65 @@ mod tests {
     }
 
     #[test]
+    fn fix_diff_rows_concatenate_in_commit_path_order_with_newline_separators() {
+        // `load_fix_diff` re-sorts the persisted per-file patches by (commit_sha, path) and joins
+        // them, inserting a separating newline after any row that does not already end in one.
+        let conn = fixture();
+        seed(&conn, "first", 10);
+        // Inserted out of (commit_sha, path) order; the SECOND row (commit 'bbb') has no trailing
+        // newline, exercising the normalization branch.
+        conn.execute(
+            "INSERT INTO papertrail_distill_fix_diffs
+                 (tracker, project, item_kind, item_key, commit_sha, path, patch, repo_id)
+             VALUES ('github','org/repo','issue','first','bbb','src/z.rs','PATCH-Z-no-newline',
+                     'repo')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_fix_diffs
+                 (tracker, project, item_kind, item_key, commit_sha, path, patch, repo_id)
+             VALUES ('github','org/repo','issue','first','aaa','src/a.rs','PATCH-A' || char(10),
+                     'repo')",
+            [],
+        )
+        .unwrap();
+
+        let jobs = load_prepared_jobs(&conn, "repo", 1, &PromptBudget::default()).unwrap();
+        let prompt = &jobs[0].rendered_prompt;
+        let a_pos = prompt.find("PATCH-A").expect("patch A renders");
+        let z_pos = prompt.find("PATCH-Z-no-newline").expect("patch Z renders");
+        assert!(a_pos < z_pos, "rows render in (commit_sha, path) order: aaa before bbb: {prompt}");
+    }
+
+    #[test]
+    fn a_null_xref_target_kind_renders_an_empty_kind_label() {
+        // `load_xrefs` tolerates a NULL `target_item_kind` (defaulting it to an empty label) rather
+        // than dropping the row — the drain never fabricates a kind the snapshot did not resolve.
+        let conn = fixture();
+        seed(&conn, "first", 10);
+        conn.execute(
+            "INSERT INTO papertrail_distill_xrefs
+                 (tracker, project, item_kind, item_key, xref_ordinal, target_tracker,
+                  target_project, target_item_kind, target_item_key, ref_kind, title, opening,
+                  repo_id)
+             VALUES \
+             ('github','org/repo','issue','first',0,'github','org/repo',NULL,'9','reference',
+                     'Kindless target','','repo')",
+            [],
+        )
+        .unwrap();
+
+        let jobs = load_prepared_jobs(&conn, "repo", 1, &PromptBudget::default()).unwrap();
+        let prompt = &jobs[0].rendered_prompt;
+        assert!(prompt.contains("REFERENCED ITEMS:"), "{prompt}");
+        assert!(
+            prompt.contains("[] #9 (reference): Kindless target"),
+            "a NULL target kind renders as an empty kind label: {prompt}",
+        );
+    }
+
+    #[test]
     fn model_executes_after_the_read_transaction_is_released() {
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let conn = Connection::open(&path).unwrap();

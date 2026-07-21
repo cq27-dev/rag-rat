@@ -37,10 +37,6 @@ const FIX_DIFF_FILE_CAP: usize = 8_000;
 /// hostile 50MB minified file in memory inside the extraction write transaction.
 const FIX_DIFF_BLOB_CAP: u64 = 1_000_000;
 
-/// Byte cap for a snapshotted xref opening paragraph (#800): the prompt renders at most 200
-/// chars of it, so a giant single-paragraph body must not inflate the snapshot row.
-const XREF_OPENING_CAP: usize = 2_000;
-
 /// Max cross-referenced items snapshotted per record (#800). Matches the prompt's `max_xrefs`
 /// budget: refs beyond the cap are invisible to both the snapshot and the prompt.
 const XREF_SNAPSHOT_CAP: usize = 20;
@@ -1339,15 +1335,18 @@ fn xref_snapshots(
             if !seen.insert((tracker.clone(), project.clone(), kind.clone(), key.clone())) {
                 continue;
             }
+            // Cap the STORED (and therefore hashed) title/opening to exactly what the prompt
+            // renders (`XREF_TEXT_RENDER_CHARS`). Storing more would hash text the model never
+            // sees, so a referenced item's edit beyond the rendered width would regenerate the
+            // record and re-pay the model with identical visible input. `truncate_chars` is the
+            // same idempotent helper the render applies, so stored == rendered (pre-neutralize).
             let opening = units::segment_blocks(&body)
                 .first()
                 .map(|span| {
-                    let text = &body[span.start..span.end];
-                    let mut end = XREF_OPENING_CAP.min(text.len());
-                    while end > 0 && !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text[..end].to_string()
+                    prompts::truncate_chars(
+                        body[span.start..span.end].trim(),
+                        prompts::XREF_TEXT_RENDER_CHARS,
+                    )
                 })
                 .unwrap_or_default();
             out.push(XrefSnapshot {
@@ -1357,7 +1356,7 @@ fn xref_snapshots(
                 target_item_kind: Some(kind),
                 target_item_key: key,
                 ref_kind,
-                title,
+                title: prompts::truncate_chars(title.trim(), prompts::XREF_TEXT_RENDER_CHARS),
                 opening,
             });
             if out.len() >= XREF_SNAPSHOT_CAP {
@@ -2630,8 +2629,9 @@ mod tests {
         seed_comment(&conn, "repoA", "issue", "5", "c1", false);
         seed_outbound_ref(&conn, "repoA", "github:o/r:issue:5:c1", "9", "reference");
         seed_outbound_ref(&conn, "repoA", "github:o/r:issue:5", "404", "reference");
-        // A giant single-paragraph body: the opening snapshot is capped (the prompt renders at
-        // most 200 chars of it — a multi-MB paragraph must not inflate the row).
+        // A giant single-paragraph body: the opening snapshot is capped to EXACTLY the prompt's
+        // render width, so a multi-MB paragraph neither inflates the row nor hashes text the model
+        // never sees.
         seed_item(&conn, "repoA", "issue", "10", &"x".repeat(5_000), "closed", None);
         seed_outbound_ref(&conn, "repoA", "github:o/r:issue:5", "10", "reference");
 
@@ -2653,7 +2653,12 @@ mod tests {
         assert_eq!(rows[0].2, "t", "seeded title is frozen");
         assert_eq!(rows[0].3, "Opening line.", "the opening paragraph only, not the body");
         assert_eq!(rows[1].0, "10");
-        assert_eq!(rows[1].3.len(), 2_000, "a giant paragraph's opening is capped");
+        assert_eq!(
+            rows[1].3.chars().count(),
+            crate::distill::prompts::XREF_TEXT_RENDER_CHARS + 1,
+            "a giant paragraph's opening is capped to the render width plus the ellipsis",
+        );
+        assert!(rows[1].3.ends_with('…'), "the truncated opening keeps the ellipsis marker");
 
         // The referenced records are eligible too, but their own records have no outbound refs.
         assert_eq!(distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_xrefs"), 2);
@@ -2669,6 +2674,165 @@ mod tests {
             crate::distill::prompts::PromptBudget::default().max_xrefs,
             "the snapshot cap and the render budget must move together"
         );
+    }
+
+    #[test]
+    fn an_xref_edit_beyond_the_render_width_does_not_regenerate() {
+        // The length-dimension partner of `xref_snapshot_cap_matches_the_prompt_xref_budget`: a
+        // referenced item's title/opening are hashed at EXACTLY the width the prompt renders, so an
+        // edit past that width is invisible to the model and must NOT regenerate the record
+        // (re-paying the model with identical visible input). An edit WITHIN the width still does.
+        let width = crate::distill::prompts::XREF_TEXT_RENDER_CHARS;
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "issue", "5", "A bug. See #9.", "closed", None);
+        seed_item(&conn, "repoA", "issue", "9", "Body.", "closed", None);
+        seed_outbound_ref(&conn, "repoA", "github:o/r:issue:5", "9", "reference");
+        let head = "a".repeat(width);
+        conn.execute("UPDATE papertrail_items SET title = ?1 WHERE item_key = '9'", [format!(
+            "{head}X"
+        )])
+        .unwrap();
+
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let baseline = input_hash(&conn, "5");
+        let stored: String = conn
+            .query_row("SELECT title FROM papertrail_distill_xrefs WHERE item_key='5'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            stored.chars().count(),
+            width + 1,
+            "the stored title is capped to the render width (plus the ellipsis), not the source",
+        );
+
+        // Edit only the TAIL, past the rendered width — the first `width` chars are unchanged.
+        conn.execute("UPDATE papertrail_items SET title = ?1 WHERE item_key = '9'", [format!(
+            "{head}YYYY"
+        )])
+        .unwrap();
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        assert_eq!(
+            input_hash(&conn, "5"),
+            baseline,
+            "a tail-only edit past the render width leaves the identity unchanged",
+        );
+
+        // Edit WITHIN the rendered width — now the model-visible text changes, so regenerate.
+        conn.execute("UPDATE papertrail_items SET title = ?1 WHERE item_key = '9'", [format!(
+            "z{head}"
+        )])
+        .unwrap();
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        assert_ne!(
+            input_hash(&conn, "5"),
+            baseline,
+            "an edit within the render width regenerates the record",
+        );
+    }
+
+    #[test]
+    fn a_bare_ref_resolves_the_target_kind_by_fallback() {
+        // A kindless bare ref (`#N`, `papertrail_refs.item_kind` NULL) resolves down the fallback
+        // ladder: the source item's OWN kind first (parser namespace inheritance), then the
+        // deterministic kind order. A PR whose `#9` names an ISSUE resolves the issue even though
+        // the syntax could not disambiguate; a ref that resolves as NEITHER kind drops entirely.
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "change_request", "5", "A PR. See #9 and #404.", "merged", None);
+        seed_item(&conn, "repoA", "issue", "9", "The referenced issue body.", "closed", None);
+        let kindless = |target: &str| {
+            conn.execute(
+                "INSERT INTO papertrail_refs
+                     (tracker, project, item_key, item_kind, ref_kind, source_kind, source_text,
+                      discovered_at_ms, repo_id)
+                 VALUES ('github','o/r',?1,NULL,'reference','item',
+                         'github:o/r:change_request:5',1,'repoA')",
+                [target],
+            )
+            .unwrap();
+        };
+        kindless("9"); // no change_request #9 exists, but issue #9 does → resolves via fallback
+        kindless("404"); // resolves as neither kind → dropped
+
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+
+        let rows: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT target_item_key, target_item_kind FROM papertrail_distill_xrefs
+                 WHERE item_kind='change_request' AND item_key='5' ORDER BY xref_ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("9".to_string(), "issue".to_string())],
+            "the kindless ref resolves to the issue by fallback; the unresolvable ref drops",
+        );
+    }
+
+    /// Build a throwaway repo whose HEAD fix commit DELETES `src/gone.rs` (added in the base
+    /// commit), returning `(root, fix_sha, path)`.
+    fn build_delete_repo() -> (std::path::PathBuf, String, String) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("ragrat-distill-del-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let git = |args: &[&str]| {
+            let status =
+                std::process::Command::new("git").current_dir(&root).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Rag Rat"]);
+        git(&["config", "user.email", "rag@example.com"]);
+        std::fs::write(root.join("src/gone.rs"), "fn gone() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::remove_file(root.join("src/gone.rs")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "fix: remove gone"]);
+        let out = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let fix_sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        (root, fix_sha, "src/gone.rs".to_string())
+    }
+
+    #[test]
+    fn a_deleted_symbol_file_snapshots_a_deletion_patch() {
+        // The deletion arm of the file-patch header: a fixing commit that removes a
+        // symbol-candidate file diffs the old path TO /dev/null, not a bogus addition.
+        let (root, fix_sha, path) = build_delete_repo();
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "change_request", "9", "Remove it.", "merged", Some(&fix_sha));
+        seed_commit(&conn, "repoA", &fix_sha, "fix: remove gone");
+        seed_changed_file(&conn, "repoA", &fix_sha, &path);
+
+        extract(&conn, Some(&root), &ExtractOptions::default()).unwrap();
+
+        let patch: String = conn
+            .query_row(
+                "SELECT patch FROM papertrail_distill_fix_diffs WHERE path = ?1",
+                [&path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            patch.contains(&format!("--- a/{path}")),
+            "a deletion diffs from the old path: {patch}"
+        );
+        assert!(patch.contains("+++ /dev/null"), "a deleted file diffs TO /dev/null: {patch}");
+        assert!(patch.contains("-fn gone() {}"), "the removed line renders: {patch}");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
