@@ -1012,6 +1012,13 @@ fn pending_refold_queue_nonempty(conn: &Connection) -> anyhow::Result<bool> {
 /// adversarial review). The row stays QUEUED — its refold debt is real and a later call retries
 /// it; only its fairness position changes. `MAX(...) + 1` is index-backed
 /// (`content_streams_pending_refold_order`), never a scan.
+///
+/// This MUST NOT run INSIDE the paging loop (#798 adversarial finding F1): the bump moves the row
+/// to `MAX(first_enqueued_at_ms) + 1`, AHEAD of the advancing keyset cursor, so a persistently
+/// failing OLDEST stream would re-list and re-fold on every later page of the SAME settle call
+/// (duplicate `failures`, redundant folds, premature budget consumption that starves healthy
+/// later-page rows). Callers collect the failed stream ids during the loop and apply them once,
+/// after paging, via [`demote_pending_refolds`].
 fn demote_pending_refold(conn: &Connection, stream_id: StreamId) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE content_streams_pending_refold
@@ -1020,6 +1027,26 @@ fn demote_pending_refold(conn: &Connection, stream_id: StreamId) -> anyhow::Resu
          WHERE stream_id = ?1",
         [stream_id.to_bytes().as_slice()],
     )?;
+    Ok(())
+}
+
+/// Apply the settle call's collected fairness demotions in ONE committed IMMEDIATE transaction,
+/// AFTER the paging loop finished (#798 adversarial finding F1). Demoting inside the loop moved a
+/// failed row ahead of the keyset cursor and re-listed it on later pages; deferring every demotion
+/// to this single post-loop pass keeps each failed stream attempted exactly once per call while
+/// still bumping it behind every currently-queued row for the NEXT call. The pass is committed
+/// independently of (and survives) the rolled-back per-stream txns. Demotions are applied in
+/// collection order (oldest failed stream first); each row lands at `MAX + 1` of the queue as it
+/// stands at that point, so the bumped rows keep their relative order at the back.
+fn demote_pending_refolds(conn: &Connection, stream_ids: &[StreamId]) -> anyhow::Result<()> {
+    if stream_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    for &stream_id in stream_ids {
+        demote_pending_refold(&tx, stream_id)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1336,7 +1363,12 @@ pub struct ContentSettleReport {
 /// alone — its queue mark is kept for retry and DEMOTED behind every currently-queued row (so the
 /// next call tries other streams first instead of head-of-line blocking on the poisoned stream
 /// forever), it lands in [`ContentSettleReport::failures`], and it never blocks the rest of the
-/// batch. A BEGIN IMMEDIATE lock/BUSY race is NOT poison: it is retried once, then counted in
+/// batch. The demotions are COLLECTED during paging and applied once AFTER the loop (a single
+/// committed pass, [`demote_pending_refolds`]): bumping a failed row mid-loop moves it ahead of
+/// the keyset cursor, so a persistently failing oldest stream would re-list and re-fold on every
+/// later page of the SAME call (#798 adversarial finding F1) — deferring the bump keeps each
+/// failed stream attempted exactly once per call. A BEGIN IMMEDIATE lock/BUSY race is NOT poison:
+/// it is retried once, then counted in
 /// [`ContentSettleReport::lock_failures`] with no budget charge and no demotion. Only store/setup
 /// failures (e.g. the queue snapshot itself) make the overall call `Err`.
 ///
@@ -1409,6 +1441,13 @@ fn settle_pending_content_refolds_inner(
     // without a transaction; the rare row that GREW past the budget between listing and admission
     // is deferred by the in-transaction revalidation instead.
     let mut listed_any = false;
+    // Fairness demotions are COLLECTED here and applied once after the paging loop (#798
+    // adversarial finding F1): demoting a failed row inside the loop moves it to
+    // `MAX(first_enqueued_at_ms) + 1`, ahead of the advancing keyset cursor, so a persistently
+    // failing oldest stream would re-list and re-fold on every later page of THIS call. Deferring
+    // the bump keeps a failed row behind the cursor (never re-listed), so it is attempted exactly
+    // once per call and never starves the healthy later-page rows.
+    let mut deferred_demotions: Vec<StreamId> = Vec::new();
     loop {
         let page = list_pending_refold_streams_page(conn, cursor, budget, batch)?;
         if let Some(hook) = after_first_listing.take() {
@@ -1432,7 +1471,7 @@ fn settle_pending_content_refolds_inner(
             let (admitted, vanished, demote) =
                 record_settle_outcome(&mut report, &mut consumed, stream_id, outcome);
             if demote {
-                demote_pending_refold(conn, stream_id)?;
+                deferred_demotions.push(stream_id);
             }
             page_admitted |= admitted;
             page_vanished |= vanished;
@@ -1460,9 +1499,14 @@ fn settle_pending_content_refolds_inner(
         let outcome = settle_one_pending_refold(conn, stream_id, budget, consumed);
         let (_, _, demote) = record_settle_outcome(&mut report, &mut consumed, stream_id, outcome);
         if demote {
-            demote_pending_refold(conn, stream_id)?;
+            deferred_demotions.push(stream_id);
         }
     }
+    // Apply every collected fairness demotion once, after paging, in its own committed txn — see
+    // `deferred_demotions` above and [`demote_pending_refolds`]. Runs before the queue-empty probe
+    // so the report reflects the final queue, though the O(1) EXISTS observation is position-blind
+    // (a failed row still leaves `queue_empty == false` either way).
+    demote_pending_refolds(conn, &deferred_demotions)?;
     report.queue_empty = !pending_refold_queue_nonempty(conn)?;
     Ok(report)
 }
@@ -5043,6 +5087,81 @@ mod tests {
         assert!(!queue_contains(&conn, healthy));
         assert!(queue_contains(&conn, poisoned), "the poisoned stream is still queued for retry");
         assert!(!second.queue_empty);
+    }
+
+    #[test]
+    fn a_failing_oldest_stream_is_folded_once_across_pages_and_demoted_after_the_loop() {
+        // #798 adversarial finding F1: demoting a failed stream INSIDE the paging loop moves its
+        // keyset position to `MAX(first_enqueued_at_ms) + 1` — AHEAD of the advancing cursor — so a
+        // persistently-failing OLDEST stream re-lists and re-folds on every LATER page of the SAME
+        // call (duplicate `failures`, redundant folds, premature budget consumption starving
+        // healthy later-page rows). Applying the demotion once AFTER the loop keeps the failed row
+        // BEHIND the cursor: it is attempted exactly once, the healthy later-page rows all settle,
+        // and the row is bumped a single time. This is only latent because production callers use
+        // max_streams=1 (never page); the unbounded budget here pages (batch caps at MAX_BATCH).
+        let conn = db();
+        let poisoned = [0xd1_u8; 32];
+        // The unbounded batch size caps at MAX_BATCH (512), so > 512 queued rows force a second
+        // page. The poisoned oldest sits at the head of page 1; every healthy row is newer.
+        let unbounded = ContentRefoldBudget::unbounded();
+        let batch = settle_candidate_batch_size(&unbounded);
+        let healthy_count = batch + 88; // 600 for the 512 cap: spans two pages, no third empty page
+        seed_synthetic_candidates(&conn, poisoned, 1);
+        enqueue_refold(&conn, poisoned, 1); // strictly the oldest
+        let mut healthy_streams = Vec::with_capacity(healthy_count);
+        for ordinal in 0..healthy_count as u64 {
+            let stream = backlog_stream(ordinal);
+            seed_synthetic_candidates(&conn, stream, 1);
+            // All newer than the poisoned oldest (first_enqueued_at_ms >= 2), ascending by ordinal.
+            enqueue_refold(&conn, stream, i64::try_from(ordinal).unwrap() + 2);
+            healthy_streams.push(stream);
+        }
+        // Fail only the poisoned stream's queue clear: its per-stream txn rolls back, the row is
+        // retained, and it is collected for a single post-loop demotion.
+        let poison_hex: String = poisoned.iter().map(|byte| format!("{byte:02x}")).collect();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER poison_paging_queue_clear
+             BEFORE DELETE ON content_streams_pending_refold
+             WHEN OLD.stream_id = X'{poison_hex}'
+             BEGIN SELECT RAISE(ABORT, 'injected queue-clear failure'); END;"
+        ))
+        .unwrap();
+        assert!(
+            pending_refold_count(&conn) > i64::try_from(batch).unwrap(),
+            "the queue must exceed one page so the settle actually pages",
+        );
+
+        reset_settle_work_counters();
+        let report = settle_pending_content_refolds(&conn, &unbounded).unwrap();
+        let (listings, probes) = settle_work_counters();
+
+        // Fairness: every healthy row settles despite the failing oldest row on page 1.
+        assert_eq!(report.settled_streams, healthy_count, "all healthy rows settle across pages");
+        for stream in &healthy_streams {
+            assert!(!queue_contains(&conn, *stream), "no healthy row is starved by the poison");
+        }
+        // The poisoned stream is attempted, folded, and reported EXACTLY ONCE — not once per page.
+        assert_eq!(report.failures.len(), 1, "the failing oldest row fails exactly once per call");
+        assert_eq!(report.failures[0].stream_id, StreamId::from_bytes(poisoned));
+        assert!(queue_contains(&conn, poisoned), "a failed row keeps its queue mark for retry");
+        assert!(!report.queue_empty, "a failed row still leaves the queue non-empty");
+        // Bounded re-fold: one admission probe per healthy row plus ONE for the poisoned stream.
+        // With the pre-fix in-loop demotion the poisoned row re-lists on the second page and this
+        // would be `healthy_count + 2`.
+        assert_eq!(
+            probes,
+            healthy_count + 1,
+            "the poisoned stream is folded once, not re-folded on every later page",
+        );
+        assert_eq!(listings, 2, "the queue spans exactly two bounded pages");
+        // Demoted EXACTLY once: the post-loop pass runs after every healthy row has been cleared,
+        // so the queue holds only the poisoned row and `MAX + 1` bumps it from 1 to 2 a single
+        // time. The pre-fix mid-loop bump would have moved it far past the whole backlog.
+        assert_eq!(
+            stream_enqueued_at(&conn, poisoned),
+            2,
+            "the failed row is demoted (bumped) exactly once, after the paging loop",
+        );
     }
 
     /// Differential cut-binding parity harness (I11). The account control fold and the `/3` content
