@@ -9,7 +9,9 @@
 //!   Classifies events through the target globs to decide whether to fire, and debounces bursts
 //!   with a max-latency cap so sustained writes can't starve a pass.
 //! - Each pass runs the existing pipeline: discover → reconcile → (rate-limited) gc →
-//!   memory_validate. Discover handles additions/edits/deletions; the pass is idempotent.
+//!   memory_validate. Discover handles additions/edits/deletions; the pass is idempotent. A pass
+//!   whose only change is a linked-worktree overlay skips the base reconcile / clone stages and
+//!   runs just memory_validate (#817).
 //! - Passes execute on a dedicated worker thread, never on the event loop (#506): a long stage
 //!   (cold embedding backlog, clone-graph rebuild) or a blocked write-lock acquisition must not
 //!   stop events from classifying or the fleet hot-upgrade trigger from firing. One pass in flight
@@ -40,8 +42,8 @@ pub use pass::{CLONE_GRAPH_QUIET_MS, maintenance_pass, maintenance_pass_or_skip}
 #[cfg(test)]
 pub(crate) use pass::{
     Debounce, GC_EVERY_PASSES, LoopMsg, PassRequest, PassScheduler, STARTUP_CATCHUP_RUN_GC,
-    SweepClock, base_embedding_backlog_needs_tail, maybe_checkpoint_wal, should_run_pass_tail,
-    spawn_pass_worker, startup_catchup_pass,
+    SweepClock, base_embedding_backlog_needs_tail, base_tail_forced_by_state, maybe_checkpoint_wal,
+    should_run_base_tail, spawn_pass_worker, startup_catchup_pass,
 };
 #[cfg(test)]
 pub(crate) use placement::{

@@ -548,32 +548,50 @@ fn recording_watcher_trait_methods_are_covered() {
 #[test]
 fn startup_catchup_does_not_force_the_expensive_tail() {
     assert!(
-        !should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, false, false, false),
+        !should_run_base_tail(false, STARTUP_CATCHUP_RUN_GC, false, false, false),
         "an unchanged startup catch-up must not run reconcile/gc/memory validation",
     );
     assert!(
-        should_run_pass_tail(true, false, STARTUP_CATCHUP_RUN_GC, false, false, false),
+        should_run_base_tail(true, STARTUP_CATCHUP_RUN_GC, false, false, false),
         "real base content changes still run the maintenance tail",
     );
     assert!(
-        should_run_pass_tail(false, true, STARTUP_CATCHUP_RUN_GC, false, false, false),
-        "linked-worktree overlay changes still run the maintenance tail",
-    );
-    assert!(
-        should_run_pass_tail(false, false, true, false, false, false),
+        should_run_base_tail(false, true, false, false, false),
         "scheduled GC passes still force the maintenance tail",
     );
     assert!(
-        should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, true, false, false),
+        should_run_base_tail(false, STARTUP_CATCHUP_RUN_GC, true, false, false),
         "a bounded shutdown discover marks base reconcile owed for the next startup pass",
     );
     assert!(
-        should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, false, true, false),
+        should_run_base_tail(false, STARTUP_CATCHUP_RUN_GC, false, true, false),
         "startup catch-up retries an already-indexed base embedding backlog",
     );
     assert!(
-        should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, false, false, true),
+        should_run_base_tail(false, STARTUP_CATCHUP_RUN_GC, false, false, true),
         "a quiet-elapsed clone-graph backlog forces the otherwise-idle tail (#472)",
+    );
+}
+
+#[test]
+fn overlay_changes_do_not_force_the_base_tail() {
+    // #817: a changed overlay's embeddings are reconciled inline by the overlay stage, and every
+    // base-tail stage keys off `content_revision()` (base files only) — so overlay churn must not
+    // buy the corpus-scale reconcile/clone scans that are guaranteed no-ops there. The base tail
+    // is forced by base-side state only; `run_pass` still runs memory_validate on overlay-changed
+    // passes (covered by `overlay_only_pass_skips_base_tail_but_still_validates_memories`).
+    assert!(
+        !base_tail_forced_by_state(false, false, false),
+        "no base-side state forces the base tail — overlay changes are not in the force set",
+    );
+    assert!(
+        base_tail_forced_by_state(true, false, false),
+        "a base content change forces the base tail",
+    );
+    assert!(base_tail_forced_by_state(false, true, false), "the gc cadence forces the base tail");
+    assert!(
+        base_tail_forced_by_state(false, false, true),
+        "a shutdown-owed base reconcile forces the base tail",
     );
 }
 
@@ -759,6 +777,109 @@ fn startup_catchup_retries_existing_base_embedding_backlog() {
     );
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// #817 end-to-end: a maintenance pass whose only change is a dirty LINKED worktree skips the
+/// base tail (reconcile / clone delta / clone rebuild) but still validates memory anchors.
+/// Two persisted traces pin the split:
+/// - the clone quiet gate stays UNARMED across overlay-only passes (the pass carries no probe
+///   permission, so the pending-forever clone graph is neither probed nor armed — the intended
+///   trade-off: it rides overlay churn until a content, gc, or backlog pass), and a base content
+///   change then arms it on its own pass (#472 arming preserved);
+/// - a memory bound to a path that exists nowhere reaches `anchor_status = "gone"`, which the #492
+///   hysteresis only permits after TWO consecutive `memory_validate` passes — proof that both
+///   overlay-only passes ran the validate stage.
+#[test]
+fn overlay_only_pass_skips_base_tail_but_still_validates_memories() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let main =
+        std::env::temp_dir().join(format!("ragrat-watch-overlay-only-{}-{id}", std::process::id()));
+    let linked = std::env::temp_dir()
+        .join(format!("ragrat-watch-overlay-only-linked-{}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&main);
+    let _ = std::fs::remove_dir_all(&linked);
+    std::fs::create_dir_all(main.join("src")).unwrap();
+    let git = |dir: &Path, args: &[&str]| {
+        let status =
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    };
+    git(&main, &["init", "-q"]);
+    git(&main, &["config", "user.email", "t@e"]);
+    git(&main, &["config", "user.name", "t"]);
+    std::fs::write(main.join("src/lib.rs"), "pub fn base_target(x: i32) -> i32 { x + 1 }\n")
+        .unwrap();
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "seed"]);
+    let linked_arg = linked.to_string_lossy().into_owned();
+    git(&main, &["worktree", "add", "-q", "-b", "feature", &linked_arg]);
+
+    let main_root = main.canonicalize().unwrap();
+    let config = whole_root_config(&main_root, &[PathBuf::from("src")]);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let created = db
+        .memory_create(RepoMemoryCreate {
+            kind: "Risk".to_string(),
+            title: "ghost anchor".to_string(),
+            body: "observed gone by each memory_validate pass".to_string(),
+            confidence: "low".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget {
+                path: Some("src/ghost.rs".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id.clone();
+    drop(db);
+
+    // Two overlay-only passes: only the linked worktree is dirtied, base content never changes.
+    std::fs::write(linked.join("src/lib.rs"), "pub fn base_target(x: i32) -> i32 { x + 2 }\n")
+        .unwrap();
+    maintenance_pass(&config, false).unwrap();
+    std::fs::write(linked.join("src/lib.rs"), "pub fn base_target(x: i32) -> i32 { x + 3 }\n")
+        .unwrap();
+    maintenance_pass(&config, false).unwrap();
+    {
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert!(
+            !db.clone_graph_quiet_candidate_armed(),
+            "overlay-only passes neither probe nor arm the clone quiet gate — the pending clone \
+             graph rides overlay churn until a content, gc, or backlog pass (#817)"
+        );
+        let memory = db.memory_get(&memory_id).unwrap().expect("memory persists");
+        let path_binding =
+            memory.bindings.iter().find(|b| b.binding_kind == "path").expect("path binding");
+        assert_eq!(
+            path_binding.anchor_status, "gone",
+            "memory_validate ran on both overlay-only passes: the #492 hysteresis needs two \
+             consecutive gone observations to persist the downgrade"
+        );
+    }
+
+    // A base content change carries probe permission, so its pass ARMS the quiet window for the
+    // (still absent) clone graph — the #472 arming path is untouched by #817.
+    std::fs::write(main_root.join("src/lib.rs"), "pub fn base_target(x: i32) -> i32 { x + 4 }\n")
+        .unwrap();
+    maintenance_pass(&config, false).unwrap();
+    {
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert!(
+            db.clone_graph_quiet_candidate_armed(),
+            "a base content change arms the clone quiet gate on its own pass"
+        );
+    }
+
+    git(&main_root, &["worktree", "remove", "-f", &linked_arg]);
+    std::fs::remove_dir_all(&main_root).ok();
+    std::fs::remove_dir_all(&linked).ok();
 }
 
 #[test]

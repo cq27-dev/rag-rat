@@ -253,6 +253,14 @@ impl IndexDatabase {
         }
     }
 
+    /// Whether the #472 quiet gate holds an armed candidate. Watch-level tests assert the #817
+    /// posture through this (an overlay-only pass neither probes nor arms) — `repo_meta` is not
+    /// reachable from outside the `index` module tree.
+    #[cfg(test)]
+    pub(crate) fn clone_graph_quiet_candidate_armed(&self) -> bool {
+        self.clone_graph_quiet_candidate().ok().flatten().is_some()
+    }
+
     /// The armed quiet-window candidate, if any: the stale revision under observation and when it
     /// was first seen. A torn/corrupt pair reads as absent (the next probe re-arms it).
     fn clone_graph_quiet_candidate(&self) -> anyhow::Result<Option<(String, i64)>> {
@@ -1432,6 +1440,23 @@ pub(super) mod tests {
             "the probing call after a cold one arms fresh"
         );
         assert!(db.clone_graph_rebuild_due_at(50_000_000 + 300_000, 300_000, true).unwrap());
+    }
+
+    /// An ARMED candidate bypasses `probe_without_candidate = false`: an overlay-only or idle
+    /// pass — which carries no probe permission since #817 — still fires a quiet-elapsed owed
+    /// rebuild. Arming is what needs permission (a content/gc/backlog pass); firing is not.
+    #[test]
+    fn clone_graph_quiet_gate_fires_an_armed_candidate_without_probe_permission() {
+        let db = build_clone_fixture("quiet-gate-armed-fires");
+        assert!(!db.clone_graph_rebuild_due_at(1_000, 300_000, true).unwrap(), "arm");
+        assert!(
+            !db.clone_graph_rebuild_due_at(2_000, 300_000, false).unwrap(),
+            "armed but not quiet-elapsed: not due"
+        );
+        assert!(
+            db.clone_graph_rebuild_due_at(1_000 + 300_000, 300_000, false).unwrap(),
+            "a quiet-elapsed armed candidate fires on a pass with no probe permission"
+        );
     }
 
     /// Once the graph is current the gate reports not-due and drops the armed candidate, so idle

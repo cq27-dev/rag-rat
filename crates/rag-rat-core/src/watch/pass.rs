@@ -307,14 +307,10 @@ fn run_pass(
     let overlays_changed = timings.stage("overlays", || {
         refresh_worktree_overlays(&mut db, config, Some(&budget), overlay_scope)
     });
-    let tail_already_forced = pass_tail_forced_by_state(
-        content_changed,
-        overlays_changed,
-        run_gc,
-        shutdown_reconcile_pending,
-    );
+    let base_tail_forced =
+        base_tail_forced_by_state(content_changed, run_gc, shutdown_reconcile_pending);
     let base_embedding_backlog = base_embedding_backlog_needs_tail(
-        tail_already_forced,
+        base_tail_forced,
         retry_base_embedding_backlog,
         &budget,
         |options| {
@@ -322,78 +318,93 @@ fn run_pass(
                 .is_ok_and(|pending| pending > 0)
         },
     );
-    // Clone-graph quiet gate (#472): one probe serves two roles. Inside the tail it REPLACES the
-    // bare `pending_clone_graph` check — a pass during active editing arms/re-arms the quiet
+    // Clone-graph quiet gate (#472): one probe serves two roles. Inside the base tail it REPLACES
+    // the bare `pending_clone_graph` check — a pass during active editing arms/re-arms the quiet
     // window instead of discarding the in-flight generation and rebuilding the whole graph — and
-    // on an otherwise-idle pass a quiet-elapsed backlog FORCES the tail (like the embedding
+    // on an otherwise-idle pass a quiet-elapsed armed backlog FORCES the tail (like the embedding
     // backlog above) so the owed rebuild lands right after the churn pauses rather than waiting
-    // for a gc pass. Unlike the embedding probe it must also run whenever the tail will run —
-    // including a startup embedding-backlog tail, which doesn't flip `tail_already_forced` — so
-    // every tail pass can at least ARM an unarmed pending graph (else it rides until a content
-    // change or gc pass). When nothing runs the tail the probe stays cheap: without an armed
-    // candidate it skips the content-revision digest entirely.
+    // for a gc pass. Probe permission is "the base tail already runs" — including a startup
+    // embedding-backlog tail, which doesn't flip `base_tail_forced` — so every base-tail pass can
+    // at least ARM an unarmed pending graph. Overlay-only passes deliberately carry NO permission
+    // (#817): overlay churn never moves `content_revision()` (it digests base files only), so an
+    // unarmed probe there could only re-observe the same base staleness while paying the
+    // corpus-scale revision digest every pass. An unarmed pending graph therefore rides overlay
+    // churn until a content, gc, or backlog pass arms it; an ALREADY-ARMED candidate still probes
+    // on every pass — candidate presence bypasses the permission — so a quiet-elapsed owed
+    // rebuild lands even mid-churn. When nothing is armed and nothing grants permission the gate
+    // costs one meta read.
     let clone_graph_due = db
-        .clone_graph_rebuild_due(
-            CLONE_GRAPH_QUIET_MS,
-            tail_already_forced || base_embedding_backlog,
-        )
+        .clone_graph_rebuild_due(CLONE_GRAPH_QUIET_MS, base_tail_forced || base_embedding_backlog)
         .unwrap_or(false);
-    // Idle backstop (issue #63, facet 2): when the sweep changed no content, skip the reconcile /
-    // gc / memory-validate tail — an idle server should do no work past discovery. `run_gc` (every
-    // GC_EVERY_PASSES) still forces a full tail, so the cases that DON'T flip content_changed are
-    // still caught within that bound: a freshly-installed embedder, an embedding backlog left by a
-    // time-capped reconcile (PASS_RECONCILE_MAX_SECONDS), and drifted memory anchors. Any real
-    // content change runs the full tail immediately. Startup has two discover-only exceptions:
-    // a prior bounded shutdown discover that marked base reconcile owed, and an already-indexed
-    // base embedding backlog left by a time-capped or blocked prior pass.
+    // Idle backstop (issue #63, facet 2): when the sweep changed nothing, skip everything past
+    // discovery — an idle server should do no work. `run_gc` (every GC_EVERY_PASSES) still forces
+    // a full tail, so the cases that DON'T flip content_changed are still caught within that
+    // bound: a freshly-installed embedder, an embedding backlog left by a time-capped reconcile
+    // (PASS_RECONCILE_MAX_SECONDS), and drifted memory anchors. Any real content change runs the
+    // full tail immediately. Startup has two discover-only exceptions: a prior bounded shutdown
+    // discover that marked base reconcile owed, and an already-indexed base embedding backlog
+    // left by a time-capped or blocked prior pass.
     // A pass with no content/overlay change is the quiet moment WAL hygiene waits for (#482) —
     // whether or not something else (gc, a backlog, the clone gate) still forces the tail below.
     let quiet_pass = !content_changed && !overlays_changed;
-    if !should_run_pass_tail(
+    // Overlay changes do NOT force the base tail (#817): the overlay stage above already
+    // reconciled a changed overlay's embeddings inline, and every base stage keys off
+    // `content_revision()` (base files only) — on an overlay-only pass the base reconcile is
+    // already Current and the clone delta is a guaranteed no-op that still pays two revision
+    // scans plus a corpus-scale `delta_paths` sweep (measured 66–94 s per pass under worktree
+    // churn). Such a pass runs only `memory_validate` below — cheap next to the base stages, and
+    // overlay edits can move memory anchors.
+    let run_base_tail = should_run_base_tail(
         content_changed,
-        overlays_changed,
         run_gc,
         shutdown_reconcile_pending,
         base_embedding_backlog,
         clone_graph_due,
-    ) {
+    );
+    if !run_base_tail && !overlays_changed {
         timings.stage("wal", || {
             maybe_checkpoint_wal(&db, quiet_pass, crate::index::WAL_CHECKPOINT_MIN_BYTES)
         });
         timings.emit(false, content_changed, overlays_changed);
         return Ok(());
     }
-    // The base reconcile gets only the budget the overlays left behind; `None` → already exhausted,
-    // so skip it (the embedding backlog rides the next pass) rather than spend a fresh full budget.
     let mut base_reconcile_status = None;
-    if let Some(options) = budget.next_options() {
-        let report =
-            timings.stage("reconcile", || db.reconcile_with_options_progress(options, |_| {}))?;
-        base_reconcile_status = Some(report.status);
-    }
-    // Clone-edge graph (#286/#473): try the cheap IN-PLACE delta first — it settles an ordinary
-    // edit on this very pass (freshness is the point; no quiet window) and reports whether a FULL
-    // rebuild is still owed (accumulated df drift). The full rebuild runs only when the delta
-    // could not settle freshness (absent generation, normalizer bump, cap crossing, huge delta,
-    // error) or a drift refresh is owed — and it stays behind the #472 quiet window
-    // (`clone_graph_due`) so sustained editing defers it instead of treadmilling. Best-effort +
-    // resumable, with whatever budget the embedding reconcile left (shared
-    // PASS_RECONCILE_MAX_SECONDS so a pass can't overrun); `None` budget → rides the next pass.
-    let clone_full_rebuild_owed = match timings
-        .stage("clone_delta", || db.apply_clone_graph_delta(crate::index::CLONE_DELTA_MAX_FILES))
-    {
-        Ok(delta) if delta.status == "Applied" || delta.status == "Noop" => delta.full_rebuild_owed,
-        _ => true,
-    };
-    if clone_full_rebuild_owed
-        && clone_graph_due
-        && let Some(options) = budget.next_options()
-    {
-        let _ = timings
-            .stage("clone_rebuild", || db.reconcile_clone_edges_with_budget(options.max_seconds));
-    }
-    if run_gc {
-        let _ = timings.stage("gc", || db.garbage_collect());
+    if run_base_tail {
+        // The base reconcile gets only the budget the overlays left behind; `None` → already
+        // exhausted, so skip it (the embedding backlog rides the next pass) rather than spend a
+        // fresh full budget.
+        if let Some(options) = budget.next_options() {
+            let report = timings
+                .stage("reconcile", || db.reconcile_with_options_progress(options, |_| {}))?;
+            base_reconcile_status = Some(report.status);
+        }
+        // Clone-edge graph (#286/#473): try the cheap IN-PLACE delta first — it settles an
+        // ordinary edit on this very pass (freshness is the point; no quiet window) and reports
+        // whether a FULL rebuild is still owed (accumulated df drift). The full rebuild runs only
+        // when the delta could not settle freshness (absent generation, normalizer bump, cap
+        // crossing, huge delta, error) or a drift refresh is owed — and it stays behind the #472
+        // quiet window (`clone_graph_due`) so sustained editing defers it instead of
+        // treadmilling. Best-effort + resumable, with whatever budget the embedding reconcile
+        // left (shared PASS_RECONCILE_MAX_SECONDS so a pass can't overrun); `None` budget → rides
+        // the next pass.
+        let clone_full_rebuild_owed = match timings.stage("clone_delta", || {
+            db.apply_clone_graph_delta(crate::index::CLONE_DELTA_MAX_FILES)
+        }) {
+            Ok(delta) if delta.status == "Applied" || delta.status == "Noop" =>
+                delta.full_rebuild_owed,
+            _ => true,
+        };
+        if clone_full_rebuild_owed
+            && clone_graph_due
+            && let Some(options) = budget.next_options()
+        {
+            let _ = timings.stage("clone_rebuild", || {
+                db.reconcile_clone_edges_with_budget(options.max_seconds)
+            });
+        }
+        if run_gc {
+            let _ = timings.stage("gc", || db.garbage_collect());
+        }
     }
     let _ = timings.stage("memory_validate", || db.memory_validate());
     if shutdown_reconcile_pending && base_reconcile_status.as_deref() == Some("Current") {
@@ -484,38 +495,41 @@ pub(crate) fn maybe_checkpoint_wal(db: &IndexDatabase, quiet_pass: bool, min_byt
     }
 }
 
-pub(crate) fn should_run_pass_tail(
+/// Whether the base-scope tail runs: reconcile → clone delta / rebuild → gc. Overlay changes are
+/// deliberately absent from this set (#817): the overlay stage reconciles a changed overlay's
+/// embeddings inline, and every base stage keys off `content_revision()` (base files only), so an
+/// overlay-only pass could only pay corpus-scale scans to discover there is nothing to do. An
+/// overlay-only pass still runs `memory_validate` — see `run_pass`.
+pub(crate) fn should_run_base_tail(
     content_changed: bool,
-    overlays_changed: bool,
     run_gc: bool,
     shutdown_reconcile_pending: bool,
     base_embedding_backlog: bool,
     clone_graph_due: bool,
 ) -> bool {
-    content_changed
-        || overlays_changed
-        || run_gc
-        || shutdown_reconcile_pending
+    base_tail_forced_by_state(content_changed, run_gc, shutdown_reconcile_pending)
         || base_embedding_backlog
         || clone_graph_due
 }
 
-pub(crate) fn pass_tail_forced_by_state(
+/// The state that forces the base tail before any probe runs. The backlog probe SKIPS when one of
+/// these holds (the forced tail inspects the backlog anyway, #459), and the clone quiet gate takes
+/// it as probe permission (#472) — see the call sites in `run_pass`.
+pub(crate) fn base_tail_forced_by_state(
     content_changed: bool,
-    overlays_changed: bool,
     run_gc: bool,
     shutdown_reconcile_pending: bool,
 ) -> bool {
-    content_changed || overlays_changed || run_gc || shutdown_reconcile_pending
+    content_changed || run_gc || shutdown_reconcile_pending
 }
 
 pub(crate) fn base_embedding_backlog_needs_tail(
-    tail_already_forced: bool,
+    base_tail_forced: bool,
     retry_base_embedding_backlog: bool,
     budget: &ReconcileBudget,
     pending_embedding_jobs: impl FnOnce(&ReconcileOptions) -> bool,
 ) -> bool {
-    if tail_already_forced || !retry_base_embedding_backlog {
+    if base_tail_forced || !retry_base_embedding_backlog {
         return false;
     }
     budget.next_options().is_some_and(|options| pending_embedding_jobs(&options))
