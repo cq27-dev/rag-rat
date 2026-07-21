@@ -1043,10 +1043,12 @@ fn startup_catchup_keeps_shutdown_marker_when_reconcile_is_blocked() {
 }
 
 #[test]
-fn wal_checkpoint_runs_on_quiet_passes_only() {
-    // #482: the TRUNCATE checkpoint waits on concurrent readers up to the busy timeout, so a
-    // churn pass (content changed) must never attempt it; it lands on the first quiet pass
-    // after editing pauses — the same deferral posture as the clone-graph rebuild.
+fn wal_checkpoint_runs_at_every_pass_terminal_gated_by_size_alone() {
+    // #818: with `wal_autocheckpoint = 0` on every read-write connection, the pass-terminal
+    // checkpoint is the ONLY thing folding the WAL back into the main file — so it must fire on
+    // churn passes too (the pre-#818 quiet-only gate would let the sidecar grow without bound
+    // under sustained editing, where quiet passes almost never happen). The size threshold is
+    // the one remaining gate.
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
@@ -1063,17 +1065,17 @@ fn wal_checkpoint_runs_on_quiet_passes_only() {
     db.clear_watch_shutdown_reconcile_pending().unwrap();
     assert!(db.database_file_health().unwrap().wal_bytes > 0);
 
-    maybe_checkpoint_wal(&db, false, 1);
+    maybe_checkpoint_wal(&db, u64::MAX);
     assert!(
         db.database_file_health().unwrap().wal_bytes > 0,
-        "a churn pass must leave the WAL alone"
+        "an under-threshold WAL is left alone — the probe is a bare stat"
     );
 
-    maybe_checkpoint_wal(&db, true, 1);
+    maybe_checkpoint_wal(&db, 1);
     assert_eq!(
         db.database_file_health().unwrap().wal_bytes,
         0,
-        "a quiet pass truncates the oversized WAL"
+        "an oversized WAL is truncated with no quiet-pass precondition"
     );
 
     let _ = std::fs::remove_dir_all(&root);

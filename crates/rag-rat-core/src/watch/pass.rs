@@ -344,9 +344,6 @@ fn run_pass(
     // full tail immediately. Startup has two discover-only exceptions: a prior bounded shutdown
     // discover that marked base reconcile owed, and an already-indexed base embedding backlog
     // left by a time-capped or blocked prior pass.
-    // A pass with no content/overlay change is the quiet moment WAL hygiene waits for (#482) —
-    // whether or not something else (gc, a backlog, the clone gate) still forces the tail below.
-    let quiet_pass = !content_changed && !overlays_changed;
     // Overlay changes do NOT force the base tail (#817): the overlay stage above already
     // reconciled a changed overlay's embeddings inline, and every base stage keys off
     // `content_revision()` (base files only) — on an overlay-only pass the base reconcile is
@@ -362,9 +359,7 @@ fn run_pass(
         clone_graph_due,
     );
     if !run_base_tail && !overlays_changed {
-        timings.stage("wal", || {
-            maybe_checkpoint_wal(&db, quiet_pass, crate::index::WAL_CHECKPOINT_MIN_BYTES)
-        });
+        timings.stage("wal", || maybe_checkpoint_wal(&db, crate::index::WAL_CHECKPOINT_MIN_BYTES));
         timings.emit(false, content_changed, overlays_changed);
         return Ok(());
     }
@@ -410,9 +405,7 @@ fn run_pass(
     if shutdown_reconcile_pending && base_reconcile_status.as_deref() == Some("Current") {
         db.clear_watch_shutdown_reconcile_pending()?;
     }
-    timings.stage("wal", || {
-        maybe_checkpoint_wal(&db, quiet_pass, crate::index::WAL_CHECKPOINT_MIN_BYTES)
-    });
+    timings.stage("wal", || maybe_checkpoint_wal(&db, crate::index::WAL_CHECKPOINT_MIN_BYTES));
     timings.emit(true, content_changed, overlays_changed);
     Ok(())
 }
@@ -469,16 +462,14 @@ impl PassTimings {
     }
 }
 
-/// Opportunistic WAL hygiene (#482), on QUIET passes only: nothing else truncates the shared
-/// database's `-wal`, so it keeps its high-water mark forever without this. During sustained
-/// editing every pass has content changes, so the truncate — which waits on concurrent readers up
-/// to the busy timeout — defers exactly like the clone-graph rebuild and lands once churn pauses.
-/// Under `min_bytes` the probe is a bare stat of the sidecar, free on idle passes. Best-effort: a
-/// busy or failed checkpoint just rides the next quiet pass, and never fails the pass itself.
-pub(crate) fn maybe_checkpoint_wal(db: &IndexDatabase, quiet_pass: bool, min_bytes: u64) {
-    if !quiet_pass {
-        return;
-    }
+/// WAL hygiene at the terminal of EVERY pass (#482, #818). Every read-write connection runs with
+/// `wal_autocheckpoint = 0` (no mid-pass passive checkpoints thrashing the main file), so this
+/// call is the watcher's one deliberate fold point — restricting it to quiet passes would let the
+/// sidecar grow without bound under sustained editing, where quiet passes almost never happen.
+/// Size-gated: under `min_bytes` the probe is a bare stat of the sidecar, free on idle passes.
+/// Best-effort: the TRUNCATE waits on concurrent readers only within the busy timeout, and a busy
+/// or failed checkpoint just rides the next pass, never failing the pass itself.
+pub(crate) fn maybe_checkpoint_wal(db: &IndexDatabase, min_bytes: u64) {
     match db.checkpoint_wal_if_oversized(min_bytes) {
         Ok(report) if report.attempted => {
             tracing::debug!(

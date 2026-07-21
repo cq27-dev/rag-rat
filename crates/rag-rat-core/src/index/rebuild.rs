@@ -121,6 +121,14 @@ impl IndexDatabase {
         // and safe under concurrency; do NOT touch `temp_store` (it would drop the
         // connection_context overlay temp table `set_context_at_generation` created above).
         db.storage.execute_batch("PRAGMA cache_size = -262144;")?;
+        // Connections open with `wal_autocheckpoint = 0` (#818) — right for watcher passes, whose
+        // pass-terminal checkpoint folds each pass's WAL, but a FULL rebuild stages a whole
+        // generation on this one connection, and with no autocheckpoint at all its WAL would peak
+        // at the entire rebuild's write volume. Restore a COARSE autocheckpoint for the bulk build
+        // (25600 pages ≈ 100 MiB at the 4 KiB default page size): folding every ~100 MiB bounds
+        // peak disk without the per-4-MiB thrash the SQLite default caused. The diagnostic
+        // override below still wins when set.
+        db.storage.execute_batch("PRAGMA wal_autocheckpoint = 25600;")?;
         maybe_set_sqlite_soft_heap_limit();
         // Diagnostic: override wal_autocheckpoint for this rebuild. No-op unless
         // RAG_RAT_WAL_AUTOCHECKPOINT is set.
@@ -330,6 +338,12 @@ impl IndexDatabase {
             let _ = db.storage.execute_batch("ROLLBACK");
         }
         // cache_size is left bumped — harmless for the short remaining lifetime of the connection.
+        // The coarse bulk-build autocheckpoint is NOT left in place: watcher heals and startup
+        // catch-up KEEP the returned connection for later passes, and a lingering autocheckpoint
+        // would fire passive checkpoints mid-pass — exactly what `wal_autocheckpoint = 0` at open
+        // exists to prevent (#818). Restore it on success AND failure; best-effort, since a failed
+        // restore only leaves the coarser cadence behind.
+        let _ = db.storage.execute_batch("PRAGMA wal_autocheckpoint = 0;");
         result?;
         // Poison-sibling test harness (compiled out of production): after the rebuild flips,
         // register a second `poison-sibling` repo with tripwire rows in every repo-scoped

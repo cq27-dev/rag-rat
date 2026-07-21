@@ -74,7 +74,12 @@ pub(crate) fn create_memory(
     // Authored write: commit durably so a `memory_create` that returned success survives power loss
     // (#560). FULL for this transaction only; the connection restores NORMAL on drop.
     let _durability = authoring::AuthoredDurability::begin(conn)?;
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE, not deferred: memory writes are the sanctioned flock-less writers on the shared
+    // database, racing foreign repos' rebuilds by design. A deferred txn that READS first (the
+    // tombstone check below) and then upgrades to write fails with SQLITE_BUSY_SNAPSHOT the moment
+    // a concurrent writer committed in between — and that error BYPASSES the busy handler, so
+    // busy_timeout never gets a say. Taking the write lock up front waits it out instead (#818).
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // #767: revalidate the removal tombstone INSIDE the write txn — a connection that resolved its
     // active scope before `rm` ran must fail closed here rather than stamp the removed `repo_id`
     // onto a fresh row after the purge.
@@ -271,7 +276,10 @@ pub(crate) fn rebind_memory(
     // so it commits durably even though it does not yet mint a signed op (it will ride the FULL
     // path for free once it does). NORMAL restored on drop.
     let _durability = authoring::AuthoredDurability::begin(conn)?;
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE for the same reason as `create_memory`: `resolve_binding` READS before the writes
+    // below, and a deferred read→write upgrade racing a foreign repo's rebuild dies with
+    // SQLITE_BUSY_SNAPSHOT, which the busy handler never sees.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Rebind MUST name an anchor — moving a memory to "no binding" is meaningless (delete/recreate
     // it unanchored instead). Only `create_memory` accepts the unanchored (`None`) case (#463).
     let binding = resolve_binding(conn, &bind)?.ok_or_else(|| {

@@ -155,10 +155,31 @@ impl IndexConnection {
         // pragma itself briefly needs the lock and would otherwise fail fast under a concurrent
         // writer (#220). It makes a connection wait out a writer (the watcher mid-pass, a lazy
         // heal) instead of failing with SQLITE_BUSY — WAL allows one writer at a time.
+        //
+        // The write-path memory knobs (#815) also live here, at open — BEFORE any temp object
+        // exists on the connection: SQLite silently DROPS every existing temp table/view when
+        // `temp_store` changes, and the scope view installs a temp overlay right after open, so
+        // this batch is the only safe point to set it. Against the ~2 MiB default page cache,
+        // sorts and temp b-trees spilled to disk as external merges (measured on a live watcher:
+        // ~2.0 GB written to /var/tmp temp files in 27 min, 743 MB of it funneled through one
+        // ~25 MB temp b-tree); an in-memory temp store plus a 64 MiB page cache (negative
+        // `cache_size` is KiB) absorbs those working sets. Per-connection and a cap, not a
+        // preallocation; bulk rebuilds raise the cache further on their own connection.
+        //
+        // `wal_autocheckpoint = 0` (#818): the default passive autocheckpoint (~4 MiB) fires
+        // dozens of times inside one write burst, thrashing pages back into the main file while
+        // the WAL never shrinks (measured alongside the above: 947 MB WAL writes, 199 MB main-db
+        // write-back in 27 min). WAL folding belongs to the DELIBERATE checkpoint sites instead —
+        // the watcher's pass-terminal checkpoint, the git-hook maintenance pass, and SQLite's
+        // last-connection-close checkpoint — all size-gated or terminal, so disabling the mid-burst
+        // autocheckpoint is safe only because those sites exist. `synchronous` stays NORMAL.
         self.conn.execute_batch(
             "
             PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = ON;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA cache_size = -65536;
+            PRAGMA wal_autocheckpoint = 0;
             ",
         )?;
         // The delete→WAL transition needs an EXCLUSIVE lock, and SQLite deliberately does NOT run
@@ -222,6 +243,37 @@ mod tests {
         assert_eq!(n, 0);
         let err = ro.connection().execute("INSERT INTO index_meta(key, value) VALUES('x','y')", []);
         assert!(err.is_err(), "read-only connection must reject writes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn setup_pins_the_write_path_pragmas() {
+        let dir = std::env::temp_dir().join(format!(
+            "ragrat-setup-pragmas-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let rw = IndexConnection::open(&db).unwrap();
+        let pragma = |name: &str| -> i64 {
+            rw.connection().query_row(&format!("PRAGMA {name}"), [], |row| row.get(0)).unwrap()
+        };
+
+        // #815: temp b-trees/tables must stay in memory (2 = MEMORY), never spill to /var/tmp
+        // external-merge files, and the page cache is a bounded 64 MiB (negative form = KiB).
+        assert_eq!(pragma("temp_store"), 2, "temp_store must be MEMORY");
+        assert_eq!(pragma("cache_size"), -65536, "page cache must be a bounded 64 MiB");
+        // #818: no mid-burst passive autocheckpoints — the deliberate checkpoint sites (the
+        // watcher pass terminal, the maintenance pass, last-close) own WAL folding.
+        assert_eq!(pragma("wal_autocheckpoint"), 0, "passive autocheckpoint must be off");
+        // The durability pairing those knobs rely on: WAL journaling with synchronous = NORMAL
+        // (never OFF — the shared-database global constraint).
+        let mode: String =
+            rw.connection().query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(pragma("synchronous"), 1, "synchronous must stay NORMAL");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
