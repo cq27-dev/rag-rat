@@ -3454,7 +3454,7 @@ fn migration_082_is_the_tip_and_accounts_for_content_refold_work() {
             )
         };
 
-    // Reconstruct the previous tip: retain the V079 distill snapshot migration and its data, but
+    // Reconstruct the previous tip: retain the V081 distill migrations and their data, but
     // restore the V072 queue shape and remove every V082 object before replaying only V082.
     conn.execute_batch(
         "DROP TRIGGER content_stream_stats_after_insert;
@@ -3476,10 +3476,10 @@ fn migration_082_is_the_tip_and_accounts_for_content_refold_work() {
         rusqlite::params![vec![0x11u8; 32], vec![0x33u8; 32]],
     )
     .unwrap();
-    truncate_schema_to(&conn, 79);
+    truncate_schema_to(&conn, 81);
 
     schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 80);
+    assert_eq!(schema::status(&conn).unwrap().current_version, 82);
 
     let queued: Vec<(Vec<u8>, i64, i64, i64)> = conn
         .prepare(
