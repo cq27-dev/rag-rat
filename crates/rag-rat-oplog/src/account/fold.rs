@@ -36,6 +36,18 @@ pub(super) const CONTROL_LOG: u8 = 0;
 /// log, and a `CutExtend { chain_kind: Secrets }` raises it — the same register machinery the
 /// control chain uses, keyed at `log: SECRETS_LOG` instead of `log: CONTROL_LOG`.
 pub(super) const SECRETS_LOG: u8 = 1;
+/// The account ANNEX log — authority-inert bookkeeping artifacts (C6 snapshots, #609). It is 3, not
+/// 2: `ChainKind::Content = 2` already names the content chain on the register/cut axis, so a
+/// `CutExtend { chain_kind: Content }` means "log 2" and a second meaning for that number would be
+/// ambiguous.
+///
+/// Nothing here ever folds. Entries on this log are stored, retained header-only, and can never
+/// mint authority, shift `effective_count`, or enter control-chain branch selection — that
+/// inertness is TOPOLOGICAL (the `foldable` gate below short-circuits on `log_id`, before any tag
+/// dispatch), not a property some future arm has to remember to preserve. That is precisely why an
+/// authority-inert artifact must not ride the control log: a never-effective entry in a control
+/// chain orphans every later entry from that device (#809).
+pub(super) const ANNEX_LOG: u8 = 3;
 /// The account-op version this fold understands. A known `entry_type` at a different version may
 /// reuse the tag with new semantics, so it is retained-unfolded rather than folded as today's op.
 pub(super) const SUPPORTED_OP_VERSION: u32 = 1;

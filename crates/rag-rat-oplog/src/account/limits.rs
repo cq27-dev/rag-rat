@@ -37,6 +37,13 @@ pub(super) const CONTENT_CUTS_MAX: usize = 1024;
 /// §18a — max wrap recipients in a `StreamKeyWrap`. Consumed by C4 (key wraps); pinned here now so
 /// the whole §18a set is frozen together at C1.
 pub(super) const WRAP_RECIPIENTS_MAX: usize = 1024;
+/// §18a — max coverage targets in a snapshot manifest. Consumed by C6. A decoder bound has to be a
+/// VALIDITY limit, not a local quota: two implementations that bound the same array differently
+/// would accept different entries on the same signed log.
+pub(super) const SNAPSHOT_TARGETS_MAX: usize = 256;
+/// §18a — max covered watermarks within ONE snapshot target. Bounded by roster size, so it matches
+/// [`WRAP_RECIPIENTS_MAX`]; the 64 KiB envelope is the binding constraint in practice.
+pub(super) const SNAPSHOT_COVERED_MAX: usize = 1024;
 
 #[cfg(test)]
 mod tests {
@@ -58,6 +65,8 @@ mod tests {
         // §18a: a violation is a structural reject in every impl, and changing one of these is a
         // deliberate wire bump. Pin the exact values so a drift breaks the build, not a live peer.
         assert_eq!(ACCOUNT_ENVELOPE_MAX_BYTES, 65_536);
+        assert_eq!(SNAPSHOT_TARGETS_MAX, 256);
+        assert_eq!(SNAPSHOT_COVERED_MAX, 1024);
         assert_eq!(CONTENT_ENVELOPE_MAX_BYTES, 262_144);
         assert_eq!(DEVICE_CUTS_MAX, 256);
         assert_eq!(CONTENT_CUTS_MAX, 1_024);

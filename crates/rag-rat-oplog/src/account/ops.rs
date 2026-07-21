@@ -749,7 +749,7 @@ fn decode_opt_str(d: &mut Decoder<'_>) -> Result<Option<String>, CborError> {
 }
 
 /// `Some(b32)` → a 32-byte bstr; `None` → CBOR `null`.
-fn encode_opt_b32(enc: &mut Encoder<&mut Vec<u8>>, value: Option<[u8; 32]>) {
+pub(in crate::account) fn encode_opt_b32(enc: &mut Encoder<&mut Vec<u8>>, value: Option<[u8; 32]>) {
     match value {
         Some(value) => {
             enc.bytes(&value).expect(INFALLIBLE);
@@ -760,7 +760,10 @@ fn encode_opt_b32(enc: &mut Encoder<&mut Vec<u8>>, value: Option<[u8; 32]>) {
     }
 }
 
-fn decode_opt_b32(d: &mut Decoder<'_>, field: &str) -> Result<Option<[u8; 32]>, CborError> {
+pub(in crate::account) fn decode_opt_b32(
+    d: &mut Decoder<'_>,
+    field: &str,
+) -> Result<Option<[u8; 32]>, CborError> {
     if d.datatype()? == Type::Null {
         d.null()?;
         Ok(None)

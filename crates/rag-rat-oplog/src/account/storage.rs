@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
-use super::{AccountId, content, fold, secrets};
+use super::{AccountId, content, fold, secrets, snapshot};
 use crate::cbor;
 use crate::device::{DevicePublic, DeviceX25519Public};
 use crate::op::DeviceFingerprint;
@@ -1867,6 +1867,28 @@ fn is_current_secrets_plaintext(header: &AccountEntryHeader) -> bool {
         && header.op_version == fold::SUPPORTED_OP_VERSION
 }
 
+/// The annex-plaintext predicate (C6): a current-version, plaintext entry on the annex log.
+fn is_current_annex_plaintext(header: &AccountEntryHeader) -> bool {
+    header.log_id == fold::ANNEX_LOG
+        && header.crypto_suite == 0
+        && header.op_version == fold::SUPPORTED_OP_VERSION
+}
+
+/// A SEALED snapshot is a contradiction, not a forward-version entry to retain: the manifest's
+/// entire §4.7 value is that a peer can verify coverage WITHOUT the plaintext, so a snapshot whose
+/// manifest is ciphertext can never serve its one purpose. Refuse it rather than storing opaque
+/// bytes that no binary — present or future — could interpret as a coverage claim.
+///
+/// Scoped to the snapshot TAG, not the annex log: `crypto_suite` is in the clear header, and a
+/// later annex artifact class may legitimately be sealed. Blanket-rejecting every sealed annex
+/// entry would spend that option for nothing.
+fn is_sealed_snapshot(header: &AccountEntryHeader) -> bool {
+    header.log_id == fold::ANNEX_LOG
+        && header.op_version == fold::SUPPORTED_OP_VERSION
+        && header.entry_type == snapshot::ops::entry_type::SNAPSHOT
+        && header.crypto_suite != 0
+}
+
 fn validate_storable_header_payload(
     header: &AccountEntryHeader,
     payload: &[u8],
@@ -1883,6 +1905,15 @@ fn validate_storable_header_payload(
         // unvalidated (it is slot-eligible, folded by a newer binary).
         secrets::validate_storable_secrets_payload(header.entry_type, payload)
             .map_err(|err| format!("secrets op payload decode failed: {err}"))?;
+    } else if is_sealed_snapshot(header) {
+        return Err("snapshot manifests must be plaintext-signed (crypto_suite 0)".to_string());
+    } else if is_current_annex_plaintext(header) {
+        // The annex-plaintext twin (C6): a known annex tag is fully validated so a garbage manifest
+        // can never chain; an unknown tag is retained opaque. This is STRUCTURAL only — whether the
+        // manifest's coverage claim is true is a read-time question, and asking it here would make
+        // storage depend on what this device happens to hold.
+        snapshot::ops::validate_storable_snapshot_payload(header.entry_type, payload)
+            .map_err(|err| format!("annex op payload decode failed: {err}"))?;
     }
     Ok(())
 }
@@ -3121,6 +3152,163 @@ mod tests {
             "the DeviceAdd runs the sweep exactly once",
         );
         assert_eq!(parked(&conn), 0, "the DeviceAdd promotes the parked content");
+    }
+
+    #[test]
+    fn an_annex_entry_is_stored_inert_and_never_touches_control_acceptance() {
+        // #609 C6: the annex log (3) exists so a bookkeeping artifact can be authority-INERT by
+        // topology. Two properties, and both must hold on a binary that knows nothing about it:
+        // it is stored and retained header-only, and the control chain is completely unaffected.
+        //
+        // `entry_type = 0` is deliberate: on log 0 that is `AccountGenesis`, so this also proves
+        // the log gate runs BEFORE any tag dispatch and an annex tag can never be misread as the
+        // control tag with the same number.
+        let conn = db();
+        let founder = Dev::new(0x81);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        let manifest = snapshot::ops::encode(&snapshot::ops::SnapshotOp::Snapshot {
+            state_format_version: snapshot::ops::SNAPSHOT_STATE_FORMAT_V1,
+            moderation_epoch: 0,
+            targets: Vec::new(),
+        })
+        .unwrap();
+        let header = AccountEntryHeader {
+            account_id,
+            log_id: fold::ANNEX_LOG,
+            device_fingerprint: founder.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: snapshot::ops::entry_type::SNAPSHOT,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: Some(genesis_hash),
+        };
+        let annex = sign_account_entry(&founder.secret, &header, &manifest).unwrap();
+        assert_eq!(
+            account_ingest(&conn, &annex.signed_bytes, NOW + 1).unwrap(),
+            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+            "an annex entry is stored and retained, never folded and never rejected",
+        );
+
+        // The control chain is untouched: a later control op still accepts at its own seq. This is
+        // the property a never-effective entry on log 0 would break (#809).
+        let member = Dev::new(0x82);
+        let (add_bytes, add_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&member, DeviceRole::Member),
+        );
+        account_ingest(&conn, &add_bytes, NOW + 2).unwrap();
+        assert_eq!(status(&conn, &genesis_hash).as_deref(), Some("accepted"));
+        assert_eq!(
+            status(&conn, &add_hash).as_deref(),
+            Some("accepted"),
+            "the annex entry did not orphan the control chain",
+        );
+        assert_eq!(status(&conn, &annex.entry_hash).as_deref(), Some("retained_unfolded"));
+    }
+
+    #[test]
+    fn a_garbage_annex_manifest_is_refused_at_ingest() {
+        // The manifest is structurally validated at ingest (the per-log twin of the control and
+        // secrets validators), so garbage can never chain — even though nothing folds this log.
+        let conn = db();
+        let founder = Dev::new(0x83);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        let header = AccountEntryHeader {
+            account_id,
+            log_id: fold::ANNEX_LOG,
+            device_fingerprint: founder.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: snapshot::ops::entry_type::SNAPSHOT,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: Some(genesis_hash),
+        };
+        // A CBOR map where the manifest wire requires a 3-element array.
+        let garbage = sign_account_entry(&founder.secret, &header, &[0xa1, 0x01, 0x02]).unwrap();
+        let outcome = account_ingest(&conn, &garbage.signed_bytes, NOW + 1).unwrap();
+        assert!(
+            matches!(&outcome, IngestOutcome::Rejected(err) if err.contains("annex op payload")),
+            "a structurally invalid manifest is rejected, not stored: {outcome:?}",
+        );
+        assert_eq!(status(&conn, &garbage.entry_hash), None, "and it never became a chain link");
+
+        // An UNKNOWN annex tag is the forward-compat case and must still be stored — it is a valid
+        // chain link for a binary that does not know it, exactly like an unknown secrets tag.
+        let forward = sign_account_entry(
+            &founder.secret,
+            &AccountEntryHeader { entry_type: 7, ..header },
+            &[0x81, 0x01],
+        )
+        .unwrap();
+        assert_eq!(
+            account_ingest(&conn, &forward.signed_bytes, NOW + 2).unwrap(),
+            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+            "an unknown annex tag is retained, never rejected",
+        );
+    }
+
+    #[test]
+    fn a_sealed_snapshot_is_refused_rather_than_retained() {
+        // A sealed manifest can never serve its purpose (§4.7's whole value is that a peer verifies
+        // coverage WITHOUT plaintext), so it is refused rather than stored as opaque bytes no
+        // binary could ever interpret. Contrast the control/secrets logs, where a sealed payload is
+        // deliberately retained for a newer binary to fold.
+        let conn = db();
+        let founder = Dev::new(0x84);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        let header = AccountEntryHeader {
+            account_id,
+            log_id: fold::ANNEX_LOG,
+            device_fingerprint: founder.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: snapshot::ops::entry_type::SNAPSHOT,
+            op_version: 1,
+            crypto_suite: 1,
+            key_id: Some([0x77; 32]),
+            auth_len: 1,
+            authority_ref: Some(genesis_hash),
+        };
+        let sealed = sign_account_entry(&founder.secret, &header, &[0x81, 0x01]).unwrap();
+        let outcome = account_ingest(&conn, &sealed.signed_bytes, NOW + 1).unwrap();
+        assert!(
+            matches!(&outcome, IngestOutcome::Rejected(err) if err.contains("plaintext-signed")),
+            "a sealed snapshot is rejected: {outcome:?}",
+        );
+        assert_eq!(status(&conn, &sealed.entry_hash), None, "and never became a chain link");
+
+        // The rejection is scoped to the SNAPSHOT tag, not the annex log: a future annex artifact
+        // class may legitimately be sealed, and that option must survive this slice.
+        let other_tag = sign_account_entry(
+            &founder.secret,
+            &AccountEntryHeader { entry_type: 9, ..header },
+            &[0x81, 0x01],
+        )
+        .unwrap();
+        assert_eq!(
+            account_ingest(&conn, &other_tag.signed_bytes, NOW + 2).unwrap(),
+            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+            "a sealed NON-snapshot annex entry is still retained",
+        );
     }
 
     #[test]
