@@ -1487,3 +1487,94 @@ fn reconcile_heals_an_op_log_ghost_in_an_idle_repo() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn candidate_count_stream_is_unordered_and_sorts_only_under_a_limit() {
+    // #816: the count-only callers (`pending_embedding_jobs`, `reconcile_plan`) walk EVERY
+    // candidate, so the old need-first ORDER BY — whose CASE reads LEFT-JOINed `chunk_embeddings`
+    // columns no index can serve — external-sorted the whole candidate set into a temp b-tree on
+    // every watcher backlog probe and reconcile preflight. An exhaustive walk feeds
+    // order-independent counts; only a LIMITed walk keeps the order, because it then decides
+    // WHICH rows are counted.
+    let (root, config) = markdown_config(
+        "# One\nalpha token with enough surrounding detail for embedding eligibility and useful \
+         semantic context\n",
+    );
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    let plan_details = |sql: &str| -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        // The stream's ?1 (model_id) / ?2 (limit) slots survive into the EXPLAIN statement.
+        let details =
+            stmt.query_map(rusqlite::params!["", i64::MAX], |row| row.get::<_, String>(3)).unwrap();
+        details.collect::<Result<Vec<_>, _>>().unwrap().join("\n")
+    };
+
+    let unordered = plan_details(&crate::index::ai::embedding_candidate_stream_sql(None, false));
+    assert!(
+        !unordered.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "the exhaustive count walk must not external-sort the candidate set:\n{unordered}"
+    );
+    let limited = plan_details(&crate::index::ai::embedding_candidate_stream_sql(Some(5), false));
+    assert!(
+        limited.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "a LIMITed walk keeps the need-first order — it decides which rows are counted:\n{limited}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn count_paths_fetch_text_only_for_rows_that_reach_a_text_gate() {
+    // #816 twin of the temp-sort test: the streamed count no longer carries `chunk_text.blob`
+    // through every row. Poisoning every blob makes ANY text decompression error, so this test
+    // DISAGREES with the old eager path (which resolved every row's text before classifying)
+    // instead of passing through identical behavior.
+    let (root, mut config) = markdown_config(
+        "# One\nalpha token with enough surrounding detail for embedding eligibility and useful \
+         semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding \
+         eligibility and useful semantic context\n",
+    );
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
+    let poison_blobs = |db: &IndexDatabase| {
+        db.storage.connection().execute("UPDATE chunk_text SET blob = x'DEADBEEF'", []).unwrap();
+    };
+
+    let pending_before = db.pending_embedding_jobs().unwrap();
+    assert!(pending_before > 0, "fixture starts with un-embedded chunks");
+
+    // Missing chunks are decided by `is_stale_without_text` + the certified stamped policy
+    // column alone, so the watcher backlog probe and the plan both survive a poisoned text store
+    // untouched.
+    poison_blobs(&db);
+    assert_eq!(
+        db.pending_embedding_jobs().unwrap(),
+        pending_before,
+        "the missing-chunk backlog count must not read chunk text"
+    );
+    assert_eq!(
+        db.reconcile_plan().unwrap().embeddings.missing,
+        pending_before,
+        "the plan classifies missing chunks without reading chunk text"
+    );
+    drop(db);
+
+    // Restore real text (rebuild rewrites `chunk_text` from source), embed everything, THEN
+    // poison again: a metadata-fresh chunk still reaches the input-hash recompute — the one
+    // staleness clause that reads the text — so the lazy fetch must fail loudly, not skip the
+    // gate.
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
+    let report = db.reconcile(None, None).unwrap();
+    assert!(report.embeddings_written > 0, "the hash model embedded the fixture: {report:?}");
+    assert_eq!(db.pending_embedding_jobs().unwrap(), 0, "fixture is fully current");
+    poison_blobs(&db);
+    assert!(
+        db.pending_embedding_jobs().is_err(),
+        "a metadata-fresh chunk still fetches text for the input-hash clause"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

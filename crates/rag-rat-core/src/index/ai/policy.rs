@@ -43,6 +43,19 @@ pub(crate) const EMBEDDING_POLICY_VERSION: &str = "c426172dd063e4c0";
 pub(crate) const EMBEDDING_POLICY_VERSION_KEY: &str = "embedding_policy_version";
 pub(crate) const EMBEDDING_POLICY_CAP_KEY: &str = "embedding_policy_cap";
 
+/// The staleness clauses decidable WITHOUT the chunk text: missing (no embedding row → status !=
+/// "Current"), re-hashed, model-/dim-/text-version-shifted. [`needs_embedding`]'s first gate, and
+/// what lets the count path (`estimated_reconcile_jobs`) defer fetching a candidate's text until a
+/// metadata-fresh chunk actually reaches the input-hash clause — the only staleness signal that
+/// reads the text.
+pub(crate) fn is_stale_without_text(chunk: &CurrentChunk, model_version: &str, dim: usize) -> bool {
+    chunk.embedding_status.as_deref() != Some("Current")
+        || chunk.source_text_hash.as_deref() != Some(chunk.text_hash.as_str())
+        || chunk.model_version.as_deref() != Some(model_version)
+        || chunk.embedding_dim != Some(i64::try_from(dim).unwrap_or(i64::MAX))
+        || chunk.embedding_text_version.as_deref() != Some(EMBEDDING_TEXT_VERSION)
+}
+
 pub(crate) fn needs_embedding(
     chunk: &CurrentChunk,
     model_id: &str,
@@ -52,19 +65,14 @@ pub(crate) fn needs_embedding(
 ) -> bool {
     // Evaluate the CHEAP staleness signals first. The only clause that needs the (O(text))
     // embedding input + its hash is the `input_hash` comparison, so defer building them until
-    // every cheaper signal has said "fresh" — a chunk that is missing (no embedding row →
-    // status != "Current"), re-hashed, model-/dim-/text-version-shifted is decided here without
-    // touching the text. This is a pure reordering of an OR chain (`build_embedding_input` is
+    // every cheaper signal has said "fresh" — a chunk that is missing, re-hashed,
+    // model-/dim-/text-version-shifted is decided by `is_stale_without_text` without touching the
+    // text. This is a pure reordering of an OR chain (`build_embedding_input` is
     // side-effect-free), so the boolean is byte-identical; it matters because
     // `estimated_reconcile_jobs` runs this per candidate on the idle watcher/maintenance gate,
     // where a repo full of policy-skipped chunks (all missing, so decided by the first clause)
     // must not pay a build+hash each pass.
-    if chunk.embedding_status.as_deref() != Some("Current")
-        || chunk.source_text_hash.as_deref() != Some(chunk.text_hash.as_str())
-        || chunk.model_version.as_deref() != Some(model_version)
-        || chunk.embedding_dim != Some(i64::try_from(dim).unwrap_or(i64::MAX))
-        || chunk.embedding_text_version.as_deref() != Some(EMBEDDING_TEXT_VERSION)
-    {
+    if is_stale_without_text(chunk, model_version, dim) {
         return true;
     }
     let input = build_embedding_input(chunk, max_embedding_chars);

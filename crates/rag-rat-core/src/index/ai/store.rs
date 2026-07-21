@@ -52,29 +52,101 @@ pub(crate) fn current_chunk_row(
     Ok((chunk, text_row))
 }
 
-/// Stream ordered embedding candidates one at a time (need-first), decompressing each chunk's text
-/// on the fly and handing the owned [`CurrentChunk`] to `f` — WITHOUT collecting the whole set into
-/// a `Vec`. This bounds the resident memory of a full-index pass to one chunk's text at a time.
-/// `embedding_reconcile_plan` counts over it so a plan on a kernel-scale index never materializes
-/// every candidate's decompressed text at once (#379). `limit == None` walks every candidate.
-pub(crate) fn for_each_embedding_candidate(
-    conn: &Connection,
-    model_id: &str,
-    model_version: &str,
-    dim: usize,
-    limit: Option<u32>,
-    changed_first: bool,
-    mut f: impl FnMut(CurrentChunk) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    let changed_order = if changed_first {
-        "chunks.source_revision DESC,"
+/// Metadata-only row mapper for the streamed count path ([`for_each_embedding_candidate`]): the
+/// same identity + embedding-metadata columns as [`current_chunk_row`], but no `chunk_text`
+/// payload — `text` stays empty until [`EmbeddingCandidate::ensure_text`] fetches it. The SELECT
+/// order is: 0-5 identity, 6-13 embedding metadata, 14-15 stamped policy columns.
+fn candidate_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CurrentChunk> {
+    Ok(CurrentChunk {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        language: row.get(2)?,
+        file_kind: row.get(3)?,
+        chunk_kind: row.get(4)?,
+        symbol_path: row.get(5)?,
+        text: String::new(),
+        text_hash: row.get(6)?,
+        embedding_status: row.get(7)?,
+        source_text_hash: row.get(8)?,
+        model_version: row.get(9)?,
+        embedding_dim: row.get(10)?,
+        input_hash: row.get(11)?,
+        embedding_text_version: row.get(12)?,
+        next_retry_after_ms: row.get(13)?,
+        embedding_policy: row.get(14)?,
+        embedding_priority: row.get(15)?,
+        reason: ReconcileReason::Forced,
+    })
+}
+
+/// One streamed candidate row: chunk metadata up front, text on demand. The count-only callers
+/// decide most rows from metadata alone (`is_stale_without_text`, the certified stamped policy
+/// column), so the text fetch + decompression runs only for rows that reach a text gate — the
+/// input-hash recompute on a metadata-fresh chunk, or the FromText policy fallback when the
+/// stamped column isn't certified (#816).
+pub(crate) struct EmbeddingCandidate<'run, 'conn, 'dicts> {
+    pub(crate) chunk: CurrentChunk,
+    text_loaded: bool,
+    text_stmt: &'run mut rusqlite::Statement<'conn>,
+    decoder: &'run mut ChunkTextDecoder<'dicts>,
+}
+
+impl EmbeddingCandidate<'_, '_, '_> {
+    /// Fetch + decompress this chunk's text on first call (no-op after); `chunk.text` is empty
+    /// until then. Callers MUST call this before any text-reading classifier — `needs_embedding`
+    /// past its cheap clauses, `job_policy` without a certified stamp, `build_embedding_input`.
+    pub(crate) fn ensure_text(&mut self) -> anyhow::Result<()> {
+        if self.text_loaded {
+            return Ok(());
+        }
+        // The streamed SELECT INNER JOINs `chunk_text`, so every yielded row has exactly one text
+        // row here; the outer statement stays live across the loop, so both reads share one
+        // implicit read transaction and cannot diverge.
+        let text_row = self.text_stmt.query_row(params![self.chunk.id], |row| {
+            Ok(ChunkTextRow { blob: row.get(0)?, raw_len: row.get(1)?, dict_version: row.get(2)? })
+        })?;
+        self.chunk.text = text_row.resolve(self.decoder)?;
+        self.text_loaded = true;
+        Ok(())
+    }
+}
+
+/// The streamed candidate SELECT for [`for_each_embedding_candidate`]. `chunk_text` stays INNER
+/// JOINed so the row set is exactly "live chunks with stored text" (#77 Phase 2 — every live chunk
+/// has one blob; the old `WHERE chunks.text IS NOT NULL` was dropped as vacuous), but its payload
+/// columns are NOT selected: the count-only callers decide most rows from metadata alone, so the
+/// text is point-fetched lazily per row ([`EmbeddingCandidate::ensure_text`]) instead of carried
+/// through the whole stream (#816).
+///
+/// Need-first ORDER BY only when a `limit` truncates the walk: the CASE reads LEFT-JOINed
+/// `chunk_embeddings` columns, which no index can serve, so SQLite external-sorts the ENTIRE
+/// candidate set into a temp b-tree before yielding row 1 — ~210 MB of temp writes in under half
+/// an hour of watcher/reconcile passes on a kernel-scale index (#816). An exhaustive
+/// (`limit == None`) walk feeds order-independent counts, so the sort bought nothing there; a
+/// limited walk keeps it because the order then decides WHICH rows are counted. The real embed
+/// ordering lives in [`embedding_candidate_ids`].
+pub(crate) fn embedding_candidate_stream_sql(limit: Option<u32>, changed_first: bool) -> String {
+    let order_clause = if limit.is_some() {
+        let changed_order = if changed_first {
+            "chunks.source_revision DESC,"
+        } else {
+            "chunks.embedding_priority ASC,"
+        };
+        format!(
+            "ORDER BY
+          CASE
+            WHEN chunk_embeddings.chunk_id IS NULL THEN 0
+            WHEN chunk_embeddings.source_text_hash != chunks.text_hash THEN 1
+            WHEN chunk_embeddings.status = 'Failed' THEN 2
+            ELSE 3
+          END,
+          {changed_order}
+          chunks.id"
+        )
     } else {
-        "chunks.embedding_priority ASC,"
+        String::new()
     };
-    // Chunk text comes from the compressed `chunk_text` store (#77 Phase 2); the `chunks.text`
-    // column is gone, so INNER JOIN `chunk_text` (every live chunk has exactly one blob). The old
-    // `WHERE chunks.text IS NOT NULL` was already dropped as vacuous.
-    let sql = format!(
+    format!(
         "
         SELECT chunks.id,
                files.path,
@@ -90,9 +162,6 @@ pub(crate) fn for_each_embedding_candidate(
                chunk_embeddings.input_hash,
                chunk_embeddings.embedding_text_version,
                chunk_embeddings.next_retry_after_ms,
-               chunk_text.blob,
-               chunk_text.raw_len,
-               chunk_text.dict_version,
                chunks.embedding_policy,
                chunks.embedding_priority
         FROM chunks
@@ -101,42 +170,52 @@ pub(crate) fn for_each_embedding_candidate(
           ON chunk_embeddings.chunk_id = chunks.id
          AND chunk_embeddings.model_id = ?1
         JOIN chunk_text ON chunk_text.chunk_id = chunks.id
-        ORDER BY
-          CASE
-            WHEN chunk_embeddings.chunk_id IS NULL THEN 0
-            WHEN chunk_embeddings.source_text_hash != chunks.text_hash THEN 1
-            WHEN chunk_embeddings.status = 'Failed' THEN 2
-            ELSE 3
-          END,
-          {changed_order}
-          chunks.id
-        LIMIT ?5
+        {order_clause}
+        LIMIT ?2
     "
-    );
-    // One dict decoder for the whole stream (dict versions loaded once, reused per row). Loaded
-    // BEFORE the candidate statement so no second query runs while that statement is mid-iteration.
+    )
+}
+
+/// Stream embedding candidates one at a time WITHOUT collecting the set into a `Vec`, handing each
+/// row to `f` as an [`EmbeddingCandidate`] — metadata up front, text on demand. This bounds the
+/// resident memory of a full-index pass to one row (plus one chunk's text when a row reaches a
+/// text gate), so a count on a kernel-scale index never materializes every candidate's
+/// decompressed text at once (#379, #816). Both callers are count-only
+/// ([`estimated_reconcile_jobs`], `embedding_reconcile_plan`); the stream is unordered unless a
+/// `limit` makes order part of the count's meaning — see [`embedding_candidate_stream_sql`].
+/// `limit == None` walks every candidate.
+pub(crate) fn for_each_embedding_candidate(
+    conn: &Connection,
+    model_id: &str,
+    limit: Option<u32>,
+    changed_first: bool,
+    mut f: impl FnMut(&mut EmbeddingCandidate<'_, '_, '_>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    // One dict decoder for the whole stream (dict versions loaded once, reused across rows),
+    // loaded before the candidate statement starts iterating.
     let dicts = rag_rat_query::chunk_text_dicts(conn)?;
     let mut decoder = ChunkTextDecoder::new(&dicts);
-    let mut stmt = conn.prepare(&sql)?;
+    // The lazy per-row text fetch ([`EmbeddingCandidate::ensure_text`]): a point lookup by
+    // chunk_id, prepared once. The unordered stream arrives in chunks.id-adjacent order, so the
+    // probes stay near-sequential.
+    let mut text_stmt =
+        conn.prepare("SELECT blob, raw_len, dict_version FROM chunk_text WHERE chunk_id = ?1")?;
+    let mut stmt = conn.prepare(&embedding_candidate_stream_sql(limit, changed_first))?;
     let rows = stmt.query_map(
-        params![
-            model_id,
-            model_version,
-            i64::try_from(dim).unwrap_or(i64::MAX),
-            now_ms(),
-            limit.map(i64::from).unwrap_or(i64::MAX)
-        ],
-        current_chunk_row,
+        params![model_id, limit.map(i64::from).unwrap_or(i64::MAX)],
+        candidate_metadata_row,
     )?;
-    // Decompress per row in the loop body (not inside the rusqlite closure above — decompress's
-    // `anyhow::Result` can't cross it), so only one chunk's text is resident at a time.
     for row in rows {
-        let (mut chunk, text_row) = row?;
-        chunk.text = text_row.resolve(&mut decoder)?;
+        let mut chunk = row?;
         if !model_id.is_empty() {
             chunk.reason = ReconcileReason::Missing;
         }
-        f(chunk)?;
+        f(&mut EmbeddingCandidate {
+            chunk,
+            text_loaded: false,
+            text_stmt: &mut text_stmt,
+            decoder: &mut decoder,
+        })?;
     }
     Ok(())
 }
@@ -283,49 +362,52 @@ pub(crate) fn estimated_reconcile_jobs(
     // (`pending_embedding_jobs`), so materializing the whole index here was a per-pass memory
     // peak. The `force` branch queries with an empty model_id (no embedding rows join, so every
     // chunk is a candidate — matching the old `current_chunks`); otherwise use the active model
-    // so `needs_embedding` sees each chunk's embedding row. Text is still decompressed per row
-    // (`needs_embedding`'s input hash reads it; `policy_for_job` reads it only for the stale
-    // chunks that reach the policy gate after the #522 reorder), but only ONE chunk is resident
-    // at a time now.
-    let (model_id, model_version, dim, changed_first) = if options.force {
-        ("", "", 0, false)
-    } else {
-        (scan.model_id, scan.model_version, scan.dim, options.changed_first)
-    };
+    // so `needs_embedding` sees each chunk's embedding row. Text is fetched lazily (#816): a
+    // metadata-stale chunk is decided without it, and under a certified stamp so is its policy —
+    // only a metadata-fresh chunk's input-hash recompute (or the FromText policy fallback) reads
+    // the text.
+    let (model_id, changed_first) =
+        if options.force { ("", false) } else { (scan.model_id, options.changed_first) };
     let mut count = 0_u64;
-    for_each_embedding_candidate(
-        conn,
-        model_id,
-        model_version,
-        dim,
-        options.limit,
-        changed_first,
-        |candidate| {
-            // Freshness FIRST, policy second (#522). Both operands are pure, so `&&` commutes and
-            // the count is byte-identical to the old policy-first order — but in steady state most
-            // chunks are already `Current`, so `needs_embedding` returns false and short-circuits
-            // BEFORE `policy_for_job`, whose low-signal gate would otherwise re-parse the chunk
-            // with tree-sitter. The parse now runs only for genuinely stale chunks (about to be
-            // embedded anyway) or under `--force` (where `options.force` short-circuits
-            // `needs_embedding`). Policy-skipped chunks (generated/tiny/fixture) are always
-            // missing, so `needs_embedding` decides them on its first (cheap) clause
-            // without building or hashing the text — the idle gate does not pay an
-            // O(text) pass per skipped chunk.
-            let eligible = (options.force
-                || needs_embedding(
-                    &candidate,
+    for_each_embedding_candidate(conn, model_id, options.limit, changed_first, |candidate| {
+        // Freshness FIRST, policy second (#522). Both operands are pure, so `&&` commutes and
+        // the count is byte-identical to the old policy-first order — but in steady state most
+        // chunks are already `Current`, so the freshness gate resolves false and short-circuits
+        // BEFORE `policy_for_job`, whose low-signal gate would otherwise re-parse the chunk
+        // with tree-sitter. The parse now runs only for genuinely stale chunks (about to be
+        // embedded anyway) or under `--force` (where `options.force` short-circuits the
+        // freshness gate). Policy-skipped chunks (generated/tiny/fixture) are always missing,
+        // so `is_stale_without_text` decides them on its first (cheap) clause without fetching,
+        // building, or hashing the text — the idle gate does not pay an O(text) pass per
+        // skipped chunk.
+        let stale = options.force
+            || is_stale_without_text(&candidate.chunk, scan.model_version, scan.dim)
+            || {
+                // Metadata-fresh: only the input-hash recompute is left, the one staleness
+                // clause that reads the text (#816). `needs_embedding` re-runs the cheap
+                // clauses (all false here), so the boolean is byte-identical to the eager path.
+                candidate.ensure_text()?;
+                needs_embedding(
+                    &candidate.chunk,
                     scan.model_id,
                     scan.model_version,
                     scan.dim,
                     scan.max_embedding_chars,
-                ))
-                && job_policy(&candidate, scan.max_embedding_chars, scan.stamped_policy).eligible;
-            if eligible {
-                count = count.saturating_add(1);
-            }
-            Ok(())
-        },
-    )?;
+                )
+            };
+        if !stale {
+            return Ok(());
+        }
+        // The FromText policy fallback re-parses the chunk text; the certified stamped column
+        // does not (#530), so only the fallback pays the fetch.
+        if !scan.stamped_policy {
+            candidate.ensure_text()?;
+        }
+        if job_policy(&candidate.chunk, scan.max_embedding_chars, scan.stamped_policy).eligible {
+            count = count.saturating_add(1);
+        }
+        Ok(())
+    })?;
     Ok(count)
 }
 

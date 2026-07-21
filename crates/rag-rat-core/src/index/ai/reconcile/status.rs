@@ -170,28 +170,44 @@ pub(crate) fn embedding_reconcile_plan(
     let mut failed_retryable = 0_u64;
     let mut failed_waiting = 0_u64;
     let mut blocked = 0_u64;
-    // STREAM the candidates (need-first) and count — never materialize every candidate's
-    // decompressed text at once (#379). Same per-job classification as the old `for job in jobs`
-    // over `embedding_job_candidates(None)`, so the counts are identical; only the peak memory
-    // drops.
-    for_each_embedding_candidate(conn, &model.model_id, model_version, dim, None, false, |job| {
-        let policy = job_policy(&job, max_embedding_chars, stamped_policy);
+    // STREAM the candidates and count — never materialize every candidate's decompressed text at
+    // once (#379); the stream is unordered because these counts are order-independent (#816).
+    // Same per-job classification as the old `for job in jobs` over
+    // `embedding_job_candidates(None)`, so the counts are identical; only the peak memory and the
+    // per-row text work drop.
+    for_each_embedding_candidate(conn, &model.model_id, None, false, |candidate| {
+        // The certified stamped column decides policy without the chunk text (#530); only the
+        // FromText fallback needs it fetched up front (#816).
+        if !stamped_policy {
+            candidate.ensure_text()?;
+        }
+        let policy = job_policy(&candidate.chunk, max_embedding_chars, stamped_policy);
         if !policy.eligible {
             return Ok(());
         }
-        let current_artifact = job.embedding_status.as_deref() == Some("Current")
-            && job.source_text_hash.as_deref() == Some(job.text_hash.as_str())
-            && job.model_version.as_deref() == Some(model_version)
-            && job.embedding_dim == Some(i64::try_from(dim).unwrap_or(i64::MAX))
-            && job.embedding_text_version.as_deref() == Some(EMBEDDING_TEXT_VERSION)
-            && job.input_hash.as_deref().is_some_and(|input_hash| {
-                let input = build_embedding_input(&job, max_embedding_chars);
+        let metadata_current = {
+            let job = &candidate.chunk;
+            job.embedding_status.as_deref() == Some("Current")
+                && job.source_text_hash.as_deref() == Some(job.text_hash.as_str())
+                && job.model_version.as_deref() == Some(model_version)
+                && job.embedding_dim == Some(i64::try_from(dim).unwrap_or(i64::MAX))
+                && job.embedding_text_version.as_deref() == Some(EMBEDDING_TEXT_VERSION)
+        };
+        // Only a metadata-current artifact reaches the input-hash recompute — the one clause
+        // that reads the text, fetched lazily (#816).
+        let current_artifact = metadata_current && {
+            candidate.ensure_text()?;
+            let job = &candidate.chunk;
+            job.input_hash.as_deref().is_some_and(|input_hash| {
+                let input = build_embedding_input(job, max_embedding_chars);
                 input_hash == embedding_input_hash(&model.model_id, model_version, &input.text)
-            });
+            })
+        };
         if current_artifact {
             current += 1;
             return Ok(());
         }
+        let job = &candidate.chunk;
         let reason = job.reason(model_version, dim, now_ms(), max_embedding_chars);
         match reason {
             ReconcileReason::Missing => missing += 1,
