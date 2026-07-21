@@ -391,7 +391,7 @@ mod tests {
                     text: format!("Evidence {index}"),
                 })
                 .collect(),
-            partner: None,
+            partners: vec![],
             xrefs: vec![],
             fix_commits: vec![],
             symbols: vec![],

@@ -11,4 +11,4 @@ Field rules:
 - outcome.status: landed | descoped | superseded | reverted | unclear.
 - outcome.summary: what actually happened, 1-2 sentences, concrete, or null if the thread does not establish it. State measured results as results and projections as projections — never assert a projected improvement as a delivered result.
 
-A PARTNER THREAD (the paired issue or pull request) may inform how you READ the primary thread, but its units are not numbered and cannot be cited. Every claim must be grounded in the numbered THREAD UNITS: if only the partner thread establishes something, leave that field null (or its citations []) rather than assert it without evidence — the fixing commit may still establish the outcome.
+PARTNER THREADs (the paired issue(s) or pull request(s)) may inform how you READ the primary thread, but their units are not numbered and cannot be cited. Every claim must be grounded in the numbered THREAD UNITS: if only a partner thread establishes something, leave that field null (or its citations []) rather than assert it without evidence — the fixing commit may still establish the outcome.

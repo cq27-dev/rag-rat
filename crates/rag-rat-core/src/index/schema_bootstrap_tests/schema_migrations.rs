@@ -3152,9 +3152,9 @@ fn migration_078_distinguishes_candidates_from_selections() {
 }
 
 #[test]
-fn migration_079_is_the_tip_and_builds_safe_input_snapshots() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 79, "move this pin with the next schema migration");
-
+fn migration_079_builds_safe_input_snapshots() {
+    // `LATEST_SCHEMA_VERSION` pin moved to `migration_080_*`, the new tip; this uses only the
+    // symbolic checks (the hardcoded-LATEST footgun).
     let legacy = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply_distill_record_store(&legacy).unwrap();
     schema::apply_distill_anchor_selection(&legacy).unwrap();
@@ -3244,7 +3244,7 @@ fn migration_079_is_the_tip_and_builds_safe_input_snapshots() {
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 79);
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM schema_version WHERE id = '079_distill_safe_input_snapshot'",
@@ -3253,4 +3253,110 @@ fn migration_079_is_the_tip_and_builds_safe_input_snapshots() {
         )
         .unwrap();
     assert_eq!(recorded, 1, "the forward migration records V079");
+}
+
+#[test]
+fn migration_080_is_the_tip_and_builds_enriched_context_snapshots() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 80, "move this pin with the next schema migration");
+
+    let legacy = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_distill_record_store(&legacy).unwrap();
+    schema::apply_distill_anchor_selection(&legacy).unwrap();
+    schema::apply_distill_safe_input_snapshot(&legacy).unwrap();
+    assert!(!schema::table_exists(&legacy, "papertrail_distill_fix_diffs").unwrap());
+    assert!(!schema::table_exists(&legacy, "papertrail_distill_xrefs").unwrap());
+
+    schema::apply_distill_enriched_context(&legacy).unwrap();
+    for table in ["papertrail_distill_fix_diffs", "papertrail_distill_xrefs"] {
+        assert!(schema::table_exists(&legacy, table).unwrap(), "V080 table `{table}` exists");
+    }
+
+    legacy
+        .execute(
+            "INSERT INTO papertrail_distill_fix_diffs
+                 (tracker, project, item_kind, item_key, commit_sha, path, patch, repo_id)
+             VALUES ('github','o/r','issue','5','abc123','src/lib.rs','patch A','repoA')",
+            [],
+        )
+        .unwrap();
+    legacy
+        .execute(
+            "INSERT INTO papertrail_distill_fix_diffs
+                 (tracker, project, item_kind, item_key, commit_sha, path, patch, repo_id)
+             VALUES ('github','o/r','issue','5','abc123','src/lib.rs','patch B','repoB')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        legacy
+            .execute(
+                "INSERT INTO papertrail_distill_fix_diffs
+                     (tracker, project, item_kind, item_key, commit_sha, path, patch, repo_id)
+                 VALUES ('github','o/r','issue','5','abc123','src/lib.rs','dup','repoA')",
+                [],
+            )
+            .is_err(),
+        "one patch row per (record, commit, path) inside the full repo-scoped record identity",
+    );
+    assert!(
+        legacy
+            .execute(
+                "INSERT INTO papertrail_distill_xrefs
+                     (tracker, project, item_kind, item_key, xref_ordinal, target_tracker,
+                      target_project, target_item_kind, target_item_key, ref_kind, title, opening,
+                      repo_id)
+                 VALUES ('github','o/r','issue','5',-1,'github','o/r','issue','9','reference',
+                         't','o','repoA')",
+                [],
+            )
+            .is_err(),
+        "xref ordinals are non-negative",
+    );
+    legacy
+        .execute(
+            "INSERT INTO papertrail_distill_xrefs
+                 (tracker, project, item_kind, item_key, xref_ordinal, target_tracker,
+                  target_project, target_item_kind, target_item_key, ref_kind, title, opening,
+                  repo_id)
+             VALUES ('github','o/r','issue','5',0,'github','o/r','issue','9','reference','t','o',
+                     'repoA')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        legacy
+            .execute(
+                "INSERT INTO papertrail_distill_xrefs
+                     (tracker, project, item_kind, item_key, xref_ordinal, target_tracker,
+                      target_project, target_item_kind, target_item_key, ref_kind, title, opening,
+                      repo_id)
+                 VALUES ('github','o/r','issue','5',0,'github','o/r','issue','10','reference',
+                         't','o','repoA')",
+                [],
+            )
+            .is_err(),
+        "xref ordinals are unique within a record",
+    );
+
+    // Torn replay: the diff table survived, the xref table did not. The additive applier must
+    // converge without touching existing rows.
+    legacy.execute_batch("DROP TABLE papertrail_distill_xrefs;").unwrap();
+    schema::apply_distill_enriched_context(&legacy).unwrap();
+    assert!(schema::table_exists(&legacy, "papertrail_distill_xrefs").unwrap());
+    let diffs: i64 = legacy
+        .query_row("SELECT COUNT(*) FROM papertrail_distill_fix_diffs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(diffs, 2, "replay preserves existing diff snapshots");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, 80);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '080_distill_enriched_context'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V080");
 }

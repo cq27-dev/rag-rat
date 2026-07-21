@@ -69,6 +69,8 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
     "papertrail_distill_runs",
     "papertrail_distill_sources",
     "papertrail_distill_units",
+    "papertrail_distill_fix_diffs",
+    "papertrail_distill_xrefs",
     // V056 (#566) derived change-coupling table: standalone, direct `repo_id`, no FK children, so
     // a LocalOnly→Portable adoption re-points its rows here (moving them together with the
     // `git_coupling_stamp` repo_meta so the derived table stays consistent + fresh), and the

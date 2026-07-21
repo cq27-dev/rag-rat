@@ -21,8 +21,29 @@ use crate::distill::candidates::{self, AnchorCaps};
 use crate::distill::{prompts, units, validate};
 
 /// Bumped whenever the extraction/prompt contract changes in a way that invalidates existing
-/// records — part of the regeneration identity alongside `distill_input_hash`.
-pub(crate) const PIPELINE_VERSION: i64 = 2;
+/// records — part of the regeneration identity alongside `distill_input_hash`. 2 → 3 (#800):
+/// cross-referenced-item snapshots joined the extraction identity, and the fix-diff renderer was
+/// added (its rows are regenerable and deliberately NOT hashed, so a renderer change also rides
+/// this bump).
+pub(crate) const PIPELINE_VERSION: i64 = 3;
+
+/// Byte cap for ONE snapshotted per-file patch (#800). The diff is a deterministic function of the
+/// (immutable) fixing commit, so truncation cannot hide a mutable edit; the cap bounds a single
+/// generated/vendored file's patch so one sprawling fix cannot inflate the snapshot table.
+const FIX_DIFF_FILE_CAP: usize = 8_000;
+
+/// Blob-size pre-filter for the fix-diff renderer (#800): a file whose old OR new side exceeds
+/// this is skipped entirely. The output cap truncates after a full render, which would diff a
+/// hostile 50MB minified file in memory inside the extraction write transaction.
+const FIX_DIFF_BLOB_CAP: u64 = 1_000_000;
+
+/// Byte cap for a snapshotted xref opening paragraph (#800): the prompt renders at most 200
+/// chars of it, so a giant single-paragraph body must not inflate the snapshot row.
+const XREF_OPENING_CAP: usize = 2_000;
+
+/// Max cross-referenced items snapshotted per record (#800). Matches the prompt's `max_xrefs`
+/// budget: refs beyond the cap are invisible to both the snapshot and the prompt.
+const XREF_SNAPSHOT_CAP: usize = 20;
 
 /// Knobs for one extraction pass.
 pub(crate) struct ExtractOptions {
@@ -516,6 +537,17 @@ fn write_record(
         .filter(|a| a.resolved && matches!(a.kind, candidates::AnchorKind::Symbol))
         .count();
 
+    // Enriched context (#800), snapshotted in this same transaction so the drain never reads
+    // mutable git/mirror state: the titles + opening paragraphs of items this thread's outbound
+    // refs name are MUTABLE mirror rows and must be frozen here. The fix diff is different: it is
+    // a pure function of the (already-hashed) fix SHAs and anchor candidates, so it is NOT part of
+    // the input identity — folding rendered patch bytes in would tie the identity to git object
+    // AVAILABILITY (a bare-index or shallow run would flip every hash, destroy good snapshots, and
+    // re-pay the model) and force a full re-render of every record's diffs on every pass inside
+    // this write transaction. It is rendered lazily below, only when the record's identity changed
+    // or its rows are missing.
+    let xrefs = xref_snapshots(conn, repo_id, plan, &snapshot)?;
+
     let thread_shape = validate::classify_thread_shape(total_comments, review_comments, body_len);
 
     // The mechanical effective status (model absent) — a floors-only preview for the report.
@@ -536,6 +568,7 @@ fn write_record(
         revert_override,
         closing_keyword,
         anchors: &anchors,
+        xrefs: &xrefs,
     });
 
     // Record state drives model invalidation + enqueue. New/regenerated records need inference; an
@@ -570,6 +603,22 @@ fn write_record(
     })?;
     if state != RecordState::Unchanged {
         replace_snapshot(conn, repo_id, plan, &snapshot)?;
+        replace_xrefs(conn, repo_id, plan, &xrefs)?;
+    }
+    // The fix-diff snapshot is rebuilt when the identity changed, and SELF-HEALED when an earlier
+    // pass ran without a usable repo handle (bare/copied index, shallow clone): the rows are a
+    // pure function of hashed inputs, so filling them late cannot invalidate anything. A record
+    // whose rendering legitimately yields zero rows (all binary/missing) re-attempts each pass —
+    // the cheap edge of this posture.
+    let diff_heal = state == RecordState::Unchanged
+        && repo.is_some()
+        && anchors
+            .iter()
+            .any(|a| matches!(a.kind, candidates::AnchorKind::Symbol) && a.file_path.is_some())
+        && !fix_diff_rows_exist(conn, repo_id, plan)?;
+    if state != RecordState::Unchanged || diff_heal {
+        let fix_diffs = fix_diff_snapshots(repo, &plan.fix_shas, &anchors);
+        replace_fix_diffs(conn, repo_id, plan, &fix_diffs)?;
     }
     write_commits(conn, repo_id, plan, &plan.fix_shas)?;
     write_coalesced_edges(conn, repo_id, now, plan)?;
@@ -611,6 +660,25 @@ fn queue_entry_exists(conn: &Connection, repo_id: &str, plan: &RecordPlan) -> an
     .map_err(Into::into)
 }
 
+/// Whether the thread already has snapshotted fix-diff rows (#800) — the self-heal probe for a
+/// record first extracted without a usable repo handle.
+fn fix_diff_rows_exist(
+    conn: &Connection,
+    repo_id: &str,
+    plan: &RecordPlan,
+) -> anyhow::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM papertrail_distill_fix_diffs
+             WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3
+               AND item_kind = ?4 AND item_key = ?5
+         )",
+        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 /// Everything that folds into a record's regeneration identity.
 struct HashInputs<'a> {
     pipeline_version: i64,
@@ -622,6 +690,7 @@ struct HashInputs<'a> {
     revert_override: bool,
     closing_keyword: Option<&'a str>,
     anchors: &'a [candidates::AnchorCandidate],
+    xrefs: &'a [XrefSnapshot],
 }
 
 /// The regeneration identity: pipeline version, full record identity, the complete exact source
@@ -639,9 +708,10 @@ fn compute_input_hash(inputs: &HashInputs<'_>) -> String {
         revert_override,
         closing_keyword,
         anchors,
+        xrefs,
     } = inputs;
     let mut hasher = Sha256::new();
-    hash_str(&mut hasher, "rag-rat-distill-input-v2");
+    hash_str(&mut hasher, "rag-rat-distill-input-v3");
     hasher.update(pipeline_version.to_le_bytes());
     hash_str(&mut hasher, repo_id);
     hash_str(&mut hasher, &plan.tracker);
@@ -706,6 +776,23 @@ fn compute_input_hash(inputs: &HashInputs<'_>) -> String {
         hash_optional_str(&mut hasher, anchor.file_path.as_deref());
         hash_str(&mut hasher, &anchor.name);
         hasher.update([anchor.resolved as u8]);
+    }
+    // Enriched-context snapshots (#800). The xref rows carry MUTABLE mirror text (a referenced
+    // item's edited title/opening) that must regenerate the record exactly like a primary-source
+    // edit. The fix diff is deliberately ABSENT: it is a pure function of the hashed fix SHAs and
+    // anchor candidates, so hashing rendered patches would only couple the identity to git object
+    // availability; renderer changes ride PIPELINE_VERSION instead.
+    hash_str(&mut hasher, "xrefs");
+    hasher.update((xrefs.len() as u64).to_le_bytes());
+    for xref in *xrefs {
+        hasher.update((xref.ordinal as u64).to_le_bytes());
+        hash_str(&mut hasher, &xref.target_tracker);
+        hash_str(&mut hasher, &xref.target_project);
+        hash_optional_str(&mut hasher, xref.target_item_kind.as_deref());
+        hash_str(&mut hasher, &xref.target_item_key);
+        hash_str(&mut hasher, &xref.ref_kind);
+        hash_str(&mut hasher, &xref.title);
+        hash_str(&mut hasher, &xref.opening);
     }
     let hex: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
     format!("sha256:{hex}")
@@ -999,14 +1086,13 @@ fn merge_first_parent_paths(repo: &gix::Repository, sha: &str) -> anyhow::Result
         return Ok(Vec::new());
     };
     let new_tree = commit.tree()?;
+    // A parent id with a MISSING object is a shallow boundary, not a root commit — diffing against
+    // the empty tree would report every file in the repo as added. Skip the commit instead.
     let parent_tree = match commit.parent_ids().next() {
-        Some(parent) => repo
-            .find_commit(parent.detach())
-            .ok()
-            .and_then(|p| p.tree().ok())
-            .unwrap_or_else(|| repo.empty_tree()),
-        None => repo.empty_tree(),
+        Some(parent) => repo.find_commit(parent.detach()).ok().and_then(|p| p.tree().ok()),
+        None => Some(repo.empty_tree()),
     };
+    let Some(parent_tree) = parent_tree else { return Ok(Vec::new()) };
     let mut paths = Vec::new();
     parent_tree
         .changes()?
@@ -1025,6 +1111,307 @@ fn merge_first_parent_paths(repo: &gix::Repository, sha: &str) -> anyhow::Result
 struct CommitMeta {
     subject: String,
     body: String,
+}
+
+/// One snapshotted per-file patch of a fixing commit (#800): git-style headers plus the unified
+/// hunks, capped at [`FIX_DIFF_FILE_CAP`]. Rendered at extraction time and persisted; the drain
+/// never opens the repo.
+struct FixDiffSnapshot {
+    commit_sha: String,
+    path: String,
+    patch: String,
+}
+
+/// One snapshotted cross-referenced item (#800): the outbound ref's target identity (kind as
+/// RESOLVED against the mirror) plus the frozen title and opening paragraph the prompt shows.
+struct XrefSnapshot {
+    ordinal: usize,
+    target_tracker: String,
+    target_project: String,
+    target_item_kind: Option<String>,
+    target_item_key: String,
+    ref_kind: String,
+    title: String,
+    opening: String,
+}
+
+/// The fix diff, "capped by files with symbol candidates" (#800): per fixing commit, the unified
+/// patch of every changed file that yielded a SYMBOL anchor candidate (mining already excluded
+/// test/generated churn and unindexed paths). Git content is immutable, so this is a determinism
+/// snapshot (drain stays DB-only), not a mutability one — best-effort like the merge path
+/// recovery: an unresolvable sha, shallow clone, binary file, or driver-skipped diff contributes
+/// nothing rather than failing the pass.
+fn fix_diff_snapshots(
+    repo: Option<&gix::Repository>,
+    fix_shas: &[String],
+    anchors: &[candidates::AnchorCandidate],
+) -> Vec<FixDiffSnapshot> {
+    let Some(repo) = repo else { return Vec::new() };
+    let symbol_paths: BTreeSet<&str> = anchors
+        .iter()
+        .filter(|anchor| matches!(anchor.kind, candidates::AnchorKind::Symbol))
+        .filter_map(|anchor| anchor.file_path.as_deref())
+        .collect();
+    if symbol_paths.is_empty() {
+        return Vec::new();
+    }
+    let Ok(mut diff_cache) = repo.diff_resource_cache_for_tree_diff() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for sha in fix_shas {
+        diff_cache.clear_resource_cache();
+        let _ = collect_commit_diffs(repo, sha, &symbol_paths, &mut diff_cache, &mut out);
+    }
+    out
+}
+
+/// Append one fixing commit's per-file patches (vs its FIRST parent) for the symbol-candidate
+/// paths. Best-effort at the call site: any gix error (unparseable sha, missing object on a
+/// shallow clone) yields no rows for this commit rather than failing the pass.
+fn collect_commit_diffs(
+    repo: &gix::Repository,
+    sha: &str,
+    symbol_paths: &BTreeSet<&str>,
+    diff_cache: &mut gix::diff::blob::Platform,
+    out: &mut Vec<FixDiffSnapshot>,
+) -> anyhow::Result<()> {
+    use gix::object::tree::diff::Action;
+
+    let id = gix::ObjectId::from_hex(sha.as_bytes())?;
+    let commit = repo.find_commit(id)?;
+    let new_tree = commit.tree()?;
+    // A parent id with a MISSING object is a shallow boundary, not a root commit — diffing against
+    // the empty tree would render a bogus full-tree addition. Skip the commit instead.
+    let parent_tree = match commit.parent_ids().next() {
+        Some(parent) => repo.find_commit(parent.detach()).ok().and_then(|p| p.tree().ok()),
+        None => Some(repo.empty_tree()),
+    };
+    let Some(parent_tree) = parent_tree else { return Ok(()) };
+    parent_tree
+        .changes()?
+        .options(|opts| {
+            opts.track_path();
+        })
+        .for_each_to_obtain_tree(&new_tree, |change| {
+            // Blobs only: a gitlink's submodule SHA is not diffable text, and a symlink's target
+            // path is not file content.
+            if change.entry_mode().is_blob() {
+                let path = change.location().to_string();
+                if symbol_paths.contains(path.as_str())
+                    && let Some(patch) = render_file_patch(repo, &change, &path, diff_cache)
+                {
+                    out.push(FixDiffSnapshot { commit_sha: sha.to_string(), path, patch });
+                }
+            }
+            Ok::<_, std::convert::Infallible>(Action::Continue(()))
+        })?;
+    Ok(())
+}
+
+/// Render one changed file's unified patch with git-style headers. `None` for binary/driver-
+/// skipped diffs, empty patches (a mode-only change), either side over [`FIX_DIFF_BLOB_CAP`]
+/// (the 8k output cap truncates AFTER a full render — a 50MB minified file would otherwise be
+/// diffed in memory inside the extraction write transaction), and paths carrying control chars
+/// (a newline-bearing filename would split the header lines the drain concatenates). Hunk text
+/// is lossy-decoded — deterministic, and the prompt treats it as untrusted display text only.
+fn render_file_patch(
+    repo: &gix::Repository,
+    change: &gix::object::tree::diff::Change<'_, '_, '_>,
+    path: &str,
+    diff_cache: &mut gix::diff::blob::Platform,
+) -> Option<String> {
+    use gix::diff::blob::platform::prepare_diff::Operation;
+    use gix::diff::blob::unified_diff::{ConsumeBinaryHunk, ContextSize};
+    use gix::objs::FindHeader;
+
+    if path.chars().any(char::is_control) {
+        return None;
+    }
+    let platform = change.diff(diff_cache).ok()?;
+    for resource in
+        platform.resource_cache.resources().into_iter().flat_map(|(old, new)| [old, new])
+    {
+        if resource.id.is_null() {
+            continue;
+        }
+        if let Ok(Some(header)) = repo.try_header(resource.id)
+            && header.size > FIX_DIFF_BLOB_CAP
+        {
+            return None;
+        }
+    }
+    platform.resource_cache.options.skip_internal_diff_if_external_is_configured = false;
+    let prep = platform.resource_cache.prepare_diff().ok()?;
+    let Operation::InternalDiff { algorithm } = prep.operation else { return None };
+    let input = prep.interned_input();
+    let diff = gix::diff::blob::diff_with_slider_heuristics(algorithm, &input);
+    let hunks = gix::diff::blob::UnifiedDiff::new(
+        &diff,
+        &input,
+        ConsumeBinaryHunk::new(Vec::new(), "\n"),
+        ContextSize::symmetrical(3),
+    )
+    .consume()
+    .ok()?;
+    let hunks = String::from_utf8_lossy(&hunks);
+    if hunks.trim().is_empty() {
+        return None;
+    }
+    let header = match change {
+        gix::object::tree::diff::Change::Addition { .. } =>
+            format!("diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n"),
+        gix::object::tree::diff::Change::Deletion { .. } =>
+            format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ /dev/null\n"),
+        _ => format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"),
+    };
+    let patch = format!("{header}{hunks}");
+    // The cap covers the WHOLE row, headers included; truncation is deterministic and the drain
+    // renders at a tighter budget anyway.
+    let mut end = FIX_DIFF_FILE_CAP.min(patch.len());
+    while end > 0 && !patch.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(patch[..end].to_string())
+}
+
+/// The thread's cross-referenced items (#800): outbound `papertrail_refs` rows keyed by the
+/// SNAPSHOT's own source identities (so the ref set a record sees is exactly the set derivable
+/// from its frozen sources), each target resolved against the mirror in this transaction and
+/// frozen as title + opening paragraph. Unmirrored targets (foreign projects, never-synced
+/// items) contribute nothing — there is no immutable text to freeze. Kind preference when the
+/// ref syntax left the kind ambiguous (bare `#N`): the source item's own kind first, matching
+/// the parser's namespace inheritance, then a deterministic kind order.
+fn xref_snapshots(
+    conn: &Connection,
+    repo_id: &str,
+    plan: &RecordPlan,
+    snapshot: &ThreadSnapshot,
+) -> anyhow::Result<Vec<XrefSnapshot>> {
+    let mut ref_stmt = conn.prepare(
+        "SELECT tracker, project, item_kind, item_key, ref_kind FROM papertrail_refs
+         WHERE repo_id = ?1 AND source_kind IN ('item', 'comment') AND source_text = ?2
+         ORDER BY id",
+    )?;
+    let mut seen: BTreeSet<(String, String, String, String)> = BTreeSet::new();
+    let mut out = Vec::new();
+    'sources: for source in &snapshot.sources {
+        let identity = match source.kind {
+            SourceKind::Item => format!(
+                "{}:{}:{}:{}",
+                plan.tracker,
+                plan.project,
+                source.item_kind.as_db_str(),
+                source.item_key
+            ),
+            SourceKind::Comment => format!(
+                "{}:{}:{}:{}:{}",
+                plan.tracker,
+                plan.project,
+                source.item_kind.as_db_str(),
+                source.item_key,
+                source.id
+            ),
+        };
+        let rows = ref_stmt.query_map(params![repo_id, identity], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (tracker, project, parsed_kind, key, ref_kind) = row?;
+            let Some((kind, title, body)) = resolve_xref_target(
+                conn,
+                repo_id,
+                &tracker,
+                &project,
+                parsed_kind.as_deref(),
+                source.item_kind.as_db_str(),
+                &key,
+            )?
+            else {
+                continue;
+            };
+            if !seen.insert((tracker.clone(), project.clone(), kind.clone(), key.clone())) {
+                continue;
+            }
+            let opening = units::segment_blocks(&body)
+                .first()
+                .map(|span| {
+                    let text = &body[span.start..span.end];
+                    let mut end = XREF_OPENING_CAP.min(text.len());
+                    while end > 0 && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text[..end].to_string()
+                })
+                .unwrap_or_default();
+            out.push(XrefSnapshot {
+                ordinal: out.len(),
+                target_tracker: tracker,
+                target_project: project,
+                target_item_kind: Some(kind),
+                target_item_key: key,
+                ref_kind,
+                title,
+                opening,
+            });
+            if out.len() >= XREF_SNAPSHOT_CAP {
+                break 'sources;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve an outbound ref's target to a mirrored item: exact kind when the syntax named one,
+/// else the source item's kind (parser namespace inheritance), else the deterministically first
+/// kind. Returns `(item_kind, title, body)`.
+fn resolve_xref_target(
+    conn: &Connection,
+    repo_id: &str,
+    tracker: &str,
+    project: &str,
+    parsed_kind: Option<&str>,
+    source_kind: &str,
+    key: &str,
+) -> anyhow::Result<Option<(String, String, String)>> {
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(kind) = parsed_kind {
+        candidates.push(kind);
+    } else {
+        candidates.push(source_kind);
+        for kind in [ItemKind::ChangeRequest.as_db_str(), ItemKind::Issue.as_db_str()] {
+            if kind != source_kind {
+                candidates.push(kind);
+            }
+        }
+    }
+    for kind in candidates {
+        let resolved = conn
+            .query_row(
+                "SELECT item_kind, title, body FROM papertrail_items
+                 WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_key = ?4
+                   AND item_kind = ?5",
+                params![repo_id, tracker, project, key, kind],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if resolved.is_some() {
+            return Ok(resolved);
+        }
+    }
+    Ok(None)
 }
 
 fn commit_message(
@@ -1130,6 +1517,8 @@ fn delete_record(conn: &Connection, repo_id: &str, record: &RecordKey) -> anyhow
         "papertrail_distill_queue",
         "papertrail_distill_sources",
         "papertrail_distill_units",
+        "papertrail_distill_fix_diffs",
+        "papertrail_distill_xrefs",
     ] {
         conn.execute(
             &format!(
@@ -1369,6 +1758,79 @@ fn replace_snapshot(
                 unit.source_ordinal as i64,
                 unit.span.start as i64,
                 unit.span.end as i64,
+                repo_id,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Replace a thread's snapshotted fix-diff rows (#800). Same gating as [`replace_snapshot`]:
+/// rewritten only when the extraction identity changed.
+fn replace_fix_diffs(
+    conn: &Connection,
+    repo_id: &str,
+    plan: &RecordPlan,
+    diffs: &[FixDiffSnapshot],
+) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM papertrail_distill_fix_diffs
+         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
+        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+    )?;
+    for diff in diffs {
+        conn.execute(
+            "INSERT INTO papertrail_distill_fix_diffs
+                 (tracker, project, item_kind, item_key, commit_sha, path, patch, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                plan.tracker,
+                plan.project,
+                plan.kind.as_db_str(),
+                plan.key,
+                diff.commit_sha,
+                diff.path,
+                diff.patch,
+                repo_id,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Replace a thread's snapshotted cross-reference rows (#800). Same gating as
+/// [`replace_snapshot`].
+fn replace_xrefs(
+    conn: &Connection,
+    repo_id: &str,
+    plan: &RecordPlan,
+    xrefs: &[XrefSnapshot],
+) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM papertrail_distill_xrefs
+         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
+        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+    )?;
+    for xref in xrefs {
+        conn.execute(
+            "INSERT INTO papertrail_distill_xrefs
+                 (tracker, project, item_kind, item_key, xref_ordinal, target_tracker,
+                  target_project, target_item_kind, target_item_key, ref_kind, title, opening,
+                  repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                plan.tracker,
+                plan.project,
+                plan.kind.as_db_str(),
+                plan.key,
+                xref.ordinal as i64,
+                xref.target_tracker,
+                xref.target_project,
+                xref.target_item_kind,
+                xref.target_item_key,
+                xref.ref_kind,
+                xref.title,
+                xref.opening,
                 repo_id,
             ],
         )?;
@@ -1895,6 +2357,375 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fix_diff_is_snapshotted_only_for_symbol_candidate_files() {
+        // The merge repo's first-parent diff adds `src/widget.rs`; the seeded index resolves its
+        // symbol, so the patch is snapshotted. The same commit's `README.md` change (no symbol
+        // candidate) must NOT appear — the cap is by symbol-candidate files, not by changed files.
+        let (root, merge_sha, path) = build_merge_repo();
+        let conn = scoped_conn("repoA");
+        seed_item(
+            &conn,
+            "repoA",
+            "change_request",
+            "9",
+            "A refactor PR.",
+            "merged",
+            Some(&merge_sha),
+        );
+        seed_commit(&conn, "repoA", &merge_sha, "Merge feature");
+        seed_indexed_source(&conn, "repoA", &path);
+
+        extract(&conn, Some(&root), &ExtractOptions::default()).unwrap();
+
+        let patches: Vec<(String, String)> = conn
+            .prepare("SELECT path, patch FROM papertrail_distill_fix_diffs ORDER BY path")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(patches.len(), 1, "only the symbol-candidate file's patch is snapshotted");
+        let (patch_path, patch) = &patches[0];
+        assert_eq!(patch_path, &path);
+        assert!(patch.contains("diff --git a/src/widget.rs b/src/widget.rs"), "{patch}");
+        assert!(patch.contains("--- /dev/null"), "an added file diffs from /dev/null: {patch}");
+        assert!(patch.contains("+++ b/src/widget.rs"), "{patch}");
+        assert!(patch.contains("+fn render_widget() {}"), "the hunk content renders: {patch}");
+
+        // Control: no repo handle → no diff rows (the drain never sees git state).
+        let conn2 = scoped_conn("repoB");
+        seed_item(
+            &conn2,
+            "repoB",
+            "change_request",
+            "9",
+            "A refactor PR.",
+            "merged",
+            Some(&merge_sha),
+        );
+        seed_commit(&conn2, "repoB", &merge_sha, "Merge feature");
+        seed_indexed_source(&conn2, "repoB", &path);
+        extract(&conn2, None, &ExtractOptions::default()).unwrap();
+        assert_eq!(
+            distill_count(&conn2, "SELECT COUNT(*) FROM papertrail_distill_fix_diffs"),
+            0,
+            "no repo handle → best-effort empty diff snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn losing_the_repo_handle_preserves_diff_snapshots_and_the_identity() {
+        // The diff is a pure function of already-hashed inputs, so git AVAILABILITY must not be
+        // part of the record identity: extract with a repo, then again with `None` (the documented
+        // bare/copied-index path) — the hash holds, the good snapshot rows survive, nothing
+        // re-enqueues. The changed paths come from `git_file_changes` rows here (not the live-gix
+        // merge fallback), so the anchors and changed-path selection are repo-independent and ONLY
+        // the diff snapshot differs between the two passes.
+        let (root, merge_sha, path) = build_merge_repo();
+        let conn = scoped_conn("repoA");
+        seed_item(
+            &conn,
+            "repoA",
+            "change_request",
+            "9",
+            "A refactor PR.",
+            "merged",
+            Some(&merge_sha),
+        );
+        seed_commit(&conn, "repoA", &merge_sha, "Merge feature");
+        seed_changed_file(&conn, "repoA", &merge_sha, &path);
+
+        extract(&conn, Some(&root), &ExtractOptions::default()).unwrap();
+        let hash_with_repo: String = conn
+            .query_row("SELECT distill_input_hash FROM papertrail_distill", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_fix_diffs"),
+            1,
+            "the repo-backed pass snapshots the diff"
+        );
+
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let hash_without_repo: String = conn
+            .query_row("SELECT distill_input_hash FROM papertrail_distill", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(hash_with_repo, hash_without_repo, "repo availability is not identity");
+        assert_eq!(
+            distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_fix_diffs"),
+            1,
+            "a repo-less rerun preserves the snapshot"
+        );
+
+        // Self-heal: the mirror is reset to the repo-less state (record + no diff rows), then a
+        // repo-backed pass fills the missing rows WITHOUT any identity change.
+        let conn2 = scoped_conn("repoB");
+        seed_item(
+            &conn2,
+            "repoB",
+            "change_request",
+            "9",
+            "A refactor PR.",
+            "merged",
+            Some(&merge_sha),
+        );
+        seed_commit(&conn2, "repoB", &merge_sha, "Merge feature");
+        seed_changed_file(&conn2, "repoB", &merge_sha, &path);
+        extract(&conn2, None, &ExtractOptions::default()).unwrap();
+        assert_eq!(distill_count(&conn2, "SELECT COUNT(*) FROM papertrail_distill_fix_diffs"), 0);
+        extract(&conn2, Some(&root), &ExtractOptions::default()).unwrap();
+        assert_eq!(
+            distill_count(&conn2, "SELECT COUNT(*) FROM papertrail_distill_fix_diffs"),
+            1,
+            "a later repo-backed pass heals the missing diff rows"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_shallow_clone_missing_the_parent_yields_no_bogus_full_tree_diff() {
+        // At a shallow boundary the parent id is recorded but the object is absent; that is NOT a
+        // root commit. Diffing against the empty tree would snapshot every repo file as added.
+        let (root, merge_sha, path) = build_merge_repo();
+        let shallow =
+            std::env::temp_dir().join(format!("ragrat-distill-shallow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&shallow);
+        let status = std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &format!("file://{}", root.display()),
+                shallow.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "shallow clone failed");
+
+        let conn = scoped_conn("repoA");
+        seed_item(
+            &conn,
+            "repoA",
+            "change_request",
+            "9",
+            "A refactor PR.",
+            "merged",
+            Some(&merge_sha),
+        );
+        seed_commit(&conn, "repoA", &merge_sha, "Merge feature");
+        // `git_file_changes` rows supply the anchors, so the symbol-candidate filter is non-empty
+        // even though the shallow repo cannot produce a first-parent diff.
+        seed_changed_file(&conn, "repoA", &merge_sha, &path);
+
+        extract(&conn, Some(&shallow), &ExtractOptions::default()).unwrap();
+        assert_eq!(
+            distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_fix_diffs"),
+            0,
+            "a missing parent skips the commit — never a full-tree 'everything added' patch"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(shallow);
+    }
+
+    /// Build a throwaway repo whose HEAD fix commit modifies `src/widget.rs` and adds a >1MiB
+    /// `src/big.rs`, returning `(root, fix_sha)`.
+    fn build_big_blob_repo() -> (std::path::PathBuf, String) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("ragrat-distill-big-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let git = |args: &[&str]| {
+            let status =
+                std::process::Command::new("git").current_dir(&root).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Rag Rat"]);
+        git(&["config", "user.email", "rag@example.com"]);
+        std::fs::write(root.join("src/widget.rs"), "fn render_widget() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::write(root.join("src/widget.rs"), "fn render_widget() { todo!() }\n").unwrap();
+        std::fs::write(root.join("src/big.rs"), "x".repeat(1_200_000)).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "fix: widget and a giant file"]);
+        let out = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let fix_sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        (root, fix_sha)
+    }
+
+    #[test]
+    fn a_blob_over_the_size_cap_is_skipped_before_rendering() {
+        let (root, fix_sha) = build_big_blob_repo();
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "change_request", "9", "The fix.", "merged", Some(&fix_sha));
+        seed_commit(&conn, "repoA", &fix_sha, "fix: widget and a giant file");
+        seed_changed_file(&conn, "repoA", &fix_sha, "src/widget.rs");
+        seed_changed_file(&conn, "repoA", &fix_sha, "src/big.rs");
+
+        extract(&conn, Some(&root), &ExtractOptions::default()).unwrap();
+        let paths: Vec<String> = conn
+            .prepare("SELECT path FROM papertrail_distill_fix_diffs ORDER BY path")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec!["src/widget.rs".to_string()],
+            "the small patch renders; the >1MiB blob is skipped before any full diff"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Seed one outbound ref row the mirror sync would have mined from `source_text`'s item body.
+    fn seed_outbound_ref(
+        conn: &Connection,
+        repo: &str,
+        source_text: &str,
+        target_key: &str,
+        ref_kind: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO papertrail_refs
+                 (tracker, project, item_key, item_kind, ref_kind, source_kind, source_text,
+                  discovered_at_ms, repo_id)
+             VALUES ('github','o/r',?1,'issue',?2,'item',?3,1,?4)",
+            params![target_key, ref_kind, source_text, repo],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn outbound_refs_snapshot_the_referenced_title_and_opening() {
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "issue", "5", "A bug. See #9.", "closed", None);
+        seed_item(
+            &conn,
+            "repoA",
+            "issue",
+            "9",
+            "Opening line.\n\nSecond paragraph.",
+            "closed",
+            None,
+        );
+        seed_outbound_ref(&conn, "repoA", "github:o/r:issue:5", "9", "reference");
+        // A comment-sourced ref to the same target dedupes; a ref to an unmirrored item drops.
+        seed_comment(&conn, "repoA", "issue", "5", "c1", false);
+        seed_outbound_ref(&conn, "repoA", "github:o/r:issue:5:c1", "9", "reference");
+        seed_outbound_ref(&conn, "repoA", "github:o/r:issue:5", "404", "reference");
+        // A giant single-paragraph body: the opening snapshot is capped (the prompt renders at
+        // most 200 chars of it — a multi-MB paragraph must not inflate the row).
+        seed_item(&conn, "repoA", "issue", "10", &"x".repeat(5_000), "closed", None);
+        seed_outbound_ref(&conn, "repoA", "github:o/r:issue:5", "10", "reference");
+
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+
+        let rows: Vec<(String, String, String, String)> = conn
+            .prepare(
+                "SELECT target_item_key, ref_kind, title, opening FROM papertrail_distill_xrefs
+                 WHERE item_kind='issue' AND item_key='5' ORDER BY xref_ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "comment-source dup and unmirrored target contribute nothing");
+        assert_eq!(rows[0].0, "9");
+        assert_eq!(rows[0].1, "reference");
+        assert_eq!(rows[0].2, "t", "seeded title is frozen");
+        assert_eq!(rows[0].3, "Opening line.", "the opening paragraph only, not the body");
+        assert_eq!(rows[1].0, "10");
+        assert_eq!(rows[1].3.len(), 2_000, "a giant paragraph's opening is capped");
+
+        // The referenced records are eligible too, but their own records have no outbound refs.
+        assert_eq!(distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_xrefs"), 2);
+    }
+
+    #[test]
+    fn xref_snapshot_cap_matches_the_prompt_xref_budget() {
+        // Rows beyond the snapshot cap are invisible to the prompt; a budget below the cap would
+        // hash rows the model never sees (spurious regeneration on their edits). Keep the two
+        // equal.
+        assert_eq!(
+            super::XREF_SNAPSHOT_CAP,
+            crate::distill::prompts::PromptBudget::default().max_xrefs,
+            "the snapshot cap and the render budget must move together"
+        );
+    }
+
+    #[test]
+    fn an_xref_title_edit_regenerates_the_record() {
+        // The referenced item's title is MUTABLE mirror state folded into the prompt, so an edit
+        // must regenerate the record exactly like a primary-source edit.
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "issue", "5", "A bug. See #9.", "closed", None);
+        seed_item(&conn, "repoA", "issue", "9", "Opening line.", "closed", None);
+        seed_outbound_ref(&conn, "repoA", "github:o/r:issue:5", "9", "reference");
+
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let hash_before: String = conn
+            .query_row(
+                "SELECT distill_input_hash FROM papertrail_distill WHERE item_key='5'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE papertrail_items SET title='Renamed referenced item' WHERE item_key='9'",
+            [],
+        )
+        .unwrap();
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        let hash_after: String = conn
+            .query_row(
+                "SELECT distill_input_hash FROM papertrail_distill WHERE item_key='5'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(hash_before, hash_after, "a referenced title edit changes the input identity");
+        let title: String = conn
+            .query_row("SELECT title FROM papertrail_distill_xrefs WHERE item_key='5'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "Renamed referenced item", "the snapshot re-froze the edited title");
+
+        // An identical rerun is stable: no new queue rows for either record (the still-queued
+        // NULL-stamped rows keep their place — draining, not extraction, retires them).
+        let queue_before = distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_queue");
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        assert_eq!(
+            distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_queue"),
+            queue_before,
+            "unchanged input does not re-enqueue"
+        );
+        let hash_stable: String = conn
+            .query_row(
+                "SELECT distill_input_hash FROM papertrail_distill WHERE item_key='5'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash_after, hash_stable, "an identical rerun recomputes the same identity");
     }
 
     #[test]

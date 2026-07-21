@@ -291,7 +291,9 @@ fn assemble_job(
     let units = load_units(conn, repo_id, &key, &sources)?;
     let anchors = load_anchors(conn, repo_id, &key)?;
     let commits = load_commits(conn, repo_id, &key)?;
-    let prompt_input = build_prompt_input(&key, &sources, &units, &anchors, commits)?;
+    let diff = load_fix_diff(conn, repo_id, &key)?;
+    let xrefs = load_xrefs(conn, repo_id, &key)?;
+    let prompt_input = build_prompt_input(&key, &sources, &units, &anchors, commits, xrefs, diff)?;
     let rendered_prompt = prompts::render_prompt(&prompt_input, budget);
     let schema = prompts::record_schema(&prompt_input, budget);
     let model_input_hash = compute_model_input_hash(&rendered_prompt, &schema)?;
@@ -476,12 +478,73 @@ fn load_commits(
     Ok(commits)
 }
 
+/// The snapshotted per-file patches (#800), concatenated in deterministic (commit, path) order —
+/// the extraction froze the diff, so the drain renders it without ever opening the repo.
+fn load_fix_diff(
+    conn: &Connection,
+    repo_id: &str,
+    key: &ThreadKey,
+) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT patch FROM papertrail_distill_fix_diffs
+         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4
+           AND item_key = ?5
+         ORDER BY commit_sha, path",
+    )?;
+    let rows = stmt.query_map(
+        params![repo_id, key.tracker, key.project, key.item_kind, key.item_key],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut diff = String::new();
+    for row in rows {
+        diff.push_str(&row?);
+        if !diff.ends_with('\n') {
+            diff.push('\n');
+        }
+    }
+    Ok((!diff.is_empty()).then_some(diff))
+}
+
+/// The snapshotted cross-referenced items (#800), in extraction's durable ordinal order.
+fn load_xrefs(
+    conn: &Connection,
+    repo_id: &str,
+    key: &ThreadKey,
+) -> anyhow::Result<Vec<prompts::Xref>> {
+    let mut stmt = conn.prepare(
+        "SELECT target_item_kind, target_item_key, ref_kind, title, opening
+         FROM papertrail_distill_xrefs
+         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4
+           AND item_key = ?5
+         ORDER BY xref_ordinal",
+    )?;
+    let rows = stmt.query_map(
+        params![repo_id, key.tracker, key.project, key.item_kind, key.item_key],
+        |row| {
+            Ok(prompts::Xref {
+                kind: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                key: row.get(1)?,
+                ref_kind: row.get(2)?,
+                title: row.get(3)?,
+                opening: row.get(4)?,
+            })
+        },
+    )?;
+    let mut xrefs = Vec::new();
+    for row in rows {
+        xrefs.push(row?);
+    }
+    Ok(xrefs)
+}
+
 fn build_prompt_input(
     key: &ThreadKey,
     sources: &[SourceSnapshot],
     units: &[UnitSnapshot],
     anchors: &[AnchorSnapshot],
     commits: Vec<FixCommit>,
+    xrefs: Vec<prompts::Xref>,
+    diff: Option<String>,
 ) -> anyhow::Result<PromptInput> {
     let primary_title = sources
         .iter()
@@ -493,34 +556,36 @@ fn build_prompt_input(
         anyhow::ensure!(unit.ordinal == expected, "primary distill unit ids are not a prefix");
     }
 
-    // PromptInput currently has one partner slot. Extraction stores partner_ordinal explicitly, so
-    // choose the first partner by that durable order rather than row-id or query order.
-    let first_partner = sources
-        .iter()
-        .filter_map(|source| source.partner_ordinal.map(|ordinal| (ordinal, source)))
-        .map(|(ordinal, _)| ordinal)
-        .min();
-    let partner = first_partner.map(|partner_ordinal| {
-        let partner_sources: Vec<&SourceSnapshot> = sources
-            .iter()
-            .filter(|source| source.partner_ordinal == Some(partner_ordinal))
-            .collect();
-        let title = partner_sources
-            .iter()
-            .find(|source| source.source_part == "title")
-            .map_or("", |source| source.exact_text.as_str());
-        let identity = partner_sources.first().copied();
-        PartnerThread {
-            kind: identity.map_or("change_request", |source| source.item_kind.as_str()).to_string(),
-            key: identity.map_or("", |source| source.item_key.as_str()).to_string(),
-            title: title.to_string(),
-            units: units
+    // Every coalesced partner, in the extraction's durable partner_ordinal order — the persisted
+    // ordinal, not row-id or query order, defines the render sequence.
+    let partner_ordinals: std::collections::BTreeSet<usize> =
+        sources.iter().filter_map(|source| source.partner_ordinal).collect();
+    let partners = partner_ordinals
+        .into_iter()
+        .map(|partner_ordinal| {
+            let partner_sources: Vec<&SourceSnapshot> = sources
                 .iter()
-                .filter(|unit| unit.source.partner_ordinal == Some(partner_ordinal))
-                .map(prompt_unit)
-                .collect(),
-        }
-    });
+                .filter(|source| source.partner_ordinal == Some(partner_ordinal))
+                .collect();
+            let title = partner_sources
+                .iter()
+                .find(|source| source.source_part == "title")
+                .map_or("", |source| source.exact_text.as_str());
+            let identity = partner_sources.first().copied();
+            PartnerThread {
+                kind: identity
+                    .map_or("change_request", |source| source.item_kind.as_str())
+                    .to_string(),
+                key: identity.map_or("", |source| source.item_key.as_str()).to_string(),
+                title: title.to_string(),
+                units: units
+                    .iter()
+                    .filter(|unit| unit.source.partner_ordinal == Some(partner_ordinal))
+                    .map(prompt_unit)
+                    .collect(),
+            }
+        })
+        .collect();
     let anchor_candidates = anchors
         .iter()
         .map(|anchor| AnchorContext {
@@ -547,12 +612,12 @@ fn build_prompt_input(
         title: primary_title.exact_text.clone(),
         opened: primary_title.created_at_ms.map_or_else(String::new, |value| value.to_string()),
         units: primary_units,
-        partner,
-        xrefs: Vec::new(),
+        partners,
+        xrefs,
         fix_commits: commits,
         symbols,
         anchor_candidates,
-        diff: None,
+        diff,
     })
 }
 
@@ -909,7 +974,7 @@ mod tests {
     use std::sync::Mutex;
 
     use rag_rat_db::schema::{
-        apply_distill_anchor_selection, apply_distill_record_store,
+        apply_distill_anchor_selection, apply_distill_enriched_context, apply_distill_record_store,
         apply_distill_safe_input_snapshot,
     };
     use rag_rat_llm::chat::{ChatModel, GuidedJson};
@@ -961,6 +1026,7 @@ mod tests {
         apply_distill_record_store(&conn).unwrap();
         apply_distill_anchor_selection(&conn).unwrap();
         apply_distill_safe_input_snapshot(&conn).unwrap();
+        apply_distill_enriched_context(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
@@ -1181,6 +1247,7 @@ mod tests {
         apply_distill_record_store(&conn).unwrap();
         apply_distill_anchor_selection(&conn).unwrap();
         apply_distill_safe_input_snapshot(&conn).unwrap();
+        apply_distill_enriched_context(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
@@ -1220,7 +1287,7 @@ mod tests {
         seed(&conn, "later", 20);
         seed(&conn, "first", 10);
         // Insert partner rows out of row-id order. The persisted partner ordinal, not insertion
-        // order, chooses the one PromptInput can currently represent.
+        // order, defines the render sequence.
         conn.execute_batch(
             "INSERT INTO papertrail_distill_sources
                  (tracker, project, item_kind, item_key, source_ordinal, role, partner_ordinal,
@@ -1245,8 +1312,10 @@ mod tests {
         assert_eq!(jobs[0].key.item_key, "first");
         assert!(jobs[0].rendered_prompt.contains("Detailed fix."));
         assert!(jobs[0].rendered_prompt.contains("[A0]"));
-        assert!(jobs[0].rendered_prompt.contains("First partner"));
-        assert!(!jobs[0].rendered_prompt.contains("Later partner"));
+        // Every coalesced partner renders, lowest partner_ordinal first (#800).
+        let first_pos = jobs[0].rendered_prompt.find("First partner").expect("first partner");
+        let later_pos = jobs[0].rendered_prompt.find("Later partner").expect("later partner");
+        assert!(first_pos < later_pos, "partners render in durable ordinal order");
         assert_eq!(
             jobs[0].model_input_hash,
             compute_model_input_hash(&jobs[0].rendered_prompt, &jobs[0].schema).unwrap()
@@ -1263,12 +1332,51 @@ mod tests {
     }
 
     #[test]
+    fn enriched_context_renders_from_the_frozen_snapshots() {
+        let conn = fixture();
+        seed(&conn, "first", 10);
+        conn.execute(
+            "INSERT INTO papertrail_distill_fix_diffs
+                 (tracker, project, item_kind, item_key, commit_sha, path, patch, repo_id)
+             VALUES ('github', 'org/repo', 'issue', 'first', 'abc123', 'src/widget.rs',
+                     'diff --git a/src/widget.rs b/src/widget.rs\n--- a/src/widget.rs\n+++ \
+             b/src/widget.rs\n@@ -1 +1 @@\n-old\n+new\n',
+                     'repo')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_xrefs
+                 (tracker, project, item_kind, item_key, xref_ordinal, target_tracker,
+                  target_project, target_item_kind, target_item_key, ref_kind, title, opening,
+                  repo_id)
+             VALUES ('github', 'org/repo', 'issue', 'first', 0, 'github', 'org/repo', 'issue',
+                     '9', 'reference', 'Related refactor', 'We reworked the render path.', 'repo')",
+            [],
+        )
+        .unwrap();
+
+        let jobs = load_prepared_jobs(&conn, "repo", 1, &PromptBudget::default()).unwrap();
+        let prompt = &jobs[0].rendered_prompt;
+        assert!(prompt.contains("DIFF:"), "the diff block renders: {prompt}");
+        assert!(prompt.contains("+new"), "hunk content renders: {prompt}");
+        assert!(prompt.contains("REFERENCED ITEMS:"), "{prompt}");
+        assert!(
+            prompt.contains(
+                "[issue] #9 (reference): Related refactor — We reworked the render path."
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
     fn model_executes_after_the_read_transaction_is_released() {
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let conn = Connection::open(&path).unwrap();
         apply_distill_record_store(&conn).unwrap();
         apply_distill_anchor_selection(&conn).unwrap();
         apply_distill_safe_input_snapshot(&conn).unwrap();
+        apply_distill_enriched_context(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,

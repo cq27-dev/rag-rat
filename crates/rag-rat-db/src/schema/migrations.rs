@@ -1328,6 +1328,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_077_ID => Some(77),
             MIGRATION_078_ID => Some(78),
             MIGRATION_079_ID => Some(79),
+            MIGRATION_080_ID => Some(80),
             _ => None,
         })
         .max()
@@ -1416,6 +1417,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_077_ID
             | MIGRATION_078_ID
             | MIGRATION_079_ID
+            | MIGRATION_080_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1501,6 +1503,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_077_ID => migration.checksum != MIGRATION_077_CHECKSUM,
         MIGRATION_078_ID => migration.checksum != MIGRATION_078_CHECKSUM,
         MIGRATION_079_ID => migration.checksum != MIGRATION_079_CHECKSUM,
+        MIGRATION_080_ID => migration.checksum != MIGRATION_080_CHECKSUM,
         _ => false,
     }
 }
@@ -5544,6 +5547,56 @@ pub fn apply_distill_safe_input_snapshot(conn: &Connection) -> rusqlite::Result<
         CREATE INDEX IF NOT EXISTS idx_papertrail_distill_units_source
             ON papertrail_distill_units(
                 repo_id, tracker, project, item_kind, item_key, source_ordinal, unit_ordinal
+            );
+        ",
+    )
+}
+
+/// V080 — extraction-owned enriched-context snapshots (#800): the fix diff (restricted to files
+/// with symbol anchor candidates) and the thread's cross-referenced item titles + opening
+/// paragraphs, snapshotted so the drain never reads mutable git/mirror state.
+///
+/// There is deliberately no SQL backfill, same doctrine as V079: old derived records must
+/// regenerate under the bumped extraction pipeline and snapshot the git/mirror state read in that
+/// same transaction.
+pub fn apply_distill_enriched_context(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS papertrail_distill_fix_diffs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL,
+            project TEXT NOT NULL,
+            item_kind TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            path TEXT NOT NULL,
+            patch TEXT NOT NULL,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_distill_fix_diffs_file
+            ON papertrail_distill_fix_diffs(
+                repo_id, tracker, project, item_kind, item_key, commit_sha, path
+            );
+
+        CREATE TABLE IF NOT EXISTS papertrail_distill_xrefs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracker TEXT NOT NULL,
+            project TEXT NOT NULL,
+            item_kind TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            xref_ordinal INTEGER NOT NULL CHECK(xref_ordinal >= 0),
+            target_tracker TEXT NOT NULL,
+            target_project TEXT NOT NULL,
+            target_item_kind TEXT,
+            target_item_key TEXT NOT NULL,
+            ref_kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            opening TEXT NOT NULL,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__'
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_papertrail_distill_xrefs_ordinal
+            ON papertrail_distill_xrefs(
+                repo_id, tracker, project, item_kind, item_key, xref_ordinal
             );
         ",
     )

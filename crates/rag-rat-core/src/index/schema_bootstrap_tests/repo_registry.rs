@@ -232,6 +232,22 @@ fn register_repo_repoints_distill_rows_from_the_placeholder() {
         [LEGACY_REPO_ID],
     )
     .unwrap();
+    conn.execute(
+        "INSERT INTO papertrail_distill_fix_diffs
+             (tracker, project, item_kind, item_key, commit_sha, path, patch, repo_id)
+         VALUES ('github','o/r','issue','5','abc123','src/lib.rs','patch',?1)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO papertrail_distill_xrefs
+             (tracker, project, item_kind, item_key, xref_ordinal, target_tracker,
+              target_project, target_item_kind, target_item_key, ref_kind, title, opening,
+              repo_id)
+         VALUES ('github','o/r','issue','5',0,'github','o/r','issue','9','reference','t','o',?1)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
 
     register_repo(
         &conn,
@@ -246,7 +262,12 @@ fn register_repo_repoints_distill_rows_from_the_placeholder() {
         .query_row("SELECT repo_id FROM papertrail_distill WHERE item_key='5'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(repo_id, "repo-abc", "the distill row is re-pointed to the adopted repo id");
-    for table in ["papertrail_distill_sources", "papertrail_distill_units"] {
+    for table in [
+        "papertrail_distill_sources",
+        "papertrail_distill_units",
+        "papertrail_distill_fix_diffs",
+        "papertrail_distill_xrefs",
+    ] {
         let adopted: i64 = conn
             .query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE repo_id='repo-abc'"),
