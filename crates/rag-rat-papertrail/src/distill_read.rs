@@ -99,6 +99,9 @@ fn coalesced_partners(
     repo_id: &str,
     key: &RecordKey,
 ) -> anyhow::Result<Vec<CoalescedThread>> {
+    // ORDER BY the combined UNION so the partner list is DETERMINISTIC: when one PR closes several
+    // issues (`Closes #5, Closes #7`), both are valid owners, so the redirect target and the
+    // rendered `coalesced` order must not depend on SQLite's unspecified UNION order.
     let mut stmt = conn.prepare(
         "SELECT dst_item_kind, dst_item_key FROM papertrail_distill_edges
          WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND edge_kind = ?4
@@ -106,7 +109,8 @@ fn coalesced_partners(
          UNION
          SELECT src_item_kind, src_item_key FROM papertrail_distill_edges
          WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND edge_kind = ?4
-           AND dst_item_kind = ?5 AND dst_item_key = ?6",
+           AND dst_item_kind = ?5 AND dst_item_key = ?6
+         ORDER BY 1, 2",
     )?;
     let rows = stmt.query_map(
         params![
@@ -484,6 +488,36 @@ mod tests {
         let via_issue =
             distilled_record_for_thread(&conn, "repoA", &key("issue", "5")).unwrap().unwrap();
         assert_eq!(via_issue.item_key, "5");
+    }
+
+    #[test]
+    fn a_pr_closing_several_issues_redirects_deterministically() {
+        // One merged PR closing issue #5 AND issue #7 (`Closes #5, Closes #7`) yields two coalesced
+        // edges to the same PR; both issues own records. The PR lookup must resolve to the SAME
+        // issue every time (lowest by (kind, key)), not an arbitrary one in SQLite's UNION order.
+        let conn = conn();
+        for issue in ["5", "7"] {
+            seed_record(&conn, &Seed {
+                repo: "repoA",
+                kind: "issue",
+                key: issue,
+                root_issue: Some(issue),
+                model_status: Some("landed"),
+                fix_edge_source: "provider",
+                revert_override: false,
+                closing_keyword: Some("closes"),
+            });
+            seed_coalesced_edge(&conn, "repoA", ("issue", issue), ("change_request", "6"));
+        }
+        for _ in 0..5 {
+            let record = distilled_record_for_thread(&conn, "repoA", &key("change_request", "6"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record.item_key, "5",
+                "the PR redirects to the ordinally-first owning issue"
+            );
+        }
     }
 
     #[test]
