@@ -823,7 +823,7 @@ fn clear_pending_content_refold(tx: &Transaction<'_>, stream_id: StreamId) -> ru
     Ok(())
 }
 
-/// One queued stream's current settle cost. The cost comes from the V080 `content_stream_stats`
+/// One queued stream's current settle cost. The cost comes from the V082 `content_stream_stats`
 /// aggregate (counts and `length(signed_bytes) + 32` per row, trigger-maintained) — never a
 /// `COUNT(*)`/`SUM` over the stream's candidate rows, which would make admission itself
 /// attacker-triggered O(stream).
@@ -835,7 +835,7 @@ struct PendingRefoldWork {
 
 /// One row of a BOUNDED fairness-ordered queue page: the stream identity, its position in the
 /// fairness order (the keyset cursor for the next page), and its LISTED fold cost joined in from
-/// the V080 `content_stream_stats` aggregate (counts and `length(signed_bytes) + 32` per row,
+/// the V082 `content_stream_stats` aggregate (counts and `length(signed_bytes) + 32` per row,
 /// trigger-maintained). The listing query filters eligibility in SQL, so every listed row fits a
 /// FRESH candidate/byte budget; the listed cost then classifies rows that no longer fit the
 /// REMAINING budget without a transaction, and anything that can still be admitted is re-read
@@ -866,7 +866,7 @@ fn settle_candidate_batch_size(budget: &ContentRefoldBudget) -> usize {
 /// Eligibility is filtered INSIDE the query (#798 Codex P1): only rows whose stored stats fit a
 /// FRESH candidate/byte budget are returned (a missing stats row is zero cost), so oversize rows
 /// are never listed — they cannot head-of-line block the smaller rows behind them, and later
-/// calls never re-list them. The scan stays one bounded page query per call, backed by the V080
+/// calls never re-list them. The scan stays one bounded page query per call, backed by the V082
 /// `content_streams_pending_refold_order` index.
 fn list_pending_refold_streams_page(
     conn: &Connection,
@@ -1269,7 +1269,7 @@ fn record_settle_outcome(
 /// REMAINING budget on every axis, so one call's cost stays bounded and the queue resumes where
 /// the budget ran out.
 ///
-/// Counts and bytes are the V080 `content_stream_stats` fold-cost units: a candidate row and
+/// Counts and bytes are the V082 `content_stream_stats` fold-cost units: a candidate row and
 /// `length(signed_bytes) + 32` bytes per row (the payload a full refold's `load_stream_headers`
 /// copies out of SQLite).
 ///

@@ -3455,7 +3455,7 @@ fn migration_082_is_the_tip_and_accounts_for_content_refold_work() {
         };
 
     // Reconstruct the previous tip: retain the V079 distill snapshot migration and its data, but
-    // restore the V072 queue shape and remove every V080 object before replaying only V080.
+    // restore the V072 queue shape and remove every V082 object before replaying only V082.
     conn.execute_batch(
         "DROP TRIGGER content_stream_stats_after_insert;
          DROP TRIGGER content_stream_stats_after_delete;
