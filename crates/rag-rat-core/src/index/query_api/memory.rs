@@ -132,6 +132,24 @@ impl IndexDatabase {
         )
     }
 
+    /// Distilled decision records worth surfacing on a symbol (#705 drive-by), labeled unreviewed.
+    /// Empty for a symbol with no resolved logical id (nothing to anchor a record to). Repo-scoped;
+    /// the facet gate + cap live in `rag_rat_papertrail::records_for_symbol`.
+    pub fn records_for_symbol(
+        &self,
+        symbol: &rag_rat_query::symbol::SymbolHit,
+        limit: usize,
+    ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
+        let Some(logical_symbol_id) = symbol.logical_symbol_id else {
+            return Ok(Vec::new());
+        };
+        let conn = self.storage.connection();
+        let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+        let records =
+            rag_rat_papertrail::records_for_symbol(conn, &repo_id, logical_symbol_id, limit)?;
+        Ok(records.into_iter().map(rag_rat_papertrail::DriveByRecord::new).collect())
+    }
+
     pub fn memory_for_path(
         &self,
         path: &str,

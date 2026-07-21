@@ -307,6 +307,13 @@ pub(crate) fn symbol_lookup_tool(
         if !memories.is_empty() {
             candidate["memories"] = json!(memories);
         }
+        // Distilled decision records for this symbol (#705 drive-by), capped ≤2 and labeled
+        // unreviewed. Facet-gated (provider fix edge + selected symbol anchor), so this is empty
+        // for the vast majority of symbols and never bloats the candidate.
+        let records = db.records_for_symbol(hit, 2)?;
+        if !records.is_empty() {
+            candidate["distilled_records"] = json!(records);
+        }
     }
     Ok(value)
 }

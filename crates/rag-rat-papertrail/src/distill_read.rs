@@ -87,6 +87,24 @@ pub struct DistilledRecord {
     pub coalesced: Vec<CoalescedThread>,
 }
 
+/// A distilled record surfaced on a drive-by (symbol / chunk) surface, LABELED so a consumer knows
+/// it is model-distilled and NOT human-reviewed. The record itself already carries its thread
+/// identity and fixing commits as provenance; this wrapper adds the `unreviewed` label the drive-by
+/// spec requires (a symbol's related decisions are best-effort context, not verified facts).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DriveByRecord {
+    /// Always `true`: the record is model-distilled, not human-reviewed.
+    pub unreviewed: bool,
+    #[serde(flatten)]
+    pub record: DistilledRecord,
+}
+
+impl DriveByRecord {
+    pub fn new(record: DistilledRecord) -> Self {
+        Self { unreviewed: true, record }
+    }
+}
+
 /// Load the canonical distilled record for a thread, following a `coalesced` edge when the thread
 /// was coalesced into a partner that owns the row. `None` when no record exists for the thread or
 /// its coalesce partner. `repo_id` is the active repo (mandatory: the store is one index over every
@@ -133,6 +151,12 @@ pub fn records_for_symbol(
     limit: usize,
 ) -> anyhow::Result<Vec<DistilledRecord>> {
     if limit == 0 {
+        return Ok(Vec::new());
+    }
+    // The distill store is OPTIONAL enrichment: a pre-distill or partially-migrated index has the
+    // symbol index but not the distill tables (V077). Serve nothing rather than error the whole
+    // surface that attaches the drive-by (symbol_lookup etc.) on a missing table.
+    if !rag_rat_db::schema::table_exists(conn, "papertrail_distill")? {
         return Ok(Vec::new());
     }
     let token = rag_rat_base::serde_big_id::format_sym_handle(logical_symbol_id);
@@ -396,7 +420,7 @@ fn fixing_commits(
 mod tests {
     use rusqlite::{Connection, params};
 
-    use super::{RecordKey, distilled_record_for_thread, records_for_symbol};
+    use super::{DriveByRecord, RecordKey, distilled_record_for_thread, records_for_symbol};
     use crate::{FixEdgeSource, OutcomeStatus, ThreadShape};
 
     fn conn() -> Connection {
@@ -487,6 +511,50 @@ mod tests {
         seed_symbol_anchor(&conn, "5", SYM_A, true);
         assert!(records_for_symbol(&conn, "repoA", SYM_UNANCHORED, 10).unwrap().is_empty());
         assert!(records_for_symbol(&conn, "repoA", SYM_A, 0).unwrap().is_empty(), "limit 0");
+    }
+
+    #[test]
+    fn drive_by_record_labels_the_serialized_record_unreviewed() {
+        let conn = conn();
+        // Seed a NON-null model status so this test can actually FAIL if the raw field ever
+        // regresses from unconditional `skip_serializing` to a conditional skip: it must be absent
+        // from the wire even when the record carries it.
+        seed_record(&conn, &Seed {
+            repo: "repoA",
+            kind: "issue",
+            key: "5",
+            root_issue: None,
+            model_status: Some("landed"),
+            fix_edge_source: "provider",
+            revert_override: false,
+            closing_keyword: None,
+        });
+        let record =
+            distilled_record_for_thread(&conn, "repoA", &key("issue", "5")).unwrap().unwrap();
+        assert_eq!(
+            record.outcome_status_model,
+            Some(OutcomeStatus::Landed),
+            "precondition: the record carries a raw model status",
+        );
+        let json = serde_json::to_value(DriveByRecord::new(record)).unwrap();
+        assert_eq!(
+            json["unreviewed"],
+            serde_json::json!(true),
+            "labeled model-distilled, unreviewed"
+        );
+        assert_eq!(json["item_key"], serde_json::json!("5"), "the record fields flatten alongside");
+        assert!(
+            json.get("outcome_status_model").is_none(),
+            "the raw model status is UNCONDITIONALLY off the wire, even when present",
+        );
+    }
+
+    #[test]
+    fn records_for_symbol_is_a_no_op_when_the_distill_store_is_absent() {
+        // A pre-distill / partially-migrated index has the symbol index but no distill tables; the
+        // drive-by must return nothing rather than erroring on the missing table.
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(records_for_symbol(&conn, "repoA", SYM_A, 10).unwrap().is_empty());
     }
 
     fn key(kind: &str, k: &str) -> RecordKey {
