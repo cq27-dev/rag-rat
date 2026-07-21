@@ -11,7 +11,8 @@ pub use migrations::{
     apply_account_candidate_dag, apply_clone_delta_maintenance, apply_clone_df_epoch,
     apply_clone_fingerprint_tables, apply_clone_graph_tables, apply_content_candidate_dag,
     apply_content_projected_tables, apply_content_streams_pending_refold,
-    apply_distill_anchor_selection, apply_distill_enriched_context, apply_distill_record_store,
+    apply_distill_anchor_selection, apply_distill_enriched_context,
+    apply_distill_evidence_source_part, apply_distill_record_store,
     apply_distill_safe_input_snapshot, apply_dream_findings, apply_edge_string_interning,
     apply_edge_target_qname_index, apply_external_symbols, apply_files_generation,
     apply_files_has_test_code, apply_git_change_couplings, apply_github_child_key_widening,
@@ -44,7 +45,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 80;
+pub const LATEST_SCHEMA_VERSION: u32 = 81;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -592,6 +593,14 @@ const MIGRATION_080_DESCRIPTION: &str =
      per-fix-commit unified diffs restricted to files with symbol anchor candidates, and \
      cross-referenced item titles + opening paragraphs mined from the thread's outbound \
      papertrail refs. Additive and intentionally does not backfill from mutable git/mirror state";
+
+const MIGRATION_081_ID: &str = "081_distill_evidence_source_part";
+const MIGRATION_081_CHECKSUM: &str = "sha256:rag-rat-distill-evidence-source-part-v81";
+const MIGRATION_081_DESCRIPTION: &str =
+    "Persist source-part identity (title|body|comment) on distilled evidence rows (issue #801) so \
+     a citation from an item's title is distinguishable from one in its body (both share the item \
+     key as source_id). Nullable and additive: existing rows keep NULL, the drain populates new \
+     rows from its snapshot, and no SQL backfill is performed (a re-drain rewrites evidence)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1263,6 +1272,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_080_CHECKSUM,
         description: MIGRATION_080_DESCRIPTION,
         apply: MigrationFn::Plain(apply_distill_enriched_context),
+    },
+    Migration {
+        id: MIGRATION_081_ID,
+        checksum: MIGRATION_081_CHECKSUM,
+        description: MIGRATION_081_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_distill_evidence_source_part),
     },
 ];
 

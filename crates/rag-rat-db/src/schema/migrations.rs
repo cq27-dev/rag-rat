@@ -1329,6 +1329,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_078_ID => Some(78),
             MIGRATION_079_ID => Some(79),
             MIGRATION_080_ID => Some(80),
+            MIGRATION_081_ID => Some(81),
             _ => None,
         })
         .max()
@@ -1418,6 +1419,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_078_ID
             | MIGRATION_079_ID
             | MIGRATION_080_ID
+            | MIGRATION_081_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1504,6 +1506,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_078_ID => migration.checksum != MIGRATION_078_CHECKSUM,
         MIGRATION_079_ID => migration.checksum != MIGRATION_079_CHECKSUM,
         MIGRATION_080_ID => migration.checksum != MIGRATION_080_CHECKSUM,
+        MIGRATION_081_ID => migration.checksum != MIGRATION_081_CHECKSUM,
         _ => false,
     }
 }
@@ -5599,6 +5602,30 @@ pub fn apply_distill_enriched_context(conn: &Connection) -> rusqlite::Result<()>
                 repo_id, tracker, project, item_kind, item_key, xref_ordinal
             );
         ",
+    )
+}
+
+/// V081 — persist source-part identity on distilled evidence rows (#801). V077's
+/// `papertrail_distill_evidence` stores `source_kind`/`source_id` but not WHICH part of an item a
+/// citation came from: an item's title and body share the same `source_id` (the item key), so two
+/// citations with identical or overlapping spans were indistinguishable in the persisted record —
+/// even though the V079 snapshot substrate keeps full identity at drain time. Add `source_part`
+/// (title|body|comment, matching the V079 CHECK), populated by the drain from its `SourceSnapshot`.
+///
+/// Nullable: existing rows predate the column and keep NULL (which passes the value CHECK). No SQL
+/// backfill — evidence is derived and rewritten wholesale on every drain, so a re-drain repopulates
+/// it (the derived-data doctrine of V079/V080). The source ITEM identity is deliberately NOT added:
+/// distilled evidence is primary-only (the drain rejects partner units), so the source item is
+/// always the record's own `(item_kind, item_key)` already stored on the row. Guarded by
+/// `column_exists` so a torn replay (column added, migration row not yet recorded) is a no-op
+/// rather than a duplicate-column error.
+pub fn apply_distill_evidence_source_part(conn: &Connection) -> rusqlite::Result<()> {
+    if column_exists(conn, "papertrail_distill_evidence", "source_part")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE papertrail_distill_evidence
+             ADD COLUMN source_part TEXT CHECK(source_part IN ('title', 'body', 'comment'));",
     )
 }
 

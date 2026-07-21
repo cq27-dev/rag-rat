@@ -895,10 +895,10 @@ fn insert_evidence(
     let quote = &evidence.source.exact_text[evidence.unit.byte_start..evidence.unit.byte_end];
     conn.execute(
         "INSERT INTO papertrail_distill_evidence
-             (tracker, project, item_kind, item_key, field, source_kind, source_id, byte_start,
-              byte_end, quote, author, author_kind, author_association, unit_created_at_ms, \
-         repo_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             (tracker, project, item_kind, item_key, field, source_kind, source_part, source_id,
+              byte_start, byte_end, quote, author, author_kind, author_association,
+              unit_created_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             key.tracker,
             key.project,
@@ -906,6 +906,9 @@ fn insert_evidence(
             key.item_key,
             evidence.field,
             evidence.source.source_kind,
+            // source_part (#801) distinguishes a title citation from a body citation on the same
+            // item — both carry the item key as source_id, so this is the only discriminator.
+            evidence.source.source_part,
             evidence.source.source_id,
             i64::try_from(evidence.unit.byte_start)?,
             i64::try_from(evidence.unit.byte_end)?,
@@ -974,7 +977,8 @@ mod tests {
     use std::sync::Mutex;
 
     use rag_rat_db::schema::{
-        apply_distill_anchor_selection, apply_distill_enriched_context, apply_distill_record_store,
+        apply_distill_anchor_selection, apply_distill_enriched_context,
+        apply_distill_evidence_source_part, apply_distill_record_store,
         apply_distill_safe_input_snapshot,
     };
     use rag_rat_llm::chat::{ChatModel, GuidedJson};
@@ -1027,6 +1031,7 @@ mod tests {
         apply_distill_anchor_selection(&conn).unwrap();
         apply_distill_safe_input_snapshot(&conn).unwrap();
         apply_distill_enriched_context(&conn).unwrap();
+        apply_distill_evidence_source_part(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
@@ -1117,6 +1122,64 @@ mod tests {
     }
 
     #[test]
+    fn evidence_records_the_part_each_citation_came_from() {
+        // #801: an item's title and body share the same source_id (the item key). A citation to the
+        // title and one to the body must be distinguishable in the persisted evidence — the only
+        // discriminator is source_part.
+        let conn = fixture();
+        let lock_db = tempfile::NamedTempFile::new().unwrap();
+        seed(&conn, "7", 20);
+        // seed() gives unit 0 → the body source (ordinal 1). Add unit 1 → the title source
+        // (ordinal 0), so the model can cite both parts of the same item.
+        conn.execute(
+            "INSERT INTO papertrail_distill_units
+                 (tracker, project, item_kind, item_key, unit_ordinal, source_ordinal, byte_start,
+                  byte_end, repo_id)
+             VALUES ('github', 'org/repo', 'issue', '7', 1, 0, 0, 7, 'repo')",
+            [],
+        )
+        .unwrap();
+        // root_cause cites the TITLE unit (1); decision and outcome cite the BODY unit (0).
+        let reply = serde_json::json!({
+            "root_issue": "The operation failed.",
+            "root_cause_units": [1],
+            "root_cause": "A stale decision caused the failure.",
+            "root_cause_class": "stale decision",
+            "decision_units": [0],
+            "decision": {"chosen": "Use the current decision.", "rejected": []},
+            "outcome_units": [0],
+            "anchor_indices": [0],
+            "outcome": {"status": "landed", "summary": "The fix landed."}
+        })
+        .to_string();
+
+        let report =
+            drain(&conn, lock_db.path(), "repo", &ScriptedModel::new(vec![Ok(reply)]), 10, 99)
+                .unwrap();
+        assert_eq!((report.threads, report.succeeded), (1, 1));
+
+        let rows: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT field, source_part, source_id FROM papertrail_distill_evidence
+                 ORDER BY field",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("decision".to_string(), "body".to_string(), "7".to_string()),
+                ("outcome".to_string(), "body".to_string(), "7".to_string()),
+                ("root_cause".to_string(), "title".to_string(), "7".to_string()),
+            ],
+            "the title citation and the body citations share a source_id but differ by source_part",
+        );
+    }
+
+    #[test]
     fn successful_drain_persists_the_complete_model_transition() {
         let conn = fixture();
         let lock_db = tempfile::NamedTempFile::new().unwrap();
@@ -1173,6 +1236,16 @@ mod tests {
             })
             .unwrap(),
             "Cause and decision landed."
+        );
+        // Every citation here is the body unit, so the persisted evidence records its part (#801).
+        assert_eq!(
+            conn.query_row(
+                "SELECT DISTINCT source_part FROM papertrail_distill_evidence",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "body",
         );
         assert_eq!(
             conn.query_row("SELECT selected FROM papertrail_distill_anchors", [], |row| row
@@ -1248,6 +1321,7 @@ mod tests {
         apply_distill_anchor_selection(&conn).unwrap();
         apply_distill_safe_input_snapshot(&conn).unwrap();
         apply_distill_enriched_context(&conn).unwrap();
+        apply_distill_evidence_source_part(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
@@ -1436,6 +1510,7 @@ mod tests {
         apply_distill_anchor_selection(&conn).unwrap();
         apply_distill_safe_input_snapshot(&conn).unwrap();
         apply_distill_enriched_context(&conn).unwrap();
+        apply_distill_evidence_source_part(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,

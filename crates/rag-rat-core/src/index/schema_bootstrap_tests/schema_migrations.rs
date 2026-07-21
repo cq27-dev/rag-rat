@@ -3256,9 +3256,9 @@ fn migration_079_builds_safe_input_snapshots() {
 }
 
 #[test]
-fn migration_080_is_the_tip_and_builds_enriched_context_snapshots() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 80, "move this pin with the next schema migration");
-
+fn migration_080_builds_enriched_context_snapshots() {
+    // `LATEST_SCHEMA_VERSION` pin moved to `migration_081_*`, the new tip; this uses only the
+    // symbolic checks (the hardcoded-LATEST footgun).
     let legacy = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply_distill_record_store(&legacy).unwrap();
     schema::apply_distill_anchor_selection(&legacy).unwrap();
@@ -3350,7 +3350,7 @@ fn migration_080_is_the_tip_and_builds_enriched_context_snapshots() {
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 80);
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM schema_version WHERE id = '080_distill_enriched_context'",
@@ -3359,4 +3359,78 @@ fn migration_080_is_the_tip_and_builds_enriched_context_snapshots() {
         )
         .unwrap();
     assert_eq!(recorded, 1, "the forward migration records V080");
+}
+
+#[test]
+fn migration_081_is_the_tip_and_adds_evidence_source_part() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 81, "move this pin with the next schema migration");
+
+    // The evidence table predates the column: build the record store (V077) without V081, then
+    // apply V081 and confirm the column appears.
+    let legacy = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_distill_record_store(&legacy).unwrap();
+    assert!(
+        !schema::column_exists(&legacy, "papertrail_distill_evidence", "source_part").unwrap(),
+        "V077 evidence has no source_part",
+    );
+
+    schema::apply_distill_evidence_source_part(&legacy).unwrap();
+    assert!(
+        schema::column_exists(&legacy, "papertrail_distill_evidence", "source_part").unwrap(),
+        "V081 adds the source_part column",
+    );
+
+    // A pre-V081 row is representable with NULL source_part (the value CHECK passes NULL).
+    legacy
+        .execute(
+            "INSERT INTO papertrail_distill_evidence
+                 (tracker, project, item_kind, item_key, field, source_kind, source_id,
+                  byte_start, byte_end, quote, repo_id)
+             VALUES ('github','o/r','issue','5','root_cause','item','5',0,4,'quot','repoA')",
+            [],
+        )
+        .unwrap();
+    // A new row must carry one of title|body|comment.
+    legacy
+        .execute(
+            "INSERT INTO papertrail_distill_evidence
+                 (tracker, project, item_kind, item_key, field, source_kind, source_part,
+                  source_id, byte_start, byte_end, quote, repo_id)
+             VALUES ('github','o/r','issue','5','decision','item','title','5',0,4,'quot','repoA')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        legacy
+            .execute(
+                "INSERT INTO papertrail_distill_evidence
+                     (tracker, project, item_kind, item_key, field, source_kind, source_part,
+                      source_id, byte_start, byte_end, quote, repo_id)
+                 VALUES ('github','o/r','issue','5','decision','item','headline','5',0,4,'q',
+                         'repoA')",
+                [],
+            )
+            .is_err(),
+        "source_part is CHECK-constrained to title|body|comment",
+    );
+
+    // Torn replay: the column already exists, so re-applying is a no-op, not a duplicate-column
+    // error, and existing rows survive.
+    schema::apply_distill_evidence_source_part(&legacy).unwrap();
+    let rows: i64 = legacy
+        .query_row("SELECT COUNT(*) FROM papertrail_distill_evidence", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 2, "an idempotent re-apply preserves existing evidence rows");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, 81);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '081_distill_evidence_source_part'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V081");
 }
