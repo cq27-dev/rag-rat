@@ -215,7 +215,12 @@ pub fn account_ingest(
     } else {
         PromotionOutcome::default()
     };
-    let state = refold_untrusted_ingest_in_tx(&tx, account_id, now_ms)?;
+    let promotion = if is_genesis(&verified.header) || is_device_add(&verified) {
+        PreVerifyPromotion::Retry
+    } else {
+        PreVerifyPromotion::Skip
+    };
+    let state = refold_untrusted_ingest_in_tx(&tx, account_id, now_ms, promotion)?;
     tx.commit()?;
     let status =
         state.statuses.get(&verified.entry_hash).cloned().unwrap_or_else(|| "unknown".into());
@@ -956,7 +961,7 @@ pub(super) fn refold_in_tx(
     account_id: AccountId,
     now_ms: i64,
 ) -> anyhow::Result<HashMap<[u8; 32], String>> {
-    let state = fold_account_state_in_tx(tx, account_id, now_ms)?;
+    let state = fold_account_state_in_tx(tx, account_id, now_ms, PreVerifyPromotion::Skip)?;
     super::content::finalize_affected_streams(tx, &state.affected_streams)?;
     // `state.rejected_content_promotions` is deliberately DISCARDED here: this trusted/local path
     // has no remote caller to signal evicted promotions to (the ingest outcome variants carry it
@@ -971,10 +976,24 @@ fn refold_untrusted_ingest_in_tx(
     tx: &Transaction<'_>,
     account_id: AccountId,
     now_ms: i64,
+    promotion: PreVerifyPromotion,
 ) -> anyhow::Result<AccountStateFold> {
-    let state = fold_account_state_in_tx(tx, account_id, now_ms)?;
+    let state = fold_account_state_in_tx(tx, account_id, now_ms, promotion)?;
     super::content::queue_account_changed_streams(tx, &state.affected_streams, now_ms)?;
     Ok(state)
+}
+
+/// Whether this fold should re-attempt content rows parked before their author's device was
+/// resolvable. ONLY a genesis or a `DeviceAdd` can make a previously unresolvable roster key
+/// resolve, so every other entry skips the sweep — it would otherwise decode up to the per-author
+/// pre-verify cap of parked envelopes on EVERY account entry, reintroducing exactly the per-entry
+/// amplification this path exists to remove.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreVerifyPromotion {
+    /// A genesis or `DeviceAdd`: retry the parked rows for this account.
+    Retry,
+    /// Any other entry, and every trusted/local refold: nothing new can resolve.
+    Skip,
 }
 
 /// Fold account-owned state and return the exact content streams whose acceptance or projection
@@ -984,6 +1003,7 @@ fn fold_account_state_in_tx(
     tx: &Transaction<'_>,
     account_id: AccountId,
     now_ms: i64,
+    promotion: PreVerifyPromotion,
 ) -> anyhow::Result<AccountStateFold> {
     let rows = load_candidates(tx, account_id)?;
     let projection = derive_account_projection(&rows);
@@ -1036,8 +1056,13 @@ fn fold_account_state_in_tx(
     // what makes a control fold that condemns a device's secrets chain retro-condemn its wraps
     // atomically.
     super::secrets::refold_secrets_log(tx, account_id, &mut statuses)?;
-    let rejected_content_promotions =
-        super::content::promote_pre_verify_for_account(tx, account_id, now_ms)?;
+    // Runs AFTER the projection rewrite and the secrets refold, so a `DeviceAdd`'s own key is
+    // already visible to the roster resolution the promotion performs.
+    let rejected_content_promotions = match promotion {
+        PreVerifyPromotion::Retry =>
+            super::content::promote_pre_verify_for_account(tx, account_id, now_ms)?,
+        PreVerifyPromotion::Skip => Default::default(),
+    };
     let affected_streams =
         super::content::affected_streams_for_account(tx, account_id, &previously_owned)?;
     Ok(AccountStateFold { statuses, affected_streams, rejected_content_promotions })
@@ -3029,6 +3054,73 @@ mod tests {
         let pending: i64 =
             conn.query_row("SELECT COUNT(*) FROM account_pre_verify", [], |r| r.get(0)).unwrap();
         assert_eq!(pending, 0, "the pre-verify queue is drained");
+    }
+
+    #[test]
+    fn only_a_genesis_or_device_add_sweeps_parked_content_for_promotion() {
+        // #798 adversarial finding 4: the pre-verify promotion sweep must stay gated on the entry
+        // types that can actually make an unresolvable roster key resolve. Running it on EVERY
+        // account entry decodes up to the per-author parked cap per entry — reintroducing exactly
+        // the per-entry amplification the deferred-refold path exists to remove — and is pure waste
+        // for every other entry type.
+        //
+        // Observable form: a `StreamOwn` (neither genesis nor `DeviceAdd`) must leave the parked
+        // row exactly where it is; the `DeviceAdd` that follows is what drains it.
+        let conn = db();
+        let founder = Dev::new(0x41);
+        let member = Dev::new(0x42);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        let (stream_id, own) = stream_own(account_id);
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
+
+        // Build the rest of the chain up front: the content binds to the DeviceAdd's hash as its
+        // roster_ref, so the add's exact bytes (and therefore its seq/prev) must be fixed before
+        // the content is signed. Chain order is genesis -> own -> second_own -> add.
+        let (_, second_own) = stream_own(account_id);
+        let (second_own_bytes, second_own_hash) =
+            op(account_id, &founder, 2, Some(own_hash), Some(genesis_hash), &second_own);
+        let (add_bytes, add_hash) = op(
+            account_id,
+            &founder,
+            3,
+            Some(second_own_hash),
+            Some(genesis_hash),
+            &device_add(&member, DeviceRole::Member),
+        );
+
+        // The member is not on the roster yet, so its content parks pre-verified.
+        let content = signed_member_content(&member, account_id, stream_id, add_hash, 4);
+        content_ingest(&conn, &content.signed_bytes, NOW + 2).unwrap();
+        let parked = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM content_pre_verify", [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(parked(&conn), 1, "the member's content parks behind its unresolvable device");
+
+        // A `StreamOwn` — a perfectly ordinary control entry that resolves no device. The sweep
+        // must not RUN at all; asserting only that the parked row survives would pass with the gate
+        // deleted, because a sweep that can resolve nothing promotes nothing.
+        super::super::content::reset_pre_verify_content_sweeps();
+        account_ingest(&conn, &second_own_bytes, NOW + 3).unwrap();
+        assert_eq!(
+            super::super::content::pre_verify_content_sweeps(),
+            0,
+            "a non-resolving entry must not sweep the parked rows at all",
+        );
+        assert_eq!(parked(&conn), 1, "and the parked row is untouched");
+
+        // The `DeviceAdd` is what can resolve the key, so it runs the sweep and drains the row.
+        super::super::content::reset_pre_verify_content_sweeps();
+        account_ingest(&conn, &add_bytes, NOW + 4).unwrap();
+        assert_eq!(
+            super::super::content::pre_verify_content_sweeps(),
+            1,
+            "the DeviceAdd runs the sweep exactly once",
+        );
+        assert_eq!(parked(&conn), 0, "the DeviceAdd promotes the parked content");
     }
 
     #[test]

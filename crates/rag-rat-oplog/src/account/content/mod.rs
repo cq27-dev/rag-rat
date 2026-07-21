@@ -47,9 +47,11 @@ pub(crate) use storage::content_projected_tables_exist;
 pub use storage::{
     ContentCapacityScope, ContentIngestOutcome, ContentRefoldBudget, ContentSettleReport,
     ContentStreamSettleFailure, content_ingest, content_stream_has_pending_refold,
-    settle_pending_content_refold_for_stream, settle_pending_content_refolds,
+    settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
 };
 pub(super) use storage::{
     ContentPromotionOutcome, affected_streams_for_account, finalize_affected_streams,
     promote_pre_verify_for_account, queue_account_changed_streams,
 };
+#[cfg(test)]
+pub(super) use storage::{pre_verify_content_sweeps, reset_pre_verify_content_sweeps};

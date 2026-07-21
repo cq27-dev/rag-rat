@@ -4639,8 +4639,15 @@ pub fn apply_content_streams_pending_refold(conn: &Connection) -> rusqlite::Resu
 /// row. It deliberately does not guess at allocator/container overhead after decode. The source
 /// rows remain authoritative: this migration rebuilds the aggregate once, and database triggers
 /// maintain it for every writer thereafter. The update trigger covers direct mutation of
-/// `stream_id` or `signed_bytes`; runtime writers currently treat both as immutable, but the schema
-/// does not rely on every present or future caller remembering the accounting invariant.
+/// `stream_id` or `signed_bytes`; runtime writers currently treat both as immutable.
+///
+/// The triggers do NOT cover one shape: SQLite performs `INSERT OR REPLACE`'s implicit row deletion
+/// WITHOUT firing `AFTER DELETE` triggers unless `PRAGMA recursive_triggers` is on, which this
+/// store never sets — so a `REPLACE` into `content_entries` fires the insert trigger only and
+/// drifts the aggregate upward permanently. Upward drift is fail-safe for admission (the stream
+/// looks expensive and is skipped, never silently unbounded), but it makes the stream invisible to
+/// normal-mode settle forever. No writer uses `REPLACE` today and a source tripwire test keeps it
+/// that way (`rag-rat-oplog`); `INSERT OR IGNORE` and non-accounting `UPDATE`s are correctly inert.
 ///
 /// Existing V072 queue rows predate enqueue timestamps. Their first/last times derive
 /// deterministically from the stream's minimum/maximum candidate `received_at_ms`; an orphan queue

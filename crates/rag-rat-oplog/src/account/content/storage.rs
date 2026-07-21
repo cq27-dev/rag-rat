@@ -5,8 +5,6 @@
 //! freshness, and branch selection together before content can reach the live projection.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -325,11 +323,32 @@ fn evict_oldest_pre_verify(
     )
 }
 
+// Test-only: how many times the parked-content promotion sweep actually ran. The gate that keeps
+// it off every non-resolving account entry is a COST invariant, not an outcome one — the sweep is
+// a no-op whenever nothing new can resolve, so a parked-row-count assertion alone would pass just
+// as happily with the gate deleted. Thread-local for the same reason as the settle counters.
+#[cfg(test)]
+thread_local! {
+    static PRE_VERIFY_CONTENT_SWEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::account) fn reset_pre_verify_content_sweeps() {
+    PRE_VERIFY_CONTENT_SWEEPS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(in crate::account) fn pre_verify_content_sweeps() -> usize {
+    PRE_VERIFY_CONTENT_SWEEPS.with(std::cell::Cell::get)
+}
+
 pub(in crate::account) fn promote_pre_verify_for_account(
     tx: &Transaction<'_>,
     account_id: super::super::AccountId,
     now_ms: i64,
 ) -> anyhow::Result<ContentPromotionOutcome> {
+    #[cfg(test)]
+    PRE_VERIFY_CONTENT_SWEEPS.with(|c| c.set(c.get() + 1));
     // V064/V065 authority backfill predates the V066 content tables. Account-state folding is also
     // used by that migration, where there cannot be content pre-verify work yet.
     if !content_entries_exists(tx)? {
@@ -866,8 +885,13 @@ fn settle_candidate_batch_size(budget: &ContentRefoldBudget) -> usize {
 /// Eligibility is filtered INSIDE the query (#798 Codex P1): only rows whose stored stats fit a
 /// FRESH candidate/byte budget are returned (a missing stats row is zero cost), so oversize rows
 /// are never listed — they cannot head-of-line block the smaller rows behind them, and later
-/// calls never re-list them. The scan stays one bounded page query per call, backed by the V082
-/// `content_streams_pending_refold_order` index.
+/// calls never re-list them.
+///
+/// The `LIMIT` bounds the rows RETURNED, not the rows examined: the eligibility predicates are
+/// applied before it, so SQLite walks the `content_streams_pending_refold_order` index and probes
+/// `content_stream_stats` per row until it collects a full page. A queue that is entirely oversize
+/// therefore costs one index walk, not one page. That stays bounded in practice by the global
+/// candidate/account caps, but it is a walk, not a point read.
 fn list_pending_refold_streams_page(
     conn: &Connection,
     cursor: Option<(i64, StreamId)>,
@@ -875,7 +899,7 @@ fn list_pending_refold_streams_page(
     limit: usize,
 ) -> anyhow::Result<Vec<PendingRefoldListing>> {
     #[cfg(test)]
-    SETTLE_LISTING_QUERIES.fetch_add(1, Ordering::Relaxed);
+    SETTLE_LISTING_QUERIES.with(|c| c.set(c.get() + 1));
     let (after_ms, after_stream) = match &cursor {
         Some((ms, stream)) => (Some(*ms), Some(stream.to_bytes().to_vec())),
         None => (None, None),
@@ -957,17 +981,23 @@ fn budget_could_fit_more(budget: &ContentRefoldBudget, consumed: ContentSettleCo
         && consumed.candidate_bytes < budget.max_candidate_bytes
 }
 
-/// Test-only work counters proving a settle call's SQL/lock work is bounded by the budget and not
-/// the backlog (#798 review): listing queries (page listings plus the one targeted oversize query
-/// in maintenance mode), per-stream admission probes (each an IMMEDIATE transaction), and the one
-/// O(1) queue-empty completion probe. Production semantics are unchanged; nextest isolates tests
-/// per process.
+// Test-only work counters proving a settle call's SQL/lock work is bounded by the budget and not
+// the backlog (#798 review): listing queries (page listings plus the one targeted oversize query
+// in maintenance mode), per-stream admission probes (each an IMMEDIATE transaction), and the one
+// O(1) queue-empty completion probe. Production semantics are unchanged.
+//
+// THREAD-LOCAL, not `static`: the CI coverage job runs `cargo llvm-cov` over `cargo test`, which
+// shares ONE process per test binary and runs tests on concurrent threads, so process-global
+// counters read whatever sibling settle tests happened to add in the window. `cargo test` gives
+// each test its own thread and the settle path is synchronous rusqlite, so per-thread counting is
+// exact under both that runner and nextest. A future test that settles on a SPAWNED thread would
+// read 0 here — assert counters only on the thread that called settle.
 #[cfg(test)]
-static SETTLE_LISTING_QUERIES: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static SETTLE_ADMISSION_PROBES: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static SETTLE_COMPLETION_PROBES: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static SETTLE_LISTING_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SETTLE_ADMISSION_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SETTLE_COMPLETION_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Revalidate both queue membership and O(1) fold cost under the transaction that may fold it.
 fn pending_refold_work_in_tx(
@@ -999,7 +1029,7 @@ fn pending_refold_work_in_tx(
 /// deliberately NOT taken.
 fn pending_refold_queue_nonempty(conn: &Connection) -> anyhow::Result<bool> {
     #[cfg(test)]
-    SETTLE_COMPLETION_PROBES.fetch_add(1, Ordering::Relaxed);
+    SETTLE_COMPLETION_PROBES.with(|c| c.set(c.get() + 1));
     let nonempty =
         conn.query_row("SELECT EXISTS(SELECT 1 FROM content_streams_pending_refold)", [], |row| {
             row.get::<_, i64>(0)
@@ -1064,7 +1094,7 @@ fn oldest_oversize_pending_refold(
     budget: &ContentRefoldBudget,
 ) -> anyhow::Result<Option<StreamId>> {
     #[cfg(test)]
-    SETTLE_LISTING_QUERIES.fetch_add(1, Ordering::Relaxed);
+    SETTLE_LISTING_QUERIES.with(|c| c.set(c.get() + 1));
     let max_candidates = i64::try_from(budget.max_candidates).unwrap_or(i64::MAX);
     let max_candidate_bytes = i64::try_from(budget.max_candidate_bytes).unwrap_or(i64::MAX);
     conn.query_row(
@@ -1179,7 +1209,7 @@ fn settle_one_pending_refold(
     consumed: ContentSettleConsumption,
 ) -> PendingRefoldOutcome {
     #[cfg(test)]
-    SETTLE_ADMISSION_PROBES.fetch_add(1, Ordering::Relaxed);
+    SETTLE_ADMISSION_PROBES.with(|c| c.set(c.get() + 1));
     let tx = match begin_immediate_tx(conn) {
         Ok(tx) => tx,
         Err(outcome) => return outcome,
@@ -1354,6 +1384,12 @@ pub struct ContentSettleReport {
     /// Whether the queue was empty at this O(1) post-pass observation. The transport caller loops
     /// while this is false AND the last call made progress; it never learns the exact backlog.
     pub queue_empty: bool,
+    /// Queue rows the paged listing actually returned this call. Zero with `queue_empty == false`
+    /// is the ONLY signal distinguishing "the remaining work is all SQL-filtered oversize rows"
+    /// (schedule an oversize-maintenance pass) from a poisoned stream, lock contention, or a
+    /// listing that raced empty — every one of which otherwise reports identical all-zero counters
+    /// (#798 adversarial finding 6). Costs nothing: it is the page lengths already read.
+    pub discovered_rows: usize,
 }
 
 /// Fold the streams `content_ingest` deferred, oldest first, until `budget` runs out, and report
@@ -1440,7 +1476,10 @@ fn settle_pending_content_refolds_inner(
     // quadratic). A listed row that fit the fresh budget but not the REMAINING budget is deferred
     // without a transaction; the rare row that GREW past the budget between listing and admission
     // is deferred by the in-transaction revalidation instead.
-    let mut listed_any = false;
+    // Whether the paging loop ended because ELIGIBLE work ran out (as opposed to the budget running
+    // out with eligible rows still queued behind the cursor). Only the former licenses the oversize
+    // probe below — see its comment for why "listed nothing at all" is the wrong test.
+    let eligible_work_drained;
     // Fairness demotions are COLLECTED here and applied once after the paging loop (#798
     // adversarial finding F1): demoting a failed row inside the loop moves it to
     // `MAX(first_enqueued_at_ms) + 1`, ahead of the advancing keyset cursor, so a persistently
@@ -1454,10 +1493,11 @@ fn settle_pending_content_refolds_inner(
             hook();
         }
         if page.is_empty() {
+            eligible_work_drained = true;
             break;
         }
-        listed_any = true;
         let page_len = page.len();
+        report.discovered_rows += page_len;
         let mut page_admitted = false;
         let mut page_vanished = false;
         for listing in page {
@@ -1476,22 +1516,32 @@ fn settle_pending_content_refolds_inner(
             page_admitted |= admitted;
             page_vanished |= vanished;
         }
-        if page_len < batch
+        // A SHORT page is the only exit that proves the eligible queue is exhausted: the other two
+        // mean the budget ran out while eligible rows remain behind the cursor. Rows this call
+        // deferred for remaining budget are still owed eligible work, so they veto it too.
+        let last_page = page_len < batch;
+        if last_page
             || !budget_could_fit_more(budget, consumed)
             || !(page_admitted || page_vanished)
         {
+            eligible_work_drained = last_page && report.deferred_budget == 0;
             break;
         }
     }
     // Oversize maintenance: the listing above never discovers rows that exceed a fresh budget.
-    // Probe for the OLDEST such row ONLY when normal discovery listed ZERO eligible rows on its
-    // first page — oversize rows are then the only work left. The `LIMIT 1` probe is oldest-first
-    // via the order index but degenerates to a FULL QUEUE SCAN when no oversize row exists, so
-    // running it whenever a slot remained would make every budgeted call O(queue) (#798
-    // adversarial review). The admission goes through the same in-transaction revalidation, which
-    // honors the intentional exceedance and the stream-slot limit.
+    // Probe for the OLDEST such row only once ELIGIBLE work is drained for this budget. The
+    // `LIMIT 1` probe is oldest-first via the order index but degenerates to a FULL QUEUE SCAN when
+    // no oversize row exists, so running it whenever a slot remained would make every budgeted call
+    // O(queue) (#798 Codex review) — hence the gate. It must NOT be "the loop listed nothing at
+    // all", though: that starves maintenance forever whenever the queue keeps producing any
+    // listable row (a persistently failing small stream, or just steady remote ingest), so the
+    // oversize row's acceptance and projection freeze permanently (#798 adversarial finding 1).
+    // Draining eligible work first keeps the scan off the hot path while still guaranteeing that a
+    // maintenance caller which reaches a quiet queue converges. The admission goes through the same
+    // in-transaction revalidation, which honors the intentional exceedance and the stream-slot
+    // limit.
     if budget.allow_one_oversize
-        && !listed_any
+        && eligible_work_drained
         && !consumed.oversize_slot_spent
         && consumed.attempted_streams < budget.max_streams
         && let Some(stream_id) = oldest_oversize_pending_refold(conn, budget)?
@@ -1511,31 +1561,27 @@ fn settle_pending_content_refolds_inner(
     Ok(report)
 }
 
-/// Settle ONE named stream's queued refold debt, in its own IMMEDIATE transaction — the
-/// pending-fold barrier's inline drain (rag-rat-core `memory_write`). Targeted on purpose: the
-/// barrier owes THIS stream's acceptance before it may read completeness, so draining the global
-/// oldest-first queue (which could settle a different stream) would not unblock it. Bypasses the
-/// fairness order and never demotes — a failure here keeps the row exactly where it was. Returns
-/// whether the stream's queue row is gone afterwards (a vanished row counts as clear).
-pub fn settle_pending_content_refold_for_stream(
-    conn: &Connection,
+/// Settle ONE named stream's queued refold debt INSIDE the caller's already-open IMMEDIATE
+/// transaction — the pending-fold barrier's drain (rag-rat-core `memory_write`).
+///
+/// The barrier owes THIS stream's acceptance before it may read completeness, so it settles the
+/// stream as part of the write it is already performing rather than draining it beforehand on an
+/// autocommit connection: a foreign `/3` candidate can target the LOCAL owner stream (C2 targeting
+/// is unconstrained), so a remote peer can re-enqueue debt on the most expensive stream in the
+/// store at will. Folding inside the caller's transaction bounds that to ONE fold per local write —
+/// work the write's own authoring would do anyway — instead of an unbudgeted refold of the entire
+/// local memory history run before the transaction opens (#798 adversarial finding 2). It also
+/// means a barrier trip inside an open transaction can self-heal instead of hard-erroring, which
+/// previously turned a remote enqueue landing mid-write into an unactionable failure for the user
+/// (finding 5). A fold failure propagates and rolls the caller's write back — fail-closed.
+pub fn settle_pending_content_refold_for_stream_in_tx(
+    tx: &Transaction<'_>,
     stream_id: StreamId,
-) -> anyhow::Result<bool> {
-    let outcome = settle_one_pending_refold(
-        conn,
-        stream_id,
-        &ContentRefoldBudget::unbounded(),
-        ContentSettleConsumption::default(),
-    );
-    match outcome {
-        PendingRefoldOutcome::Settled { .. } | PendingRefoldOutcome::Missing => Ok(true),
-        // The unbounded budget admits every present row, so a deferral is unreachable; a failure
-        // (or a persistent begin-lock race) retains the row.
-        PendingRefoldOutcome::Deferred { .. }
-        | PendingRefoldOutcome::Failed { .. }
-        | PendingRefoldOutcome::TransientLock { .. } =>
-            Ok(!content_stream_has_pending_refold(conn, stream_id)?),
+) -> anyhow::Result<()> {
+    if !content_stream_has_pending_refold(tx, stream_id)? {
+        return Ok(());
     }
+    refold_and_project_stream_in_tx(tx, stream_id)
 }
 
 /// Narrow the branch-selected winners to a contiguous accepted prefix per coordinate.
@@ -4572,46 +4618,33 @@ mod tests {
         enqueue_refold(&conn, small, 3);
 
         let maintenance = budget(u64::MAX, 2, u64::MAX, true);
-        // Call 1: normal discovery lists the small stream (eligible), so the oversize probe is
-        // NOT run this call (#798 finding 2: probing while eligible work remains would degenerate
-        // to a full queue scan when no oversize row exists). Only the small stream settles.
+        // Call 1: normal discovery lists and settles the small stream, which EXHAUSTS the eligible
+        // queue for this budget — so the oversize slot then fires for the OLDEST oversize stream,
+        // an intentional exceedance visible in the charged counters. Exactly ONE oversize row is
+        // admitted per call.
         let first = settle_pending_content_refolds(&conn, &maintenance).unwrap();
         assert_eq!(
-            first.settled_streams, 1,
-            "only the eligible small stream settles; the oversize slot is deferred while normal \
-             discovery found work",
+            first.settled_streams, 2,
+            "the eligible small stream settles, then the drained queue releases the oversize slot",
         );
-        assert_eq!(first.consumed_candidates, 1, "no intentional exceedance yet");
-        assert!(!first.queue_empty);
-        assert!(!queue_contains(&conn, small));
-        assert!(
-            queue_contains(&conn, oldest_big),
-            "oversize rows wait for a no-eligible-work call"
-        );
-        assert!(queue_contains(&conn, other_big));
-
-        // Call 2: normal discovery lists ZERO eligible rows (both bigs are filtered as oversize),
-        // so the oversize slot runs and settles the OLDEST oversize stream, an intentional
-        // exceedance visible in the charged counters.
-        let second = settle_pending_content_refolds(&conn, &maintenance).unwrap();
-        assert_eq!(second.settled_streams, 1);
-        assert_eq!(second.consumed_candidates, 3, "the intentional exceedance is charged");
-        assert!(second.consumed_candidates > maintenance.max_candidates);
+        assert_eq!(first.consumed_candidates, 4, "1 small + the 3-candidate exceedance");
+        assert!(first.consumed_candidates > maintenance.max_candidates);
         assert_eq!(
-            second.deferred_oversize, 0,
+            first.deferred_oversize, 0,
             "the second oversize stream is filtered out of discovery, not listed and deferred"
         );
-        assert!(!second.queue_empty);
-        assert!(!queue_contains(&conn, oldest_big));
+        assert!(!first.queue_empty);
+        assert!(!queue_contains(&conn, small));
+        assert!(!queue_contains(&conn, oldest_big), "the OLDEST oversize row goes first");
         assert!(queue_contains(&conn, other_big), "one oversize attempt per call");
 
-        // Call 3: the scheduled maintenance loop converges — the second big stream claims this
+        // Call 2: the scheduled maintenance loop converges — the second big stream claims this
         // call's oversize slot.
-        let third = settle_pending_content_refolds(&conn, &maintenance).unwrap();
-        assert_eq!(third.settled_streams, 1);
-        assert_eq!(third.consumed_candidates, 3);
+        let second = settle_pending_content_refolds(&conn, &maintenance).unwrap();
+        assert_eq!(second.settled_streams, 1);
+        assert_eq!(second.consumed_candidates, 3);
         assert!(!queue_contains(&conn, other_big));
-        assert!(third.queue_empty);
+        assert!(second.queue_empty);
     }
 
     #[test]
@@ -4756,20 +4789,20 @@ mod tests {
     // ---- #798 review: bounded progressive candidate discovery ----
 
     fn reset_settle_work_counters() {
-        SETTLE_LISTING_QUERIES.store(0, Ordering::SeqCst);
-        SETTLE_ADMISSION_PROBES.store(0, Ordering::SeqCst);
-        SETTLE_COMPLETION_PROBES.store(0, Ordering::SeqCst);
+        SETTLE_LISTING_QUERIES.with(|c| c.set(0));
+        SETTLE_ADMISSION_PROBES.with(|c| c.set(0));
+        SETTLE_COMPLETION_PROBES.with(|c| c.set(0));
     }
 
     fn settle_work_counters() -> (usize, usize) {
         (
-            SETTLE_LISTING_QUERIES.load(Ordering::SeqCst),
-            SETTLE_ADMISSION_PROBES.load(Ordering::SeqCst),
+            SETTLE_LISTING_QUERIES.with(std::cell::Cell::get),
+            SETTLE_ADMISSION_PROBES.with(std::cell::Cell::get),
         )
     }
 
     fn settle_completion_probes() -> usize {
-        SETTLE_COMPLETION_PROBES.load(Ordering::SeqCst)
+        SETTLE_COMPLETION_PROBES.with(std::cell::Cell::get)
     }
 
     /// One deterministic stream id per backlog ordinal.
@@ -5005,41 +5038,107 @@ mod tests {
     }
 
     #[test]
-    fn oversize_probe_is_not_run_while_eligible_work_remains() {
-        // #798 finding 2: the oversize `LIMIT 1` probe degenerates to a full queue scan when no
-        // oversize row exists, so it must run ONLY when normal discovery listed zero eligible rows.
-        // Here an eligible small stream is discoverable AND a free stream slot remains, yet the
-        // oversize stream must NOT be admitted this call — proving the probe was skipped.
+    fn oversize_probe_is_skipped_while_the_budget_leaves_eligible_work_queued() {
+        // #798 Codex review: the oversize `LIMIT 1` probe degenerates to a full queue scan when no
+        // oversize row exists, so it must not run on a call that still has eligible work queued
+        // behind it — otherwise every budgeted maintenance call is O(queue). The budget here is
+        // exhausted by eligible rows with more still queued, so the oversize row must NOT settle.
         let conn = db();
-        let small = [0xb1_u8; 32];
         let oversize = [0xb2_u8; 32];
-        seed_synthetic_candidates(&conn, small, 1);
         seed_synthetic_candidates(&conn, oversize, 5);
-        enqueue_refold(&conn, small, 1);
-        enqueue_refold(&conn, oversize, 2);
-        // Maintenance mode with plenty of stream slots: only the `!listed_any` gate keeps the
-        // oversize slot from firing. The OLD unconditional probe would settle the oversize row too.
-        let maintenance = budget(u64::MAX, 2, u64::MAX, true);
+        enqueue_refold(&conn, oversize, 99);
+        for ordinal in 0..4_u64 {
+            let stream = backlog_stream(ordinal);
+            seed_synthetic_candidates(&conn, stream, 1);
+            enqueue_refold(&conn, stream, i64::try_from(ordinal).unwrap() + 1);
+        }
+        // Two stream slots for four eligible rows: the budget runs out with eligible work queued.
+        let maintenance = budget(2, 2, u64::MAX, true);
 
         let report = settle_pending_content_refolds(&conn, &maintenance).unwrap();
-        assert_eq!(
-            report.settled_streams, 1,
-            "only the eligible small stream settles; the oversize probe did not run",
-        );
-        assert!(!queue_contains(&conn, small));
+        assert_eq!(report.settled_streams, 2, "only the two budgeted eligible rows settle");
         assert!(
             queue_contains(&conn, oversize),
-            "the oversize probe is skipped while eligible work remained, so the oversize row stays",
+            "the oversize probe is skipped while the budget left eligible work queued",
         );
-        assert_eq!(report.consumed_candidates, 1, "no intentional oversize exceedance was charged");
+        assert_eq!(report.consumed_candidates, 2, "no intentional oversize exceedance was charged");
         assert!(!report.queue_empty);
+    }
 
-        // Once the eligible work is drained, a follow-up maintenance call finds zero eligible rows
-        // and the probe DOES run, converging the oversize row.
+    #[test]
+    fn oversize_maintenance_converges_behind_a_persistently_failing_small_stream() {
+        // #798 adversarial finding 1: gating the oversize probe on "the listing returned NOTHING"
+        // starves maintenance forever whenever the queue keeps producing any listable row. A small
+        // POISONED stream is listable on every call (it is eligible, it just always fails), so the
+        // old gate never fired and the oversize row's acceptance/projection froze permanently.
+        let conn = db();
+        let poisoned = [0xe1_u8; 32];
+        let oversize = [0xe2_u8; 32];
+        seed_synthetic_candidates(&conn, poisoned, 1);
+        seed_synthetic_candidates(&conn, oversize, 50);
+        enqueue_refold(&conn, poisoned, 1);
+        enqueue_refold(&conn, oversize, 2);
+        let poison_hex: String = poisoned.iter().map(|byte| format!("{byte:02x}")).collect();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER poison_oversize_starvation
+             BEFORE DELETE ON content_streams_pending_refold
+             WHEN OLD.stream_id = X'{poison_hex}'
+             BEGIN SELECT RAISE(ABORT, 'injected queue-clear failure'); END;"
+        ))
+        .unwrap();
+        let maintenance = budget(4, 5, u64::MAX, true);
+
         let report = settle_pending_content_refolds(&conn, &maintenance).unwrap();
-        assert_eq!(report.settled_streams, 1, "with no eligible work the oversize probe runs");
-        assert!(!queue_contains(&conn, oversize));
-        assert!(report.queue_empty);
+        assert_eq!(report.failures.len(), 1, "the poisoned row is attempted and fails");
+        assert!(
+            !queue_contains(&conn, oversize),
+            "the oversize row converges even though a failing small row is listable every call",
+        );
+        assert!(queue_contains(&conn, poisoned), "the poisoned row is retained for retry");
+    }
+
+    #[test]
+    fn oversize_maintenance_converges_against_steady_eligible_arrivals() {
+        // The same starvation without any poison: one fresh small stream arriving before each call
+        // (ordinary remote ingest) kept the old `listed_any` gate true forever. Draining the
+        // eligible work first is what lets maintenance reach the oversize row.
+        let conn = db();
+        let oversize = [0xe3_u8; 32];
+        seed_synthetic_candidates(&conn, oversize, 50);
+        enqueue_refold(&conn, oversize, 1);
+        let maintenance = budget(4, 5, u64::MAX, true);
+
+        let arrival = backlog_stream(0);
+        seed_synthetic_candidates(&conn, arrival, 1);
+        enqueue_refold(&conn, arrival, 2);
+
+        let report = settle_pending_content_refolds(&conn, &maintenance).unwrap();
+        assert!(
+            !queue_contains(&conn, oversize),
+            "a steady trickle of eligible rows no longer starves oversize maintenance",
+        );
+        assert!(report.settled_streams >= 2, "the arrival and the oversize row both settle");
+    }
+
+    #[test]
+    fn a_filtered_oversize_row_is_distinguishable_from_a_silent_no_op() {
+        // #798 adversarial finding 6: an SQL-filtered oversize row reported all-zero counters with
+        // `queue_empty == false`, identical to a poisoned stream or a listing that raced empty.
+        // `discovered_rows == 0` is the signal that the remaining work is oversize.
+        let conn = db();
+        let oversize = [0xe4_u8; 32];
+        seed_synthetic_candidates(&conn, oversize, 50);
+        enqueue_refold(&conn, oversize, 1);
+
+        let report = settle_pending_content_refolds(&conn, &budget(4, 5, u64::MAX, false)).unwrap();
+        assert_eq!(report.settled_streams, 0);
+        assert_eq!(report.deferred_oversize, 0, "a listing-filtered row is never counted here");
+        assert!(report.failures.is_empty());
+        assert!(!report.queue_empty, "the oversize row is still queued");
+        assert_eq!(
+            report.discovered_rows, 0,
+            "zero discovered rows with a non-empty queue means the remainder is oversize",
+        );
     }
 
     #[test]
@@ -5442,5 +5541,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// TRIPWIRE (#798 adversarial finding 3): the V082 `content_stream_stats` triggers cannot see
+    /// `INSERT OR REPLACE`'s implicit row deletion — SQLite skips `AFTER DELETE` triggers for it
+    /// unless `PRAGMA recursive_triggers` is on, which this store never sets. A `REPLACE` into
+    /// `content_entries` would therefore fire the insert trigger alone and drift the aggregate
+    /// upward permanently, making the stream invisible to normal-mode settle forever. Upsert
+    /// (`ON CONFLICT ... DO UPDATE`) is the same hazard when it rewrites an accounted column.
+    ///
+    /// The accounting invariant is enforced HERE rather than by hoping every future caller
+    /// remembers it. If this fires: use `INSERT OR IGNORE` (correctly inert on the ignore branch)
+    /// or a plain `INSERT`/`DELETE` pair, or make the aggregate maintenance explicit.
+    #[test]
+    fn no_writer_replaces_or_upserts_content_entries_behind_the_stats_triggers() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root above crates/<crate>")
+            .join("crates");
+        let mut sources = Vec::new();
+        let mut stack = vec![workspace];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("readable crate dir") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    sources.push(path);
+                }
+            }
+        }
+        assert!(sources.len() > 100, "the source sweep found suspiciously few files to scan");
+
+        let mut offenders = Vec::new();
+        for path in sources {
+            let text = std::fs::read_to_string(&path).expect("readable rust source");
+            // SQL is written across several lines, so compare on a whitespace-normalized copy.
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            // Needles are assembled at runtime: spelled literally they would appear in this
+            // file's own source and the tripwire would flag itself.
+            let table = "content_entries";
+            let replace_into = format!("{} INTO {table}", "REPLACE");
+            let replaces = flat.contains(&replace_into);
+            // An upsert is only a hazard when it can rewrite an accounted column, but the tripwire
+            // is deliberately blunt: any `DO UPDATE` on this table wants a human decision.
+            let insert_into = format!("{} INTO {table}", "INSERT");
+            let upserts = flat.split(insert_into.as_str()).skip(1).any(|tail| {
+                let statement = tail.split(';').next().unwrap_or(tail);
+                statement.contains("ON CONFLICT") && statement.contains("DO UPDATE")
+            });
+            if replaces || upserts {
+                offenders.push(path.display().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "content_entries must not be written with REPLACE/upsert semantics — the V082 stats \
+             triggers cannot account for it (see the migration doc): {offenders:?}",
+        );
     }
 }
