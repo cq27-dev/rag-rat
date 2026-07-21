@@ -109,6 +109,12 @@ pub struct ImpactSurfaceReport {
     pub files_co_changed_with_symbol_path: Vec<ImpactItem>,
     pub papertrail_rationale_items: Vec<ImpactItem>,
     pub repo_memories: RepoMemoryEvidenceView,
+    /// Distilled decision records for the selected symbol (#705 drive-by), capped ≤2 and labeled
+    /// unreviewed. Facet-gated, so empty for the vast majority of symbols; populated by the core
+    /// read layer after this builder runs. When more than the cap qualify,
+    /// `completeness_and_caveats.truncated_sections` names this lane (no silent caps, #49).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub distilled_records: Vec<rag_rat_papertrail::DriveByRecord>,
     pub completeness_and_caveats: ImpactCompleteness,
 }
 
@@ -376,6 +382,9 @@ pub fn impact_surface_report_for_symbol(
         files_co_changed_with_symbol_path,
         papertrail_rationale_items,
         repo_memories,
+        // Populated by the core read layer (it owns the distill-store access); this builder is the
+        // graph/text/papertrail lanes only.
+        distilled_records: Vec::new(),
     })
 }
 

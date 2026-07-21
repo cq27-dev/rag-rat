@@ -619,6 +619,8 @@ pub(crate) fn impact_tool(
             limit: args.limit,
         };
         return match db.select_symbol(&selector)? {
+            // The distilled-records drive-by lane (#705) is now part of the report itself — built,
+            // capped, and truncation-signalled in `impact_surface_report_for_selected_symbol`.
             Ok(Some(symbol)) => Ok(json!(
                 db.impact_surface_report_for_selected_symbol(&symbol, args.limit, &options)?
             )),

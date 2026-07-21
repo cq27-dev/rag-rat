@@ -871,6 +871,25 @@ impl IndexDatabase {
         }
         report.completeness_and_caveats.stale_files =
             u64::try_from(self.stale_source_paths(&result_paths)?.len()).unwrap_or(u64::MAX);
+        // Distilled decision records for the selected symbol (#705 drive-by), rides the memories
+        // lane's include flag. Fetch one past the ≤2 display cap so truncation is SIGNALLED (the
+        // report's no-silent-caps contract, #49) rather than silently dropping older records.
+        if options.include_memories {
+            const DISTILLED_RECORD_CAP: usize = 2;
+            let mut records = self.records_for_symbol(symbol, DISTILLED_RECORD_CAP + 1)?;
+            let truncated = records.len() > DISTILLED_RECORD_CAP;
+            records.truncate(DISTILLED_RECORD_CAP);
+            report.distilled_records = records;
+            if truncated {
+                report.completeness_and_caveats.truncated_sections.push("distilled_records".into());
+                report.completeness_and_caveats.caveats.push(
+                    "distilled_records is a fixed-size (2) drive-by lane — more qualifying \
+                     decision records exist for this symbol and cannot be retrieved by raising \
+                     `limit`."
+                        .to_string(),
+                );
+            }
+        }
         Ok(report)
     }
 
