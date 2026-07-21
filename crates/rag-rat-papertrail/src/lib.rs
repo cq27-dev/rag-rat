@@ -258,6 +258,11 @@ pub struct PapertrailEvidence {
     pub classification: String,
     pub evidence_kind: &'static str,
     pub score: f64,
+    /// The distilled decision record for this thread (#705), when one exists — the model's
+    /// root-cause/decision/outcome over the thread, replacing a bare item/comment match with the
+    /// resolved rationale. `None` until the thread is distilled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<DistilledRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]

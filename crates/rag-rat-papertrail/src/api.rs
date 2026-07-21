@@ -698,7 +698,21 @@ pub fn issue_search(
     limit: u32,
 ) -> anyhow::Result<Vec<PapertrailEvidence>> {
     // Item rows only (issues AND change requests — their titles/bodies), not comment rows.
-    search_fts(conn, query, Some("item"), limit)
+    // Over-fetch so collapsing a coalesced issue↔PR pair (both are item rows and both match) does
+    // not shrink the result below `limit` when lower-ranked unique matches exist; truncate after.
+    // Bounded 2× covers the common single-PR pair; a thread with many coalesced PRs may still
+    // under-fill (rare, and the corpus may genuinely have fewer distinct threads).
+    let mut evidence = search_fts(conn, query, Some("item"), coalesce_overfetch(limit))?;
+    attach_records(conn, &mut evidence)?;
+    coalesce_pairs(&mut evidence);
+    evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(evidence)
+}
+
+/// Fetch headroom for the FTS scan so [`coalesce_pairs`] can drop coalesced issue↔PR duplicates and
+/// still fill `limit` from lower-ranked unique matches. Bounded (2×) — not a guarantee.
+fn coalesce_overfetch(limit: u32) -> u32 {
+    limit.saturating_mul(2)
 }
 pub fn rationale_search(
     conn: &Connection,
@@ -729,8 +743,13 @@ pub fn rationale_search(
             )?);
         }
     }
-    evidence.extend(search_fts(conn, query, None, limit)?);
+    // Over-fetch the FTS lane so collapsing a coalesced issue↔PR pair still leaves `limit` unique
+    // records after truncation, rather than shrinking the result (the FTS `LIMIT` is applied before
+    // coalescing, so without headroom there is no lower-ranked hit to promote into the freed slot).
+    evidence.extend(search_fts(conn, query, None, coalesce_overfetch(limit))?);
     dedupe_evidence(&mut evidence);
+    attach_records(conn, &mut evidence)?;
+    coalesce_pairs(&mut evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(evidence)
 }

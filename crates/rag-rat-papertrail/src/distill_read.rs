@@ -17,7 +17,7 @@ use crate::distill_status::{EffectiveStatusInputs, effective_status};
 use crate::{DistillEdgeKind, EpistemicStatus, FixEdgeSource, OutcomeStatus, ThreadShape};
 
 /// A thread's natural identity — the key of a `papertrail_distill` row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RecordKey {
     pub tracker: String,
     pub project: String,
@@ -26,50 +26,64 @@ pub struct RecordKey {
 }
 
 /// A thread coalesced into a record (the paired issue or PR), for issue↔PR dedup at the call site.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CoalescedThread {
     pub item_kind: String,
     pub item_key: String,
 }
 
 /// An alternative the thread explicitly considered and did not take.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RejectedAlternative {
     pub alternative: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
 /// A distilled decision record as the consumption surfaces see it: the model-owned narrative
 /// fields, the mechanically resolved effective status, the rejected alternatives, the fixing
 /// commits, the provenance facets, and the coalesced partner identities.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DistilledRecord {
     pub tracker: String,
     pub project: String,
     pub item_kind: String,
     pub item_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub root_issue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub root_cause: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub root_cause_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_chosen: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rejected_alternatives: Vec<RejectedAlternative>,
     /// The EFFECTIVE outcome status (floors resolved over the model status) — surface this, never
     /// [`outcome_status_model`](Self::outcome_status_model) alone.
     pub outcome_status: OutcomeStatus,
-    /// The raw model-emitted status, kept for provenance/debugging; may differ from
-    /// [`outcome_status`](Self::outcome_status) when a mechanical floor overrode it.
+    /// The raw model-emitted status, retained for internal provenance; may differ from
+    /// [`outcome_status`](Self::outcome_status) when a mechanical floor overrode it. NOT
+    /// serialized into the payload, so a consumer cannot read the pre-floor status instead of
+    /// the resolved one.
+    #[serde(skip_serializing)]
     pub outcome_status_model: Option<OutcomeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub epistemic_status_decision: Option<EpistemicStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub epistemic_status_outcome: Option<EpistemicStatus>,
     pub fix_edge_source: FixEdgeSource,
     pub thread_shape: ThreadShape,
     pub outcome_claim_verified: bool,
     pub decision_provenance_verified: bool,
     pub anchors_qualified_count: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fixing_commits: Vec<String>,
     /// The issue/PR threads coalesced into this record — present so a caller can answer an
     /// issue↔PR pair as one result.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub coalesced: Vec<CoalescedThread>,
 }
 
