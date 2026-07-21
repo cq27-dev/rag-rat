@@ -106,6 +106,76 @@ pub fn distilled_record_for_thread(
     Ok(None)
 }
 
+/// The distilled records worth surfacing on a logical symbol (#705 drive-by lane). The FACET GATE
+/// is deliberately strict for a tight per-symbol cap: a record qualifies only when its thread has a
+/// PROVIDER fix edge AND a SELECTED (model-chosen, V078) resolved symbol anchor bound to this
+/// symbol. A bare mined-but-unselected anchor, or a text-tier / no fix edge, does not surface.
+///
+/// `logical_symbol_id` is the i64 logical-symbol handle (e.g. `SymbolHit.logical_symbol_id`); the
+/// helper formats it to the `sym_<hex>` token the anchor store keys on
+/// (`rag_rat_base::serde_big_id::format_sym_handle`) so a caller can never pass the wrong string
+/// form. Records come back newest-distilled first, at most `limit` of them (the drive-by cap), each
+/// loaded directly for the anchor's OWN record-owning thread (no coalesce redirect — the anchor
+/// always sits on the thread that owns the record). Repo-scoped.
+///
+/// LIMITATION (eventual consistency): the anchor's stored token is a snapshot of the symbol's id at
+/// mining time and is NOT rewritten by the logical-id relocation engine (which covers only the
+/// memory/moniker tables). A code reindex that REMAPS a logical id can leave the token stale until
+/// that thread's next distill regeneration refreshes it (the distill input hash includes the token,
+/// so a re-extract on mirror sync heals it). In that window a moved symbol may miss its record, or
+/// — if an id is reused — a stale anchor may surface the PREVIOUS occupant's record. The drive-by
+/// is labeled unreviewed/best-effort; the durable fix (extend the relocation engine to the anchor
+/// token, or validate at the caller) is tracked separately.
+pub fn records_for_symbol(
+    conn: &Connection,
+    repo_id: &str,
+    logical_symbol_id: i64,
+    limit: usize,
+) -> anyhow::Result<Vec<DistilledRecord>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let token = rag_rat_base::serde_big_id::format_sym_handle(logical_symbol_id);
+    // The eligible record-owning threads: DISTINCT so one record anchored by several symbol rows
+    // counts once; newest-distilled first with a deterministic tiebreak so the cap is stable.
+    let mut stmt = conn.prepare(
+        "SELECT anchor.tracker, anchor.project, anchor.item_kind, anchor.item_key
+         FROM papertrail_distill_anchors AS anchor
+         JOIN papertrail_distill AS record
+           ON record.repo_id = anchor.repo_id AND record.tracker = anchor.tracker
+          AND record.project = anchor.project AND record.item_kind = anchor.item_kind
+          AND record.item_key = anchor.item_key
+         WHERE anchor.repo_id = ?1 AND anchor.anchor_kind = 'symbol' AND anchor.selected = 1
+           AND anchor.logical_symbol_id = ?2 AND record.fix_edge_source = ?3
+         GROUP BY anchor.tracker, anchor.project, anchor.item_kind, anchor.item_key
+         ORDER BY MAX(record.distilled_at_ms) DESC, anchor.tracker, anchor.project,
+                  anchor.item_kind, anchor.item_key
+         LIMIT ?4",
+    )?;
+    let keys = stmt.query_map(
+        params![repo_id, token, FixEdgeSource::Provider.as_db_str(), i64::try_from(limit)?],
+        |row| {
+            Ok(RecordKey {
+                tracker: row.get(0)?,
+                project: row.get(1)?,
+                item_kind: row.get(2)?,
+                item_key: row.get(3)?,
+            })
+        },
+    )?;
+    let mut records = Vec::new();
+    for key in keys {
+        let key = key?;
+        // Load the anchor thread's OWN record directly (never redirect): a redirect would be wrong
+        // here (the thread owns the record), and it also closes a TOCTOU where a concurrent delete
+        // between the SELECT and this load could otherwise return a coalesced partner's record.
+        if let Some(record) = load_record(conn, repo_id, &key)? {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
 /// The threads a `coalesced` edge connects to `key`, in either direction (the edge is thread-keyed
 /// and survives record regeneration).
 fn coalesced_partners(
@@ -326,13 +396,97 @@ fn fixing_commits(
 mod tests {
     use rusqlite::{Connection, params};
 
-    use super::{RecordKey, distilled_record_for_thread};
+    use super::{RecordKey, distilled_record_for_thread, records_for_symbol};
     use crate::{FixEdgeSource, OutcomeStatus, ThreadShape};
 
     fn conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply_distill_record_store(&conn).unwrap();
+        // V078 adds the anchor `selected` flag that `records_for_symbol` gates on.
+        rag_rat_db::schema::apply_distill_anchor_selection(&conn).unwrap();
         conn
+    }
+
+    fn seed_symbol_record(conn: &Connection, item_key: &str, fix_edge: &str, distilled_at_ms: i64) {
+        conn.execute(
+            "INSERT INTO papertrail_distill
+                 (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+                  root_issue, fix_edge_source, thread_shape, anchors_qualified_count,
+                  distilled_at_ms, repo_id)
+             VALUES ('github','o/r','issue',?1,'sha256:h',3,?1,?2,'investigation',1,?3,'repoA')",
+            params![item_key, fix_edge, distilled_at_ms],
+        )
+        .unwrap();
+    }
+
+    // Logical-symbol handles for the drive-by tests; the anchor store keys on their `sym_<hex>`
+    // token form, which `records_for_symbol` derives from the i64 it is given.
+    const SYM_A: i64 = 100;
+    const SYM_B: i64 = 200;
+    const SYM_C: i64 = 300;
+    const SYM_UNANCHORED: i64 = 999;
+
+    fn seed_symbol_anchor(conn: &Connection, item_key: &str, sym_id: i64, selected: bool) {
+        conn.execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, anchor_kind, logical_symbol_id, name,
+                  resolved, candidate_ordinal, selected, repo_id)
+             VALUES ('github','o/r','issue',?1,'symbol',?2,'run',1,0,?3,'repoA')",
+            params![
+                item_key,
+                rag_rat_base::serde_big_id::format_sym_handle(sym_id),
+                selected as i64
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn records_for_symbol_gates_on_a_provider_edge_and_a_selected_anchor() {
+        let conn = conn();
+        // Qualifies: provider fix edge + a SELECTED symbol anchor on the target symbol.
+        seed_symbol_record(&conn, "5", "provider", 10);
+        seed_symbol_anchor(&conn, "5", SYM_A, true);
+        // Excluded: a text-tier fix edge (not provider), even with a selected anchor.
+        seed_symbol_record(&conn, "6", "text", 10);
+        seed_symbol_anchor(&conn, "6", SYM_A, true);
+        // Excluded: provider edge but the anchor is a mined candidate the model did NOT select.
+        seed_symbol_record(&conn, "7", "provider", 10);
+        seed_symbol_anchor(&conn, "7", SYM_A, false);
+        // Excluded: qualifies but for a DIFFERENT symbol.
+        seed_symbol_record(&conn, "8", "provider", 10);
+        seed_symbol_anchor(&conn, "8", SYM_B, true);
+
+        let records = records_for_symbol(&conn, "repoA", SYM_A, 10).unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.item_key.as_str()).collect::<Vec<_>>(),
+            vec!["5"],
+            "only the provider-edge record with a selected anchor on this symbol surfaces",
+        );
+    }
+
+    #[test]
+    fn records_for_symbol_caps_at_the_limit_newest_distilled_first() {
+        let conn = conn();
+        for (key, ms) in [("5", 10), ("6", 30), ("7", 20)] {
+            seed_symbol_record(&conn, key, "provider", ms);
+            seed_symbol_anchor(&conn, key, SYM_C, true);
+        }
+        let records = records_for_symbol(&conn, "repoA", SYM_C, 2).unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.item_key.as_str()).collect::<Vec<_>>(),
+            vec!["6", "7"],
+            "capped at 2, newest-distilled first",
+        );
+    }
+
+    #[test]
+    fn records_for_symbol_is_empty_for_an_unanchored_symbol() {
+        let conn = conn();
+        seed_symbol_record(&conn, "5", "provider", 10);
+        seed_symbol_anchor(&conn, "5", SYM_A, true);
+        assert!(records_for_symbol(&conn, "repoA", SYM_UNANCHORED, 10).unwrap().is_empty());
+        assert!(records_for_symbol(&conn, "repoA", SYM_A, 0).unwrap().is_empty(), "limit 0");
     }
 
     fn key(kind: &str, k: &str) -> RecordKey {

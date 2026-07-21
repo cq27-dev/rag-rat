@@ -29,6 +29,7 @@ pub use distill::{
 };
 pub use distill_read::{
     CoalescedThread, DistilledRecord, RecordKey, RejectedAlternative, distilled_record_for_thread,
+    records_for_symbol,
 };
 pub use distill_status::{EffectiveStatusInputs, effective_status, no_fix_edge};
 pub use evidence::{refs, *};
