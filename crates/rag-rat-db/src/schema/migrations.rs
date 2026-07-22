@@ -1369,6 +1369,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_081_ID => Some(81),
             MIGRATION_082_ID => Some(82),
             MIGRATION_083_ID => Some(83),
+            MIGRATION_084_ID => Some(84),
             _ => None,
         })
         .max()
@@ -1461,6 +1462,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_081_ID
             | MIGRATION_082_ID
             | MIGRATION_083_ID
+            | MIGRATION_084_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1550,6 +1552,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_081_ID => migration.checksum != MIGRATION_081_CHECKSUM,
         MIGRATION_082_ID => migration.checksum != MIGRATION_082_CHECKSUM,
         MIGRATION_083_ID => migration.checksum != MIGRATION_083_CHECKSUM,
+        MIGRATION_084_ID => migration.checksum != MIGRATION_084_CHECKSUM,
         _ => false,
     }
 }
@@ -4780,6 +4783,93 @@ pub fn apply_content_refold_queue_and_stats(conn: &Connection) -> rusqlite::Resu
     )?;
 
     tx.commit()
+}
+
+/// V083 (#855/#860) — persist the direct chunk→symbol link. `chunks.symbol_id` is the rowid of the
+/// symbol a code chunk was cut from, stamped at index time by `insert_chunks` from the same parse
+/// that assigned the symbol its rowid. It replaces position-based resolution (match by
+/// `(path, qualified_name)` then narrow by byte/line geometry), which could not disambiguate
+/// same-name symbols that nest or share a physical line — `qualified_name` is `path::simple_name`,
+/// not scope-qualified, so overloads and nested same-name functions collide, and no geometric
+/// metric attributes a chunk to one of two coincident symbols.
+pub fn apply_chunk_symbol_id(conn: &Connection) -> rusqlite::Result<()> {
+    // One transaction for the column add + backfill. An established index can hold hundreds of
+    // thousands of symbol-bearing chunks; committing each per-row UPDATE in its own autocommit
+    // (a WAL fsync apiece) would make the startup migration prohibitively slow. It is also atomic —
+    // an interrupted upgrade rolls back to no column and no partial backfill, and replay redoes it
+    // from scratch (and is idempotent on any rows a later run finds already linked).
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    add_column_if_missing(&tx, "chunks", "symbol_id", "INTEGER")?;
+    backfill_chunk_symbol_ids(&tx)?;
+    tx.commit()
+}
+
+/// One-time backfill of `chunks.symbol_id` for chunks indexed before V083. Unlike the V079/V081
+/// derived stores, chunks are NOT rewritten on a regular cadence — incremental/discover indexing
+/// skips UNCHANGED files, so a stable file's chunks would keep NULL `symbol_id` (and lose their
+/// drive-by records) indefinitely, not "until the next reindex".
+///
+/// Resolve each chunk from the identity it ALREADY carries: `symbol_path` is the defining symbol's
+/// bare qualified name, except a split continuation which appends `#<n>` (a code path holds at most
+/// one `#`, so stripping from the first `#` recovers the bare name; context / whole-file / markdown
+/// paths keep theirs and simply match no qualified name). Link a chunk ONLY when exactly one
+/// same-file symbol of that qualified name OVERLAPS it in bytes.
+///
+/// BYTES, not lines: `symbols.start_byte`/`end_byte` are baseline columns, always populated,
+/// whereas `start_line`/`end_line` were added later with `DEFAULT 0`, so a never-reindexed legacy
+/// symbol can carry `0`/`0` line spans — a line predicate would silently match nothing and strand
+/// exactly the rows this repairs. A chunk is cut from the whole lines around its symbol, so it
+/// always overlaps that symbol's byte span (part 0 and every continuation part alike).
+///
+/// This never guesses the cases the direct link exists to resolve: a continuation whose outer is
+/// UNIQUELY named links back to that outer (even when a differently-named nested symbol's bytes it
+/// falls within also exist), but two same-name symbols that nest or share a line match more than
+/// one (`HAVING COUNT(*) = 1` excludes them → NULL), and a non-qualified-name path matches nothing
+/// (→ NULL). A NULL chunk surfaces no record; a wrong guess would surface the WRONG one and
+/// persist. `rag-rat index` re-stamps every chunk precisely from the parse.
+///
+/// One set-based statement (no per-row round-trip, no materializing every chunk in memory), run
+/// inside the caller's transaction so the whole backfill is a single commit. Idempotent: only
+/// chunks still NULL are considered, so a re-run never overwrites an exact index-time id.
+fn backfill_chunk_symbol_ids(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        // `base.qname` strips ONLY a trailing `#<digits>` continuation suffix, matching what the
+        // chunker appends. Splitting on the FIRST `#` instead would truncate a qualified name
+        // whose FILE PATH legitimately contains one (`src/foo#bar.rs::run`), and since
+        // unchanged files are never re-chunked those rows would keep a NULL `symbol_id` —
+        // and lose their drive-by records — indefinitely. `rtrim` removes trailing digits;
+        // the suffix is real only if that shortened the string AND what remains ends in
+        // `#`.
+        "WITH base AS (
+             SELECT c.id AS chunk_id, c.file_id AS file_id,
+                    c.start_byte AS start_byte, c.end_byte AS end_byte,
+                    CASE
+                        WHEN rtrim(c.symbol_path, '0123456789') <> c.symbol_path
+                         AND substr(rtrim(c.symbol_path, '0123456789'), -1) = '#'
+                        THEN substr(rtrim(c.symbol_path, '0123456789'), 1,
+                                    length(rtrim(c.symbol_path, '0123456789')) - 1)
+                        ELSE c.symbol_path
+                    END AS qname
+             FROM chunks c
+             WHERE c.symbol_id IS NULL
+               AND c.symbol_path IS NOT NULL
+         ),
+         resolved AS (
+             SELECT base.chunk_id AS chunk_id, s.id AS symbol_id
+             FROM base
+             JOIN symbols s ON s.file_id = base.file_id
+             JOIN name_strings ns ON ns.id = s.qualified_name_id
+             WHERE ns.value = base.qname
+               AND s.start_byte < base.end_byte
+               AND base.start_byte < s.end_byte
+             GROUP BY base.chunk_id
+             HAVING COUNT(*) = 1
+         )
+         UPDATE chunks
+         SET symbol_id = resolved.symbol_id
+         FROM resolved
+         WHERE chunks.id = resolved.chunk_id;",
+    )
 }
 
 /// V076 (sync phase C4.3b, #607): the sealing-key adoption audit log. A recipient device records a

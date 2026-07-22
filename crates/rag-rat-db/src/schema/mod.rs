@@ -8,11 +8,12 @@ pub(crate) use migrations::*;
 // Migration steps and table lists the engine's schema tests exercise directly:
 pub use migrations::{
     apply_account_authority_boundaries, apply_account_authority_projection,
-    apply_account_candidate_dag, apply_clone_delta_maintenance, apply_clone_df_epoch,
-    apply_clone_fingerprint_tables, apply_clone_graph_tables, apply_content_candidate_dag,
-    apply_content_projected_tables, apply_content_refold_queue_and_stats,
-    apply_content_streams_pending_refold, apply_distill_anchor_selection,
-    apply_distill_enriched_context, apply_distill_evidence_source_part, apply_distill_record_store,
+    apply_account_candidate_dag, apply_chunk_symbol_id, apply_clone_delta_maintenance,
+    apply_clone_df_epoch, apply_clone_fingerprint_tables, apply_clone_graph_tables,
+    apply_content_candidate_dag, apply_content_projected_tables,
+    apply_content_refold_queue_and_stats, apply_content_streams_pending_refold,
+    apply_distill_anchor_selection, apply_distill_enriched_context,
+    apply_distill_evidence_source_part, apply_distill_record_store,
     apply_distill_safe_input_snapshot, apply_dream_findings, apply_edge_string_interning,
     apply_edge_target_qname_index, apply_external_symbols, apply_files_generation,
     apply_files_has_test_code, apply_git_change_couplings, apply_github_child_key_widening,
@@ -45,7 +46,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 83;
+pub const LATEST_SCHEMA_VERSION: u32 = 84;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -613,6 +614,14 @@ const MIGRATION_082_DESCRIPTION: &str =
      content_entries. SQLite triggers keep the stats exact for inserts, deletes, and mutable \
      stream_id/signed_bytes updates; existing queue rows backfill as content-candidate work with \
      min/max candidate receive times";
+const MIGRATION_084_ID: &str = "084_chunk_symbol_id";
+const MIGRATION_084_CHECKSUM: &str = "sha256:rag-rat-chunk-symbol-id-v84";
+const MIGRATION_084_DESCRIPTION: &str =
+    "Add chunks.symbol_id: the direct rowid of the symbol a code chunk was cut from, written at \
+     index time from the same parse that assigned the symbol its rowid. Replaces position-based \
+     chunk→symbol resolution, which could not disambiguate same-name symbols that nest or share a \
+     physical line. Nullable; backfills on the next reindex of each file (derived data, no SQL \
+     backfill)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1302,6 +1311,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_083_CHECKSUM,
         description: MIGRATION_083_DESCRIPTION,
         apply: MigrationFn::Plain(apply_logical_group_reason_by_evidence),
+    },
+    Migration {
+        id: MIGRATION_084_ID,
+        checksum: MIGRATION_084_CHECKSUM,
+        description: MIGRATION_084_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_chunk_symbol_id),
     },
 ];
 

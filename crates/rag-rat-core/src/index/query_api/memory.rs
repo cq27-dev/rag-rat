@@ -144,26 +144,26 @@ impl IndexDatabase {
     }
 
     /// Distilled decision records for the symbol a chunk defines (#705 drive-by on `read_chunk`).
-    /// Resolves the chunk's file `path` + qualified `symbol_path` to a logical symbol, then the
-    /// same facet-gated lane as [`records_for_symbol`]. Empty when the chunk defines no resolvable
-    /// logical symbol. `pub(crate)`: only the `read_chunk` reader calls it (unlike the sibling
-    /// `records_for_symbol`, which the MCP handler invokes directly).
+    /// Resolves the chunk's PRECISE defining symbol by the direct `chunks.symbol_id` link
+    /// (#855/#860 — position matching is ambiguous across same-simple-name methods that nest or
+    /// share a line), then the same facet-gated lane as [`records_for_symbol`]. Empty when the
+    /// chunk defines no resolvable logical symbol. `pub(crate)`: only the `read_chunk` reader calls
+    /// it (unlike the sibling `records_for_symbol`, which the MCP handler invokes directly).
     pub(crate) fn records_for_chunk_symbol(
         &self,
         chunk_id: i64,
-        symbol_path: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
         let conn = self.storage.connection();
         let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-        let logical_symbol_id =
-            rag_rat_query::memory::logical_symbol_id_for_chunk_symbol(conn, chunk_id, symbol_path)?;
+        let logical_symbol_id = rag_rat_query::memory::logical_symbol_id_for_chunk(conn, chunk_id)?;
         Self::drive_by_records_scoped(conn, &repo_id, logical_symbol_id, limit)
     }
 
     /// Attach distilled decision records (#705 drive-by) to each search hit's symbol — the same
-    /// facet-gated, capped lane as `read_chunk`, resolved from each hit's `(path, symbol_path)`.
-    /// Skips a result set with no symbol-bearing hits so a doc/config-only result pays nothing.
+    /// facet-gated, capped lane as `read_chunk`, resolved precisely from each hit's `chunk_id`
+    /// (#855). Skips a result set with no symbol-bearing hits so a doc/config-only result pays
+    /// nothing.
     /// `pub`: the `semantic_search` MCP handler calls it directly (the shared
     /// `search_with_graph_meta` deliberately does NOT, so records stay off docs_for_symbol and
     /// other search consumers).
@@ -182,22 +182,16 @@ impl IndexDatabase {
         if !rag_rat_db::schema::table_exists(conn, "papertrail_distill")? {
             return Ok(());
         }
-        // Resolve the repo scope ONCE for the batch, then memoize the record FETCH by the
-        // RESOLVED logical id. Keying the memo on the raw `(path, symbol_path)` would be both
-        // wrong and useless now: resolution is per-chunk (two same-named methods in one file share
-        // a symbol_path but are different symbols), and continuation chunks carry distinct
-        // `qname#<part>` strings that never collided as keys in the first place. The logical id is
-        // what the many chunks of one symbol actually share.
+        // Resolve the repo scope ONCE, and memoize the fetched records by the RESOLVED
+        // logical-symbol id — so the many chunks of one symbol (including its continuation
+        // parts, which each carry that symbol's `symbol_id` and so resolve to the same logical
+        // id) fetch a single time.
         let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
         let mut by_logical: std::collections::HashMap<i64, Vec<rag_rat_papertrail::DriveByRecord>> =
             std::collections::HashMap::new();
         for hit in hits.iter_mut() {
             let Some(logical_symbol_id) =
-                rag_rat_query::memory::logical_symbol_id_for_chunk_symbol(
-                    conn,
-                    hit.chunk_id,
-                    hit.symbol_path.as_deref(),
-                )?
+                rag_rat_query::memory::logical_symbol_id_for_chunk(conn, hit.chunk_id)?
             else {
                 continue;
             };

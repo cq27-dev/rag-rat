@@ -526,7 +526,6 @@ pub(crate) struct ChunkAnchor {
     path: String,
     start_line: i64,
     end_line: i64,
-    symbol_path: Option<String>,
     text_hash: String,
     symbol_id: Option<i64>,
 }

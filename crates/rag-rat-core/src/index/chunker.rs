@@ -10,6 +10,13 @@ pub const MAX_STRUCTURAL_PARSE_BYTES: usize = 512_000;
 pub struct Chunk {
     pub kind: &'static str,
     pub symbol_path: Option<String>,
+    /// Index of the parsed symbol this chunk was cut from, into the same `&[ParsedSymbol]` slice
+    /// `code_chunks_for_symbols` received — `insert_chunks` remaps it to the symbol's DB rowid and
+    /// persists it as `chunks.symbol_id` (the direct chunk→symbol link, #855/#860). `None` for
+    /// chunks that define no symbol: uncovered/context spans, whole-file, markdown, and generated
+    /// / oversized line-split chunks. Follows the same local-index-then-remap convention as
+    /// edge candidates and clone fingerprints.
+    pub symbol_index: Option<usize>,
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_line: usize,
@@ -91,7 +98,7 @@ pub fn code_chunks_for_symbols(
     // instead of a from-byte-0 rescan per symbol (#517).
     let lines = LineOffsets::new(text);
     let mut chunks = Vec::new();
-    for symbol in symbols {
+    for (symbol_index, symbol) in symbols.iter().enumerate() {
         let Some(range) = lines.byte_range(symbol.start_line, symbol.end_line) else {
             continue;
         };
@@ -103,7 +110,7 @@ pub fn code_chunks_for_symbols(
         for (part_idx, part) in
             split_symbol(span_text, span_start, symbol.start_line, 120).into_iter().enumerate()
         {
-            chunks.push(make_chunk(
+            let mut chunk = make_chunk(
                 "code",
                 Some(if part_idx == 0 {
                     symbol.qualified_name.clone()
@@ -115,7 +122,12 @@ pub fn code_chunks_for_symbols(
                 part.start_line,
                 part.end_line,
                 part.text,
-            ));
+            );
+            // Every part (part 0 and each `qname#<n>` continuation) is cut from THIS symbol, so
+            // they all carry its index — and thus resolve to the one symbol/logical id at read
+            // time.
+            chunk.symbol_index = Some(symbol_index);
+            chunks.push(chunk);
         }
     }
     chunks.extend(uncovered_code_chunks(path, text, symbols, &lines));
@@ -313,6 +325,10 @@ fn make_chunk(
     Chunk {
         kind,
         symbol_path: symbol_path.filter(|s| !s.is_empty()),
+        // Defaults to "no defining symbol"; `code_chunks_for_symbols` sets it for the code chunks
+        // it cuts from a specific parsed symbol. Every other producer (context, whole-file,
+        // markdown, line-split) leaves it None.
+        symbol_index: None,
         start_byte,
         end_byte,
         start_line,

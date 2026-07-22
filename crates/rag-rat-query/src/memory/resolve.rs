@@ -462,137 +462,55 @@ pub(crate) fn chunk_ids_for_symbol(
         })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
+/// The `symbols` rowid the chunk was cut from — the DIRECT `chunks.symbol_id` link written at
+/// index time, not a reconstruction from byte geometry.
+///
+/// This used to resolve `(files.path, qualified_name)` and, briefly, the closest byte range.
+/// Neither can be exact: `qualified_name` is the bare `path::simple_name`, so a file can hold
+/// several symbols sharing it, and any positional metric ties or mis-attributes when those symbols
+/// nest or share a physical line. The chunker knows which symbol it cut each chunk from, so the
+/// answer is recorded rather than inferred. `None` for a chunk that defines no symbol (context,
+/// whole-file, line-split) or one written before the column existed and not yet re-indexed.
 pub(crate) fn symbol_id_for_chunk(
     conn: &Connection,
     chunk: &ChunkAnchor,
 ) -> anyhow::Result<Option<i64>> {
-    symbol_id_for_chunk_symbol(conn, chunk.chunk_id, chunk.symbol_path.as_deref())
-}
-
-/// The `symbols` rowid for the symbol a CHUNK defines, disambiguated by BYTE OVERLAP.
-///
-/// `qualified_name` is `"{path}::{simple_name}"` — the bare identifier, not scope-qualified — so
-/// every same-simple-name symbol in a file shares one name (`fmt` across two trait impls, `new`
-/// across several inherent impls). `chunks.symbol_path` is that same ambiguous string and the
-/// chunk carries no symbol id, so resolving on the name alone with `LIMIT 1` returns an arbitrary
-/// winner that flips between reindexes as rowids are reassigned (#855).
-///
-/// The chunk is DERIVED from a symbol, so the match is the symbol whose range most closely
-/// corresponds to the chunk's: minimise `|Δstart| + |Δend|`. Overlap is only a prefilter.
-///
-/// Neither obvious alternative survives contact with real input. Containment
-/// (`symbol.start <= chunk.start`) fails because a chunk begins BEFORE its symbol whenever it
-/// captures the leading doc comment. WIDEST OVERLAP fails on NESTED same-named symbols — a `run`
-/// defined inside another `run` — where the inner chunk overlaps the enclosing symbol MORE than
-/// its own simply because the enclosing one is larger, so the inner chunk would bind the outer
-/// symbol. Closest-range handles siblings, nesting, and the doc-comment offset uniformly. The
-/// rowid remains only as a last-resort determinism guarantee.
-///
-/// This is NOT merely a raw-rowid concern. Logical grouping keys on `LogicalSymbolKey
-/// { language, path, name, qualified_name, kind, signature }`, where `signature` is the trimmed
-/// FIRST LINE of the declaration — so two same-named symbols in one file are DISTINCT logical
-/// symbols whenever their declaration lines differ. Resolving to the wrong one therefore maps
-/// through `logical_symbol_members` to the wrong logical id, and surfaces another symbol's repo
-/// memories and decision records as context. (Where the declaration lines coincide — two trait
-/// impls of `fmt`, two `default`s — the symbols are ONE logical symbol and no chunk-side
-/// resolution can separate them; that is a defect in the identity key, not here.)
-///
-/// KNOWN RESIDUAL: a symbol long enough to SPLIT that also contains a same-named NESTED symbol can
-/// still resolve a continuation part onto the nested symbol. Proximity reconstructs an association
-/// the chunker knew and did not persist, and no ordering over byte ranges recovers it in general;
-/// the root fix is to record the defining symbol on the chunk at chunk time instead of inferring
-/// it here.
-///
-/// Keying on `chunk_id` also pins the file exactly — `chunks.file_id` identifies one file even in a
-/// consolidated multi-repo database, where two repos can share a path (#852).
-///
-/// The rowid is reassigned on every reindex (#149), so resolve it to a logical id before caching or
-/// crossing the wire.
-pub(crate) fn symbol_id_for_chunk_symbol(
-    conn: &Connection,
-    chunk_id: i64,
-    symbol_path: Option<&str>,
-) -> anyhow::Result<Option<i64>> {
-    let Some(symbol_path) = symbol_path else {
-        return Ok(None);
-    };
-    // A symbol wider than the chunk limit is split into parts; its continuation chunks carry a
-    // `qualified_name#<part>` symbol_path while `symbols.qualified_name_id` stores only the bare
-    // qualified name. Strip the suffix so a continuation resolves to the SAME defining symbol.
-    let base = strip_chunk_continuation_suffix(symbol_path);
-    let overlapping: Option<i64> = conn
-        .query_row(
-            "
-        SELECT symbols.id AS symbol_id
-        FROM chunks
-        JOIN symbols ON symbols.file_id = chunks.file_id
-        WHERE chunks.id = ?1
-          AND symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?2)
-          AND symbols.start_byte < chunks.end_byte
-          AND chunks.start_byte < symbols.end_byte
-        ORDER BY
-          ABS(symbols.start_byte - chunks.start_byte)
-            + ABS(symbols.end_byte - chunks.end_byte) ASC,
-          symbols.id ASC
-        LIMIT 1
-        ",
-            params![chunk_id, base],
-            |row| row.get("symbol_id"),
-        )
-        .optional()?;
-    if overlapping.is_some() {
-        return Ok(overlapping);
-    }
-    // No overlap at all — stale byte ranges, or a chunk whose symbol moved. Guessing is only safe
-    // when there is nothing to guess between: one candidate is the pre-#855 answer and cannot be
-    // the wrong method, while two or more means the ambiguity this function exists to resolve, so
-    // surface nothing rather than an arbitrary winner.
-    let mut stmt = conn.prepare(
-        "
-        SELECT symbols.id AS symbol_id
-        FROM chunks
-        JOIN symbols ON symbols.file_id = chunks.file_id
-        WHERE chunks.id = ?1
-          AND symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?2)
-        LIMIT 2
-        ",
-    )?;
-    let candidates: Vec<i64> = stmt
-        .query_map(params![chunk_id, base], |row| row.get("symbol_id"))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(match candidates.as_slice() {
-        [only] => Some(*only),
-        _ => None,
+    conn.query_row("SELECT symbol_id FROM chunks WHERE id = ?1", params![chunk.chunk_id], |row| {
+        row.get(0)
     })
+    .optional()
+    .map(Option::flatten)
+    .map_err(Into::into)
 }
 
-/// The stable logical-symbol handle for the symbol a chunk defines — for #705 drive-by records on
-/// `read_chunk` and `semantic_search`. `None` when the chunk defines no symbol, the symbol has no
-/// logical grouping, or the name is ambiguous within the file and byte ranges cannot settle it
-/// (see [`symbol_id_for_chunk_symbol`]).
-///
-/// Takes the `chunk_id` rather than a path: the chunk's own byte range is what disambiguates two
-/// same-simple-name symbols in one file, and its `file_id` pins the file exactly.
-pub fn logical_symbol_id_for_chunk_symbol(
+/// The stable logical-symbol handle for the symbol a chunk defines, for #705 drive-by records on
+/// `read_chunk` / `semantic_search`. `None` when the chunk defines no symbol (a context /
+/// whole-file / line-split chunk, whose `chunks.symbol_id` is NULL) or its symbol has no logical
+/// grouping.
+pub fn logical_symbol_id_for_chunk(
     conn: &Connection,
     chunk_id: i64,
-    symbol_path: Option<&str>,
 ) -> anyhow::Result<Option<i64>> {
-    let Some(symbol_id) = symbol_id_for_chunk_symbol(conn, chunk_id, symbol_path)? else {
-        return Ok(None);
-    };
-    logical_symbol_id_for_symbol(conn, symbol_id)
+    // Resolve the symbol a chunk DEFINES by the DIRECT `chunks.symbol_id` link — the rowid stamped
+    // at index time from the same parse that assigned the symbol its rowid (#855/#860). This is
+    // exact where position matching cannot be: a file can hold several symbols sharing one bare
+    // `qualified_name` (`path::simple_name`, NOT scope-qualified — `new`/`from`/`default` across
+    // impls with different signatures, or a nested `fn f` inside a `fn f`), and any byte/line
+    // metric ties or mis-attributes when such symbols nest or share a physical line. Every
+    // continuation chunk of a split symbol carries that symbol's id, so they all resolve to the one
+    // logical symbol.
+    conn.query_row(
+        "SELECT members.logical_symbol_id
+         FROM chunks
+         JOIN logical_symbol_members members ON members.symbol_id = chunks.symbol_id
+         WHERE chunks.id = ?1",
+        params![chunk_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
-/// Strip a chunker continuation suffix (`…#<digits>`) from a chunk's `symbol_path`, yielding the
-/// defining symbol's bare qualified name. A name without a trailing numeric `#` suffix — the common
-/// case, and part 0 of any split — passes through unchanged.
-pub(crate) fn strip_chunk_continuation_suffix(symbol_path: &str) -> &str {
-    match symbol_path.rsplit_once('#') {
-        Some((base, part)) if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) => base,
-        _ => symbol_path,
-    }
-}
 pub(crate) fn logical_symbol_id_for_symbol(
     conn: &Connection,
     symbol_id: i64,
@@ -612,7 +530,6 @@ pub(crate) fn chunk_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chun
         path: row.get("path")?,
         start_line: row.get("start_line")?,
         end_line: row.get("end_line")?,
-        symbol_path: row.get("symbol_path")?,
         text_hash: row.get("text_hash")?,
         symbol_id: row.get("symbol_id")?,
     })
@@ -1086,23 +1003,4 @@ pub(crate) fn short_symbol_name<'a>(binding_id: &'a str, path: Option<&str>) -> 
         return name;
     }
     binding_id.rsplit("::").next().unwrap_or(binding_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::strip_chunk_continuation_suffix as strip;
-
-    #[test]
-    fn continuation_suffix_is_stripped_only_when_numeric() {
-        // Part 0 and any ordinary qualified name pass through.
-        assert_eq!(strip("foo::bar"), "foo::bar");
-        assert_eq!(strip("target"), "target");
-        // A chunker continuation suffix (`#<digits>`) is dropped to the defining symbol.
-        assert_eq!(strip("foo::bar#1"), "foo::bar");
-        assert_eq!(strip("target#12"), "target");
-        // A `#` that is not a numeric continuation is left intact (never a split part).
-        assert_eq!(strip("foo#bar"), "foo#bar");
-        assert_eq!(strip("foo::bar#"), "foo::bar#");
-        assert_eq!(strip("foo#1a"), "foo#1a");
-    }
 }

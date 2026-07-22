@@ -3153,7 +3153,7 @@ fn migration_078_distinguishes_candidates_from_selections() {
 
 #[test]
 fn migration_079_builds_safe_input_snapshots() {
-    // `LATEST_SCHEMA_VERSION` pin moved to `migration_082_*`, the new tip; this uses only the
+    // `LATEST_SCHEMA_VERSION` pin moved to `migration_083_*`, the new tip; this uses only the
     // symbolic checks (the hardcoded-LATEST footgun).
     let legacy = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply_distill_record_store(&legacy).unwrap();
@@ -3257,7 +3257,7 @@ fn migration_079_builds_safe_input_snapshots() {
 
 #[test]
 fn migration_080_builds_enriched_context_snapshots() {
-    // The `LATEST_SCHEMA_VERSION` pin lives on `migration_082_*`, the current tip; this uses
+    // The `LATEST_SCHEMA_VERSION` pin lives on `migration_083_*`, the current tip; this uses
     // only the symbolic checks (the hardcoded-LATEST footgun).
     let legacy = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply_distill_record_store(&legacy).unwrap();
@@ -3363,7 +3363,7 @@ fn migration_080_builds_enriched_context_snapshots() {
 
 #[test]
 fn migration_081_adds_evidence_source_part() {
-    // The `LATEST_SCHEMA_VERSION` pin lives on `migration_082_*`, the current tip.
+    // The `LATEST_SCHEMA_VERSION` pin lives on `migration_083_*`, the current tip.
 
     // The evidence table predates the column: build the record store (V077) without V081, then
     // apply V081 and confirm the column appears.
@@ -3437,6 +3437,7 @@ fn migration_081_adds_evidence_source_part() {
 
 #[test]
 fn migration_082_accounts_for_content_refold_work() {
+    // The `LATEST_SCHEMA_VERSION` pin lives on `migration_084_*`, the current tip.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
@@ -3453,8 +3454,9 @@ fn migration_082_accounts_for_content_refold_work() {
             )
         };
 
-    // Reconstruct the previous tip: retain the V081 distill migrations and their data, but
-    // restore the V072 queue shape and remove every V082 object before replaying only V082.
+    // Reconstruct a pre-V082 index: retain the V081 distill migrations and their data, but
+    // restore the V072 queue shape and remove every V082 object, then replay forward from V081
+    // (V082 does the content-refold work; later tips are orthogonal to it).
     conn.execute_batch(
         "DROP TRIGGER content_stream_stats_after_insert;
          DROP TRIGGER content_stream_stats_after_delete;
@@ -3620,14 +3622,13 @@ fn migration_082_accounts_for_content_refold_work() {
     assert_eq!(v82_recorded, 1, "forward migration records V082");
 }
 
-/// V083 recomputes `logical_symbols.group_reason` from member evidence, and is the schema tip.
+/// V083 recomputes `logical_symbols.group_reason` from member evidence.
 ///
 /// The column is derived but PERSISTED, so a new labelling rule alone would never reach an existing
 /// index: a query-only server over an unchanged repository never runs `rebuild_logical_symbols` and
 /// would keep serving the old `cfg_variant` for every multi-member group indefinitely.
 #[test]
-fn migration_083_is_the_tip_and_relabels_logical_groups_by_evidence() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 83, "move this pin with the next schema migration");
+fn migration_083_relabels_logical_groups_by_evidence() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
@@ -3680,7 +3681,8 @@ fn migration_083_is_the_tip_and_relabels_logical_groups_by_evidence() {
 
     truncate_schema_to(&conn, 82);
     schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 83);
+    // Replaying from 82 runs V083 and everything after it, so pin the TIP rather than a literal.
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 
     let reason = |id: i64| -> String {
         conn.query_row("SELECT group_reason FROM logical_symbols WHERE id = ?1", [id], |row| {
@@ -3700,4 +3702,149 @@ fn migration_083_is_the_tip_and_relabels_logical_groups_by_evidence() {
         "two symbols inside one file row genuinely share an identity",
     );
     assert_eq!(reason(300), "single");
+}
+
+/// V084 links each chunk to the symbol it was cut from, and is the schema tip.
+#[test]
+fn migration_084_is_the_tip_and_links_chunks_to_symbols() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 84, "move this pin with the next schema migration");
+
+    // The chunks table predates the column (it lives in the baseline). Build bare chunks + symbols
+    // tables WITHOUT symbol_id, seed pre-migration rows, apply V084 in ISOLATION, and confirm the
+    // column appears AND the backfill links each chunk — asserting absence against this migration's
+    // own precondition, never the full ladder's end state.
+    let legacy = rusqlite::Connection::open_in_memory().unwrap();
+    legacy
+        .execute_batch(
+            "CREATE TABLE chunks(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 file_id INTEGER NOT NULL,
+                 chunk_kind TEXT NOT NULL,
+                 symbol_path TEXT,
+                 start_byte INTEGER NOT NULL,
+                 end_byte INTEGER NOT NULL,
+                 start_line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL,
+                 text_hash TEXT NOT NULL);
+             CREATE TABLE name_strings(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL);
+             CREATE TABLE symbols(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 file_id INTEGER NOT NULL,
+                 qualified_name_id INTEGER NOT NULL,
+                 start_byte INTEGER NOT NULL,
+                 end_byte INTEGER NOT NULL,
+                 start_line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL);",
+        )
+        .unwrap();
+    assert!(
+        !schema::column_exists(&legacy, "chunks", "symbol_id").unwrap(),
+        "pre-V084 chunks has no symbol_id",
+    );
+
+    // Symbols in one file: an OUTER `outer` (id 1, bytes 100..200) with a DIFFERENT-named NESTED
+    // `inner` (id 2, bytes 130..160); a PAIR of same-name `g` (ids 3 & 4, disjoint bytes on one
+    // physical line — the minified same-line case); and an OUTER `wrap` (id 5, bytes 400..600) with
+    // a same-name NESTED `wrap` (id 6, bytes 500..560). Their line spans are 0/0 — the migration
+    // DEFAULT for a symbol never reindexed since the line columns were added — so the backfill MUST
+    // key off byte spans. Chunks carry the qualified name they were cut from (a split continuation
+    // appends `#<n>`).
+    legacy
+        .execute_batch(
+            "INSERT INTO name_strings(id, value) VALUES (1,'outer'), (2,'inner'), (3,'g'), \
+             (4,'wrap'), (5,'src/od#d.rs::run'), (6,'trailing2');
+             INSERT INTO symbols(id, file_id, qualified_name_id, start_byte, end_byte, start_line, \
+             end_line)
+                 VALUES (1, 1, 1, 100, 200, 0, 0), (2, 1, 2, 130, 160, 0, 0),
+                        (3, 1, 3, 300, 310, 0, 0), (4, 1, 3, 320, 330, 0, 0),
+                        (5, 1, 4, 400, 600, 0, 0), (6, 1, 4, 500, 560, 0, 0),
+                        (7, 1, 5, 700, 720, 0, 0), (8, 1, 6, 800, 820, 0, 0);
+             INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, start_line,
+                                end_line, text_hash)
+                 VALUES (1,'code','outer',100,200,13,14,'h'),
+                        (1,'code','inner',130,160,14,15,'h'),
+                        (1,'code','outer#1',130,160,13,14,'h'),
+                        (1,'code','g',300,330,30,30,'h'),
+                        (1,'code','wrap#1',520,540,55,58,'h'),
+                        (1,'code',NULL,900,910,80,81,'h'),
+                        (1,'code','src/od#d.rs::run',700,720,70,71,'h'),
+                        (1,'code','trailing2',800,820,75,76,'h');",
+        )
+        .unwrap();
+
+    schema::apply_chunk_symbol_id(&legacy).unwrap();
+    assert!(
+        schema::column_exists(&legacy, "chunks", "symbol_id").unwrap(),
+        "V084 adds the symbol_id column",
+    );
+
+    // The backfill binds a chunk to the same-named symbol it overlaps in BYTES only when that
+    // symbol is UNIQUE — matching by NAME (line spans are 0, so a line predicate would match
+    // nothing):
+    //   * `outer` -> id 1, even though the `inner` bytes also overlap (`inner` is a different name,
+    //     so it is not a candidate);
+    //   * `inner` -> id 2;
+    //   * `outer#1` CONTINUATION -> id 1: the `#1` suffix is stripped to `outer`, whose only
+    //     overlapping symbol is the outer — recovered, and NOT mis-bound to the nested `inner`.
+    // It leaves NULL every case no stored data can settle: the same-line `g` chunk (its whole-line
+    // bytes overlap both `g` symbols), the `wrap#1` continuation (overlaps both the outer and
+    // nested `wrap`), and the uncovered chunk (no symbol_path).
+    let linked: Vec<(Option<String>, Option<i64>)> = legacy
+        .prepare("SELECT symbol_path, symbol_id FROM chunks ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        linked,
+        vec![
+            (Some("outer".to_string()), Some(1)),
+            (Some("inner".to_string()), Some(2)),
+            (Some("outer#1".to_string()), Some(1)),
+            (Some("g".to_string()), None),
+            (Some("wrap#1".to_string()), None),
+            (None, None),
+            // A `#` inside the FILE PATH is not a continuation marker. Splitting on the FIRST `#`
+            // would truncate this to `src/od`, match nothing, and — since unchanged files are
+            // never re-chunked — strand the row at NULL forever. Only a TRAILING
+            // `#<digits>` is a suffix.
+            (Some("src/od#d.rs::run".to_string()), Some(7)),
+            // Trailing digits that are part of the NAME are likewise not a suffix: there is no `#`
+            // before them.
+            (Some("trailing2".to_string()), Some(8)),
+        ],
+        "backfill links a uniquely-named container (including a stripped continuation); a \
+         same-name tie / nested continuation / uncovered chunk stays NULL, and a `#` inside the \
+         FILE PATH is never mistaken for a continuation marker",
+    );
+
+    // Torn replay: the column already exists and every chunk is already linked, so re-applying is a
+    // no-op — it neither errors nor overwrites a resolved symbol_id.
+    schema::apply_chunk_symbol_id(&legacy).unwrap();
+    let relinked: Vec<(Option<String>, Option<i64>)> = legacy
+        .prepare("SELECT symbol_path, symbol_id FROM chunks ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(relinked, linked, "an idempotent re-apply preserves the backfilled links");
+
+    // Full ladder: the tip provisions cleanly and records V084 with the column present.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    assert!(
+        schema::column_exists(&conn, "chunks", "symbol_id").unwrap(),
+        "the full ladder ends with chunks.symbol_id present",
+    );
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '084_chunk_symbol_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V084");
 }

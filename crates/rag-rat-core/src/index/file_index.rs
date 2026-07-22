@@ -229,11 +229,16 @@ impl IndexDatabase {
                 ],
                 |row| row.get::<_, i64>(0),
             )?;
+        // Insert symbols FIRST so their freshly assigned rowids are in hand to stamp on each code
+        // chunk's `symbol_id` (the direct chunk→symbol link, #855/#860). Chunks and symbols are
+        // independent INSERTs into their own tables, so the order is free — nothing between the two
+        // depends on chunks preceding symbols.
+        let symbol_db_ids = self.insert_symbols(file_id, file.language, &prepared.symbols)?;
         self.insert_chunks(
             ChunkInsertFile { file_id, source_revision: &prepared.sha256 },
             &prepared.chunks,
+            &symbol_db_ids,
         )?;
-        let symbol_db_ids = self.insert_symbols(file_id, file.language, &prepared.symbols)?;
         // Clone fingerprints were computed in the parallel prepare phase from the same parse used
         // for symbols/edges (#230) — no second read, no second parse here, just the DB write.
         // bump_df = graph.is_none(): the full-rebuild path (graph: Some) recomputes clone_token_df
@@ -374,6 +379,7 @@ impl IndexDatabase {
         &self,
         file: ChunkInsertFile<'_>,
         chunks: &[PreparedChunk],
+        symbol_db_ids: &[i64],
     ) -> anyhow::Result<()> {
         let ChunkInsertFile { file_id, source_revision } = file;
         // Maintain the compressed store inline when a dict exists (incremental + heal, and a full
@@ -393,20 +399,29 @@ impl IndexDatabase {
         for prepared in chunks {
             let chunk = &prepared.chunk;
             let anchor = &prepared.anchor;
+            // Remap the chunk's LOCAL parsed-symbol index to the symbol's DB rowid (same convention
+            // as edge candidates / clone fingerprints). `symbol_db_ids[i]` is the rowid of
+            // `prepared.symbols[i]`, which is 1:1 with the `&[ParsedSymbol]` the chunker indexed —
+            // so this is the exact symbol the chunk was cut from. `get` (not `[]`) stays defensive:
+            // an out-of-range index resolves to NULL rather than panicking, and NULL simply yields
+            // no drive-by record.
+            let symbol_id: Option<i64> =
+                chunk.symbol_index.and_then(|i| symbol_db_ids.get(i).copied());
             conn.prepare_cached(
-                "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, \
-                 start_line, end_line, text_hash,
+                "INSERT INTO chunks(file_id, chunk_kind, symbol_path, symbol_id, start_byte, \
+                 end_byte, start_line, end_line, text_hash,
                                     source_revision, anchor_version, normalized_hash, \
                  start_boundary_hash, end_boundary_hash,
                                     start_context_hash, end_context_hash, context_radius, \
                  embedding_policy, embedding_priority)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                 ?17, ?18)",
+                 ?17, ?18, ?19)",
             )?
             .execute(params![
                 file_id,
                 chunk.kind,
                 chunk.symbol_path,
+                symbol_id,
                 i64::try_from(chunk.start_byte)?,
                 i64::try_from(chunk.end_byte)?,
                 i64::try_from(chunk.start_line)?,
