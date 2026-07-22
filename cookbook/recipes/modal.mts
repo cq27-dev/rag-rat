@@ -37,7 +37,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { AlreadyExistsError, ModalClient, NotFoundError, Probe } from "modal";
+import { AlreadyExistsError, ModalClient, NotFoundError } from "modal";
 import type { Logger as ModalLogger, Sandbox } from "modal";
 
 import {
@@ -250,7 +250,10 @@ async function provision(ctx: ProvisionContext<ModalHandle>): Promise<Provisione
         },
         ...(cacheVolume !== null ? { volumes: { [HF_CACHE_MOUNT_PATH]: cacheVolume } } : {}),
         encryptedPorts: [port],
-        readinessProbe: Probe.withTcp(port, { intervalMs: 1000 }),
+        // No SDK `readinessProbe`/`waitUntilReady`: its TCP-probe RPC has hung indefinitely on a cold
+        // vLLM boot even after the port was bound and the tunnel already served HTTP 200 (the box
+        // billed the whole time, no `ready` ever emitted). Readiness is instead the endpoint
+        // serve-probe below (`verifyChat`/`verifyEmbed`) — the authoritative, backend-agnostic signal.
         timeoutMs: BOX_MAX_LIFETIME_MS,
         idleTimeoutMs: idleWindowMs(provisionTimeoutMs),
         ...(gpu !== null ? { gpu } : {}),
@@ -294,14 +297,43 @@ async function provision(ctx: ProvisionContext<ModalHandle>): Promise<Provisione
   ctx.onBox(handle);
   log("info", `sandbox created: ${sb.sandboxId ?? "(id unavailable)"}`);
 
-  ctx.status("provisioning", `waiting for ${spec.backend} to listen on port ${port}`);
-  const readinessTimeoutMs = assertBudgetRemaining(deadline, "sandbox readiness");
+  // Resolve the public tunnel URL. The tunnel is allocated at creation and returns independent of
+  // whether the in-box server is listening yet — the serving wait is the endpoint poll below.
+  ctx.status("provisioning", `resolving the tunnel for ${spec.backend} on port ${port}`);
+  const tunnels = await withBudget(deadline, "sb.tunnels", () => sb.tunnels());
+  const tunnel = tunnels[port];
+  if (tunnel === undefined) {
+    throw new Error(`no tunnel for port ${port}; got ports [${Object.keys(tunnels).join(", ")}]`);
+  }
+  const endpoint = tunnel.url;
+  log("info", `tunnel up: ${endpoint}`);
+
+  // Load the model. infinity/vLLM auto-download on boot (nothing to do); ollama boots empty, so pull
+  // the model into the running server via an in-box exec. `sb.exec` rides the command router (attached
+  // at creation), not the served port, so it does not need the serve-probe to have passed first.
+  if (spec.modelLoad === "ollama-pull") {
+    await pullOllamaModel(sb, input.model, deadline, ctx);
+  }
+
+  // THE readiness gate: poll the tunnel until the server actually SERVES (or the budget elapses).
+  // Replaces `sb.waitUntilReady()` (see the create call) — a box can be reachable while the model is
+  // still loading, so this retries until a real completion/vector, tolerating connection-refused
+  // during boot. Budget = the time REMAINING until the shared deadline. The probe matches the
+  // capability: a chat box gets a chat-completions ping, an embed box an embeddings one. On failure,
+  // surface the sandbox's own output tail + exit code so a boot crash (OOM, bad model id) is
+  // debuggable, not just an opaque "probe timed out".
+  const servePath = spec.servePath(capability);
+  ctx.status(
+    "verifying",
+    `probing ${servePath} for a real ${capability === "chat" ? "completion" : "vector"}`,
+  );
+  const verifyBudgetMs = assertBudgetRemaining(deadline, `${capability} verification`);
   try {
-    await raceWithTimeout(
-      () => sb.waitUntilReady(readinessTimeoutMs),
-      readinessTimeoutMs,
-      "sandbox.waitUntilReady",
-    );
+    if (capability === "chat") {
+      await verifyChat(endpoint, { model: input.model, chatPath: servePath, budgetMs: verifyBudgetMs });
+    } else {
+      await verifyEmbed(endpoint, { model: input.model, embedPath: servePath, budgetMs: verifyBudgetMs });
+    }
   } catch (cause) {
     const diagnosticMs = Math.min(FAILURE_LOG_SETTLE_MS, Math.max(0, deadline - Date.now()));
     const [, exitCode] = await Promise.all([
@@ -321,36 +353,7 @@ async function provision(ctx: ProvisionContext<ModalHandle>): Promise<Provisione
       { cause },
     );
   }
-  log("info", `${spec.backend} is listening`);
-
-  // Load the model. infinity/vLLM auto-download on boot (nothing to do); ollama boots empty, so pull
-  // the model into the running server via an in-box exec.
-  if (spec.modelLoad === "ollama-pull") {
-    await pullOllamaModel(sb, input.model, deadline, ctx);
-  }
-
-  // Resolve the public tunnel URL for the served port.
-  const tunnels = await withBudget(deadline, "sb.tunnels", () => sb.tunnels());
-  const tunnel = tunnels[port];
-  if (tunnel === undefined) {
-    throw new Error(`no tunnel for port ${port}; got ports [${Object.keys(tunnels).join(", ")}]`);
-  }
-  const endpoint = tunnel.url;
-  log("info", `tunnel up: ${endpoint}`);
-
-  // Verify the server actually serves before we emit `ready`. This catches a box that booted but
-  // isn't serving (the whole point of waiting before the ready event). Budget = the time REMAINING
-  // until the shared deadline (create + pull already consumed some); throws if it's spent. The probe
-  // matches the capability: a chat box gets a chat-completions ping, an embed box an embeddings one.
-  const servePath = spec.servePath(capability);
-  ctx.status("verifying", `probing ${servePath} for a real ${capability === "chat" ? "completion" : "vector"}`);
-  const verifyBudgetMs = assertBudgetRemaining(deadline, `${capability} verification`);
-  if (capability === "chat") {
-    await verifyChat(endpoint, { model: input.model, chatPath: servePath, budgetMs: verifyBudgetMs });
-  } else {
-    await verifyEmbed(endpoint, { model: input.model, embedPath: servePath, budgetMs: verifyBudgetMs });
-  }
-  log("info", `${capability} verification passed; box is serving`);
+  log("info", `${spec.backend} is serving`);
   if (cachePublication !== null) cachePublication.verified = true;
 
   // Open tunnel via encryptedPorts → no per-request token needed. auth_token stays null.
