@@ -20,3 +20,4 @@
 //! local inventory would make the verdict device-dependent, breaking convergence.
 
 pub(in crate::account) mod ops;
+pub(in crate::account) mod projection;

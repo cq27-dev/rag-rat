@@ -69,7 +69,7 @@ impl DeviceRole {
         }
     }
 
-    fn as_u8(self) -> u8 {
+    pub(in crate::account) fn as_u8(self) -> u8 {
         match self {
             DeviceRole::Member => 1,
             DeviceRole::Owner => 2,
@@ -109,7 +109,7 @@ impl GrantRole {
         }
     }
 
-    fn as_u8(self) -> u8 {
+    pub(in crate::account) fn as_u8(self) -> u8 {
         match self {
             GrantRole::Reader => 1,
             GrantRole::Writer => 2,

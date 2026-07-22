@@ -210,6 +210,9 @@ pub(super) struct AccountAuthHistory {
     stream_ownership: HashMap<StreamId, StreamOwnershipFact>,
     grants: HashMap<[u8; 32], GrantFact>,
     grant_cuts: HashMap<[u8; 32], Vec<DeviceCut>>,
+    /// Removed devices (I4: never re-enroll). Exported because the C6 canonical projection binds
+    /// it: a snapshot that omitted tombstones would let a bootstrap re-admit a removed device.
+    tombstoned: HashSet<DeviceFingerprint>,
 }
 
 /// One authority fact resolved against the CURRENT fold. There is exactly one snapshot to resolve
@@ -375,6 +378,20 @@ impl AccountAuthHistory {
 
     pub(super) fn grant_facts(&self) -> impl Iterator<Item = (&[u8; 32], &GrantFact)> {
         self.grants.iter()
+    }
+
+    /// Every EFFECTIVE entry with the `auth_epoch` it took, in arbitrary order. The C6 canonical
+    /// projection sorts this; callers must not depend on iteration order (it is a `HashMap`).
+    pub(super) fn effective_entries(&self) -> impl Iterator<Item = ([u8; 32], u64)> + '_ {
+        self.outcomes.iter().filter_map(|(hash, outcome)| match outcome {
+            Outcome::Effective { auth_epoch } => Some((*hash, *auth_epoch)),
+            _ => None,
+        })
+    }
+
+    /// Removed devices (I4). Arbitrary order — see [`Self::effective_entries`].
+    pub(super) fn tombstoned(&self) -> impl Iterator<Item = &DeviceFingerprint> {
+        self.tombstoned.iter()
     }
 
     pub(super) fn grant_cuts(&self) -> impl Iterator<Item = (&[u8; 32], &[DeviceCut])> {
@@ -1083,6 +1100,7 @@ fn fold_account_pass(
                 stream_ownership: HashMap::new(),
                 grants: HashMap::new(),
                 grant_cuts: HashMap::new(),
+                tombstoned: HashSet::new(),
             },
             HashMap::new(),
         );
@@ -1592,6 +1610,7 @@ fn fold_account_pass(
             stream_ownership: facts.stream_ownership,
             grants: facts.grants,
             grant_cuts: facts.grant_cuts,
+            tombstoned: state.tombstoned,
         },
         discovered,
     )
@@ -2235,7 +2254,7 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
 mod tests {
     use super::*;
     use crate::account::envelope::{sign_account_entry, verify_account_signed};
-    use crate::account::{AccountId, ops as account_ops};
+    use crate::account::{AccountId, ops as account_ops, snapshot};
     use crate::device::{DeviceSecret, DeviceX25519Secret};
     use crate::stream::{StreamId, StreamSpec, StreamSpecV2};
 
@@ -2453,6 +2472,150 @@ mod tests {
         fn effective_set(history: &AccountAuthHistory) -> HashSet<[u8; 32]> {
             history.outcomes.iter().filter(|(_, o)| o.is_effective()).map(|(h, _)| *h).collect()
         }
+    }
+
+    // ---- C6b: the canonical projection (#609) ----
+
+    /// A fixture exercising every collection the projection binds: two owners, a member, a removed
+    /// device (tombstone + cuts), stream ownership, and a grant.
+    fn projection_fixture() -> Fixture {
+        let founder = Dev::new(1);
+        let owner_b = Dev::new(2);
+        let member = Dev::new(3);
+        let removed = Dev::new(4);
+        let mut f = Fixture::genesis(&founder);
+        let g = f.genesis_hash;
+        f.author(&founder, Some(g), &device_add(&owner_b, DeviceRole::Owner));
+        f.author(&founder, Some(g), &device_add(&member, DeviceRole::Member));
+        f.author(&founder, Some(g), &device_add(&removed, DeviceRole::Member));
+        let (stream_id, own) = stream_own(f.account_id);
+        f.author(&founder, Some(g), &own);
+        f.author(&founder, Some(g), &AccountOp::StreamGrant {
+            stream_id,
+            grantee_account_id: AccountId::from_bytes([0x9a; 32]),
+            grant_role: GrantRole::Writer,
+        });
+        // `Cut::Empty` because `removed` never authored an entry: a `Cut::At` would name a
+        // coordinate on its chain that does not exist, and the remove would park
+        // `unknown_cut_target` instead of taking effect — leaving the fixture with no tombstone at
+        // all, which is exactly what `a_different_covered_prefix_projects_differently` caught.
+        f.author(&founder, Some(g), &AccountOp::DeviceRemove {
+            device_fingerprint: removed.fp,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        });
+        f
+    }
+
+    /// THE determinism tripwire. Every collection the projection reads is a `HashMap`/`HashSet`,
+    /// whose iteration order varies run to run and between peers. Arrival order must not change one
+    /// byte — this is what makes `folded_state_hash` a claim two honest devices can both compute.
+    ///
+    /// It fails the moment any collection is iterated straight into the encoder instead of being
+    /// sorted first.
+    #[test]
+    fn a_shuffled_fold_produces_identical_projection_bytes() {
+        let f = projection_fixture();
+        let baseline = snapshot::projection::encoded(&f.fold());
+        assert!(baseline.len() > 200, "the fixture must exercise a non-trivial projection");
+        for rot in 0..f.entries.len() {
+            assert_eq!(
+                snapshot::projection::encoded(&f.fold_rotated(rot)),
+                baseline,
+                "arrival order rotated by {rot} changed the canonical bytes",
+            );
+        }
+    }
+
+    /// The projection must be ONE complete, canonical CBOR item — not a well-formed prefix followed
+    /// by trailing values. A golden hash alone cannot catch that: it freezes whatever bytes the
+    /// encoder produces, malformed or not, which is exactly how a short top-level array survived
+    /// into a pinned vector. This checks the shape rather than the digest.
+    #[test]
+    fn the_projection_is_one_complete_canonical_cbor_item() {
+        let bytes = snapshot::projection::encoded(&projection_fixture().fold());
+        crate::cbor::require_canonical_cbor(&bytes)
+            .expect("the canonical projection must decode as exactly one canonical CBOR item");
+    }
+
+    /// The canonical encoding is a FROZEN WIRE: two honest devices must agree byte-for-byte, and a
+    /// hash computed under one encoding is meaningless under another. Determinism and sensitivity
+    /// tests both keep passing if the encoding silently changes shape, so pin the bytes.
+    ///
+    /// If this fails, you changed what `folded_state_hash` covers — that is a
+    /// `SNAPSHOT_STATE_FORMAT_V1` bump, not a refactor.
+    #[test]
+    fn golden_projection_pins_the_canonical_encoding() {
+        let hash = snapshot::projection::folded_state_hash(&projection_fixture().fold());
+        assert_eq!(
+            hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "f6cace33757ebd07c34e076bc6078233321e857292c422e3b2b16940cbe7cb52",
+        );
+    }
+
+    /// The hash must actually depend on the state it claims to bind. Without this, a projection
+    /// that silently dropped a collection would still pass the determinism test above.
+    #[test]
+    fn the_projection_hash_moves_with_every_bound_collection() {
+        let base = snapshot::projection::folded_state_hash(&projection_fixture().fold());
+
+        // A roster/effective-set change.
+        let mut roster = projection_fixture();
+        let g = roster.genesis_hash;
+        roster.author(&Dev::new(1), Some(g), &device_add(&Dev::new(7), DeviceRole::Member));
+        assert_ne!(
+            snapshot::projection::folded_state_hash(&roster.fold()),
+            base,
+            "an added device must change the hash",
+        );
+
+        // A tombstone change (I4's set is bound, so a bootstrap cannot re-admit a removed device).
+        let mut tombstone = projection_fixture();
+        let g = tombstone.genesis_hash;
+        let victim = Dev::new(3);
+        tombstone.author(&Dev::new(1), Some(g), &AccountOp::DeviceRemove {
+            device_fingerprint: victim.fp,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        });
+        assert_ne!(
+            snapshot::projection::folded_state_hash(&tombstone.fold()),
+            base,
+            "a tombstoned device must change the hash",
+        );
+
+        // A grant change.
+        let mut grant = projection_fixture();
+        let g = grant.genesis_hash;
+        let (stream_id, _) = stream_own(grant.account_id);
+        grant.author(&Dev::new(1), Some(g), &AccountOp::StreamGrant {
+            stream_id,
+            grantee_account_id: AccountId::from_bytes([0xbe; 32]),
+            grant_role: GrantRole::Reader,
+        });
+        assert_ne!(
+            snapshot::projection::folded_state_hash(&grant.fold()),
+            base,
+            "an added grant must change the hash",
+        );
+    }
+
+    /// A held-back entry changes the fold, so it must change the projection — this is what makes a
+    /// coverage claim meaningful rather than a constant.
+    #[test]
+    fn a_different_covered_prefix_projects_differently() {
+        let f = projection_fixture();
+        let full = snapshot::projection::folded_state_hash(&f.fold());
+        let withheld = f.entries.last().expect("fixture has entries").entry_hash;
+        assert_ne!(
+            snapshot::projection::folded_state_hash(&f.fold_without(withheld)),
+            full,
+            "folding a shorter prefix must project differently",
+        );
     }
 
     fn device_add(dev: &Dev, role: DeviceRole) -> AccountOp {
