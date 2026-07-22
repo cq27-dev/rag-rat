@@ -455,7 +455,7 @@ impl IndexDatabase {
     /// one in-scope symbol shares the name (overloads / cfg twins) the lowest id is returned —
     /// the fan-in is computed per concrete symbol id, and the load-bearing signal is a coarse
     /// bucket, so picking a stable representative is acceptable for the enrichment.
-    fn active_symbol_id_for_qualified_name(
+    pub(crate) fn active_symbol_id_for_qualified_name(
         &self,
         qualified_name: &str,
     ) -> anyhow::Result<Option<i64>> {

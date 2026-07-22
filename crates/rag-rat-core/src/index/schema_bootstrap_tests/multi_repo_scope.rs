@@ -2076,3 +2076,101 @@ fn rebuild_certifies_the_policy_version_only_for_the_active_repo() {
         "the rebuild of repo A must leave co-resident repo B's stamp untouched"
     );
 }
+
+/// #852 REGRESSION: qualified-name symbol resolution stays repo-scoped in a consolidated DB.
+///
+/// The issue's premise — that these resolvers filter by name but not repo, so a `LIMIT 1` picks a
+/// sibling repo's symbol — no longer holds. Two mechanisms close it, and this pins both against a
+/// refactor reintroducing the leak:
+///
+///   * The unqualified `files` in every name→symbol query resolves to the per-connection
+///     `temp.files` VIEW, which filters `repo_id` FIRST. Qualifying it to `main.files` (or dropping
+///     the view install on an open path) would reintroduce the bug — and fail this test.
+///   * The chunk→symbol resolvers were rewritten (#858) to the direct `chunks.symbol_id` link,
+///     whose `chunks.file_id` pins the repo with no name lookup at all; the old
+///     `symbol_id_for_path_symbol` was deleted.
+///
+/// The probe injects a SIBLING repo's file + symbol sharing the qualified name, with a symbol id
+/// (`-1`) that sorts BEFORE the local one, so an unscoped `ORDER BY id LIMIT 1` would return it.
+#[test]
+fn qualified_name_resolution_is_repo_scoped_in_a_consolidated_db() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn shared_name() {}\n").unwrap();
+    run_git(&root, &["init", "-q", "-b", "main"]);
+    run_git(&root, &["config", "user.email", "t@e"]);
+    run_git(&root, &["config", "user.name", "t"]);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "init"]);
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let (local_sym, qname_id, generation): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT s.id, s.qualified_name_id, f.generation FROM symbols s
+             JOIN main.files f ON f.id = s.file_id
+             JOIN name_strings ns ON ns.id = s.qualified_name_id
+             WHERE ns.value = 'src/lib.rs::shared_name'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+
+    // A sibling repo (id sorts before), a file+symbol sharing the qualified name, symbol id -1 so
+    // it wins an unscoped `ORDER BY id`.
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, 'sibling', 0)",
+        [SMALLER_SIBLING],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO main.files(id, repo_id, path, language, kind, sha256, modified_at_ms,
+                                indexed_at_ms, commit_sha, worktree_id, generation)
+         VALUES (900000, ?1, 'src/lib.rs', 'rust', 'source', 'x', 0, 0, 'head', '', ?2)",
+        rusqlite::params![SMALLER_SIBLING, generation],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO symbols(id, file_id, language, name, qualified_name_id, kind, start_byte,
+                             end_byte)
+         VALUES (-1, 900000, 'rust', 'shared_name', ?1, 'function', 0, 1)",
+        [qname_id],
+    )
+    .unwrap();
+
+    // 1. The load-bearing importance resolver returns the ACTIVE repo's symbol.
+    assert_eq!(
+        db.active_symbol_id_for_qualified_name("src/lib.rs::shared_name").unwrap(),
+        Some(local_sym),
+        "importance enrichment must resolve within the active repo, not the sibling's lower id",
+    );
+
+    // 2. The symbol-lookup query (`lookup_candidates` → `lookup_name`) sees only the active repo's
+    //    symbol. Called directly on the scoped connection rather than through `symbol_candidates`,
+    //    whose stale-path heal layer would independently drop the phantom sibling row and mask a
+    //    regression in the `files` join itself — this pins THAT join.
+    let candidates = rag_rat_query::symbol::lookup_candidates(
+        conn,
+        &rag_rat_query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("shared_name".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        },
+        false,
+    )
+    .unwrap();
+    let ids: Vec<i64> = candidates.candidates.iter().map(|c| c.symbol_id).collect();
+    assert!(
+        ids.contains(&local_sym) && !ids.contains(&-1),
+        "symbol_lookup must surface the active repo's symbol and never the sibling's: {ids:?}",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
