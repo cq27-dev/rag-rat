@@ -557,6 +557,48 @@ fn owner_chain_authority_in_snapshot(
     }))
 }
 
+/// Verify every snapshot this device holds for `account_id` against the account history it holds.
+///
+/// The read/query surface for [`snapshot::verify`], and deliberately READ-ONLY: it returns verdicts
+/// and changes nothing. A `Mismatch` here does not delete, condemn, or unaccept the entry — a
+/// snapshot whose claim is false stays stored and is simply never trusted. Nothing may feed a
+/// verdict back into acceptance, because verifying consults the local candidate inventory and an
+/// acceptance rule that did so would make the verdict device-dependent.
+///
+/// Entries that are not current-version plaintext snapshots on the annex log are skipped, and a
+/// manifest this binary cannot interpret (a future state format) simply yields no verdict rather
+/// than a failure.
+pub(in crate::account) fn verify_stored_snapshots(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Vec<(EntryHash, snapshot::verify::SnapshotVerdict)>> {
+    let rows = load_candidates(conn, account_id)?;
+    let held: Vec<envelope::VerifiedAccountEntry> =
+        rows.iter().map(|row| row.verified.clone()).collect();
+    let mut verdicts = Vec::new();
+    for row in &rows {
+        let header = &row.verified.header;
+        if header.log_id != fold::ANNEX_LOG
+            || header.crypto_suite != 0
+            || header.op_version != fold::SUPPORTED_OP_VERSION
+        {
+            continue;
+        }
+        let Ok(snapshot::ops::DecodedSnapshotOp::Known(snapshot::ops::SnapshotOp::Snapshot {
+            targets,
+            ..
+        })) = snapshot::ops::decode(header.entry_type, &row.verified.payload)
+        else {
+            // An unknown tag or a future state format is retained and uninterpretable here — not a
+            // verdict, and not an error.
+            continue;
+        };
+        verdicts.push((row.entry_hash, snapshot::verify::verify_snapshot(&held, &targets)));
+    }
+    verdicts.sort_unstable_by_key(|(hash, _)| *hash);
+    Ok(verdicts)
+}
+
 pub fn owner_incarnation_effective(
     conn: &Connection,
     account_id: AccountId,
@@ -3329,6 +3371,120 @@ mod tests {
             account_ingest(&conn, &other_tag.signed_bytes, NOW + 3).unwrap(),
             IngestOutcome::Ingested { status: "retained_unfolded".into() },
             "a sealed NON-snapshot annex entry is still retained",
+        );
+    }
+
+    /// END-TO-END through storage: author a real snapshot over the account's own history, ingest
+    /// it, and verify it back out. The algorithm has unit coverage against a fold fixture; this is
+    /// the path — stored bytes, manifest decode, covered walk over real rows — actually working.
+    fn author_snapshot_over(
+        conn: &Connection,
+        account_id: AccountId,
+        founder: &Dev,
+        genesis_hash: [u8; 32],
+        mangle: impl FnOnce(&mut snapshot::ops::SnapshotTarget),
+    ) -> [u8; 32] {
+        // The honest claim: every device's control-chain head, and the hash of folding exactly
+        // that.
+        let rows = load_candidates(conn, account_id).unwrap();
+        let held: Vec<_> = rows.iter().map(|r| r.verified.clone()).collect();
+        let mut heads: std::collections::HashMap<DeviceFingerprint, (u64, [u8; 32])> =
+            std::collections::HashMap::new();
+        for entry in &held {
+            if entry.header.log_id != fold::CONTROL_LOG {
+                continue;
+            }
+            let slot = heads
+                .entry(entry.header.device_fingerprint)
+                .or_insert((entry.header.seq, entry.entry_hash));
+            if entry.header.seq >= slot.0 {
+                *slot = (entry.header.seq, entry.entry_hash);
+            }
+        }
+        let control_only: Vec<_> =
+            held.iter().filter(|e| e.header.log_id == fold::CONTROL_LOG).cloned().collect();
+        let mut target =
+            snapshot::ops::SnapshotTarget {
+                log_id: fold::CONTROL_LOG,
+                stream_id: None,
+                subject_account_id: None,
+                folded_state_hash: snapshot::projection::folded_state_hash(&fold::fold_account(
+                    &control_only,
+                )),
+                covered: heads
+                    .into_iter()
+                    .map(|(device_fingerprint, (seq, entry_hash))| {
+                        snapshot::ops::CoveredWatermark { device_fingerprint, seq, entry_hash }
+                    })
+                    .collect(),
+            };
+        mangle(&mut target);
+
+        let payload = snapshot::ops::encode(&snapshot::ops::SnapshotOp::Snapshot {
+            state_format_version: snapshot::ops::SNAPSHOT_STATE_FORMAT_V1,
+            moderation_epoch: 0,
+            targets: vec![target],
+        })
+        .unwrap();
+        let header = AccountEntryHeader {
+            account_id,
+            log_id: fold::ANNEX_LOG,
+            device_fingerprint: founder.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: snapshot::ops::entry_type::SNAPSHOT,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: Some(genesis_hash),
+        };
+        let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
+        account_ingest(conn, &signed.signed_bytes, NOW + 9).unwrap();
+        signed.entry_hash
+    }
+
+    #[test]
+    fn a_stored_snapshot_verifies_end_to_end_and_a_forged_one_does_not() {
+        let conn = db();
+        let founder = Dev::new(0x91);
+        let member = Dev::new(0x92);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (add_bytes, _) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&member, DeviceRole::Member),
+        );
+        account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
+
+        let honest = author_snapshot_over(&conn, account_id, &founder, genesis_hash, |_| {});
+        assert_eq!(
+            verify_stored_snapshots(&conn, account_id).unwrap(),
+            vec![(honest, snapshot::verify::SnapshotVerdict::Verified)],
+            "an honest claim over stored history verifies through the real read path",
+        );
+
+        // A forged hash on an otherwise well-formed manifest is detected, and — the load-bearing
+        // half — the entry is still STORED. Verification never unaccepts anything.
+        let conn = db();
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let forged = author_snapshot_over(&conn, account_id, &founder, genesis_hash, |target| {
+            target.folded_state_hash = [0xff; 32];
+        });
+        assert_eq!(verify_stored_snapshots(&conn, account_id).unwrap(), vec![(
+            forged,
+            snapshot::verify::SnapshotVerdict::Mismatch
+        )],);
+        assert_eq!(
+            status(&conn, &forged).as_deref(),
+            Some("retained_unfolded"),
+            "a false claim is still stored — verification decides trust, never storage",
         );
     }
 
