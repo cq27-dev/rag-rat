@@ -2315,6 +2315,37 @@ mod tests {
         (signed.signed_bytes, signed.entry_hash)
     }
 
+    /// `op`, but signed by the store's OWN device — the local identity is minted, never seeded from
+    /// a `Dev`, so any test that drives the production authoring seam has to author its history
+    /// under the same key.
+    #[allow(clippy::too_many_arguments)]
+    fn op_local(
+        account_id: AccountId,
+        device: &crate::identity::LocalDevice,
+        seq: u64,
+        prev: Option<[u8; 32]>,
+        authority_ref: Option<[u8; 32]>,
+        op: &AccountOp,
+    ) -> (Vec<u8>, [u8; 32]) {
+        let payload = ops::encode(op).unwrap();
+        let header = AccountEntryHeader {
+            account_id,
+            log_id: 0,
+            device_fingerprint: device.fingerprint(),
+            seq,
+            prev_hash: prev,
+            parent_ref: None,
+            entry_type: ops::entry_type_of(op),
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref,
+        };
+        let signed = sign_account_entry(device.secret(), &header, &payload).unwrap();
+        (signed.signed_bytes, signed.entry_hash)
+    }
+
     fn device_add(dev: &Dev, role: DeviceRole) -> AccountOp {
         AccountOp::DeviceAdd {
             device_fingerprint: dev.fp,
@@ -4008,6 +4039,114 @@ mod tests {
             stored.verified.header.parent_ref,
             Some(impostor.entry_hash),
             "never the impostor"
+        );
+    }
+
+    /// I4 SURVIVES A SNAPSHOT: the bound tombstone set is TOTAL, never windowed (#609).
+    ///
+    /// I4 says a tombstoned fingerprint never re-enrolls. A snapshot binds folded state, so if that
+    /// state carried only *recent* tombstones — anything windowed, aged out, or summarised into an
+    /// accumulator — a peer that trusted the snapshot would admit a `DeviceAdd` for a fingerprint
+    /// removed deeper in the covered history, and I4 would hold locally while failing across the
+    /// very artifact meant to convey state.
+    ///
+    /// That is also why no digest-style accumulator is sound here: I4 needs deterministic
+    /// *rejection* of a re-add, i.e. exact membership. A digest without a universally verifiable
+    /// non-membership proof makes the verdict depend on which peer is checking — the fold-firewall
+    /// failure this phase exists to prevent.
+    ///
+    /// The removal is placed at the very bottom of the chain and the snapshot authored well after
+    /// it, so a windowed set would drop it.
+    #[test]
+    fn a_snapshot_binds_the_total_tombstone_set_so_a_deep_removal_still_bars_re_enrollment() {
+        let conn = db();
+        let device = crate::local_device(&conn, NOW).unwrap();
+        super::super::bootstrap::local_account(&conn, NOW).unwrap();
+        let account =
+            super::super::bootstrap::local_account_ref(&conn).unwrap().expect("account minted");
+        let (account_id, genesis_hash) = (account.account_id, account.genesis_hash);
+
+        // Deep history: enroll a device, then remove it — this tombstone must outlive everything.
+        let doomed = Dev::new(0xd1);
+        let (add_bytes, roster_ref) = op_local(
+            account_id,
+            &device,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&doomed, DeviceRole::Member),
+        );
+        account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
+        let (remove_bytes, remove_hash) = op_local(
+            account_id,
+            &device,
+            2,
+            Some(roster_ref),
+            Some(genesis_hash),
+            &device_remove(&doomed, super::super::cut::Cut::Empty),
+        );
+        account_ingest(&conn, &remove_bytes, NOW + 2).unwrap();
+
+        // Bury it: unrelated history piles up on top, so a windowed tombstone set would age it out.
+        let mut prev = remove_hash;
+        for (index, seed) in (0xe0u8..0xe6).enumerate() {
+            let (bytes, hash) = op_local(
+                account_id,
+                &device,
+                3 + index as u64,
+                Some(prev),
+                Some(genesis_hash),
+                &device_add(&Dev::new(seed), DeviceRole::Member),
+            );
+            account_ingest(&conn, &bytes, NOW + 3 + index as i64).unwrap();
+            prev = hash;
+        }
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let outcome =
+            snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 20).unwrap();
+        tx.commit().unwrap();
+        let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
+            panic!("the local founder is an open owner of a live account: {outcome:?}");
+        };
+        assert_eq!(
+            verify_stored_snapshots(&conn, account_id).unwrap(),
+            vec![(hash, snapshot::verify::SnapshotVerdict::Verified)],
+            "the snapshot must verify, or it binds nothing at all",
+        );
+
+        // The BOUND state carries the deep tombstone. Asserted over the snapshot's own covered
+        // prefix rather than over everything held: the prefix is what `folded_state_hash` is
+        // computed from, so this is the set a peer inherits by trusting the manifest — folding all
+        // held entries instead would prove only that the local fold works.
+        let held = account_entries_view(&conn, account_id).unwrap();
+        let usable = usable_snapshots(&conn, account_id).unwrap();
+        let covered = &usable[0].targets[0].covered;
+        let by_hash = held.held().iter().map(|entry| (entry.entry_hash, entry)).collect();
+        let prefix = snapshot::verify::on_branch_prefix(covered, &by_hash)
+            .expect("the covered prefix is walkable");
+        let bound = fold::fold_account(&prefix);
+        assert!(
+            bound.tombstoned().any(|fingerprint| *fingerprint == doomed.fp),
+            "a removal at the bottom of the chain is still in the tombstone set the snapshot binds",
+        );
+
+        // And the guarantee bites: re-adding that fingerprint after the snapshot is not effective.
+        let (readd_bytes, readd_hash) = op_local(
+            account_id,
+            &device,
+            9,
+            Some(prev),
+            Some(genesis_hash),
+            &device_add(&doomed, DeviceRole::Member),
+        );
+        account_ingest(&conn, &readd_bytes, NOW + 21).unwrap();
+        assert_eq!(
+            status(&conn, &readd_hash).as_deref(),
+            Some("rejected"),
+            "a tombstoned fingerprint never re-enrolls, snapshot or no snapshot (I4) — asserted \
+             as the exact verdict, since a merely-not-accepted re-add could be forked for an \
+             unrelated chain reason and prove nothing",
         );
     }
 
