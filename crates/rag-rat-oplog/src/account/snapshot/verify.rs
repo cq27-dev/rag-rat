@@ -142,7 +142,15 @@ pub(in crate::account) fn verify_snapshot(
 /// The claim can be entirely true about the branch it names and still be an incomplete view of what
 /// is known here. Since the author chooses which branch to hash, this is the check that stops that
 /// choice from being the only thing verification inspects.
-fn ignores_held_evidence(prefix: &[VerifiedAccountEntry], held: &[VerifiedAccountEntry]) -> bool {
+/// Does `held` contain an entry at a covered coordinate that the claimed chain does not include?
+///
+/// Shared with authoring for the same reason as [`on_branch_prefix`]: an author that could not ask
+/// this question would mint snapshots its own verifier deterministically refuses. One function, two
+/// callers.
+pub(in crate::account) fn ignores_held_evidence(
+    prefix: &[VerifiedAccountEntry],
+    held: &[VerifiedAccountEntry],
+) -> bool {
     let covered_slots: HashMap<(u8, DeviceFingerprint, u64), [u8; 32]> = prefix
         .iter()
         .map(|entry| {
@@ -160,11 +168,15 @@ fn ignores_held_evidence(prefix: &[VerifiedAccountEntry], held: &[VerifiedAccoun
 
 /// Collect the union of the chains reachable by walking `prev_hash` from each covered watermark.
 ///
+/// Shared with authoring ON PURPOSE. The author hashes a projection of this prefix and a verifier
+/// re-derives it from the same watermark vector, so if the two ever computed "the covered prefix"
+/// differently every honest snapshot would fail verification. One function, two callers.
+///
 /// The walk mirrors [`super::super::candidate::ancestry`]'s link rules exactly: every step stays on
 /// the watermark's own `(log, device)` coordinate and steps down precisely one seq slot, ending at
 /// seq 0 with no parent. A signed header pins only `prev_hash` NULLITY — not that its parent is a
 /// valid contiguous link — so a forged chain must not be walkable into the verification input.
-fn on_branch_prefix(
+pub(in crate::account) fn on_branch_prefix(
     covered: &[CoveredWatermark],
     by_hash: &HashMap<[u8; 32], &VerifiedAccountEntry>,
 ) -> Result<Vec<VerifiedAccountEntry>, Unverifiable> {

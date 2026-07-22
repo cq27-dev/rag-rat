@@ -213,6 +213,12 @@ pub(super) struct AccountAuthHistory {
     /// Removed devices (I4: never re-enroll). Exported because the C6 canonical projection binds
     /// it: a snapshot that omitted tombstones would let a bootstrap re-admit a removed device.
     tombstoned: HashSet<DeviceFingerprint>,
+    /// The CANONICAL root, as selected by [`find_genesis`] — not merely the first entry carrying
+    /// the genesis tag. Exported because C6 signs snapshots with it as `parent_ref`: a malformed
+    /// same-payload genesis (a non-null `parent_ref`, say) can be held alongside the real root and
+    /// sort ahead of it by hash, and no snapshot read revalidates `parent_ref`. `None` when no
+    /// valid genesis is held yet.
+    genesis_hash: Option<[u8; 32]>,
 }
 
 /// One authority fact resolved against the CURRENT fold. There is exactly one snapshot to resolve
@@ -345,6 +351,12 @@ impl AccountAuthHistory {
     /// The outcome of the entry with this hash (absent ⇒ the entry was not in the folded set).
     pub(super) fn outcome(&self, entry_hash: &[u8; 32]) -> Option<Outcome> {
         self.outcomes.get(entry_hash).copied()
+    }
+
+    /// The canonical root hash — see the field docs. Callers signing `parent_ref` MUST use this
+    /// rather than scanning held entries for the genesis tag themselves.
+    pub(super) fn genesis_hash(&self) -> Option<[u8; 32]> {
+        self.genesis_hash
     }
 
     pub(super) fn classification(&self) -> AccountClassification {
@@ -1101,6 +1113,7 @@ fn fold_account_pass(
                 grants: HashMap::new(),
                 grant_cuts: HashMap::new(),
                 tombstoned: HashSet::new(),
+                genesis_hash: None,
             },
             HashMap::new(),
         );
@@ -1611,6 +1624,7 @@ fn fold_account_pass(
             grants: facts.grants,
             grant_cuts: facts.grant_cuts,
             tombstoned: state.tombstoned,
+            genesis_hash: Some(genesis_owner_id),
         },
         discovered,
     )

@@ -1476,6 +1476,74 @@ struct CandidateRow {
     verified: VerifiedAccountEntry,
 }
 
+/// One read of an account's candidate DAG, carrying BOTH facts a snapshot author needs: everything
+/// held, and which of it the store's own branch selection accepted.
+///
+/// The fields are private on purpose. These two sets differ exactly when a device has equivocated,
+/// and that is precisely the case where confusing them is harmful: a coverage claim built from
+/// "everything held" can name the LOSING side of a same-sequence fork (highest seq wins, and both
+/// forks share a seq), producing a snapshot that is internally consistent yet describes a branch
+/// this store rejected. So the head computation is a method here rather than a free function over a
+/// slice a caller supplies — there is no wrong set to hand it.
+pub(in crate::account) struct AccountEntriesView {
+    held: Vec<VerifiedAccountEntry>,
+    accepted: HashSet<EntryHash>,
+}
+
+impl AccountEntriesView {
+    /// Everything held, accepted or not. Classification must fold THIS: a verifier folds the full
+    /// held set before trusting a snapshot, so an author that folded only its accepted branch would
+    /// call an account live that its peers can see is contested.
+    pub(in crate::account) fn held(&self) -> &[VerifiedAccountEntry] {
+        &self.held
+    }
+
+    /// Each device's ACCEPTED control-chain head — what a coverage claim names.
+    ///
+    /// Accepted rather than merely held: the accepted branch is the coherent one, and a watermark
+    /// pointing at a forked head would name a branch the receiving verifier cannot reconcile with
+    /// its own view of that device's chain.
+    pub(in crate::account) fn accepted_control_heads(
+        &self,
+    ) -> Vec<snapshot::ops::CoveredWatermark> {
+        let mut heads: HashMap<DeviceFingerprint, (u64, EntryHash)> = HashMap::new();
+        for entry in &self.held {
+            if entry.header.log_id != fold::CONTROL_LOG
+                || !self.accepted.contains(&entry.entry_hash)
+            {
+                continue;
+            }
+            let slot = heads
+                .entry(entry.header.device_fingerprint)
+                .or_insert((entry.header.seq, entry.entry_hash));
+            if entry.header.seq >= slot.0 {
+                *slot = (entry.header.seq, entry.entry_hash);
+            }
+        }
+        let mut covered: Vec<snapshot::ops::CoveredWatermark> = heads
+            .into_iter()
+            .map(|(device_fingerprint, (seq, entry_hash))| snapshot::ops::CoveredWatermark {
+                device_fingerprint,
+                seq,
+                entry_hash,
+            })
+            .collect();
+        covered.sort_unstable_by_key(|w| w.device_fingerprint.to_bytes());
+        covered
+    }
+}
+
+/// Read the account's candidate DAG once and derive its accepted branch with the SAME selection the
+/// store persists — [`derive_account_projection`], never a second implementation that could drift.
+pub(in crate::account) fn account_entries_view(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<AccountEntriesView> {
+    let rows = load_candidates(conn, account_id)?;
+    let accepted = derive_account_projection(&rows).accepted;
+    Ok(AccountEntriesView { held: rows.into_iter().map(|row| row.verified).collect(), accepted })
+}
+
 fn load_candidates(conn: &Connection, account_id: AccountId) -> anyhow::Result<Vec<CandidateRow>> {
     let mut stmt = conn.prepare(
         "SELECT entry_hash, device_fingerprint, seq, signed_bytes
@@ -3568,6 +3636,374 @@ mod tests {
             status(&conn, &forged).as_deref(),
             Some("retained_unfolded"),
             "a false claim is still stored — verification decides trust, never storage",
+        );
+    }
+
+    /// THE LOOP CLOSED: production authoring feeds production verification and selection.
+    ///
+    /// Every earlier C6 slice was exercised by hand-built snapshots. This is the first test where
+    /// the artifact is minted by the same code a real caller would use, which is what makes the
+    /// author/verifier agreement real rather than asserted — they share `on_branch_prefix`, so any
+    /// drift in what a watermark vector DENOTES fails here immediately, and would otherwise look
+    /// like a fold bug rather than a disagreement about set membership.
+    #[test]
+    fn an_authored_snapshot_verifies_and_is_selected_through_production_code() {
+        let conn = db();
+        let device = crate::local_device(&conn, NOW).unwrap();
+        super::super::bootstrap::local_account(&conn, NOW).unwrap();
+        let account =
+            super::super::bootstrap::local_account_ref(&conn).unwrap().expect("account minted");
+
+        let effective_before = account_effective_count(&conn, account.account_id).unwrap();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let outcome =
+            snapshot::author::author_snapshot_in_tx(&tx, &device, account.account_id, NOW + 2)
+                .unwrap();
+        tx.commit().unwrap();
+
+        let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
+            panic!("the local founder is an open owner with history: {outcome:?}");
+        };
+
+        // The claim the author made is one the verifier independently reproduces from the same
+        // watermark vector — the whole point of sharing the prefix walk.
+        assert_eq!(
+            verify_stored_snapshots(&conn, account.account_id).unwrap(),
+            vec![(hash, snapshot::verify::SnapshotVerdict::Verified)],
+            "an authored snapshot must verify against the history it was authored over",
+        );
+        assert_eq!(
+            selected_snapshot(&conn, account.account_id).unwrap().map(|s| s.entry_hash),
+            Some(hash),
+        );
+
+        // It rides the annex log and is INERT there, asserted two ways. The status row proves
+        // authoring refolded in its own transaction — without that, the entry exists in
+        // `account_entries` with no projection row and a status-based reader silently omits it.
+        assert_eq!(
+            status(&conn, &hash).as_deref(),
+            Some("retained_unfolded"),
+            "an authored snapshot must be projected, and projected as unfolded",
+        );
+        // And the count is the property that actually matters: an annex entry must not move
+        // `effective_count`, or every later control op asserting the higher `auth_len` would park
+        // un-healably on a binary that does not know the type (#809).
+        assert_eq!(
+            account_effective_count(&conn, account.account_id).unwrap(),
+            effective_before,
+            "an annex entry must not shift the control fold's effective count",
+        );
+
+        // And the claim is about real history: the covered vector names the founder's own chain.
+        let usable = usable_snapshots(&conn, account.account_id).unwrap();
+        let covered = &usable[0].targets[0].covered;
+        assert_eq!(covered.len(), 1, "one device has control history so far");
+        assert_eq!(covered[0].device_fingerprint, device.fingerprint());
+    }
+
+    /// A `DeviceAdd` for the store's OWN device — the local identity is minted, never seeded from a
+    /// `Dev`, so a foreign founder enrolling it has to name its real keys.
+    fn device_add_local(device: &crate::identity::LocalDevice, role: DeviceRole) -> AccountOp {
+        AccountOp::DeviceAdd {
+            device_fingerprint: device.fingerprint(),
+            ed25519_pubkey: device.public().to_bytes(),
+            x25519_pubkey: device.x25519_public().to_bytes(),
+            role,
+            label: None,
+        }
+    }
+
+    /// A member holds the same history an owner does and can verify every snapshot it receives — it
+    /// simply has no incarnation to CITE, and the manifest is only usable while the incarnation it
+    /// cites stays open. So authoring reports the state instead of minting an unusable artifact.
+    #[test]
+    fn a_member_device_has_no_authority_to_cite_and_authors_nothing() {
+        let conn = db();
+        let device = crate::local_device(&conn, NOW).unwrap();
+        let founder = Dev::new(0xa1);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        let (add_local, _) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add_local(&device, DeviceRole::Member),
+        );
+        account_ingest(&conn, &add_local, NOW + 1).unwrap();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let outcome =
+            snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 2).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(outcome, snapshot::author::SnapshotAuthorOutcome::NotAnOpenOwner);
+        assert!(
+            usable_snapshots(&conn, account_id).unwrap().is_empty(),
+            "reporting the state must not have minted anything",
+        );
+    }
+
+    /// A contested account is one whose authority is under dispute; a snapshot of it is a
+    /// clean-looking claim about disputed state. Verification already folds the full held set and
+    /// requires `Live`, so authoring one would only mint an artifact guaranteed to be rejected —
+    /// this device declines at the source rather than emitting garbage for peers to refuse.
+    #[test]
+    fn a_contested_account_is_never_snapshotted_even_by_an_open_owner() {
+        let conn = db();
+        let device = crate::local_device(&conn, NOW).unwrap();
+        let (founder, a, b) = (Dev::new(0xa1), Dev::new(0xa2), Dev::new(0xa3));
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        // The local device is a bona fide open owner throughout — the refusal must come from the
+        // account's classification, not from this device lacking authority.
+        let (add_local, add_local_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add_local(&device, DeviceRole::Owner),
+        );
+        account_ingest(&conn, &add_local, NOW + 1).unwrap();
+
+        // Two other owners cut each other at the same depth: the mutual-condemnation cycle that
+        // makes the fold fail closed to state_before(1).
+        let (add_a, owner_a) = op(
+            account_id,
+            &founder,
+            2,
+            Some(add_local_hash),
+            Some(genesis_hash),
+            &device_add(&a, DeviceRole::Owner),
+        );
+        account_ingest(&conn, &add_a, NOW + 2).unwrap();
+        let (add_b, owner_b) = op(
+            account_id,
+            &founder,
+            3,
+            Some(owner_a),
+            Some(genesis_hash),
+            &device_add(&b, DeviceRole::Owner),
+        );
+        account_ingest(&conn, &add_b, NOW + 3).unwrap();
+        let (remove_b, _) = op(account_id, &a, 0, None, Some(owner_a), &owner_demote(&b, owner_b));
+        account_ingest(&conn, &remove_b, NOW + 4).unwrap();
+        let (remove_a, _) = op(account_id, &b, 0, None, Some(owner_b), &owner_demote(&a, owner_a));
+        account_ingest(&conn, &remove_a, NOW + 5).unwrap();
+
+        let held = account_entries_view(&conn, account_id).unwrap();
+        assert!(
+            matches!(
+                fold::fold_account(held.held()).classification(),
+                fold::AccountClassification::Contested { .. }
+            ),
+            "the setup must actually contest the account, or this test proves nothing",
+        );
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let outcome =
+            snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 6).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(outcome, snapshot::author::SnapshotAuthorOutcome::AccountNotLive);
+        assert!(
+            usable_snapshots(&conn, account_id).unwrap().is_empty(),
+            "declining must not have minted anything",
+        );
+    }
+
+    /// A snapshot's `parent_ref` is the CANONICAL root, not the lowest-hashed genesis-tagged entry.
+    ///
+    /// Ingest validates a genesis payload against its `account_id` and its founder key, but NOT the
+    /// canonical header shape (§6). So a founder-signed entry carrying the real genesis payload at
+    /// a NON-origin seq is accepted and stored alongside the true root. `fold::find_genesis`
+    /// excludes it (a genesis is seq 0 by definition), which is why the account still folds `Live`
+    /// — but a naive "first entry with the genesis tag, in hash order" scan picks it whenever its
+    /// hash sorts lower, and `is_genesis` tests only the log and the tag. An off-origin seq is also
+    /// off every covered coordinate, so the equivocation guard does not fire either. Nothing
+    /// downstream revalidates `parent_ref`, so such a snapshot would store, report as authored, and
+    /// be selectable.
+    #[test]
+    fn a_snapshot_parents_the_canonical_genesis_not_a_lower_hashed_impostor() {
+        let conn = db();
+        let device = crate::local_device(&conn, NOW).unwrap();
+        let founder = Dev::new(0xa1);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        // The same genesis payload re-signed with a non-null `parent_ref` — malformed per §6, yet
+        // it satisfies every check ingest actually performs. Vary the bogus parent until the entry
+        // hash sorts BELOW the real root, which is what makes a tag scan choose it.
+        let genesis_op = AccountOp::AccountGenesis {
+            ed25519_pubkey: founder.ed,
+            x25519_pubkey: founder.x,
+            nonce16: [0u8; 16],
+            created_at_ms: NOW as u64,
+            label: None,
+        };
+        let payload = ops::encode(&genesis_op).unwrap();
+        let mut impostor = None;
+        for seq in 2u64..4096 {
+            let header = AccountEntryHeader {
+                account_id,
+                log_id: 0,
+                device_fingerprint: founder.fp,
+                seq, // <- the malformation: a genesis is seq 0 by definition (§6)
+                prev_hash: Some(genesis_hash), // ingest requires null iff seq == 0
+                parent_ref: None,
+                entry_type: ops::entry_type::ACCOUNT_GENESIS,
+                op_version: 1,
+                crypto_suite: 0,
+                auth_len: 0,
+                key_id: None,
+                authority_ref: None,
+            };
+            let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
+            if signed.entry_hash < genesis_hash {
+                impostor = Some(signed);
+                break;
+            }
+        }
+        let impostor = impostor.expect("some off-origin seq hashes below the real root");
+        account_ingest(&conn, &impostor.signed_bytes, NOW + 1).unwrap();
+        assert!(
+            impostor.entry_hash < genesis_hash,
+            "the impostor must sort first, or this test cannot distinguish the two selections",
+        );
+
+        // The local device becomes an open owner so it can author at all.
+        let (add_local, _) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add_local(&device, DeviceRole::Owner),
+        );
+        account_ingest(&conn, &add_local, NOW + 2).unwrap();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let outcome =
+            snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 3).unwrap();
+        tx.commit().unwrap();
+        let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
+            panic!("the account still folds Live despite the impostor: {outcome:?}");
+        };
+
+        let stored = load_candidates(&conn, account_id)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.entry_hash == hash)
+            .expect("the authored snapshot is stored");
+        assert_eq!(
+            stored.verified.header.parent_ref,
+            Some(genesis_hash),
+            "the snapshot must parent the canonical root the fold selected",
+        );
+        assert_ne!(
+            stored.verified.header.parent_ref,
+            Some(impostor.entry_hash),
+            "never the impostor"
+        );
+    }
+
+    /// A coverage claim names the ACCEPTED branch, never merely the highest-sequence entry held.
+    ///
+    /// The two sets diverge exactly under equivocation: a device that signs two different entries
+    /// at the SAME seq puts both in the candidate store, and branch selection accepts one. Sequence
+    /// alone cannot break that tie — both forks share a seq — so a "highest seq wins" rule falls
+    /// through to load order, which is not the store's branch selection.
+    ///
+    /// Why this matters even though the snapshot below is refused locally: a peer that never
+    /// received the losing fork has no equivocation to object to. Handed a watermark naming the
+    /// losing side, it either cannot walk the chain at all or — if it holds only that side —
+    /// accepts a claim about a branch this store rejected.
+    #[test]
+    fn a_coverage_claim_names_the_accepted_fork_not_the_losing_one() {
+        let conn = db();
+        let device = crate::local_device(&conn, NOW).unwrap();
+        let founder = Dev::new(0xa1);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        let (add_local, add_local_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add_local(&device, DeviceRole::Owner),
+        );
+        account_ingest(&conn, &add_local, NOW + 1).unwrap();
+
+        // The founder equivocates: two DIFFERENT entries at seq 2 off the same prev.
+        let (fork_x, fork_x_hash) = op(
+            account_id,
+            &founder,
+            2,
+            Some(add_local_hash),
+            Some(genesis_hash),
+            &device_add(&Dev::new(0xb1), DeviceRole::Member),
+        );
+        account_ingest(&conn, &fork_x, NOW + 2).unwrap();
+        let (fork_y, fork_y_hash) = op(
+            account_id,
+            &founder,
+            2,
+            Some(add_local_hash),
+            Some(genesis_hash),
+            &device_add(&Dev::new(0xb2), DeviceRole::Member),
+        );
+        account_ingest(&conn, &fork_y, NOW + 3).unwrap();
+
+        // Which side the store kept is its business; the watermark must follow it, whichever it is.
+        let (winner, loser) = match (
+            status(&conn, &fork_x_hash).as_deref(),
+            status(&conn, &fork_y_hash).as_deref(),
+        ) {
+            (Some("accepted"), Some("forked")) => (fork_x_hash, fork_y_hash),
+            (Some("forked"), Some("accepted")) => (fork_y_hash, fork_x_hash),
+            other =>
+                panic!("the setup must produce exactly one accepted and one forked: {other:?}"),
+        };
+        assert!(loser != winner);
+
+        // The production head selection the author uses — asserted directly, because the end-to-end
+        // path below deliberately refuses this snapshot and so cannot discriminate the branches.
+        let heads = account_entries_view(&conn, account_id).unwrap().accepted_control_heads();
+        let founder_head = heads
+            .iter()
+            .find(|w| w.device_fingerprint == founder.fp)
+            .expect("the founder's chain is covered");
+        assert_eq!(
+            founder_head.entry_hash, winner,
+            "the watermark must name the branch the store accepted, not the higher hash",
+        );
+        assert_eq!(founder_head.seq, 2, "and it is still that device's head");
+
+        // End to end, a device that HOLDS the equivocation declines rather than publishing a
+        // one-branch view of a chain it knows to be forked — and it declines BEFORE minting, since
+        // the artifact would be refused by this very device and would only burn candidate capacity.
+        let effective_before = account_effective_count(&conn, account_id).unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let outcome =
+            snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 4).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(outcome, snapshot::author::SnapshotAuthorOutcome::HeldEvidenceOffBranch);
+        assert!(
+            verify_stored_snapshots(&conn, account_id).unwrap().is_empty(),
+            "declining must not have stored a snapshot to verify",
+        );
+        assert!(usable_snapshots(&conn, account_id).unwrap().is_empty());
+        assert_eq!(
+            account_effective_count(&conn, account_id).unwrap(),
+            effective_before,
+            "and the control fold is untouched either way",
         );
     }
 

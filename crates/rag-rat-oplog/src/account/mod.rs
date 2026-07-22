@@ -90,6 +90,14 @@ pub use secrets::{
     live_stream_key_targets_for_device, mint_and_author_stream_key_wrap_in_tx,
     rotate_stream_key_in_tx, select_current_sealing_wrap, stream_key_rotation_needed,
 };
+// The C6 snapshot-authoring seam (#609). No caller fires it yet, and that is deliberate rather
+// than an oversight: a snapshot is only worth minting once something reads one. #406 owns both
+// halves — it is what consumes manifests ("window pruning only against verified snapshot
+// manifests") and it owns the maintenance path device-side sync piggybacks. Authoring on a
+// cadence before then would write entries nothing reads into a capacity-bounded candidate
+// store that cannot yet prune them, since the tombstone horizon is still outstanding on #609.
+#[allow(unused_imports, reason = "C6 authoring seam is frozen before transport wiring lands")]
+pub use snapshot::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub(crate) use storage::stream_owner_account;
 pub use storage::{
     CapacityScope, IngestOutcome, account_ingest, auth_len_freshness,

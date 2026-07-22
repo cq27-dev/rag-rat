@@ -19,6 +19,7 @@
 //! because answering it requires holding the covered history and an acceptance rule that reads
 //! local inventory would make the verdict device-dependent, breaking convergence.
 
+pub(in crate::account) mod author;
 pub(in crate::account) mod ops;
 pub(in crate::account) mod projection;
 pub(in crate::account) mod select;
