@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.20.0...rag-rat-base-v0.21.0) - 2026-07-22
+
+### Added
+
+- *(distill)* drain prepared snapshots through the configured chat model ([#704](https://github.com/cq27-dev/rag-rat/pull/704)) ([#799](https://github.com/cq27-dev/rag-rat/pull/799))
+
+### Other
+
+- *(watch)* quiet-window overlay skip; reuse repo handles and the recorded delta in the probe ([#857](https://github.com/cq27-dev/rag-rat/pull/857))
+- *(watch)* add a minimum inter-pass cooldown to the watcher event loop ([#847](https://github.com/cq27-dev/rag-rat/pull/847))
+
 ## [0.20.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.19.0...rag-rat-base-v0.20.0) - 2026-07-20
 
 ### Added
