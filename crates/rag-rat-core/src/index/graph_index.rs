@@ -232,7 +232,45 @@ fn rewrite_logical_symbol_references(
           WHERE end_logical_symbol_id = ?2",
         params![to, from],
     )?;
+    // The two tables below are guarded on existence because this runs DURING migrations:
+    // `realign_logical_symbol_ids` is a `MigrationHooks` entry, so an index forward-migrating from
+    // an old version reaches here at a schema state that predates them.
+    if table_present(conn, "repo_node_edges")? {
+        conn.execute(
+            "UPDATE repo_node_edges SET target_logical_symbol_id = ?1
+              WHERE target_logical_symbol_id = ?2",
+            params![to, from],
+        )?;
+    }
+    // Distill anchors store the logical id as the OPAQUE `sym_<hex>` TEXT handle, not an INTEGER,
+    // which is exactly why they were missed: every other reference column is an i64, so a remap
+    // that updated "the id columns" silently skipped this one (#810). A stale token then points at
+    // whatever now occupies that id — surfacing the previous occupant's decision record on an
+    // unrelated symbol, the failure mode that matters most here.
+    if table_present(conn, "papertrail_distill_anchors")? {
+        conn.execute(
+            "UPDATE papertrail_distill_anchors SET logical_symbol_id = ?1
+              WHERE logical_symbol_id = ?2",
+            params![
+                rag_rat_base::serde_big_id::format_sym_handle(to),
+                rag_rat_base::serde_big_id::format_sym_handle(from)
+            ],
+        )?;
+    }
     Ok(())
+}
+
+/// Does `table` exist in this connection? Kept rusqlite-native (rather than the `rag_rat_db`
+/// helper, which returns `anyhow`) so it composes with the `rusqlite::Result` remap seam.
+fn table_present(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// NULL every CALL-PATH reference to a drifted id the heal could not realign (#493 review).
@@ -262,6 +300,26 @@ fn null_call_path_references(conn: &rusqlite::Connection, from: i64) -> rusqlite
           WHERE end_logical_symbol_id = ?1",
         params![from],
     )?;
+    // Distill anchors and node-edge targets are cleared for EVERY no-winner id, not just occupied
+    // ones, because both carry a STATUS alongside the reference. Left alone on a vanished id they
+    // keep asserting `resolved = 1` / `anchor_status = 'current'` for a target that resolves to
+    // nothing — a claim their readers act on. Memory bindings differ and stay occupied-only: a
+    // vanished binding is unresolvable, which is exactly what lets the validate-time relocation
+    // ladder find it a new home later.
+    if table_present(conn, "repo_node_edges")? {
+        conn.execute(
+            "UPDATE repo_node_edges SET target_logical_symbol_id = NULL, anchor_status = 'gone'
+              WHERE target_logical_symbol_id = ?1",
+            params![from],
+        )?;
+    }
+    if table_present(conn, "papertrail_distill_anchors")? {
+        conn.execute(
+            "UPDATE papertrail_distill_anchors SET logical_symbol_id = NULL, resolved = 0
+              WHERE logical_symbol_id = ?1",
+            params![rag_rat_base::serde_big_id::format_sym_handle(from)],
+        )?;
+    }
     Ok(())
 }
 
@@ -955,15 +1013,12 @@ impl IndexDatabase {
             return Ok(None);
         }
         let conn = self.storage.connection();
-        let mut stmt = conn.prepare(&format!(
+        // The snapshot is bounded to ids holding a DURABLE reference — healing an id nothing points
+        // at would be wasted work. That makes this list the definition of "durable reference", so a
+        // reference table missing from it is never healed at all, no matter what the remap covers
+        // (#810). Both additions below are guarded because a store can predate their tables.
+        let mut reference_sources = String::from(
             "
-            SELECT ls.id, ls.path, ls.logical_name,
-                   (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
-                   ls.kind,
-                   {UNANIMOUS_MEMBER_SIGNATURE_SQL}
-            FROM main.logical_symbols ls
-            WHERE ls.repo_id = ?1
-              AND ls.id IN (
                   SELECT logical_symbol_id FROM repo_memory_bindings
                    WHERE logical_symbol_id IS NOT NULL
                   UNION
@@ -973,7 +1028,39 @@ impl IndexDatabase {
                   SELECT end_logical_symbol_id FROM repo_memory_call_paths
                    WHERE end_logical_symbol_id IS NOT NULL
                   UNION
-                  SELECT logical_symbol_id FROM logical_symbol_monikers
+                  SELECT logical_symbol_id FROM logical_symbol_monikers",
+        );
+        if table_present(conn, "repo_node_edges")? {
+            reference_sources.push_str(
+                "
+                  UNION
+                  SELECT target_logical_symbol_id FROM repo_node_edges
+                   WHERE target_logical_symbol_id IS NOT NULL",
+            );
+        }
+        if table_present(conn, "papertrail_distill_anchors")? {
+            // Anchors hold the OPAQUE `sym_<hex>` handle as TEXT, so the match runs the other way:
+            // format the candidate id and compare. SQLite's `%x` is byte-identical to the Rust
+            // `format_sym_handle` encoding, and `stable_id` is a shifted sha256 so ids are never
+            // negative — the two agree over the whole domain in play.
+            reference_sources.push_str(
+                "
+                  UNION
+                  SELECT anchored.id FROM main.logical_symbols anchored
+                   WHERE EXISTS (
+                       SELECT 1 FROM papertrail_distill_anchors a
+                        WHERE a.logical_symbol_id = 'sym_' || format('%x', anchored.id))",
+            );
+        }
+        let mut stmt = conn.prepare(&format!(
+            "
+            SELECT ls.id, ls.path, ls.logical_name,
+                   (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
+                   ls.kind,
+                   {UNANIMOUS_MEMBER_SIGNATURE_SQL}
+            FROM main.logical_symbols ls
+            WHERE ls.repo_id = ?1
+              AND ls.id IN ({reference_sources}
               )
             "
         ))?;

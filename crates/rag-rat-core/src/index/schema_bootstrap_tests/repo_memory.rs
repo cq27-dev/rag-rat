@@ -7108,3 +7108,395 @@ fn a_decision_record_does_not_leak_between_distinct_same_named_methods() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// #810: a logical-id remap must carry the distill anchor's `sym_<hex>` TEXT token with it.
+///
+/// Every other durable reference to a logical id is an INTEGER column, so a remap written as "move
+/// the id columns" silently skipped `papertrail_distill_anchors.logical_symbol_id`, which stores
+/// the OPAQUE handle as TEXT. The anchor then still names the OLD id, and if a later re-derive
+/// hands that id to a different symbol — exactly what the drift heal exists to handle — the anchor
+/// resolves to the new occupant and surfaces one symbol's decision record on another.
+///
+/// The anchor is the ONLY reference here on purpose. Closing the remap alone would not have been
+/// enough: the drift snapshot is bounded to ids holding a durable reference, and its definition of
+/// that did not include anchors either, so this id would never have been considered for healing.
+/// Both halves are required and this fixture fails if either is missing.
+#[test]
+fn a_remap_heals_a_logical_id_referenced_only_by_a_distill_anchor() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn drift_anchor() -> u32 { 7 }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(db.storage.connection()).unwrap();
+    let real_id: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM logical_symbols WHERE logical_name = 'drift_anchor'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+
+    let stale_id = 424242_i64;
+    {
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute("UPDATE logical_symbols SET id = ?1 WHERE id = ?2", params![
+            stale_id, real_id
+        ])
+        .unwrap();
+        conn.execute(
+            "UPDATE logical_symbol_members SET logical_symbol_id = ?1 WHERE logical_symbol_id = ?2",
+            params![stale_id, real_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill
+                 (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+                  root_issue, fix_edge_source, thread_shape, anchors_qualified_count,
+                  distilled_at_ms, repo_id)
+             VALUES \
+             ('github','o/r','issue','5','sha256:h',3,'5','provider','investigation',1,10,?1)",
+            params![repo_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, anchor_kind, logical_symbol_id, name,
+                  resolved, candidate_ordinal, selected, repo_id)
+             VALUES ('github','o/r','issue','5','symbol',?1,'drift_anchor',1,0,1,?2)",
+            params![rag_rat_base::serde_big_id::format_sym_handle(stale_id), repo_id],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", []).unwrap();
+    }
+
+    // A content change so the next rebuild runs a full pass (unchanged content short-circuits).
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn drift_anchor() -> u32 { 7 }\n\npub fn drift_appendix() {}\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let fresh_id: i64 = conn
+        .query_row("SELECT id FROM logical_symbols WHERE logical_name = 'drift_anchor'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_ne!(
+        fresh_id, stale_id,
+        "the re-derive must mint a different id, or nothing is remapped"
+    );
+    let anchor_token: String = conn
+        .query_row(
+            "SELECT logical_symbol_id FROM papertrail_distill_anchors WHERE item_key = '5'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        anchor_token,
+        rag_rat_base::serde_big_id::format_sym_handle(fresh_id),
+        "the anchor's sym_<hex> token follows the symbol; left stale it names whatever occupies \
+         the old id next",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The same gap, for `repo_node_edges.target_logical_symbol_id` — an INTEGER column that was simply
+/// never added to either the remap or the snapshot's reference set. Referenced only by that edge.
+#[test]
+fn a_remap_heals_a_logical_id_referenced_only_by_a_node_edge() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn drift_anchor() -> u32 { 7 }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(db.storage.connection()).unwrap();
+    let real_id: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM logical_symbols WHERE logical_name = 'drift_anchor'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+
+    let stale_id = 424242_i64;
+    {
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute("UPDATE logical_symbols SET id = ?1 WHERE id = ?2", params![
+            stale_id, real_id
+        ])
+        .unwrap();
+        conn.execute(
+            "UPDATE logical_symbol_members SET logical_symbol_id = ?1 WHERE logical_symbol_id = ?2",
+            params![stale_id, real_id],
+        )
+        .unwrap();
+        // FKs are off here, so a placeholder source node is fine — the row exists only to carry a
+        // `target_logical_symbol_id` through the remap.
+        conn.execute(
+            "INSERT INTO repo_node_edges
+                 (edge_key, repo_id, source_node_id, relation, target_repo_id, target_kind,
+                  target_anchor, target_logical_symbol_id, anchor_status, created_at_ms)
+             VALUES ('edge-810', ?1, 'node-810', 'references', ?1, 'symbol', 'drift_anchor', ?2,
+                     'current', 0)",
+            params![repo_id, stale_id],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", []).unwrap();
+    }
+
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn drift_anchor() -> u32 { 7 }\n\npub fn drift_appendix() {}\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let fresh_id: i64 = conn
+        .query_row("SELECT id FROM logical_symbols WHERE logical_name = 'drift_anchor'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_ne!(fresh_id, stale_id);
+    let edge_target: i64 = conn
+        .query_row(
+            "SELECT target_logical_symbol_id FROM repo_node_edges WHERE edge_key = 'edge-810'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(edge_target, fresh_id, "the node-edge target follows the symbol");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// No drift winner on an OCCUPIED id: the references must be CLEARED, never left naming it.
+///
+/// Snapshotting these tables put them in scope for the successful-remap branch. Leaving them out of
+/// the failure branch would be worse than never snapshotting them: an occupied no-winner id belongs
+/// to a DIFFERENT re-derived symbol, so a reference still naming it resolves to that unrelated
+/// symbol while reporting itself current — the false positive #810 calls the concerning case.
+///
+/// Note the cleanup is deliberately occupied-only. A VANISHED id resolves to nothing, so leaving a
+/// reference on it is a miss rather than a mis-attribution, and the validate-time ladder still gets
+/// a chance to relocate it.
+#[test]
+fn a_no_winner_drift_on_an_occupied_id_clears_the_anchor_and_the_node_edge() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha_occ(a: u8) -> u8 { a }\n\npub fn beta_occ(b: u16) -> u16 { b }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(db.storage.connection()).unwrap();
+    let id_of = |db: &IndexDatabase, name: &str| -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT id FROM logical_symbols WHERE logical_name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let alpha_id = id_of(&db, "alpha_occ");
+    let beta_id = id_of(&db, "beta_occ");
+    drop(db);
+
+    {
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        // The swap: under OLD rules alpha's key hashed to what is beta's id under the NEW rules.
+        // Park alpha's row and its references there; beta will re-derive back onto that id, so it
+        // is OCCUPIED after the rebuild.
+        conn.execute("DELETE FROM logical_symbol_members WHERE logical_symbol_id = ?1", params![
+            beta_id
+        ])
+        .unwrap();
+        conn.execute("DELETE FROM logical_symbols WHERE id = ?1", params![beta_id]).unwrap();
+        conn.execute("UPDATE logical_symbols SET id = ?1 WHERE id = ?2", params![
+            beta_id, alpha_id
+        ])
+        .unwrap();
+        conn.execute(
+            "UPDATE logical_symbol_members SET logical_symbol_id = ?1 WHERE logical_symbol_id = ?2",
+            params![beta_id, alpha_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill
+                 (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+                  root_issue, fix_edge_source, thread_shape, anchors_qualified_count,
+                  distilled_at_ms, repo_id)
+             VALUES \
+             ('github','o/r','issue','5','sha256:h',3,'5','provider','investigation',1,10,?1)",
+            params![repo_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, anchor_kind, logical_symbol_id, name,
+                  resolved, candidate_ordinal, selected, repo_id)
+             VALUES ('github','o/r','issue','5','symbol',?1,'alpha_occ',1,0,1,?2)",
+            params![rag_rat_base::serde_big_id::format_sym_handle(beta_id), repo_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_node_edges
+                 (edge_key, repo_id, source_node_id, relation, target_repo_id, target_kind,
+                  target_anchor, target_logical_symbol_id, anchor_status, created_at_ms)
+             VALUES ('edge-810', ?1, 'node-810', 'references', ?1, 'symbol', 'alpha_occ', ?2,
+                     'current', 0)",
+            params![repo_id, beta_id],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", []).unwrap();
+    }
+
+    // alpha disappears, so the parked row has no candidate to match: no winner, and the id it sits
+    // on is re-derived back to beta.
+    fs::write(root.join("src/lib.rs"), "pub fn beta_occ(b: u16) -> u16 { b }\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    assert_eq!(id_of(&db, "beta_occ"), beta_id, "beta re-derives onto the contested id");
+
+    let anchor: (Option<String>, i64) = conn
+        .query_row(
+            "SELECT logical_symbol_id, resolved FROM papertrail_distill_anchors WHERE item_key = \
+             '5'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        anchor.0, None,
+        "the anchor token is cleared rather than left resolving to the symbol that now holds that \
+         id",
+    );
+    assert_eq!(anchor.1, 0, "and the anchor is marked unresolved");
+
+    let edge: (Option<i64>, String) = conn
+        .query_row(
+            "SELECT target_logical_symbol_id, anchor_status FROM repo_node_edges WHERE edge_key = \
+             'edge-810'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(edge.0, None, "the node-edge target is cleared");
+    assert_eq!(edge.1, "gone", "and reports itself gone rather than current");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The VANISHED no-winner case: nothing occupies the old id, and the references are still cleared.
+///
+/// Nothing mis-resolves here — a dead id resolves to nothing — but both of these carry a STATUS
+/// next to the reference, and left alone they keep asserting `resolved = 1` and
+/// `anchor_status = 'current'` for a target that no longer exists. Their readers act on those
+/// fields, so a dead-but-"current" row is a false claim rather than a harmless miss. Memory
+/// bindings deliberately behave differently and are left for the relocation ladder.
+#[test]
+fn a_no_winner_drift_on_a_vanished_id_also_clears_the_anchor_and_the_node_edge() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn drift_anchor() -> u32 { 7 }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(db.storage.connection()).unwrap();
+    let real_id: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM logical_symbols WHERE logical_name = 'drift_anchor'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+
+    let stale_id = 424242_i64;
+    {
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute("UPDATE logical_symbols SET id = ?1 WHERE id = ?2", params![
+            stale_id, real_id
+        ])
+        .unwrap();
+        conn.execute(
+            "UPDATE logical_symbol_members SET logical_symbol_id = ?1 WHERE logical_symbol_id = ?2",
+            params![stale_id, real_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill
+                 (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+                  root_issue, fix_edge_source, thread_shape, anchors_qualified_count,
+                  distilled_at_ms, repo_id)
+             VALUES \
+             ('github','o/r','issue','5','sha256:h',3,'5','provider','investigation',1,10,?1)",
+            params![repo_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, anchor_kind, logical_symbol_id, name,
+                  resolved, candidate_ordinal, selected, repo_id)
+             VALUES ('github','o/r','issue','5','symbol',?1,'drift_anchor',1,0,1,?2)",
+            params![rag_rat_base::serde_big_id::format_sym_handle(stale_id), repo_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_node_edges
+                 (edge_key, repo_id, source_node_id, relation, target_repo_id, target_kind,
+                  target_anchor, target_logical_symbol_id, anchor_status, created_at_ms)
+             VALUES ('edge-810v', ?1, 'node-810v', 'references', ?1, 'symbol', 'drift_anchor', ?2,
+                     'current', 0)",
+            params![repo_id, stale_id],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", []).unwrap();
+    }
+
+    // The symbol disappears and nothing re-derives onto 424242, so the id simply vanishes.
+    fs::write(root.join("src/lib.rs"), "pub fn something_else() {}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    let occupied: i64 = conn
+        .query_row("SELECT COUNT(*) FROM logical_symbols WHERE id = ?1", [stale_id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(occupied, 0, "the old id must be VANISHED, not occupied, for this test to differ");
+
+    let anchor: (Option<String>, i64) = conn
+        .query_row(
+            "SELECT logical_symbol_id, resolved FROM papertrail_distill_anchors WHERE item_key = \
+             '5'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(anchor.0, None, "a dead token is cleared");
+    assert_eq!(anchor.1, 0, "and the anchor stops claiming to be resolved");
+
+    let edge: (Option<i64>, String) = conn
+        .query_row(
+            "SELECT target_logical_symbol_id, anchor_status FROM repo_node_edges WHERE edge_key = \
+             'edge-810v'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(edge.0, None, "a dead target is cleared");
+    assert_eq!(edge.1, "gone", "and stops claiming to be current");
+
+    let _ = fs::remove_dir_all(&root);
+}
