@@ -259,9 +259,6 @@ mod format_v1 {
     /// canonicalizes away; two DIFFERENT claims about one coordinate are contradictory and are
     /// refused rather than silently resolved.
     fn canonical_targets(targets: &[SnapshotTarget]) -> Result<Vec<SnapshotTarget>, CborError> {
-        if targets.len() > SNAPSHOT_TARGETS_MAX {
-            return Err(CborError::message("snapshot targets exceeds the §18a bound"));
-        }
         let mut sorted = Vec::with_capacity(targets.len());
         for target in targets {
             check_qualification(
@@ -269,9 +266,6 @@ mod format_v1 {
                 target.stream_id.is_some(),
                 target.subject_account_id.is_some(),
             )?;
-            if target.covered.len() > SNAPSHOT_COVERED_MAX {
-                return Err(CborError::message("snapshot covered exceeds the §18a bound"));
-            }
             let mut covered = target.covered.clone();
             covered.sort_by_key(|w| w.device_fingerprint.to_bytes());
             covered.dedup();
@@ -283,12 +277,22 @@ mod format_v1 {
                     "snapshot covered has conflicting entries for one device_fingerprint",
                 ));
             }
+            // Bound the CANONICAL length, not the caller's input — the §18a limits constrain the
+            // wire, and only canonical content ever reaches it. Checking the raw input would refuse
+            // a caller whose duplicates collapse to a manifest well inside the bound. Same order as
+            // `canonical_content_cuts`: sort, dedup, conflict-check, then bound.
+            if covered.len() > SNAPSHOT_COVERED_MAX {
+                return Err(CborError::message("snapshot covered exceeds the §18a bound"));
+            }
             sorted.push(SnapshotTarget { covered, ..target.clone() });
         }
         sorted.sort_by_key(target_key);
         sorted.dedup();
         if sorted.windows(2).any(|pair| target_key(&pair[0]) == target_key(&pair[1])) {
             return Err(CborError::message("snapshot targets has conflicting entries for one log"));
+        }
+        if sorted.len() > SNAPSHOT_TARGETS_MAX {
+            return Err(CborError::message("snapshot targets exceeds the §18a bound"));
         }
         Ok(sorted)
     }
@@ -431,7 +435,7 @@ mod format_v1 {
 mod tests {
     use minicbor::Encoder;
 
-    use super::super::super::limits::SNAPSHOT_COVERED_MAX;
+    use super::super::super::limits::{SNAPSHOT_COVERED_MAX, SNAPSHOT_TARGETS_MAX};
     use super::*;
 
     fn stream(byte: u8) -> StreamId {
@@ -711,7 +715,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_bounds_violations() {
+    fn the_18a_bounds_constrain_the_canonical_manifest_not_the_callers_input() {
+        // DISTINCT coordinates past the bound are a real violation: they all reach the wire.
         let too_many_covered = snapshot(vec![SnapshotTarget {
             covered: (0..=SNAPSHOT_COVERED_MAX)
                 .map(|i| CoveredWatermark {
@@ -723,6 +728,37 @@ mod tests {
             ..account_target(0, &[])
         }]);
         assert!(encode(&too_many_covered).is_err(), "§18a bounds the covered array");
+
+        // But §18a constrains the WIRE, and only canonical content reaches it. Byte-identical
+        // repeats are one claim (see `snapshot_rejects_conflicting_coverage_claims`), so a caller
+        // whose duplicates collapse well inside the bound must not be refused for the size of its
+        // input. Same order as `canonical_content_cuts`: dedup first, then bound.
+        let repeated = snapshot(vec![SnapshotTarget {
+            covered: vec![
+                CoveredWatermark {
+                    device_fingerprint: DeviceFingerprint::from_bytes([0x11; 32]),
+                    seq: 1,
+                    entry_hash: [0x1d; 32],
+                };
+                SNAPSHOT_COVERED_MAX + 50
+            ],
+            ..account_target(0, &[])
+        }]);
+        let once = snapshot(vec![account_target(0, &[0x11])]);
+        assert_eq!(
+            encode(&repeated).unwrap(),
+            encode(&once).unwrap(),
+            "identical repeats collapse to one claim rather than tripping the bound",
+        );
+
+        // The same rule one level up, for the target list itself.
+        let repeated_targets =
+            snapshot(vec![account_target(0, &[0x11]); SNAPSHOT_TARGETS_MAX + 50]);
+        assert_eq!(
+            encode(&repeated_targets).unwrap(),
+            encode(&once).unwrap(),
+            "identical targets collapse too",
+        );
     }
 
     #[test]
