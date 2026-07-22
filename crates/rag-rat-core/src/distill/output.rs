@@ -108,6 +108,49 @@ pub(crate) struct OutcomeOutput {
     pub summary: Option<String>,
 }
 
+impl RecordOutput {
+    /// Normalize the model's output before validation so a record the model fails on FORMATTING
+    /// alone is accepted with its content intact — post-generation only, so it never touches the
+    /// prompt or the regeneration hash. Two deterministic fix-ups the gate would otherwise reject,
+    /// and whose unguided/tolerant re-attempts fail identically:
+    ///  - prose fields: demote a reject-worthy inline-code span (a multi-word phrase, an empty
+    ///    span, an unclosed backtick) to plain prose, preserving valid single-identifier spans;
+    ///  - citation / anchor arrays: drop duplicate ids, order-preserving (the model emits e.g.
+    ///    `decision_units: [U17, U17]`, a repeated `outcome_units` id, or a repeated anchor index).
+    ///
+    /// Returns `true` if it changed the output — i.e. the reply would have failed the gate without
+    /// repair — so the ladder can count repaired replies separately from genuinely-clean ones.
+    pub(crate) fn normalize(&mut self) -> bool {
+        let before = self.clone();
+        fn fix(field: &mut Option<String>) {
+            if let Some(text) = field {
+                *text = prompts::neutralize_inline_code_phrases(text);
+            }
+        }
+        fix(&mut self.root_issue);
+        fix(&mut self.root_cause);
+        fix(&mut self.root_cause_class);
+        fix(&mut self.decision.chosen);
+        fix(&mut self.outcome.summary);
+        for alternative in &mut self.decision.rejected {
+            alternative.alternative =
+                prompts::neutralize_inline_code_phrases(&alternative.alternative);
+            fix(&mut alternative.reason);
+        }
+        dedup_in_place(&mut self.root_cause_units);
+        dedup_in_place(&mut self.decision_units);
+        dedup_in_place(&mut self.outcome_units);
+        dedup_in_place(&mut self.anchor_indices);
+        *self != before
+    }
+}
+
+/// Order-preserving in-place dedup for a small id list (citations / anchor indices).
+fn dedup_in_place<T: std::hash::Hash + Eq + Copy>(items: &mut Vec<T>) {
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|&item| seen.insert(item));
+}
+
 /// Stable output-ladder tokens. The names map directly to the `rung_*` run-counter columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputRung {
@@ -153,6 +196,13 @@ pub(crate) struct LadderStats {
     pub rung_unguided: u64,
     pub rung_tolerant: u64,
     pub failed: u64,
+    /// Of the accepted replies (any rung), how many passed only after `RecordOutput::normalize`
+    /// changed the model's output (a demoted backtick phrase or a deduped id). Orthogonal to the
+    /// rungs — a repaired reply is still counted in whichever rung accepted it — so
+    /// `rung_serde - repaired-on-serde` is the genuinely-clean guided rate. Without this, a
+    /// repaired reply is indistinguishable from clean guided output in the run-stats, hiding
+    /// the very formatting-failure rate the normalization exists to absorb.
+    pub repaired: u64,
 }
 
 impl LadderStats {
@@ -171,6 +221,7 @@ impl LadderStats {
         self.rung_unguided += other.rung_unguided;
         self.rung_tolerant += other.rung_tolerant;
         self.failed += other.failed;
+        self.repaired += other.repaired;
     }
 
     pub(crate) fn terminal_count(self) -> u64 {
@@ -218,8 +269,11 @@ pub(crate) fn run_output_ladder(
         Ok(raw) => {
             latest_raw = Some(raw.clone());
             match parse_and_validate(&raw, input, budget) {
-                Ok((output, value)) => {
+                Ok((output, value, repaired)) => {
                     stats.record(OutputRung::Serde);
+                    if repaired {
+                        stats.repaired += 1;
+                    }
                     return Ok(LadderResult {
                         output,
                         value,
@@ -247,8 +301,11 @@ pub(crate) fn run_output_ladder(
     };
 
     match parse_and_validate(&retry_raw, input, budget) {
-        Ok((output, value)) => {
+        Ok((output, value, repaired)) => {
             stats.record(OutputRung::Unguided);
+            if repaired {
+                stats.repaired += 1;
+            }
             return Ok(LadderResult {
                 output,
                 value,
@@ -262,8 +319,11 @@ pub(crate) fn run_output_ladder(
 
     if let Some(stripped) = strip_whole_json_fence(&retry_raw) {
         match parse_and_validate(stripped, input, budget) {
-            Ok((output, value)) => {
+            Ok((output, value, repaired)) => {
                 stats.record(OutputRung::Tolerant);
+                if repaired {
+                    stats.repaired += 1;
+                }
                 return Ok(LadderResult {
                     output,
                     value,
@@ -287,14 +347,20 @@ fn parse_and_validate(
     raw: &str,
     input: &PromptInput,
     budget: &PromptBudget,
-) -> Result<(RecordOutput, serde_json::Value), String> {
-    let output: RecordOutput =
+) -> Result<(RecordOutput, serde_json::Value, bool), String> {
+    let mut output: RecordOutput =
         serde_json::from_str(raw).map_err(|error| format!("strict JSON parse failed: {error}"))?;
+    // Normalize the model's output before validation: it reliably emits formatting the gate rejects
+    // (multi-word backtick phrases; duplicate citation/anchor ids) and re-attempts fail
+    // identically, so rescue the record by demoting reject-worthy spans to prose and deduping
+    // id arrays. Content-preserving; post-generation only (does not touch the prompt). `repaired`
+    // is true when that rescue changed the output, so the ladder counts it apart from clean output.
+    let repaired = output.normalize();
     let value = serde_json::to_value(&output)
         .map_err(|error| format!("typed output conversion failed: {error}"))?;
     prompts::validate_record_output(&value, input, budget)
         .map_err(|error| format!("record validation failed: {error}"))?;
-    Ok((output, value))
+    Ok((output, value, repaired))
 }
 
 fn strip_whole_json_fence(raw: &str) -> Option<&str> {
@@ -458,6 +524,35 @@ mod tests {
             ..LadderStats::default()
         });
         assert_eq!(model.guided_flags(), [true]);
+    }
+
+    #[test]
+    fn a_backticked_phrase_is_demoted_to_prose_so_the_record_is_rescued() {
+        // The model backticks a multi-word phrase; the plain-prose gate would reject it, but
+        // normalization demotes the span to prose so the guided reply is accepted on the serde rung
+        // with its content intact.
+        let reply = r#"{"root_issue":null,"root_cause_units":[12],"root_cause":"Cause","root_cause_class":"bug","decision_units":[12],"decision":{"chosen":"Adopt `the retry loop` approach","rejected":[]},"outcome_units":[12],"anchor_indices":[3],"outcome":{"status":"landed","summary":"Landed"}}"#;
+        let model = ScriptedChatModel::new([ScriptedReply::Ok(reply.to_string())]);
+        let result = run(&model).unwrap();
+        assert_eq!(result.accepted_at, OutputRung::Serde);
+        assert_eq!(result.output.decision.chosen.as_deref(), Some("Adopt the retry loop approach"));
+        assert_eq!(result.value["decision"]["chosen"], "Adopt the retry loop approach");
+        // The reply needed repair, so it is counted apart from clean guided output.
+        assert_eq!(result.stats.repaired, 1);
+    }
+
+    #[test]
+    fn duplicate_citation_and_anchor_ids_are_deduped_so_the_record_is_rescued() {
+        // The model repeats a citation / anchor id; the gate rejects duplicates and the re-attempts
+        // fail identically. Order-preserving dedup rescues the record on the serde rung.
+        let reply = r#"{"root_issue":null,"root_cause_units":[12,12],"root_cause":"Cause","root_cause_class":"bug","decision_units":[12,12],"decision":{"chosen":"Fix","rejected":[]},"outcome_units":[12],"anchor_indices":[3,3],"outcome":{"status":"landed","summary":"Landed"}}"#;
+        let model = ScriptedChatModel::new([ScriptedReply::Ok(reply.to_string())]);
+        let result = run(&model).unwrap();
+        assert_eq!(result.accepted_at, OutputRung::Serde);
+        assert_eq!(result.output.root_cause_units.len(), 1);
+        assert_eq!(result.output.decision_units.len(), 1);
+        assert_eq!(result.output.anchor_indices, vec![3]);
+        assert_eq!(result.stats.repaired, 1);
     }
 
     #[test]

@@ -22,7 +22,10 @@ use super::units::BudgetPlan;
 /// The drain folds this into the regeneration hash so a prompt edit re-runs the model. Start at 1.
 /// 2 → 3 (#800): every coalesced partner renders (was: only the first), and the diff/xref blocks
 /// are now hydrated from extraction snapshots.
-pub(crate) const PROMPT_VERSION: u32 = 3;
+/// 3 → 4: the plain-prose rule spells out that a backtick span is a SINGLE identifier with no
+/// internal spaces, with worked examples — the 30B was backticking multi-word phrases, which the
+/// plain-prose gate rejects, and re-attempts failed identically (a live-run precision fix).
+pub(crate) const PROMPT_VERSION: u32 = 4;
 
 // Output bounds are shared contract constants so the later strict/fallback parser can enforce the
 // same limits as guided decoding rather than trusting the backend alone.
@@ -551,6 +554,64 @@ fn outside_inline_code(line: &str) -> Option<String> {
         }
     }
     (!in_code).then_some(outside)
+}
+
+/// Rewrite inline-code spans that [`outside_inline_code`] would reject — a span containing
+/// whitespace or a control char, an empty span, or an unclosed trailing backtick — into plain prose
+/// (drop the backticks, keep the inner text), while preserving a valid single-identifier span.
+///
+/// Why: the model (measured on Qwen3-30B) reliably backticks multi-word phrases like `the retry
+/// loop`, which the plain-prose gate rejects, and the unguided/tolerant re-attempts fail
+/// identically — so those threads never distill. Normalizing the model's OUTPUT (this is
+/// post-generation; it does NOT touch the prompt or the regeneration hash) rescues the record with
+/// its content intact and the stored value genuinely plain prose, without loosening the
+/// identifier-only rule for real identifiers. Per-line to mirror the gate's per-line span scan, so
+/// the result always validates.
+pub(crate) fn neutralize_inline_code_phrases(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        neutralize_line_into(line, &mut out);
+    }
+    out
+}
+
+fn neutralize_line_into(line: &str, out: &mut String) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        match chars[i + 1..].iter().position(|&c| c == '`') {
+            Some(offset) => {
+                let close = i + 1 + offset;
+                let span: String = chars[i + 1..close].iter().collect();
+                let valid =
+                    !span.is_empty() && !span.chars().any(|c| c.is_whitespace() || c.is_control());
+                if valid {
+                    out.push('`');
+                    out.push_str(&span);
+                    out.push('`');
+                } else {
+                    // Reject-worthy span (whitespace inside, or empty `` ``): keep the text, drop
+                    // the backticks so it reads as prose.
+                    out.push_str(&span);
+                }
+                i = close + 1;
+            },
+            None => {
+                // Unclosed backtick to end of line — the gate rejects it; drop the lone backtick
+                // and keep the remainder as prose.
+                out.extend(&chars[i + 1..]);
+                break;
+            },
+        }
+    }
 }
 
 fn has_markdown_emphasis(text: &str, marker: u8) -> bool {
@@ -1089,7 +1150,28 @@ mod tests {
         // Starts at 1; the drain folds it into the record's regeneration hash so a prompt edit
         // re-distills. Bump it (and this expectation) whenever `system.md`/`rules.md`/the schema
         // change in a way that should invalidate existing model output.
-        assert_eq!(super::PROMPT_VERSION, 3);
+        assert_eq!(super::PROMPT_VERSION, 4);
+    }
+
+    #[test]
+    fn neutralize_demotes_phrase_backticks_to_prose_and_keeps_identifiers() {
+        use super::neutralize_inline_code_phrases as fix;
+        // Reject-worthy spans (whitespace inside, empty, unclosed) lose their backticks.
+        assert_eq!(fix("use `the retry loop` here"), "use the retry loop here");
+        assert_eq!(fix("an empty `` span"), "an empty  span");
+        assert_eq!(fix("dangling `backtick"), "dangling backtick");
+        // Valid single-identifier spans are preserved verbatim.
+        assert_eq!(fix("call `foo_bar` and `Vec<T>`"), "call `foo_bar` and `Vec<T>`");
+        assert_eq!(fix("no backticks at all"), "no backticks at all");
+        // Mixed: keep the identifier, demote the phrase.
+        assert_eq!(
+            fix("`retry_backoff` guards `the slow path`"),
+            "`retry_backoff` guards the slow path"
+        );
+        // Multi-line: newlines are preserved and each line's spans are handled independently.
+        assert_eq!(fix("keep `id`\n`a b` demote"), "keep `id`\na b demote");
+        // The normalized output always passes the plain-prose gate.
+        assert!(super::forbidden_markdown(&fix("set `max num seqs` to `1`")).is_none());
     }
 
     #[test]
