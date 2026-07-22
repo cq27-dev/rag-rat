@@ -2529,6 +2529,166 @@ mod tests {
         }
     }
 
+    // ---- C6b-ii: read-time verification (#609) ----
+
+    /// Build the manifest target a HONEST author would publish for this fixture: every device's
+    /// control-chain head, and the hash its own fold produces.
+    fn honest_target(f: &Fixture) -> snapshot::ops::SnapshotTarget {
+        let history = f.fold();
+        let mut heads: HashMap<DeviceFingerprint, (u64, [u8; 32])> = HashMap::new();
+        for entry in &f.entries {
+            let h = &entry.header;
+            let slot = heads.entry(h.device_fingerprint).or_insert((h.seq, entry.entry_hash));
+            if h.seq >= slot.0 {
+                *slot = (h.seq, entry.entry_hash);
+            }
+        }
+        snapshot::ops::SnapshotTarget {
+            log_id: 0,
+            stream_id: None,
+            subject_account_id: None,
+            folded_state_hash: snapshot::projection::folded_state_hash(&history),
+            covered: heads
+                .into_iter()
+                .map(|(device_fingerprint, (seq, entry_hash))| snapshot::ops::CoveredWatermark {
+                    device_fingerprint,
+                    seq,
+                    entry_hash,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_honest_snapshot_verifies_against_a_local_refold() {
+        let f = projection_fixture();
+        assert_eq!(
+            snapshot::verify::verify_snapshot(&f.entries, &[honest_target(&f)]),
+            snapshot::verify::SnapshotVerdict::Verified,
+        );
+    }
+
+    #[test]
+    fn a_false_coverage_claim_is_a_mismatch() {
+        // The point of the hash: a claim that does not match the covered prefix is detectable.
+        let f = projection_fixture();
+        let mut lying = honest_target(&f);
+        lying.folded_state_hash = [0xff; 32];
+        assert_eq!(
+            snapshot::verify::verify_snapshot(&f.entries, &[lying]),
+            snapshot::verify::SnapshotVerdict::Mismatch,
+        );
+    }
+
+    /// THE FIREWALL PROPERTY. Verification is device-dependent by nature, so it must be advisory:
+    /// a device that lacks the covered history reports `Unverifiable`, NEVER a judgement. If this
+    /// ever returned `Mismatch` for missing history, two peers at different sync progress would
+    /// disagree about the same signed entry.
+    #[test]
+    fn a_device_lacking_the_covered_history_reports_unverifiable_not_a_judgement() {
+        let f = projection_fixture();
+        let target = honest_target(&f);
+
+        // Hold nothing at all: the heads themselves are absent.
+        assert_eq!(
+            snapshot::verify::verify_snapshot(&[], std::slice::from_ref(&target)),
+            snapshot::verify::SnapshotVerdict::Unverifiable(
+                snapshot::verify::Unverifiable::WatermarkNotHeld
+            ),
+        );
+
+        // Hold the heads but not a link beneath them: a claim this device cannot reconstruct.
+        let heads: Vec<_> = f
+            .entries
+            .iter()
+            .filter(|e| target.covered.iter().any(|w| w.entry_hash == e.entry_hash))
+            .cloned()
+            .collect();
+        assert!(heads.len() < f.entries.len(), "the fixture must have interior entries");
+        assert_eq!(
+            snapshot::verify::verify_snapshot(&heads, &[target]),
+            snapshot::verify::SnapshotVerdict::Unverifiable(
+                snapshot::verify::Unverifiable::IncompleteChain
+            ),
+        );
+    }
+
+    /// The attack the branch restriction would otherwise enable. Verification folds only the chain
+    /// a watermark names — that is what makes the hash deterministic between honest peers — but it
+    /// also means the AUTHOR picks which branch gets hashed. An author who equivocates and then
+    /// snapshots the clean side produces a claim that is perfectly true about that branch.
+    ///
+    /// So a device that HOLDS the sibling must refuse it. Without this, checking `Live` over the
+    /// covered input would be inspecting the author's own selection: that fold is `Live` by
+    /// construction, because the evidence contradicting it was left out.
+    #[test]
+    fn a_snapshot_of_one_branch_is_refused_by_a_device_holding_the_equivocation() {
+        let founder = Dev::new(1);
+        let sibling_target = Dev::new(8);
+        let mut f = projection_fixture();
+        let target = honest_target(&f);
+
+        // Without the sibling, the claim verifies — the branch it names is real.
+        assert_eq!(
+            snapshot::verify::verify_snapshot(&f.entries, std::slice::from_ref(&target)),
+            snapshot::verify::SnapshotVerdict::Verified,
+        );
+
+        // Now equivocate at a covered coordinate: a second entry at a `(device, seq)` the claim's
+        // chain already occupies. The claim is unchanged and still true about its own branch.
+        let covered = target.covered.iter().find(|w| w.device_fingerprint == founder.fp).cloned();
+        let covered = covered.expect("the founder's chain is covered");
+        let held_entry = f
+            .entries
+            .iter()
+            .find(|e| e.entry_hash == covered.entry_hash)
+            .expect("the covered head is held");
+        let (seq, prev) = (held_entry.header.seq, held_entry.header.prev_hash);
+        let g = f.genesis_hash;
+        f.author_forked(
+            &founder,
+            Some(g),
+            &device_add(&sibling_target, DeviceRole::Member),
+            seq,
+            prev,
+        );
+
+        assert_eq!(
+            snapshot::verify::verify_snapshot(&f.entries, &[target]),
+            snapshot::verify::SnapshotVerdict::IgnoresHeldEvidence,
+            "a device holding the sibling must not trust a snapshot that folded only one branch",
+        );
+    }
+
+    #[test]
+    fn a_target_naming_an_unsupported_log_is_unverifiable_not_failed() {
+        // The wire admits secrets/content targets so #406 needs no bump; this binary has no
+        // projection for them and must say so rather than call the snapshot wrong.
+        let f = projection_fixture();
+        let secrets_target = snapshot::ops::SnapshotTarget { log_id: 1, ..honest_target(&f) };
+        assert_eq!(
+            snapshot::verify::verify_snapshot(&f.entries, &[secrets_target]),
+            snapshot::verify::SnapshotVerdict::Unverifiable(
+                snapshot::verify::Unverifiable::UnsupportedTargets
+            ),
+        );
+    }
+
+    #[test]
+    fn a_forged_chain_link_is_not_walkable_into_the_verification_input() {
+        // A signed header pins `prev_hash` NULLITY, not that its parent is a contiguous link on the
+        // same coordinate. A watermark whose seq disagrees with the entry it names must not fold.
+        let f = projection_fixture();
+        let mut forged = honest_target(&f);
+        forged.covered[0].seq = forged.covered[0].seq.wrapping_add(7);
+        assert_eq!(
+            snapshot::verify::verify_snapshot(&f.entries, &[forged]),
+            snapshot::verify::SnapshotVerdict::Unverifiable(
+                snapshot::verify::Unverifiable::IncompleteChain
+            ),
+        );
+    }
+
     /// The projection must be ONE complete, canonical CBOR item — not a well-formed prefix followed
     /// by trailing values. A golden hash alone cannot catch that: it freezes whatever bytes the
     /// encoder produces, malformed or not, which is exactly how a short top-level array survived
