@@ -52,6 +52,7 @@ import {
   runRecipe,
   verifyChat,
   verifyEmbed,
+  waitForServerListening,
   withBudget,
 } from "../src/contract.js";
 import { assertCapabilitySupported, selectBackendSpec } from "./backends.mjs";
@@ -309,9 +310,15 @@ async function provision(ctx: ProvisionContext<ModalHandle>): Promise<Provisione
   log("info", `tunnel up: ${endpoint}`);
 
   // Load the model. infinity/vLLM auto-download on boot (nothing to do); ollama boots empty, so pull
-  // the model into the running server via an in-box exec. `sb.exec` rides the command router (attached
-  // at creation), not the served port, so it does not need the serve-probe to have passed first.
+  // the model into the running server via an in-box exec. The pull connects to the local ollama
+  // server and does NOT retry on connection refusal, so gate it on an HTTP liveness poll first — the
+  // SDK readiness wait that used to gate this is gone (it hung on cold vLLM boots). vLLM/infinity load
+  // on boot and are gated by the serve-probe below instead, so they skip both steps.
   if (spec.modelLoad === "ollama-pull") {
+    ctx.status("provisioning", `waiting for ${spec.backend} to listen on ${endpoint}`);
+    await waitForServerListening(endpoint, {
+      budgetMs: assertBudgetRemaining(deadline, "server listening"),
+    });
     await pullOllamaModel(sb, input.model, deadline, ctx);
   }
 

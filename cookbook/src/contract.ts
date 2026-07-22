@@ -553,6 +553,44 @@ export async function pollUntil<T>(url: string, options: PollUntilOptions<T>): P
   );
 }
 
+/**
+ * Poll `endpoint` with a bare GET until the in-box server is LISTENING (it answers with a non-5xx
+ * status), or the budget elapses. A lightweight liveness gate that — unlike {@link verifyChat} /
+ * {@link verifyEmbed} — does NOT require the model to be loaded, so it fits BEFORE the ollama model
+ * pull: `ollama pull` connects to the local server and exits on connection refusal with no retry of
+ * its own, so it must not run until the server is up. Connection-refused (server still booting) and a
+ * gateway 5xx (the tunnel proxying to a not-yet-listening port) are both retried; any status < 500
+ * means the server itself answered. Throws if the budget runs out.
+ */
+export async function waitForServerListening(
+  endpoint: string,
+  options: { budgetMs: number; pollIntervalMs?: number; perAttemptTimeoutMs?: number },
+): Promise<void> {
+  const pollIntervalMs = options.pollIntervalMs ?? 1000;
+  const perAttemptTimeoutMs = options.perAttemptTimeoutMs ?? 5000;
+  const deadline = Date.now() + options.budgetMs;
+  let lastError = "(no attempt made)";
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    const attemptTimeout = Math.min(perAttemptTimeoutMs, remainingBudgetMs(deadline));
+    if (attemptTimeout < 250) break;
+    attempt += 1;
+    try {
+      const res = await fetchWithTimeout(endpoint, { method: "GET" }, attemptTimeout);
+      if (res.status < 500) return;
+      lastError = `HTTP ${res.status} ${res.statusText}`;
+    } catch (cause) {
+      lastError = errorMessage(cause);
+    }
+    if (Date.now() + pollIntervalMs >= deadline) break;
+    log("info", `server-listening probe attempt ${attempt} not ready (${lastError}); retrying…`);
+    await sleep(pollIntervalMs);
+  }
+  throw new Error(
+    `server did not start listening within ${options.budgetMs}ms; last error: ${lastError}`,
+  );
+}
+
 /** Default delay between embed-readiness probes (ms). */
 const VERIFY_EMBED_POLL_INTERVAL_MS = 3_000;
 /**

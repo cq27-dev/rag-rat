@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { LogLevel } from "../src/contract.js";
+import { waitForServerListening } from "../src/contract.js";
 import { selectBackendSpec } from "../recipes/backends.mjs";
 import {
   HF_CACHE_MOUNT_PATH,
@@ -166,4 +167,38 @@ test("a locked stream cannot create an unhandled pump rejection", async () => {
   await owner.cancel();
   owner.releaseLock();
   assert.equal(capture.failureTail(), "");
+});
+
+test("waitForServerListening retries connection-refused and gateway 5xx, then returns on a server answer", async () => {
+  const original = globalThis.fetch;
+  const responses: Array<() => Promise<Response>> = [
+    () => Promise.reject(new Error("ECONNREFUSED")), // server still booting
+    () => Promise.resolve(new Response("bad gateway", { status: 502 })), // tunnel up, port not yet
+    () => Promise.resolve(new Response("Ollama is running", { status: 200 })), // listening
+  ];
+  let calls = 0;
+  globalThis.fetch = (() => {
+    const next = responses[Math.min(calls, responses.length - 1)]!;
+    calls += 1;
+    return next();
+  }) as typeof fetch;
+  try {
+    await waitForServerListening("https://box.example", { budgetMs: 5_000, pollIntervalMs: 1 });
+    assert.equal(calls, 3);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("waitForServerListening throws when the server never listens within the budget", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (() => Promise.reject(new Error("ECONNREFUSED"))) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => waitForServerListening("https://box.example", { budgetMs: 30, pollIntervalMs: 1 }),
+      /did not start listening/,
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
 });
