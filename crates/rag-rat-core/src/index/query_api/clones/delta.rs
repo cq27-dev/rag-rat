@@ -44,7 +44,7 @@ use super::substrate::{
     SymbolBag, add_struct_hash_pairs, load_scoped_baseline_bags_for_paths, overlap,
     sub_block_tokens, verified_clone,
 };
-use crate::index::IndexDatabase;
+use crate::index::{ContentRevisionSnapshot, IndexDatabase};
 
 /// SQLite bind-variable safety chunk for `IN (…)` lists (mirrors `of_text::HYDRATION_CHUNK`).
 const DELTA_SQL_CHUNK: usize = 400;
@@ -94,7 +94,22 @@ impl IndexDatabase {
     /// runs lock-stable outside a transaction, and all writes commit in ONE transaction, so a
     /// reader sees either the old graph or the fully-applied delta.
     pub fn apply_clone_graph_delta(&self, max_files: usize) -> anyhow::Result<CloneDeltaReport> {
-        self.apply_clone_graph_delta_inner(max_files, None)
+        self.apply_clone_graph_delta_inner(max_files, None, None)
+    }
+
+    /// [`Self::apply_clone_graph_delta`] reusing the digest the same pass's quiet-gate probe
+    /// already computed (#821): the probe and this delta run moments apart on the same
+    /// connection, and `content_revision()` is a full `main.files` scan. The pin is a HINT, not
+    /// an authority — [`Self::content_revision_reusing`] serves it only when the connection
+    /// counters prove no write (this connection's or another's) has intervened since capture,
+    /// and recomputes otherwise, so the base reconcile between probe and delta can never leave
+    /// this delta acting on a digest that no longer describes the `files` rows it reads.
+    pub(crate) fn apply_clone_graph_delta_reusing_revision(
+        &self,
+        max_files: usize,
+        pinned_revision: Option<&ContentRevisionSnapshot>,
+    ) -> anyhow::Result<CloneDeltaReport> {
+        self.apply_clone_graph_delta_inner(max_files, None, pinned_revision)
     }
 
     /// [`Self::apply_clone_graph_delta`] with an explicit posting-row work budget — the test seam
@@ -107,13 +122,14 @@ impl IndexDatabase {
         max_files: usize,
         posting_row_budget: u64,
     ) -> anyhow::Result<CloneDeltaReport> {
-        self.apply_clone_graph_delta_inner(max_files, Some(posting_row_budget))
+        self.apply_clone_graph_delta_inner(max_files, Some(posting_row_budget), None)
     }
 
     fn apply_clone_graph_delta_inner(
         &self,
         max_files: usize,
         posting_row_budget: Option<u64>,
+        pinned_revision: Option<&ContentRevisionSnapshot>,
     ) -> anyhow::Result<CloneDeltaReport> {
         let started = Instant::now();
         let conn = self.storage.connection();
@@ -161,7 +177,14 @@ impl IndexDatabase {
                 started,
             ));
         }
-        let revision = self.content_revision()?;
+        // The digest this delta settles freshness TOWARD — compared against the live
+        // generation's stamp above and written back as the new stamp below, so it MUST describe
+        // the `files` rows this delta reads. `content_revision_reusing` serves the probe's
+        // pinned digest only while the connection counters prove nothing wrote in between
+        // (see the reuse rule on that method); a stale stamp here would let a later content
+        // state that happens to equal it serve the postings fast path against edges built from
+        // different content.
+        let revision = self.content_revision_reusing(pinned_revision)?;
         if live.source_revision == revision {
             return Ok(CloneDeltaReport {
                 full_rebuild_owed: live.delta_files_applied >= CLONE_GRAPH_DRIFT_REBUILD_FILES,
@@ -831,7 +854,7 @@ impl<'a> CandidateHydrator<'a> {
 mod tests {
     use super::super::precompute::tests::{clone_fixture_config, edge_keys};
     use super::{
-        BTreeSet, CLONE_PRECOMPUTE_THETA, load_scoped_baseline_bags_for_paths, params,
+        BTreeSet, CLONE_PRECOMPUTE_THETA, Connection, load_scoped_baseline_bags_for_paths, params,
         sub_block_tokens,
     };
     use crate::index::query_api::clones::precompute::CloneEdgeOptions;
@@ -1449,6 +1472,155 @@ mod tests {
         assert!(
             report.posting_rows_fetched < report.posting_rows_requested,
             "shared tokens are served from the per-application cache: {report:?}"
+        );
+    }
+
+    /// The stamped `source_revision` of the live generation — what the delta compares and
+    /// re-pins, so it is the observable for whether a pinned digest was served or recomputed.
+    fn stamped_source_revision(db: &crate::IndexDatabase, generation: i64) -> String {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT source_revision FROM clone_graph_generations WHERE generation = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// #821 reuse leg: when NOTHING writes between the pin and the delta, the delta must serve
+    /// the pinned digest instead of recomputing. The pin carries a FABRICATED revision (the
+    /// fast path must disagree with the recompute fallback, or this test would pass through the
+    /// fallback): the only way the generation ends up stamped with it is the reuse actually
+    /// firing — a recomputing delta would see the real digest, find the generation current, and
+    /// Noop without stamping anything.
+    #[test]
+    fn clone_delta_reuses_the_probes_pinned_digest_when_nothing_wrote_in_between() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-revision-reuse");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        let built = db.precompute_clone_graph(None).unwrap();
+        assert_eq!(built.status, "Complete");
+
+        let before_digest = db.connection_data_version().unwrap();
+        let pinned = db
+            .pin_content_revision("fabricated-pinned-digest".to_string(), before_digest)
+            .unwrap()
+            .expect("no cross-connection commit intervened, so the pin is granted");
+        let report = db.apply_clone_graph_delta_reusing_revision(64, Some(&pinned)).unwrap();
+        // The fabricated digest reads as "revision moved, no clone-relevant path changed", so
+        // the delta re-pins the generation to it — proof the reuse path served the pin.
+        assert_eq!(report.status, "Applied", "{report:?}");
+        assert_eq!(
+            stamped_source_revision(&db, built.generation),
+            "fabricated-pinned-digest",
+            "an intact pin is served verbatim"
+        );
+    }
+
+    /// #821 invalidation leg, own connection: a `files` write AFTER the pin (in the watcher
+    /// pass, the base reconcile runs between the quiet-gate probe and this delta) voids the pin
+    /// — the delta must recompute rather than compare/stamp a digest that no longer describes
+    /// the rows it reads. The pin again carries a fabricated revision so unconditional reuse
+    /// cannot hide behind a correct answer: if the stale pin were served, the generation would
+    /// be stamped `fabricated-stale-digest`.
+    #[test]
+    fn clone_delta_recomputes_when_this_connection_writes_after_the_pin() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-revision-stale-own");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        let built = db.precompute_clone_graph(None).unwrap();
+        assert_eq!(built.status, "Complete");
+
+        let before_digest = db.connection_data_version().unwrap();
+        let pinned = db
+            .pin_content_revision("fabricated-stale-digest".to_string(), before_digest)
+            .unwrap()
+            .expect("no cross-connection commit intervened, so the pin is granted");
+        // The simulated mid-pass mutation: a files-row write on the SAME connection.
+        db.storage
+            .connection()
+            .execute("UPDATE main.files SET sha256 = sha256 || '-moved' WHERE path = 'src/a.rs'", [
+            ])
+            .unwrap();
+
+        let report = db.apply_clone_graph_delta_reusing_revision(64, Some(&pinned)).unwrap();
+        assert_eq!(report.status, "Applied", "{report:?}");
+        let stamped = stamped_source_revision(&db, built.generation);
+        assert_ne!(stamped, "fabricated-stale-digest", "a stale pin must not be served");
+        assert_eq!(
+            stamped,
+            db.content_revision().unwrap(),
+            "the delta recomputed the digest for the mutated files table"
+        );
+    }
+
+    /// #821 invalidation leg, cross-connection: the database file is shared across processes
+    /// (and, consolidated, across repos — `content_revision()` is GLOBAL), so a commit by
+    /// ANOTHER connection after the pin must also void it, even though this connection wrote
+    /// nothing.
+    #[test]
+    fn clone_delta_recomputes_when_another_connection_writes_after_the_pin() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-revision-stale-other");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        let built = db.precompute_clone_graph(None).unwrap();
+        assert_eq!(built.status, "Complete");
+
+        let before_digest = db.connection_data_version().unwrap();
+        let pinned = db
+            .pin_content_revision("fabricated-stale-digest".to_string(), before_digest)
+            .unwrap()
+            .expect("no cross-connection commit intervened, so the pin is granted");
+        // The simulated concurrent writer: a files-row write through a SECOND connection.
+        let other = Connection::open(&config.database).unwrap();
+        other.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        other
+            .execute("UPDATE files SET sha256 = sha256 || '-moved' WHERE path = 'src/a.rs'", [])
+            .unwrap();
+        drop(other);
+
+        let report = db.apply_clone_graph_delta_reusing_revision(64, Some(&pinned)).unwrap();
+        assert_eq!(report.status, "Applied", "{report:?}");
+        let stamped = stamped_source_revision(&db, built.generation);
+        assert_ne!(stamped, "fabricated-stale-digest", "a stale pin must not be served");
+        assert_eq!(
+            stamped,
+            db.content_revision().unwrap(),
+            "the delta recomputed the digest after the cross-connection write"
+        );
+    }
+
+    /// #821 TOCTOU bracket: a cross-connection commit landing BETWEEN the digest computation and
+    /// the pin capture must refuse the pin outright. Without the pre-digest `data_version`
+    /// bracket, the pin would carry the NEW data_version with a digest of the OLD rows — and a
+    /// later no-write window would validate the mismatch and serve the stale digest.
+    #[test]
+    fn pin_is_refused_when_another_connection_commits_during_the_digest() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-pin-toctou");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+
+        // The interleaving: guard captured, then another connection commits before the pin.
+        let before_digest = db.connection_data_version().unwrap();
+        let other = Connection::open(&config.database).unwrap();
+        other.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        other
+            .execute("UPDATE files SET sha256 = sha256 || '-moved' WHERE path = 'src/a.rs'", [])
+            .unwrap();
+        drop(other);
+        assert!(
+            db.pin_content_revision("digest-of-the-old-rows".to_string(), before_digest)
+                .unwrap()
+                .is_none(),
+            "a commit inside the digest window refuses the pin"
+        );
+
+        // Control: with no interleaved commit the same bracket grants the pin.
+        let before_digest = db.connection_data_version().unwrap();
+        assert!(
+            db.pin_content_revision("digest".to_string(), before_digest).unwrap().is_some(),
+            "an undisturbed window grants the pin"
         );
     }
 }

@@ -29,6 +29,9 @@ mod incremental;
 mod lifecycle;
 mod mem_diag;
 mod meta;
+// Crate-internal: a `content_revision()` digest pinned to its connection write-state, threaded
+// probe → clone delta by the watcher pass (#821).
+pub(crate) use meta::ContentRevisionSnapshot;
 mod migration_gate;
 mod packages;
 mod parser_failures;

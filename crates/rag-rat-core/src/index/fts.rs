@@ -92,16 +92,29 @@ impl IndexDatabase {
     }
 
     pub fn sync_fts(&self) -> anyhow::Result<()> {
-        self.record_content_revision()?;
-        self.record_fts_current()?;
+        // ONE `main.files` digest per sync (#821): the recomputing `record_content_revision` +
+        // `record_fts_current` pair paid the identical full-table scan twice back-to-back on the
+        // same connection (and this runs on every incremental index and overlay refresh). Compute
+        // it once and stamp both freshness keys from the same value — byte-identical to the
+        // recomputing forms (same path-ordered `main.files` input), so `ensure_fts_fresh`'s
+        // digest comparison never churns on which path stamped last.
+        let revision = self.content_revision()?;
+        self.record_content_revision_value(&revision)?;
+        self.record_fts_current_value(&revision)?;
         self.set_meta("fts_dirty", "false")?;
         Ok(())
     }
 
     fn record_fts_current(&self) -> anyhow::Result<()> {
-        self.set_meta("fts_synced_at_ms", &now_ms().to_string())?;
         let revision = self.content_revision()?;
-        self.set_meta("fts_source_revision", &revision)?;
+        self.record_fts_current_value(&revision)
+    }
+
+    /// [`Self::record_fts_current`] with the digest already in hand (#821) — for `sync_fts`,
+    /// which stamps both freshness keys from one computed `content_revision()`.
+    fn record_fts_current_value(&self, revision: &str) -> anyhow::Result<()> {
+        self.set_meta("fts_synced_at_ms", &now_ms().to_string())?;
+        self.set_meta("fts_source_revision", revision)?;
         Ok(())
     }
 

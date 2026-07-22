@@ -7,17 +7,110 @@ use rag_rat_db::meta::*;
 
 use super::*;
 
+/// A [`IndexDatabase::content_revision`] digest pinned to the connection state it was computed
+/// under (#821), so a LATER stage of the same pass can reuse the digest instead of paying the
+/// full `main.files` scan again — but only when nothing can have moved it in between. Consumed
+/// through [`IndexDatabase::content_revision_reusing`], which enforces the reuse rule.
+#[derive(Debug)]
+pub(crate) struct ContentRevisionSnapshot {
+    revision: String,
+    /// `PRAGMA data_version` at capture — moves iff ANOTHER connection committed to this
+    /// database since. The database is shared cross-process (and, consolidated, cross-repo:
+    /// a sibling repo's writer moves the GLOBAL digest without touching this repo's rows).
+    data_version: i64,
+    /// SQL `total_changes()` at capture — moves iff THIS connection wrote any row since.
+    total_changes: i64,
+}
+
 impl IndexDatabase {
     pub(super) fn record_content_revision(&self) -> anyhow::Result<String> {
         let revision = self.content_revision()?;
+        self.record_content_revision_value(&revision)?;
+        Ok(revision)
+    }
+
+    /// [`Self::record_content_revision`] with the digest already in hand (#821): `sync_fts`
+    /// computes ONE `main.files` digest and stamps both `content_revision` and
+    /// `fts_source_revision` from it instead of paying the full-table scan twice.
+    pub(super) fn record_content_revision_value(&self, revision: &str) -> anyhow::Result<()> {
         // GLOBAL, not per-repo (V040 reclassification): `content_revision()` digests the WHOLE
         // `main.files` (no repo filter — see the method below), so its stored value is scope- and
         // repo-invariant. V039 relocated it to `repo_meta` under the one-DB-per-repo assumption;
         // per-repo copies would make a consolidated DB's FTS freshness alternate. `set_meta` writes
         // the global `index_meta`. (V040's `move_repo_meta_keys_to_global` migrates any stale
         // per-repo copy back; the shared relocate helper no longer re-relocates it.)
-        self.set_meta("content_revision", &revision)?;
-        Ok(revision)
+        self.set_meta("content_revision", revision)
+    }
+
+    /// The connection's `PRAGMA data_version` — differs between two reads on THIS connection iff
+    /// ANOTHER connection committed to the database in between.
+    pub(super) fn connection_data_version(&self) -> anyhow::Result<i64> {
+        Ok(self.storage.connection().query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
+    /// The connection's SQL `total_changes()` — moves iff THIS connection wrote any row.
+    fn connection_total_changes(&self) -> anyhow::Result<i64> {
+        Ok(self.storage.connection().query_row("SELECT total_changes()", [], |row| row.get(0))?)
+    }
+
+    /// Pin `revision` — a digest [`Self::content_revision`] just computed on this connection —
+    /// to the connection's current write state, for [`Self::content_revision_reusing`] (#821).
+    ///
+    /// `data_version_before_digest` is [`Self::connection_data_version`] captured BEFORE the
+    /// digest was computed: it brackets the digest against the cross-connection TOCTOU. Without
+    /// it, another connection committing between the digest read and this capture would bake the
+    /// NEW `data_version` into a pin whose digest describes the OLD rows — a later no-write
+    /// window would then validate the mismatched pin. When the bracket detects such a commit the
+    /// pin is refused (`None`) and the consumer recomputes.
+    pub(super) fn pin_content_revision(
+        &self,
+        revision: String,
+        data_version_before_digest: i64,
+    ) -> anyhow::Result<Option<ContentRevisionSnapshot>> {
+        let data_version = self.connection_data_version()?;
+        if data_version != data_version_before_digest {
+            return Ok(None);
+        }
+        Ok(Some(ContentRevisionSnapshot {
+            revision,
+            data_version,
+            total_changes: self.connection_total_changes()?,
+        }))
+    }
+
+    /// The pinned digest when it is PROVABLY still current, else a fresh recompute (#821).
+    ///
+    /// REUSE RULE: a pinned digest describes `main.files` only while nothing has written to the
+    /// database, and stages run between the pin and its consumer — in the watcher pass, the base
+    /// reconcile runs between the clone quiet-gate probe and the clone delta. No stage report
+    /// distinguishes "wrote `files` rows" (the reconcile's `"Current"` covers both a no-op and a
+    /// completed embedding run), and other processes share the database file. So the gate is the
+    /// connection's own counters: reuse ONLY when `PRAGMA data_version` (other connections) AND
+    /// `total_changes()` (this connection) both still match the capture — ANY intervening write,
+    /// `files` or not, forces the recompute. Conservative by design: a false negative costs one
+    /// redundant digest; a false positive would let the consumer stamp or compare a digest that
+    /// does not describe the rows it actually read.
+    pub(super) fn content_revision_reusing(
+        &self,
+        pinned: Option<&ContentRevisionSnapshot>,
+    ) -> anyhow::Result<String> {
+        // Validation order matters: own-connection `total_changes()` FIRST, the cross-connection
+        // `data_version` LAST — read last, it covers every sibling commit up to this moment, so
+        // the validation itself has no internal race window. What remains is the gap between
+        // this check and the consumer's own reads — the SAME gap the recompute path always had
+        // (a digest is computed, then consumed outside a transaction) — and it is benign: the
+        // consumer holds the per-repo write lock, so the rows it reads cannot move; only ANOTHER
+        // repo's rows in a consolidated DB can, which lags the GLOBAL freshness stamp by one
+        // pass (the next probe recomputes and the delta re-pins) and fails safe wherever the
+        // stamp is compared for exact freshness (an older-than-content stamp disables the
+        // postings fast path, never enables it).
+        if let Some(pinned) = pinned
+            && self.connection_total_changes()? == pinned.total_changes
+            && self.connection_data_version()? == pinned.data_version
+        {
+            return Ok(pinned.revision.clone());
+        }
+        self.content_revision()
     }
 
     /// Read a per-repo meta value (`repo_meta`) for the repo owning this connection — the ergonomic

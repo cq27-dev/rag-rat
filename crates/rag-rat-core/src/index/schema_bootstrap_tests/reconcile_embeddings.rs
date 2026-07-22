@@ -1578,3 +1578,33 @@ fn count_paths_fetch_text_only_for_rows_that_reach_a_text_gate() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// #821 digest parity: `sync_fts` computes ONE `main.files` digest and stamps BOTH freshness
+/// keys (`content_revision`, `fts_source_revision`) from it. The stamps must be byte-identical
+/// to what the recomputing form produces from the same table state — that identity is what keeps
+/// `ensure_fts_fresh`'s digest comparison from churning on which path stamped last.
+#[test]
+fn sync_fts_threaded_digest_matches_the_recomputing_form_byte_for_byte() {
+    // Whole-DB-digest assertions; the poison-sibling harness would legitimately move the fresh
+    // digest after rebuild. Opt out (same rationale as the revision-metadata test above).
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
+    let (root, config) = markdown_config("parity token");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Poison both stamps so the assertions below can only pass if `sync_fts` rewrote them.
+    db.set_meta("content_revision", "poisoned-stale").unwrap();
+    db.set_meta("fts_source_revision", "poisoned-stale").unwrap();
+    db.sync_fts().unwrap();
+    let threaded_content = db.meta("content_revision").unwrap().unwrap();
+    let threaded_fts = db.meta("fts_source_revision").unwrap().unwrap();
+    assert_eq!(threaded_content, threaded_fts, "one digest feeds both freshness keys");
+
+    // The recomputing form re-scans `main.files` and returns the digest it stamped.
+    let recomputed = db.record_content_revision().unwrap();
+    assert_eq!(
+        threaded_content, recomputed,
+        "the value-threaded stamp is byte-identical to a recompute over the same table state"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

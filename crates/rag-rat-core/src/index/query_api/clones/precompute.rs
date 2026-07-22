@@ -30,7 +30,7 @@ use super::substrate::{
     SymbolBag, load_clone_df_epoch, load_scoped_baseline_bags_with_df, overlap, sub_block_tokens,
     verified_clone,
 };
-use crate::index::IndexDatabase;
+use crate::index::{ContentRevisionSnapshot, IndexDatabase};
 
 /// θ the graph is precomputed at — the default `find_clones` threshold. Queries at θ ≥ this read
 /// the stored edges (filtering the exact gate inputs); θ below falls back to the live path.
@@ -42,6 +42,17 @@ const DEFAULT_BATCH_SIZE: usize = 512;
 /// observation and when it was first observed (epoch ms).
 const CLONE_GRAPH_QUIET_REVISION_META: &str = "clone_graph_quiet_candidate_revision";
 const CLONE_GRAPH_QUIET_SINCE_META: &str = "clone_graph_quiet_candidate_since_ms";
+
+/// One #472 quiet-gate probe outcome (#821): whether the deferred FULL rebuild is due, plus the
+/// content digest the probe computed — pinned to the connection state — so the SAME pass's clone
+/// delta can reuse it instead of paying the `main.files` digest scan again. `revision` is `None`
+/// when the gate short-circuited without probing (nothing armed, no probe permission) or the
+/// probe errored ([`Default`] is the caller's error fallback).
+#[derive(Debug, Default)]
+pub(crate) struct CloneGraphRebuildProbe {
+    pub(crate) due: bool,
+    pub(crate) revision: Option<ContentRevisionSnapshot>,
+}
 
 /// Soft per-pass budget + checkpoint granularity for one
 /// [`IndexDatabase::reconcile_clone_edges_pass`].
@@ -207,50 +218,83 @@ impl IndexDatabase {
         quiet_ms: i64,
         probe_without_candidate: bool,
     ) -> anyhow::Result<bool> {
-        self.clone_graph_rebuild_due_at(now_ms(), quiet_ms, probe_without_candidate)
+        Ok(self.clone_graph_rebuild_probe(quiet_ms, probe_without_candidate)?.due)
+    }
+
+    /// [`Self::clone_graph_rebuild_due`] returning the probe's full outcome (#821): the due
+    /// verdict PLUS the content digest the probe computed, pinned to the connection state, so
+    /// the same pass's clone delta can reuse the digest instead of re-scanning `main.files` —
+    /// see [`Self::apply_clone_graph_delta_reusing_revision`].
+    pub(crate) fn clone_graph_rebuild_probe(
+        &self,
+        quiet_ms: i64,
+        probe_without_candidate: bool,
+    ) -> anyhow::Result<CloneGraphRebuildProbe> {
+        self.clone_graph_rebuild_probe_at(now_ms(), quiet_ms, probe_without_candidate)
     }
 
     /// [`Self::clone_graph_rebuild_due`] with the clock injected (tests).
-    ///
-    /// "Owed" here means a FULL rebuild: the graph is stale in a way the #473 delta can't settle
-    /// (absent / normalizer bump / postings gap), OR the live generation has absorbed enough
-    /// delta files ([`CLONE_GRAPH_DRIFT_REBUILD_FILES`]) that its frozen df epoch owes a refresh.
-    /// A merely revision-stale-but-delta-eligible graph also arms here — if the delta settles it
-    /// first, the next probe sees it current and disarms.
+    #[cfg(test)]
     pub(crate) fn clone_graph_rebuild_due_at(
         &self,
         now_ms: i64,
         quiet_ms: i64,
         probe_without_candidate: bool,
     ) -> anyhow::Result<bool> {
+        Ok(self.clone_graph_rebuild_probe_at(now_ms, quiet_ms, probe_without_candidate)?.due)
+    }
+
+    /// [`Self::clone_graph_rebuild_probe`] with the clock injected.
+    ///
+    /// "Owed" here means a FULL rebuild: the graph is stale in a way the #473 delta can't settle
+    /// (absent / normalizer bump / postings gap), OR the live generation has absorbed enough
+    /// delta files ([`CLONE_GRAPH_DRIFT_REBUILD_FILES`]) that its frozen df epoch owes a refresh.
+    /// A merely revision-stale-but-delta-eligible graph also arms here — if the delta settles it
+    /// first, the next probe sees it current and disarms.
+    fn clone_graph_rebuild_probe_at(
+        &self,
+        now_ms: i64,
+        quiet_ms: i64,
+        probe_without_candidate: bool,
+    ) -> anyhow::Result<CloneGraphRebuildProbe> {
         let candidate = self.clone_graph_quiet_candidate()?;
         if candidate.is_none() && !probe_without_candidate {
-            return Ok(false);
+            return Ok(CloneGraphRebuildProbe::default());
         }
+        // Captured BEFORE the digest: brackets it against a cross-connection commit landing
+        // between the digest read and the pin capture (see `pin_content_revision`).
+        let data_version_before_digest = self.connection_data_version()?;
         let revision = self.content_revision()?;
         let drifted = {
             let conn = self.storage.connection();
             live_generation_row(conn)?
                 .is_some_and(|live| live.delta_files_applied >= CLONE_GRAPH_DRIFT_REBUILD_FILES)
         };
-        if !self.clone_graph_stale_against(&revision)? && !drifted {
+        let due = if !self.clone_graph_stale_against(&revision)? && !drifted {
             if candidate.is_some() {
                 self.clear_clone_graph_quiet_candidate()?;
             }
-            return Ok(false);
-        }
-        if quiet_ms == 0 {
-            return Ok(true);
-        }
-        match candidate {
-            Some((armed_revision, since_ms)) if armed_revision == revision =>
-                Ok(now_ms.saturating_sub(since_ms) >= quiet_ms),
-            _ => {
-                self.set_repo_meta(CLONE_GRAPH_QUIET_REVISION_META, &revision)?;
-                self.set_repo_meta(CLONE_GRAPH_QUIET_SINCE_META, &now_ms.to_string())?;
-                Ok(false)
-            },
-        }
+            false
+        } else if quiet_ms == 0 {
+            true
+        } else {
+            match candidate {
+                Some((armed_revision, since_ms)) if armed_revision == revision =>
+                    now_ms.saturating_sub(since_ms) >= quiet_ms,
+                _ => {
+                    self.set_repo_meta(CLONE_GRAPH_QUIET_REVISION_META, &revision)?;
+                    self.set_repo_meta(CLONE_GRAPH_QUIET_SINCE_META, &now_ms.to_string())?;
+                    false
+                },
+            }
+        };
+        // Pin AFTER the gate's own bookkeeping writes (arming or clearing the quiet candidate):
+        // those touch repo_meta only, never `files`, but they bump `total_changes()` — pinning
+        // before them would make the reuse check read the probe's own writes as an intervening
+        // mutation and never fire. The pre-digest `data_version` bracket still guards the whole
+        // window against other connections.
+        let revision = self.pin_content_revision(revision, data_version_before_digest)?;
+        Ok(CloneGraphRebuildProbe { due, revision })
     }
 
     /// Whether the #472 quiet gate holds an armed candidate. Watch-level tests assert the #817

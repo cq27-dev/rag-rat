@@ -390,10 +390,13 @@ fn run_pass(
     // churn until a content, gc, or backlog pass arms it; an ALREADY-ARMED candidate still probes
     // on every pass — candidate presence bypasses the permission — so a quiet-elapsed owed
     // rebuild lands even mid-churn. When nothing is armed and nothing grants permission the gate
-    // costs one meta read.
-    let clone_graph_due = db
-        .clone_graph_rebuild_due(CLONE_GRAPH_QUIET_MS, base_tail_forced || base_embedding_backlog)
-        .unwrap_or(false);
+    // costs one meta read. When it DOES probe, the probe hands back the content digest it
+    // computed (pinned to the connection state) so the clone delta below can reuse it instead of
+    // paying the corpus-scale `main.files` digest a second time this pass (#821).
+    let clone_probe = db
+        .clone_graph_rebuild_probe(CLONE_GRAPH_QUIET_MS, base_tail_forced || base_embedding_backlog)
+        .unwrap_or_default();
+    let clone_graph_due = clone_probe.due;
     // Idle backstop (issue #63, facet 2): when the sweep changed nothing, skip everything past
     // discovery — an idle server should do no work. `run_gc` (every GC_EVERY_PASSES) still forces
     // a full tail, so the cases that DON'T flip content_changed are still caught within that
@@ -439,9 +442,15 @@ fn run_pass(
         // quiet window (`clone_graph_due`) so sustained editing defers it instead of
         // treadmilling. Best-effort + resumable, with whatever budget the embedding reconcile
         // left (shared PASS_RECONCILE_MAX_SECONDS so a pass can't overrun); `None` budget → rides
-        // the next pass.
+        // the next pass. The quiet-gate probe's pinned digest is threaded in (#821); the base
+        // reconcile above ran in between, so the delta reuses it only when the connection
+        // counters prove no write intervened — see `content_revision_reusing` — and recomputes
+        // otherwise.
         let clone_full_rebuild_owed = match timings.stage("clone_delta", || {
-            db.apply_clone_graph_delta(crate::index::CLONE_DELTA_MAX_FILES)
+            db.apply_clone_graph_delta_reusing_revision(
+                crate::index::CLONE_DELTA_MAX_FILES,
+                clone_probe.revision.as_ref(),
+            )
         }) {
             Ok(delta) if delta.status == "Applied" || delta.status == "Noop" =>
                 delta.full_rebuild_owed,
