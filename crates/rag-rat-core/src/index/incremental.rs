@@ -417,6 +417,14 @@ impl IndexDatabase {
             healed,
             "incremental pass (reads hoisted out of the write transaction)"
         );
+        // Settle any pending overlay-batch logical rebuild before returning (#819 review): an
+        // interrupted Deferred overlay batch leaves its obligation committed, and this pass's
+        // own rebuild is gated on its row changes — an IDLE pass closes its empty transaction
+        // above and would otherwise exit past the marker, leaving branch-only symbols
+        // unresolvable until an unrelated pass rebuilt. Its own `BEGIN IMMEDIATE` (the pass's
+        // transaction is closed by now); write-free when nothing is pending (one meta read),
+        // so the #63 idle-pass posture holds. On failure the marker survives for the next pass.
+        db.apply_pending_logical_rebuild()?;
         Ok((db, content_changed))
     }
 

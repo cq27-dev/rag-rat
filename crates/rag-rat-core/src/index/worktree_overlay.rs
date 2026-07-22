@@ -574,7 +574,9 @@ impl IndexDatabase {
         let Some((base_sha, worktree_id, source_root)) =
             resolve_overlay_scope(config, linked_path)?
         else {
-            // Fell back to base → not a valid linked sibling; nothing to overlay.
+            // Fell back to base → not a valid linked sibling; nothing to overlay. Still an
+            // entry-point exit, so it settles a pending batch obligation like every other one.
+            self.settle_pending_logical_rebuild_inline(tail.logical_rebuild)?;
             return Ok(WorktreeOverlayReport::default());
         };
         // Scope the connection to the overlay (base commit + linked worktree id) so context-
@@ -661,6 +663,11 @@ impl IndexDatabase {
                 return Err(err);
             },
         };
+        // AFTER the commit (its own transaction): an Inline refresh whose delta was EMPTY
+        // skipped the finalize above, so this is the exit that consumes a stale pending
+        // obligation instead of returning past it (#819 review). A failed refresh skips it —
+        // the obligation survives for the next pass, like the batch callers' error arms.
+        self.settle_pending_logical_rebuild_inline(tail.logical_rebuild)?;
 
         Ok(WorktreeOverlayReport {
             worktree_id,
@@ -710,6 +717,9 @@ impl IndexDatabase {
         let Some((base_sha, worktree_id, source_root)) =
             resolve_overlay_scope(config, linked_path)?
         else {
+            // Not a valid linked sibling — still an entry-point exit (#819 review): settle a
+            // pending batch obligation like the whole-delta route's no-op arm does.
+            self.settle_pending_logical_rebuild_inline(logical_rebuild)?;
             return Ok(WorktreeOverlayReport::default());
         };
         self.set_context(&base_sha, &worktree_id)?;
@@ -835,6 +845,10 @@ impl IndexDatabase {
                 return Err(err);
             },
         };
+        // The Inline entry-point exit settle (#819 review), AFTER the commit: an unchanged
+        // supplied path identity-skips (the finalize above never ran), and a stale pending
+        // obligation must not survive this exit.
+        self.settle_pending_logical_rebuild_inline(logical_rebuild)?;
         Ok(WorktreeOverlayReport {
             worktree_id,
             indexed,
@@ -1022,8 +1036,12 @@ impl IndexDatabase {
     /// This is also the mid-batch-error / crash backstop: the pending marker committed with each
     /// worktree's rows, so earlier worktrees' committed refreshes get their rebuild even when a
     /// later worktree failed, or when the process died between the overlay transactions and this
-    /// tail (the next pass finds the marker and heals). Returns whether a rebuild ran;
-    /// `Ok(false)` = nothing pending, write-free (the #63 idle backstop).
+    /// tail (the next pass finds the marker and heals). Beyond the batch callers, EVERY indexing
+    /// entry point runs this before returning — the Inline overlay exits (via
+    /// [`Self::settle_pending_logical_rebuild_inline`]) and the base incremental writer's tail —
+    /// so no entry point exits past a committed obligation just because its own delta was empty.
+    /// Returns whether a rebuild ran; `Ok(false)` = nothing pending, write-free (the #63 idle
+    /// backstop).
     pub fn apply_pending_logical_rebuild(&self) -> anyhow::Result<bool> {
         // Lockless fast path: the common idle pass never opens a write transaction at all.
         if self.repo_meta(OVERLAY_LOGICAL_REBUILD_PENDING_META)?.is_none() {
@@ -1055,6 +1073,27 @@ impl IndexDatabase {
                 Err(err)
             },
         }
+    }
+
+    /// The Inline entry-point exit settle (#819 review): every overlay indexing entry point
+    /// consumes a pending batch obligation before returning — even when its OWN delta was
+    /// empty. An interrupted [`OverlayLogicalRebuild::Deferred`] batch leaves the marker
+    /// committed, and an Inline refresh with no row changes skips `finalize_overlay_refresh`
+    /// (and with it the inline rebuild, the marker's sole clearer) entirely — without this,
+    /// `index --worktree` over an unchanged checkout would exit leaving BOTH the marker and the
+    /// stale `logical_symbols` in place, branch-only symbols unresolvable until an unrelated
+    /// pass happened to rebuild. Inline-only: `Deferred` callers own their batch tail
+    /// ([`Self::apply_pending_logical_rebuild`] after their loop) — settling per worktree here
+    /// would undo the #819 batching. Runs OUTSIDE the refresh transaction (its own
+    /// `BEGIN IMMEDIATE`); write-free when nothing is pending (one meta read).
+    fn settle_pending_logical_rebuild_inline(
+        &self,
+        logical_rebuild: OverlayLogicalRebuild,
+    ) -> anyhow::Result<()> {
+        if logical_rebuild == OverlayLogicalRebuild::Inline {
+            self.apply_pending_logical_rebuild()?;
+        }
+        Ok(())
     }
 
     /// Index an EXPLICIT set of repo-relative `paths`, reading bytes from `source_root` (which may

@@ -1723,6 +1723,172 @@ fn inline_rebuild_satisfies_a_pending_deferred_obligation() {
 }
 
 #[test]
+fn standalone_unchanged_refresh_settles_a_pending_deferred_obligation() {
+    // #819 review P2: an interrupted Deferred batch leaves the pending marker committed. A
+    // standalone `index --worktree` (Inline) over the UNCHANGED checkout then has an EMPTY
+    // delta — `finalize_overlay_refresh` (and with it the inline rebuild, the sole marker
+    // clearer) is skipped entirely — so without the entry-point tail settle the run would
+    // exit leaving BOTH the marker and the stale `logical_symbols` in place: branch-only
+    // symbols invisible to symbol/graph queries until some unrelated pass consumed the
+    // marker. The invariant: EVERY indexing entry point settles a pending obligation before
+    // exiting, even when its own delta is empty.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/new.rs"), "pub fn branch_only_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds file"]);
+
+    // Interrupted deferred batch: rows + marker committed, the batch tail never runs.
+    let tail = crate::index::OverlayRefreshTail {
+        logical_rebuild: crate::index::OverlayLogicalRebuild::Deferred,
+        basis: None,
+    };
+    db.index_worktree_overlay_with_tail(&config, &linked, tail, &mut |_| {}).unwrap();
+    assert!(logical_rebuild_pending(&db), "the interrupted batch left its obligation");
+    assert!(!logical_symbol_named(&db, "branch_only_fn"), "the grouping is stale");
+
+    // The standalone (Inline) refresh over the SAME, unchanged worktree: zero row changes.
+    let before = db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed);
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(report.indexed, 0, "unchanged checkout: the refresh itself writes no rows");
+    assert_eq!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed) - before,
+        1,
+        "the entry-point tail ran the ONE owed rebuild"
+    );
+    assert!(!logical_rebuild_pending(&db), "the standalone exit consumed the obligation");
+    assert!(logical_symbol_named(&db, "branch_only_fn"), "branch symbols are grouped again");
+
+    // Settled means settled: a second unchanged standalone run owes (and pays) nothing.
+    let idle = db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed),
+        idle,
+        "no obligation pending: the tail settle is a single meta read"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn idle_base_incremental_pass_settles_a_pending_deferred_obligation() {
+    // Same class as the standalone-worktree exit (#819 review): the base incremental writer's
+    // logical rebuild is gated on its OWN row changes (indexed/healed/carried/roots_changed),
+    // so an IDLE `rag-rat index` pass over an unchanged base tree closes its empty transaction
+    // and would exit past a committed obligation. The pass settles at its tail instead — one
+    // meta read when nothing is pending.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/new.rs"), "pub fn branch_only_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds file"]);
+
+    // Interrupted deferred batch: rows + marker committed, the batch tail never runs.
+    let tail = crate::index::OverlayRefreshTail {
+        logical_rebuild: crate::index::OverlayLogicalRebuild::Deferred,
+        basis: None,
+    };
+    db.index_worktree_overlay_with_tail(&config, &linked, tail, &mut |_| {}).unwrap();
+    assert!(logical_rebuild_pending(&db), "the interrupted batch left its obligation");
+
+    // An idle base incremental pass (its own connection, like the CLI `index`): the base tree
+    // is unchanged, so the pass's gated rebuild never fires — only the tail settle can.
+    let refreshed = IndexDatabase::index_changed(&config).unwrap();
+    drop(refreshed);
+    assert!(!logical_rebuild_pending(&db), "the idle incremental pass settled the obligation");
+    assert!(logical_symbol_named(&db, "branch_only_fn"), "branch symbols are grouped again");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn path_scoped_inline_refresh_settles_a_pending_deferred_obligation() {
+    // The path-scoped overlay twin (#679) has the same empty-delta exit as the whole-delta
+    // route: an unchanged supplied path identity-skips, `finalize_overlay_refresh` never runs,
+    // and a stale pending obligation (#819 review) must still be settled at the entry point's
+    // tail. The non-sibling no-op exit is an entry-point exit too.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/new.rs"), "pub fn branch_only_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds file"]);
+
+    // Interrupted deferred batch: rows + marker committed, the batch tail never runs.
+    let tail = crate::index::OverlayRefreshTail {
+        logical_rebuild: crate::index::OverlayLogicalRebuild::Deferred,
+        basis: None,
+    };
+    db.index_worktree_overlay_with_tail(&config, &linked, tail, &mut |_| {}).unwrap();
+    assert!(logical_rebuild_pending(&db), "the interrupted batch left its obligation");
+
+    // Path-scoped INLINE refresh of the UNCHANGED path: identity-skip, zero row changes.
+    let report = db
+        .index_worktree_overlay_paths(
+            &config,
+            &linked,
+            &[linked.join("src/new.rs")],
+            crate::index::OverlayLogicalRebuild::Inline,
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_eq!(report.indexed, 0, "unchanged path: the refresh itself writes no rows");
+    assert!(!logical_rebuild_pending(&db), "the path-scoped exit consumed the obligation");
+    assert!(logical_symbol_named(&db, "branch_only_fn"), "branch symbols are grouped again");
+
+    // Re-arm the obligation with a second interrupted Deferred refresh...
+    fs::write(linked.join("src/more.rs"), "pub fn second_branch_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "second branch file"]);
+    db.index_worktree_overlay_with_tail(&config, &linked, tail, &mut |_| {}).unwrap();
+    assert!(logical_rebuild_pending(&db), "the second interrupted batch re-armed it");
+    // ...then exit through the NON-SIBLING no-op arm (the base root is not a linked sibling):
+    // still an Inline entry-point exit, so it settles too.
+    let report = db.index_worktree_overlay(&config, &main, &mut |_| {}).unwrap();
+    assert!(report.worktree_id.is_empty(), "base root refresh is the no-op arm");
+    assert!(!logical_rebuild_pending(&db), "every Inline entry-point exit settles");
+    assert!(logical_symbol_named(&db, "second_branch_fn"), "the settle grouped the new symbol");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
 fn overlay_basis_writes_ride_the_refresh_transaction() {
     // #824 (#577 semantics preserved): the skip-proof basis is maintained INSIDE the overlay's
     // own BEGIN IMMEDIATE — record the caller's pair on a COMPLETE refresh (even a no-change
