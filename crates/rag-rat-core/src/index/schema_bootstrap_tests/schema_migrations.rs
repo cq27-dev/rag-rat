@@ -3436,8 +3436,7 @@ fn migration_081_adds_evidence_source_part() {
 }
 
 #[test]
-fn migration_082_is_the_tip_and_accounts_for_content_refold_work() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 82, "move this pin with the next schema migration");
+fn migration_082_accounts_for_content_refold_work() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
@@ -3479,7 +3478,9 @@ fn migration_082_is_the_tip_and_accounts_for_content_refold_work() {
     truncate_schema_to(&conn, 81);
 
     schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 82);
+    // Replaying from 81 runs V082 and everything after it, so pin the TIP rather than a literal —
+    // this assertion is about the forward path completing, not about which migration is last.
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 
     let queued: Vec<(Vec<u8>, i64, i64, i64)> = conn
         .prepare(
@@ -3617,4 +3618,86 @@ fn migration_082_is_the_tip_and_accounts_for_content_refold_work() {
         )
         .unwrap();
     assert_eq!(v82_recorded, 1, "forward migration records V082");
+}
+
+/// V083 recomputes `logical_symbols.group_reason` from member evidence, and is the schema tip.
+///
+/// The column is derived but PERSISTED, so a new labelling rule alone would never reach an existing
+/// index: a query-only server over an unchanged repository never runs `rebuild_logical_symbols` and
+/// would keep serving the old `cfg_variant` for every multi-member group indefinitely.
+#[test]
+fn migration_083_is_the_tip_and_relabels_logical_groups_by_evidence() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 83, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    // Two `files` ROWS for one path — what a worktree-overlay or commit scope produces.
+    for (id, worktree) in [(1_i64, "base"), (2_i64, "wt")] {
+        conn.execute(
+            "INSERT INTO files(id, path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+                               commit_sha, worktree_id)
+             VALUES (?1, 'src/lib.rs', 'rust', 'source', 'sha', 0, 0, 'head', ?2)",
+            rusqlite::params![id, worktree],
+        )
+        .unwrap();
+    }
+    let symbol = |id: i64, file_id: i64, name: &str| {
+        conn.execute(
+            "INSERT INTO symbols(id, file_id, language, name, kind, start_byte, end_byte)
+             VALUES (?1, ?2, 'rust', ?3, 'function', 0, 1)",
+            rusqlite::params![id, file_id, name],
+        )
+        .unwrap();
+    };
+    // `replicated` is ONE symbol seen in both scopes; `collided` is TWO symbols in one file.
+    symbol(1, 1, "replicated");
+    symbol(2, 2, "replicated");
+    symbol(3, 1, "collided");
+    symbol(4, 1, "collided");
+    symbol(5, 2, "solo");
+
+    let group = |id: i64, name: &str, members: &[i64]| {
+        conn.execute(
+            "INSERT INTO logical_symbols(id, language, path, logical_name, kind, variant_count,
+                                         group_reason)
+             VALUES (?1, 'rust', 'src/lib.rs', ?2, 'function', ?3, 'cfg_variant')",
+            rusqlite::params![id, name, members.len() as i64],
+        )
+        .unwrap();
+        for symbol_id in members {
+            conn.execute(
+                "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line,
+                                                    end_line)
+                 VALUES (?1, ?2, 1, 2)",
+                rusqlite::params![id, symbol_id],
+            )
+            .unwrap();
+        }
+    };
+    group(100, "replicated", &[1, 2]);
+    group(200, "collided", &[3, 4]);
+    group(300, "solo", &[5]);
+
+    truncate_schema_to(&conn, 82);
+    schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, 83);
+
+    let reason = |id: i64| -> String {
+        conn.query_row("SELECT group_reason FROM logical_symbols WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        reason(100),
+        "scope_replica",
+        "one symbol indexed in two scopes is a replica, not a cfg variant — this is the case the \
+         old label got wrong for the overwhelming majority of groups",
+    );
+    assert_eq!(
+        reason(200),
+        "same_file_multi",
+        "two symbols inside one file row genuinely share an identity",
+    );
+    assert_eq!(reason(300), "single");
 }

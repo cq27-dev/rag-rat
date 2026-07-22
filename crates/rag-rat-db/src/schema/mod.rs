@@ -45,7 +45,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 82;
+pub const LATEST_SCHEMA_VERSION: u32 = 83;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -600,6 +600,11 @@ const MIGRATION_081_DESCRIPTION: &str =
      key as source_id). Nullable and additive: existing rows keep NULL, the drain populates new \
      rows from its snapshot, and no SQL backfill is performed (a re-drain rewrites evidence)";
 
+const MIGRATION_083_ID: &str = "083_logical_group_reason_by_evidence";
+const MIGRATION_083_CHECKSUM: &str = "sha256:rag-rat-logical-group-reason-by-evidence-v83";
+const MIGRATION_083_DESCRIPTION: &str = "Recompute logical_symbols.group_reason from member \
+                                         evidence — the old value asserted cfg_variant for every \
+                                         multi-member group (#855)";
 const MIGRATION_082_ID: &str = "082_content_refold_queue_and_stats";
 const MIGRATION_082_CHECKSUM: &str = "sha256:rag-rat-content-refold-queue-and-stats-v82";
 const MIGRATION_082_DESCRIPTION: &str =
@@ -1291,6 +1296,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_082_CHECKSUM,
         description: MIGRATION_082_DESCRIPTION,
         apply: MigrationFn::Plain(apply_content_refold_queue_and_stats),
+    },
+    Migration {
+        id: MIGRATION_083_ID,
+        checksum: MIGRATION_083_CHECKSUM,
+        description: MIGRATION_083_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_logical_group_reason_by_evidence),
     },
 ];
 

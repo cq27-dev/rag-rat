@@ -1245,6 +1245,43 @@ pub(crate) fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<Applie
     Ok(migrations)
 }
 
+/// Recompute `logical_symbols.group_reason` from what the members actually show (#855).
+///
+/// The previous writer labelled EVERY multi-member group `cfg_variant`. On a representative index
+/// that was wrong for 3,686 of 3,699 such groups: a source path carries one `files` row per index
+/// scope (worktree-overlay and commit scopes), so a symbol defined once shows up once per scope and
+/// gets grouped. Callers were told a symbol with a single definition had N cfg variants.
+///
+/// This runs as a migration rather than waiting for the next `rebuild_logical_symbols` because the
+/// column is derived but PERSISTED: a query-only server over an unchanged repository never
+/// rebuilds, and would keep serving the old label indefinitely.
+///
+/// The three outcomes match [`logical_group_reason`](../../../rag-rat-core) exactly — one member is
+/// `single`; members spread one-per-`files`-row are a `scope_replica`; any `files` row holding two
+/// or more members makes the group `same_file_multi`. A group whose members have all been deleted
+/// falls back to `single` so the NOT NULL column always gets a value.
+pub(crate) fn apply_logical_group_reason_by_evidence(conn: &Connection) -> rusqlite::Result<()> {
+    // Both tables are in the baseline, so no existence guard is needed.
+    conn.execute_batch(
+        "
+        UPDATE logical_symbols SET group_reason = COALESCE((
+            SELECT CASE
+                     WHEN SUM(per_file.members) <= 1 THEN 'single'
+                     WHEN MAX(per_file.members) > 1 THEN 'same_file_multi'
+                     ELSE 'scope_replica'
+                   END
+            FROM (
+                SELECT COUNT(*) AS members
+                FROM logical_symbol_members
+                JOIN symbols ON symbols.id = logical_symbol_members.symbol_id
+                WHERE logical_symbol_members.logical_symbol_id = logical_symbols.id
+                GROUP BY symbols.file_id
+            ) AS per_file
+        ), 'single');
+        ",
+    )
+}
+
 pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
     migrations
         .iter()
@@ -1331,6 +1368,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_080_ID => Some(80),
             MIGRATION_081_ID => Some(81),
             MIGRATION_082_ID => Some(82),
+            MIGRATION_083_ID => Some(83),
             _ => None,
         })
         .max()
@@ -1422,6 +1460,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_080_ID
             | MIGRATION_081_ID
             | MIGRATION_082_ID
+            | MIGRATION_083_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1510,6 +1549,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_080_ID => migration.checksum != MIGRATION_080_CHECKSUM,
         MIGRATION_081_ID => migration.checksum != MIGRATION_081_CHECKSUM,
         MIGRATION_082_ID => migration.checksum != MIGRATION_082_CHECKSUM,
+        MIGRATION_083_ID => migration.checksum != MIGRATION_083_CHECKSUM,
         _ => false,
     }
 }

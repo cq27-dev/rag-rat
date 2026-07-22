@@ -553,6 +553,11 @@ fn conflicting_drift_evidence(
 #[derive(Debug, Clone)]
 pub(super) struct LogicalSymbolMemberRow {
     pub(super) symbol_id: i64,
+    /// Which `files` ROW this member came from. A path can have several: worktree-overlay and
+    /// commit scopes each carry their own row for the same source file. That distinction is what
+    /// separates "one symbol seen in N scopes" from "N symbols in one file" when labelling a
+    /// group — see [`insert_logical_group`].
+    pub(super) file_id: i64,
     pub(super) path: String,
     pub(super) language: String,
     pub(super) name: String,
@@ -651,7 +656,7 @@ impl IndexDatabase {
             "
             SELECT symbols.id, main.files.path, symbols.language, symbols.name,
                    qn.value, symbols.kind, symbols.signature, symbols.start_line,
-                   symbols.end_line
+                   symbols.end_line, symbols.file_id
             FROM main.symbols AS symbols
             JOIN main.files ON main.files.id = symbols.file_id
             LEFT JOIN main.name_strings qn ON qn.id = symbols.qualified_name_id
@@ -673,6 +678,7 @@ impl IndexDatabase {
                 signature: row.get(6)?,
                 start_line: row.get(7)?,
                 end_line: row.get(8)?,
+                file_id: row.get(9)?,
             };
             // Compare the member's key fields against the current group WITHOUT allocating a key
             // per row (only per group, on a boundary).

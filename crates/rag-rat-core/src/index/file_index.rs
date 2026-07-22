@@ -508,6 +508,39 @@ impl IndexDatabase {
         Ok(symbol_ids)
     }
 
+    /// Label a logical group by what the members ACTUALLY show, not by a guess.
+    ///
+    /// This used to report `cfg_variant` for every multi-member group, which was wrong for almost
+    /// all of them. A `files` PATH can have several `files` ROWS — worktree-overlay and commit
+    /// scopes each carry one for the same source file — so the same single symbol shows up once
+    /// per scope and gets grouped. On this repo's own index that accounted for 3,686 of 3,699
+    /// multi-member groups: symbols that exist exactly once in the source were being presented
+    /// as cfg variants with `variant_count` equal to the number of indexed scopes.
+    ///
+    /// What the members can actually distinguish:
+    ///
+    /// - `single` — one member.
+    /// - `scope_replica` — several members, but no single `files` row contributes more than one.
+    ///   This is one symbol observed in several index scopes; it is not a variant of anything.
+    /// - `name_collision` — some `files` row contributes two or more members, so one file genuinely
+    ///   holds multiple symbols that share name, kind, and declaration line. `impl Default for A`
+    ///   and `impl Default for B` in one file land here.
+    ///
+    /// Deliberately NOT reported: `cfg_variant`. Genuine cfg variants are indistinguishable from a
+    /// `name_collision` at this layer — both are several symbols in one file with identical
+    /// declaration lines — and the group key carries no cfg evidence to separate them. Asserting
+    /// the friendlier label is what made the old value useless.
+    fn logical_group_reason(members: &[LogicalSymbolMemberRow]) -> &'static str {
+        if members.len() <= 1 {
+            return "single";
+        }
+        let mut per_file: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for member in members {
+            *per_file.entry(member.file_id).or_default() += 1;
+        }
+        if per_file.values().any(|count| *count > 1) { "same_file_multi" } else { "scope_replica" }
+    }
+
     /// Insert one logical symbol and its members. Extracted so `rebuild_logical_symbols` can flush
     /// each group as its key changes (streaming) rather than buffering every group. Both INSERTs
     /// are `prepare_cached` — the member insert runs once per symbol, so recompiling the SQL each
@@ -518,7 +551,7 @@ impl IndexDatabase {
         key: &LogicalSymbolKey,
         members: &[LogicalSymbolMemberRow],
     ) -> anyhow::Result<()> {
-        let group_reason = if members.len() > 1 { "cfg_variant" } else { "single" };
+        let group_reason = Self::logical_group_reason(members);
         // Repo-distinct id (A3): `stable_id` folds `repo_id` into the content hash so two repos
         // with identical content don't collide on the `logical_symbols.id` PK in a
         // consolidated DB.
@@ -564,5 +597,58 @@ impl IndexDatabase {
             ])?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod logical_group_reason_tests {
+    use super::*;
+
+    fn member(symbol_id: i64, file_id: i64) -> LogicalSymbolMemberRow {
+        LogicalSymbolMemberRow {
+            symbol_id,
+            file_id,
+            path: "src/lib.rs".to_string(),
+            language: "rust".to_string(),
+            name: "describe".to_string(),
+            qualified_name: "src/lib.rs::describe".to_string(),
+            kind: "function".to_string(),
+            signature: Some("pub fn describe(&self) -> u32 {".to_string()),
+            start_line: 1,
+            end_line: 3,
+        }
+    }
+
+    #[test]
+    fn one_member_is_single() {
+        assert_eq!(IndexDatabase::logical_group_reason(&[member(1, 10)]), "single");
+    }
+
+    /// The case the old label got wrong for 3,686 of 3,699 multi-member groups on this repo's own
+    /// index: one symbol observed once per index scope. A path carries several `files` rows —
+    /// worktree-overlay and commit scopes each add one — so the symbol is replicated, not varied.
+    /// Reporting `cfg_variant` with `variant_count` equal to the number of indexed scopes told
+    /// every caller a symbol that exists once in the source had N definitions.
+    #[test]
+    fn one_symbol_seen_in_several_scopes_is_a_replica_not_a_variant() {
+        let members = [member(1, 10), member(2, 11), member(3, 12)];
+        assert_eq!(IndexDatabase::logical_group_reason(&members), "scope_replica");
+    }
+
+    /// Two symbols inside ONE file row: genuinely several definitions sharing an identity. Covers
+    /// both `#[cfg]`-gated pairs and unrelated collisions like two `impl Default for _` blocks —
+    /// the label stays neutral because the group key cannot tell them apart.
+    #[test]
+    fn several_members_in_one_file_row_is_reported_as_same_file_multi() {
+        let members = [member(1, 10), member(2, 10)];
+        assert_eq!(IndexDatabase::logical_group_reason(&members), "same_file_multi");
+    }
+
+    /// A collision that ALSO spans scopes must not be downgraded to a replica: the same two
+    /// same-file symbols seen in two scopes is still a genuine multi-definition group.
+    #[test]
+    fn a_same_file_collision_replicated_across_scopes_is_still_same_file_multi() {
+        let members = [member(1, 10), member(2, 10), member(3, 11), member(4, 11)];
+        assert_eq!(IndexDatabase::logical_group_reason(&members), "same_file_multi");
     }
 }

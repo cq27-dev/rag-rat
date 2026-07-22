@@ -336,7 +336,11 @@ pub fn caller() {
         .unwrap();
     let logical_symbol_id = lookup.candidates[0].logical_symbol_id.expect("logical id");
     assert_eq!(lookup.candidates[0].logical_variant_count, Some(2));
-    assert_eq!(lookup.candidates[0].logical_group_reason.as_deref(), Some("cfg_variant"));
+    // This fixture IS a genuine cfg pair, but the label deliberately does not claim so: two
+    // `#[cfg]` definitions and two unrelated same-signature symbols in one file are
+    // indistinguishable from the group key alone, so the reported reason states only what the
+    // members show — several members inside one `files` row.
+    assert_eq!(lookup.candidates[0].logical_group_reason.as_deref(), Some("same_file_multi"));
 
     let exact_variant_callers = db
         .find_callers_with_options(
