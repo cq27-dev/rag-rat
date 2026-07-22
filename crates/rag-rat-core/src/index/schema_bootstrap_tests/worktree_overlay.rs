@@ -2335,3 +2335,438 @@ fn a_body_only_base_edit_pass_relinks_without_a_rebuild() {
 
     let _ = fs::remove_dir_all(&main);
 }
+
+/// One committed base repo + one linked worktree, the shared #822/#825 shape: `(main, linked,
+/// config, db)` with `src/a.rs` committed on both sides and every overlay basis unrecorded.
+fn quiet_window_fixture() -> (PathBuf, PathBuf, Config, IndexDatabase) {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_a() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    (main, linked, config, db)
+}
+
+#[test]
+fn overlay_quiet_window_skips_a_dirty_only_listed_worktree_inside_the_window() {
+    // #822: dirty working-tree churn fires events that LIST the worktree, and pre-#822 every such
+    // pass re-paid the full per-worktree probe (tree diff + status walk + ignore compile). While
+    // both heads still equal the recorded basis AND the last complete refresh is younger than the
+    // quiet window, the scoped pass skips the worktree outright; the window elapsing re-arms the
+    // refresh.
+    let (main, linked, mut config, mut db) = quiet_window_fixture();
+    config.watch.overlay_quiet_secs = 300;
+
+    // The All pass records the basis WITH its fresh timestamp (the window anchor).
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    // Dirty-only churn: no HEAD moves, the event scope lists the worktree.
+    fs::write(linked.join("src/a.rs"), "pub fn dirty_fn() {}\n").unwrap();
+    let scope =
+        crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([linked.clone()]));
+    assert!(
+        !crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        "inside the window a dirty-only listed worktree is skipped"
+    );
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/a.rs"),
+        vec!["base_a".to_string()],
+        "the dirty edit stays un-overlaid while the quiet window holds"
+    );
+
+    // The window elapsing re-arms the refresh: backdate the recorded timestamp past the window.
+    set_base_scope(&mut db, &main);
+    let worktree_id = crate::index::worktree_id_of(&linked);
+    let (base_sha, linked_head) = db.worktree_overlay_basis(&worktree_id).unwrap().unwrap();
+    db.record_worktree_overlay_basis(
+        &worktree_id,
+        &base_sha,
+        &linked_head,
+        rag_rat_base::time::now_ms() - 301_000,
+    )
+    .unwrap();
+    assert!(
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        "an elapsed window refreshes the dirty-only worktree"
+    );
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/a.rs"),
+        vec!["dirty_fn".to_string()],
+        "the deferred dirty edit lands once the window elapses"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn overlay_quiet_window_never_defers_a_head_move() {
+    // #822: committed freshness stays immediate — a commit moves a HEAD, the recorded basis
+    // mismatches, and the refresh runs no matter how young the window is. Both directions: a
+    // linked commit, then a base commit.
+    let (main, linked, mut config, mut db) = quiet_window_fixture();
+    config.watch.overlay_quiet_secs = 300;
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    // Linked commit, seconds into the window, on a pass that lists the worktree.
+    fs::write(linked.join("src/new.rs"), "pub fn committed_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds file"]);
+    let scope =
+        crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([linked.clone()]));
+    assert!(
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        "a linked HEAD move refreshes immediately inside the window"
+    );
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(names_in_scope(&db, "src/new.rs"), vec!["committed_fn".to_string()]);
+
+    // Base commit: every worktree's diff basis moves; even an EMPTY event scope refreshes.
+    fs::write(main.join("src/a.rs"), "pub fn base_v2() {}\n").unwrap();
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base v2"]);
+    set_base_scope(&mut db, &main);
+    let empty = crate::watch::OverlayScope::Linked(std::collections::BTreeSet::new());
+    assert!(
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty),
+        "a base HEAD move refreshes immediately inside the window"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn overlay_quiet_window_zero_disables_and_sweeps_ignore_it() {
+    // #822: `overlay_quiet_secs = 0` restores per-pass refresh for listed worktrees, and an `All`
+    // sweep never consults the window even when it is armed — the sweep is one of the backstops
+    // the window's staleness bound leans on.
+    let (main, linked, mut config, mut db) = quiet_window_fixture();
+    config.watch.overlay_quiet_secs = 0;
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    fs::write(linked.join("src/a.rs"), "pub fn dirty_v1() {}\n").unwrap();
+    let scope =
+        crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([linked.clone()]));
+    assert!(
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        "0 disables the window: a dirty-only listed worktree refreshes every pass"
+    );
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(names_in_scope(&db, "src/a.rs"), vec!["dirty_v1".to_string()]);
+
+    // Arm the window; the All sweep refreshes the fresh dirty edit regardless.
+    set_base_scope(&mut db, &main);
+    config.watch.overlay_quiet_secs = 300;
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    fs::write(linked.join("src/a.rs"), "pub fn dirty_v2() {}\n").unwrap();
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/a.rs"),
+        vec!["dirty_v2".to_string()],
+        "an All sweep is never held back by the quiet window"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn overlay_quiet_window_is_ignored_when_the_periodic_sweep_is_disabled() {
+    // #822: the window defers work it never schedules — a deferred edit is delivered by the next
+    // post-window event pass or by the periodic sweep. With `periodic_sweep_secs = 0` a one-off
+    // dirty edit skipped inside the window could have neither (no follow-up event, no sweep) and
+    // stay invisible indefinitely, so the gate must disable itself.
+    let (main, linked, mut config, mut db) = quiet_window_fixture();
+    config.watch.overlay_quiet_secs = 300;
+    config.watch.periodic_sweep_secs = 0;
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    fs::write(linked.join("src/a.rs"), "pub fn dirty_fn() {}\n").unwrap();
+    let scope =
+        crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([linked.clone()]));
+    assert!(
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        "no sweep backstop → the window is ignored and the pass refreshes"
+    );
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(names_in_scope(&db, "src/a.rs"), vec!["dirty_fn".to_string()]);
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn a_cleared_basis_never_quiet_skips() {
+    // #822: the timestamp rides the basis value, so the #577 clear paths (partial refresh in-txn,
+    // failed refresh caller-side) drop the window anchor with the pair — after a clear, a scoped
+    // pass must refresh even though the window would otherwise still hold.
+    let (main, linked, mut config, mut db) = quiet_window_fixture();
+    config.watch.overlay_quiet_secs = 300;
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    fs::write(linked.join("src/a.rs"), "pub fn dirty_fn() {}\n").unwrap();
+    // The failure path's clear (the watcher's Err arm calls exactly this).
+    let worktree_id = crate::index::worktree_id_of(&linked);
+    db.clear_worktree_overlay_basis(&worktree_id).unwrap();
+    let scope =
+        crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([linked.clone()]));
+    assert!(
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        "no recorded basis, no quiet skip — the pass refreshes"
+    );
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(names_in_scope(&db, "src/a.rs"), vec!["dirty_fn".to_string()]);
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn overlay_basis_value_parses_stamped_and_legacy_shapes() {
+    // #822: the basis meta value grew a third line (the last-complete-refresh timestamp). A
+    // pre-#822 two-line value must still yield the #577 pair — only the quiet window stays
+    // disarmed — and a malformed timestamp degrades the same way instead of poisoning the pair.
+    let (main, linked, _config, db) = quiet_window_fixture();
+
+    db.record_worktree_overlay_basis("wt-stamped", "base-1", "linked-1", 42).unwrap();
+    assert_eq!(
+        db.worktree_overlay_basis("wt-stamped").unwrap(),
+        Some(("base-1".to_string(), "linked-1".to_string()))
+    );
+    assert_eq!(db.worktree_overlay_basis_refreshed_at_ms("wt-stamped").unwrap(), Some(42));
+
+    // A legacy value written by a pre-#822 build.
+    db.set_repo_meta_if_changed("worktree_overlay_basis:wt-legacy", "base-2\nlinked-2").unwrap();
+    assert_eq!(
+        db.worktree_overlay_basis("wt-legacy").unwrap(),
+        Some(("base-2".to_string(), "linked-2".to_string())),
+        "the pair survives a pre-#822 value"
+    );
+    assert_eq!(
+        db.worktree_overlay_basis_refreshed_at_ms("wt-legacy").unwrap(),
+        None,
+        "no timestamp on a legacy value — the quiet window never holds"
+    );
+
+    db.set_repo_meta_if_changed("worktree_overlay_basis:wt-garbage", "base-3\nlinked-3\nnot-ms")
+        .unwrap();
+    assert_eq!(
+        db.worktree_overlay_basis("wt-garbage").unwrap(),
+        Some(("base-3".to_string(), "linked-3".to_string()))
+    );
+    assert_eq!(db.worktree_overlay_basis_refreshed_at_ms("wt-garbage").unwrap(), None);
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// The overlay's `(path, is_tombstone)` rows for `worktree_id` at the live scope — the observable
+/// the #825 tree-diff-skip equivalence is asserted on (tombstones included: pruning one would
+/// un-shadow a branch-deleted base file).
+fn overlay_rows(db: &IndexDatabase, worktree_id: &str) -> Vec<(String, bool)> {
+    let conn = db.storage.connection();
+    let mut stmt = conn
+        .prepare(
+            "SELECT path, kind = 'deleted' FROM main.files WHERE worktree_id = ?1 AND commit_sha \
+             = '' ORDER BY path",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([worktree_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)))
+        .unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+#[test]
+fn heads_unchanged_refresh_reuses_the_committed_delta_and_still_sees_dirty_edits() {
+    // #825: when both heads equal the recorded basis, the refresh seeds its committed candidates
+    // from the current overlay rows instead of walking the base↔linked tree diff; the status walk
+    // still runs. Equivalence on a heads-unchanged fixture: the committed rows (a modified file's
+    // overlay row, a deleted file's tombstone) come out identical, and a fresh dirty edit is
+    // still picked up. The PROOF the tree walk was actually skipped is the seed path's one
+    // accepted divergence: a previously-dirty file REVERTED to base content keeps its
+    // (content-identical) overlay row — the full diff would have pruned it — until the next
+    // HEAD move runs the full diff and does.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_a() {}\n").unwrap();
+    fs::write(main.join("src/b.rs"), "pub fn base_b() {}\n").unwrap();
+    fs::write(main.join("src/c.rs"), "pub fn base_c() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Committed branch delta: modify a.rs, delete b.rs (→ tombstone).
+    fs::write(linked.join("src/a.rs"), "pub fn branch_a() {}\n").unwrap();
+    fs::remove_file(linked.join("src/b.rs")).unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch delta"]);
+    // Dirty edit that will be REVERTED before the seeded pass.
+    fs::write(linked.join("src/c.rs"), "pub fn dirty_c() {}\n").unwrap();
+
+    // Refresh maintaining the basis with REAL heads, exactly as the watcher does.
+    let refresh = |db: &mut IndexDatabase| {
+        let base_sha = crate::index::head_sha(&main);
+        let linked_head = crate::index::head_sha(&linked);
+        let tail = crate::index::OverlayRefreshTail {
+            logical_rebuild: crate::index::OverlayLogicalRebuild::Inline,
+            basis: Some(crate::index::OverlayBasisUpdate {
+                base_sha: &base_sha,
+                linked_head_sha: &linked_head,
+            }),
+        };
+        db.index_worktree_overlay_with_tail(&config, &linked, tail, &mut |_| {}).unwrap()
+    };
+    // Pass 1: no recorded basis → the full tree diff.
+    let first = refresh(&mut db);
+    assert!(first.status_complete);
+    assert_eq!(first.indexed, 2, "branch a.rs + dirty c.rs");
+    assert_eq!(first.tombstoned, 1, "deleted b.rs shadows its base row");
+    let worktree_id = first.worktree_id.clone();
+    let committed_rows = overlay_rows(&db, &worktree_id);
+
+    // Heads unchanged; revert c.rs to base content and add a NEW dirty file d.rs.
+    fs::write(linked.join("src/c.rs"), "pub fn base_c() {}\n").unwrap();
+    fs::write(linked.join("src/d.rs"), "pub fn dirty_d() {}\n").unwrap();
+    let second = refresh(&mut db);
+    assert!(second.status_complete);
+    let expected = {
+        let mut expected = committed_rows.clone();
+        expected.push(("src/d.rs".to_string(), false));
+        expected.sort();
+        expected
+    };
+    assert_eq!(
+        overlay_rows(&db, &worktree_id),
+        expected,
+        "the seeded pass reproduces the committed delta exactly (a.rs row, b.rs tombstone), still \
+         catches the new dirty d.rs via the status walk, and keeps the reverted c.rs row — the \
+         divergence that proves the tree diff was skipped (a full diff prunes it)"
+    );
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(names_in_scope(&db, "src/a.rs"), vec!["branch_a".to_string()]);
+    assert!(!path_in_scope(&db, "src/b.rs"), "the tombstone still shadows the base row");
+    assert_eq!(names_in_scope(&db, "src/d.rs"), vec!["dirty_d".to_string()]);
+
+    // A HEAD move runs the full diff again, which prunes the lingering reverted row.
+    set_base_scope(&mut db, &main);
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "commit the dirty work"]);
+    let third = refresh(&mut db);
+    assert!(third.status_complete);
+    assert!(
+        !overlay_rows(&db, &worktree_id).iter().any(|(path, _)| path == "src/c.rs"),
+        "the next tree-diff refresh prunes the content-identical reverted row"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn a_dirty_gitignore_edit_forces_the_full_diff_on_matching_heads() {
+    // #825: the one committed-side case the row seed provably cannot see — an ignore flip making
+    // a committed branch-only file indexable for the FIRST time (it produced no row, and it is
+    // tracked + clean so it is not in status). A dirty `.gitignore` among the status candidates
+    // must force the full tree diff even though the heads match the basis.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_a() {}\n").unwrap();
+    fs::write(main.join("src/.gitignore"), "gen.rs\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // The branch COMMITS an ignored file (forced add): a tree-diff candidate on the first pass,
+    // but not indexable → no overlay row.
+    fs::write(linked.join("src/gen.rs"), "pub fn generated_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "-f", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds ignored file"]);
+
+    let refresh = |db: &mut IndexDatabase| {
+        let base_sha = crate::index::head_sha(&main);
+        let linked_head = crate::index::head_sha(&linked);
+        let tail = crate::index::OverlayRefreshTail {
+            logical_rebuild: crate::index::OverlayLogicalRebuild::Inline,
+            basis: Some(crate::index::OverlayBasisUpdate {
+                base_sha: &base_sha,
+                linked_head_sha: &linked_head,
+            }),
+        };
+        db.index_worktree_overlay_with_tail(&config, &linked, tail, &mut |_| {}).unwrap()
+    };
+    let first = refresh(&mut db);
+    assert!(first.status_complete);
+    assert_eq!(first.indexed, 0, "the committed file is ignored — no overlay row yet");
+
+    // Heads unchanged; a DIRTY `.gitignore` edit unignores it. Without the forced full diff the
+    // seeded pass could never surface gen.rs: it has no row and is absent from status.
+    fs::write(linked.join("src/.gitignore"), "").unwrap();
+    let second = refresh(&mut db);
+    assert!(second.status_complete);
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/gen.rs"),
+        vec!["generated_fn".to_string()],
+        "the dirty .gitignore edit forced the tree diff, surfacing the newly-unignored file"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}

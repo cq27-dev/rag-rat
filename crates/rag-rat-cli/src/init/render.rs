@@ -82,7 +82,9 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
          [watch]\n# enabled = true\n# debounce_ms = 400           # quiet window before a reindex \
          pass\n# max_latency_ms = 2500       # force a pass after this much continuous \
          activity\n# periodic_sweep_secs = 300   # backstop pass interval, 0 disables\n# \
-         pass_cooldown_secs = 60     # minimum gap between event-driven passes, 0 disables\n\n",
+         pass_cooldown_secs = 60     # minimum gap between event-driven passes, 0 disables\n# \
+         overlay_quiet_secs = 300    # linked-worktree quiet window for uncommitted edits, 0 \
+         disables\n\n",
     );
 
     text.push_str(

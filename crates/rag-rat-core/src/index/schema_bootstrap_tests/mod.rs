@@ -371,7 +371,11 @@ fn source_config_dirs(root: PathBuf, language: Language, dirs: &[&str]) -> Confi
             kind: TargetKind::Source,
         }],
         llm: Default::default(),
-        watch: Default::default(),
+        // The #822 overlay quiet window is OFF in this shared fixture: the overlay/watch tests
+        // built on it assert per-pass refresh semantics (the #577 scope matrix, delta
+        // categorization, prune safety), which the window would time-gate. Tests exercising the
+        // window itself opt in by setting `overlay_quiet_secs` explicitly.
+        watch: rag_rat_base::config::WatchConfig { overlay_quiet_secs: 0, ..Default::default() },
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),

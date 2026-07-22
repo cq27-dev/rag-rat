@@ -252,6 +252,18 @@ pub struct WatchConfig {
     /// `periodic_sweep_secs` remains the staleness bound, and the periodic sweep is never held
     /// back by the cooldown.
     pub pass_cooldown_secs: u64,
+    /// Quiet window (seconds) for a linked worktree's overlay refresh on EVENT-scoped watcher
+    /// passes (0 disables): while both the base and the linked HEAD still equal the worktree's
+    /// recorded refresh basis (dirty-only working-tree churn — no commit, no checkout) and the
+    /// last complete refresh is younger than this, the pass skips that worktree's overlay refresh
+    /// (its base↔branch tree diff, status walk, and ignore compile). Either HEAD moving always
+    /// refreshes immediately. Only uncommitted-edit visibility is deferred: a skipped edit
+    /// surfaces on the first event-driven pass after the window elapses, or at latest on the
+    /// periodic sweep — sweep-style (`All`-scoped) passes (startup catch-up, the periodic sweep,
+    /// gc, the CLI/hook `maintenance` command) are never held back. The window is ignored when
+    /// `periodic_sweep_secs` is 0: without the sweep, a one-off edit deferred here could have no
+    /// later pass to surface it.
+    pub overlay_quiet_secs: u64,
 }
 
 impl Default for WatchConfig {
@@ -262,6 +274,7 @@ impl Default for WatchConfig {
             max_latency_ms: 2500,
             periodic_sweep_secs: 300,
             pass_cooldown_secs: 60,
+            overlay_quiet_secs: 300,
         }
     }
 }

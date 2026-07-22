@@ -88,6 +88,19 @@ impl OverlayScope {
 /// events, or at latest via the next `All` sweep (`periodic_sweep_secs`) — the same missed-event
 /// backstop the watcher already relies on.
 ///
+/// The quiet window (#822, `overlay_quiet_secs`): a worktree the scope DOES list is still skipped
+/// when both heads equal its recorded basis (dirty-only churn — file events with no commit or
+/// checkout) AND the recording COMPLETE refresh is younger than the window. Sustained editing in
+/// a worktree otherwise re-pays the full per-worktree probe every pass for a delta only the
+/// status walk can extend; the window batches that to once per `overlay_quiet_secs`. A HEAD move
+/// mismatches the basis and always refreshes immediately. Only uncommitted-edit visibility is
+/// deferred, and a skipped edit surfaces on the next pass that reaches the worktree: the first
+/// event-driven pass after the window elapses (sustained churn), or the periodic `All` sweep (a
+/// one-off edit with no follow-up event) — `All` passes never consult the window, so every
+/// existing backstop (startup catch-up, periodic sweep, gc, CLI/hook `maintenance`) is never
+/// held back. With the sweep disabled the gate turns itself off (see the clamp below): deferring
+/// an edit that no later event or sweep would deliver would leave the overlay stale forever.
+///
 /// `pub` so the hook-driven CLI `maintenance` command shares this exact path: the git hooks invoke
 /// `rag-rat maintenance` (not the foreground watcher), so without calling this a commit/checkout/
 /// merge in a linked worktree would index the base `config.root` but leave that worktree's overlay
@@ -108,6 +121,16 @@ pub fn refresh_worktree_overlays(
     // on the next pass and re-refreshes (the safe direction).
     let base_sha = crate::index::head_sha(&config.root);
     let sweep = matches!(scope, OverlayScope::All);
+    // One clock read serves every quiet-window decision of the pass (#822); the window compares
+    // against the persisted last-complete-refresh timestamp, so it survives watcher restarts.
+    let now_ms = rag_rat_base::time::now_ms();
+    // The window defers work it never schedules: a skipped edit surfaces on the NEXT pass that
+    // reaches the worktree — another event after the window elapses, or the periodic `All`
+    // sweep. With the sweep disabled (`periodic_sweep_secs = 0`) a one-off edit skipped here
+    // could have neither (no follow-up event, no sweep) and stay invisible indefinitely, so the
+    // gate disables itself rather than break the watcher's freshness contract.
+    let overlay_quiet_secs =
+        if config.watch.periodic_sweep_secs == 0 { 0 } else { config.watch.overlay_quiet_secs };
     let mut changed = false;
     for worktree in worktrees {
         if worktree == base_id {
@@ -116,11 +139,25 @@ pub fn refresh_worktree_overlays(
         // The linked HEAD is read BEFORE the refresh, so a commit racing the refresh records the
         // pre-commit head — mismatching (and re-refreshing) next pass rather than skipping.
         let linked_head = crate::index::head_sha(Path::new(&worktree));
-        if !scope.lists(&worktree)
-            && db.worktree_overlay_basis(&worktree).ok().flatten()
-                == Some((base_sha.clone(), linked_head.clone()))
-        {
+        let basis_unchanged = db.worktree_overlay_basis(&worktree).ok().flatten()
+            == Some((base_sha.clone(), linked_head.clone()));
+        if basis_unchanged && !scope.lists(&worktree) {
             continue; // not implicated by events and the diff basis is unchanged (#577)
+        }
+        // The quiet window (#822): dirty-only churn (matching basis) in a LISTED worktree defers
+        // the refresh until the window since the last COMPLETE refresh elapses. Event-scoped
+        // passes only — an `All` pass is one of the backstops the window's staleness bound
+        // relies on, so it must never be held back. A partial or failed refresh cleared the
+        // basis (timestamp included), so a stale overlay can never quiet-skip.
+        if basis_unchanged
+            && !sweep
+            && overlay_quiet_window_holds(
+                db.worktree_overlay_basis_refreshed_at_ms(&worktree).ok().flatten(),
+                overlay_quiet_secs,
+                now_ms,
+            )
+        {
+            continue;
         }
         // Refresh the overlay with the LINKED worktree's OWN config targets, not the sweeping
         // process's. A branch whose `rag-rat.toml` ADDS a target (e.g. `extra/`) would otherwise be
@@ -195,6 +232,22 @@ pub fn refresh_worktree_overlays(
     // scoped to the last worktree it touched).
     let _ = db.use_worktree_scope(&config.root, None);
     changed
+}
+
+/// Whether the #822 quiet window still holds for a heads-unchanged worktree: the last COMPLETE
+/// refresh recorded its timestamp less than `quiet_secs` ago. `0` disables the window; a missing
+/// timestamp (no recorded basis, or one written before the timestamp existed) never holds; a
+/// FUTURE timestamp (the wall clock stepped back) is a suspect proof, so it refreshes rather than
+/// skips. Pure — the caller injects `now_ms` — so the boundary cases are unit-testable.
+fn overlay_quiet_window_holds(refreshed_at_ms: Option<i64>, quiet_secs: u64, now_ms: i64) -> bool {
+    if quiet_secs == 0 {
+        return false;
+    }
+    let Some(refreshed_at_ms) = refreshed_at_ms else {
+        return false;
+    };
+    let window_ms = i64::try_from(quiet_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+    (0..window_ms).contains(&now_ms.saturating_sub(refreshed_at_ms))
 }
 
 pub(crate) fn overlay_needs_embed(
@@ -524,5 +577,34 @@ mod tests {
         let options = ReconcileOptions { max_seconds: Some(5), ..ReconcileOptions::default() };
         let spent = ReconcileBudget::new(options, Instant::now() - Duration::from_secs(10));
         assert!(spent.next_options().is_none());
+    }
+
+    #[test]
+    fn overlay_quiet_window_boundaries() {
+        let now_ms = 1_000_000;
+        assert!(
+            overlay_quiet_window_holds(Some(now_ms - 299_000), 300, now_ms),
+            "a fresh complete refresh holds the window"
+        );
+        assert!(
+            !overlay_quiet_window_holds(Some(now_ms - 300_000), 300, now_ms),
+            "the window is half-open: exactly `quiet_secs` old no longer holds"
+        );
+        assert!(
+            !overlay_quiet_window_holds(Some(now_ms - 1), 0, now_ms),
+            "0 disables the window entirely"
+        );
+        assert!(
+            !overlay_quiet_window_holds(None, 300, now_ms),
+            "no recorded timestamp (pre-#822 basis, or none) never holds"
+        );
+        assert!(
+            !overlay_quiet_window_holds(Some(now_ms + 60_000), 300, now_ms),
+            "a future timestamp (clock stepped back) refreshes rather than skips"
+        );
+        assert!(
+            overlay_quiet_window_holds(Some(0), u64::MAX, now_ms),
+            "an enormous window saturates instead of overflowing"
+        );
     }
 }

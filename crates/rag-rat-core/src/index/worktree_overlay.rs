@@ -98,15 +98,30 @@ fn linked_config_subdir_and_root(
     (config_subdir, linked_config_root)
 }
 
-/// Resolve the `(base_sha, worktree_id, source_root)` for a linked-worktree overlay, or `None` when
-/// `linked_path` is not a valid linked sibling of `config.root`'s repo (its scope fell back to
-/// base). Shared by [`IndexDatabase::index_worktree_overlay`] and
+/// A linked-worktree overlay's resolved identity plus the opened repositories it was resolved
+/// against. The repo handles are part of the resolution on purpose (#825): the delta computation
+/// used to re-discover both repos after this had already opened them — four `discover_repo`
+/// walks per refresh instead of two — so the handles are threaded through instead.
+pub(crate) struct ResolvedOverlayScope {
+    pub(crate) base_sha: String,
+    pub(crate) worktree_id: String,
+    /// `config.root`'s prefix relative to the repo workdir (both checkouts share the layout).
+    pub(crate) config_subdir: PathBuf,
+    /// The LINKED checkout's equivalent of `config.root` — overlay bytes are read from here.
+    pub(crate) source_root: PathBuf,
+    pub(crate) base_repo: gix::Repository,
+    pub(crate) linked_repo: gix::Repository,
+}
+
+/// Resolve a linked-worktree overlay's scope, or `None` when `linked_path` is not a valid linked
+/// sibling of `config.root`'s repo (its scope fell back to base). Shared by
+/// [`IndexDatabase::index_worktree_overlay`] and
 /// [`IndexDatabase::refresh_worktree_overlay_packages`] so both derive the SAME scope + source
 /// root.
 fn resolve_overlay_scope(
     config: &Config,
     linked_path: &Path,
-) -> anyhow::Result<Option<(String, String, PathBuf)>> {
+) -> anyhow::Result<Option<ResolvedOverlayScope>> {
     let (base_sha, worktree_id) =
         git_context::resolve_worktree_scope(&config.root, Some(linked_path));
     if worktree_id == git_context::worktree_id_of(&config.root) {
@@ -114,65 +129,65 @@ fn resolve_overlay_scope(
     }
     let base_repo = rag_rat_base::repo_discover::discover_repo(&config.root)?;
     let linked_repo = rag_rat_base::repo_discover::discover_repo(linked_path)?;
-    let (_, source_root) =
+    let (config_subdir, source_root) =
         linked_config_subdir_and_root(config, &base_repo, &linked_repo, linked_path);
-    Ok(Some((base_sha, worktree_id, source_root)))
+    Ok(Some(ResolvedOverlayScope {
+        base_sha,
+        worktree_id,
+        config_subdir,
+        source_root,
+        base_repo,
+        linked_repo,
+    }))
 }
 
-/// Compute the overlay delta of `linked_path` (a linked worktree of `config.root`'s repo) against
-/// the base scope. Candidate paths = the committed branch diff (base HEAD tree ↔ linked HEAD tree)
-/// UNION the linked worktree's working-tree status (dirty + untracked + deleted). Each candidate's
-/// FINAL category is decided by its on-disk state in the LINKED checkout — present → read it
-/// (readable); absent but present in the base tree → tombstone — which correctly merges committed
-/// and working-tree changes (and maps a rename to delete-old + add-new). Only target-matching paths
-/// are kept: the base wouldn't index the rest, so there is nothing to shadow.
+/// How an overlay refresh sources the COMMITTED half of its candidate set (#825) — the base↔linked
+/// tree diff, or (when provably identical) the recorded outcome of the last complete refresh.
+pub(crate) enum CommittedDeltaSource {
+    /// Walk the base HEAD tree ↔ linked HEAD tree diff. The default: a head moved, or there is no
+    /// complete-refresh proof to reuse.
+    TreeDiff,
+    /// Both HEADs still equal the recorded #577 basis: the committed diff is a pure function of
+    /// that pair, so its candidate outcome is already materialized as the worktree's current
+    /// overlay rows — source rows AND tombstones, config-root-relative
+    /// ([`IndexDatabase::list_overlay_shadowed_paths`]). Seed those instead of paying the tree
+    /// walk; the working-tree status walk still runs, since dirty edits are the only thing that
+    /// can differ while both heads hold still.
+    ///
+    /// Accepted (self-healing) divergence from [`Self::TreeDiff`]: a previously-dirty file
+    /// reverted to content the base already has keeps its (now content-identical, query-invisible)
+    /// overlay row until the next tree-diff refresh prunes it — the row seed can't distinguish
+    /// "row because committed diff" from "row because then-dirty".
+    UnchangedSinceBasis { shadowed_paths: Vec<PathBuf> },
+}
+
+/// Compute the overlay delta of `scope`'s linked worktree against the base scope. Candidate paths
+/// = the committed branch diff (per `committed` — the tree diff, or the recorded rows when the
+/// heads are unchanged, #825) UNION the linked worktree's working-tree status (dirty + untracked +
+/// deleted). Each candidate's FINAL category is decided by its on-disk state in the LINKED
+/// checkout — present → read it (readable); absent but present in the base tree → tombstone —
+/// which correctly merges committed and working-tree changes (and maps a rename to delete-old +
+/// add-new). Only target-matching paths are kept: the base wouldn't index the rest, so there is
+/// nothing to shadow.
 pub(crate) fn compute_linked_worktree_delta(
     config: &Config,
-    linked_path: &Path,
+    scope: &ResolvedOverlayScope,
+    committed: CommittedDeltaSource,
 ) -> anyhow::Result<WorktreeOverlayDelta> {
-    let base_repo = rag_rat_base::repo_discover::discover_repo(&config.root)?;
-    let linked_repo = rag_rat_base::repo_discover::discover_repo(linked_path)?;
     // `config.root` may be a SUBDIR of the repo. Tree-diff and status entries are repo-relative
     // (e.g. `crate/src/lib.rs`), but `target_for_path` / the overlay path keys are config-root-
     // relative (e.g. `src/lib.rs`), and the readable files are read from the LINKED checkout's
     // equivalent of `config.root`. `config_subdir` is the prefix to strip; `linked_config_root` is
-    // the source root overlay bytes are read from (#219 review).
-    let (config_subdir, linked_config_root) =
-        linked_config_subdir_and_root(config, &base_repo, &linked_repo, linked_path);
+    // the source root overlay bytes are read from (#219 review). Both were derived when the scope
+    // was resolved (the same repos this delta reads — #825 threads the opened handles through
+    // instead of re-discovering them here).
+    let config_subdir = &scope.config_subdir;
+    let linked_config_root = &scope.source_root;
 
     let mut candidates: BTreeSet<PathBuf> = BTreeSet::new();
 
-    // Resolve BOTH trees through `base_repo` so the cross-tree diff shares one object store (the
-    // worktrees share the same `.git`). Each is OPTIONAL: an unborn HEAD (a fresh `git worktree add
-    // --orphan`, zero commits) has no tree. Without tolerating that, `head_id()?` errored the whole
-    // pass, so the watcher logged a failure for an orphan worktree every pass (#219 review). The
-    // committed branch diff is computed only when both trees exist; the working-tree status below
-    // still captures an orphan worktree's files.
-    let base_tree = base_repo
-        .head_id()
-        .ok()
-        .and_then(|id| id.object().ok())
-        .and_then(|o| o.peel_to_tree().ok());
-    let linked_tree = linked_repo
-        .head_id()
-        .ok()
-        .and_then(|id| base_repo.find_object(id.detach()).ok())
-        .and_then(|o| o.peel_to_tree().ok());
-    if let (Some(base_tree), Some(linked_tree)) = (base_tree.as_ref(), linked_tree.as_ref()) {
-        // Rename detection OFF: a rename becomes delete(old)+add(new), which the on-disk
-        // categorization below resolves to tombstone(old) + readable(new).
-        base_tree
-            .changes()?
-            .options(|opts| {
-                opts.track_path().track_rewrites(None);
-            })
-            .for_each_to_obtain_tree(linked_tree, |change| {
-                candidates.insert(change_location_path(&change));
-                Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
-            })?;
-    }
-
-    // Linked working-tree status (vs the linked HEAD): dirty edits, untracked files, deletes. Track
+    // Linked working-tree status (vs the linked HEAD): dirty edits, untracked files, deletes —
+    // read FIRST so the committed-source decision below can see a dirty `.gitignore` edit. Track
     // whether it was read in FULL — a silently-dropped status read yields a PARTIAL delta (missing
     // untracked / working-tree-deleted paths), and the caller must skip the prune on a partial
     // delta or it would delete valid overlay rows (#219 review).
@@ -182,17 +197,78 @@ pub(crate) fn compute_linked_worktree_delta(
     // readable set). Detect it DURING the fold — status is a one-shot iterator. `Cell` because
     // `fold_status_candidates` takes an `Fn` locator, not `FnMut`.
     let manifest_in_status = std::cell::Cell::new(false);
-    if let Ok(platform) = linked_repo.status(gix::progress::Discard)
+    if let Ok(platform) = scope.linked_repo.status(gix::progress::Discard)
         && let Ok(items) =
             platform.untracked_files(UntrackedFiles::Files).into_iter(None::<gix::bstr::BString>)
     {
         status_complete = fold_status_candidates(&mut candidates, items, |item| {
             let path = PathBuf::from(item.location().to_str_lossy().as_ref());
-            if path_is_manifest_under_subdir(&path, &config_subdir) {
+            if path_is_manifest_under_subdir(&path, config_subdir) {
                 manifest_in_status.set(true);
             }
             path
         });
+    }
+
+    // The base tree is needed by BOTH committed sources: `shadows_base_file()` below and the
+    // ignore-flip expansion read it. OPTIONAL, like the linked tree: an unborn HEAD (a fresh
+    // `git worktree add --orphan`, zero commits) has no tree. Without tolerating that,
+    // `head_id()?` errored the whole pass, so the watcher logged a failure for an orphan worktree
+    // every pass (#219 review).
+    let base_tree = scope
+        .base_repo
+        .head_id()
+        .ok()
+        .and_then(|id| id.object().ok())
+        .and_then(|o| o.peel_to_tree().ok());
+
+    // A DIRTY `.gitignore` edit forces the full diff even when the heads are unchanged: an
+    // ignore flip can make a committed branch-only file indexable for the first time — such a
+    // file produced NO row on the last refresh (not indexable then) and is not in status (it is
+    // tracked and clean), so the row seed provably cannot surface it. Ignore edits are rare;
+    // paying the tree walk for them keeps the skip equivalence exact. (The caller already forces
+    // the full diff for the analogous branch-config/target-drift case.)
+    let dirty_ignore_edit =
+        candidates.iter().any(|path| path.file_name() == Some(std::ffi::OsStr::new(".gitignore")));
+    let committed = match committed {
+        CommittedDeltaSource::UnchangedSinceBasis { .. } if dirty_ignore_edit =>
+            CommittedDeltaSource::TreeDiff,
+        other => other,
+    };
+    match committed {
+        CommittedDeltaSource::TreeDiff => {
+            // Resolve the linked tree through `base_repo` so the cross-tree diff shares one
+            // object store (the worktrees share the same `.git`). The committed branch diff is
+            // computed only when both trees exist; the working-tree status above still captures
+            // an orphan worktree's files.
+            let linked_tree = scope
+                .linked_repo
+                .head_id()
+                .ok()
+                .and_then(|id| scope.base_repo.find_object(id.detach()).ok())
+                .and_then(|o| o.peel_to_tree().ok());
+            if let (Some(base_tree), Some(linked_tree)) = (base_tree.as_ref(), linked_tree.as_ref())
+            {
+                // Rename detection OFF: a rename becomes delete(old)+add(new), which the on-disk
+                // categorization below resolves to tombstone(old) + readable(new).
+                base_tree
+                    .changes()?
+                    .options(|opts| {
+                        opts.track_path().track_rewrites(None);
+                    })
+                    .for_each_to_obtain_tree(linked_tree, |change| {
+                        candidates.insert(change_location_path(&change));
+                        Ok::<_, std::convert::Infallible>(
+                            gix::object::tree::diff::Action::Continue(()),
+                        )
+                    })?;
+            }
+        },
+        CommittedDeltaSource::UnchangedSinceBasis { shadowed_paths } => {
+            // Overlay rows are keyed config-root-relative; candidates are repo-relative until the
+            // categorization loop strips the subdir back off.
+            candidates.extend(shadowed_paths.iter().map(|rel| config_subdir.join(rel)));
+        },
     }
 
     // Honor the worktree's `.gitignore` for files PRESENT in the worktree, so the overlay indexes
@@ -203,7 +279,7 @@ pub(crate) fn compute_linked_worktree_delta(
     // Tombstones are NOT ignore-filtered: a branch-deleted file must shadow its base row
     // regardless of ignore rules.
     let ignore =
-        ignore_rules::IgnoreMatcher::compile(&linked_config_root, &config.target_directories());
+        ignore_rules::IgnoreMatcher::compile(linked_config_root, &config.target_directories());
 
     // Ignore-ONLY change expansion. When the branch's only change under a directory is a
     // `.gitignore` edit, the tree-diff/status candidates contain just `.gitignore` itself — the
@@ -219,8 +295,8 @@ pub(crate) fn compute_linked_worktree_delta(
     expand_candidates_for_ignore_only_flips(
         &mut candidates,
         base_tree.as_ref(),
-        &config_subdir,
-        &linked_config_root,
+        config_subdir,
+        linked_config_root,
         &ignore,
         config,
     );
@@ -234,7 +310,7 @@ pub(crate) fn compute_linked_worktree_delta(
         // Candidates are repo-relative; the overlay keys rows config-root-relative (matching the
         // base rows + `target_for_path`). A candidate OUTSIDE the config subdir has no base row to
         // shadow, so it can't strip the prefix → skip it.
-        let Ok(rel) = repo_rel.strip_prefix(&config_subdir) else {
+        let Ok(rel) = repo_rel.strip_prefix(config_subdir) else {
             continue;
         };
         let rel = rel.to_path_buf();
@@ -380,13 +456,25 @@ fn change_location_path(change: &gix::object::tree::diff::Change<'_, '_, '_>) ->
 }
 
 /// `repo_meta` key prefix for a linked worktree's overlay refresh basis (#577): one key per
-/// `worktree_id`, value `"<base_sha>\n<linked_head_sha>"` — the (base HEAD, linked HEAD) pair the
-/// overlay delta was last computed against. A scoped watcher pass skips a worktree not implicated
-/// by events ONLY while this pair still matches; either head moving (a base commit re-basing every
-/// overlay, a linked commit with no file event) forces the refresh. Kept per worktree in the
-/// per-repo kv rather than a dedicated table: it is a marker, not queried relationally, and the
+/// `worktree_id`, value `"<base_sha>\n<linked_head_sha>\n<refreshed_at_ms>"` — the (base HEAD,
+/// linked HEAD) pair the overlay delta was last computed against, plus when that COMPLETE refresh
+/// recorded it (epoch ms, the #822 quiet-window anchor). A scoped watcher pass skips a worktree
+/// not implicated by events ONLY while this pair still matches; either head moving (a base commit
+/// re-basing every overlay, a linked commit with no file event) forces the refresh. A pre-#822
+/// two-line value still yields the pair — its missing timestamp just disarms the quiet window
+/// (never the safe-direction refresh). Kept per worktree in the per-repo kv rather than a
+/// dedicated table: it is a marker, not queried relationally, and the
 /// `watch_shutdown_reconcile_pending` marker set the pattern.
 const WORKTREE_OVERLAY_BASIS_META_PREFIX: &str = "worktree_overlay_basis:";
+
+/// A parsed refresh-basis value: the #577 skip-proof pair plus, when recorded by a #822-aware
+/// build, the recording refresh's timestamp. Internal to the two projection readers so the meta
+/// value is parsed in exactly one place.
+struct RecordedOverlayBasis {
+    base_sha: String,
+    linked_head_sha: String,
+    refreshed_at_ms: Option<i64>,
+}
 
 /// `repo_meta` key marking that a committed overlay refresh deferred the repo-global
 /// `logical_symbols` rebuild to its batch's tail (#819). Set INSIDE each overlay transaction that
@@ -460,30 +548,64 @@ impl OverlayChangeCounts {
 }
 
 impl IndexDatabase {
+    /// The parsed refresh-basis value for `worktree_id`, or `None` when never refreshed (or
+    /// written by a pre-#577 build). The single parse under both projection readers below.
+    fn read_worktree_overlay_basis(
+        &self,
+        worktree_id: &str,
+    ) -> anyhow::Result<Option<RecordedOverlayBasis>> {
+        let key = format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}");
+        Ok(self.repo_meta(&key)?.and_then(|value| {
+            let mut lines = value.splitn(3, '\n');
+            let base_sha = lines.next()?.to_string();
+            let linked_head_sha = lines.next()?.to_string();
+            // Absent on a pre-#822 two-line value; an unparsable third line degrades the same
+            // way (no quiet skip) rather than invalidating the still-meaningful pair.
+            let refreshed_at_ms = lines.next().and_then(|at_ms| at_ms.parse().ok());
+            Some(RecordedOverlayBasis { base_sha, linked_head_sha, refreshed_at_ms })
+        }))
+    }
+
     /// The recorded refresh basis for `worktree_id`: `(base_sha, linked_head_sha)` at the last
-    /// successful overlay refresh, or `None` when never refreshed (or written by a pre-#577
+    /// COMPLETE overlay refresh, or `None` when never refreshed (or written by a pre-#577
     /// build) — the caller then refreshes unconditionally.
     pub(crate) fn worktree_overlay_basis(
         &self,
         worktree_id: &str,
     ) -> anyhow::Result<Option<(String, String)>> {
-        let key = format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}");
-        Ok(self.repo_meta(&key)?.and_then(|value| {
-            let (base_sha, linked_head) = value.split_once('\n')?;
-            Some((base_sha.to_string(), linked_head.to_string()))
-        }))
+        Ok(self
+            .read_worktree_overlay_basis(worktree_id)?
+            .map(|basis| (basis.base_sha, basis.linked_head_sha)))
     }
 
-    /// Upsert the refresh basis after a successful overlay refresh. `set_repo_meta_if_changed` so
-    /// an unchanged-basis `All` sweep stays write-free (#63 idle backstop).
+    /// When `worktree_id`'s last COMPLETE refresh recorded its basis (epoch ms) — the #822
+    /// quiet-window anchor — or `None` when no basis is recorded or it predates the timestamp
+    /// (either way the quiet window never holds; the refresh side of that coin is always safe).
+    pub(crate) fn worktree_overlay_basis_refreshed_at_ms(
+        &self,
+        worktree_id: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        Ok(self.read_worktree_overlay_basis(worktree_id)?.and_then(|basis| basis.refreshed_at_ms))
+    }
+
+    /// Upsert the refresh basis after a COMPLETE overlay refresh, stamped with `refreshed_at_ms`
+    /// (injected by the caller — the quiet-window anchor, #822). The timestamp advances on every
+    /// complete refresh, so unlike the pre-#822 pair-only value this writes one `repo_meta` row
+    /// per recording refresh — bounded by the #822 gate itself (a scoped pass inside the window
+    /// skips the whole refresh, and with it this write) and negligible next to the tree diff /
+    /// status walk the recording refresh just paid.
     pub(crate) fn record_worktree_overlay_basis(
         &self,
         worktree_id: &str,
         base_sha: &str,
         linked_head_sha: &str,
+        refreshed_at_ms: i64,
     ) -> anyhow::Result<()> {
         let key = format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}");
-        self.set_repo_meta_if_changed(&key, &format!("{base_sha}\n{linked_head_sha}"))?;
+        self.set_repo_meta_if_changed(
+            &key,
+            &format!("{base_sha}\n{linked_head_sha}\n{refreshed_at_ms}"),
+        )?;
         Ok(())
     }
 
@@ -571,9 +693,7 @@ impl IndexDatabase {
         // `source_root` is the LINKED checkout's equivalent of `config.root` — bytes are read from
         // there, not the raw `linked_path` (which may be a subdir of the checkout, e.g. `--worktree
         // .` from `/wt/src`, or the git dir from a hook) (#219 review).
-        let Some((base_sha, worktree_id, source_root)) =
-            resolve_overlay_scope(config, linked_path)?
-        else {
+        let Some(overlay) = resolve_overlay_scope(config, linked_path)? else {
             // Fell back to base → not a valid linked sibling; nothing to overlay. Still an
             // entry-point exit, so it settles a pending batch obligation like every other one.
             self.settle_pending_logical_rebuild_inline(tail.logical_rebuild)?;
@@ -581,9 +701,11 @@ impl IndexDatabase {
         };
         // Scope the connection to the overlay (base commit + linked worktree id) so context-
         // dependent steps (tombstones, FTS, edge resolution) operate in the linked scope.
-        self.set_context(&base_sha, &worktree_id)?;
+        self.set_context(&overlay.base_sha, &overlay.worktree_id)?;
 
-        let mut delta = compute_linked_worktree_delta(config, linked_path)?;
+        let committed = self.resolve_committed_delta_source(&overlay, config)?;
+        let mut delta = compute_linked_worktree_delta(config, &overlay, committed)?;
+        let ResolvedOverlayScope { base_sha, worktree_id, source_root, .. } = overlay;
         // Fold in TARGET-IDENTITY drift: a branch config change that re-languages or drops a
         // byte-identical file is invisible to the content delta, but the overlay's (language, kind)
         // must still track the branch config, like discovery's staleness (#659 review). This also
@@ -716,7 +838,7 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        let Some((base_sha, worktree_id, source_root)) =
+        let Some(ResolvedOverlayScope { base_sha, worktree_id, source_root, .. }) =
             resolve_overlay_scope(config, linked_path)?
         else {
             // Not a valid linked sibling — still an entry-point exit (#819 review): settle a
@@ -901,6 +1023,58 @@ impl IndexDatabase {
         )?)
     }
 
+    /// Decide how a whole-delta refresh sources the COMMITTED half of its candidate set (#825).
+    /// When both CURRENT heads (re-read here, from the already-opened repos) still equal the
+    /// recorded #577 basis, the base↔linked tree diff would reproduce exactly the last complete
+    /// refresh's candidate outcome — materialized as the worktree's current overlay rows — so the
+    /// walk is skipped and those rows seed the candidates instead. Only complete refreshes record
+    /// the basis, only refreshes (or basis-clearing path-scoped passes) mutate overlay rows, and
+    /// a commit racing this read lands the safe way (the stored pair mismatches → full diff).
+    ///
+    /// Forced to the full diff when the branch config's targets may drift against the base
+    /// fingerprint: a re-target/re-language changes categorization without moving a HEAD and can
+    /// surface committed branch-only files that never produced a row, which the row seed provably
+    /// cannot see. (`compute_linked_worktree_delta` itself falls back on a dirty `.gitignore`
+    /// edit, the other row-blind case.)
+    fn resolve_committed_delta_source(
+        &self,
+        overlay: &ResolvedOverlayScope,
+        config: &Config,
+    ) -> anyhow::Result<CommittedDeltaSource> {
+        let heads_unchanged = self.worktree_overlay_basis(&overlay.worktree_id)?.is_some_and(
+            |(recorded_base, recorded_linked)| {
+                recorded_base == overlay.base_sha
+                    && recorded_linked == git_context::repo_head_sha(&overlay.linked_repo)
+            },
+        );
+        if !heads_unchanged || self.overlay_targets_may_drift(&config.targets)? {
+            return Ok(CommittedDeltaSource::TreeDiff);
+        }
+        Ok(CommittedDeltaSource::UnchangedSinceBasis {
+            shadowed_paths: self.list_overlay_shadowed_paths(&overlay.worktree_id)?,
+        })
+    }
+
+    /// Every path `worktree_id`'s overlay claims at the live generation — source rows AND
+    /// tombstones (`kind = 'deleted'`), config-root-relative: the materialized `shadowing_paths`
+    /// outcome of the last complete refresh, i.e. the committed-candidate seed when both HEADs
+    /// still match the recorded basis (#825). Tombstones MUST be included, or the seeded pass's
+    /// prune would drop them and un-shadow branch-deleted base files.
+    fn list_overlay_shadowed_paths(&self, worktree_id: &str) -> anyhow::Result<Vec<PathBuf>> {
+        let conn = self.storage.connection();
+        let mut stmt = conn.prepare(
+            "SELECT path FROM main.files WHERE repo_id = ?1 AND commit_sha = '' AND worktree_id = \
+             ?2 AND generation = ?3",
+        )?;
+        let paths = stmt
+            .query_map(params![self.active_repo_id, worktree_id, self.active_generation], |row| {
+                row.get::<_, String>(0)
+            })?
+            .map(|row| row.map(PathBuf::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(paths)
+    }
+
     /// Refresh JUST the linked overlay's package/import scope (and re-resolve its edges against the
     /// new map) — the `index --paths <linked>/Cargo.toml` entry point when the supplied manifest is
     /// CLEAN/committed. `index_worktree_overlay` derives its manifest signal from the WORKING-TREE
@@ -915,7 +1089,7 @@ impl IndexDatabase {
         config: &Config,
         linked_path: &Path,
     ) -> anyhow::Result<()> {
-        let Some((base_sha, worktree_id, source_root)) =
+        let Some(ResolvedOverlayScope { base_sha, worktree_id, source_root, .. }) =
             resolve_overlay_scope(config, linked_path)?
         else {
             return Ok(());
@@ -1047,7 +1221,17 @@ impl IndexDatabase {
     ) -> anyhow::Result<()> {
         let Some(basis) = basis else { return Ok(()) };
         if status_complete {
-            self.record_worktree_overlay_basis(worktree_id, basis.base_sha, basis.linked_head_sha)
+            // The quiet-window anchor (#822) is stamped here, at the one seam every recording
+            // refresh passes through; `now_ms` is the codebase's single sanctioned wall-clock
+            // read. Riding the same value as the pair means clear-on-partial (below) and the
+            // caller-side clear-on-failure drop the timestamp with it — a cleared basis can
+            // never leave a stale quiet-skip behind.
+            self.record_worktree_overlay_basis(
+                worktree_id,
+                basis.base_sha,
+                basis.linked_head_sha,
+                rag_rat_base::time::now_ms(),
+            )
         } else {
             self.clear_worktree_overlay_basis(worktree_id)
         }

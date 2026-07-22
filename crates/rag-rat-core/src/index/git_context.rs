@@ -93,10 +93,14 @@ pub(crate) fn matches_simple_pattern(path: &str, pattern: &str) -> bool {
 /// HEAD commit sha for `root` via gix, or empty if unborn / not a repo (matching the old
 /// `rev-parse HEAD` failure behavior).
 pub(crate) fn head_sha(root: &Path) -> String {
-    discover_repo(root)
-        .ok()
-        .and_then(|repo| repo.head_id().ok().map(|id| id.to_hex().to_string()))
-        .unwrap_or_default()
+    discover_repo(root).ok().map(|repo| repo_head_sha(&repo)).unwrap_or_default()
+}
+
+/// [`head_sha`] for an ALREADY-OPENED repository — byte-identical formatting (empty when unborn),
+/// for callers holding a handle that must not pay a re-discover. Comparisons against a recorded
+/// refresh basis (whose shas came from `head_sha`) rely on the two never diverging.
+pub(crate) fn repo_head_sha(repo: &gix::Repository) -> String {
+    repo.head_id().ok().map(|id| id.to_hex().to_string()).unwrap_or_default()
 }
 
 /// Whether the worktree has any uncommitted change (tracked modifications + untracked files), the

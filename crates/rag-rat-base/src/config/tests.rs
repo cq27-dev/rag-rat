@@ -2175,6 +2175,7 @@ fn watch_config_defaults_on_and_parses_overrides() {
     assert_eq!(default.max_latency_ms, 2500);
     assert_eq!(default.periodic_sweep_secs, 300);
     assert_eq!(default.pass_cooldown_secs, 60);
+    assert_eq!(default.overlay_quiet_secs, 300);
 
     let raw: RawConfig = toml::from_str(
         r#"
@@ -2187,6 +2188,7 @@ fn watch_config_defaults_on_and_parses_overrides() {
             max_latency_ms = 4000
             periodic_sweep_secs = 0
             pass_cooldown_secs = 5
+            overlay_quiet_secs = 0
             "#,
     )
     .unwrap();
@@ -2197,6 +2199,7 @@ fn watch_config_defaults_on_and_parses_overrides() {
         max_latency_ms: 4000,
         periodic_sweep_secs: 0,
         pass_cooldown_secs: 5,
+        overlay_quiet_secs: 0,
     });
 }
 
