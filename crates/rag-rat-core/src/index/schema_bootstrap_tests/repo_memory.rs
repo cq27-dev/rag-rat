@@ -2930,7 +2930,7 @@ fn read_chunk_attaches_distilled_records_for_the_chunk_symbol() {
     let base_symbol_path = chunk.symbol_path.clone().expect("the chunk defines a symbol");
     let continuation = format!("{base_symbol_path}#1");
     assert_eq!(
-        db.records_for_chunk_symbol("src/lib.rs", Some(&continuation), 2)
+        db.records_for_chunk_symbol(chunk_id, Some(&continuation), 2)
             .unwrap()
             .iter()
             .map(|r| r.record.item_key.as_str())
@@ -2953,10 +2953,8 @@ fn read_chunk_attaches_distilled_records_for_the_chunk_symbol() {
     assert!(bare.distilled_records.is_empty(), "the drive-by rides the memories include flag");
 
     // Resolver guards: a chunk with no symbol name, and an unknown symbol, both surface nothing.
-    assert!(db.records_for_chunk_symbol("src/lib.rs", None, 2).unwrap().is_empty());
-    assert!(
-        db.records_for_chunk_symbol("src/lib.rs", Some("does_not_exist"), 2).unwrap().is_empty()
-    );
+    assert!(db.records_for_chunk_symbol(chunk_id, None, 2).unwrap().is_empty());
+    assert!(db.records_for_chunk_symbol(chunk_id, Some("does_not_exist"), 2).unwrap().is_empty());
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -6826,6 +6824,286 @@ fn a_rebuild_carrying_a_committed_leftover_defers_the_stamp() {
         None,
         "a rebuild carrying an other-commit committed leftover must defer the stamp, not stamp \
          over its un-reparsed rows"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A chunk resolves to the symbol it actually covers, disambiguated by BYTE OVERLAP (#855).
+///
+/// `qualified_name` is `"{path}::{simple_name}"` — the bare identifier, not scope-qualified — so
+/// every same-simple-name symbol in a file shares one name (`describe` here; `fmt` / `new` /
+/// `default` in real code). `chunks.symbol_path` is that same ambiguous string and the chunk
+/// carries no symbol id, so resolving on the name alone with `LIMIT 1` returned an arbitrary
+/// winner that could flip between reindexes as rowids are reassigned.
+///
+/// Overlap rather than containment: a chunk begins BEFORE its symbol when it captures the leading
+/// doc comment, so `symbol.start <= chunk.start` would reject the right answer.
+///
+/// NOTE the second half of this test. These two methods have BYTE-IDENTICAL declaration lines, and
+/// `signature` — the trimmed first line — is part of `LogicalSymbolKey`, so they collapse into ONE
+/// logical symbol. Every logical-id-anchored surface therefore still applies to both, and no
+/// chunk-side resolution can change that; it is a defect in the identity key. (When the
+/// declaration lines DIFFER the two are distinct logical symbols and the leak is real and fixed —
+/// see `a_decision_record_does_not_leak_between_distinct_same_named_methods`.) This test pins the
+/// raw-`symbol_id` precision that IS fixable here, plus the collapse itself, so the day the
+/// identity key gains a scope discriminator, this test notices.
+#[test]
+fn a_chunk_binding_resolves_the_symbol_it_overlaps_not_an_arbitrary_same_named_sibling() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub struct Alpha;\npub struct Beta;\n\nimpl Alpha {\n    /// Alpha's describe.\n    pub fn \
+         describe(&self) -> u32 {\n        let a = 1;\n        let b = 2;\n        a + b\n    }\n}\n\nimpl \
+         Beta {\n    /// Beta's describe.\n    pub fn describe(&self) -> u32 {\n        let c = \
+         3;\n        let d = 4;\n        c + d\n    }\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    // The two `describe` symbols share one qualified name and differ only by byte range.
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.start_byte FROM symbols s
+             JOIN name_strings ns ON ns.id = s.qualified_name_id
+             WHERE ns.value = 'src/lib.rs::describe' ORDER BY s.start_byte",
+        )
+        .unwrap();
+    let describes: Vec<(i64, i64)> =
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
+    drop(stmt);
+    assert_eq!(describes.len(), 2, "the fixture must actually collide, or this proves nothing");
+    let (alpha_symbol, beta_symbol) = (describes[0].0, describes[1].0);
+
+    let chunk_at = |after: i64| -> i64 {
+        conn.query_row(
+            "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE f.path = 'src/lib.rs' AND c.symbol_path = 'src/lib.rs::describe'
+               AND c.start_byte >= ?1 ORDER BY c.start_byte LIMIT 1",
+            [after],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let alpha_chunk = chunk_at(0);
+    let beta_chunk = chunk_at(describes[1].1 - 8);
+    assert_ne!(alpha_chunk, beta_chunk, "the two methods must land in distinct chunks");
+
+    let resolve = |chunk_id: i64| {
+        rag_rat_query::memory::resolve_binding(conn, &rag_rat_query::memory::RepoMemoryBindTarget {
+            chunk_id: Some(chunk_id),
+            ..Default::default()
+        })
+        .unwrap()
+        .expect("chunk binding resolves")
+    };
+    let alpha = resolve(alpha_chunk);
+    let beta = resolve(beta_chunk);
+
+    assert_eq!(
+        alpha.symbol_id,
+        Some(alpha_symbol),
+        "the first method's chunk binds the first method, not whichever rowid sorted first",
+    );
+    assert_eq!(beta.symbol_id, Some(beta_symbol), "and the second method's chunk binds the second",);
+
+    // The known remaining imprecision, pinned deliberately: logical grouping is
+    // `(repo_id, path, logical_name)`, so these two distinct methods are ONE logical symbol and
+    // anything anchored to it applies to both.
+    assert_eq!(
+        alpha.logical_symbol_id, beta.logical_symbol_id,
+        "same-named symbols in one file still share a logical id — if this ever fails, grouping \
+         gained a discriminator and the logical-id-anchored surfaces became per-method",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// NESTED same-named symbols: each chunk binds its OWN nesting level (#855).
+///
+/// A `run` defined inside another `run` is the case that kills the intuitive rule. The inner
+/// chunk overlaps the ENCLOSING symbol more than its own — the enclosing range is simply larger —
+/// so "widest overlap wins" binds the inner chunk to the outer symbol. Resolution is by closest
+/// range instead, which is what makes both directions come out right.
+#[test]
+fn nested_same_named_symbols_each_bind_their_own_nesting_level() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn run() -> u32 {\n    /// inner\n    fn run() -> u32 {\n        let x = 1;\n        \
+         let y = 2;\n        x + y\n    }\n    let z = run();\n    z + 1\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.start_byte, s.end_byte FROM symbols s
+             JOIN name_strings ns ON ns.id = s.qualified_name_id
+             WHERE ns.value = 'src/lib.rs::run' ORDER BY s.start_byte",
+        )
+        .unwrap();
+    let runs: Vec<(i64, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    drop(stmt);
+    assert_eq!(runs.len(), 2, "the fixture must nest two same-named fns");
+    let (outer_symbol, inner_symbol) = (runs[0].0, runs[1].0);
+    assert!(
+        runs[0].1 < runs[1].1 && runs[1].2 < runs[0].2,
+        "the second symbol must be nested INSIDE the first, or this tests nothing",
+    );
+
+    let mut cstmt = conn
+        .prepare(
+            "SELECT c.id, c.start_byte FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE f.path = 'src/lib.rs' AND c.symbol_path = 'src/lib.rs::run'
+             ORDER BY c.start_byte",
+        )
+        .unwrap();
+    let chunks: Vec<(i64, i64)> =
+        cstmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
+    drop(cstmt);
+    assert_eq!(chunks.len(), 2, "each nesting level gets its own chunk");
+
+    let resolve = |chunk_id: i64| {
+        rag_rat_query::memory::resolve_binding(conn, &rag_rat_query::memory::RepoMemoryBindTarget {
+            chunk_id: Some(chunk_id),
+            ..Default::default()
+        })
+        .unwrap()
+        .expect("chunk binding resolves")
+        .symbol_id
+    };
+    assert_eq!(resolve(chunks[0].0), Some(outer_symbol), "the outer chunk binds the outer fn");
+    assert_eq!(
+        resolve(chunks[1].0),
+        Some(inner_symbol),
+        "the inner chunk binds the INNER fn — it overlaps the enclosing symbol more, so a \
+         widest-overlap rule would get this backwards",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// THE #855 CASE: a decision record must not leak between same-named methods that are genuinely
+/// distinct logical symbols.
+///
+/// Logical grouping keys on `LogicalSymbolKey { language, path, name, qualified_name, kind,
+/// signature }`. `qualified_name` is `"{path}::{simple_name}"` and `signature` is the trimmed
+/// FIRST LINE of the declaration, so two same-named methods split into distinct logical symbols
+/// exactly when their declaration lines differ. When they do — `describe(&self) -> u32` vs
+/// `describe(&self, extra: u8) -> u64` here — an arbitrary `LIMIT 1` winner in the chunk resolver
+/// binds one method's chunk to the OTHER's logical symbol, and a record anchored there surfaces as
+/// context on a method it was never about.
+///
+/// (Where the declaration lines are byte-identical — two trait impls of `fmt`, two `default`s —
+/// the two methods are ONE logical symbol and no chunk-side fix can separate them. That is a
+/// distinct defect in the identity key, not something this resolver can reach.)
+#[test]
+fn a_decision_record_does_not_leak_between_distinct_same_named_methods() {
+    use rag_rat_base::config::MemorySurface;
+    use rag_rat_query::graph_meta::GraphMetaMode;
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub struct Alpha;\npub struct Beta;\n\nimpl Alpha {\n    /// Alpha's describe.\n    pub \
+         fn describe(&self) -> u32 {\n        let a = 1;\n        let b = 2;\n        a + b\n    \
+         }\n}\n\nimpl Beta {\n    /// Beta's describe.\n    pub fn describe(&self, extra: u8) -> \
+         u64 {\n        let c = u64::from(extra);\n        let d = 4;\n        c + d\n    }\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.start_byte, m.logical_symbol_id FROM symbols s
+             JOIN logical_symbol_members m ON m.symbol_id = s.id
+             JOIN name_strings ns ON ns.id = s.qualified_name_id
+             WHERE ns.value = 'src/lib.rs::describe' ORDER BY s.start_byte",
+        )
+        .unwrap();
+    let describes: Vec<(i64, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    drop(stmt);
+    assert_eq!(describes.len(), 2, "the fixture must collide on name");
+    assert_ne!(
+        describes[0].2, describes[1].2,
+        "differing declaration lines must yield DISTINCT logical symbols, or this test cannot \
+         distinguish a leak from correct shared-anchor behaviour",
+    );
+    let alpha_logical = describes[0].2;
+
+    let chunk_at = |after: i64| -> i64 {
+        conn.query_row(
+            "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE f.path = 'src/lib.rs' AND c.symbol_path = 'src/lib.rs::describe'
+               AND c.start_byte >= ?1 ORDER BY c.start_byte LIMIT 1",
+            [after],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let (alpha_chunk, beta_chunk) = (chunk_at(0), chunk_at(describes[1].1 - 8));
+    assert_ne!(alpha_chunk, beta_chunk);
+
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
+    conn.execute(
+        "INSERT INTO papertrail_distill
+             (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+              root_issue, fix_edge_source, thread_shape, anchors_qualified_count,
+              distilled_at_ms, repo_id)
+         VALUES ('github','o/r','issue','5','sha256:h',3,'5','provider','investigation',1,10,?1)",
+        rusqlite::params![repo_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO papertrail_distill_anchors
+             (tracker, project, item_kind, item_key, anchor_kind, logical_symbol_id, name,
+              resolved, candidate_ordinal, selected, repo_id)
+         VALUES ('github','o/r','issue','5','symbol',?1,'describe',1,0,1,?2)",
+        rusqlite::params![rag_rat_base::serde_big_id::format_sym_handle(alpha_logical), repo_id],
+    )
+    .unwrap();
+
+    let records_on = |chunk_id: i64| -> Vec<String> {
+        db.read_chunk_with_graph_and_memories(
+            chunk_id,
+            GraphMetaMode::Full,
+            20,
+            true,
+            MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("chunk")
+        .distilled_records
+        .iter()
+        .map(|r| r.record.item_key.clone())
+        .collect()
+    };
+
+    assert_eq!(records_on(alpha_chunk), vec!["5".to_string()], "attaches to the anchored method");
+    assert!(
+        records_on(beta_chunk).is_empty(),
+        "and does NOT leak onto the same-named sibling — the wrong decision record presented as \
+         context is exactly what #855 reported",
     );
 
     let _ = fs::remove_dir_all(&root);

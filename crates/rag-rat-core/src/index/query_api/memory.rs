@@ -150,14 +150,14 @@ impl IndexDatabase {
     /// `records_for_symbol`, which the MCP handler invokes directly).
     pub(crate) fn records_for_chunk_symbol(
         &self,
-        path: &str,
+        chunk_id: i64,
         symbol_path: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
         let conn = self.storage.connection();
         let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
         let logical_symbol_id =
-            rag_rat_query::memory::logical_symbol_id_for_chunk_symbol(conn, path, symbol_path)?;
+            rag_rat_query::memory::logical_symbol_id_for_chunk_symbol(conn, chunk_id, symbol_path)?;
         Self::drive_by_records_scoped(conn, &repo_id, logical_symbol_id, limit)
     }
 
@@ -182,27 +182,32 @@ impl IndexDatabase {
         if !rag_rat_db::schema::table_exists(conn, "papertrail_distill")? {
             return Ok(());
         }
-        // Resolve the repo scope ONCE for the batch, and memoize records by (path, symbol_path) so
-        // the many chunks of one symbol (e.g. its continuation parts) resolve + fetch a single time
-        // rather than re-querying per hit.
+        // Resolve the repo scope ONCE for the batch, then memoize the record FETCH by the
+        // RESOLVED logical id. Keying the memo on the raw `(path, symbol_path)` would be both
+        // wrong and useless now: resolution is per-chunk (two same-named methods in one file share
+        // a symbol_path but are different symbols), and continuation chunks carry distinct
+        // `qname#<part>` strings that never collided as keys in the first place. The logical id is
+        // what the many chunks of one symbol actually share.
         let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-        let mut by_symbol: std::collections::HashMap<
-            (String, Option<String>),
-            Vec<rag_rat_papertrail::DriveByRecord>,
-        > = std::collections::HashMap::new();
+        let mut by_logical: std::collections::HashMap<i64, Vec<rag_rat_papertrail::DriveByRecord>> =
+            std::collections::HashMap::new();
         for hit in hits.iter_mut() {
-            let key = (hit.path.clone(), hit.symbol_path.clone());
-            if let Some(cached) = by_symbol.get(&key) {
+            let Some(logical_symbol_id) =
+                rag_rat_query::memory::logical_symbol_id_for_chunk_symbol(
+                    conn,
+                    hit.chunk_id,
+                    hit.symbol_path.as_deref(),
+                )?
+            else {
+                continue;
+            };
+            if let Some(cached) = by_logical.get(&logical_symbol_id) {
                 hit.distilled_records = cached.clone();
                 continue;
             }
-            let logical_symbol_id = rag_rat_query::memory::logical_symbol_id_for_chunk_symbol(
-                conn,
-                &hit.path,
-                hit.symbol_path.as_deref(),
-            )?;
-            let records = Self::drive_by_records_scoped(conn, &repo_id, logical_symbol_id, 2)?;
-            by_symbol.insert(key, records.clone());
+            let records =
+                Self::drive_by_records_scoped(conn, &repo_id, Some(logical_symbol_id), 2)?;
+            by_logical.insert(logical_symbol_id, records.clone());
             hit.distilled_records = records;
         }
         Ok(())

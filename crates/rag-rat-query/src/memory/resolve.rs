@@ -466,57 +466,119 @@ pub(crate) fn symbol_id_for_chunk(
     conn: &Connection,
     chunk: &ChunkAnchor,
 ) -> anyhow::Result<Option<i64>> {
-    symbol_id_for_path_symbol(conn, &chunk.path, chunk.symbol_path.as_deref())
+    symbol_id_for_chunk_symbol(conn, chunk.chunk_id, chunk.symbol_path.as_deref())
 }
 
-/// The `symbols` rowid for the symbol at (`path`, qualified `symbol_path`). `None` when there is no
-/// symbol name or the name is unknown to the index. The rowid is reassigned on every reindex
-/// (#149), so resolve it to a logical id before caching or crossing the wire.
-pub(crate) fn symbol_id_for_path_symbol(
+/// The `symbols` rowid for the symbol a CHUNK defines, disambiguated by BYTE OVERLAP.
+///
+/// `qualified_name` is `"{path}::{simple_name}"` — the bare identifier, not scope-qualified — so
+/// every same-simple-name symbol in a file shares one name (`fmt` across two trait impls, `new`
+/// across several inherent impls). `chunks.symbol_path` is that same ambiguous string and the
+/// chunk carries no symbol id, so resolving on the name alone with `LIMIT 1` returns an arbitrary
+/// winner that flips between reindexes as rowids are reassigned (#855).
+///
+/// The chunk is DERIVED from a symbol, so the match is the symbol whose range most closely
+/// corresponds to the chunk's: minimise `|Δstart| + |Δend|`. Overlap is only a prefilter.
+///
+/// Neither obvious alternative survives contact with real input. Containment
+/// (`symbol.start <= chunk.start`) fails because a chunk begins BEFORE its symbol whenever it
+/// captures the leading doc comment. WIDEST OVERLAP fails on NESTED same-named symbols — a `run`
+/// defined inside another `run` — where the inner chunk overlaps the enclosing symbol MORE than
+/// its own simply because the enclosing one is larger, so the inner chunk would bind the outer
+/// symbol. Closest-range handles siblings, nesting, and the doc-comment offset uniformly. The
+/// rowid remains only as a last-resort determinism guarantee.
+///
+/// This is NOT merely a raw-rowid concern. Logical grouping keys on `LogicalSymbolKey
+/// { language, path, name, qualified_name, kind, signature }`, where `signature` is the trimmed
+/// FIRST LINE of the declaration — so two same-named symbols in one file are DISTINCT logical
+/// symbols whenever their declaration lines differ. Resolving to the wrong one therefore maps
+/// through `logical_symbol_members` to the wrong logical id, and surfaces another symbol's repo
+/// memories and decision records as context. (Where the declaration lines coincide — two trait
+/// impls of `fmt`, two `default`s — the symbols are ONE logical symbol and no chunk-side
+/// resolution can separate them; that is a defect in the identity key, not here.)
+///
+/// KNOWN RESIDUAL: a symbol long enough to SPLIT that also contains a same-named NESTED symbol can
+/// still resolve a continuation part onto the nested symbol. Proximity reconstructs an association
+/// the chunker knew and did not persist, and no ordering over byte ranges recovers it in general;
+/// the root fix is to record the defining symbol on the chunk at chunk time instead of inferring
+/// it here.
+///
+/// Keying on `chunk_id` also pins the file exactly — `chunks.file_id` identifies one file even in a
+/// consolidated multi-repo database, where two repos can share a path (#852).
+///
+/// The rowid is reassigned on every reindex (#149), so resolve it to a logical id before caching or
+/// crossing the wire.
+pub(crate) fn symbol_id_for_chunk_symbol(
     conn: &Connection,
-    path: &str,
+    chunk_id: i64,
     symbol_path: Option<&str>,
 ) -> anyhow::Result<Option<i64>> {
     let Some(symbol_path) = symbol_path else {
         return Ok(None);
     };
-    conn.query_row(
-        "
+    // A symbol wider than the chunk limit is split into parts; its continuation chunks carry a
+    // `qualified_name#<part>` symbol_path while `symbols.qualified_name_id` stores only the bare
+    // qualified name. Strip the suffix so a continuation resolves to the SAME defining symbol.
+    let base = strip_chunk_continuation_suffix(symbol_path);
+    let overlapping: Option<i64> = conn
+        .query_row(
+            "
         SELECT symbols.id AS symbol_id
-        FROM symbols
-        JOIN files ON files.id = symbols.file_id
-        WHERE files.path = ?1
+        FROM chunks
+        JOIN symbols ON symbols.file_id = chunks.file_id
+        WHERE chunks.id = ?1
           AND symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?2)
+          AND symbols.start_byte < chunks.end_byte
+          AND chunks.start_byte < symbols.end_byte
+        ORDER BY
+          ABS(symbols.start_byte - chunks.start_byte)
+            + ABS(symbols.end_byte - chunks.end_byte) ASC,
+          symbols.id ASC
         LIMIT 1
         ",
-        params![path, symbol_path],
-        |row| row.get("symbol_id"),
-    )
-    .optional()
-    .map_err(Into::into)
+            params![chunk_id, base],
+            |row| row.get("symbol_id"),
+        )
+        .optional()?;
+    if overlapping.is_some() {
+        return Ok(overlapping);
+    }
+    // No overlap at all — stale byte ranges, or a chunk whose symbol moved. Guessing is only safe
+    // when there is nothing to guess between: one candidate is the pre-#855 answer and cannot be
+    // the wrong method, while two or more means the ambiguity this function exists to resolve, so
+    // surface nothing rather than an arbitrary winner.
+    let mut stmt = conn.prepare(
+        "
+        SELECT symbols.id AS symbol_id
+        FROM chunks
+        JOIN symbols ON symbols.file_id = chunks.file_id
+        WHERE chunks.id = ?1
+          AND symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?2)
+        LIMIT 2
+        ",
+    )?;
+    let candidates: Vec<i64> = stmt
+        .query_map(params![chunk_id, base], |row| row.get("symbol_id"))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(match candidates.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    })
 }
 
-/// The stable logical-symbol handle for the symbol a chunk defines — its file `path` + qualified
-/// `symbol_path` — for #705 drive-by records on `read_chunk`. `None` when the chunk defines no
-/// symbol or the symbol has no logical grouping.
+/// The stable logical-symbol handle for the symbol a chunk defines — for #705 drive-by records on
+/// `read_chunk` and `semantic_search`. `None` when the chunk defines no symbol, the symbol has no
+/// logical grouping, or the name is ambiguous within the file and byte ranges cannot settle it
+/// (see [`symbol_id_for_chunk_symbol`]).
+///
+/// Takes the `chunk_id` rather than a path: the chunk's own byte range is what disambiguates two
+/// same-simple-name symbols in one file, and its `file_id` pins the file exactly.
 pub fn logical_symbol_id_for_chunk_symbol(
     conn: &Connection,
-    path: &str,
+    chunk_id: i64,
     symbol_path: Option<&str>,
 ) -> anyhow::Result<Option<i64>> {
-    // A symbol wider than the chunk limit is split into parts; its continuation chunks carry a
-    // `qualified_name#<part>` symbol_path (see the chunker) while `symbols.qualified_name_id`
-    // stores only the bare qualified name. Strip the numeric continuation suffix so reading a
-    // continuation chunk resolves to the SAME defining symbol as its first part instead of
-    // silently surfacing no records.
-    //
-    // Resolution is by (path, qualified name), NOT repo-scoped — matching the codebase's other
-    // qualified-name symbol resolvers (e.g. `active_symbol_id_for_qualified_name`, which the search
-    // load-bearing enrichment uses). `files` carries no `repo_id` in the base schema, and the
-    // subsequent record fetch is itself repo-scoped, so a cross-repo mis-resolution only ever
-    // yields fewer records, never a sibling repo's.
-    let base = symbol_path.map(strip_chunk_continuation_suffix);
-    let Some(symbol_id) = symbol_id_for_path_symbol(conn, path, base)? else {
+    let Some(symbol_id) = symbol_id_for_chunk_symbol(conn, chunk_id, symbol_path)? else {
         return Ok(None);
     };
     logical_symbol_id_for_symbol(conn, symbol_id)
