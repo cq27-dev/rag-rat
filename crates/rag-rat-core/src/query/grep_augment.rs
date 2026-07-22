@@ -574,6 +574,7 @@ mod tests {
             graph: None,
             score_components: None,
             importance: None,
+            distilled_records: Vec::new(),
         }
     }
 

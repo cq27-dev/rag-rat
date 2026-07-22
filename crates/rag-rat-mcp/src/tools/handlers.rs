@@ -17,7 +17,8 @@ pub(crate) fn call_tool_with_db(
     let result = match name {
         "semantic_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
-            json!(db.search_with_graph_meta(rag_rat_core::index::SearchRequest {
+            let include_papertrail = included(&args.include, SearchInclude::Papertrail, true);
+            let mut hits = db.search_with_graph_meta(rag_rat_core::index::SearchRequest {
                 query: &args.query,
                 limit: args.limit,
                 include_generated: included(&args.include, SearchInclude::Generated, false),
@@ -26,13 +27,21 @@ pub(crate) fn call_tool_with_db(
                 graph_limit: args.graph_limit,
                 options: SearchOptions {
                     include_git: included(&args.include, SearchInclude::Git, true),
-                    include_papertrail: included(&args.include, SearchInclude::Papertrail, true),
+                    include_papertrail,
                     // Sourced from `[search] graded_git_rerank` (default false) by the caller;
                     // every other tool ignores it. OFF → the semantic_search
                     // fuse is byte-identical.
                     graded_history,
                 },
-            })?)
+            })?;
+            // Distilled decision records (#705 drive-by) for each hit's symbol — attached HERE, on
+            // the semantic_search surface only, so the shared `search_with_graph_meta` (which also
+            // backs docs_for_symbol) does not surface them. Gated on the papertrail include:
+            // records are papertrail-derived decision context, on by default.
+            if include_papertrail {
+                db.attach_distilled_records_to_search_hits(&mut hits)?;
+            }
+            json!(hits)
         },
         "symbol_lookup" => {
             let args: SymbolArgs = serde_json::from_value(arguments)?;

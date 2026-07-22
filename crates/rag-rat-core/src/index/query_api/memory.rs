@@ -154,12 +154,58 @@ impl IndexDatabase {
         symbol_path: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
-        let logical_symbol_id = rag_rat_query::memory::logical_symbol_id_for_chunk_symbol(
-            self.storage.connection(),
-            path,
-            symbol_path,
-        )?;
-        self.drive_by_records_for_logical_id(logical_symbol_id, limit)
+        let conn = self.storage.connection();
+        let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+        let logical_symbol_id =
+            rag_rat_query::memory::logical_symbol_id_for_chunk_symbol(conn, path, symbol_path)?;
+        Self::drive_by_records_scoped(conn, &repo_id, logical_symbol_id, limit)
+    }
+
+    /// Attach distilled decision records (#705 drive-by) to each search hit's symbol — the same
+    /// facet-gated, capped lane as `read_chunk`, resolved from each hit's `(path, symbol_path)`.
+    /// Skips a result set with no symbol-bearing hits so a doc/config-only result pays nothing.
+    /// `pub`: the `semantic_search` MCP handler calls it directly (the shared
+    /// `search_with_graph_meta` deliberately does NOT, so records stay off docs_for_symbol and
+    /// other search consumers).
+    pub fn attach_distilled_records_to_search_hits(
+        &self,
+        hits: &mut [rag_rat_query::SearchHit],
+    ) -> anyhow::Result<()> {
+        if hits.iter().all(|hit| hit.symbol_path.is_none()) {
+            return Ok(());
+        }
+        let conn = self.storage.connection();
+        // The distill store is optional (V077). When it is absent — a repo that never distilled —
+        // skip the WHOLE batch: `records_for_symbol` would bail at the same guard, but only after
+        // per-hit symbol resolution, so checking once here avoids that resolution work entirely on
+        // the search hot path.
+        if !rag_rat_db::schema::table_exists(conn, "papertrail_distill")? {
+            return Ok(());
+        }
+        // Resolve the repo scope ONCE for the batch, and memoize records by (path, symbol_path) so
+        // the many chunks of one symbol (e.g. its continuation parts) resolve + fetch a single time
+        // rather than re-querying per hit.
+        let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+        let mut by_symbol: std::collections::HashMap<
+            (String, Option<String>),
+            Vec<rag_rat_papertrail::DriveByRecord>,
+        > = std::collections::HashMap::new();
+        for hit in hits.iter_mut() {
+            let key = (hit.path.clone(), hit.symbol_path.clone());
+            if let Some(cached) = by_symbol.get(&key) {
+                hit.distilled_records = cached.clone();
+                continue;
+            }
+            let logical_symbol_id = rag_rat_query::memory::logical_symbol_id_for_chunk_symbol(
+                conn,
+                &hit.path,
+                hit.symbol_path.as_deref(),
+            )?;
+            let records = Self::drive_by_records_scoped(conn, &repo_id, logical_symbol_id, 2)?;
+            by_symbol.insert(key, records.clone());
+            hit.distilled_records = records;
+        }
+        Ok(())
     }
 
     /// Shared drive-by fetch: the repo-scoped, facet-gated `records_for_symbol` lane over a
@@ -170,13 +216,26 @@ impl IndexDatabase {
         logical_symbol_id: Option<i64>,
         limit: usize,
     ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
+        let conn = self.storage.connection();
+        let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+        Self::drive_by_records_scoped(conn, &repo_id, logical_symbol_id, limit)
+    }
+
+    /// The facet-gated `records_for_symbol` fetch over a resolved logical id and an
+    /// ALREADY-resolved repo scope — the batch-friendly core so a caller enriching many hits
+    /// resolves `active_repo_id` once. `None`/unresolved id surfaces nothing (no anchor to bind
+    /// a record to).
+    fn drive_by_records_scoped(
+        conn: &rusqlite::Connection,
+        repo_id: &str,
+        logical_symbol_id: Option<i64>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
         let Some(logical_symbol_id) = logical_symbol_id else {
             return Ok(Vec::new());
         };
-        let conn = self.storage.connection();
-        let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
         let records =
-            rag_rat_papertrail::records_for_symbol(conn, &repo_id, logical_symbol_id, limit)?;
+            rag_rat_papertrail::records_for_symbol(conn, repo_id, logical_symbol_id, limit)?;
         Ok(records.into_iter().map(rag_rat_papertrail::DriveByRecord::new).collect())
     }
 

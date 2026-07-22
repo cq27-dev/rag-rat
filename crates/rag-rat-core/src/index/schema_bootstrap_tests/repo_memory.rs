@@ -2961,6 +2961,76 @@ fn read_chunk_attaches_distilled_records_for_the_chunk_symbol() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// #705 drive-by: the semantic_search enrichment attaches each hit's symbol's distilled records
+/// (the last of the four drive-by surfaces). The enrichment pass — NOT the shared
+/// `search_with_graph_meta` — attaches them, so docs_for_symbol and other search consumers do not.
+#[test]
+fn semantic_search_record_enrichment_does_not_ride_the_shared_search() {
+    use crate::index::SearchRequest;
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let symbol = db
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("target".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("selected symbol");
+    let logical = symbol.logical_symbol_id.expect("target has a logical id");
+
+    let conn = db.storage.connection();
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
+    conn.execute(
+        "INSERT INTO papertrail_distill
+             (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+              root_issue, fix_edge_source, thread_shape, anchors_qualified_count,
+              distilled_at_ms, repo_id)
+         VALUES ('github','o/r','issue','5','sha256:h',3,'5','provider','investigation',1,10,?1)",
+        rusqlite::params![repo_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO papertrail_distill_anchors
+             (tracker, project, item_kind, item_key, anchor_kind, logical_symbol_id, name,
+              resolved, candidate_ordinal, selected, repo_id)
+         VALUES ('github','o/r','issue','5','symbol',?1,'target',1,0,1,?2)",
+        rusqlite::params![rag_rat_base::serde_big_id::format_sym_handle(logical), repo_id],
+    )
+    .unwrap();
+
+    // The shared search does NOT attach records — that stays on the semantic_search handler, so
+    // docs_for_symbol and other `search_with_graph_meta` consumers never surface them.
+    let mut hits = db.search_with_graph_meta(SearchRequest::new("target", 10)).unwrap();
+    assert!(
+        hits.iter().all(|h| h.distilled_records.is_empty()),
+        "the shared search does not attach records: {hits:?}",
+    );
+    assert!(
+        hits.iter().any(|h| h.symbol_path.is_some()),
+        "the target hit is present with a symbol to enrich: {hits:?}",
+    );
+
+    // The semantic_search enrichment attaches the target's record to the matching hit.
+    db.attach_distilled_records_to_search_hits(&mut hits).unwrap();
+    assert!(
+        hits.iter().any(|h| h.distilled_records.iter().any(|r| r.record.item_key == "5")),
+        "the target hit carries its distilled record after enrichment: {hits:?}",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// #463: a node created with NO binding target is UNANCHORED — a graph node (a `Concept` /
 /// standalone `Task`) with no code anchor. It surfaces in the general `memory list` with blank
 /// binding columns, dedupes against another unanchored node of the same text, is excluded by a

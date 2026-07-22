@@ -385,6 +385,7 @@ fn bm25_candidates(
                 graph: None,
                 score_components: None,
                 importance: None,
+                distilled_records: Vec::new(),
             },
             ChunkTextRow { blob: row.get(8)?, raw_len: row.get(9)?, dict_version: row.get(10)? },
         ))
@@ -477,6 +478,7 @@ fn vector_candidates(
                     graph: None,
                     score_components: None,
                     importance: None,
+                    distilled_records: Vec::new(),
                 },
                 vector_blob,
                 ChunkTextRow {
@@ -1026,6 +1028,7 @@ mod tests {
             graph: None,
             score_components: None,
             importance: None,
+            distilled_records: Vec::new(),
         };
         let repo_id = schema::active_repo_id(&conn).unwrap();
         let boost = graph_boost(&conn, &hit, &["available".to_string()], &repo_id).unwrap();

@@ -704,6 +704,7 @@ impl IndexDatabase {
                         graph: None,
                         score_components: None,
                         importance: None,
+                        distilled_records: Vec::new(),
                     },
                     rag_rat_db::text_compression::ChunkTextRow {
                         blob: row.get(7)?,

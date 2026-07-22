@@ -509,6 +509,12 @@ pub fn logical_symbol_id_for_chunk_symbol(
     // stores only the bare qualified name. Strip the numeric continuation suffix so reading a
     // continuation chunk resolves to the SAME defining symbol as its first part instead of
     // silently surfacing no records.
+    //
+    // Resolution is by (path, qualified name), NOT repo-scoped — matching the codebase's other
+    // qualified-name symbol resolvers (e.g. `active_symbol_id_for_qualified_name`, which the search
+    // load-bearing enrichment uses). `files` carries no `repo_id` in the base schema, and the
+    // subsequent record fetch is itself repo-scoped, so a cross-repo mis-resolution only ever
+    // yields fewer records, never a sibling repo's.
     let base = symbol_path.map(strip_chunk_continuation_suffix);
     let Some(symbol_id) = symbol_id_for_path_symbol(conn, path, base)? else {
         return Ok(None);

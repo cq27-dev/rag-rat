@@ -166,4 +166,9 @@ pub struct SearchHit {
     /// `crate::load_bearing`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub importance: Option<crate::load_bearing::ImportanceEnrichment>,
+    /// Distilled decision records (#705 drive-by) for the symbol this hit resolves to — capped ≤2,
+    /// labeled unreviewed. Empty for almost every hit (facet-gated: a provider fix edge + a
+    /// qualified symbol anchor). Attached by the search enrichment pass, never by the base search.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub distilled_records: Vec<rag_rat_papertrail::DriveByRecord>,
 }
