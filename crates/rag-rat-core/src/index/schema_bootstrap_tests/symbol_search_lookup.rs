@@ -2013,7 +2013,7 @@ fn papertrail_sync_caches_rationale_without_query_time_crawling() {
 
     let issue_hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(issue_hits.len(), 1);
-    assert_eq!(issue_hits[0].classification, "decision");
+    assert_eq!(issue_hits[0].title, "Decision: keep sqlite");
     assert_eq!(issue_hits[0].evidence_kind, "historical_tracker");
 
     let refs = db.papertrail_refs_for_path("docs/search.md", 10).unwrap();
@@ -2021,7 +2021,7 @@ fn papertrail_sync_caches_rationale_without_query_time_crawling() {
     assert_eq!(refs[0].source_kind, "file");
 
     let rationale = db.rationale_search("risk", 10).unwrap();
-    assert!(rationale.iter().any(|item| item.classification == "risk"));
+    assert!(rationale.iter().any(|item| item.snippet.contains("live crawling")));
     let issue_ref_rationale = db.rationale_search("Fixes #42", 10).unwrap();
     assert_eq!(issue_ref_rationale.first().map(|item| item.item_key.as_str()), Some("42"));
     assert_eq!(

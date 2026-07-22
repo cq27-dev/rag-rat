@@ -256,6 +256,12 @@ pub struct PapertrailEvidence {
     pub url: String,
     pub title: String,
     pub snippet: String,
+    /// Coarse keyword label (`classify_text`) kept for the internal eval harness only. It is NOT a
+    /// read surface: the distilled decision record (`record`, #705) supersedes it, so it is never
+    /// serialized to a retrieval payload or drive-by. Retained (not deleted) because the eval
+    /// harness still scores against it; the `papertrail_fts.classification` column keeps
+    /// populating it. Do not resurface it — read `record` instead.
+    #[serde(skip_serializing)]
     pub classification: String,
     pub evidence_kind: &'static str,
     pub score: f64,

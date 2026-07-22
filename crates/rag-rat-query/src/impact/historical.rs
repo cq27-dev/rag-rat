@@ -177,7 +177,7 @@ pub(crate) fn papertrail_rationale_for_query(
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
-        SELECT url, title, classification
+        SELECT url, title
         FROM papertrail_fts
         WHERE papertrail_fts MATCH ?1 AND repo_id = ?3
         ORDER BY rank
@@ -186,10 +186,10 @@ pub(crate) fn papertrail_rationale_for_query(
     )?;
     let rows = stmt.query_map(
         params![fts_query, i64::try_from(limit).unwrap_or(i64::MAX), repo_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )?;
     for row in rows {
-        let (url, title, classification) = row?;
+        let (url, title) = row?;
         surface.push(
             ImpactCategory::HistoricalPapertrail,
             FileSymbol {
@@ -199,7 +199,7 @@ pub(crate) fn papertrail_rationale_for_query(
                 symbol: None,
             },
             "papertrail",
-            format!("{classification}: {title} ({url})"),
+            format!("{title} ({url})"),
         );
     }
     Ok(())
@@ -312,5 +312,40 @@ mod tests {
         // hot.rs's three commits collapsed into one item carrying multiple evidence lines.
         let hot = items.iter().find(|item| item.path == "hot.rs").unwrap();
         assert!(hot.evidence.len() >= 2, "collapsed commits accumulate evidence: {hot:?}");
+    }
+
+    /// #705: the historical papertrail rationale surfaces `title (url)` only — it must NOT prefix
+    /// the line with the deprecated `classify_text` keyword label, so the distilled record is the
+    /// sole decision signal on this surface.
+    #[test]
+    fn papertrail_rationale_surfaces_title_and_url_without_the_classification_prefix() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &rag_rat_core::index::migration_hooks()).unwrap();
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        // The `classification` column is still stored ('decision') — the assertion proves it does
+        // not reach the surfaced text.
+        conn.execute(
+            "INSERT INTO papertrail_fts(tracker, project, item_kind, item_key, doc_kind, \
+             comment_id, url, title, body, classification, repo_id) VALUES ('github', 'o/r', \
+             'issue', '7', 'item', '', 'https://x/7', 'Keep sqlite', 'We keep sqlite for size.', \
+             'decision', 'r')",
+            [],
+        )
+        .unwrap();
+
+        let mut surface = ImpactSurface::default();
+        papertrail_rationale_for_query(&conn, "sqlite", &mut surface, 10).unwrap();
+        let items = surface.into_items(10);
+        let text = items
+            .iter()
+            .flat_map(|item| item.evidence.iter())
+            .find(|line| line.contains("Keep sqlite"))
+            .expect("the matching papertrail item surfaces");
+        assert_eq!(text, "Keep sqlite (https://x/7)", "title (url) only, no prefix: {text}");
+        assert!(!text.contains("decision"), "the keyword label must not surface: {text}");
     }
 }

@@ -504,4 +504,16 @@ mod payload_tests {
         attach_records(&conn, &mut hits).unwrap();
         assert!(hits[0].record.is_none(), "no distill store → bare hit, no error");
     }
+
+    #[test]
+    fn classification_is_never_serialized_to_a_read_surface() {
+        // #705: the coarse keyword label is internal-only (the eval harness scores against it); the
+        // distilled `record` supersedes it as the decision signal. A populated `classification`
+        // must NOT reach the JSON a retrieval consumer sees, while ordinary fields still do.
+        let mut hit = ev("issue", "5", None);
+        hit.classification = "decision".into();
+        let json = serde_json::to_string(&hit).unwrap();
+        assert!(!json.contains("classification"), "classification must not surface: {json}");
+        assert!(json.contains("\"item_key\":\"5\""), "ordinary fields still serialize: {json}");
+    }
 }
