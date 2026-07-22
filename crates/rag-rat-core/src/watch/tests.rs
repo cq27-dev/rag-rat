@@ -2536,6 +2536,80 @@ fn scheduler_coalesces_fire_requests_while_a_pass_is_in_flight() {
 }
 
 #[test]
+fn the_pass_cooldown_holds_the_coalesced_follow_up_until_it_elapses() {
+    // #823: a debounce armed by mid-pass events survives the whole (minutes-long) pass — it
+    // resets only on dispatch — so at PassDone it is long past due and, unchecked, the coalesced
+    // follow-up dispatches back-to-back (107 passes in ~5 h measured). The cooldown gates that
+    // dispatch until it has elapsed since the pass COMPLETED.
+    let t0 = Instant::now();
+    let mut debounce = Debounce::new(Duration::from_millis(400), Duration::from_millis(2500));
+    let mut cooldown = PassCooldown::new(Some(Duration::from_secs(60)));
+
+    // Before any pass completes there is nothing to cool down from.
+    assert!(cooldown.ready(t0), "no completed pass yet — dispatch is not held back");
+
+    // An event lands while a pass is in flight; the debounce stays armed across the pass.
+    debounce.on_event(t0);
+    let pass_done = t0 + Duration::from_secs(120);
+    cooldown.on_pass_done(pass_done);
+
+    // Immediately after PassDone the debounce is long past due — the #823 precondition...
+    assert!(debounce.should_fire(pass_done), "the armed debounce elapsed during the pass");
+    // ...but the cooldown holds the dispatch until it elapses from the COMPLETION instant.
+    assert!(!cooldown.ready(pass_done), "no immediate back-to-back redispatch");
+    assert!(!cooldown.ready(pass_done + Duration::from_secs(59)));
+    assert!(cooldown.ready(pass_done + Duration::from_secs(60)), "ready once elapsed");
+}
+
+#[test]
+fn a_zero_pass_cooldown_preserves_immediate_redispatch() {
+    // `pass_cooldown_secs = 0` disables the gate entirely: the follow-up may dispatch at the
+    // very instant the pass completes — exactly the pre-#823 behavior (the loop-level pin is
+    // `a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger`, which runs cooldown-free).
+    let mut cooldown = PassCooldown::new(None);
+    let t0 = Instant::now();
+    cooldown.on_pass_done(t0);
+    assert!(cooldown.ready(t0), "a disabled cooldown never holds dispatch back");
+    let mut armed = Debounce::new(Duration::from_millis(400), Duration::from_millis(2500));
+    armed.on_event(t0);
+    assert_eq!(
+        cooldown.gate_debounce_wait(&armed, t0),
+        Some(Duration::from_millis(400)),
+        "a disabled cooldown is transparent to the recv-wait — the raw debounce deadline stands",
+    );
+}
+
+#[test]
+fn a_held_back_debounce_sleeps_out_the_cooldown_instead_of_spinning() {
+    // #823 spin-avoidance: after PassDone the armed debounce is already past due while dispatch
+    // is held back, so the raw debounce deadline of zero would wake the loop every iteration.
+    // The recv-wait slot must be the cooldown's REMAINING time — the loop sleeps until dispatch
+    // is actually allowed (the injected-clock analogue of counting loop iterations).
+    let t0 = Instant::now();
+    let mut debounce = Debounce::new(Duration::from_millis(400), Duration::from_millis(2500));
+    let mut cooldown = PassCooldown::new(Some(Duration::from_secs(60)));
+    debounce.on_event(t0);
+    cooldown.on_pass_done(t0 + Duration::from_secs(120));
+
+    let mid_cooldown = t0 + Duration::from_secs(130);
+    assert_eq!(debounce.due_in(mid_cooldown), Some(Duration::ZERO), "debounce is past due");
+    assert_eq!(
+        cooldown.gate_debounce_wait(&debounce, mid_cooldown),
+        Some(Duration::from_secs(50)),
+        "the wait is the cooldown remainder, not a zero-length spin",
+    );
+    assert_eq!(
+        cooldown.gate_debounce_wait(&debounce, t0 + Duration::from_secs(180)),
+        Some(Duration::ZERO),
+        "once the cooldown elapses the past-due debounce fires without further delay",
+    );
+    // An idle debounce has no deadline: the cooldown alone never wakes the loop (there is
+    // nothing to dispatch when it elapses).
+    let idle = Debounce::new(Duration::from_millis(400), Duration::from_millis(2500));
+    assert_eq!(cooldown.gate_debounce_wait(&idle, mid_cooldown), None);
+}
+
+#[test]
 fn scheduler_gc_cadence_counts_maintenance_passes_only() {
     let mut scheduler = PassScheduler::new();
     assert_eq!(scheduler.dispatch_startup(), PassRequest::StartupCatchup);
@@ -2602,6 +2676,9 @@ fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
     config.watch.debounce_ms = 10;
     config.watch.max_latency_ms = 50;
     config.watch.periodic_sweep_secs = 0;
+    // This test pins #506 coalescing, not pacing: with the cooldown DISABLED the coalesced
+    // follow-up must dispatch immediately on PassDone — exactly the pre-#823 behavior.
+    config.watch.pass_cooldown_secs = 0;
     let target_dirs = config.target_directories();
     let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
     let mut linked_worktrees = LinkedWorktreeWatches::default();
@@ -2681,6 +2758,175 @@ fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
         let _ = tx.send(LoopMsg::Wake);
         let final_refresh_owed = loop_thread.join().unwrap();
         assert!(!final_refresh_owed, "every observed edit was consumed by a dispatched pass",);
+    });
+}
+
+/// The #823 regression, end-to-end: events arriving during a pass leave the debounce armed and
+/// long-elapsed at `PassDone`, and the loop used to dispatch the coalesced follow-up immediately —
+/// back-to-back passes for as long as editing continued. With a cooldown configured, the follow-up
+/// must wait it out (counted from pass COMPLETION) and then dispatch.
+#[test]
+fn events_during_a_pass_do_not_redispatch_until_the_cooldown_elapses() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    config.watch.debounce_ms = 10;
+    config.watch.max_latency_ms = 50;
+    config.watch.periodic_sweep_secs = 0;
+    config.watch.pass_cooldown_secs = 2;
+    let target_dirs = config.target_directories();
+    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+    let mut linked_worktrees = LinkedWorktreeWatches::default();
+    let mut notify_watcher =
+        <RecordingWatcher as notify::Watcher>::new(|_| {}, notify::Config::default()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (pass_tx, pass_rx) = std::sync::mpsc::channel();
+    let pass_tx_for_loop = pass_tx.clone();
+    let mut scheduler = PassScheduler::new();
+    let stop = AtomicBool::new(false);
+    let mut fleet_trigger = |_: &Path| {};
+
+    let counters = placement_counters();
+    let event_loop = EventLoop {
+        config: &config,
+        target_dirs: &target_dirs,
+        fleet_bin: None,
+        notify_watcher: &mut notify_watcher,
+        counters: &counters,
+        ignore: &mut ignore,
+        linked_worktrees: &mut linked_worktrees,
+        worktree_registry: None,
+        rx,
+        pass_tx: &pass_tx_for_loop,
+        scheduler: &mut scheduler,
+        papertrail_tx: None,
+        papertrail_interval: None,
+        stop: &stop,
+        fleet_trigger: &mut fleet_trigger,
+    };
+    std::thread::scope(|scope| {
+        let loop_thread = scope.spawn(move || event_loop.run());
+
+        // A relevant edit dispatches the first pass (this test plays the worker).
+        tx.send(LoopMsg::Fs(Ok(mutation_event(root.join("src/lib.rs"))))).unwrap();
+        assert_eq!(
+            pass_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(PassRequest::Maintenance {
+                run_gc: false,
+                overlay_scope: OverlayScope::Linked(BTreeSet::new())
+            }),
+        );
+
+        // More edits land while the pass is in flight — they coalesce into the armed debounce.
+        tx.send(LoopMsg::Fs(Ok(mutation_event(root.join("src/lib.rs"))))).unwrap();
+        // Let the debounce (10 ms) and even the max-latency cap (50 ms) elapse BEFORE the pass
+        // completes — the production shape: the pass runs minutes, so at PassDone the armed
+        // debounce is already past due and the loop's own PassDone iteration is where the
+        // back-to-back redispatch used to happen.
+        std::thread::sleep(Duration::from_millis(100));
+        tx.send(LoopMsg::PassDone).unwrap();
+
+        // The pre-#823 behavior was an immediate redispatch here. The follow-up must instead
+        // wait out the cooldown (2 s; the 700 ms probe leaves ample CI-jitter margin)...
+        assert_eq!(
+            pass_rx.recv_timeout(Duration::from_millis(700)),
+            Err(RecvTimeoutError::Timeout),
+            "the coalesced follow-up must not dispatch before the cooldown elapses",
+        );
+        // ...and then dispatch, carrying the coalesced scope.
+        assert_eq!(
+            pass_rx.recv_timeout(Duration::from_secs(10)),
+            Ok(PassRequest::Maintenance {
+                run_gc: false,
+                overlay_scope: OverlayScope::Linked(BTreeSet::new())
+            }),
+            "the follow-up dispatches once the cooldown elapses",
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        // Best-effort wake: a timeout tick may have already observed `stop` and exited the loop,
+        // in which case `rx` is gone and this send fails — that is success, not an error.
+        let _ = tx.send(LoopMsg::Wake);
+        let final_refresh_owed = loop_thread.join().unwrap();
+        assert!(!final_refresh_owed, "the held-back edit was consumed by the delayed follow-up");
+    });
+}
+
+/// #823: the periodic sweep is the missed-event backstop and must never be starved by the
+/// cooldown. With an absurdly long cooldown armed by a completed pass, a due sweep still
+/// dispatches on time.
+#[test]
+fn a_due_periodic_sweep_overrides_the_pass_cooldown() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    // No debounce fires (nothing event-driven); the sweep is due every second while the
+    // cooldown would hold event-driven dispatch for an hour.
+    config.watch.debounce_ms = 60_000;
+    config.watch.max_latency_ms = 60_000;
+    config.watch.periodic_sweep_secs = 1;
+    config.watch.pass_cooldown_secs = 3_600;
+    let target_dirs = config.target_directories();
+    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+    let mut linked_worktrees = LinkedWorktreeWatches::default();
+    let mut notify_watcher =
+        <RecordingWatcher as notify::Watcher>::new(|_| {}, notify::Config::default()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (pass_tx, pass_rx) = std::sync::mpsc::channel();
+    let pass_tx_for_loop = pass_tx.clone();
+    let mut scheduler = PassScheduler::new();
+    let stop = AtomicBool::new(false);
+    let mut fleet_trigger = |_: &Path| {};
+
+    let counters = placement_counters();
+    let event_loop = EventLoop {
+        config: &config,
+        target_dirs: &target_dirs,
+        fleet_bin: None,
+        notify_watcher: &mut notify_watcher,
+        counters: &counters,
+        ignore: &mut ignore,
+        linked_worktrees: &mut linked_worktrees,
+        worktree_registry: None,
+        rx,
+        pass_tx: &pass_tx_for_loop,
+        scheduler: &mut scheduler,
+        papertrail_tx: None,
+        papertrail_interval: None,
+        stop: &stop,
+        fleet_trigger: &mut fleet_trigger,
+    };
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(move || event_loop.run());
+
+        // The first periodic sweep dispatches; completing it arms the hour-long cooldown.
+        assert_eq!(
+            pass_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(PassRequest::Maintenance { run_gc: false, overlay_scope: OverlayScope::All }),
+        );
+        tx.send(LoopMsg::PassDone).unwrap();
+
+        // The next sweep falls due one second later — deep inside the cooldown — and must
+        // dispatch anyway: the backstop bypasses the cooldown.
+        assert_eq!(
+            pass_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(PassRequest::Maintenance { run_gc: false, overlay_scope: OverlayScope::All }),
+            "a due periodic sweep must never be starved by the pass cooldown",
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        // Best-effort wake: a timeout tick may have already observed `stop` and exited the loop,
+        // in which case `rx` is gone and this send fails — that is success, not an error.
+        let _ = tx.send(LoopMsg::Wake);
+        drop(tx);
+        drop(pass_tx);
+        let _ = handle.join();
     });
 }
 

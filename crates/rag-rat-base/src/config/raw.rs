@@ -214,6 +214,7 @@ pub(crate) struct RawWatch {
     debounce_ms: Option<u64>,
     max_latency_ms: Option<u64>,
     periodic_sweep_secs: Option<u64>,
+    pass_cooldown_secs: Option<u64>,
 }
 
 impl From<RawWatch> for WatchConfig {
@@ -224,6 +225,7 @@ impl From<RawWatch> for WatchConfig {
             debounce_ms: raw.debounce_ms.unwrap_or(default.debounce_ms),
             max_latency_ms: raw.max_latency_ms.unwrap_or(default.max_latency_ms),
             periodic_sweep_secs: raw.periodic_sweep_secs.unwrap_or(default.periodic_sweep_secs),
+            pass_cooldown_secs: raw.pass_cooldown_secs.unwrap_or(default.pass_cooldown_secs),
         }
     }
 }

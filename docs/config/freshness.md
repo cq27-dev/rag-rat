@@ -11,7 +11,14 @@ enabled = true        # on by default; false (or RAG_RAT_NO_WATCH=1) disables it
 debounce_ms = 400     # quiet window before a reindex pass
 max_latency_ms = 2500 # force a pass after this much continuous activity (starvation cap)
 periodic_sweep_secs = 300 # backstop pass at least this often (0 disables) — set for NFS/WSL
+pass_cooldown_secs = 60   # minimum gap between event-driven passes (0 disables)
 ```
+
+`pass_cooldown_secs` paces the watcher under sustained editing: the next event-driven pass starts
+no sooner than this long after the previous pass completed, so long agent sessions can't run
+minutes-long passes back-to-back. The trade-off is up to that much added indexing latency after a
+pass completes; `periodic_sweep_secs` remains the staleness bound, and the periodic sweep is never
+held back by the cooldown.
 
 The watcher runs inside `rag-rat mcp` automatically, and on demand via `rag-rat index --watch`. It
 watches the configured target directories recursively and runs the discover → reconcile → gc →

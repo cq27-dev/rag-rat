@@ -14,7 +14,7 @@ use rag_rat_papertrail::AutosyncRequest;
 use super::overlay::OverlayScope;
 use super::papertrail::{self, PapertrailClock, PapertrailScheduler};
 use super::pass::{
-    Debounce, LoopMsg, PassRequest, PassScheduler, SKIP_TIMEOUT, SweepClock,
+    Debounce, LoopMsg, PassCooldown, PassRequest, PassScheduler, SKIP_TIMEOUT, SweepClock,
     maintenance_pass_scoped, spawn_pass_worker, startup_catchup_pass,
 };
 use super::placement::{
@@ -360,6 +360,15 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
         let periodic = (self.config.watch.periodic_sweep_secs > 0)
             .then(|| Duration::from_secs(self.config.watch.periodic_sweep_secs));
         let mut sweep = SweepClock::new(periodic, Instant::now());
+        // Minimum inter-pass cooldown (#823): the next event-driven pass dispatches no sooner
+        // than this long after the previous pass completed, so sustained editing can't run
+        // passes back-to-back off a debounce that elapsed mid-pass. Watcher-event-loop-only:
+        // the startup catch-up (dispatched before this loop) and the hook/CLI
+        // `maintenance_pass*` entry points are not rate-limited.
+        let mut cooldown = PassCooldown::new(
+            (self.config.watch.pass_cooldown_secs > 0)
+                .then(|| Duration::from_secs(self.config.watch.pass_cooldown_secs)),
+        );
         // The papertrail evaluation deadline (#592): fires even on a filesystem-idle watcher, so
         // the freshness probe and the daily full-walk backstop run on time without any events.
         let mut papertrail_clock =
@@ -395,7 +404,13 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                     .unwrap_or(IDLE_WAIT)
             } else {
                 [
-                    debounce.due_in(now),
+                    // The debounce deadline is floored by the cooldown's remaining time (#823):
+                    // a debounce that elapsed during the pass stays fireable while dispatch is
+                    // held back, so an unfloored deadline would wake the loop every iteration —
+                    // the same spin the in-flight branch above avoids. The sweep deadline is
+                    // deliberately NOT floored: the periodic backstop overrides the cooldown, so
+                    // its wake must arrive on time.
+                    cooldown.gate_debounce_wait(&debounce, now),
                     fleet_debounce.due_in(now),
                     sweep.due_in(now),
                     papertrail_clock.due_in(now),
@@ -469,7 +484,12 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                 Ok(LoopMsg::Fs(Err(_))) => {},
                 Ok(LoopMsg::PassDone) => {
                     self.scheduler.on_done();
-                    sweep.on_pass_done(Instant::now());
+                    let done_at = Instant::now();
+                    sweep.on_pass_done(done_at);
+                    // The cooldown counts from pass COMPLETION (#823) — the armed debounce below
+                    // is typically long-elapsed by now, and without this the next iteration
+                    // would dispatch the follow-up immediately, back-to-back.
+                    cooldown.on_pass_done(done_at);
                     // Refresh the live linked-worktree set after every pass. Existing checkout
                     // paths can switch branches and therefore branch-local target sets; rebuilding
                     // the state keeps classification, ignore matchers, and watch placement in one
@@ -513,7 +533,10 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                 }
             }
             let periodic_due = sweep.due(now);
-            if debounce.should_fire(now) || periodic_due {
+            // The cooldown (#823) holds back only the DEBOUNCE-driven dispatch; a due periodic
+            // sweep dispatches regardless — the missed-event backstop is never starved by the
+            // cooldown.
+            if periodic_due || (debounce.should_fire(now) && cooldown.ready(now)) {
                 // The periodic sweep is the missed-event backstop, so it refreshes every overlay;
                 // an event-driven pass carries the roots accumulated above (#577). When both are
                 // due at once, `All` is the superset — and because the sweep clock counts from

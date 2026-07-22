@@ -110,6 +110,64 @@ impl SweepClock {
     }
 }
 
+/// Minimum inter-pass cooldown (#823), pure like [`SweepClock`] (clock injected). A debounce armed
+/// by mid-pass events survives the whole (minutes-long) pass — it resets only on dispatch — so on
+/// `PassDone` the loop would otherwise find it long-elapsed and dispatch the coalesced follow-up
+/// immediately, running passes back-to-back for as long as editing continues (107 passes in ~5 h
+/// measured under continuous agent editing). This clock holds the next EVENT-driven dispatch until
+/// the cooldown has elapsed since the previous pass COMPLETED.
+///
+/// Only the watcher event loop consults it: the periodic sweep bypasses it (the missed-event
+/// backstop must never be starved by the cooldown), and the startup catch-up pass and the
+/// hook/CLI `maintenance_pass*` entry points are not rate-limited.
+#[derive(Debug)]
+pub(crate) struct PassCooldown {
+    /// `None` disables the cooldown (`pass_cooldown_secs = 0`) — dispatch is never held back.
+    cooldown: Option<Duration>,
+    /// When the most recent pass completed; `None` until the first completion (nothing to cool
+    /// down from).
+    last_pass_done: Option<Instant>,
+}
+
+impl PassCooldown {
+    pub(crate) fn new(cooldown: Option<Duration>) -> Self {
+        Self { cooldown, last_pass_done: None }
+    }
+
+    /// A pass completed; event-driven dispatch is held back until the cooldown elapses from here.
+    pub(crate) fn on_pass_done(&mut self, now: Instant) {
+        self.last_pass_done = Some(now);
+    }
+
+    /// `None` when no cooldown is pending — disabled, no pass completed yet, or a configured
+    /// duration so large the deadline overflows `Instant` arithmetic (degrades to "not held
+    /// back", never a panic in the watcher's wait computation).
+    fn ready_at(&self) -> Option<Instant> {
+        self.last_pass_done?.checked_add(self.cooldown?)
+    }
+
+    /// Whether an event-driven dispatch may go ahead (`now >= last completion + cooldown`). The
+    /// periodic sweep must NOT consult this — the caller ORs its due-ness in front.
+    pub(crate) fn ready(&self, now: Instant) -> bool {
+        self.ready_at().is_none_or(|at| now >= at)
+    }
+
+    /// Time left until [`Self::ready`]; `Duration::ZERO` when already ready.
+    fn remaining(&self, now: Instant) -> Duration {
+        self.ready_at().map_or(Duration::ZERO, |at| at.saturating_duration_since(now))
+    }
+
+    /// The event-debounce slot of the loop's recv-wait: the debounce deadline floored by this
+    /// cooldown's remaining time. While the cooldown holds dispatch back, an already-elapsed
+    /// debounce stays fireable (it resets only on dispatch), so its raw `due_in` of zero would
+    /// wake the loop every iteration — the same spin the in-flight branch avoids by dropping the
+    /// debounce deadline entirely. Flooring makes the loop SLEEP until dispatch is allowed. An
+    /// idle debounce yields `None`: the cooldown alone never wakes the loop.
+    pub(crate) fn gate_debounce_wait(&self, debounce: &Debounce, now: Instant) -> Option<Duration> {
+        debounce.due_in(now).map(|due| due.max(self.remaining(now)))
+    }
+}
+
 /// What the event loop asks the pass worker to run (#506).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PassRequest {

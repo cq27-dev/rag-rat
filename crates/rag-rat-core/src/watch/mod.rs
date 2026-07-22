@@ -41,9 +41,10 @@ pub(crate) use papertrail::{PapertrailClock, PapertrailScheduler, papertrail_tic
 pub use pass::{CLONE_GRAPH_QUIET_MS, maintenance_pass, maintenance_pass_or_skip};
 #[cfg(test)]
 pub(crate) use pass::{
-    Debounce, GC_EVERY_PASSES, LoopMsg, PassRequest, PassScheduler, STARTUP_CATCHUP_RUN_GC,
-    SweepClock, base_embedding_backlog_needs_tail, base_tail_forced_by_state, maybe_checkpoint_wal,
-    should_run_base_tail, spawn_pass_worker, startup_catchup_pass,
+    Debounce, GC_EVERY_PASSES, LoopMsg, PassCooldown, PassRequest, PassScheduler,
+    STARTUP_CATCHUP_RUN_GC, SweepClock, base_embedding_backlog_needs_tail,
+    base_tail_forced_by_state, maybe_checkpoint_wal, should_run_base_tail, spawn_pass_worker,
+    startup_catchup_pass,
 };
 #[cfg(test)]
 pub(crate) use placement::{

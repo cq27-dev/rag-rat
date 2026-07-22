@@ -245,11 +245,24 @@ pub struct WatchConfig {
     /// event-blind filesystems (NFS, WSL2 `/mnt`) and a watcher that missed events, and bounds how
     /// long a wedged peer can leave the index stale.
     pub periodic_sweep_secs: u64,
+    /// Minimum seconds between watcher passes (0 disables): the next event-driven pass dispatches
+    /// no sooner than this long after the previous pass completed, so sustained editing (an agent
+    /// rewriting files for hours) can't run minutes-long passes back-to-back. Trade-off: edits
+    /// landing right after a pass wait up to the cooldown before indexing starts;
+    /// `periodic_sweep_secs` remains the staleness bound, and the periodic sweep is never held
+    /// back by the cooldown.
+    pub pass_cooldown_secs: u64,
 }
 
 impl Default for WatchConfig {
     fn default() -> Self {
-        Self { enabled: true, debounce_ms: 400, max_latency_ms: 2500, periodic_sweep_secs: 300 }
+        Self {
+            enabled: true,
+            debounce_ms: 400,
+            max_latency_ms: 2500,
+            periodic_sweep_secs: 300,
+            pass_cooldown_secs: 60,
+        }
     }
 }
 
