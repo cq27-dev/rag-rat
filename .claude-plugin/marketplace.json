@@ -9,7 +9,7 @@
     {
       "name": "rag-rat",
       "description": "Local repo-intelligence index + MCP server: semantic search, symbol/graph navigation, impact-surface preflight, git + GitHub papertrail, and a source-anchored memory graph.",
-      "version": "0.20.0",
+      "version": "0.21.0",
       "source": "./plugin",
       "category": "developer-tools",
       "license": "MIT",

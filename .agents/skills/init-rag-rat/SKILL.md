@@ -32,7 +32,7 @@ hand-write a config blind, and let a real config load re-check it before indexin
    do **not** use `@latest`, and **don't blindly trust an on-`PATH` `rag-rat`**:
    - If `rag-rat` is on `PATH`, check `rag-rat --version` and use it **only if it matches** the
      plugin/MCP version — a stale global install would build the index with the wrong binary.
-   - Otherwise (or on a version mismatch) use `npx -y @rag-rat/bin@0.20.0 …` — the plugin pins
+   - Otherwise (or on a version mismatch) use `npx -y @rag-rat/bin@0.21.0 …` — the plugin pins
      `@rag-rat/bin` to its own version and caches the binary privately, so this is the
      version-matched CLI; `npx` runs it in the current directory.
 
