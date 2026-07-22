@@ -140,7 +140,37 @@ impl IndexDatabase {
         symbol: &rag_rat_query::symbol::SymbolHit,
         limit: usize,
     ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
-        let Some(logical_symbol_id) = symbol.logical_symbol_id else {
+        self.drive_by_records_for_logical_id(symbol.logical_symbol_id, limit)
+    }
+
+    /// Distilled decision records for the symbol a chunk defines (#705 drive-by on `read_chunk`).
+    /// Resolves the chunk's file `path` + qualified `symbol_path` to a logical symbol, then the
+    /// same facet-gated lane as [`records_for_symbol`]. Empty when the chunk defines no resolvable
+    /// logical symbol. `pub(crate)`: only the `read_chunk` reader calls it (unlike the sibling
+    /// `records_for_symbol`, which the MCP handler invokes directly).
+    pub(crate) fn records_for_chunk_symbol(
+        &self,
+        path: &str,
+        symbol_path: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
+        let logical_symbol_id = rag_rat_query::memory::logical_symbol_id_for_chunk_symbol(
+            self.storage.connection(),
+            path,
+            symbol_path,
+        )?;
+        self.drive_by_records_for_logical_id(logical_symbol_id, limit)
+    }
+
+    /// Shared drive-by fetch: the repo-scoped, facet-gated `records_for_symbol` lane over a
+    /// resolved logical-symbol handle. `None`/unresolved id surfaces nothing (no anchor to bind
+    /// a record to).
+    fn drive_by_records_for_logical_id(
+        &self,
+        logical_symbol_id: Option<i64>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
+        let Some(logical_symbol_id) = logical_symbol_id else {
             return Ok(Vec::new());
         };
         let conn = self.storage.connection();

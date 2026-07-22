@@ -478,6 +478,11 @@ impl IndexDatabase {
                 },
                 || self.heal_corrupt_fts(),
             )?;
+            // Distilled decision records (#705 drive-by) for the symbol this chunk defines, capped
+            // ≤2 and labeled unreviewed. Rides the memories flag; facet-gated, so empty for almost
+            // every chunk — matches the symbol_lookup convention (a lightweight per-item surface).
+            chunk.distilled_records =
+                self.records_for_chunk_symbol(&chunk.path, chunk.symbol_path.as_deref(), 2)?;
         }
         Ok(Some(chunk))
     }

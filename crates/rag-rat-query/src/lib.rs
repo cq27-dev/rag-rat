@@ -35,6 +35,11 @@ pub struct ReadChunk {
     pub graph: Option<graph_meta::GraphEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub memories: Vec<memory::RepoMemory>,
+    /// Distilled decision records (#705 drive-by) for the symbol this chunk defines — capped ≤2,
+    /// labeled unreviewed. Empty for almost every chunk (facet-gated: a provider fix edge + a
+    /// qualified symbol anchor). Populated by the core reader, never by the base `read_chunk`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub distilled_records: Vec<rag_rat_papertrail::DriveByRecord>,
 }
 
 pub fn read_chunk(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<ReadChunk>> {
@@ -82,6 +87,7 @@ pub fn read_chunk_with(
                         text: String::new(),
                         graph: None,
                         memories: Vec::new(),
+                        distilled_records: Vec::new(),
                     },
                     ChunkTextRow {
                         blob: row.get(7)?,

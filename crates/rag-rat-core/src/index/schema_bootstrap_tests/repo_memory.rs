@@ -2844,6 +2844,123 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// #705 drive-by: `read_chunk` attaches the distilled decision records for the symbol the chunk
+/// defines — resolved from the chunk's (path, symbol_path) to the same facet-gated (provider fix
+/// edge + a selected symbol anchor), capped, labeled lane the other symbol surfaces use. Rides the
+/// memories include flag.
+#[test]
+fn read_chunk_attaches_distilled_records_for_the_chunk_symbol() {
+    use rag_rat_base::config::MemorySurface;
+    use rag_rat_query::graph_meta::GraphMetaMode;
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let symbol = db
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("target".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("selected symbol");
+    let logical = symbol.logical_symbol_id.expect("target has a logical id");
+
+    let conn = db.storage.connection();
+    let repo_id = rag_rat_db::schema::active_repo_id(conn).unwrap();
+    // A distilled record for issue #5: a PROVIDER fix edge, anchored to `target`'s logical symbol
+    // and SELECTED — the two facets `records_for_symbol` gates the drive-by on.
+    conn.execute(
+        "INSERT INTO papertrail_distill
+             (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+              root_issue, fix_edge_source, thread_shape, anchors_qualified_count,
+              distilled_at_ms, repo_id)
+         VALUES ('github','o/r','issue','5','sha256:h',3,'5','provider','investigation',1,10,?1)",
+        rusqlite::params![repo_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO papertrail_distill_anchors
+             (tracker, project, item_kind, item_key, anchor_kind, logical_symbol_id, name,
+              resolved, candidate_ordinal, selected, repo_id)
+         VALUES ('github','o/r','issue','5','symbol',?1,'target',1,0,1,?2)",
+        rusqlite::params![rag_rat_base::serde_big_id::format_sym_handle(logical), repo_id],
+    )
+    .unwrap();
+
+    let chunk_id: i64 = conn
+        .query_row(
+            "SELECT chunks.id FROM chunks JOIN files ON files.id = chunks.file_id WHERE \
+             files.path = 'src/lib.rs' AND chunks.symbol_path IS NOT NULL LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // Happy path: the record surfaces on read_chunk, labeled unreviewed.
+    let chunk = db
+        .read_chunk_with_graph_and_memories(
+            chunk_id,
+            GraphMetaMode::Full,
+            20,
+            true,
+            MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("chunk");
+    assert_eq!(
+        chunk.distilled_records.iter().map(|r| r.record.item_key.as_str()).collect::<Vec<_>>(),
+        vec!["5"],
+        "the provider-edge, selected-anchor record for this chunk's symbol attaches",
+    );
+    assert!(chunk.distilled_records[0].unreviewed, "the drive-by record is labeled unreviewed");
+
+    // A symbol wider than the chunk limit splits; its continuation chunks carry a
+    // `<qualified_name>#<part>` symbol_path. That must resolve to the SAME defining symbol rather
+    // than silently surfacing nothing — the numeric continuation suffix is stripped before the
+    // symbol lookup.
+    let base_symbol_path = chunk.symbol_path.clone().expect("the chunk defines a symbol");
+    let continuation = format!("{base_symbol_path}#1");
+    assert_eq!(
+        db.records_for_chunk_symbol("src/lib.rs", Some(&continuation), 2)
+            .unwrap()
+            .iter()
+            .map(|r| r.record.item_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["5"],
+        "a `{base_symbol_path}#<part>` continuation symbol_path resolves to the same records",
+    );
+
+    // include_memories = false skips the whole drive-by lane, same as memories.
+    let bare = db
+        .read_chunk_with_graph_and_memories(
+            chunk_id,
+            GraphMetaMode::Full,
+            20,
+            false,
+            MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("chunk");
+    assert!(bare.distilled_records.is_empty(), "the drive-by rides the memories include flag");
+
+    // Resolver guards: a chunk with no symbol name, and an unknown symbol, both surface nothing.
+    assert!(db.records_for_chunk_symbol("src/lib.rs", None, 2).unwrap().is_empty());
+    assert!(
+        db.records_for_chunk_symbol("src/lib.rs", Some("does_not_exist"), 2).unwrap().is_empty()
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// #463: a node created with NO binding target is UNANCHORED — a graph node (a `Concept` /
 /// standalone `Task`) with no code anchor. It surfaces in the general `memory list` with blank
 /// binding columns, dedupes against another unanchored node of the same text, is excluded by a

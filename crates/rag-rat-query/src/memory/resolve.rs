@@ -466,7 +466,18 @@ pub(crate) fn symbol_id_for_chunk(
     conn: &Connection,
     chunk: &ChunkAnchor,
 ) -> anyhow::Result<Option<i64>> {
-    let Some(symbol_path) = chunk.symbol_path.as_deref() else {
+    symbol_id_for_path_symbol(conn, &chunk.path, chunk.symbol_path.as_deref())
+}
+
+/// The `symbols` rowid for the symbol at (`path`, qualified `symbol_path`). `None` when there is no
+/// symbol name or the name is unknown to the index. The rowid is reassigned on every reindex
+/// (#149), so resolve it to a logical id before caching or crossing the wire.
+pub(crate) fn symbol_id_for_path_symbol(
+    conn: &Connection,
+    path: &str,
+    symbol_path: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
+    let Some(symbol_path) = symbol_path else {
         return Ok(None);
     };
     conn.query_row(
@@ -478,11 +489,41 @@ pub(crate) fn symbol_id_for_chunk(
           AND symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?2)
         LIMIT 1
         ",
-        params![chunk.path, symbol_path],
+        params![path, symbol_path],
         |row| row.get("symbol_id"),
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// The stable logical-symbol handle for the symbol a chunk defines — its file `path` + qualified
+/// `symbol_path` — for #705 drive-by records on `read_chunk`. `None` when the chunk defines no
+/// symbol or the symbol has no logical grouping.
+pub fn logical_symbol_id_for_chunk_symbol(
+    conn: &Connection,
+    path: &str,
+    symbol_path: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
+    // A symbol wider than the chunk limit is split into parts; its continuation chunks carry a
+    // `qualified_name#<part>` symbol_path (see the chunker) while `symbols.qualified_name_id`
+    // stores only the bare qualified name. Strip the numeric continuation suffix so reading a
+    // continuation chunk resolves to the SAME defining symbol as its first part instead of
+    // silently surfacing no records.
+    let base = symbol_path.map(strip_chunk_continuation_suffix);
+    let Some(symbol_id) = symbol_id_for_path_symbol(conn, path, base)? else {
+        return Ok(None);
+    };
+    logical_symbol_id_for_symbol(conn, symbol_id)
+}
+
+/// Strip a chunker continuation suffix (`…#<digits>`) from a chunk's `symbol_path`, yielding the
+/// defining symbol's bare qualified name. A name without a trailing numeric `#` suffix — the common
+/// case, and part 0 of any split — passes through unchanged.
+pub(crate) fn strip_chunk_continuation_suffix(symbol_path: &str) -> &str {
+    match symbol_path.rsplit_once('#') {
+        Some((base, part)) if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => symbol_path,
+    }
 }
 pub(crate) fn logical_symbol_id_for_symbol(
     conn: &Connection,
@@ -977,4 +1018,23 @@ pub(crate) fn short_symbol_name<'a>(binding_id: &'a str, path: Option<&str>) -> 
         return name;
     }
     binding_id.rsplit("::").next().unwrap_or(binding_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_chunk_continuation_suffix as strip;
+
+    #[test]
+    fn continuation_suffix_is_stripped_only_when_numeric() {
+        // Part 0 and any ordinary qualified name pass through.
+        assert_eq!(strip("foo::bar"), "foo::bar");
+        assert_eq!(strip("target"), "target");
+        // A chunker continuation suffix (`#<digits>`) is dropped to the defining symbol.
+        assert_eq!(strip("foo::bar#1"), "foo::bar");
+        assert_eq!(strip("target#12"), "target");
+        // A `#` that is not a numeric continuation is left intact (never a split part).
+        assert_eq!(strip("foo#bar"), "foo#bar");
+        assert_eq!(strip("foo::bar#"), "foo::bar#");
+        assert_eq!(strip("foo#1a"), "foo#1a");
+    }
 }
