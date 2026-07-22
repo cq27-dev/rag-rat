@@ -21,4 +21,5 @@
 
 pub(in crate::account) mod ops;
 pub(in crate::account) mod projection;
+pub(in crate::account) mod select;
 pub(in crate::account) mod verify;

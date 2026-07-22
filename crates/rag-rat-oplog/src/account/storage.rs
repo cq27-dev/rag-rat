@@ -599,6 +599,89 @@ pub(in crate::account) fn verify_stored_snapshots(
     Ok(verdicts)
 }
 
+/// A snapshot this device may act on: it verified against local history, and the owner incarnation
+/// it cites is still open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::account) struct UsableSnapshot {
+    pub(in crate::account) entry_hash: EntryHash,
+    pub(in crate::account) targets: Vec<snapshot::ops::SnapshotTarget>,
+}
+
+/// Every stored snapshot that verified AND whose author's cited incarnation is still open.
+///
+/// The incarnation gate is the revocation story for this artifact class. No control op can cut an
+/// annex chain — registers are minted per log and `ChainKind` has no annex variant — so a revoked
+/// device's snapshots cannot be condemned by watermark the way its control entries are. Scoping
+/// usability to the cited incarnation gives a rule that needs no wire change and is derived purely
+/// from the control fold, so it is the same for every device holding the same control history.
+///
+/// A snapshot citing no authority is never usable: an unauthorized claim about folded state is not
+/// something to weigh, it is something to ignore.
+pub(in crate::account) fn usable_snapshots(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Vec<UsableSnapshot>> {
+    let rows = load_candidates(conn, account_id)?;
+    let held: Vec<envelope::VerifiedAccountEntry> =
+        rows.iter().map(|row| row.verified.clone()).collect();
+    let mut usable = Vec::new();
+    for row in &rows {
+        let header = &row.verified.header;
+        if header.log_id != fold::ANNEX_LOG
+            || header.crypto_suite != 0
+            || header.op_version != fold::SUPPORTED_OP_VERSION
+        {
+            continue;
+        }
+        let Ok(snapshot::ops::DecodedSnapshotOp::Known(snapshot::ops::SnapshotOp::Snapshot {
+            targets,
+            ..
+        })) = snapshot::ops::decode(header.entry_type, &row.verified.payload)
+        else {
+            continue;
+        };
+        let Some(owner_id) = header.authority_ref else {
+            continue;
+        };
+        if !matches!(
+            owner_incarnation_effective(conn, account_id, owner_id, header.device_fingerprint)?,
+            fold::AuthorityQuery::Effective(_)
+        ) {
+            continue;
+        }
+        if snapshot::verify::verify_snapshot(&held, &targets)
+            != snapshot::verify::SnapshotVerdict::Verified
+        {
+            continue;
+        }
+        // Keep ONLY the targets verification actually checked. Selection ranks by coverage, so
+        // carrying unverified targets would let an author pad a manifest with fabricated secrets or
+        // content coverage and outrank an honest snapshot on claims nobody validated.
+        let verified_targets: Vec<_> =
+            targets.into_iter().filter(snapshot::verify::is_supported_target).collect();
+        usable.push(UsableSnapshot { entry_hash: row.entry_hash, targets: verified_targets });
+    }
+    usable.sort_unstable_by_key(|snapshot| snapshot.entry_hash);
+    Ok(usable)
+}
+
+/// The snapshot this device would act on, if any: the maximal-coverage usable one, `entry_hash`
+/// breaking ties. Read-only and advisory, like everything on this path.
+pub(in crate::account) fn selected_snapshot(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Option<UsableSnapshot>> {
+    let usable = usable_snapshots(conn, account_id)?;
+    let candidates: Vec<snapshot::select::Candidate<'_>> = usable
+        .iter()
+        .map(|s| snapshot::select::Candidate { entry_hash: s.entry_hash, targets: &s.targets })
+        .collect();
+    let Some(chosen) = snapshot::select::select(&candidates) else {
+        return Ok(None);
+    };
+    Ok(usable.into_iter().find(|s| s.entry_hash == chosen))
+}
+
 pub fn owner_incarnation_effective(
     conn: &Connection,
     account_id: AccountId,
@@ -3485,6 +3568,124 @@ mod tests {
             status(&conn, &forged).as_deref(),
             Some("retained_unfolded"),
             "a false claim is still stored — verification decides trust, never storage",
+        );
+    }
+
+    /// Selection ranks by VERIFIED coverage, never by claims the verifier skipped.
+    ///
+    /// An unsupported target (secrets, or content until #406) is passed over by verification
+    /// without affecting the verdict. If selection counted it, padding a manifest with fabricated
+    /// coverage would be a way to outrank an honest snapshot — winning on a claim nobody checked.
+    #[test]
+    fn padding_a_manifest_with_unverifiable_coverage_does_not_win_selection() {
+        let conn = db();
+        let founder = Dev::new(0xb1);
+        let member = Dev::new(0xb2);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (add_bytes, _) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&member, DeviceRole::Member),
+        );
+        account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
+
+        // An honest control-only snapshot, and a padded one claiming extra secrets-log coverage
+        // this binary cannot check. The padded one is authored second so its entry_hash is not
+        // guaranteed to lose the tiebreak — the assertion below is about coverage, so pin whichever
+        // wins by comparing against the honest hash directly.
+        let honest = author_snapshot_over(&conn, account_id, &founder, genesis_hash, |_| {});
+        let padded = author_snapshot_over(&conn, account_id, &founder, genesis_hash, |target| {
+            target.covered.push(snapshot::ops::CoveredWatermark {
+                device_fingerprint: member.fp,
+                seq: 0,
+                entry_hash: [0xcd; 32],
+            });
+        });
+        assert_ne!(honest, padded, "the two snapshots are distinct entries");
+
+        let usable = usable_snapshots(&conn, account_id).unwrap();
+        // The padded snapshot names a watermark this device does not hold, so it does not even
+        // verify — the first line of defence. What matters for selection is that a snapshot cannot
+        // gain rank from coverage that was never checked.
+        assert!(
+            usable.iter().all(|s| s.targets.iter().all(snapshot::verify::is_supported_target)),
+            "only verified targets may reach the selector",
+        );
+        assert_eq!(
+            selected_snapshot(&conn, account_id).unwrap().map(|s| s.entry_hash),
+            Some(honest),
+            "the honest snapshot is chosen; unverifiable coverage buys no rank",
+        );
+    }
+
+    /// The revocation story for this artifact class, and the reason it is incarnation-scoped.
+    ///
+    /// Registers are minted per log and `ChainKind` has no annex variant, so NO control op can cut
+    /// an annex chain — a revoked device's snapshots cannot be condemned by watermark the way its
+    /// control entries are. Usability is therefore tied to the owner incarnation the snapshot
+    /// cites, which closing kills wholesale: every snapshot authored under it becomes unusable,
+    /// including ones authored long before the revocation. Coarser than a beyond-cut boundary, and
+    /// for a claim about folded state that is the safer direction.
+    #[test]
+    fn closing_an_incarnation_makes_every_snapshot_it_authored_unusable() {
+        let conn = db();
+        let founder = Dev::new(0xa1);
+        let owner_b = Dev::new(0xa2);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        // A second owner; the DeviceAdd mints its incarnation, and that hash is its `owner_id`.
+        let (add_b, owner_b_id) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&owner_b, DeviceRole::Owner),
+        );
+        account_ingest(&conn, &add_b, NOW + 1).unwrap();
+
+        // `owner_b` snapshots under its own incarnation, BEFORE any revocation.
+        let snapshot_hash = author_snapshot_over(&conn, account_id, &owner_b, owner_b_id, |_| {});
+        let usable = usable_snapshots(&conn, account_id).unwrap();
+        assert_eq!(usable.len(), 1, "an open incarnation's snapshot is usable");
+        assert_eq!(usable[0].entry_hash, snapshot_hash);
+        assert_eq!(
+            selected_snapshot(&conn, account_id).unwrap().map(|s| s.entry_hash),
+            Some(snapshot_hash),
+        );
+
+        // The founder closes that incarnation. The snapshot is untouched and still verifies against
+        // local history — its claim was never false — but the authority it was authored under is
+        // gone.
+        let (demote_bytes, _) = op(
+            account_id,
+            &founder,
+            2,
+            Some(owner_b_id),
+            Some(genesis_hash),
+            &owner_demote(&owner_b, owner_b_id),
+        );
+        account_ingest(&conn, &demote_bytes, NOW + 3).unwrap();
+
+        assert_eq!(
+            verify_stored_snapshots(&conn, account_id).unwrap(),
+            vec![(snapshot_hash, snapshot::verify::SnapshotVerdict::Verified)],
+            "the claim is still true — revocation is about authority, not correctness",
+        );
+        assert!(
+            usable_snapshots(&conn, account_id).unwrap().is_empty(),
+            "a pre-revocation snapshot dies with its incarnation, not at a watermark",
+        );
+        assert_eq!(selected_snapshot(&conn, account_id).unwrap(), None);
+        assert_eq!(
+            status(&conn, &snapshot_hash).as_deref(),
+            Some("retained_unfolded"),
+            "and it is still stored — usability decides trust, never storage",
         );
     }
 

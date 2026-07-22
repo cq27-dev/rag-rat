@@ -79,6 +79,17 @@ pub(in crate::account) enum SnapshotVerdict {
     Unverifiable(Unverifiable),
 }
 
+/// Whether this binary can actually check a target's claim.
+///
+/// The single source of truth for "supported", and it has a second consumer for a sharp reason:
+/// selection must rank snapshots by VERIFIED coverage only. An unsupported target is skipped here
+/// without affecting the verdict, so if selection counted it, an author could pad a manifest with
+/// fabricated secrets or content targets and outrank an honest control-only snapshot on coverage
+/// nobody validated.
+pub(in crate::account) fn is_supported_target(target: &SnapshotTarget) -> bool {
+    target.log_id == CONTROL_LOG_ID
+}
+
 /// Check one snapshot's targets against the entries this device holds for the account.
 ///
 /// A pure function of `(held, targets)` — deliberately not a storage call, so it is impossible to
@@ -101,7 +112,7 @@ pub(in crate::account) fn verify_snapshot(
 
     let mut supported = 0usize;
     for target in targets {
-        if target.log_id != CONTROL_LOG_ID {
+        if !is_supported_target(target) {
             // A target this binary has no projection for is not a failure — a newer binary (or
             // #406, for content) will check it.
             continue;
