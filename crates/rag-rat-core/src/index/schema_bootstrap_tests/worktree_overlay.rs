@@ -1518,3 +1518,285 @@ fn worktree_overlay_gc_prunes_a_removed_worktrees_refresh_basis() {
     let _ = fs::remove_dir_all(&removed);
     let _ = fs::remove_dir_all(&kept);
 }
+
+/// Whether the repo's `logical_symbols` grouping has a row named `name` — the table
+/// symbol_lookup / graph nav resolve through, i.e. the direct observable for "the repo-global
+/// rebuild ran (or didn't) since these symbols were indexed".
+fn logical_symbol_named(db: &IndexDatabase, name: &str) -> bool {
+    db.storage
+        .connection()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.logical_symbols WHERE repo_id = ?1 AND logical_name \
+             = ?2)",
+            rusqlite::params![db.active_repo_id, name],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// The #819 pending-rebuild marker, so tests can assert a batch commits it with the overlay rows
+/// and the batch tail consumes it.
+fn logical_rebuild_pending(db: &IndexDatabase) -> bool {
+    db.repo_meta("overlay_logical_rebuild_pending").unwrap().is_some()
+}
+
+#[test]
+fn overlay_batch_pass_rebuilds_logical_symbols_once() {
+    // #819: `logical_symbols` is repo-scoped but scope-INDEPENDENT, so a pass refreshing K
+    // changed worktrees needs exactly ONE repo-global rebuild — per-worktree inline rebuilds
+    // are K−1 redundant DELETE-all + re-derive passes (only the last one's output survives).
+    // The counter is the cardinality observable: the old inline behavior paid one rebuild per
+    // changed worktree and fails this assertion.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let wt_one = unique_temp_root();
+    let _ = fs::remove_dir_all(&wt_one);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-one", wt_one.to_str().unwrap()]);
+    fs::write(wt_one.join("src/one.rs"), "pub fn one_fn() {}\n").unwrap();
+    run_git(&wt_one, &["add", "."]);
+    run_git(&wt_one, &["commit", "-q", "-m", "one"]);
+    let wt_two = unique_temp_root();
+    let _ = fs::remove_dir_all(&wt_two);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-two", wt_two.to_str().unwrap()]);
+    fs::write(wt_two.join("src/two.rs"), "pub fn two_fn() {}\n").unwrap();
+    run_git(&wt_two, &["add", "."]);
+    run_git(&wt_two, &["commit", "-q", "-m", "two"]);
+
+    let before = db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed);
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    let after = db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(after - before, 1, "two changed worktrees, ONE repo-global rebuild");
+    assert!(!logical_rebuild_pending(&db), "the batch tail consumed the pending marker");
+    // The deferred rebuild still lands every branch's new symbols in the grouping — the #219
+    // field bug (a newly added overlay file's symbols unresolvable) stays fixed.
+    assert!(logical_symbol_named(&db, "one_fn"), "first worktree's new symbol is grouped");
+    assert!(logical_symbol_named(&db, "two_fn"), "second worktree's new symbol is grouped");
+
+    // An idle follow-up sweep neither rebuilds nor marks anything pending (#63 idle backstop).
+    let idle_before = db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed);
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    assert_eq!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed),
+        idle_before,
+        "an unchanged fleet rebuilds nothing"
+    );
+    assert!(!logical_rebuild_pending(&db));
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&wt_one);
+    let _ = fs::remove_dir_all(&wt_two);
+}
+
+#[test]
+fn pending_logical_rebuild_marker_heals_an_interrupted_batch() {
+    // #819 crash-window backstop: a Deferred overlay refresh commits its rows and the pending
+    // marker in ONE transaction; if the process dies before the batch tail, the next pass
+    // idle-skips the (now unchanged) overlay rows — only the persisted marker can force the
+    // owed rebuild then. Without it, a newly added branch file's symbols would stay
+    // unresolvable until an unrelated change triggered a rebuild.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/new.rs"), "pub fn branch_only_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds file"]);
+
+    // Simulate the interrupted batch: the refresh commits (rows + marker); the tail never runs.
+    let tail = crate::index::OverlayRefreshTail {
+        logical_rebuild: crate::index::OverlayLogicalRebuild::Deferred,
+        basis: None,
+    };
+    let report = db.index_worktree_overlay_with_tail(&config, &linked, tail, &mut |_| {}).unwrap();
+    assert!(report.indexed >= 1, "the branch file landed as an overlay row");
+    assert!(logical_rebuild_pending(&db), "the obligation is committed with the rows");
+    assert!(
+        !logical_symbol_named(&db, "branch_only_fn"),
+        "committed rows without the batch tail leave the grouping stale — the state the persisted \
+         marker exists to heal"
+    );
+
+    // The next maintenance pass finds every overlay row unchanged (identity-skip) but still
+    // runs the owed rebuild off the marker.
+    let before = db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed);
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    assert_eq!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed) - before,
+        1,
+        "the write-idle pass still runs the owed rebuild"
+    );
+    assert!(!logical_rebuild_pending(&db), "the healing pass consumed the marker");
+    assert!(logical_symbol_named(&db, "branch_only_fn"), "the branch symbol is now grouped");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn inline_rebuild_satisfies_a_pending_deferred_obligation() {
+    // #819 review: a stale pending marker (left by an interrupted deferred batch) must be
+    // consumed by ANY successful rebuild — here a standalone INLINE overlay refresh — not only
+    // by the batch tail. Left set, the next maintenance pass would pay a second wholesale
+    // rebuild the inline one already performed.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/new.rs"), "pub fn branch_only_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds file"]);
+
+    // Interrupted deferred batch: rows + marker committed, the tail never runs.
+    let tail = crate::index::OverlayRefreshTail {
+        logical_rebuild: crate::index::OverlayLogicalRebuild::Deferred,
+        basis: None,
+    };
+    db.index_worktree_overlay_with_tail(&config, &linked, tail, &mut |_| {}).unwrap();
+    assert!(logical_rebuild_pending(&db), "the interrupted batch left its obligation");
+
+    // A later dirty edit in the same worktree, refreshed via the STANDALONE (inline) route.
+    fs::write(linked.join("src/more.rs"), "pub fn later_fn() {}\n").unwrap();
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.indexed >= 1, "the dirty edit landed as an overlay row");
+    assert!(!logical_rebuild_pending(&db), "the inline rebuild consumed the stale obligation");
+    // The rebuild is repo-global, so it grouped the interrupted batch's earlier symbols too.
+    assert!(logical_symbol_named(&db, "branch_only_fn"));
+    assert!(logical_symbol_named(&db, "later_fn"));
+
+    // The next sweep owes nothing — no second wholesale rebuild.
+    let before = db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed);
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    assert_eq!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "an already-satisfied obligation triggers nothing"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn overlay_basis_writes_ride_the_refresh_transaction() {
+    // #824 (#577 semantics preserved): the skip-proof basis is maintained INSIDE the overlay's
+    // own BEGIN IMMEDIATE — record the caller's pair on a COMPLETE refresh (even a no-change
+    // one: the proof "this pair is current" is the point), clear it on a PARTIAL one, leave it
+    // untouched when no basis is maintained — instead of a separate autocommit per worktree
+    // per pass.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+
+    // COMPLETE refresh with a maintained basis: the CALLER's pair (read around the refresh,
+    // like the watcher's) is recorded in the refresh transaction.
+    let tail = crate::index::OverlayRefreshTail {
+        logical_rebuild: crate::index::OverlayLogicalRebuild::Deferred,
+        basis: Some(crate::index::OverlayBasisUpdate {
+            base_sha: "base-head-1",
+            linked_head_sha: "linked-head-1",
+        }),
+    };
+    let report = db.index_worktree_overlay_with_tail(&config, &linked, tail, &mut |_| {}).unwrap();
+    assert!(report.status_complete, "an undisturbed delta walk completes");
+    assert_eq!(
+        db.worktree_overlay_basis(&report.worktree_id).unwrap(),
+        Some(("base-head-1".to_string(), "linked-head-1".to_string())),
+        "a complete refresh records the maintained basis"
+    );
+    assert!(!logical_rebuild_pending(&db), "a no-change refresh defers no rebuild");
+
+    // PARTIAL refresh clears the recorded proof: a dirty edit moves no HEAD, so a stale pair
+    // would keep matching and scoped passes would skip the stale overlay until an `All` sweep
+    // (#577 review). Exercised at the tail seam — a real mid-walk gix status failure can't be
+    // provoked deterministically.
+    db.apply_overlay_basis_tail(
+        &report.worktree_id,
+        false,
+        Some(crate::index::OverlayBasisUpdate {
+            base_sha: "base-head-2",
+            linked_head_sha: "linked-head-2",
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        db.worktree_overlay_basis(&report.worktree_id).unwrap(),
+        None,
+        "a partial refresh drops the stale skip proof"
+    );
+
+    // The standalone shape maintains no basis: whatever is recorded stays untouched.
+    db.apply_overlay_basis_tail(
+        &report.worktree_id,
+        true,
+        Some(crate::index::OverlayBasisUpdate {
+            base_sha: "base-head-3",
+            linked_head_sha: "linked-head-3",
+        }),
+    )
+    .unwrap();
+    let standalone = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        db.worktree_overlay_basis(&standalone.worktree_id).unwrap(),
+        Some(("base-head-3".to_string(), "linked-head-3".to_string())),
+        "a refresh that maintains no basis leaves the recorded pair alone"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}

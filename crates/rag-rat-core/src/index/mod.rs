@@ -84,7 +84,9 @@ pub use query_api::{
 };
 pub use schema::RegisteredRepo;
 pub(crate) use util::*;
-pub use worktree_overlay::WorktreeOverlayReport;
+pub use worktree_overlay::{
+    OverlayBasisUpdate, OverlayLogicalRebuild, OverlayRefreshTail, WorktreeOverlayReport,
+};
 
 #[cfg(test)]
 mod anchor_tests;
@@ -173,6 +175,10 @@ pub struct IndexDatabase {
     /// never pay the snapshot scan. Interior mutability because the deleters take `&self`.
     drift_snapshot:
         std::sync::Mutex<Option<(String, Option<Vec<graph_index::LogicalKeyDriftRow>>)>>,
+    /// Test-only #819 observability: how many times [`Self::rebuild_logical_symbols`] ran on this
+    /// connection, so batch tests can assert the once-per-pass rebuild cardinality.
+    #[cfg(test)]
+    pub(crate) logical_symbol_rebuilds: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]

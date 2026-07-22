@@ -49,6 +49,9 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
         // not the launching process's base targets — a branch that adds/narrows targets must be
         // indexed by its own config or its overlay rows are filtered/pruned (#219 review).
         let overlay_config = config.for_linked_worktree_overlay(worktree);
+        // The standalone shape: a single-checkout command has no batch to deduplicate the
+        // logical-symbol rebuild across, so it stays INLINE — atomic with the overlay
+        // transaction (the watcher/`--paths` batch routes defer it to one run per pass).
         let report = db.index_worktree_overlay(&overlay_config, worktree, &mut progress)?;
         if report.worktree_id.is_empty() {
             anyhow::bail!(

@@ -5,7 +5,9 @@ use std::time::Instant;
 use rag_rat_base::config::Config;
 
 use crate::index::ai::ReconcileOptions;
-use crate::index::{IndexDatabase, IndexProgress};
+use crate::index::{
+    IndexDatabase, IndexProgress, OverlayBasisUpdate, OverlayLogicalRebuild, OverlayRefreshTail,
+};
 
 /// The canonical worktree id string [`crate::index::live_worktree_contexts`] reports. When `root`
 /// is a repo SUBDIR (`<repo>/crate`), the enclosing worktree root is `<repo>` — which is the
@@ -127,23 +129,23 @@ pub fn refresh_worktree_overlays(
         // keeps the shared base `root`/`database` but swaps in the branch's target set
         // (#219 review).
         let overlay_config = config.for_linked_worktree_overlay(Path::new(&worktree));
-        match db.index_worktree_overlay(&overlay_config, Path::new(&worktree), &mut |_| {}) {
+        // The tail (#819/#824): defer the repo-global logical-symbol rebuild to ONE run after
+        // this loop, and let the refresh maintain the #577 basis INSIDE its own transaction —
+        // record on complete, clear on partial — instead of a separate autocommit per worktree.
+        // (A non-sibling refresh never opens the transaction and leaves any basis untouched.)
+        let tail = OverlayRefreshTail {
+            logical_rebuild: OverlayLogicalRebuild::Deferred,
+            basis: Some(OverlayBasisUpdate { base_sha: &base_sha, linked_head_sha: &linked_head }),
+        };
+        match db.index_worktree_overlay_with_tail(
+            &overlay_config,
+            Path::new(&worktree),
+            tail,
+            &mut |_| {},
+        ) {
             Ok(report) => {
                 let this_changed = report.indexed > 0 || report.tombstoned > 0 || report.pruned > 0;
                 changed |= this_changed;
-                match overlay_basis_action(&report) {
-                    // Record the refresh basis so later scoped passes can prove "unchanged" from
-                    // two head reads instead of re-computing the delta (#577). Best-effort: a
-                    // failed write just means the next pass refreshes again.
-                    OverlayBasisAction::Record => {
-                        let _ =
-                            db.record_worktree_overlay_basis(&worktree, &base_sha, &linked_head);
-                    },
-                    OverlayBasisAction::Clear => {
-                        let _ = db.clear_worktree_overlay_basis(&worktree);
-                    },
-                    OverlayBasisAction::Keep => {},
-                }
                 // Embed the overlay's chunks NOW, while the connection is still scoped to this
                 // overlay (index_worktree_overlay left it there) — the trailing base reconcile
                 // won't see them (#219 review). Run when the overlay CHANGED, OR — on an `All`
@@ -180,37 +182,19 @@ pub fn refresh_worktree_overlays(
             },
         }
     }
+    // ONE repo-global logical-symbol rebuild for the whole batch (#819): each changed overlay
+    // transaction above marked it pending instead of paying the full DELETE-all + re-derive per
+    // worktree (only the last rebuild's output would survive anyway). Runs even when a worktree
+    // errored mid-loop — the marker rode the transactions that DID commit. Best-effort like the
+    // per-worktree refresh: on failure the marker survives its rollback and the next pass
+    // retries.
+    if let Err(err) = db.apply_pending_logical_rebuild() {
+        eprintln!("watch: batch logical-symbol rebuild failed: {err}");
+    }
     // Restore the base scope for the rest of the pass (index_worktree_overlay leaves the connection
     // scoped to the last worktree it touched).
     let _ = db.use_worktree_scope(&config.root, None);
     changed
-}
-
-/// What a refresh outcome does to the worktree's skip-proof basis (#577).
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum OverlayBasisAction {
-    /// A COMPLETE refresh of a real linked sibling: the heads captured around it prove the
-    /// overlay current.
-    Record,
-    /// A PARTIAL refresh (the working-tree status read failed midway): dirty/untracked/deleted
-    /// paths may be missing while neither HEAD moved, so a previously recorded basis would keep
-    /// matching and scoped passes would skip the stale overlay until an `All` pass. Drop it so
-    /// they keep refreshing until a complete pass lands.
-    Clear,
-    /// Not a linked sibling — there is no overlay to prove anything about.
-    Keep,
-}
-
-pub(crate) fn overlay_basis_action(
-    report: &crate::index::WorktreeOverlayReport,
-) -> OverlayBasisAction {
-    if report.worktree_id.is_empty() {
-        OverlayBasisAction::Keep
-    } else if report.status_complete {
-        OverlayBasisAction::Record
-    } else {
-        OverlayBasisAction::Clear
-    }
 }
 
 pub(crate) fn overlay_needs_embed(
@@ -309,52 +293,77 @@ where
     // Always run the base pass: it opens the db (returned for status + the overlay refresh) and
     // enforces #427. With no base paths it is a no-op scoped pass over an empty change set.
     let mut db = IndexDatabase::index_paths_with_progress(config, &base_paths, &mut progress)?;
-    for (checkout, checkout_paths) in &linked {
-        // Index EXACTLY the supplied paths of each touched checkout's overlay (#679), with the
-        // LINKED branch's OWN targets (a branch that adds/narrows targets must be indexed
-        // by its own config). Path-scoped, not the whole base↔branch delta: a single-file
-        // linked edit no longer pulls in unrelated in-flight changes in the same worktree —
-        // the base `Paths` exact-path semantics on the linked route. `?` PROPAGATES a
-        // failure — the caller (an edit hook) must be able to tell the reindex did not land
-        // and retry.
-        //
-        // EXCEPT a branch `rag-rat.toml` or `.gitignore` edit: both change the indexable set across
-        // the WHOLE overlay — a config edit re-languages / adds / drops targets; a `.gitignore`
-        // edit flips OTHER files' ignore status — and neither is itself a source target, so
-        // the path-scoped route would no-op on them and leave the drift for a later sweep.
-        // Run the whole-delta pass, which reconciles both
-        // (`overlay_target_config_reconcile` for target
-        // drift, `expand_candidates_for_ignore_only_flips` for ignore flips) (#679 review). Such
-        // edits are rare, so paying the full tree-diff there is fine.
-        let overlay_config = config.for_linked_worktree_overlay(checkout);
-        let overlay_wide_edit = checkout_paths
-            .iter()
-            .any(|path| is_config_path(path) || super::placement::is_gitignore_path(path));
-        let report = if overlay_wide_edit {
-            db.index_worktree_overlay(&overlay_config, checkout, &mut progress)?
-        } else {
-            db.index_worktree_overlay_paths(
-                &overlay_config,
-                checkout,
-                checkout_paths,
-                &mut progress,
-            )?
-        };
-        // A path-scoped pass is never a complete overlay refresh (`status_complete = false`), so —
-        // like the watcher on a partial read — CLEAR this worktree's overlay basis so the next full
-        // sweep re-refreshes anything else in the branch instead of skipping on a still-matching
-        // basis (#659/#679).
-        if !report.status_complete && !report.worktree_id.is_empty() {
-            let _ = db.clear_worktree_overlay_basis(&report.worktree_id);
+    let overlay_result = (|| -> anyhow::Result<()> {
+        for (checkout, checkout_paths) in &linked {
+            // Index EXACTLY the supplied paths of each touched checkout's overlay (#679), with the
+            // LINKED branch's OWN targets (a branch that adds/narrows targets must be indexed
+            // by its own config). Path-scoped, not the whole base↔branch delta: a single-file
+            // linked edit no longer pulls in unrelated in-flight changes in the same worktree —
+            // the base `Paths` exact-path semantics on the linked route. `?` PROPAGATES a
+            // failure — the caller (an edit hook) must be able to tell the reindex did not land
+            // and retry.
+            //
+            // EXCEPT a branch `rag-rat.toml` or `.gitignore` edit: both change the indexable set
+            // across the WHOLE overlay — a config edit re-languages / adds / drops
+            // targets; a `.gitignore` edit flips OTHER files' ignore status — and
+            // neither is itself a source target, so the path-scoped route would no-op
+            // on them and leave the drift for a later sweep. Run the whole-delta pass,
+            // which reconciles both (`overlay_target_config_reconcile` for target
+            // drift, `expand_candidates_for_ignore_only_flips` for ignore flips) (#679 review).
+            // Such edits are rare, so paying the full tree-diff there is fine.
+            let overlay_config = config.for_linked_worktree_overlay(checkout);
+            let overlay_wide_edit = checkout_paths
+                .iter()
+                .any(|path| is_config_path(path) || super::placement::is_gitignore_path(path));
+            // Defer the repo-global logical-symbol rebuild to ONE run after this loop (#819) — an
+            // `index --paths` batch spanning several checkouts would otherwise pay one full
+            // DELETE-all + re-derive per checkout. The basis pair is not maintained in-txn here:
+            // this flow never RECORDS a basis (it captures no head pair), it only clears below.
+            let report = if overlay_wide_edit {
+                db.index_worktree_overlay_with_tail(
+                    &overlay_config,
+                    checkout,
+                    OverlayRefreshTail {
+                        logical_rebuild: OverlayLogicalRebuild::Deferred,
+                        basis: None,
+                    },
+                    &mut progress,
+                )?
+            } else {
+                db.index_worktree_overlay_paths(
+                    &overlay_config,
+                    checkout,
+                    checkout_paths,
+                    OverlayLogicalRebuild::Deferred,
+                    &mut progress,
+                )?
+            };
+            // A path-scoped pass is never a complete overlay refresh (`status_complete = false`),
+            // so — like the watcher on a partial read — CLEAR this worktree's overlay
+            // basis so the next full sweep re-refreshes anything else in the branch
+            // instead of skipping on a still-matching basis (#659/#679).
+            if !report.status_complete && !report.worktree_id.is_empty() {
+                let _ = db.clear_worktree_overlay_basis(&report.worktree_id);
+            }
+            // A SUPPLIED `Cargo.toml` must refresh the overlay's package map even when it is CLEAN/
+            // committed (so it produced no source rows and the overlay's status-derived signal
+            // missed it) — the base flow refreshes on a named manifest regardless of
+            // dirtiness, and the linked route must honor the same "also sees committed
+            // changes" contract (#659 review).
+            if manifest_roots.contains(checkout) {
+                db.refresh_worktree_overlay_packages(&overlay_config, checkout)?;
+            }
         }
-        // A SUPPLIED `Cargo.toml` must refresh the overlay's package map even when it is CLEAN/
-        // committed (so it produced no source rows and the overlay's status-derived signal missed
-        // it) — the base flow refreshes on a named manifest regardless of dirtiness, and the linked
-        // route must honor the same "also sees committed changes" contract (#659 review).
-        if manifest_roots.contains(checkout) {
-            db.refresh_worktree_overlay_packages(&overlay_config, checkout)?;
-        }
-    }
+        Ok(())
+    })();
+    // Run the batch's ONE deferred logical-symbol rebuild (#819) BEFORE propagating a mid-loop
+    // error: the checkouts that already committed marked it pending, and skipping it would leave
+    // their newly indexed symbols unresolvable until another pass. When the loop failed, the loop
+    // error wins; a rebuild failure here leaves the pending marker committed, so the next
+    // maintenance pass retries it.
+    let rebuild_result = db.apply_pending_logical_rebuild();
+    overlay_result?;
+    rebuild_result?;
     // The overlay passes / the manifest refresh leave the connection scoped to the LAST overlay;
     // restore the base scope so the returned db reads base-scoped status.
     if !linked.is_empty() {

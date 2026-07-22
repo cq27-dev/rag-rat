@@ -596,33 +596,6 @@ fn overlay_changes_do_not_force_the_base_tail() {
 }
 
 #[test]
-fn basis_records_on_complete_clears_on_partial_keeps_on_non_sibling() {
-    // #577 review: a PARTIAL refresh (the gix status read failed midway, so
-    // `status_complete=false` and dirty/untracked paths may be missing) must CLEAR any
-    // recorded basis, not merely skip recording — a dirty edit moves no HEAD, so a prior
-    // basis would keep matching and later scoped passes would skip the stale overlay until
-    // an `All` pass. A non-sibling skip touches nothing.
-    let complete = crate::index::WorktreeOverlayReport {
-        worktree_id: "/wt/a".to_string(),
-        status_complete: true,
-        ..Default::default()
-    };
-    assert_eq!(overlay_basis_action(&complete), OverlayBasisAction::Record);
-    let partial = crate::index::WorktreeOverlayReport {
-        worktree_id: "/wt/a".to_string(),
-        status_complete: false,
-        ..Default::default()
-    };
-    assert_eq!(
-        overlay_basis_action(&partial),
-        OverlayBasisAction::Clear,
-        "a partial status scan drops the stale skip proof"
-    );
-    let not_a_sibling = crate::index::WorktreeOverlayReport::default();
-    assert_eq!(overlay_basis_action(&not_a_sibling), OverlayBasisAction::Keep);
-}
-
-#[test]
 fn overlay_scope_merge_unions_roots_and_all_absorbs() {
     // #577: hints accumulated while the debounce is armed must union attributable roots, and
     // an unattributable hint (rescan, registry change) must widen the whole pass to All.

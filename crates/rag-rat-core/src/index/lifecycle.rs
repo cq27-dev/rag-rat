@@ -178,6 +178,8 @@ impl IndexDatabase {
             config: None,
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
         };
         if matches!(mode, BareOpenMode::ConfigLess) {
             db.ensure_graph_index_current()?;
@@ -201,6 +203,8 @@ impl IndexDatabase {
             config: Some(config.clone()),
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
         };
         db.storage.set_source_root(config.root.clone());
         // Register/adopt BEFORE anything repo-scoped runs, then install the scope context so the
@@ -378,6 +382,8 @@ impl IndexDatabase {
             config: Some(config.clone()),
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
         };
         // Install the scope context BEFORE the heal-owed gates: `set_context` mirrors the resolved
         // `repo_id` into `temp.connection_context` (writable even on a read-only main DB), so the
@@ -538,6 +544,8 @@ impl IndexDatabase {
             config: None,
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 

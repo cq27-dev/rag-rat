@@ -388,6 +388,77 @@ fn change_location_path(change: &gix::object::tree::diff::Change<'_, '_, '_>) ->
 /// `watch_shutdown_reconcile_pending` marker set the pattern.
 const WORKTREE_OVERLAY_BASIS_META_PREFIX: &str = "worktree_overlay_basis:";
 
+/// `repo_meta` key marking that a committed overlay refresh deferred the repo-global
+/// `logical_symbols` rebuild to its batch's tail (#819). Set INSIDE each overlay transaction that
+/// changes source rows under [`OverlayLogicalRebuild::Deferred`]; consumed by the batch tail
+/// ([`IndexDatabase::apply_pending_logical_rebuild`]). Persisted rather
+/// than tracked in memory so a crash between a committed overlay transaction and the batch tail
+/// leaves the obligation visible: the next pass must run the rebuild even though every overlay
+/// row is unchanged (idle-skipped) by then — otherwise a newly added overlay file's symbols would
+/// stay unresolvable until an unrelated change triggered a rebuild. `rebuild_logical_symbols` is
+/// the sole CLEARER: any successful rebuild — the batch tail, an inline overlay refresh, a heal,
+/// an incremental or full pass — satisfies the obligation in the same transaction.
+pub(super) const OVERLAY_LOGICAL_REBUILD_PENDING_META: &str = "overlay_logical_rebuild_pending";
+
+/// Whether an overlay refresh runs the repo-global logical-symbol rebuild inside its own
+/// transaction, or defers it to one batch-tail rebuild (#819). `logical_symbols` is repo-scoped
+/// but scope-INDEPENDENT (see `rebuild_logical_symbols`), so when one pass refreshes K worktrees
+/// only the LAST rebuild's output survives — K inline rebuilds are K−1 wholesale
+/// DELETE-all + re-derive passes of pure write amplification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayLogicalRebuild {
+    /// Rebuild inside this refresh's transaction — atomic with the overlay rows. The standalone
+    /// single-checkout shape (CLI `index --worktree`, tests): nothing to deduplicate.
+    Inline,
+    /// Skip the rebuild and mark it pending in the same transaction. The batch caller MUST follow
+    /// up with [`IndexDatabase::apply_pending_logical_rebuild`] after its loop.
+    Deferred,
+}
+
+/// The `(base HEAD, linked HEAD)` pair a watcher pass wants recorded as the worktree's #577
+/// skip-proof refresh basis. Both heads are read by the CALLER around the refresh (base once per
+/// pass, linked before the delta) so a commit racing the refresh records the pre-refresh head —
+/// mismatching (and re-refreshing) next pass rather than skipping a stale overlay.
+#[derive(Debug, Clone, Copy)]
+pub struct OverlayBasisUpdate<'a> {
+    pub base_sha: &'a str,
+    pub linked_head_sha: &'a str,
+}
+
+/// Caller-owned handling of an overlay refresh's repo-global tail (#819/#824): how the
+/// logical-symbol rebuild runs, and whether the refresh maintains the worktree's #577 refresh
+/// basis inside its own transaction.
+#[derive(Debug, Clone, Copy)]
+pub struct OverlayRefreshTail<'a> {
+    pub logical_rebuild: OverlayLogicalRebuild,
+    /// `Some` = maintain the #577 skip-proof basis in the refresh transaction (#824): record the
+    /// pair on a COMPLETE refresh, clear the worktree's recorded basis on a PARTIAL one. (A
+    /// FAILED refresh rolls the transaction back — the caller clears after the rollback, where a
+    /// transactional clear cannot survive.) `None` = leave any recorded basis untouched.
+    pub basis: Option<OverlayBasisUpdate<'a>>,
+}
+
+impl OverlayRefreshTail<'_> {
+    /// The standalone, self-contained refresh: rebuild logical symbols inline (atomic with the
+    /// overlay transaction) and leave any recorded refresh basis untouched.
+    pub const STANDALONE: OverlayRefreshTail<'static> =
+        OverlayRefreshTail { logical_rebuild: OverlayLogicalRebuild::Inline, basis: None };
+}
+
+/// One overlay refresh's row-change counts — the gate for its finalize tail (any change means the
+/// logical-symbol/package/edge/FTS refresh runs; none means the pass stays write-free).
+struct OverlayChangeCounts {
+    indexed: usize,
+    tombstoned: usize,
+    pruned: usize,
+}
+
+impl OverlayChangeCounts {
+    fn any_changed(&self) -> bool {
+        self.indexed > 0 || self.tombstoned > 0 || self.pruned > 0
+    }
+}
+
 impl IndexDatabase {
     /// The recorded refresh basis for `worktree_id`: `(base_sha, linked_head_sha)` at the last
     /// successful overlay refresh, or `None` when never refreshed (or written by a pre-#577
@@ -460,10 +531,38 @@ impl IndexDatabase {
     /// scope, and tombstone the files it removed (#219 stage 2). No-op (empty `worktree_id` in the
     /// report) when `linked_path` is not a valid linked sibling of `config.root`'s repo. Leaves the
     /// connection scope set to the overlay; callers re-`set_context` if they need another scope.
+    ///
+    /// The standalone shape ([`OverlayRefreshTail::STANDALONE`]): the repo-global logical-symbol
+    /// rebuild runs inline, atomic with the overlay transaction, and no #577 basis is maintained.
+    /// Callers refreshing SEVERAL worktrees in one pass use
+    /// [`Self::index_worktree_overlay_with_tail`] instead, so the batch pays the rebuild once
+    /// (#819).
     pub fn index_worktree_overlay<F>(
         &mut self,
         config: &Config,
         linked_path: &Path,
+        progress: &mut F,
+    ) -> anyhow::Result<WorktreeOverlayReport>
+    where
+        F: FnMut(IndexProgress),
+    {
+        self.index_worktree_overlay_with_tail(
+            config,
+            linked_path,
+            OverlayRefreshTail::STANDALONE,
+            progress,
+        )
+    }
+
+    /// [`Self::index_worktree_overlay`] with caller-owned tail handling (#819/#824): the batch
+    /// shape. `tail` decides whether the repo-global logical-symbol rebuild runs inline or is
+    /// deferred to one [`Self::apply_pending_logical_rebuild`] per batch, and whether the
+    /// worktree's #577 refresh basis is maintained inside this refresh's own transaction.
+    pub fn index_worktree_overlay_with_tail<F>(
+        &mut self,
+        config: &Config,
+        linked_path: &Path,
+        tail: OverlayRefreshTail<'_>,
         progress: &mut F,
     ) -> anyhow::Result<WorktreeOverlayReport>
     where
@@ -541,11 +640,15 @@ impl IndexDatabase {
             self.finalize_overlay_refresh(
                 &source_root,
                 &worktree_id,
-                indexed,
-                tombstoned,
-                pruned,
+                OverlayChangeCounts { indexed, tombstoned, pruned },
                 delta.manifest_changed,
+                tail.logical_rebuild,
             )?;
+            // #824: the basis write rides the SAME transaction as the rows it proves current —
+            // previously a separate autocommit per worktree per pass (an extra WAL-dirtying
+            // commit each). Un-gated on the counts: a COMPLETE no-change refresh must still
+            // record its basis (that skip proof is the whole point of #577).
+            self.apply_overlay_basis_tail(&worktree_id, delta.status_complete, tail.basis)?;
             Ok((indexed, tombstoned, pruned))
         })();
         let (indexed, tombstoned, pruned) = match result {
@@ -588,11 +691,17 @@ impl IndexDatabase {
     /// package-map refresh stays the caller's job (via `refresh_worktree_overlay_packages`),
     /// exactly as on the whole-delta route. No-op (empty `worktree_id`) when `linked_path` is
     /// not a valid linked sibling. Leaves the connection scoped to the overlay.
+    ///
+    /// `logical_rebuild` (#819): `Deferred` skips the repo-global logical-symbol rebuild and
+    /// marks it pending, for callers batching several overlay refreshes — the batch then runs
+    /// [`Self::apply_pending_logical_rebuild`] once. Basis maintenance stays caller-side here
+    /// (this refresh is never complete, so there is never a pair to record).
     pub fn index_worktree_overlay_paths<F>(
         &mut self,
         config: &Config,
         linked_path: &Path,
         paths: &[PathBuf],
+        logical_rebuild: OverlayLogicalRebuild,
         progress: &mut F,
     ) -> anyhow::Result<WorktreeOverlayReport>
     where
@@ -710,10 +819,9 @@ impl IndexDatabase {
             self.finalize_overlay_refresh(
                 &source_root,
                 &worktree_id,
-                indexed,
-                tombstoned,
-                pruned,
+                OverlayChangeCounts { indexed, tombstoned, pruned },
                 false,
+                logical_rebuild,
             )?;
             Ok((indexed, tombstoned, pruned))
         })();
@@ -820,7 +928,9 @@ impl IndexDatabase {
     /// - rebuild_logical_symbols: symbol_lookup / graph nav resolve through `logical_symbols`, so a
     ///   NEWLY-ADDED overlay file's symbols are invisible until regrouped (a modified file's
     ///   unchanged symbols resolve via the base's logical rows — which is why only added files were
-    ///   missing). This is the field-reported bug.
+    ///   missing). This is the field-reported bug. `Deferred` (#819) replaces the rebuild with a
+    ///   persisted pending marker in this same transaction; the batch caller runs ONE rebuild for
+    ///   all its worktrees via `apply_pending_logical_rebuild`.
     /// - refresh_packages: write the overlay scope's `packages` rows from the LINKED checkout's
     ///   manifests BEFORE resolving, so the per-package import scope (#61) is correct for the
     ///   branch. The resolver's `load_package_roots_into_scope` reads `packages` at the active
@@ -843,16 +953,28 @@ impl IndexDatabase {
         &self,
         source_root: &Path,
         worktree_id: &str,
-        indexed: usize,
-        tombstoned: usize,
-        pruned: usize,
+        counts: OverlayChangeCounts,
         manifest_changed: bool,
+        logical_rebuild: OverlayLogicalRebuild,
     ) -> anyhow::Result<()> {
-        if indexed > 0 || tombstoned > 0 || pruned > 0 {
-            // Defer: an overlay refresh re-parsed only the worktree's own files, so it must not
-            // stamp the logical-key version — the base scope's drift is still in the future
-            // (#493).
-            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+        if counts.any_changed() {
+            match logical_rebuild {
+                OverlayLogicalRebuild::Inline => {
+                    // Defer the STAMP: an overlay refresh re-parsed only the worktree's own
+                    // files, so it must not stamp the logical-key version — the base scope's
+                    // drift is still in the future (#493).
+                    self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                },
+                OverlayLogicalRebuild::Deferred => {
+                    // Mark the repo-global rebuild pending IN THIS transaction (#819).
+                    // Committed overlay rows without a follow-up rebuild would leave a newly
+                    // added file's symbols unresolvable, and a later pass would idle-skip the
+                    // then-unchanged rows — the persisted marker survives a crash between this
+                    // commit and the batch tail, so `apply_pending_logical_rebuild` still runs.
+                    // `if_changed`: the second changed worktree of a batch finds it already set.
+                    self.set_repo_meta_if_changed(OVERLAY_LOGICAL_REBUILD_PENDING_META, "1")?;
+                },
+            }
             self.refresh_packages(source_root)?;
             self.resolve_overlay_edges(worktree_id)?;
             self.sync_fts()?;
@@ -870,6 +992,69 @@ impl IndexDatabase {
             self.resolve_overlay_edges(worktree_id)?;
         }
         Ok(())
+    }
+
+    /// Apply the #577 basis leg of an overlay refresh's tail, INSIDE the refresh transaction
+    /// (#824): record the caller's pair on a COMPLETE refresh; clear the worktree's recorded
+    /// basis on a PARTIAL one (a dirty edit moves no HEAD, so a stale pair would keep matching
+    /// and scoped passes would skip the stale overlay until an `All` sweep — #577 review); no-op
+    /// when the caller maintains no basis. FAILED refreshes never reach this: the transaction
+    /// rolls back, and the caller clears the basis outside it.
+    pub(super) fn apply_overlay_basis_tail(
+        &self,
+        worktree_id: &str,
+        status_complete: bool,
+        basis: Option<OverlayBasisUpdate<'_>>,
+    ) -> anyhow::Result<()> {
+        let Some(basis) = basis else { return Ok(()) };
+        if status_complete {
+            self.record_worktree_overlay_basis(worktree_id, basis.base_sha, basis.linked_head_sha)
+        } else {
+            self.clear_worktree_overlay_basis(worktree_id)
+        }
+    }
+
+    /// Run the batch-deferred repo-global logical-symbol rebuild if one is pending (#819) — the
+    /// REQUIRED tail of any batch of [`OverlayLogicalRebuild::Deferred`] refreshes, in its own
+    /// `BEGIN IMMEDIATE` (the caller must not hold an open transaction). One rebuild serves the
+    /// whole batch: `logical_symbols` is repo-scoped but scope-independent, so per-worktree
+    /// rebuilds are redundant — with K changed worktrees only the last one's output survives.
+    /// This is also the mid-batch-error / crash backstop: the pending marker committed with each
+    /// worktree's rows, so earlier worktrees' committed refreshes get their rebuild even when a
+    /// later worktree failed, or when the process died between the overlay transactions and this
+    /// tail (the next pass finds the marker and heals). Returns whether a rebuild ran;
+    /// `Ok(false)` = nothing pending, write-free (the #63 idle backstop).
+    pub fn apply_pending_logical_rebuild(&self) -> anyhow::Result<bool> {
+        // Lockless fast path: the common idle pass never opens a write transaction at all.
+        if self.repo_meta(OVERLAY_LOGICAL_REBUILD_PENDING_META)?.is_none() {
+            return Ok(false);
+        }
+        self.storage.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> anyhow::Result<bool> {
+            // RE-CHECK under the write transaction: a concurrent tail (another watcher/hook
+            // process) may have rebuilt and cleared the marker between the read above and
+            // BEGIN IMMEDIATE — proceeding blind would pay a second wholesale rebuild for
+            // nothing.
+            if self.repo_meta(OVERLAY_LOGICAL_REBUILD_PENDING_META)?.is_none() {
+                return Ok(false);
+            }
+            // Defer the #493 stamp for the same reason each deferred refresh would have: the
+            // batch re-parsed only worktree deltas, never the full corpus. The rebuild clears
+            // the pending marker itself, in this same transaction — on failure both roll back,
+            // so the obligation survives for the next pass to retry.
+            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+            Ok(true)
+        })();
+        match result {
+            Ok(ran) => {
+                self.storage.execute_batch("COMMIT")?;
+                Ok(ran)
+            },
+            Err(err) => {
+                let _ = self.storage.execute_batch("ROLLBACK");
+                Err(err)
+            },
+        }
     }
 
     /// Index an EXPLICIT set of repo-relative `paths`, reading bytes from `source_root` (which may

@@ -504,6 +504,8 @@ impl IndexDatabase {
     /// is captured fresh here. A leftover memo for a DIFFERENT repo (a consolidated-DB context
     /// switch) is discarded, not consumed.
     pub(super) fn rebuild_logical_symbols(&self, stamp: KeyVersionStamp) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.logical_symbol_rebuilds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let memoized = self.drift_snapshot.lock().expect("drift snapshot lock").take();
         let drift_snapshot = match memoized {
             Some((repo, snapshot)) if repo == self.active_repo_id => snapshot,
@@ -617,6 +619,17 @@ impl IndexDatabase {
                 self.set_repo_meta(LOGICAL_KEY_VERSION_KEY, LOGICAL_KEY_VERSION)?;
             }
         }
+        // ANY successful rebuild satisfies a pending batch-deferred obligation (#819) — the batch
+        // tail, an inline overlay refresh, a heal, an incremental or full pass — so clear the
+        // marker here, in the same transaction as the rebuild it accounts for. Left set, the next
+        // maintenance pass would pay a second wholesale rebuild for nothing (e.g. after an
+        // interrupted deferred batch whose stale grouping a standalone `index --worktree` already
+        // repaired inline). A no-op DELETE when no marker is set.
+        rag_rat_db::meta::delete_repo_meta(
+            conn,
+            &self.active_repo_id,
+            super::worktree_overlay::OVERLAY_LOGICAL_REBUILD_PENDING_META,
+        )?;
         Ok(())
     }
 
