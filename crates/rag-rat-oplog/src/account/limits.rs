@@ -37,6 +37,13 @@ pub(super) const CONTENT_CUTS_MAX: usize = 1024;
 /// §18a — max wrap recipients in a `StreamKeyWrap`. Consumed by C4 (key wraps); pinned here now so
 /// the whole §18a set is frozen together at C1.
 pub(super) const WRAP_RECIPIENTS_MAX: usize = 1024;
+/// Bytes of [`ACCOUNT_ENVELOPE_MAX_BYTES`] held back for the signed envelope around a payload —
+/// the entry header plus the signature. Used when packing a `StreamKeyWrap`'s recipient fan-out
+/// across ops: the §18a limit applies to the SIGNED wire, not the bare payload, so the packer needs
+/// a payload budget. Deliberately generous — the real header is a few hundred bytes and the
+/// signature 64 — because underestimating costs a loud envelope rejection while overestimating
+/// costs only a few extra recipients per op.
+pub(super) const ACCOUNT_ENVELOPE_SIGNED_RESERVE: usize = 1024;
 /// §18a — max coverage targets in a snapshot manifest. Consumed by C6. A decoder bound has to be a
 /// VALIDITY limit, not a local quota: two implementations that bound the same array differently
 /// would accept different entries on the same signed log.

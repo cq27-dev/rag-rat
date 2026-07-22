@@ -45,7 +45,7 @@ use super::super::envelope::{AccountEntryHeader, VerifiedAccountEntry, sign_acco
 use super::super::fold::{SECRETS_LOG, SUPPORTED_OP_VERSION};
 use super::super::keywrap::{self, ContentKey, WrapContext};
 use super::super::storage::{self, CandidateInsert};
-use super::super::{AccountId, authoring};
+use super::super::{AccountId, authoring, limits};
 use super::ops::{self, StreamKeyWrap, WrapEntry};
 use crate::identity::LocalDevice;
 use crate::local_device;
@@ -74,7 +74,7 @@ pub fn mint_and_author_stream_key_wrap_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
     now_ms: i64,
-) -> anyhow::Result<EntryHash> {
+) -> anyhow::Result<Vec<EntryHash>> {
     let key = ContentKey::generate()?;
     author_stream_key_wrap_in_tx(tx, stream_id, &key, INITIAL_KEY_EPOCH, now_ms)
 }
@@ -85,7 +85,8 @@ pub fn mint_and_author_stream_key_wrap_in_tx(
 #[derive(Debug)]
 pub enum RotationOutcome {
     /// Rotation was needed and this (owner) device authored a fresh higher-epoch `StreamKeyWrap`.
-    Rotated(EntryHash),
+    /// Every op the rotation authored — a large roster's fan-out spans several (#764).
+    Rotated(Vec<EntryHash>),
     /// No rotation needed — every recipient of the current wrap is still roster-effective (or the
     /// stream has no current wrap at all, so there is nothing to rotate).
     Current,
@@ -124,7 +125,7 @@ pub fn rotate_stream_key_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
     now_ms: i64,
-) -> anyhow::Result<EntryHash> {
+) -> anyhow::Result<Vec<EntryHash>> {
     let account_id = bootstrap::local_account_ref(tx)?
         .context(
             "cannot rotate a StreamKeyWrap before the store's local account is minted (call \
@@ -266,7 +267,7 @@ fn author_stream_key_wrap_in_tx(
     key: &ContentKey,
     key_epoch: u64,
     now_ms: i64,
-) -> anyhow::Result<EntryHash> {
+) -> anyhow::Result<Vec<EntryHash>> {
     let LocalAccountRef { account_id, .. } = bootstrap::local_account_ref(tx)?.context(
         "cannot author a StreamKeyWrap before the store's local account is minted (call \
          local_account first)",
@@ -297,9 +298,72 @@ fn author_stream_key_wrap_in_tx(
     // proves the op folds accepted, not that it is unwrappable (independent failure modes).
     assert_self_wrap_round_trips(&device, account_id, stream_id, key_epoch, key, &wraps)?;
 
-    let wrap = StreamKeyWrap { stream_id, key_id: key.key_id().to_bytes(), key_epoch, wraps };
+    let batch = pack_wraps_into_ops(stream_id, key.key_id().to_bytes(), key_epoch, wraps)?;
+    author_stream_key_wrap_batch_in_tx(tx, &batch, now_ms)
+}
 
-    Ok(author_stream_key_wrap_batch_in_tx(tx, &[wrap], now_ms)?[0])
+/// Split one recipient fan-out across as many `StreamKeyWrap` ops as the 64 KiB envelope requires
+/// (#764).
+///
+/// A single op sealing the key to the whole roster hits the §18a envelope limit at roughly 460
+/// recipients, so a larger account could not mint or rotate at all. The frozen wire already allows
+/// several ops per `(stream, key_id)` — `WRAP_RECIPIENTS_MAX` deliberately exceeds what one
+/// envelope can hold — and every consumer resolves the fan-out as a SET: key recovery and the
+/// rotation-needed predicate both filter accepted wraps by `(key_epoch, key_id)` and flatten across
+/// ALL matching ops, while `select_from_wraps` chooses only the epoch/key identity, which every
+/// sibling shares. So a recipient in the third op is found exactly like one in the first.
+///
+/// Capacity is MEASURED against the real encoder rather than assumed from a per-entry byte count:
+/// CBOR array headers grow at 24/256/65536 elements, so arithmetic on a fixed entry size would
+/// silently drift. The estimate is then VERIFIED — any op that still exceeds the budget shrinks the
+/// capacity and repacks — so an encoding change can make this less efficient but never incorrect.
+fn pack_wraps_into_ops(
+    stream_id: StreamId,
+    key_id: [u8; 32],
+    key_epoch: u64,
+    wraps: Vec<WrapEntry>,
+) -> anyhow::Result<Vec<StreamKeyWrap>> {
+    let budget =
+        limits::ACCOUNT_ENVELOPE_MAX_BYTES.saturating_sub(limits::ACCOUNT_ENVELOPE_SIGNED_RESERVE);
+    let op_of = |entries: &[WrapEntry]| StreamKeyWrap {
+        stream_id,
+        key_id,
+        key_epoch,
+        wraps: entries.to_vec(),
+    };
+    let encoded_len = |entries: &[WrapEntry]| -> anyhow::Result<usize> {
+        Ok(ops::encode(&op_of(entries))
+            .map_err(|err| anyhow::anyhow!("encoding a StreamKeyWrap chunk failed: {err}"))?
+            .len())
+    };
+    if wraps.len() <= 1 || encoded_len(&wraps)? <= budget {
+        return Ok(vec![op_of(&wraps)]);
+    }
+
+    let empty = encoded_len(&[])?;
+    let per_entry = encoded_len(&wraps[..1])?.saturating_sub(empty).max(1);
+    let mut capacity = budget.saturating_sub(empty) / per_entry;
+    capacity = capacity.clamp(1, limits::WRAP_RECIPIENTS_MAX);
+    loop {
+        let chunks: Vec<StreamKeyWrap> = wraps.chunks(capacity).map(op_of).collect();
+        let oversized = chunks
+            .iter()
+            .map(|chunk| encoded_len(&chunk.wraps))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .any(|len| len > budget);
+        if !oversized {
+            return Ok(chunks);
+        }
+        anyhow::ensure!(
+            capacity > 1,
+            "a StreamKeyWrap with a single recipient does not fit the {}-byte envelope budget",
+            budget,
+        );
+        // Back off multiplicatively so a bad estimate converges in a few passes, not one per
+        // recipient.
+        capacity = (capacity * 3 / 4).max(1);
+    }
 }
 
 /// Sign, store, refold, and verify one batch of already-sealed wraps. The secrets chain is shared
@@ -461,9 +525,9 @@ mod tests {
     use crate::device::DeviceX25519Secret;
     use crate::op::{self, MemoryOp};
 
-    const NOW: i64 = 1_700_000_000_000;
+    pub(super) const NOW: i64 = 1_700_000_000_000;
 
-    fn db() -> Connection {
+    pub(super) fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
@@ -484,8 +548,13 @@ mod tests {
     /// Run the mint seam in its own IMMEDIATE txn and commit — the shape a live caller uses.
     fn mint_committed(conn: &Connection, stream: StreamId) -> EntryHash {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
-        let hash = mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW).expect("mint + author");
+        let hashes =
+            mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW).expect("mint + author");
         tx.commit().unwrap();
+        // These fixtures have small rosters, so the fan-out is one op. Asserted rather than
+        // indexed, so a future fixture that grows past one envelope fails here instead of silently
+        // testing only its first chunk.
+        let [hash] = hashes[..] else { panic!("expected a single wrap op: {hashes:?}") };
         hash
     }
 
@@ -1160,10 +1229,11 @@ mod tests {
         let key = ContentKey::from_seed(&[0x77; 32]);
 
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        let hash =
+        let hashes =
             author_stream_key_wrap_in_tx(&tx, stream, &key, 7, NOW).expect("mint at epoch 7");
         tx.commit().unwrap();
 
+        let [hash] = hashes[..] else { panic!("expected a single wrap op: {hashes:?}") };
         let wrap = stored_wrap(&conn, &hash);
         assert_eq!(wrap.key_epoch, 7, "the op carries the requested nonzero epoch");
         let device = local_device(&conn, NOW).unwrap();
@@ -1328,6 +1398,7 @@ mod tests {
         let RotationOutcome::Rotated(rotated) = ensure_committed(&conn, stream) else {
             panic!("an owner with a stale current-wrap recipient rotates");
         };
+        let [rotated] = rotated[..] else { panic!("expected a single wrap op: {rotated:?}") };
         assert_eq!(stored_wrap(&conn, &rotated).key_epoch, 1, "ensure rotated to epoch 1");
         assert_eq!(status(&conn, &rotated), Some(("accepted".to_string(), None)));
 
@@ -1487,8 +1558,9 @@ mod tests {
     /// Rotate the stream key in its own IMMEDIATE txn and commit — the shape a live caller uses.
     fn rotate_committed(conn: &Connection, stream: StreamId) -> EntryHash {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
-        let hash = rotate_stream_key_in_tx(&tx, stream, NOW).expect("rotate");
+        let hashes = rotate_stream_key_in_tx(&tx, stream, NOW).expect("rotate");
         tx.commit().unwrap();
+        let [hash] = hashes[..] else { panic!("expected a single wrap op: {hashes:?}") };
         hash
     }
 
@@ -1692,5 +1764,136 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod wrap_packing_tests {
+    use super::tests::{NOW, db};
+    use super::*;
+    use crate::account::keywrap::SealedKeyWrap;
+
+    fn entry(seed: u16) -> WrapEntry {
+        let mut fp = [0u8; 32];
+        fp[..2].copy_from_slice(&seed.to_be_bytes());
+        WrapEntry {
+            recipient_fp: DeviceFingerprint::from_bytes(fp),
+            // Real wraps are fixed-size (an X25519 ephemeral public key plus the AEAD output), so a
+            // synthetic one packs identically to a sealed one.
+            sealed: SealedKeyWrap { ephemeral_pubkey: [0xab; 32], ciphertext: [0xcd; 48] },
+        }
+    }
+
+    fn pack(count: usize) -> Vec<StreamKeyWrap> {
+        let entries: Vec<WrapEntry> = (0..count).map(|i| entry(i as u16)).collect();
+        pack_wraps_into_ops(StreamId::from_bytes([7; 32]), [9; 32], 3, entries).expect("pack")
+    }
+
+    fn budget() -> usize {
+        limits::ACCOUNT_ENVELOPE_MAX_BYTES - limits::ACCOUNT_ENVELOPE_SIGNED_RESERVE
+    }
+
+    /// A roster that fits stays ONE op — chunking must not fragment the common case.
+    #[test]
+    fn a_small_roster_is_a_single_op() {
+        let ops = pack(8);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].wraps.len(), 8);
+    }
+
+    /// The bug: one op sealing to the whole roster exceeds the 64 KiB envelope at ~460 recipients,
+    /// so mint and rotation failed outright for a larger account. The fan-out now spans ops.
+    #[test]
+    fn a_roster_too_large_for_one_envelope_fans_out_across_ops() {
+        let count = limits::WRAP_RECIPIENTS_MAX;
+        let ops = pack(count);
+        assert!(ops.len() > 1, "{count} recipients cannot fit one envelope, so they must span ops",);
+        for op in &ops {
+            let encoded = ops::encode(op).expect("encode").len();
+            assert!(
+                encoded <= budget(),
+                "every op must fit the payload budget: {encoded} > {}",
+                budget(),
+            );
+            assert!(
+                op.wraps.len() <= limits::WRAP_RECIPIENTS_MAX,
+                "and stay within the per-op §18a recipient bound",
+            );
+        }
+    }
+
+    /// The fan-out is a PARTITION: every recipient appears exactly once, in order, across the ops.
+    /// Consumers union the recipient sets by `(key_epoch, key_id)`, so a dropped or duplicated
+    /// recipient would silently deny or double-seal a device.
+    #[test]
+    fn the_fan_out_partitions_the_recipients_and_shares_one_key_identity() {
+        let count = limits::WRAP_RECIPIENTS_MAX;
+        let ops = pack(count);
+        let seen: Vec<DeviceFingerprint> =
+            ops.iter().flat_map(|op| op.wraps.iter().map(|w| w.recipient_fp)).collect();
+        let expected: Vec<DeviceFingerprint> =
+            (0..count).map(|i| entry(i as u16).recipient_fp).collect();
+        assert_eq!(seen, expected, "every recipient appears exactly once, in the original order");
+        for op in &ops {
+            assert_eq!(op.key_id, [9; 32], "siblings share the key identity selection keys on");
+            assert_eq!(op.key_epoch, 3);
+            assert_eq!(op.stream_id, StreamId::from_bytes([7; 32]));
+            assert!(!op.wraps.is_empty(), "no empty op is emitted");
+        }
+    }
+
+    /// Capacity is measured, not assumed: the packer fills each op close to the budget rather than
+    /// falling back to something tiny. A regression here is silent — correctness holds while the
+    /// op count balloons — so it is pinned.
+    #[test]
+    fn packing_fills_each_op_rather_than_emitting_many_small_ones() {
+        let ops = pack(limits::WRAP_RECIPIENTS_MAX);
+        let full = &ops[0];
+        let encoded = ops::encode(full).expect("encode").len();
+        assert!(
+            encoded * 10 > budget() * 9,
+            "the first op should fill >90% of the budget, got {encoded} of {}",
+            budget(),
+        );
+    }
+
+    /// The packer budgets against the PAYLOAD, but §18a bounds the SIGNED wire — so the reserve
+    /// held back for the header and signature has to actually cover them. A full op fills its
+    /// budget to within a couple of bytes, so an undersized reserve would not be approximately
+    /// wrong, it would reject the very op the packer just built.
+    #[test]
+    fn a_maximally_packed_op_still_fits_the_signed_envelope() {
+        let conn = db();
+        let account = bootstrap::local_account(&conn, NOW).expect("mint local account");
+        let device = local_device(&conn, NOW).unwrap();
+        let ops = pack(limits::WRAP_RECIPIENTS_MAX);
+        let fullest = ops.iter().max_by_key(|op| op.wraps.len()).expect("at least one op");
+        let payload = ops::encode(fullest).expect("encode");
+
+        let header = AccountEntryHeader {
+            account_id: account,
+            log_id: SECRETS_LOG,
+            device_fingerprint: device.fingerprint(),
+            seq: u64::MAX,
+            prev_hash: Some([0xff; 32]),
+            parent_ref: Some([0xff; 32]),
+            entry_type: ops::entry_type::STREAM_KEY_WRAP,
+            op_version: SUPPORTED_OP_VERSION,
+            crypto_suite: 0,
+            auth_len: u64::MAX,
+            // A plaintext op carries no `key_id` (the header rejects one when crypto_suite == 0).
+            // Every OTHER field is at its widest so the reserve is measured against the largest
+            // header a real wrap op can have.
+            key_id: None,
+            authority_ref: Some([0xff; 32]),
+        };
+        let signed = sign_account_entry(device.secret(), &header, &payload)
+            .expect("a maximally packed op must sign within the envelope");
+        assert!(
+            signed.signed_bytes.len() <= limits::ACCOUNT_ENVELOPE_MAX_BYTES,
+            "signed wire is {} bytes, over the {} limit — the reserve is too small",
+            signed.signed_bytes.len(),
+            limits::ACCOUNT_ENVELOPE_MAX_BYTES,
+        );
     }
 }
