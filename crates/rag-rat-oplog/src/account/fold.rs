@@ -1066,8 +1066,18 @@ fn fold_account_pass(
         // Fold only a KNOWN op on the control log (§11), at the supported version, with a PLAINTEXT
         // payload (`crypto_suite == 0`). A NON-foldable entry (unknown type / other log / future
         // version / sealed `crypto_suite != 0` ciphertext that could spuriously parse) is always
-        // retained header-only — never folded, never HARD-rejected — so a forward-compatible entry
-        // stays a valid watermark/ancestry target and its own layer (C2/C4/newer) folds it.
+        // retained header-only — never folded, never HARD-rejected — so it stays a valid
+        // watermark/ancestry target and its own layer (C2/C4/newer) folds it.
+        //
+        // What retention does NOT buy: forward compatibility WITHIN log 0. Branch selection accepts
+        // one contiguous chain per (log, device) over EFFECTIVE entries, so a retained entry
+        // mid-chain truncates its author's accepted chain — every later entry from that device
+        // forks. That is deliberate quarantine, not an oversight (#809): no binary folds such an
+        // entry, so every binary truncates at the same slot and peers still converge, and a third
+        // party cannot place an entry on someone else's chain. It is load-bearing only because
+        // log 0's tag set is CLOSED — a new artifact class gets its own log (C6 →
+        // `ANNEX_LOG`), never a new tag here. `retained_entry_on_the_control_log_quarantines_the_
+        // rest_of_its_own_chain` pins this.
         let foldable = entry.header.log_id == CONTROL_LOG
             && entry.header.op_version == SUPPORTED_OP_VERSION
             && entry.header.crypto_suite == 0;

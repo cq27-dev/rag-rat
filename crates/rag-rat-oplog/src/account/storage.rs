@@ -3461,6 +3461,105 @@ mod tests {
         );
     }
 
+    /// TRIPWIRE (#809): a retained entry on the CONTROL log quarantines the rest of its own chain.
+    ///
+    /// This is SPEC, not a defect, and this test exists so it cannot drift into one silently.
+    /// Branch selection accepts one contiguous chain per `(log, device)` built from EFFECTIVE
+    /// entries, so an entry the fold retains rather than folds breaks the `seq` walk at its slot
+    /// and every later entry from that device forks.
+    ///
+    /// Why that is safe rather than a convergence bug: NO binary folds such an entry, so every
+    /// binary truncates at the same slot and honest peers still agree; and a third party cannot
+    /// place an entry on a device's chain (ingest verifies the signature), so the quarantine is
+    /// self-inflicted by the signer. The property is load-bearing only because **log 0's tag set is
+    /// closed** — a new artifact class gets its own log, as C6 did with `ANNEX_LOG`, never a new
+    /// tag, a bumped `op_version`, or a sealed payload here.
+    ///
+    /// If this test fails, someone changed one of those two things: either branch selection now
+    /// walks through retained entries, or log 0 grew a class it cannot fold. Both are decisions to
+    /// make deliberately (see #809), not to absorb by editing the expectation.
+    ///
+    /// Revisit only when an op is proposed that (a) must occupy a slot in log 0's per-device chain
+    /// with a cross-log hash anchor demonstrably insufficient, (b) is authority-inert — otherwise
+    /// `auth_len`/`AuthLenAhead` divergence kills it across versions regardless of chain walking —
+    /// and (c) cannot be expressed as an annex artifact keyed on a control-fold-derivable
+    /// condition. That change must land BEFORE transport ships (#406) or behind a protocol version
+    /// fence: once peers are live, accepting entries a peer forks is a mesh-splitting change.
+    #[test]
+    fn a_retained_entry_on_the_control_log_quarantines_the_rest_of_its_own_chain() {
+        // Every class `fold_account` retains rather than folds, ON the control log. A new retained
+        // class added here without a decision on #809 fails this test.
+        enum Retained {
+            UnknownTag,
+            FutureVersion,
+            SealedPayload,
+        }
+        let cases = [
+            ("unknown entry_type", Retained::UnknownTag),
+            ("future op_version", Retained::FutureVersion),
+            ("sealed payload", Retained::SealedPayload),
+        ];
+
+        for (label, retained_class) in cases {
+            let conn = db();
+            let founder = Dev::new(0x91);
+            let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+            account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+            let base = AccountEntryHeader {
+                account_id,
+                log_id: fold::CONTROL_LOG,
+                device_fingerprint: founder.fp,
+                seq: 1,
+                prev_hash: Some(genesis_hash),
+                parent_ref: Some(genesis_hash),
+                entry_type: ops::entry_type::DEVICE_ADD,
+                op_version: fold::SUPPORTED_OP_VERSION,
+                crypto_suite: 0,
+                key_id: None,
+                auth_len: 1,
+                authority_ref: Some(genesis_hash),
+            };
+            let header = match retained_class {
+                Retained::UnknownTag => AccountEntryHeader { entry_type: 250, ..base },
+                Retained::FutureVersion =>
+                    AccountEntryHeader { op_version: fold::SUPPORTED_OP_VERSION + 1, ..base },
+                Retained::SealedPayload =>
+                    AccountEntryHeader { crypto_suite: 1, key_id: Some([0x77; 32]), ..base },
+            };
+            let retained = sign_account_entry(&founder.secret, &header, &[0x81, 0x01]).unwrap();
+            assert_eq!(
+                account_ingest(&conn, &retained.signed_bytes, NOW + 1).unwrap(),
+                IngestOutcome::Ingested { status: "retained_unfolded".into() },
+                "{label}: the entry is retained, never rejected — that half is the forward-compat \
+                 promise and must not regress either",
+            );
+
+            // An ordinary, perfectly valid op by the same device, chaining from it.
+            let (add_bytes, add_hash) = op(
+                account_id,
+                &founder,
+                2,
+                Some(retained.entry_hash),
+                Some(genesis_hash),
+                &device_add(&Dev::new(0x92), DeviceRole::Owner),
+            );
+            account_ingest(&conn, &add_bytes, NOW + 2).unwrap();
+
+            assert_eq!(
+                status(&conn, &genesis_hash).as_deref(),
+                Some("accepted"),
+                "{label}: the chain up to the retained entry is unaffected",
+            );
+            assert_eq!(
+                status(&conn, &add_hash).as_deref(),
+                Some("forked"),
+                "{label}: everything after a retained entry is quarantined — SPEC, see the doc \
+                 comment before changing this",
+            );
+        }
+    }
+
     #[test]
     fn a_sealed_snapshot_is_refused_rather_than_retained() {
         // A sealed manifest can never serve its purpose (§4.7's whole value is that a peer verifies
