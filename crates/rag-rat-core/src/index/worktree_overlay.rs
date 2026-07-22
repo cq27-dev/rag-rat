@@ -613,13 +613,14 @@ impl IndexDatabase {
         // any error (#219 review).
         self.storage.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> anyhow::Result<(usize, usize, usize)> {
-            let indexed = self.index_explicit_paths_from_root(
+            let applied = self.index_explicit_paths_from_root(
                 config,
                 &source_root,
                 &delta.readable,
                 &scope,
                 progress,
             )?;
+            let indexed = applied.written;
             // Write a tombstone only when one isn't already present, so a re-run on a static
             // worktree writes nothing (idle-safety, like the readable sha-skip).
             let mut tombstoned = 0;
@@ -645,6 +646,7 @@ impl IndexDatabase {
                 OverlayChangeCounts { indexed, tombstoned, pruned },
                 delta.manifest_changed,
                 tail.logical_rebuild,
+                applied.logical,
             )?;
             // #824: the basis write rides the SAME transaction as the rows it proves current —
             // previously a separate autocommit per worktree per pass (an extra WAL-dirtying
@@ -788,13 +790,14 @@ impl IndexDatabase {
         // front; ROLLBACK on any error.
         self.storage.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> anyhow::Result<(usize, usize, usize)> {
-            let indexed = self.index_explicit_paths_from_root(
+            let applied = self.index_explicit_paths_from_root(
                 config,
                 &source_root,
                 &readable,
                 &scope,
                 progress,
             )?;
+            let indexed = applied.written;
             let mut tombstoned = 0;
             for (rel, full) in &tombstones {
                 // RE-VALIDATE under the write lock (like removals): if the file was recreated /
@@ -832,6 +835,7 @@ impl IndexDatabase {
                 OverlayChangeCounts { indexed, tombstoned, pruned },
                 false,
                 logical_rebuild,
+                applied.logical,
             )?;
             Ok((indexed, tombstoned, pruned))
         })();
@@ -944,7 +948,11 @@ impl IndexDatabase {
     ///   unchanged symbols resolve via the base's logical rows — which is why only added files were
     ///   missing). This is the field-reported bug. `Deferred` (#819) replaces the rebuild with a
     ///   persisted pending marker in this same transaction; the batch caller runs ONE rebuild for
-    ///   all its worktrees via `apply_pending_logical_rebuild`.
+    ///   all its worktrees via `apply_pending_logical_rebuild`. When EVERY indexed change kept its
+    ///   file's logical-key multiset (#820 — the body-only-edit refresh), neither runs: the grouped
+    ///   table is already what a rebuild would produce, so the surviving logical rows are
+    ///   re-pointed at the replacement symbol ids instead, and no obligation is created. A
+    ///   tombstone or prune always changes the key set, so those refreshes keep the rebuild/marker.
     /// - refresh_packages: write the overlay scope's `packages` rows from the LINKED checkout's
     ///   manifests BEFORE resolving, so the per-package import scope (#61) is correct for the
     ///   branch. The resolver's `load_package_roots_into_scope` reads `packages` at the active
@@ -970,23 +978,40 @@ impl IndexDatabase {
         counts: OverlayChangeCounts,
         manifest_changed: bool,
         logical_rebuild: OverlayLogicalRebuild,
+        mut grouping: graph_index::LogicalGroupingUpkeep,
     ) -> anyhow::Result<()> {
         if counts.any_changed() {
-            match logical_rebuild {
-                OverlayLogicalRebuild::Inline => {
-                    // Defer the STAMP: an overlay refresh re-parsed only the worktree's own
-                    // files, so it must not stamp the logical-key version — the base scope's
-                    // drift is still in the future (#493).
-                    self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+            // #820: a tombstone or prune removes a whole file's keys from the grouped corpus —
+            // never key-stable, whatever the indexed half of the delta looked like.
+            if counts.tombstoned > 0 || counts.pruned > 0 {
+                grouping.require_rebuild();
+            }
+            match grouping {
+                graph_index::LogicalGroupingUpkeep::RelinkMembers(relinks) => {
+                    // Every indexed change was a key-stable replacement: re-link the members
+                    // inside this transaction and create NO rebuild obligation. A PRE-EXISTING
+                    // #819 marker is deliberately left in place — a relink is not a rebuild,
+                    // only `rebuild_logical_symbols` may clear the marker, and the entry-point
+                    // / batch-tail settles still consume it.
+                    self.apply_logical_member_relinks(&relinks)?;
                 },
-                OverlayLogicalRebuild::Deferred => {
-                    // Mark the repo-global rebuild pending IN THIS transaction (#819).
-                    // Committed overlay rows without a follow-up rebuild would leave a newly
-                    // added file's symbols unresolvable, and a later pass would idle-skip the
-                    // then-unchanged rows — the persisted marker survives a crash between this
-                    // commit and the batch tail, so `apply_pending_logical_rebuild` still runs.
-                    // `if_changed`: the second changed worktree of a batch finds it already set.
-                    self.set_repo_meta_if_changed(OVERLAY_LOGICAL_REBUILD_PENDING_META, "1")?;
+                graph_index::LogicalGroupingUpkeep::RebuildRequired => match logical_rebuild {
+                    OverlayLogicalRebuild::Inline => {
+                        // Defer the STAMP: an overlay refresh re-parsed only the worktree's own
+                        // files, so it must not stamp the logical-key version — the base scope's
+                        // drift is still in the future (#493).
+                        self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                    },
+                    OverlayLogicalRebuild::Deferred => {
+                        // Mark the repo-global rebuild pending IN THIS transaction (#819).
+                        // Committed overlay rows without a follow-up rebuild would leave a newly
+                        // added file's symbols unresolvable, and a later pass would idle-skip the
+                        // then-unchanged rows — the persisted marker survives a crash between this
+                        // commit and the batch tail, so `apply_pending_logical_rebuild` still
+                        // runs. `if_changed`: the second changed worktree of a batch finds it
+                        // already set.
+                        self.set_repo_meta_if_changed(OVERLAY_LOGICAL_REBUILD_PENDING_META, "1")?;
+                    },
                 },
             }
             self.refresh_packages(source_root)?;
@@ -1110,7 +1135,7 @@ impl IndexDatabase {
         paths: &[PathBuf],
         scope: &FileScope,
         progress: &mut F,
-    ) -> anyhow::Result<usize>
+    ) -> anyhow::Result<incremental::IncrementalWriteOutcome>
     where
         F: FnMut(IndexProgress),
     {

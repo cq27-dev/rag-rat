@@ -1,6 +1,8 @@
 //! Graph/edge/logical-symbol index lifecycle: resolve edges, (re)build logical symbols, graph
 //! coverage, and graph-index freshness.
 
+use std::collections::BTreeMap;
+
 use super::*;
 
 /// Grouping key that collapses cfg variants / overloads of one symbol into a single logical symbol.
@@ -378,6 +380,88 @@ pub(super) enum KeyVersionStamp {
     Defer,
 }
 
+/// One replacement symbol's owed membership row (#820): produced when a file rewrite kept its
+/// logical-key multiset, so the grouped table needs no rebuild — only the member pointers, which
+/// died with the replaced symbol rows (`logical_symbol_members` cascades on `symbols` deletes).
+/// Field-for-field what [`IndexDatabase::insert_logical_group`]'s member INSERT writes.
+#[derive(Debug)]
+pub(super) struct LogicalMemberRelink {
+    logical_symbol_id: i64,
+    symbol_id: i64,
+    signature_hash: Option<String>,
+    start_line: i64,
+    end_line: i64,
+}
+
+/// Whether one write batch's logical-symbol tail can be served by a targeted member re-link
+/// instead of the whole-repo rebuild (#820). A body-only edit re-inserts a file's symbols under
+/// new row ids, but when the logical KEY multiset (language, path, name, qualified name, kind,
+/// signature) is unchanged, the rebuilt `logical_symbols` table would be identical — only the
+/// members' `symbol_id` pointers moved. Accumulated per batch while applying the per-file
+/// incremental plan; ANY non-key-stable change downgrades the whole batch to today's
+/// rebuild/marker behavior.
+#[derive(Debug)]
+pub(super) enum LogicalGroupingUpkeep {
+    /// Every change so far replaced a file's symbols under an IDENTICAL logical-key multiset:
+    /// the grouped table already matches what a rebuild would produce; only these member rows
+    /// are owed. NEVER a clearer of the #819 pending marker — an outstanding obligation must
+    /// survive to its settle point (`rebuild_logical_symbols` is the sole clearer).
+    RelinkMembers(Vec<LogicalMemberRelink>),
+    /// Some change altered a file's key set (an added/removed/tombstoned file, a rename, a
+    /// signature or kind change, or a mutation outside the per-file plan) — the batch owes the
+    /// full rebuild, exactly the pre-#820 behavior.
+    RebuildRequired,
+}
+
+impl LogicalGroupingUpkeep {
+    /// Whether the batch is still on the relink path — the guard for paying the per-file key
+    /// capture at all.
+    pub(super) fn is_relinkable(&self) -> bool {
+        matches!(self, Self::RelinkMembers(_))
+    }
+
+    /// Downgrade the batch to the full rebuild. Relinks gathered so far are dropped — the
+    /// rebuild re-derives every membership anyway.
+    pub(super) fn require_rebuild(&mut self) {
+        *self = Self::RebuildRequired;
+    }
+
+    /// Fold one replaced file's verdict in: `None` (the key multiset changed, or the old
+    /// grouping was unavailable) downgrades the whole batch; owed relinks accumulate.
+    pub(super) fn absorb_replaced_file(&mut self, relinks: Option<Vec<LogicalMemberRelink>>) {
+        let Some(owed) = relinks else {
+            self.require_rebuild();
+            return;
+        };
+        if let Self::RelinkMembers(pending) = self {
+            pending.extend(owed);
+        }
+    }
+}
+
+/// The six logical-key columns of one symbol row in the scope being rewritten — exactly the
+/// identity [`IndexDatabase::rebuild_logical_symbols`] groups by. `Ord` so the multiset
+/// comparison is a `BTreeMap` walk; `Option` fields compare `None`-first, and `None` never
+/// equals `Some` (an absent qualified name or signature is no wildcard).
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct ReplacedSymbolKey {
+    language: String,
+    path: String,
+    name: String,
+    qualified_name: Option<String>,
+    kind: String,
+    signature: Option<String>,
+}
+
+/// One logical key's grouped claim in the scope row being replaced: the logical row the old
+/// members point at, and how many of THIS file's symbols it held. Per-key member counts are part
+/// of the stability bar — a count change would stale the logical row's `variant_count` /
+/// `group_reason`, which only the rebuild recomputes.
+pub(super) struct GroupedKeyClaim {
+    logical_symbol_id: i64,
+    members: usize,
+}
+
 /// A re-derived logical row competing to inherit a drifted reference — see
 /// [`IndexDatabase::heal_logical_key_drift`]. Carries `kind` so the strict (kind-agreeing)
 /// subset is split in memory from one kind-relaxed fetch, keeping cross-kind contenders visible
@@ -630,6 +714,204 @@ impl IndexDatabase {
             &self.active_repo_id,
             super::worktree_overlay::OVERLAY_LOGICAL_REBUILD_PENDING_META,
         )?;
+        Ok(())
+    }
+
+    /// Open the per-batch logical-grouping verdict (#820). Starts on the relink path unless the
+    /// repo's logical-key version stamp lags [`LOGICAL_KEY_VERSION`]: a lagging stamp schedules
+    /// the #493 drift heal, which only [`Self::rebuild_logical_symbols`] performs — the relink
+    /// shortcut must not defer it (and must not leave the memoized drift snapshot unconsumed),
+    /// so a lagging repo keeps today's rebuild on every mutating pass. One `repo_meta` read.
+    pub(super) fn begin_logical_grouping_upkeep(&self) -> anyhow::Result<LogicalGroupingUpkeep> {
+        let key_version_current =
+            self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() == Some(LOGICAL_KEY_VERSION);
+        Ok(if key_version_current {
+            LogicalGroupingUpkeep::RelinkMembers(Vec::new())
+        } else {
+            LogicalGroupingUpkeep::RebuildRequired
+        })
+    }
+
+    /// The grouped logical-key claims of the scope row at `(path, commit_sha, worktree_id)` —
+    /// captured BEFORE [`Self::remove_file_in_scope`] cascades the member rows away with the
+    /// symbols. `None` when the grouping cannot vouch for the file: a symbol with NO member row
+    /// (the scope row was committed by an interrupted #819 batch and never regrouped — its keys
+    /// are not in the grouped table, so a relink would fabricate members against missing or
+    /// stale logical rows) or two same-key symbols pointing at different logical rows. The
+    /// caller then falls back to the rebuild, which is always correct.
+    pub(super) fn load_grouped_key_claims(
+        &self,
+        path: &Path,
+        commit_sha: &str,
+        worktree_id: &str,
+    ) -> anyhow::Result<Option<BTreeMap<ReplacedSymbolKey, GroupedKeyClaim>>> {
+        let conn = self.storage.connection();
+        // Same joins as the rebuild's grouping SELECT (raw `main.*`, repo + generation scoped),
+        // narrowed to the one scope row being replaced.
+        let mut stmt = conn.prepare_cached(
+            "
+            SELECT s.language, f.path, s.name, qn.value, s.kind, s.signature,
+                   m.logical_symbol_id
+            FROM main.symbols s
+            JOIN main.files f ON f.id = s.file_id
+            LEFT JOIN main.name_strings qn ON qn.id = s.qualified_name_id
+            LEFT JOIN main.logical_symbol_members m ON m.symbol_id = s.id
+            WHERE f.repo_id = ?1 AND f.path = ?2 AND f.commit_sha = ?3 AND f.worktree_id = ?4
+              AND f.generation = ?5
+            ",
+        )?;
+        let mut rows = stmt.query(params![
+            self.active_repo_id,
+            rag_rat_base::paths::path_string(path),
+            commit_sha,
+            worktree_id,
+            self.active_generation,
+        ])?;
+        let mut claims: BTreeMap<ReplacedSymbolKey, GroupedKeyClaim> = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let key = ReplacedSymbolKey {
+                language: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                qualified_name: row.get(3)?,
+                kind: row.get(4)?,
+                signature: row.get(5)?,
+            };
+            let Some(logical_symbol_id) = row.get::<_, Option<i64>>(6)? else {
+                return Ok(None); // ungrouped symbol — the grouping cannot vouch for this file
+            };
+            match claims.entry(key) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let claim = entry.get_mut();
+                    if claim.logical_symbol_id != logical_symbol_id {
+                        return Ok(None); // same key split across logical rows — inconsistent
+                    }
+                    claim.members += 1;
+                },
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(GroupedKeyClaim { logical_symbol_id, members: 1 });
+                },
+            }
+        }
+        Ok(Some(claims))
+    }
+
+    /// The member rows owed to the JUST-INSERTED replacement symbols at the same scope, or
+    /// `None` when the rewrite changed the file's logical-key multiset — any added, removed,
+    /// renamed, re-kinded or re-signatured symbol, including a count change of one key's cfg
+    /// variants (which would stale `variant_count`/`group_reason`). Exactness is the
+    /// correctness bar: a false key-stable verdict would leave `logical_symbol_members` missing
+    /// rows for live symbols and break graph navigation, so all six key columns are compared as
+    /// an exact per-file multiset. Owed rows reuse the OLD members' `logical_symbol_id` (the
+    /// deterministic `stable_id` a rebuild would re-derive for the same key) and carry the
+    /// replacement symbols' fresh line spans — a body edit shifts lines even when keys hold.
+    pub(super) fn derive_key_stable_relinks(
+        &self,
+        path: &Path,
+        commit_sha: &str,
+        worktree_id: &str,
+        replaced: &BTreeMap<ReplacedSymbolKey, GroupedKeyClaim>,
+    ) -> anyhow::Result<Option<Vec<LogicalMemberRelink>>> {
+        struct ReplacementSymbolSpan {
+            symbol_id: i64,
+            start_line: i64,
+            end_line: i64,
+        }
+        let conn = self.storage.connection();
+        let mut stmt = conn.prepare_cached(
+            "
+            SELECT s.language, f.path, s.name, qn.value, s.kind, s.signature,
+                   s.id, s.start_line, s.end_line
+            FROM main.symbols s
+            JOIN main.files f ON f.id = s.file_id
+            LEFT JOIN main.name_strings qn ON qn.id = s.qualified_name_id
+            WHERE f.repo_id = ?1 AND f.path = ?2 AND f.commit_sha = ?3 AND f.worktree_id = ?4
+              AND f.generation = ?5
+            ",
+        )?;
+        let mut rows = stmt.query(params![
+            self.active_repo_id,
+            rag_rat_base::paths::path_string(path),
+            commit_sha,
+            worktree_id,
+            self.active_generation,
+        ])?;
+        let mut inserted: BTreeMap<ReplacedSymbolKey, Vec<ReplacementSymbolSpan>> = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let key = ReplacedSymbolKey {
+                language: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                qualified_name: row.get(3)?,
+                kind: row.get(4)?,
+                signature: row.get(5)?,
+            };
+            inserted.entry(key).or_default().push(ReplacementSymbolSpan {
+                symbol_id: row.get(6)?,
+                start_line: row.get(7)?,
+                end_line: row.get(8)?,
+            });
+        }
+        // Every inserted key must exist in the replaced set with the SAME member count, and the
+        // key-set cardinalities must match — together that is exact multiset equality.
+        if inserted.len() != replaced.len() {
+            return Ok(None);
+        }
+        let mut relinks = Vec::new();
+        for (key, members) in inserted {
+            let Some(claim) = replaced.get(&key) else {
+                return Ok(None);
+            };
+            if claim.members != members.len() {
+                return Ok(None);
+            }
+            // Hash exactly as `insert_logical_group` does (untrimmed bytes), so the relinked
+            // member row is byte-identical to what the rebuild would write.
+            let signature_hash = key
+                .signature
+                .as_deref()
+                .map(|signature| rag_rat_base::hash::hex_sha256(signature.as_bytes()));
+            for member in members {
+                relinks.push(LogicalMemberRelink {
+                    logical_symbol_id: claim.logical_symbol_id,
+                    symbol_id: member.symbol_id,
+                    signature_hash: signature_hash.clone(),
+                    start_line: member.start_line,
+                    end_line: member.end_line,
+                });
+            }
+        }
+        Ok(Some(relinks))
+    }
+
+    /// Write the owed member rows of a key-stable batch (#820) — the exact shape
+    /// [`Self::insert_logical_group`]'s member INSERT writes (`cfg_expr` NULL, sha256 signature
+    /// hash) — pointing the surviving logical rows at the replacement symbol ids. Runs inside
+    /// the caller's write transaction, alongside the symbol rewrite it repairs. Deliberately
+    /// NOT a clearer of the #819 pending marker: a relink is not a rebuild, and an outstanding
+    /// obligation must survive to its settle point.
+    pub(super) fn apply_logical_member_relinks(
+        &self,
+        relinks: &[LogicalMemberRelink],
+    ) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        for relink in relinks {
+            conn.prepare_cached(
+                "
+                INSERT INTO logical_symbol_members(
+                    logical_symbol_id, symbol_id, cfg_expr, signature_hash, start_line, end_line
+                )
+                VALUES (?1, ?2, NULL, ?3, ?4, ?5)
+                ",
+            )?
+            .execute(params![
+                relink.logical_symbol_id,
+                relink.symbol_id,
+                relink.signature_hash,
+                relink.start_line,
+                relink.end_line,
+            ])?;
+        }
         Ok(())
     }
 

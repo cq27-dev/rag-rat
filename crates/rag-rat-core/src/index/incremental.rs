@@ -13,6 +13,17 @@ struct IncrementalFilesOutcome {
     indexed: usize,
     manifest_in_change_set: bool,
     carried: usize,
+    /// The batch's logical-grouping verdict (#820): whether the pass's tail may re-link members
+    /// instead of paying the whole-repo `rebuild_logical_symbols`.
+    logical: graph_index::LogicalGroupingUpkeep,
+}
+
+/// What the shared prepared-file WRITE step did: the rows that actually landed (per-file writes
+/// plus tombstones — the caller's `mutated`/finalize gate input, unchanged), and the batch's
+/// logical-grouping verdict (#820) accumulated while replacing files.
+pub(super) struct IncrementalWriteOutcome {
+    pub(super) written: usize,
+    pub(super) logical: graph_index::LogicalGroupingUpkeep,
 }
 
 /// Everything the incremental/discover WRITE phase needs, computed entirely OUTSIDE the write
@@ -330,7 +341,7 @@ impl IndexDatabase {
             // per-file writes are keyed by (path, commit_sha, worktree_id) scope, so they are
             // idempotent against any intervening lockless overlay heal; and the flock has excluded
             // the only writer that could flip `active_generation`.
-            let IncrementalFilesOutcome { indexed, manifest_in_change_set, carried } =
+            let IncrementalFilesOutcome { indexed, manifest_in_change_set, carried, logical } =
                 db.apply_prepared_incremental_pass(&prepared, effective_mode, progress)?;
             let base_scope_discovery_marked = if effective_mode == IndexMode::Discover {
                 db.mark_active_base_scope_discovered(&config.targets)?
@@ -377,10 +388,29 @@ impl IndexDatabase {
             // re-resolves so a carried caller's edge re-points at re-derived rowids
             // (#502).
             if indexed > 0 || healed > 0 || carried > 0 || roots_changed {
-                progress(IndexProgress::RebuildingLogicalSymbols);
-                // Defer: this pass re-parsed only the CHANGED files, so it must not stamp the
-                // logical-key version — untouched files' drift is still in the future (#493).
-                db.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                // #820: a batch whose EVERY change was a key-stable file replacement keeps the
+                // grouped table correct by re-linking members inside this same transaction —
+                // the wholesale rebuild is owed only when a key set changed, or when the pass
+                // mutated grouping-relevant state OUTSIDE the per-file plan (an overlay heal
+                // moves symbols across scopes; a carry re-stamps scope rows; a package-map
+                // change keeps today's rebuild coupling). A pre-existing #819 obligation is
+                // untouched either way — the pass's tail settle below still consumes it.
+                let key_stable_relinks = match logical {
+                    graph_index::LogicalGroupingUpkeep::RelinkMembers(relinks)
+                        if healed == 0 && carried == 0 && !roots_changed =>
+                        Some(relinks),
+                    _ => None,
+                };
+                match key_stable_relinks {
+                    Some(relinks) => db.apply_logical_member_relinks(&relinks)?,
+                    None => {
+                        progress(IndexProgress::RebuildingLogicalSymbols);
+                        // Defer: this pass re-parsed only the CHANGED files, so it must not
+                        // stamp the logical-key version — untouched files' drift is still in
+                        // the future (#493).
+                        db.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                    },
+                }
                 progress(IndexProgress::ResolvingGraph);
                 db.resolve_edges()?;
                 db.mark_graph_index_current()?;
@@ -774,16 +804,17 @@ impl IndexDatabase {
         } else {
             0
         };
-        let indexed = self.write_prepared_incremental_files(
+        let written = self.write_prepared_incremental_files(
             &prepared.prepared_files,
             &prepared.deleted,
             Some(mode),
             progress,
         )?;
         Ok(IncrementalFilesOutcome {
-            indexed,
+            indexed: written.written,
             manifest_in_change_set: prepared.manifest_in_change_set,
             carried,
+            logical: written.logical,
         })
     }
 
@@ -922,7 +953,7 @@ impl IndexDatabase {
         files: Vec<IndexFile>,
         deleted: BTreeSet<PathBuf>,
         progress: &mut F,
-    ) -> anyhow::Result<usize>
+    ) -> anyhow::Result<IncrementalWriteOutcome>
     where
         F: FnMut(IndexProgress),
     {
@@ -944,10 +975,17 @@ impl IndexDatabase {
         deleted: &BTreeSet<PathBuf>,
         mode_guard: Option<IndexMode>,
         progress: &mut F,
-    ) -> anyhow::Result<usize>
+    ) -> anyhow::Result<IncrementalWriteOutcome>
     where
         F: FnMut(IndexProgress),
     {
+        // #820: the batch's logical-grouping verdict, opened only when this call can actually
+        // mutate rows — an idle pass (nothing prepared, nothing deleted) stays at zero reads.
+        let mut logical = if prepared.is_empty() && deleted.is_empty() {
+            graph_index::LogicalGroupingUpkeep::RelinkMembers(Vec::new())
+        } else {
+            self.begin_logical_grouping_upkeep()?
+        };
         // `mode_guard` is `Some` only for the #560 hoisted path, whose plan was prepared OFF the
         // write lock; the in-txn callers (zero-hit heal, worktree-overlay pass) prepare inside
         // their own transaction — no concurrent commit is possible — so they pass `None`
@@ -984,6 +1022,11 @@ impl IndexDatabase {
             }
             self.mark_file_deleted(path)?;
             deleted_count += 1;
+        }
+        // A tombstoned path removes a whole file's keys from the grouped corpus — never
+        // key-stable (#820).
+        if deleted_count > 0 {
+            logical.require_rebuild();
         }
 
         let total = prepared.len();
@@ -1044,6 +1087,18 @@ impl IndexDatabase {
             {
                 continue;
             }
+            // #820 key-stability capture, BEFORE the removal cascades the old member rows away
+            // with the symbols. Skipped once the batch already owes a rebuild — the capture
+            // would be dead weight then.
+            let replaced_grouping = if logical.is_relinkable() {
+                self.load_grouped_key_claims(
+                    &prepared_file.file.relative_path,
+                    &prepared_file.file.commit_sha,
+                    &prepared_file.file.worktree_id,
+                )?
+            } else {
+                None
+            };
             self.remove_file_in_scope(
                 &prepared_file.file.relative_path,
                 &prepared_file.file.commit_sha,
@@ -1055,11 +1110,24 @@ impl IndexDatabase {
             // terminal tail.
             self.insert_prepared_file(prepared_file, None)?;
             written += 1;
+            // Compare the replacement's key multiset against the captured claims: identical →
+            // the file's owed member rows accumulate; anything else (including a first-time
+            // scope row, whose captured claims are empty) downgrades the batch to the rebuild.
+            let owed_relinks = match &replaced_grouping {
+                Some(replaced) => self.derive_key_stable_relinks(
+                    &prepared_file.file.relative_path,
+                    &prepared_file.file.commit_sha,
+                    &prepared_file.file.worktree_id,
+                    replaced,
+                )?,
+                None => None,
+            };
+            logical.absorb_replaced_file(owed_relinks);
         }
 
         // Count only what actually landed (skips excluded), so an all-skipped pass keeps the
         // caller's `mutated` flag honest and preserves the #63 idle no-write invariant.
-        Ok(written + deleted_count)
+        Ok(IncrementalWriteOutcome { written: written + deleted_count, logical })
     }
 }
 
