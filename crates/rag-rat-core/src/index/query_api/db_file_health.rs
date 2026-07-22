@@ -7,19 +7,17 @@
 //! sidecar) so every watcher pass can attempt it for free; `database_file_health` feeds the
 //! `doctor` report.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+// The fold threshold and the sidecar stat live with the connection (`rag_rat_db::storage`),
+// which owns the close-time fold (#818); re-exported here so the query layer's
+// checkpoint/report surface keeps its one canonical path.
+pub use rag_rat_db::storage::WAL_CHECKPOINT_MIN_BYTES;
+pub(crate) use rag_rat_db::storage::wal_bytes;
 use rusqlite::Connection;
 use serde::Serialize;
 
 use super::*;
-
-/// The pass-tail checkpoint trigger: attempt `wal_checkpoint(TRUNCATE)` only once the sidecar
-/// exceeds this. With passive autocheckpoint disabled on write connections (#818), the WAL
-/// accumulates a write burst's volume until a deliberate fold; below this size the fold is not
-/// worth the truncate's reader-wait, and the probe is a single `stat` — cheap enough for every
-/// watcher pass.
-pub const WAL_CHECKPOINT_MIN_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Doctor warning threshold for the `-wal` sidecar: past this, checkpoints are being starved
 /// (long-lived readers) or no pass-terminal / maintenance checkpoint ever runs — worth surfacing
@@ -324,14 +322,6 @@ fn freelist_snapshot(
         conn.connection().query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
     let main_bytes = std::fs::metadata(database).map(|meta| meta.len()).unwrap_or(0);
     Ok((main_bytes, freelist_pages))
-}
-
-/// Size of the `-wal` sidecar, 0 when absent. SQLite derives the sidecar name by appending
-/// `-wal` to the database path byte-for-byte, so build it the same way (no extension juggling).
-fn wal_bytes(database: &Path) -> u64 {
-    let mut sidecar = database.as_os_str().to_os_string();
-    sidecar.push("-wal");
-    std::fs::metadata(PathBuf::from(sidecar)).map(|meta| meta.len()).unwrap_or(0)
 }
 
 #[cfg(test)]

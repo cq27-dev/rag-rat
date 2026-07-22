@@ -281,16 +281,6 @@ pub(crate) fn call_tool_with_db(
         },
         other => anyhow::bail!("unknown tool `{other}`"),
     };
-    // Deliberate WAL fold for the MCP write path (#818): connections open with
-    // `wal_autocheckpoint = 0`, and a long-lived MCP server on a machine with no watcher and no
-    // git-hook maintenance would otherwise grow the shared `-wal` without bound across memory
-    // writes — the close-time checkpoint never runs while another process holds the DB open.
-    // Write tools never run on the read-only connection, so this can't hit `SQLITE_READONLY`.
-    // Size-gated (a bare stat under the threshold) and best-effort: a busy fold rides the next
-    // write, and never fails the tool call that already succeeded.
-    if is_write_tool(name) {
-        let _ = db.checkpoint_wal_if_oversized(rag_rat_core::index::WAL_CHECKPOINT_MIN_BYTES);
-    }
     Ok(result)
 }
 

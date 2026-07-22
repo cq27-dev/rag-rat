@@ -118,11 +118,6 @@ fn report_indexed(db: &IndexDatabase, config: &Config) -> anyhow::Result<()> {
     if doctor_count > 0 {
         eprintln!("⚠ {doctor_count} repo memories need re-anchoring — run 'rag-rat memory doctor'");
     }
-    // With passive autocheckpoint disabled on write connections (#818), give the one-shot `index`
-    // exit a deliberate WAL fold, like the maintenance pass (#573): SQLite's close-time checkpoint
-    // is skipped whenever another process (an MCP server) still holds the shared DB open.
-    // Size-gated and best-effort — a busy/failed checkpoint rides the next writer's checkpoint.
-    let _ = db.checkpoint_wal_if_oversized(rag_rat_core::index::WAL_CHECKPOINT_MIN_BYTES);
     print_output(&db.status(&config.database)?)
 }
 
