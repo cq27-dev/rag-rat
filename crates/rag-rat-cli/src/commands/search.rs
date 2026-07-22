@@ -17,7 +17,13 @@ pub(crate) fn query(config: &Config, args: &QueryArgs) -> anyhow::Result<()> {
         print_query_explain(&db.search_explain(&query, 10, false)?);
         return Ok(());
     }
-    print_output(&db.search(&query, 10, false)?)
+    // Attach the drive-by distilled decision records here — the same enrichment the semantic_search
+    // MCP handler runs — so `rag-rat query <q> --json` surfaces them (the shared `search` does not,
+    // to keep records off docs_for_symbol and other search consumers). Skip-empty + facet-gated, so
+    // almost every hit stays unchanged.
+    let mut hits = db.search(&query, 10, false)?;
+    db.attach_distilled_records_to_search_hits(&mut hits)?;
+    print_output(&hits)
 }
 
 pub(crate) fn brief(config: &Config, args: &BriefArgs) -> anyhow::Result<()> {

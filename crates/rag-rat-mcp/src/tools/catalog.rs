@@ -71,13 +71,18 @@ pub fn description(name: &str) -> &'static str {
              pass explain=true for the per-component breakdown. Each hit carries `retrieval_mode` \
              ('lexical', 'vector', or 'hybrid') so you can tell whether embeddings contributed \
              without explain. Hits are validated against current source. Falls back to BM25-only \
-             (every hit 'lexical') when no embedding model is present.",
+             (every hit 'lexical') when no embedding model is present. When a hit's symbol has a \
+             distilled decision record (the model's resolved root-cause / decision / outcome over \
+             the tracker thread that shaped it), it rides along as `distilled_records` — labeled \
+             unreviewed, capped at 2; empty for almost every hit.",
         "symbol_lookup" =>
             "Resolve a symbol name (or ref/id) to its definition(s) in Rust, TypeScript, Kotlin, \
              C, C++, Python, or Swift — exact or fuzzy. Returns candidates with signatures, \
              locations, logical-symbol grouping (cfg variants), and any bound repo memories. Use \
              to disambiguate before a graph or read call. Generated bindings (codegen, ubrn FFI \
-             output) are excluded by default; pass include: [\"generated\"] to see them.",
+             output) are excluded by default; pass include: [\"generated\"] to see them. A \
+             candidate whose symbol has distilled decision records carries them as \
+             `distilled_records` (labeled unreviewed, capped at 2; empty for almost every symbol).",
         "find_callers" =>
             "Find what calls a symbol (reverse call graph), instead of grepping for call sites. \
              Returns call sites with confidence + target verification, a completeness / \
@@ -101,7 +106,10 @@ pub fn description(name: &str) -> &'static str {
         "impact_surface" =>
             "Pre-edit blast radius for a symbol or path: graph callers/callees, tests, docs, git \
              history, tracker papertrail, and the repo memories crossing it, with a completeness / \
-             risk summary. Run this before changing anything non-trivial.",
+             risk summary. Run this before changing anything non-trivial. Distilled decision \
+             records for the symbol ride along as `distilled_records` (labeled unreviewed, capped \
+             at 2; the cap is signalled in `completeness_and_caveats.truncated_sections` when more \
+             exist).",
         "check_library_usage" =>
             "Dependency-contract check for the code's EXTERNAL library calls, from the SCIP \
              oracle's external symbol info. For each `resolved-external` call site it surfaces the \
@@ -147,7 +155,9 @@ pub fn description(name: &str) -> &'static str {
         "read_chunk" =>
             "Read the current source text for one chunk id, validated against HEAD (relocates or \
              flags stale/gone), with compact call-graph context and bound repo memories. Use to \
-             read exact text after a search returns a chunk_id.",
+             read exact text after a search returns a chunk_id. When the chunk's symbol has \
+             distilled decision records they attach as `distilled_records` (labeled unreviewed, \
+             capped at 2).",
         "commit_search" =>
             "Full-text search over historical commit subjects and bodies — find when/why something \
              changed by keyword.",
@@ -173,12 +183,16 @@ pub fn description(name: &str) -> &'static str {
             "Cached tracker items (issues / change requests / reviews) related to a historical \
              commit.",
         "papertrail_issue_search" =>
-            "Full-text search across cached tracker issue and change-request titles and bodies.",
+            "Full-text search across cached tracker issue and change-request titles and bodies. A \
+             hit whose thread has a distilled decision record carries it as `record` (the model's \
+             root-cause / decision / outcome over the whole thread); coalesced issue↔PR pairs \
+             answer as one result.",
         "papertrail_refs_for_path" =>
             "List cached tracker items discovered to reference a current path.",
         "rationale_search" =>
             "Search cached tracker rationale snippets (review comments, issue / change-request \
-             discussion) by keyword.",
+             discussion) by keyword. A hit whose thread has a distilled decision record carries it \
+             as `record` (the model's root-cause / decision / outcome over the whole thread).",
         "llm_status" =>
             "Embedding status (local or remote/Ollama-served): model, install state, and how many \
              chunks are embedded / missing / skipped.",
