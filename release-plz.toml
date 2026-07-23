@@ -1,9 +1,11 @@
 # release-plz: automates version bumps, changelog, crates.io publish, and the GitHub release for
-# this three-crate workspace. https://release-plz.dev/docs/config
+# this workspace. https://release-plz.dev/docs/config
 #
-# Lockstep is the contract: all three crates share one version (see `[workspace.package].version`
+# Lockstep is the contract: every crate shares one version (see `[workspace.package].version`
 # in Cargo.toml). `version_group` below makes release-plz assign the SAME next version to every
-# member (the highest bump required across the group), so they never drift.
+# member (the highest bump required across the group), so they never drift. A new crate MUST be
+# added here with `version_group = "rag-rat"`, or release-plz treats it as its own group and tries
+# to publish it at the current (already-taken) workspace version.
 
 [workspace]
 # One git tag + one GitHub release per bump, not one per crate. The libraries stay tag/release-
@@ -85,3 +87,22 @@ changelog_path = "./CHANGELOG.md"
 name = "rag-rat-oplog"
 version_group = "rag-rat"
 changelog_path = "./CHANGELOG.md"
+
+# rag-rat-sync joined the workspace in #406. It versions in lockstep with the group, but its FIRST
+# crates.io publish is deferred to a manual bootstrap (`publish = false`), for two reasons that both
+# apply only to a brand-new crate:
+#   1. The CI registry token can publish new VERSIONS of crates it already owns, but not RESERVE a
+#      new crate name. The first publish must come from a maintainer's token, which then `cargo
+#      owner --add`s the CI token so later releases publish it automatically.
+#   2. `cargo publish --verify` builds the packaged crate against the crates.io copies of its path
+#      deps. A new crate that uses APIs added to a sibling (rag-rat-oplog) in the same PR cannot
+#      verify until that sibling's new version is on the registry — which only happens at the next
+#      lockstep release.
+# Bootstrap once the next release has published the siblings: `cargo publish -p rag-rat-sync`, then
+# `cargo owner --add <ci-token-user> rag-rat-sync`, then delete this line so releases publish it in
+# lockstep like every other crate. Until then nothing depends on it downstream, so deferring is safe.
+[[package]]
+name = "rag-rat-sync"
+version_group = "rag-rat"
+changelog_path = "./CHANGELOG.md"
+publish = false
