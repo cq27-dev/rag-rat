@@ -228,3 +228,76 @@ fn find_callers_sees_calls_in_let_bindings() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// #827: an incremental content-changed pass narrows the edge re-resolve to the changed files plus
+/// the source files of the in-edges its removals touch — but must preserve `find_callers` parity
+/// for BOTH the touched file's own out-edges AND untouched files' in-edges into it. Editing `a.rs`
+/// (which defines `target`, called from the UNCHANGED `b.rs`) must NOT drop `b_caller` from
+/// `find_callers(target)`: the scoped pass re-points that in-edge onto the changed file's new
+/// symbol id even though the first dirty edit only shadows (never removes) the committed `target`.
+/// The reverse leg — the touched file's own call into `b.rs` — must resolve too. This is the exact
+/// verification the issue calls for: find_callers parity for touched and untouched files after a
+/// scoped pass.
+#[test]
+fn scoped_incremental_pass_preserves_find_callers_both_directions() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "mod a;\nmod b;\n").unwrap();
+    fs::write(
+        root.join("src/a.rs"),
+        "use crate::b::b_helper;\npub fn target() {}\npub fn a_caller() {\n    b_helper();\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "use crate::a::target;\npub fn b_helper() {}\npub fn b_caller() {\n    target();\n}\n",
+    )
+    .unwrap();
+    init_git_repo(&root);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "seed"]);
+    let config = source_config(root.clone(), Language::Rust);
+
+    let caller_names = |db: &IndexDatabase, of: &str| -> Vec<String> {
+        db.find_callers(of, 50).unwrap().iter().filter_map(|hop| hop.from_symbol.clone()).collect()
+    };
+    let calls = |db: &IndexDatabase, callee: &str, caller: &str| {
+        caller_names(db, callee).iter().any(|name| name.ends_with(caller))
+    };
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // Baseline: both cross-file callers resolve after the full rebuild.
+    assert!(calls(&db, "target", "b_caller"), "baseline: b_caller must call target");
+    assert!(calls(&db, "b_helper", "a_caller"), "baseline: a_caller must call b_helper");
+    drop(db);
+
+    // Edit a.rs (dirty, uncommitted) — prepend a comment so its `target` / `a_caller` symbols get
+    // fresh ids while b.rs is untouched. This is the pure per-file change the scoped resolve
+    // narrows to (indexed > 0, nothing healed / carried / manifest-changed).
+    fs::write(
+        root.join("src/a.rs"),
+        "// touched\nuse crate::b::b_helper;\npub fn target() {}\npub fn a_caller() {\n    \
+         b_helper();\n}\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+
+    // The in-edge from the UNCHANGED b.rs must survive the scoped pass — the `find_callers` recall
+    // floor. A naive source-file-only write scope would leave it pointing at the shadowed committed
+    // `target` and drop b_caller here.
+    assert!(
+        calls(&db, "target", "b_caller"),
+        "after a scoped incremental edit of a.rs, b_caller must still call target (in-edge \
+         re-pointed onto the new symbol), got {:?}",
+        caller_names(&db, "target"),
+    );
+    // The touched file's own out-edge into b.rs must resolve too (set (a)).
+    assert!(
+        calls(&db, "b_helper", "a_caller"),
+        "after a scoped incremental edit of a.rs, a_caller must still call b_helper, got {:?}",
+        caller_names(&db, "b_helper"),
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

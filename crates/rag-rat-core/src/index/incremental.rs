@@ -310,6 +310,14 @@ impl IndexDatabase {
             // BEGIN IMMEDIATE: take the write lock up front so a racing writer waits out
             // busy_timeout instead of failing a deferred read→write upgrade with SQLITE_BUSY.
             db.storage.execute_batch("BEGIN IMMEDIATE")?;
+            // #827: arm scoped-edge-rewrite capture for the whole pass — BEFORE the file removals /
+            // inserts below, so `remove_file_in_scope` can stage the source files of the in-edges
+            // it NULLs and the incremental file insert can stage the changed files.
+            // Whether the pass actually narrows (vs a full re-resolve) is decided AFTER
+            // apply, once the row counts are known (see the resolve gate below); arming
+            // unconditionally only writes the `temp` schema, so it costs an idle pass
+            // nothing on the main DB (#63).
+            db.begin_scoped_edge_rewrite()?;
             // Write meta only when it actually changed, and track whether this pass mutated
             // anything at all. A periodic sweep or a spurious event over an unchanged
             // tree must NOT churn the WAL with a timestamp-only write + COMMIT (issue
@@ -412,11 +420,31 @@ impl IndexDatabase {
                     },
                 }
                 progress(IndexProgress::ResolvingGraph);
-                db.resolve_edges()?;
+                // #827: narrow the re-resolve to this pass's staged changed files + the source
+                // files of the in-edges its removals NULLed
+                // (`temp.edge_rewrite_files`) — but ONLY when the pass's mutations
+                // are purely per-file symbol/edge changes. A package-map change
+                // (`roots_changed`), a carried scope (`carried`), or an overlay heal (`healed`) can
+                // shift how edges in UNCHANGED files resolve (import scope / row visibility), which
+                // a narrowed write set would silently under-resolve — those keep
+                // the full active-scope pass. The narrowed set re-points every
+                // existing edge (no `find_callers` loss); only a purely NEW binding
+                // from an unchanged source is deferred to the next full pass.
+                let scoped_resolve = indexed > 0 && healed == 0 && carried == 0 && !roots_changed;
+                if scoped_resolve {
+                    db.resolve_changed_edges()?;
+                } else {
+                    db.resolve_edges()?;
+                }
                 db.mark_graph_index_current()?;
                 progress(IndexProgress::SyncingFts);
                 db.sync_fts()?;
             }
+            // #827: disarm capture for this connection (the staged rows are consumed by the resolve
+            // above; the next pass's `begin_scoped_edge_rewrite` clears them). Runs whether or not
+            // the resolve branch was entered, so an idle or non-narrowed pass leaves
+            // the flag clean.
+            db.finish_scoped_edge_rewrite();
             if mutated {
                 db.set_repo_meta("indexed_at_ms", &now_ms().to_string())?;
                 db.storage.execute_batch("COMMIT")?;

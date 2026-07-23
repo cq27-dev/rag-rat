@@ -631,6 +631,17 @@ impl IndexDatabase {
         edges::resolve_all_edges(self.storage.connection())
     }
 
+    /// Re-resolve ONLY the source files staged in `temp.edge_rewrite_files` (#827) — the
+    /// incremental content-changed pass's narrowed twin of [`Self::resolve_edges`]. The caller
+    /// must have armed capture (`begin_scoped_edge_rewrite`) so the staging holds this pass's
+    /// changed files plus the source files of the in-edges its removals NULLed, and must only
+    /// reach here when the pass's mutations are purely per-file symbol/edge changes (the
+    /// incremental resolve gate). Resolution TARGETS still span the full active scope, so an
+    /// edge in a changed file into an unchanged symbol resolves.
+    pub(super) fn resolve_changed_edges(&self) -> anyhow::Result<()> {
+        edges::resolve_changed_edges(self.storage.connection())
+    }
+
     /// Resolve edges for a LINKED-WORKTREE OVERLAY pass (#219 P1): re-resolve / re-synthesize ONLY
     /// the worktree's own overlay source files, never the SHARED committed (base) rows that are
     /// merely visible in the overlay scope view. Resolution targets still span the full overlay

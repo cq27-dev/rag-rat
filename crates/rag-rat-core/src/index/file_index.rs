@@ -266,14 +266,22 @@ impl IndexDatabase {
                 }
             },
             // Incremental: insert unresolved edges per file; resolve_edges resolves them afterward.
-            None =>
+            None => {
+                // #827: register this (re)written file as set (a) of the scoped re-resolve write
+                // set (no-op unless a scoped incremental pass armed capture).
+                // Staged unconditionally — even an edge-less changed file may host
+                // symbols a `resolve_changed_edges` pass will re-point in-edges
+                // toward — so the write set matches what a full re-resolve touches
+                // for the changed files.
+                self.stage_edge_rewrite_file(file_id)?;
                 if !prepared.edge_candidates.is_empty() {
                     let mut candidates = prepared.edge_candidates.clone();
                     for candidate in &mut candidates {
                         candidate.remap_from_symbol_id(&symbol_db_ids);
                     }
                     edges::insert_candidates(self.storage.connection(), file_id, candidates)?;
-                },
+                }
+            },
         }
         self.mark_fts_dirty()?;
         Ok(())

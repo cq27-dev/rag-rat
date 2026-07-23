@@ -100,7 +100,7 @@ mod parser_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::UNIX_EPOCH;
@@ -178,6 +178,15 @@ pub struct IndexDatabase {
     /// never pay the snapshot scan. Interior mutability because the deleters take `&self`.
     drift_snapshot:
         std::sync::Mutex<Option<(String, Option<Vec<graph_index::LogicalKeyDriftRow>>)>>,
+    /// #827: when armed, the pass captures the source files whose edges a scoped re-resolve must
+    /// rewrite — the changed files it (re)writes plus the source files of the in-edges its
+    /// removals NULL — into `temp.edge_rewrite_files`, so `resolve_changed_edges` narrows the
+    /// write set to those instead of every edge in the active scope. Armed for the duration of
+    /// an incremental content-changed pass by `begin_scoped_edge_rewrite`; the capture seams
+    /// (`remove_file_in_scope`, the incremental file insert) take `&self`, hence interior
+    /// mutability. `Relaxed` is sufficient: capture and resolve run on one connection/thread
+    /// within the pass, never a cross-thread handoff.
+    edge_rewrite_capture: AtomicBool,
     /// Test-only #819 observability: how many times [`Self::rebuild_logical_symbols`] ran on this
     /// connection, so batch tests can assert the once-per-pass rebuild cardinality.
     #[cfg(test)]

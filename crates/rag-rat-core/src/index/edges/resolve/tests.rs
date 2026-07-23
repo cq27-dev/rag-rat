@@ -1823,3 +1823,100 @@ fn add_py_symbol_at(
     .unwrap();
     conn.last_insert_rowid()
 }
+
+/// Stage `file_ids` into `temp.edge_rewrite_files` the way `begin_scoped_edge_rewrite` + the
+/// capture seams do, so a connection-level test can drive [`resolve_changed_edges`] directly
+/// (#827).
+fn stage_edge_rewrite_files(conn: &Connection, file_ids: &[i64]) {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS edge_rewrite_files(file_id INTEGER PRIMARY KEY);
+         DELETE FROM temp.edge_rewrite_files;",
+    )
+    .unwrap();
+    for &file_id in file_ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO temp.edge_rewrite_files(file_id) VALUES (?1)",
+            params![file_id],
+        )
+        .unwrap();
+    }
+}
+
+/// #827: a scoped re-resolve rewrites ONLY the source files staged in `temp.edge_rewrite_files`,
+/// leaving every other file's edges untouched — even one a FULL re-resolve WOULD bind. The unstaged
+/// caller's edge is left `unresolved` with its target present in the corpus: if
+/// `resolve_changed_edges` fell back to a full pass it would bind it, so the surviving `unresolved`
+/// state is what proves the narrowing is real (the fast path disagrees with the fallback — not the
+/// full path in disguise).
+#[test]
+fn scoped_resolve_rewrites_only_staged_source_files() {
+    let conn = seeded_conn();
+    let caller_staged = add_file(&conn, "a.rs", NEW);
+    let caller_unstaged = add_file(&conn, "b.rs", NEW);
+    let defs = add_file(&conn, "d.rs", NEW);
+    let target = add_symbol(&conn, defs, "target", "crate::d::target");
+    add_symbol(&conn, caller_staged, "caller_a", "crate::a::caller_a");
+    add_symbol(&conn, caller_unstaged, "caller_b", "crate::b::caller_b");
+    let edge_staged = add_edge(&conn, caller_staged, "d::target", "d::target");
+    let edge_unstaged = add_edge(&conn, caller_unstaged, "d::target", "d::target");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    // Both edges arrive `unresolved`. Stage ONLY a.rs; b.rs is the poison a full pass would bind.
+    stage_edge_rewrite_files(&conn, &[caller_staged]);
+    resolve_changed_edges(&conn).unwrap();
+
+    let (to, confidence, resolution) = edge_state(&conn, edge_staged);
+    assert_eq!(to, Some(target), "the staged file's edge is re-resolved against the full pool");
+    assert_eq!(confidence, "Syntactic");
+    assert_eq!(resolution, "qualified_suffix");
+
+    let (to, _, resolution) = edge_state(&conn, edge_unstaged);
+    assert_eq!(to, None, "the UNSTAGED file's edge is left untouched by the scoped pass");
+    assert_eq!(
+        resolution, "unresolved",
+        "a full re-resolve would bind this identical edge — its surviving unresolved state proves \
+         the scoped pass did NOT fall back to a full pass"
+    );
+}
+
+/// #827: staging the SOURCE FILE of an in-edge (what `remove_file_in_scope` captures at file
+/// granularity) re-points that in-edge onto the changed file's NEW symbol id — so a caller in an
+/// UNCHANGED file survives a change to its target's file (the `find_callers` recall floor).
+#[test]
+fn scoped_resolve_repoints_staged_inedge_onto_moved_target() {
+    let conn = seeded_conn();
+    let caller = add_file(&conn, "a.rs", NEW);
+    let defs = add_file(&conn, "d.rs", NEW);
+    add_symbol(&conn, caller, "caller", "crate::a::caller");
+    let old_target = add_symbol(&conn, defs, "target", "crate::d::target");
+    let edge = add_edge(&conn, caller, "d::target", "d::target");
+    // The caller's edge starts resolved to the target's ORIGINAL id.
+    conn.execute(
+        "UPDATE edges SET to_symbol_id = ?2, confidence = 'Syntactic', resolution = \
+         'qualified_suffix' WHERE id = ?1",
+        params![edge, old_target],
+    )
+    .unwrap();
+
+    // Simulate the target file changing: its symbol is deleted and re-inserted with a NEW id, and
+    // the in-edge is NULLed exactly as `remove_file_in_scope` does. Stage BOTH files, as the
+    // capture seams would (the changed file d.rs plus the source file a.rs of the NULLed
+    // in-edge).
+    conn.execute("DELETE FROM symbols WHERE id = ?1", params![old_target]).unwrap();
+    conn.execute(
+        "UPDATE edges SET to_symbol_id = NULL, confidence = 'NameOnly', resolution = 'unresolved' \
+         WHERE id = ?1",
+        params![edge],
+    )
+    .unwrap();
+    let new_target = add_symbol(&conn, defs, "target", "crate::d::target");
+    assert_ne!(new_target, old_target, "the re-inserted target must carry a fresh id");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    stage_edge_rewrite_files(&conn, &[caller, defs]);
+    resolve_changed_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, edge);
+    assert_eq!(to, Some(new_target), "the staged in-edge re-points onto the target's NEW id");
+    assert_eq!(resolution, "qualified_suffix");
+}

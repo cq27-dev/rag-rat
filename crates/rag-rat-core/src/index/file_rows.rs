@@ -7,6 +7,77 @@ use rag_rat_base::time::now_ms;
 use super::*;
 
 impl IndexDatabase {
+    /// #827: arm scoped-edge-rewrite capture for the duration of an incremental content-changed
+    /// pass. Creates (idempotently) and clears `temp.edge_rewrite_files`; while armed, the write
+    /// seams (`remove_file_in_scope`, the incremental file insert) stage the source files a scoped
+    /// re-resolve must rewrite into it. The temp table lives in the `temp` schema (no main-DB
+    /// write), so arming does not violate the idle-pass no-write invariant (#63). Paired with
+    /// [`Self::finish_scoped_edge_rewrite`].
+    pub(super) fn begin_scoped_edge_rewrite(&self) -> anyhow::Result<()> {
+        self.storage.connection().execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS edge_rewrite_files(file_id INTEGER PRIMARY KEY);
+             DELETE FROM temp.edge_rewrite_files;",
+        )?;
+        self.edge_rewrite_capture.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// #827: disarm scoped-edge-rewrite capture. Leaves the staged rows in place for the pass's
+    /// `resolve_changed_edges` to read; the next [`Self::begin_scoped_edge_rewrite`] clears them.
+    pub(super) fn finish_scoped_edge_rewrite(&self) {
+        self.edge_rewrite_capture.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn edge_rewrite_capture_active(&self) -> bool {
+        self.edge_rewrite_capture.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #827: stage a (re)written source file's id into the scoped re-resolve write set (set (a) — the
+    /// changed files themselves). No-op unless capture is armed.
+    pub(super) fn stage_edge_rewrite_file(&self, file_id: i64) -> anyhow::Result<()> {
+        if self.edge_rewrite_capture_active() {
+            self.storage.connection().execute(
+                "INSERT OR IGNORE INTO temp.edge_rewrite_files(file_id) VALUES (?1)",
+                params![file_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// #827: stage the SOURCE FILES of the in-edges pointing at the changed PATH's symbols (set (b)).
+    /// Called from [`Self::remove_file_in_scope`] BEFORE the NULLing UPDATE, so the in-edges are
+    /// still bound. Keyed on `path` (+ repo + generation), NOT the removed `(commit_sha,
+    /// worktree_id)` scope: a FIRST dirty edit of a committed file removes only the (empty)
+    /// overlay scope, yet the in-edge `caller → committed target` must still be re-pointed onto
+    /// the new overlay target that now WINS the active view (a full re-resolve does exactly
+    /// this). Path-keying captures the in-edge whichever scope of the path it currently binds.
+    /// Over-capturing an in-edge from a sibling worktree is harmless — the scoped resolve's
+    /// `files` view excludes non-active rows, so only the active checkout's captured sources
+    /// are actually rewritten. No-op unless capture is armed.
+    fn stage_edge_rewrite_inedge_sources(
+        &self,
+        path: &str,
+        repo_id: &str,
+        generation: i64,
+    ) -> anyhow::Result<()> {
+        if !self.edge_rewrite_capture_active() {
+            return Ok(());
+        }
+        self.storage.connection().execute(
+            "INSERT OR IGNORE INTO temp.edge_rewrite_files(file_id)
+             SELECT DISTINCT edges_data.source_file_id FROM edges_data
+             WHERE edges_data.to_symbol_id IN (
+                 SELECT symbols.id FROM symbols
+                 JOIN main.files ON main.files.id = symbols.file_id
+                 WHERE main.files.path = ?1
+                   AND main.files.repo_id = ?2
+                   AND main.files.generation = ?3
+             )",
+            params![path, repo_id, generation],
+        )?;
+        Ok(())
+    }
+
     pub(super) fn mark_file_deleted(&self, path: &Path) -> anyhow::Result<()> {
         self.write_tombstone_in_scope(path, &self.active_worktree_id)
     }
@@ -68,6 +139,13 @@ impl IndexDatabase {
         // the staging target on the rebuild connection, so each writer removes only its own
         // generation's rows.
         let generation = self.active_generation;
+        // #827: BEFORE the UPDATE NULLs them, stage the SOURCE FILES of the in-edges pointing at
+        // this PATH's symbols into the scoped re-resolve write set. A scoped incremental pass must
+        // re-resolve those files' edges (else a caller in an UNCHANGED file — NULLed here, or
+        // flipped onto a new overlay winner — would drop out of `find_callers`). Captured
+        // at FILE granularity (round up in-edge → its source file), so the whole write set
+        // stays one file-id set. No-op unless armed by `begin_scoped_edge_rewrite`.
+        self.stage_edge_rewrite_inedge_sources(&path, repo_id, generation)?;
         self.storage.connection().execute(
             "UPDATE edges_data
              SET to_symbol_id = NULL,

@@ -172,32 +172,71 @@ fn scope_context_value(conn: &Connection, key: &str) -> String {
 ///
 /// READS always span the full active-checkout `files` scope view (so a target in a shadowed/base
 /// file still resolves); this only narrows the SET of source files whose `edges_data` rows the pass
-/// mutates. A LINKED-WORKTREE OVERLAY pass must NOT rewrite a SHARED committed (base-scoped) caller
-/// file's edges: the base row's `files.id` is the same row the base scope reads, so re-resolving it
-/// against the overlay's (shadowed) symbol set would corrupt base `find_callers`/impact until a
-/// base pass resolved it back — graph results flipping by whichever worktree refreshed last (#219
-/// P1).
+/// mutates. Two orthogonal narrowings COMPOSE via `files_write_predicate` (AND-ed together):
+///
+/// - `overlay`: a LINKED-WORKTREE OVERLAY pass must NOT rewrite a SHARED committed (base-scoped)
+///   caller file's edges: the base row's `files.id` is the same row the base scope reads, so
+///   re-resolving it against the overlay's (shadowed) symbol set would corrupt base
+///   `find_callers`/impact until a base pass resolved it back — graph results flipping by whichever
+///   worktree refreshed last (#219 P1). `Some(id)` restricts writes to `files.worktree_id = id`.
+///
+/// - `changed_only`: an incremental content-changed pass restricts writes to the source files
+///   staged in `temp.edge_rewrite_files` — the files it (re)wrote this pass, plus the source files
+///   of the in-edges its removals NULLed (#827). Re-resolving every edge in the active scope on a
+///   1-file delta is the cost this narrows; the full symbol pool stays available as resolution
+///   TARGETS (only the write set shrinks). The staged set re-points every EXISTING edge that
+///   pointed into a changed file; a purely NEW binding from an UNCHANGED source (define-after-use
+///   across files) is not chased here — the same eventual-consistency recall trade-off `overlay`
+///   accepts, settled on the next full rebuild or when that caller file is next touched.
 #[derive(Clone, Copy)]
-pub(crate) enum EdgeWriteScope<'a> {
-    /// Every in-view source file (the base/incremental/full-rebuild path: the active scope OWNS its
-    /// committed rows, so rewriting them is correct).
-    ActiveScope,
-    /// Only the linked worktree's OVERLAY rows (`files.worktree_id = id`). Shared committed rows in
-    /// the view are read for resolution targets but never written.
-    OverlayOnly(&'a str),
+pub(crate) struct EdgeWriteScope<'a> {
+    /// `Some(worktree_id)` restricts writes to that worktree's overlay rows; `None` writes every
+    /// in-view source row (the active scope OWNS its committed rows, so rewriting them is
+    /// correct).
+    overlay: Option<&'a str>,
+    /// When `true`, narrow the write set to `temp.edge_rewrite_files` (#827); when `false`,
+    /// rewrite every source file the `overlay` restriction admits.
+    changed_only: bool,
 }
 
-impl EdgeWriteScope<'_> {
+impl<'a> EdgeWriteScope<'a> {
+    /// The base / incremental-when-not-narrowed / full-rebuild path: rewrite every in-view source
+    /// file's edges.
+    pub(crate) fn active_scope() -> Self {
+        Self { overlay: None, changed_only: false }
+    }
+
+    /// A linked-worktree overlay pass: rewrite ONLY that worktree's overlay source rows (#219 P1).
+    pub(crate) fn overlay_only(worktree_id: &'a str) -> Self {
+        Self { overlay: Some(worktree_id), changed_only: false }
+    }
+
+    /// An incremental content-changed BASE pass: rewrite ONLY the source files staged in
+    /// `temp.edge_rewrite_files` (#827). Composes with `overlay` (both restrictions AND together)
+    /// so a future overlay pass can narrow the same way.
+    pub(crate) fn changed_active() -> Self {
+        Self { overlay: None, changed_only: true }
+    }
+
     /// `AND`-able predicate (with a leading space) restricting `files` to the writable source rows,
-    /// or empty for `ActiveScope`. Inlined (not bound) because it is appended to several different
-    /// SELECTs; the embedded value is a git-derived worktree id, single-quote-escaped defensively.
+    /// or empty for the full active scope. Inlined (not bound) because it is appended to several
+    /// different SELECTs; the overlay value is a git-derived worktree id, single-quote-escaped
+    /// defensively. The `changed_only` term references the pass's `temp.edge_rewrite_files` staging
+    /// (created by `begin_scoped_edge_rewrite`); it AND-composes with the overlay term so an
+    /// overlay row that also changed is written while a base row that changed under an overlay
+    /// pass is not.
     fn files_write_predicate(&self) -> String {
-        match self {
-            EdgeWriteScope::ActiveScope => String::new(),
-            EdgeWriteScope::OverlayOnly(worktree_id) => {
-                format!(" AND files.worktree_id = '{}'", worktree_id.replace('\'', "''"))
-            },
+        let mut predicate = String::new();
+        if let Some(worktree_id) = self.overlay {
+            predicate.push_str(&format!(
+                " AND files.worktree_id = '{}'",
+                worktree_id.replace('\'', "''")
+            ));
         }
+        if self.changed_only {
+            predicate.push_str(" AND files.id IN (SELECT file_id FROM temp.edge_rewrite_files)");
+        }
+        predicate
     }
 }
 
@@ -219,7 +258,20 @@ impl EdgeWriteScope<'_> {
 /// scope's edges stay self-consistent until gc prunes them or their own worktree's pass rewrites
 /// them.
 pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
-    resolve_edges_with_scope(conn, EdgeWriteScope::ActiveScope)
+    resolve_edges_with_scope(conn, EdgeWriteScope::active_scope())
+}
+
+/// Re-resolve ONLY the source files staged in `temp.edge_rewrite_files` (#827) — the incremental
+/// content-changed BASE pass's narrowed twin of [`resolve_all_edges`]. Resolution TARGETS still
+/// span the full active scope (an edge in a changed file into an unchanged symbol resolves), but
+/// the WRITE set is the pass's changed files plus the source files of the in-edges its removals
+/// NULLed, so a 1-file delta rewrites a handful of files' edges instead of every edge in the scope.
+/// The caller stages the set via `begin_scoped_edge_rewrite` + the capture seams and must only
+/// reach here when the pass's mutations are purely per-file symbol/edge changes (no package-map /
+/// carry / heal visibility shift, which a narrowed write set would under-resolve) — see the
+/// incremental pass gate.
+pub(crate) fn resolve_changed_edges(conn: &Connection) -> anyhow::Result<()> {
+    resolve_edges_with_scope(conn, EdgeWriteScope::changed_active())
 }
 
 /// Re-resolve ONLY a linked worktree's OVERLAY edges (#219 P1). Resolution targets still span the
@@ -230,7 +282,7 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
 /// row is read-only here); the overlay still serves its own files' edges, and the base resolves its
 /// own on its next pass.
 pub(crate) fn resolve_overlay_edges(conn: &Connection, worktree_id: &str) -> anyhow::Result<()> {
-    resolve_edges_with_scope(conn, EdgeWriteScope::OverlayOnly(worktree_id))
+    resolve_edges_with_scope(conn, EdgeWriteScope::overlay_only(worktree_id))
 }
 
 fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> anyhow::Result<()> {
@@ -705,7 +757,7 @@ pub(crate) fn resolve_and_insert_edges(
     // #200: synthesize construct→handler `dispatches` edges from the resolved fact rows. Runs after
     // the index rebuild — the few extra inserts maintain the (now rebuilt) indexes incrementally.
     // A full rebuild owns its whole scope, so it synthesizes over the active scope.
-    synthesize_dispatch_edges(conn, EdgeWriteScope::ActiveScope)?;
+    synthesize_dispatch_edges(conn, EdgeWriteScope::active_scope())?;
     Ok(())
 }
 
