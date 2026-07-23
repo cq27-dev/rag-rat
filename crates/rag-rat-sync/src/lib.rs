@@ -24,6 +24,9 @@ pub mod wire;
 pub use endpoint::{
     EndpointError, SyncFailure, accept_and_sync, build_endpoint, connect_and_sync, endpoint_addr,
 };
-pub use session::{Ingested, SessionError, SessionReport, SyncStore, run_session};
+pub use session::{
+    DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES, SessionError, SessionReport, SyncStore,
+    run_session, run_session_with_idle_timeout,
+};
 pub use store::OplogSyncStore;
 pub use wire::{Frame, SYNC_ALPN, WireError};

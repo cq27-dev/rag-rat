@@ -100,8 +100,8 @@ pub use secrets::{
 pub use snapshot::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub(crate) use storage::stream_owner_account;
 pub use storage::{
-    CapacityScope, IngestOutcome, SyncAccountEntry, account_entries_for_sync, account_entry_exists,
-    account_entry_ref, account_ingest, auth_len_freshness, backfill_authority_projection,
-    grant_effective_for_device, owner_control_authority, owner_secrets_authority,
-    roster_content_authority, stream_owner_effective,
+    CapacityScope, IngestOutcome, SyncAccountEntry, account_entries_for_sync, account_entry_ref,
+    account_ingest, account_signed_entry_exists, account_signed_hash, auth_len_freshness,
+    backfill_authority_projection, grant_effective_for_device, owner_control_authority,
+    owner_secrets_authority, roster_content_authority, stream_owner_effective,
 };

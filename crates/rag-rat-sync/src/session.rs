@@ -12,6 +12,7 @@
 //! caller runs one session at a time on a single task (concurrent sessions are a later slice).
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -19,6 +20,20 @@ use crate::codec::{self, CodecError};
 use crate::wire::{Frame, MAX_ENTRIES_PER_PAGE, MAX_HELLO_HASHES};
 
 type Hash = [u8; 32];
+
+/// How long the receiver waits for the peer's next frame before aborting the session as idle. A
+/// peer that connects and never sends, or stalls mid-stream, would otherwise hold the (single-
+/// session) server forever, blocking every later peer. Generous — a slow but progressing transfer
+/// resets it on each frame — while still bounding a silent connection.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The most entries one session will accept from a peer before aborting. A legitimate transfer for
+/// one account is bounded by that account's stored + parked capacity (a few thousand); this cap is
+/// far above that so an honest sync never hits it, while still bounding a peer that streams
+/// redelivered or junk entries forever. Paired with the empty-page rejection below, it turns "the
+/// receive loop runs until Done" into a bounded transfer, not an open-ended one a peer can hold
+/// open (#406: bounded frames, no amplification).
+pub const MAX_SESSION_ENTRIES: usize = 1_000_000;
 
 /// Cap the outgoing hello inventory to what the wire allows the peer to decode.
 ///
@@ -39,9 +54,11 @@ pub trait SyncStore {
     /// misdirected connection and the session aborts.
     fn account_id(&self) -> Hash;
 
-    /// Every held account-log entry as `(entry_hash, signed_bytes)`, read ONCE at session start.
-    /// Snapshotting up front keeps what we send independent of what we concurrently ingest, so the
-    /// two session halves never contend for the store.
+    /// Every held account-log entry as `(dedup_key, signed_bytes)`, read ONCE at session start. The
+    /// key is the SIGNED-envelope hash (`sha256(signed_bytes)`), NOT the entry_hash — two envelopes
+    /// can share an entry_hash but differ in signature, and the wire must treat them as distinct or
+    /// a peer holding one would suppress the other. Snapshotting up front keeps what we send
+    /// independent of what we concurrently ingest, so the two session halves never contend.
     fn snapshot(&self) -> anyhow::Result<Vec<(Hash, Vec<u8>)>>;
 
     /// Ingest one received entry's `signed_bytes`. Must be idempotent (re-ingesting a held entry is
@@ -98,8 +115,24 @@ impl std::error::Error for SessionError {}
 /// alias the store.
 pub async fn run_session<S, R, W>(
     store: &mut S,
+    send: W,
+    recv: R,
+) -> Result<SessionReport, SessionError>
+where
+    S: SyncStore,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    run_session_with_idle_timeout(store, send, recv, DEFAULT_IDLE_TIMEOUT).await
+}
+
+/// [`run_session`] with an explicit idle timeout — the receiver aborts if the peer sends no frame
+/// within `idle_timeout`. Exposed so tests can exercise the timeout without waiting the default.
+pub async fn run_session_with_idle_timeout<S, R, W>(
+    store: &mut S,
     mut send: W,
     mut recv: R,
+    idle_timeout: Duration,
 ) -> Result<SessionReport, SessionError>
 where
     S: SyncStore,
@@ -148,7 +181,7 @@ where
 
     let receiver = async {
         // The peer must open with a hello for the account we are syncing.
-        let hello = codec::read_frame(&mut recv).await.map_err(SessionError::Codec)?;
+        let hello = read_frame_before(&mut recv, idle_timeout).await?;
         let Frame::Hello { account_id: peer_account, have: peer_have } = hello else {
             return Err(SessionError::Protocol("peer did not open with a hello".into()));
         };
@@ -163,24 +196,48 @@ where
 
         let mut received = 0usize;
         let mut newly_stored = 0usize;
-        // Whether the peer's previous page declared more would follow. A `Done` is valid only after
-        // a `more: false` page (or with no pages at all); a peer that declared `more: true` then
-        // sent `Done` truncated a transfer it called incomplete.
-        let mut expect_more = false;
+        // Page sequencing: a peer streams zero or more `Entries` pages, the last with `more:
+        // false`, then `Done`. `saw_page` records that at least one page arrived;
+        // `saw_final` that a `more: false` page marked the stream complete. Together they
+        // reject both a `Done` after a page that declared `more: true` (truncation) and any
+        // page sent AFTER the final one.
+        let mut saw_page = false;
+        let mut saw_final = false;
         loop {
-            match codec::read_frame(&mut recv).await {
+            match read_frame_before(&mut recv, idle_timeout).await {
                 Ok(Frame::Entries { entries, more }) => {
+                    // A page after the one that declared `more: false` contradicts the sequencing —
+                    // the peer said the previous page was the last.
+                    if saw_final {
+                        return Err(SessionError::Protocol(
+                            "peer sent an Entries page after the final page".into(),
+                        ));
+                    }
+                    // An empty page is never sent by an honest peer (nothing to say → Done). It is
+                    // the shape a flood uses to hold the session open with `more: true` forever, so
+                    // reject it outright.
+                    if entries.is_empty() {
+                        return Err(SessionError::Protocol(
+                            "peer sent an empty Entries page".into(),
+                        ));
+                    }
                     for bytes in entries {
                         received += 1;
+                        if received > MAX_SESSION_ENTRIES {
+                            return Err(SessionError::Protocol(format!(
+                                "peer streamed more than {MAX_SESSION_ENTRIES} entries",
+                            )));
+                        }
                         match store.ingest(&bytes).map_err(SessionError::Store)? {
                             Ingested::Stored => newly_stored += 1,
                             Ingested::NoChange => {},
                         }
                     }
-                    expect_more = more;
+                    saw_page = true;
+                    saw_final = !more;
                 },
                 Ok(Frame::Done) => {
-                    if expect_more {
+                    if saw_page && !saw_final {
                         return Err(SessionError::Protocol(
                             "peer sent Done after declaring more pages would follow".into(),
                         ));
@@ -190,16 +247,9 @@ where
                 Ok(Frame::Hello { .. }) => {
                     return Err(SessionError::Protocol("a second hello mid-session".into()));
                 },
-                // EOF before an explicit Done is a TRUNCATED transfer, not a clean finish: the peer
-                // may have streamed only part of its pages (the last one carrying `more: true`).
-                // Reporting success here would let the caller treat the account as synced with
-                // entries silently missing, so it fails the session instead.
-                Err(CodecError::Eof) => {
-                    return Err(SessionError::Protocol(
-                        "peer closed the stream before sending Done — transfer truncated".into(),
-                    ));
-                },
-                Err(e) => return Err(SessionError::Codec(e)),
+                // `read_frame_before` has already mapped EOF (truncated transfer) and idle timeout
+                // into a `SessionError`, so any error here just propagates.
+                Err(e) => return Err(e),
             }
         }
         Ok::<(usize, usize), SessionError>((received, newly_stored))
@@ -211,6 +261,25 @@ where
     let (entries_sent, (entries_received, entries_newly_stored)) =
         tokio::try_join!(sender, receiver)?;
     Ok(SessionReport { entries_sent, entries_received, entries_newly_stored })
+}
+
+/// Read the next frame, failing if the peer sends nothing within `idle_timeout`. Folds a clean EOF
+/// and an idle timeout into a `SessionError` — the caller propagates either as a session failure,
+/// so a stalled or silent peer cannot hold the (single-session) server open indefinitely.
+async fn read_frame_before<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    idle_timeout: Duration,
+) -> Result<Frame, SessionError> {
+    match tokio::time::timeout(idle_timeout, codec::read_frame(recv)).await {
+        Ok(Ok(frame)) => Ok(frame),
+        Ok(Err(CodecError::Eof)) => Err(SessionError::Protocol(
+            "peer closed the stream before sending Done — transfer truncated".into(),
+        )),
+        Ok(Err(e)) => Err(SessionError::Codec(e)),
+        Err(_elapsed) => Err(SessionError::Protocol(format!(
+            "peer sent no frame within {idle_timeout:?} — session aborted as idle"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -362,6 +431,87 @@ mod tests {
             matches!(result, Err(SessionError::Protocol(_))),
             "Done after more:true is a declared-incomplete transfer: {result:?}",
         );
+    }
+
+    /// An empty Entries page is the shape a flood uses to keep a session open forever; the receiver
+    /// rejects it rather than looping.
+    /// A peer that connects, sends a valid hello, then goes silent must not hold the session open:
+    /// the receiver aborts after the idle timeout. Uses a tiny timeout so the test is fast.
+    #[tokio::test]
+    async fn a_silent_peer_times_out() {
+        use crate::codec::write_frame;
+        let mut receiver = MemStore::new([11; 32], &[]);
+        // The peer sends a hello then never sends again and keeps the stream OPEN (holds
+        // `peer_send` for the whole test rather than dropping it, so there is no EOF — only
+        // silence).
+        let (mut peer_send, recv) = tokio::io::duplex(1 << 16);
+        let (send, _peer_recv) = tokio::io::duplex(1 << 16);
+        write_frame(&mut peer_send, &Frame::Hello { account_id: [11; 32], have: vec![] })
+            .await
+            .unwrap();
+        let result = run_session_with_idle_timeout(
+            &mut receiver,
+            send,
+            recv,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        drop(peer_send); // keep the stream alive until after the timeout fired
+        match result {
+            Err(SessionError::Protocol(m)) => assert!(m.contains("idle"), "{m}"),
+            other => panic!("expected an idle-timeout abort: {other:?}"),
+        }
+    }
+
+    /// A page after the one that declared `more: false` contradicts the sequencing and is rejected.
+    #[tokio::test]
+    async fn a_page_after_the_final_page_is_rejected() {
+        use crate::codec::write_frame;
+        let mut receiver = MemStore::new([12; 32], &[]);
+        let (mut peer_send, recv) = tokio::io::duplex(1 << 16);
+        let (send, _peer_recv) = tokio::io::duplex(1 << 16);
+        let feeder = tokio::spawn(async move {
+            write_frame(&mut peer_send, &Frame::Hello { account_id: [12; 32], have: vec![] })
+                .await
+                .unwrap();
+            write_frame(&mut peer_send, &Frame::Entries { entries: vec![entry(1).1], more: false })
+                .await
+                .unwrap();
+            // A page after the final one contradicts `more: false`.
+            write_frame(&mut peer_send, &Frame::Entries { entries: vec![entry(2).1], more: false })
+                .await
+                .unwrap();
+        });
+        let result = run_session(&mut receiver, send, recv).await;
+        feeder.await.unwrap();
+        match result {
+            Err(SessionError::Protocol(m)) => assert!(m.contains("after the final page"), "{m}"),
+            other => panic!("expected the after-final-page guard: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_entries_page_is_rejected() {
+        use crate::codec::write_frame;
+        let mut receiver = MemStore::new([8; 32], &[]);
+        let (mut peer_send, recv) = tokio::io::duplex(1 << 16);
+        let (send, _peer_recv) = tokio::io::duplex(1 << 16);
+        let feeder = tokio::spawn(async move {
+            write_frame(&mut peer_send, &Frame::Hello { account_id: [8; 32], have: vec![] })
+                .await
+                .unwrap();
+            write_frame(&mut peer_send, &Frame::Entries { entries: vec![], more: true })
+                .await
+                .unwrap();
+        });
+        let result = run_session(&mut receiver, send, recv).await;
+        feeder.await.unwrap();
+        // Assert the SPECIFIC guard fired — a dropped feeder also trips the EOF-before-Done guard,
+        // so a bare `Protocol` match would not distinguish the empty-page rejection from it.
+        match result {
+            Err(SessionError::Protocol(m)) => assert!(m.contains("empty Entries page"), "{m}"),
+            other => panic!("expected the empty-page guard: {other:?}"),
+        }
     }
 
     #[test]

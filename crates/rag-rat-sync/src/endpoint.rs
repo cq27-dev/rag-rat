@@ -8,13 +8,25 @@
 //! `Endpoint::builder(presets::Minimal)` is deliberate: Minimal disables the public n0 node
 //! directory, so discovery happens ONLY through the relay this deployment pins — a peer is
 //! reachable iff it shares the configured relay, never via a third-party lookup.
+//!
+//! # Authorization is NOT enforced here (see #881)
+//!
+//! iroh authenticates the transport KEY, but this slice does not check that the connecting node
+//! belongs to a device in the account. Any node that holds the endpoint address can complete the
+//! handshake and pull the account's inventory and signed entries. That is bounded — account entries
+//! are signed (a peer cannot forge one) and content is sealed (it needs keys this transport never
+//! carries), so an unauthorized peer learns the roster shape but cannot decrypt content or inject a
+//! valid entry — and no production path calls [`accept_and_sync`] yet. The node↔device binding and
+//! admission control are the pairing slice (D4); until then, treat a shared address as out-of-band
+//! trust between peers that already know each other.
 
 use std::str::FromStr;
 
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey};
+use tokio::time::timeout;
 
-use crate::session::{SessionError, SessionReport, SyncStore, run_session};
+use crate::session::{DEFAULT_IDLE_TIMEOUT, SessionError, SessionReport, SyncStore, run_session};
 use crate::wire::SYNC_ALPN;
 
 /// Endpoint construction or connection setup failed, before a session could run.
@@ -86,6 +98,11 @@ pub async fn connect_and_sync<S: SyncStore>(
 
 /// Accept ONE inbound connection and run a session against it. D4's `sync serve` loops this;
 /// keeping it single-shot here keeps the store's `!Send` connection on one task (no spawn).
+///
+/// Every pre-session wait a peer controls — the handshake and opening the bidirectional stream — is
+/// bounded by [`DEFAULT_IDLE_TIMEOUT`]. `run_session`'s own idle timeout only starts once the
+/// stream is open, so without these a peer that connects and then stalls (never opening a stream)
+/// would hold this single-session server forever, blocking every later peer.
 pub async fn accept_and_sync<S: SyncStore>(
     endpoint: &Endpoint,
     store: &mut S,
@@ -94,11 +111,13 @@ pub async fn accept_and_sync<S: SyncStore>(
         .accept()
         .await
         .ok_or_else(|| SyncFailure::Endpoint(EndpointError::Connect("endpoint closed".into())))?;
-    let conn =
-        incoming.await.map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
-    let (send, recv) = conn
-        .accept_bi()
+    let conn = timeout(DEFAULT_IDLE_TIMEOUT, incoming)
         .await
+        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("handshake timed out".into())))?
+        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+    let (send, recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.accept_bi())
+        .await
+        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("peer opened no stream".into())))?
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
     let report = run_session(store, send, recv).await.map_err(SyncFailure::Session)?;
     conn.close(0u32.into(), b"done");

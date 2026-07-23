@@ -13,7 +13,7 @@ rag-rat-base.workspace = true
 rag-rat-oplog.workspace = true
 rusqlite.workspace = true
 minicbor.workspace = true
-tokio = { workspace = true, features = ["sync", "io-util"] }
+tokio = { workspace = true, features = ["sync", "io-util", "time"] }
 iroh.workspace = true
 tracing.workspace = true
 

@@ -1604,36 +1604,65 @@ pub fn account_entry_ref(signed_bytes: &[u8]) -> anyhow::Result<(AccountId, [u8;
     Ok((signed.header.account_id, signed.entry_hash))
 }
 
-/// Whether `account_id` already holds the entry `entry_hash`. A cheap existence probe so the sync
-/// layer can report real transfer versus redelivery without decoding the fold verdict.
-pub fn account_entry_exists(
+/// The wire dedup key for a signed account entry: `sha256(signed_bytes)`, the SAME hash
+/// `account_pre_verify` keys its rows by. This distinguishes competing SIGNATURES of one entry —
+/// two envelopes can share an `entry_hash` (same body) yet differ in signature, and the sync layer
+/// must treat them as distinct, or a peer holding the valid signature would suppress it against a
+/// peer holding only an invalid one. Never diff sync inventory by `entry_hash`.
+pub fn account_signed_hash(signed_bytes: &[u8]) -> [u8; 32] {
+    cbor::sha256(signed_bytes)
+}
+
+/// Whether `account_id` already holds this EXACT signed envelope — as a stored candidate (matched
+/// by its bytes) OR a durably parked pre-verify row (matched by `signed_hash`). Signed-envelope
+/// precise, not `entry_hash` precise: skipping a distinct signature that happens to share an
+/// entry_hash would drop a valid variant on the floor. Used so the sync layer reports real transfer
+/// versus redelivery.
+pub fn account_signed_entry_exists(
     conn: &Connection,
     account_id: AccountId,
-    entry_hash: [u8; 32],
+    signed_bytes: &[u8],
 ) -> anyhow::Result<bool> {
+    let signed_hash = cbor::sha256(signed_bytes);
     let found: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM account_entries WHERE account_id = ?1 AND entry_hash = ?2",
-            params![account_id.to_bytes().as_slice(), entry_hash.as_slice()],
+            "SELECT 1 FROM account_entries WHERE account_id = ?1 AND signed_bytes = ?2
+             UNION ALL
+             SELECT 1 FROM account_pre_verify WHERE claimed_account_id = ?1 AND signed_hash = ?3
+             LIMIT 1",
+            params![account_id.to_bytes().as_slice(), signed_bytes, signed_hash.as_slice()],
             |row| row.get(0),
         )
         .optional()?;
     Ok(found.is_some())
 }
 
-/// Every held account-log entry for `account_id`, ordered by `entry_hash` for a deterministic wire
-/// order (the fold is order-free regardless). The sync layer diffs these against what a peer
-/// already holds and streams the difference; re-ingesting a held entry is an idempotent no-op.
+/// Every account-log entry for `account_id` that a peer may need — the held entries AND the ones
+/// durably PARKED in `account_pre_verify` awaiting their signer's introduction.
+///
+/// Parked entries must be offered too: a valid entry whose signing device is not yet known here is
+/// still real, and a peer that holds the authorizing `DeviceAdd` can promote it. Omitting them
+/// would let a session complete with one peer holding a dependent entry the other never receives —
+/// a silent divergence.
+///
+/// Held entries come first, ordered `(log_id, seq, entry_hash)` — a causal-leaning order (the
+/// account genesis at seq 0, then the `DeviceAdd`s that introduce signers, then later ops) so a
+/// cooperative receiver folds authorizers before dependents and avoids parking-then-eviction. It is
+/// NOT a full topological guarantee against an adversarial sender (that needs a reconciliation pass
+/// at the caller); it makes the honest restore converge in one session. Parked entries follow,
+/// since they depend on authorizers in the held set.
 pub fn account_entries_for_sync(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<Vec<SyncAccountEntry>> {
-    let mut stmt = conn.prepare(
+    let mut out = Vec::new();
+
+    let mut held = conn.prepare(
         "SELECT entry_hash, device_fingerprint, seq, log_id, signed_bytes
          FROM account_entries WHERE account_id = ?1
-         ORDER BY entry_hash",
+         ORDER BY log_id, seq, entry_hash",
     )?;
-    let rows = stmt
+    let held_rows = held
         .query_map(params![account_id.to_bytes().as_slice()], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
@@ -1644,8 +1673,7 @@ pub fn account_entries_for_sync(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut out = Vec::with_capacity(rows.len());
-    for (hash, fp, seq, log_id, signed_bytes) in rows {
+    for (hash, fp, seq, log_id, signed_bytes) in held_rows {
         out.push(SyncAccountEntry {
             device_fingerprint: DeviceFingerprint::from_bytes(fixed(&fp)?),
             log_id: u8::try_from(log_id)
@@ -1655,6 +1683,34 @@ pub fn account_entries_for_sync(
             signed_bytes,
         });
     }
+
+    // Parked rows carry the raw signed bytes but not decoded coordinates; decode the header for the
+    // log/seq the wire records (informational — the session diffs on entry_hash). A parked row that
+    // no longer decodes is skipped rather than failing the whole read.
+    let mut parked = conn.prepare(
+        "SELECT entry_hash, claimed_fingerprint, raw_bytes
+         FROM account_pre_verify WHERE claimed_account_id = ?1
+         ORDER BY entry_hash",
+    )?;
+    let parked_rows = parked
+        .query_map(params![account_id.to_bytes().as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (hash, fp, signed_bytes) in parked_rows {
+        let (log_id, seq) = match envelope::decode_account_signed(&signed_bytes) {
+            Ok(signed) => (signed.header.log_id, signed.header.seq),
+            Err(_) => continue,
+        };
+        out.push(SyncAccountEntry {
+            device_fingerprint: DeviceFingerprint::from_bytes(fixed(&fp)?),
+            log_id,
+            seq,
+            entry_hash: fixed(&hash)?,
+            signed_bytes,
+        });
+    }
+
     Ok(out)
 }
 
@@ -3365,6 +3421,65 @@ mod tests {
         let out = account_ingest(&conn, &add_bytes, NOW).unwrap();
         assert_eq!(out, IngestOutcome::Ingested { status: "accepted".into() });
         assert_eq!(status(&conn, &add_hash).as_deref(), Some("accepted"));
+    }
+
+    /// The sync existence check is by the EXACT signed envelope, not the entry_hash: two envelopes
+    /// can share a body (hence entry_hash) yet carry different signatures, and treating them as the
+    /// same would let holding one suppress the other on the wire (#406). A byte-flipped variant
+    /// therefore does NOT count as already held, and hashes distinctly.
+    #[test]
+    fn signed_entry_existence_is_by_exact_envelope_not_entry_hash() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, _gh) = genesis(&founder);
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+
+        assert!(
+            account_signed_entry_exists(&conn, acct, &gbytes).unwrap(),
+            "the exact stored envelope is held",
+        );
+        // A different byte string (a corrupted-signature variant of the same body) is a DISTINCT
+        // envelope: not held, and a distinct wire dedup hash.
+        let mut variant = gbytes.clone();
+        *variant.last_mut().unwrap() ^= 0x01;
+        assert_ne!(variant, gbytes);
+        assert!(
+            !account_signed_entry_exists(&conn, acct, &variant).unwrap(),
+            "a distinct signed envelope is not suppressed as already-held",
+        );
+        assert_ne!(
+            account_signed_hash(&gbytes),
+            account_signed_hash(&variant),
+            "distinct envelopes get distinct wire dedup keys",
+        );
+    }
+
+    /// A PARKED entry (signer not yet known) is part of what a peer must be offered for sync — a
+    /// peer holding the authorizer promotes it, and omitting it would let a session complete with
+    /// the dependent entry silently missing (#406). `account_entries_for_sync` includes both the
+    /// held genesis and the parked add.
+    #[test]
+    fn account_entries_for_sync_includes_a_parked_entry() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+
+        // An entry signed by a device NOT yet known here parks in pre-verify — but it is real and a
+        // peer with its authorizer can use it, so it must still be offered.
+        let stranger = Dev::new(9);
+        let (parked_bytes, parked_hash) =
+            op(acct, &stranger, 0, None, Some(gh), &device_add(&Dev::new(3), DeviceRole::Owner));
+        assert_eq!(account_ingest(&conn, &parked_bytes, NOW).unwrap(), IngestOutcome::PreVerify);
+        assert_eq!(status(&conn, &parked_hash), None, "parked, not a stored candidate");
+
+        let offered = account_entries_for_sync(&conn, acct).unwrap();
+        let hashes: Vec<[u8; 32]> = offered.iter().map(|e| e.entry_hash).collect();
+        assert!(hashes.contains(&gh), "the held genesis is offered");
+        assert!(hashes.contains(&parked_hash), "the parked entry is offered too, not hidden");
+        // And its bytes are the exact parked bytes, so a peer re-ingests the real entry.
+        let parked = offered.iter().find(|e| e.entry_hash == parked_hash).unwrap();
+        assert_eq!(parked.signed_bytes, parked_bytes);
     }
 
     #[test]

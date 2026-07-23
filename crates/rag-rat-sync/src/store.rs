@@ -6,8 +6,8 @@
 //! transport therefore adds no trust — a synced entry passes exactly the checks a local write does.
 
 use rag_rat_oplog::{
-    AccountId, IngestOutcome, account_entries_for_sync, account_entry_exists, account_entry_ref,
-    account_ingest,
+    AccountId, IngestOutcome, account_entries_for_sync, account_entry_ref, account_ingest,
+    account_signed_entry_exists, account_signed_hash,
 };
 use rusqlite::Connection;
 
@@ -33,9 +33,12 @@ impl SyncStore for OplogSyncStore<'_> {
     }
 
     fn snapshot(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+        // Key by the SIGNED-envelope hash, not `entry_hash`: two envelopes can share an entry_hash
+        // but differ in signature (pre-verify keeps competing signatures for exactly this reason),
+        // and diffing by entry_hash would let a peer holding the valid signature suppress it.
         Ok(account_entries_for_sync(self.conn, self.account_id)?
             .into_iter()
-            .map(|e| (e.entry_hash, e.signed_bytes))
+            .map(|e| (account_signed_hash(&e.signed_bytes), e.signed_bytes))
             .collect())
     }
 
@@ -45,15 +48,17 @@ impl SyncStore for OplogSyncStore<'_> {
         // account (it is not account-scoped), so a peer could otherwise inject and grow other
         // accounts through a session that never named them. A structurally undecodable entry is a
         // peer to distrust, not a session-fatal error — drop it as NoChange.
-        let Ok((entry_account, entry_hash)) = account_entry_ref(signed_bytes) else {
+        let Ok((entry_account, _entry_hash)) = account_entry_ref(signed_bytes) else {
             return Ok(Ingested::NoChange);
         };
         if entry_account != self.account_id {
             return Ok(Ingested::NoChange);
         }
-        // Skip an entry already held: `account_ingest`'s fast path re-reports `Ingested` for an
-        // exact replay, so without this an idempotent redelivery would inflate "newly stored".
-        if account_entry_exists(self.conn, self.account_id, entry_hash)? {
+        // Skip an entry already held — matched by the EXACT signed envelope, not entry_hash: a
+        // distinct signature of the same body is a different entry the peer may need, so it must
+        // still ingest. `account_ingest`'s fast path re-reports `Ingested` for an exact replay, so
+        // without this an idempotent redelivery would inflate "newly stored".
+        if account_signed_entry_exists(self.conn, self.account_id, signed_bytes)? {
             return Ok(Ingested::NoChange);
         }
         // `account_ingest` is the SAME entry point a local write uses: it re-verifies from scratch,
