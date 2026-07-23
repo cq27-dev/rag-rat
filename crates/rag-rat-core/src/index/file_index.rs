@@ -274,6 +274,11 @@ impl IndexDatabase {
                 // toward — so the write set matches what a full re-resolve touches
                 // for the changed files.
                 self.stage_edge_rewrite_file(file_id)?;
+                // #826: register this file's PATH for the scoped logical re-derive — its symbols
+                // were just (re)written, so its `logical_symbols` groups must be
+                // re-derived. No-op unless a scoped logical re-derive pass armed
+                // capture.
+                self.stage_logical_rederive_path(&path)?;
                 if !prepared.edge_candidates.is_empty() {
                     let mut candidates = prepared.edge_candidates.clone();
                     for candidate in &mut candidates {

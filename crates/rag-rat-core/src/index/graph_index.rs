@@ -690,38 +690,78 @@ impl IndexDatabase {
             self.active_repo_id
         ])?;
 
-        // STREAM the grouping instead of materializing every symbol. The previous version built a
-        // `BTreeMap<LogicalSymbolKey, Vec<row>>` over ALL symbols — at kernel scale ~3.5M rows ×
-        // six owned `String`s each (plus a cloned key per group). That structure, allocated in the
-        // trailing rebuild phase AFTER the edge accumulator is freed, was the dominant full-rebuild
-        // peak-RSS spike (~6 GB transient at the very end of a whole-kernel index). Ordering the
-        // SELECT by the key's `Ord` (language, path, name, qualified_name, kind, signature — SQLite
-        // ASC sorts NULL first, matching Rust `None < Some`) then the within-group member order
-        // (start_byte, end_byte, which the old per-group Vec preserved) makes each group's rows
-        // arrive contiguously, so we flush a group the moment its key changes and hold only the
-        // current group's members (kilobytes). Byte-identical: same grouping, same
-        // `logical_symbols` insert order (ids are content-derived via `stable_id`, not rowids), and
-        // the same member order, verified against the golden index.
-        // Read RAW `main.files` (ALL of the active repo's scopes), NOT the per-connection `files`
-        // scope VIEW. logical_symbols is per-repo but scope-INDEPENDENT within a repo; building it
-        // must not depend on whichever commit/worktree scope happens to be active. When this runs
-        // in a worktree-overlay context (a scope view IS installed), an unqualified `files`
-        // resolves to the scoped temp view, so the DELETE + repopulate would WIPE every
-        // other scope's grouping (base + sibling worktrees) and restore only the active
-        // scope's — persistently breaking `sym_<hex>`-handle graph nav for base symbols
-        // (the #219 review finding). Filtering `main.files.repo_id` (A3) keeps every symbol
-        // in every live scope OF THIS REPO while excluding a sibling repo's rows in a
-        // consolidated DB; the content-derived `stable_id` collapses cross-scope duplicates
-        // into one logical symbol with per-scope members, and downstream reads stay
-        // scope-filtered via the `files` view.
-        // Filter `main.files.generation` to the ACTIVE generation (A6): a full rebuild leaves the
-        // superseded generation's file rows in place (swept lazily by gc), so a bare `repo_id`
-        // predicate would fold BOTH the dead and the live generation's symbols into one grouping.
-        // `self.active_generation` is the WRITE generation on the rebuild connection — which the
-        // rebuild flips to LIVE and carries forward every live overlay onto BEFORE this runs, so
-        // filtering it folds the base scope + every carried-forward overlay of the live generation
-        // and nothing dead. On an incremental pass it is the live generation, unchanged behavior.
-        let mut stmt = conn.prepare(
+        // Re-derive the WHOLE repo's grouping from its current symbols via the shared streaming
+        // grouper (no path filter). The DELETE above cleared the prior rows, so re-insert cannot
+        // collide on the content-derived `stable_id` PK.
+        self.regroup_logical_symbols(conn, "")?;
+        if let Some(snapshot) = drift_snapshot {
+            self.heal_logical_key_drift(&snapshot)?;
+            if matches!(stamp, KeyVersionStamp::FullRederive) {
+                self.set_repo_meta(LOGICAL_KEY_VERSION_KEY, LOGICAL_KEY_VERSION)?;
+            }
+        }
+        // ANY successful rebuild satisfies a pending batch-deferred obligation (#819) — the batch
+        // tail, an inline overlay refresh, a heal, an incremental or full pass — so clear the
+        // marker here, in the same transaction as the rebuild it accounts for. Left set, the next
+        // maintenance pass would pay a second wholesale rebuild for nothing (e.g. after an
+        // interrupted deferred batch whose stale grouping a standalone `index --worktree` already
+        // repaired inline). A no-op DELETE when no marker is set.
+        rag_rat_db::meta::delete_repo_meta(
+            conn,
+            &self.active_repo_id,
+            super::worktree_overlay::OVERLAY_LOGICAL_REBUILD_PENDING_META,
+        )?;
+        Ok(())
+    }
+
+    /// Stream the active repo's live-generation symbols — optionally narrowed by `extra_where`, an
+    /// `AND`-able predicate over `main.files`/`symbols` (a hardcoded literal, never user input) —
+    /// grouped by the logical key, inserting each group via [`Self::insert_logical_group`]. Shared
+    /// by the whole-repo [`Self::rebuild_logical_symbols`] (`extra_where = ""`) and the
+    /// path-scoped [`Self::rederive_changed_logical_symbols`] (#826) so both derive
+    /// BYTE-IDENTICAL groupings for the paths they cover — same key order, same member order,
+    /// same content-derived ids.
+    ///
+    /// STREAM the grouping instead of materializing every symbol. The previous version built a
+    /// `BTreeMap<LogicalSymbolKey, Vec<row>>` over ALL symbols — at kernel scale ~3.5M rows × six
+    /// owned `String`s each (plus a cloned key per group). That structure, allocated in the
+    /// trailing rebuild phase AFTER the edge accumulator is freed, was the dominant
+    /// full-rebuild peak-RSS spike (~6 GB transient at the very end of a whole-kernel index).
+    /// Ordering the SELECT by the key's `Ord` (language, path, name, qualified_name, kind,
+    /// signature — SQLite ASC sorts NULL first, matching Rust `None < Some`) then the
+    /// within-group member order (start_byte, end_byte, which the old per-group Vec preserved)
+    /// makes each group's rows arrive contiguously, so we flush a group the moment its key
+    /// changes and hold only the current group's members (kilobytes). Byte-identical: same
+    /// grouping, same `logical_symbols` insert order (ids are content-derived via `stable_id`,
+    /// not rowids), and the same member order.
+    ///
+    /// Read RAW `main.files` (ALL of the active repo's scopes), NOT the per-connection `files`
+    /// scope VIEW. logical_symbols is per-repo but scope-INDEPENDENT within a repo; building it
+    /// must not depend on whichever commit/worktree scope happens to be active. When this runs
+    /// in a worktree-overlay context (a scope view IS installed), an unqualified `files`
+    /// resolves to the scoped temp view, so the DELETE + repopulate would WIPE every other
+    /// scope's grouping (base + sibling worktrees) and restore only the active scope's —
+    /// persistently breaking `sym_<hex>`-handle graph nav for base symbols (the #219 review
+    /// finding). Filtering `main.files.repo_id` (A3) keeps every symbol in every live scope OF
+    /// THIS REPO while excluding a sibling repo's rows in a consolidated DB; the
+    /// content-derived `stable_id` collapses cross-scope duplicates into one logical symbol
+    /// with per-scope members, and downstream reads stay scope-filtered via the `files` view.
+    /// This is also why the #826 path-scoped re-derive can run under an OVERLAY scope view and
+    /// still regroup a changed path across ALL its scopes.
+    ///
+    /// Filter `main.files.generation` to the ACTIVE generation (A6): a full rebuild leaves the
+    /// superseded generation's file rows in place (swept lazily by gc), so a bare `repo_id`
+    /// predicate would fold BOTH the dead and the live generation's symbols into one grouping.
+    /// `self.active_generation` is the WRITE generation on the rebuild connection — which the
+    /// rebuild flips to LIVE and carries forward every live overlay onto BEFORE this runs, so
+    /// filtering it folds the base scope + every carried-forward overlay of the live generation
+    /// and nothing dead. On an incremental pass it is the live generation, unchanged behavior.
+    fn regroup_logical_symbols(
+        &self,
+        conn: &rusqlite::Connection,
+        extra_where: &str,
+    ) -> anyhow::Result<()> {
+        let mut stmt = conn.prepare(&format!(
             "
             SELECT symbols.id, main.files.path, symbols.language, symbols.name,
                    qn.value, symbols.kind, symbols.signature, symbols.start_line,
@@ -729,11 +769,11 @@ impl IndexDatabase {
             FROM main.symbols AS symbols
             JOIN main.files ON main.files.id = symbols.file_id
             LEFT JOIN main.name_strings qn ON qn.id = symbols.qualified_name_id
-            WHERE main.files.repo_id = ?1 AND main.files.generation = ?2
+            WHERE main.files.repo_id = ?1 AND main.files.generation = ?2{extra_where}
             ORDER BY symbols.language, main.files.path, symbols.name, qn.value,
                      symbols.kind, symbols.signature, symbols.start_byte, symbols.end_byte
-            ",
-        )?;
+            "
+        ))?;
         let mut rows = stmt.query(params![self.active_repo_id, self.active_generation])?;
         let mut current: Option<(LogicalSymbolKey, Vec<LogicalSymbolMemberRow>)> = None;
         while let Some(row) = rows.next()? {
@@ -772,24 +812,53 @@ impl IndexDatabase {
         if let Some((key, members)) = current.take() {
             Self::insert_logical_group(conn, &self.active_repo_id, &key, &members)?;
         }
-        if let Some(snapshot) = drift_snapshot {
-            self.heal_logical_key_drift(&snapshot)?;
-            if matches!(stamp, KeyVersionStamp::FullRederive) {
-                self.set_repo_meta(LOGICAL_KEY_VERSION_KEY, LOGICAL_KEY_VERSION)?;
-            }
-        }
-        // ANY successful rebuild satisfies a pending batch-deferred obligation (#819) — the batch
-        // tail, an inline overlay refresh, a heal, an incremental or full pass — so clear the
-        // marker here, in the same transaction as the rebuild it accounts for. Left set, the next
-        // maintenance pass would pay a second wholesale rebuild for nothing (e.g. after an
-        // interrupted deferred batch whose stale grouping a standalone `index --worktree` already
-        // repaired inline). A no-op DELETE when no marker is set.
-        rag_rat_db::meta::delete_repo_meta(
-            conn,
-            &self.active_repo_id,
-            super::worktree_overlay::OVERLAY_LOGICAL_REBUILD_PENDING_META,
-        )?;
         Ok(())
+    }
+
+    /// #826: re-derive ONLY the `logical_symbols` of the paths staged in `temp.logical_rederive_paths`
+    /// (the files this pass rewrote / removed / healed), instead of the whole repo. A logical
+    /// symbol is confined to ONE path (`path` is a key field, folded into `stable_id`), so a
+    /// changed file only affects its own path's groups; every other path's rows are left
+    /// byte-identical. The DELETE (members first, then their parents — mirroring
+    /// [`Self::rebuild_logical_symbols`] rather than leaning on the cascade) clears the changed
+    /// paths' rows, incl. any orphaned by the pass's symbol removals; the regroup re-derives
+    /// them from current symbols across ALL of each path's scopes (raw `main.files`). NO #493
+    /// drift heal and NO #819 marker clear — the caller gates on
+    /// [`Self::can_scope_logical_rederive`], which is false whenever either is owed.
+    pub(super) fn rederive_changed_logical_symbols(&self) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        conn.execute(
+            "DELETE FROM main.logical_symbol_members
+             WHERE logical_symbol_id IN (
+                 SELECT id FROM main.logical_symbols
+                 WHERE repo_id = ?1 AND path IN (SELECT path FROM temp.logical_rederive_paths)
+             )",
+            params![self.active_repo_id],
+        )?;
+        conn.execute(
+            "DELETE FROM main.logical_symbols
+             WHERE repo_id = ?1 AND path IN (SELECT path FROM temp.logical_rederive_paths)",
+            params![self.active_repo_id],
+        )?;
+        self.regroup_logical_symbols(
+            conn,
+            " AND main.files.path IN (SELECT path FROM temp.logical_rederive_paths)",
+        )
+    }
+
+    /// #826: whether the pass may replace the whole-repo [`Self::rebuild_logical_symbols`] with the
+    /// path-scoped [`Self::rederive_changed_logical_symbols`]. False when a #493 drift heal is owed
+    /// (the logical-key version stamp lags — the heal is a cross-file reference remap the scoped
+    /// path does NOT perform) or a #819 deferred whole-repo rebuild is pending (a scoped
+    /// re-derive would not satisfy it, and `rebuild_logical_symbols` is the sole clearer of
+    /// that marker). Two `repo_meta` reads.
+    pub(super) fn can_scope_logical_rederive(&self) -> anyhow::Result<bool> {
+        let version_current =
+            self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() == Some(LOGICAL_KEY_VERSION);
+        let rebuild_pending = self
+            .repo_meta(super::worktree_overlay::OVERLAY_LOGICAL_REBUILD_PENDING_META)?
+            .is_some();
+        Ok(version_current && !rebuild_pending)
     }
 
     /// Open the per-batch logical-grouping verdict (#820). Starts on the relink path unless the

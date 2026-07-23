@@ -318,6 +318,10 @@ impl IndexDatabase {
             // unconditionally only writes the `temp` schema, so it costs an idle pass
             // nothing on the main DB (#63).
             db.begin_scoped_edge_rewrite()?;
+            // #826: likewise arm scoped LOGICAL re-derive capture — `remove_file_in_scope` and the
+            // incremental file insert stage the changed PATHS, so the logical-symbol rebuild below
+            // can re-derive only those paths' groups instead of the whole repo.
+            db.begin_scoped_logical_rederive()?;
             // Write meta only when it actually changed, and track whether this pass mutated
             // anything at all. A periodic sweep or a spurious event over an unchanged
             // tree must NOT churn the WAL with a timestamp-only write + COMMIT (issue
@@ -413,10 +417,22 @@ impl IndexDatabase {
                     Some(relinks) => db.apply_logical_member_relinks(&relinks)?,
                     None => {
                         progress(IndexProgress::RebuildingLogicalSymbols);
-                        // Defer: this pass re-parsed only the CHANGED files, so it must not
-                        // stamp the logical-key version — untouched files' drift is still in
-                        // the future (#493).
-                        db.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                        // #826: re-derive ONLY the changed paths' logical groups (staged in
+                        // `temp.logical_rederive_paths`) instead of the whole repo, UNLESS a #493
+                        // drift heal (key-version lag) or a #819 deferred whole-repo rebuild is
+                        // owed — both of which the scoped path cannot
+                        // serve, so they keep the full rebuild.
+                        // A carry / roots-change reaches here (their guard above excludes the
+                        // relink) but does not move any grouping, so its
+                        // captured set is empty and the scoped re-derive is
+                        // a correct no-op; a heal's removed paths ARE captured (via
+                        // `remove_file_in_scope`), so they regroup. Defer: a partial pass must not
+                        // stamp the logical-key version — untouched files' drift is still future.
+                        if db.can_scope_logical_rederive()? {
+                            db.rederive_changed_logical_symbols()?;
+                        } else {
+                            db.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                        }
                     },
                 }
                 progress(IndexProgress::ResolvingGraph);
@@ -445,6 +461,9 @@ impl IndexDatabase {
             // the resolve branch was entered, so an idle or non-narrowed pass leaves
             // the flag clean.
             db.finish_scoped_edge_rewrite();
+            // #826: disarm scoped logical re-derive capture (staged paths consumed above; the next
+            // pass's `begin_scoped_logical_rederive` clears them).
+            db.finish_scoped_logical_rederive();
             if mutated {
                 db.set_repo_meta("indexed_at_ms", &now_ms().to_string())?;
                 db.storage.execute_batch("COMMIT")?;

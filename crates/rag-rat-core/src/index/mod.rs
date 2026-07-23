@@ -187,6 +187,16 @@ pub struct IndexDatabase {
     /// mutability. `Relaxed` is sufficient: capture and resolve run on one connection/thread
     /// within the pass, never a cross-thread handoff.
     edge_rewrite_capture: AtomicBool,
+    /// #826: when armed, the pass captures the PATHS whose symbols it rewrote / removed / healed into
+    /// `temp.logical_rederive_paths`, so `rederive_changed_logical_symbols` re-derives only those
+    /// paths' `logical_symbols` groups instead of the whole repo. Armed by
+    /// `begin_scoped_logical_rederive` for the base incremental pass AND the linked-worktree
+    /// overlay finalize; the capture seams (`remove_file_in_scope`, the incremental file
+    /// insert) take `&self`. A SEPARATE flag from `edge_rewrite_capture` (not a shared one)
+    /// because #827's edge narrowing does NOT run in the overlay pass — arming a shared flag
+    /// there would pointlessly stage `temp.edge_rewrite_files`. `Relaxed` for the same
+    /// single-thread reason as #827.
+    logical_rederive_capture: AtomicBool,
     /// Test-only #819 observability: how many times [`Self::rebuild_logical_symbols`] ran on this
     /// connection, so batch tests can assert the once-per-pass rebuild cardinality.
     #[cfg(test)]

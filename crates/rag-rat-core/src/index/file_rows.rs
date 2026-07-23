@@ -32,6 +32,44 @@ impl IndexDatabase {
         self.edge_rewrite_capture.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// #826: arm scoped logical re-derive capture for a pass. Creates (idempotently) and clears
+    /// `temp.logical_rederive_paths`; while armed, `remove_file_in_scope` and the incremental file
+    /// insert stage the PATHS whose symbols changed, so `rederive_changed_logical_symbols` regroups
+    /// only those paths' `logical_symbols` instead of the whole repo. `temp` schema only (no
+    /// main-DB write → #63 idle-safe). Paired with [`Self::finish_scoped_logical_rederive`].
+    pub(super) fn begin_scoped_logical_rederive(&self) -> anyhow::Result<()> {
+        self.storage.connection().execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS logical_rederive_paths(path TEXT PRIMARY KEY);
+             DELETE FROM temp.logical_rederive_paths;",
+        )?;
+        self.logical_rederive_capture.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// #826: disarm scoped logical re-derive capture. Leaves the staged paths for the pass's
+    /// `rederive_changed_logical_symbols` to read; the next `begin_scoped_logical_rederive` clears.
+    pub(super) fn finish_scoped_logical_rederive(&self) {
+        self.logical_rederive_capture.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn logical_rederive_capture_active(&self) -> bool {
+        self.logical_rederive_capture.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #826: stage a changed PATH (a file this pass rewrote / removed / healed) into the scoped
+    /// logical re-derive set. Called from `remove_file_in_scope` (the removed path) and the
+    /// incremental file insert (the written path); their union is every path whose logical grouping
+    /// could have moved this pass. No-op unless capture is armed.
+    pub(super) fn stage_logical_rederive_path(&self, path: &str) -> anyhow::Result<()> {
+        if self.logical_rederive_capture_active() {
+            self.storage.connection().execute(
+                "INSERT OR IGNORE INTO temp.logical_rederive_paths(path) VALUES (?1)",
+                params![path],
+            )?;
+        }
+        Ok(())
+    }
+
     /// #827: stage a (re)written source file's id into the scoped re-resolve write set (set (a) — the
     /// changed files themselves). No-op unless capture is armed.
     pub(super) fn stage_edge_rewrite_file(&self, file_id: i64) -> anyhow::Result<()> {
@@ -125,6 +163,10 @@ impl IndexDatabase {
         // most once per pass.
         self.capture_drift_snapshot_before_removal()?;
         let path = path_string(path);
+        // #826: this path's symbols are about to be deleted, so its `logical_symbols` groups must
+        // be re-derived. Stage the path (re-parse remove-half, delete, heal, tombstone all
+        // funnel here). No-op unless a scoped logical re-derive pass armed capture.
+        self.stage_logical_rederive_path(&path)?;
         // Direct edges_data writes (#79): these statements touch up to every in-edge of a file's
         // symbols, so they must not pay the view triggers' per-row dictionary probes.
         // 'NameOnly' is the EdgeConfidence demotion the resolver applies to a target-less edge.

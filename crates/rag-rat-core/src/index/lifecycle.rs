@@ -179,6 +179,7 @@ impl IndexDatabase {
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
             edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
+            logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -205,6 +206,7 @@ impl IndexDatabase {
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
             edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
+            logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -385,6 +387,7 @@ impl IndexDatabase {
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
             edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
+            logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -548,6 +551,7 @@ impl IndexDatabase {
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
             edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
+            logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
         })

@@ -2292,8 +2292,10 @@ fn a_key_stable_relink_leaves_a_pending_obligation_for_the_tail() {
 fn a_body_only_base_edit_pass_relinks_without_a_rebuild() {
     // #820 on the BASE incremental writer: the second body-only edit of an already-dirty file
     // replaces the same scope row under an identical key multiset, so the pass's tail re-links
-    // members instead of rebuilding. (The FIRST dirty edit moves the file into the worktree
-    // scope — a key-set change for that scope — and correctly pays the rebuild.)
+    // members instead of rebuilding. (The FIRST dirty edit moves the file into the worktree scope —
+    // a key-set change for that scope — which #826 now serves with a PATH-SCOPED re-derive rather
+    // than the whole-repo rebuild; either way the second edit relinks, and both outputs are the
+    // wholesale rebuild's fixed point.)
     let main = unique_temp_root();
     let _ = fs::remove_dir_all(&main);
     fs::create_dir_all(main.join("src")).unwrap();
@@ -2305,12 +2307,21 @@ fn a_body_only_base_edit_pass_relinks_without_a_rebuild() {
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
 
-    // First dirty edit: the file enters the worktree overlay scope (an ADD there) — rebuild.
+    // First dirty edit: the file enters the worktree overlay scope (an ADD there — a key-set
+    // change). #826 serves it with the path-scoped re-derive, so the pass runs ZERO whole-repo
+    // rebuilds; the resulting grouping is still correct (the relink fixed point below builds on
+    // it).
     fs::write(main.join("src/a.rs"), "pub fn base_fn() -> i32 {\n    2\n}\n").unwrap();
     let first = IndexDatabase::index_paths(&config, &[main.join("src/a.rs")]).unwrap();
+    assert_eq!(
+        first.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "#826: the scope move is a key-set change served by the path-scoped re-derive, not a \
+         whole-repo rebuild"
+    );
     assert!(
-        first.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed) >= 1,
-        "the scope move is a key-set change and pays the rebuild"
+        logical_symbol_named(&first, "base_fn"),
+        "the scoped re-derive grouped the overlay add"
     );
     drop(first);
 
@@ -2769,4 +2780,246 @@ fn a_dirty_gitignore_edit_forces_the_full_diff_on_matching_heads() {
 
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);
+}
+
+/// #826: adding a function changes a file's logical-key set (a non-#820-relink change) — which used
+/// to pay the whole-repo `rebuild_logical_symbols` on every incremental pass. It now re-derives
+/// ONLY the changed path's groups. Observable: the base incremental pass runs ZERO whole-repo
+/// logical rebuilds, yet the grouping is the wholesale rebuild's FIXED POINT (byte-identical rows,
+/// ids, variant counts, member spans and hashes).
+#[test]
+fn a_key_set_change_scopes_the_logical_rederive_to_changed_paths() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_one() {}\n").unwrap();
+    fs::write(main.join("src/b.rs"), "pub fn b_one() {}\npub fn b_two() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    drop(IndexDatabase::rebuild(&config).unwrap());
+
+    // Add a function to a.rs (dirty, uncommitted) — a key-set change routes to the rebuild branch.
+    fs::write(main.join("src/a.rs"), "pub fn a_one() {}\npub fn a_two() {}\n").unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+
+    assert_eq!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a scoped re-derive runs ZERO whole-repo logical rebuilds"
+    );
+    assert!(logical_symbol_named(&db, "a_two"), "the added function is grouped");
+    assert!(logical_symbol_named(&db, "b_one"), "the unchanged file's grouping is intact");
+
+    // The scoped output is the wholesale rebuild's FIXED POINT — forcing the rebuild changes
+    // nothing.
+    let scoped = logical_grouping_snapshot(&db);
+    db.rebuild_logical_symbols(crate::index::graph_index::KeyVersionStamp::Defer).unwrap();
+    assert_eq!(
+        logical_grouping_snapshot(&db),
+        scoped,
+        "the scoped re-derive output must equal the whole-repo rebuild's output"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+}
+
+/// #826 (the fast path must disagree with the fallback): POISON an UNCHANGED file's grouping row with
+/// a wrong `variant_count`. A scoped re-derive editing a DIFFERENT file must leave the poison
+/// intact — a whole-repo rebuild would correct it, so its survival proves the scoped pass never
+/// re-derived the unchanged path (i.e. work scales with changed files, not repo size).
+#[test]
+fn the_scoped_logical_rederive_leaves_unchanged_paths_untouched() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_one() {}\n").unwrap();
+    fs::write(main.join("src/b.rs"), "pub fn b_one() {}\npub fn b_two() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let repo_id = db.active_repo_id.clone();
+    // Poison b.rs's grouping rows — each b_* function is its own group with variant_count 1.
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.logical_symbols SET variant_count = 999 WHERE repo_id = ?1 AND path = ?2",
+            rusqlite::params![repo_id, "src/b.rs"],
+        )
+        .unwrap();
+    drop(db);
+
+    fs::write(main.join("src/a.rs"), "pub fn a_one() {}\npub fn a_two() {}\n").unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert_eq!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the pass took the scoped re-derive, not a whole-repo rebuild"
+    );
+
+    let poisoned: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT variant_count FROM main.logical_symbols WHERE repo_id = ?1 AND path = ?2 \
+             LIMIT 1",
+            rusqlite::params![repo_id, "src/b.rs"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        poisoned, 999,
+        "the UNCHANGED file's poisoned grouping row survives — the scoped pass never touched b.rs"
+    );
+    assert!(logical_symbol_named(&db, "a_two"), "the edited file WAS regrouped");
+
+    // A whole-repo rebuild DOES correct the poison — proving it was live and fixable, so the scoped
+    // pass's decision to skip b.rs is what preserved it.
+    db.rebuild_logical_symbols(crate::index::graph_index::KeyVersionStamp::Defer).unwrap();
+    let corrected: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT variant_count FROM main.logical_symbols WHERE repo_id = ?1 AND path = ?2 \
+             LIMIT 1",
+            rusqlite::params![repo_id, "src/b.rs"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(corrected, 1, "a whole-repo rebuild corrects the poisoned variant_count");
+
+    let _ = fs::remove_dir_all(&main);
+}
+
+/// #826 over the OVERLAY finalize (Inline): a key-set change on a LINKED WORKTREE re-derives only
+/// that worktree's changed paths' groups, not the whole repo. ZERO whole-repo rebuilds, and the
+/// grouping is the wholesale rebuild's fixed point — the scoped re-derive regroups the changed path
+/// across ALL its scopes (raw `main.files`), so base + overlay members stay correct.
+#[test]
+fn a_linked_worktree_overlay_scopes_the_logical_rederive() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/one.rs"), "pub fn one_fn() -> i32 {\n    1\n}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds one_fn"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(logical_symbol_named(&db, "one_fn"), "the added overlay file is grouped");
+
+    // A KEY-SET change on the linked worktree (add two_fn to one.rs, uncommitted → dirty overlay).
+    fs::write(
+        linked.join("src/one.rs"),
+        "pub fn one_fn() -> i32 {\n    1\n}\npub fn two_fn() {}\n",
+    )
+    .unwrap();
+    let before = db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed) - before,
+        0,
+        "the overlay finalize's scoped re-derive runs ZERO whole-repo rebuilds"
+    );
+    assert!(logical_symbol_named(&db, "two_fn"), "the added overlay function is grouped");
+
+    let scoped = logical_grouping_snapshot(&db);
+    db.rebuild_logical_symbols(crate::index::graph_index::KeyVersionStamp::Defer).unwrap();
+    assert_eq!(
+        logical_grouping_snapshot(&db),
+        scoped,
+        "the scoped overlay re-derive output must equal the whole-repo rebuild's output"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// #826 gate: a lagging `logical_key_version` owes the #493 drift heal, which ONLY the whole-repo
+/// `rebuild_logical_symbols` performs. The scoped re-derive must NOT be used — the pass keeps the
+/// full rebuild.
+#[test]
+fn a_stale_logical_key_version_keeps_the_whole_repo_rebuild() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_one() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // Force a version lag exactly as the #493 drift-heal tests do.
+    db.storage
+        .connection()
+        .execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", [])
+        .unwrap();
+    drop(db);
+
+    fs::write(main.join("src/a.rs"), "pub fn a_one() {}\npub fn a_two() {}\n").unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "a lagging logical_key_version keeps the whole-repo rebuild (for the #493 drift heal), \
+         never the scoped re-derive"
+    );
+    assert!(logical_symbol_named(&db, "a_two"), "the edit is still grouped");
+
+    let _ = fs::remove_dir_all(&main);
+}
+
+/// #826: the scoped re-derive DROPS a group whose symbol is gone from every live scope. Adding a
+/// function to a dirty file then removing it leaves that function in NO scope (it was never
+/// committed), so the scoped DELETE + regroup must drop its `logical_symbols` row — with ZERO
+/// whole-repo rebuilds. (A single dirty deletion of a COMMITTED symbol is deliberately NOT tested
+/// here: `logical_symbols` is scope-independent, so the committed symbol's group correctly survives
+/// until the deletion is committed — the same for a scoped re-derive and a whole-repo rebuild.)
+#[test]
+fn the_scoped_rederive_drops_a_removed_symbols_group() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_one() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    drop(IndexDatabase::rebuild(&config).unwrap());
+
+    // Add a_two (dirty overlay) — a_two now exists ONLY in the overlay scope.
+    fs::write(main.join("src/a.rs"), "pub fn a_one() {}\npub fn a_two() {}\n").unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert!(logical_symbol_named(&db, "a_two"), "the added overlay symbol is grouped");
+    drop(db);
+
+    // Remove a_two again (the `// edited` line keeps a.rs DIRTY vs the commit, so this stays a
+    // scoped dirty re-index rather than a stale-overlay heal). a_two is now gone from EVERY live
+    // scope — it was only ever in the overlay.
+    fs::write(main.join("src/a.rs"), "// edited\npub fn a_one() {}\n").unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert_eq!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "dropping a symbol takes the scoped re-derive, not a whole-repo rebuild"
+    );
+    assert!(!logical_symbol_named(&db, "a_two"), "the removed symbol's group is dropped");
+    assert!(logical_symbol_named(&db, "a_one"), "the surviving symbol's group is intact");
+
+    // Byte-identity: the drop leaves exactly what a whole-repo rebuild would.
+    let scoped = logical_grouping_snapshot(&db);
+    db.rebuild_logical_symbols(crate::index::graph_index::KeyVersionStamp::Defer).unwrap();
+    assert_eq!(logical_grouping_snapshot(&db), scoped, "the drop equals the whole-repo rebuild");
+
+    let _ = fs::remove_dir_all(&main);
 }

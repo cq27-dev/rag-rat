@@ -735,6 +735,15 @@ impl IndexDatabase {
         // any error (#219 review).
         self.storage.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> anyhow::Result<(usize, usize, usize)> {
+            // #826: arm scoped logical re-derive capture — the overlay's file removals / inserts
+            // below stage the worktree's changed PATHS so `finalize_overlay_refresh`'s Inline case
+            // can re-derive only those paths' logical groups instead of the whole repo. Armed (and
+            // cleared) here — INSIDE the guarded closure so a temp-table create/clear failure rolls
+            // the transaction back rather than stranding it open on this reusable `&mut self` (the
+            // next refresh would then fail "cannot start a transaction within a transaction"). A
+            // batch's next worktree starts fresh; the Deferred (batch) case ignores the staged
+            // paths and settles via one whole-repo rebuild at the batch tail.
+            self.begin_scoped_logical_rederive()?;
             let applied = self.index_explicit_paths_from_root(
                 config,
                 &source_root,
@@ -777,6 +786,10 @@ impl IndexDatabase {
             self.apply_overlay_basis_tail(&worktree_id, delta.status_complete, tail.basis)?;
             Ok((indexed, tombstoned, pruned))
         })();
+        // #826: disarm scoped logical re-derive capture on BOTH Ok and Err paths — this pass's
+        // `&mut self` outlives an error return, so the flag must not leak into the caller's next
+        // use.
+        self.finish_scoped_logical_rederive();
         let (indexed, tombstoned, pruned) = match result {
             Ok(counts) => {
                 self.storage.execute_batch("COMMIT")?;
@@ -912,6 +925,15 @@ impl IndexDatabase {
         // front; ROLLBACK on any error.
         self.storage.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> anyhow::Result<(usize, usize, usize)> {
+            // #826: arm scoped logical re-derive capture — the overlay's file removals / inserts
+            // below stage the worktree's changed PATHS so `finalize_overlay_refresh`'s Inline case
+            // can re-derive only those paths' logical groups instead of the whole repo. Armed (and
+            // cleared) here — INSIDE the guarded closure so a temp-table create/clear failure rolls
+            // the transaction back rather than stranding it open on this reusable `&mut self` (the
+            // next refresh would then fail "cannot start a transaction within a transaction"). A
+            // batch's next worktree starts fresh; the Deferred (batch) case ignores the staged
+            // paths and settles via one whole-repo rebuild at the batch tail.
+            self.begin_scoped_logical_rederive()?;
             let applied = self.index_explicit_paths_from_root(
                 config,
                 &source_root,
@@ -961,6 +983,10 @@ impl IndexDatabase {
             )?;
             Ok((indexed, tombstoned, pruned))
         })();
+        // #826: disarm scoped logical re-derive capture on BOTH Ok and Err paths — this pass's
+        // `&mut self` outlives an error return, so the flag must not leak into the caller's next
+        // use.
+        self.finish_scoped_logical_rederive();
         let (indexed, tombstoned, pruned) = match result {
             Ok(counts) => {
                 self.storage.execute_batch("COMMIT")?;
@@ -1171,10 +1197,22 @@ impl IndexDatabase {
                 },
                 graph_index::LogicalGroupingUpkeep::RebuildRequired => match logical_rebuild {
                     OverlayLogicalRebuild::Inline => {
-                        // Defer the STAMP: an overlay refresh re-parsed only the worktree's own
-                        // files, so it must not stamp the logical-key version — the base scope's
-                        // drift is still in the future (#493).
-                        self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                        // #826: re-derive ONLY this worktree's changed paths' logical groups
+                        // (staged into `temp.logical_rederive_paths` by the
+                        // overlay apply above) instead of the whole repo —
+                        // UNLESS a #493 drift heal or a #819 deferred rebuild is
+                        // owed, which the scoped path cannot serve. The re-derive reads raw
+                        // `main.files`, so under this overlay scope view it still regroups each
+                        // changed path across ALL its scopes (base + every worktree). Defer the
+                        // STAMP regardless: an overlay refresh re-parsed
+                        // only the worktree's own files, so it must not
+                        // stamp the logical-key version — the base scope's drift is still
+                        // in the future (#493).
+                        if self.can_scope_logical_rederive()? {
+                            self.rederive_changed_logical_symbols()?;
+                        } else {
+                            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                        }
                     },
                     OverlayLogicalRebuild::Deferred => {
                         // Mark the repo-global rebuild pending IN THIS transaction (#819).
