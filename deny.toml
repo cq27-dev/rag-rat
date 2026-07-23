@@ -64,6 +64,21 @@ allow = [
 crate = "option-ext"
 allow = ["MPL-2.0"]
 
+# Unlicense (public-domain dedication, permissive — like the already-allowed CC0-1.0) reaches the
+# graph only through iroh-relay's wasm/browser transport (#406). rag-rat is native-only and never
+# links these, but cargo-deny walks every target's graph, so they need an allow to pass. Scoped
+# per crate — matching the option-ext precedent — so a future Unlicense dependency is still forced
+# through review rather than satisfying the gate silently.
+[[licenses.exceptions]]
+crate = "ws_stream_wasm"
+allow = ["Unlicense"]
+[[licenses.exceptions]]
+crate = "pharos"
+allow = ["Unlicense"]
+[[licenses.exceptions]]
+crate = "async_io_stream"
+allow = ["Unlicense"]
+
 [bans]
 # The tree carries several duplicate major versions (windows-sys, hashbrown, thiserror, tokenizers,
 # ureq, …) that we do not control from here; surface them without failing CI.
