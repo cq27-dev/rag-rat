@@ -32,10 +32,10 @@ pub struct DistillDrainReport {
     pub rung_serde: u64,
     pub rung_unguided: u64,
     pub rung_tolerant: u64,
-    /// Of the accepted replies, how many passed only after `RecordOutput::normalize` repaired the
-    /// model's formatting (a demoted backtick phrase or a deduped id). Orthogonal to the rungs, so
-    /// the genuinely-clean guided rate is `rung_serde` minus the serde-rung share of this.
-    pub repaired: u64,
+    /// Of the replies accepted on the SERDE rung, how many passed only because
+    /// `RecordOutput::normalize` repaired the model's formatting (a demoted backtick phrase or a
+    /// deduped id), so the genuinely-clean guided rate is exactly `rung_serde - repaired_serde`.
+    pub repaired_serde: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +165,7 @@ pub(crate) fn drain(
     report.rung_serde = aggregate_stats.rung_serde;
     report.rung_unguided = aggregate_stats.rung_unguided;
     report.rung_tolerant = aggregate_stats.rung_tolerant;
-    report.repaired = aggregate_stats.repaired;
+    report.repaired_serde = aggregate_stats.repaired_serde;
     let _write_lock = WriteLock::acquire_blocking(database_path, repo_id)?;
     in_transaction(conn, "IMMEDIATE", || {
         run_stats::record_distill_run(

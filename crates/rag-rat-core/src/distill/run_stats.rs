@@ -88,7 +88,7 @@ mod tests {
             rung_unguided: 1,
             rung_tolerant: 1,
             failed: 1,
-            repaired: 2,
+            repaired_serde: 2,
         };
         record_distill_run(&conn, "repo", 42, 4, stats).unwrap();
         let row: (i64, i64, i64, i64, i64, i64, String) = conn
@@ -113,9 +113,9 @@ mod tests {
         assert_eq!((row.0, row.1, row.2, row.3, row.4, row.5), (4, 4, 1, 1, 1, 1));
         let stats_json = serde_json::from_str::<serde_json::Value>(&row.6).unwrap();
         assert_eq!(stats_json["failed"], 1);
-        // `repaired` has no dedicated column; it rides in stats_json so a repaired reply is
-        // distinguishable from clean guided output.
-        assert_eq!(stats_json["repaired"], 2);
+        // `repaired_serde` has no dedicated column; it rides in stats_json so a serde reply that
+        // needed repair stays distinguishable from clean guided output.
+        assert_eq!(stats_json["repaired_serde"], 2);
     }
 
     #[test]

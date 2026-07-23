@@ -196,13 +196,14 @@ pub(crate) struct LadderStats {
     pub rung_unguided: u64,
     pub rung_tolerant: u64,
     pub failed: u64,
-    /// Of the accepted replies (any rung), how many passed only after `RecordOutput::normalize`
-    /// changed the model's output (a demoted backtick phrase or a deduped id). Orthogonal to the
-    /// rungs — a repaired reply is still counted in whichever rung accepted it — so
-    /// `rung_serde - repaired-on-serde` is the genuinely-clean guided rate. Without this, a
-    /// repaired reply is indistinguishable from clean guided output in the run-stats, hiding
-    /// the very formatting-failure rate the normalization exists to absorb.
-    pub repaired: u64,
+    /// Of the replies accepted on the SERDE rung (the clean-guided path), how many passed only
+    /// because `RecordOutput::normalize` repaired the model's output (a demoted backtick phrase or
+    /// a deduped id). So the genuinely-clean guided rate is exactly `rung_serde - repaired_serde`
+    /// — without it, a repaired reply is indistinguishable from clean guided output, hiding
+    /// the formatting-failure rate the normalization exists to absorb. Repairs on the
+    /// unguided/tolerant recovery rungs are not tracked separately: those rungs already denote
+    /// non-clean output.
+    pub repaired_serde: u64,
 }
 
 impl LadderStats {
@@ -221,7 +222,7 @@ impl LadderStats {
         self.rung_unguided += other.rung_unguided;
         self.rung_tolerant += other.rung_tolerant;
         self.failed += other.failed;
-        self.repaired += other.repaired;
+        self.repaired_serde += other.repaired_serde;
     }
 
     pub(crate) fn terminal_count(self) -> u64 {
@@ -272,7 +273,7 @@ pub(crate) fn run_output_ladder(
                 Ok((output, value, repaired)) => {
                     stats.record(OutputRung::Serde);
                     if repaired {
-                        stats.repaired += 1;
+                        stats.repaired_serde += 1;
                     }
                     return Ok(LadderResult {
                         output,
@@ -301,11 +302,10 @@ pub(crate) fn run_output_ladder(
     };
 
     match parse_and_validate(&retry_raw, input, budget) {
-        Ok((output, value, repaired)) => {
+        // A repair on the unguided/tolerant recovery rung is not tracked separately (`_repaired`):
+        // those rungs already denote non-clean output, so only serde-rung repairs carry signal.
+        Ok((output, value, _repaired)) => {
             stats.record(OutputRung::Unguided);
-            if repaired {
-                stats.repaired += 1;
-            }
             return Ok(LadderResult {
                 output,
                 value,
@@ -319,11 +319,8 @@ pub(crate) fn run_output_ladder(
 
     if let Some(stripped) = strip_whole_json_fence(&retry_raw) {
         match parse_and_validate(stripped, input, budget) {
-            Ok((output, value, repaired)) => {
+            Ok((output, value, _repaired)) => {
                 stats.record(OutputRung::Tolerant);
-                if repaired {
-                    stats.repaired += 1;
-                }
                 return Ok(LadderResult {
                     output,
                     value,
@@ -538,7 +535,7 @@ mod tests {
         assert_eq!(result.output.decision.chosen.as_deref(), Some("Adopt the retry loop approach"));
         assert_eq!(result.value["decision"]["chosen"], "Adopt the retry loop approach");
         // The reply needed repair, so it is counted apart from clean guided output.
-        assert_eq!(result.stats.repaired, 1);
+        assert_eq!(result.stats.repaired_serde, 1);
     }
 
     #[test]
@@ -552,7 +549,7 @@ mod tests {
         assert_eq!(result.output.root_cause_units.len(), 1);
         assert_eq!(result.output.decision_units.len(), 1);
         assert_eq!(result.output.anchor_indices, vec![3]);
-        assert_eq!(result.stats.repaired, 1);
+        assert_eq!(result.stats.repaired_serde, 1);
     }
 
     #[test]
