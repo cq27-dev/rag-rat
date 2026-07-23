@@ -393,16 +393,26 @@ pub struct DreamLlmConfig {
 /// a [`RemoteDreamConfig`] chat-serving block (connect XOR ephemeral), default OFF so the
 /// extraction layer stays 100% deterministic unless the operator opts in. Rides
 /// [`RemoteDreamConfig`] rather than a bespoke type — the distill pass is another single-turn chat
-/// consumer; the only difference from dream is a typically larger model (hence the
-/// `provision_timeout_s` override on the remote block, for a 30B-class weight pull).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// consumer; the difference from dream is the serving default: distill defaults to the validated
+/// 30B ephemeral box ([`RemoteDreamConfig::distill_default`]), not dream's local-Ollama connect,
+/// because a local 4B produces poor records on distill's dense prompts.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistillLlmConfig {
     /// Run the distill model pass at all (default false — opt in explicitly). When false, the
     /// deterministic extraction still runs; only the model columns stay unfilled.
     pub enabled: bool,
     /// Which chat server serves the distill turns (connect XOR ephemeral). Absent
-    /// `[llm.distill.remote]` → [`RemoteDreamConfig::default`] (a local-Ollama connect).
+    /// `[llm.distill.remote]` → [`RemoteDreamConfig::distill_default`] (the validated 30B
+    /// ephemeral box), **not** dream's local-Ollama connect.
     pub remote: RemoteDreamConfig,
+}
+
+impl Default for DistillLlmConfig {
+    /// OFF, serving the validated 30B ephemeral box — so a wholly-absent `[llm]` and a present
+    /// `[llm.distill]` with no `.remote` block resolve to the *same* distill default.
+    fn default() -> Self {
+        Self { enabled: false, remote: RemoteDreamConfig::distill_default() }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -855,6 +865,33 @@ impl Default for RemoteDreamConfig {
 }
 
 impl RemoteDreamConfig {
+    /// The distill pass's default serving block when `[llm.distill.remote]` is omitted: the
+    /// validated 30B ephemeral box (vLLM on an L40S), **not** dream's local-Ollama connect.
+    /// Distill prompts are dense enough that a local 4B produces poor records, so the honest
+    /// default is the config that was validated on the full corpus — it provisions a paid GPU only
+    /// when the opt-in `[llm.distill] enabled = true` drain actually has pending work (a zero-work
+    /// run never cold-starts a box). `request_timeout_s` is kept low (a rare guided-decoding
+    /// whitespace loop fails fast and re-queues); `provision_timeout_s` gives the ~30 GB cold
+    /// weight pull real headroom while still **reserving serving time within the cookbook box's
+    /// 30-min unconditional lifetime** — see the constants below.
+    pub fn distill_default() -> Self {
+        Self {
+            backend: RemoteBackend::Vllm,
+            endpoint: None,
+            cookbook: Some("@rag-rat/cookbook modal".to_string()),
+            model: "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8".to_string(),
+            gpu: Some("L40S".to_string()),
+            auth_env: None,
+            request_timeout_s: 240,
+            // 25 min. The cookbook box self-destructs at a hard 30-min (1800 s) lifetime, so the
+            // budget must leave room to actually *serve* after a slow cold start: even if
+            // provisioning eats this whole 1500 s, the box still has 300 s left — more than one
+            // full `request_timeout_s` (240 s) request. A larger budget lets provisioning consume
+            // the lifetime, and the first inference dies mid-flight when the box vanishes.
+            provision_timeout_s: Some(1500),
+        }
+    }
+
     /// CONNECT mode: an already-running server at `endpoint`. Exactly one of connect/ephemeral
     /// holds (config validation guarantees it), so `is_connect() == !is_ephemeral()`.
     pub fn is_connect(&self) -> bool {

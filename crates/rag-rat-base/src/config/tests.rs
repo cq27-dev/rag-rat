@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use path_slash::PathExt;
 
 use super::{
-    self as config, Config, ConfigError, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat,
-    LogLevel, MemoryConfig, MemorySurface, OracleConfig, RawConfig, RawMemory, RawOracle,
-    RawSearch, RawTarget, RawVersionCheck, RawWatch, RemoteBackend, RemoteDreamConfig,
-    RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, TargetKind, TrackerAuth,
-    VersionCheckConfig, WatchConfig,
+    self as config, Config, ConfigError, DistillLlmConfig, EmbeddingRuntimeConfig, LlmConfig,
+    LogConfig, LogFormat, LogLevel, MemoryConfig, MemorySurface, OracleConfig, RawConfig,
+    RawMemory, RawOracle, RawSearch, RawTarget, RawVersionCheck, RawWatch, RemoteBackend,
+    RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, TargetKind,
+    TrackerAuth, VersionCheckConfig, WatchConfig,
 };
 use crate::language::Language;
 
@@ -2304,9 +2304,11 @@ fn dream_remote_connect_happy_path_applies_defaults() {
 }
 
 #[test]
-fn distill_absent_defaults_to_off_and_local_ollama_connect() {
-    // No `[llm.distill]` → disabled, with the same local-Ollama CONNECT default dream carries
-    // (the distill pass rides `RemoteDreamConfig`).
+fn distill_absent_defaults_to_off_and_the_validated_30b_ephemeral_box() {
+    // No `[llm.distill]` → disabled, but its serving default is the *validated 30B ephemeral box*,
+    // NOT dream's local-Ollama connect: distill's dense prompts need the big model, so the honest
+    // default is the config validated on the full corpus. (Enabled stays false, so nothing is
+    // provisioned until the operator opts in and the drain has work.)
     let raw: RawConfig = toml::from_str(
         r#"
             [index]
@@ -2316,8 +2318,26 @@ fn distill_absent_defaults_to_off_and_local_ollama_connect() {
     .unwrap();
     let distill = LlmConfig::try_from(raw.llm).unwrap().distill;
     assert!(!distill.enabled, "the distill model pass is OFF by default");
-    assert_eq!(distill.remote, RemoteDreamConfig::default());
-    assert!(distill.remote.is_connect() && !distill.remote.is_ephemeral());
+    assert_eq!(distill.remote, RemoteDreamConfig::distill_default());
+    assert_ne!(
+        distill.remote,
+        RemoteDreamConfig::default(),
+        "distill must diverge from dream's local-Ollama default"
+    );
+    assert!(distill.remote.is_ephemeral() && !distill.remote.is_connect());
+    assert_eq!(distill.remote.backend, RemoteBackend::Vllm);
+    assert_eq!(distill.remote.model, "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8");
+    assert_eq!(distill.remote.gpu.as_deref(), Some("L40S"));
+    // Cold provisioning PLUS at least one worst-case request must fit inside the cookbook box's
+    // 30-min (1800 s) unconditional lifetime — otherwise a box that cold-starts near its budget
+    // self-destructs mid-inference on its very first request.
+    assert!(
+        distill.remote.provision_timeout_s.unwrap() + distill.remote.request_timeout_s <= 1800,
+        "provision budget + one request must fit under the 30-min box lifetime"
+    );
+    // The whole-`[llm]`-absent fallback (`DistillLlmConfig::default`) must agree with the
+    // `.remote`-absent resolution above — same validated default from both paths.
+    assert_eq!(DistillLlmConfig::default().remote, RemoteDreamConfig::distill_default());
 }
 
 #[test]

@@ -363,9 +363,13 @@ impl TryFrom<RawLlm> for LlmConfig {
     type Error = ConfigError;
 
     fn try_from(raw: RawLlm) -> Result<Self, Self::Error> {
-        let (dream_enabled, dream_remote) = resolve_chat_gate(raw.dream, "[llm.dream.remote]")?;
-        let (distill_enabled, distill_remote) =
-            resolve_chat_gate(raw.distill, "[llm.distill.remote]")?;
+        let (dream_enabled, dream_remote) =
+            resolve_chat_gate(raw.dream, "[llm.dream.remote]", RemoteDreamConfig::default)?;
+        let (distill_enabled, distill_remote) = resolve_chat_gate(
+            raw.distill,
+            "[llm.distill.remote]",
+            RemoteDreamConfig::distill_default,
+        )?;
         Ok(Self {
             embedding: EmbeddingConfig::try_from(raw.embedding)?,
             dream: DreamLlmConfig { enabled: dream_enabled, remote: dream_remote },
@@ -379,21 +383,25 @@ impl TryFrom<RawLlm> for LlmConfig {
 #[derive(Debug, Default, Deserialize, PartialEq)]
 pub(crate) struct RawChatLlm {
     enabled: Option<bool>,
-    /// The `.remote` chat-serving block — absent → [`RemoteDreamConfig::default`] (a local-Ollama
-    /// connect). Unlike embeddings there is no in-process fallback, so a missing block still
-    /// yields a serving config rather than `None`.
+    /// The `.remote` chat-serving block — absent → the pass's `default_remote` (dream: a
+    /// local-Ollama connect; distill: the validated 30B ephemeral box). Unlike embeddings there is
+    /// no in-process fallback, so a missing block still yields a serving config rather than
+    /// `None`.
     remote: Option<RawRemoteDream>,
 }
 
 /// Resolve a chat gate to `(enabled, remote)`. `section` names the TOML block (e.g.
 /// `"[llm.distill.remote]"`) so validation errors point at the block the operator actually wrote.
+/// `default_remote` is the pass-specific serving default used when the `.remote` block is absent —
+/// [`RemoteDreamConfig::default`] for dream, [`RemoteDreamConfig::distill_default`] for distill.
 fn resolve_chat_gate(
     raw: RawChatLlm,
     section: &'static str,
+    default_remote: fn() -> RemoteDreamConfig,
 ) -> Result<(bool, RemoteDreamConfig), ConfigError> {
     let remote = match raw.remote {
         Some(remote) => resolve_remote_dream(remote, section)?,
-        None => RemoteDreamConfig::default(),
+        None => default_remote(),
     };
     Ok((raw.enabled.unwrap_or_default(), remote))
 }
