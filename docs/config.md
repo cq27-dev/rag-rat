@@ -42,6 +42,8 @@ Each topic below has its own in-depth page under [`docs/config/`](config/):
   (`[version_check]`).
 - **[Dream memory maintenance](config/dream.md)** — the opt-in verify/compaction model
   (`[llm.dream]`), ephemeral GPU serving, nightly scheduling, and reviewing findings.
+- **[Issue distillation model](config/distill.md)** — the opt-in LLM pass that fills distilled
+  decision records (`[llm.distill]`), ephemeral GPU serving, and batching.
 - **[Memory surfacing](config/memory.md)** — summary-vs-full rendering of repo memories
   everywhere they surface (`[memory] surface`).
 - **[Issue trackers & papertrail](config/trackers.md)** — `[[tracker]]` bindings, per-provider

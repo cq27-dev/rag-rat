@@ -44,6 +44,10 @@ sequenceDiagram
   symbols.
 - **History as evidence.** Git history, lazy chunk blame, and cached GitHub issue/PR/review
   rationale, all queryable.
+- **Issue distillation.** Every closed issue and merged PR **plus its fixing diff** distilled into a typed
+  [decision record](docs/distillation.md) — root cause, the approach that landed (and the rejected
+  alternatives), and the outcome — validated against the thread and surfaced as drive-by context on
+  the anchored symbols.
 - **Rides your existing grep.** A [grep-augmentation hook](docs/grep-augmentation.md) injects the
   memories and symbols behind whatever you just searched for.
 - **Flags clones as you write them.** A PreToolUse hook on Write/Edit/MultiEdit fingerprints the
