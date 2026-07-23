@@ -117,6 +117,15 @@ pub use account::{
 // open/migrate seam by rag-rat-core, so a stale store is rebuilt (every stream, then the one
 // stamp) before any per-stream write.
 pub use content_projection::rebuild_all_content_projections_if_stale;
+// The projection READ seam (#691 A1): decode a `/2` stream's projected nodes/edges back into
+// the op model. The memory drain reads these to mirror accepted synced content into
+// `repo_memories` / `repo_node_edges` as `origin='synced'` rows — the reverse of the local
+// reconcile. Read-only over the projection tables, keeping the private row DTOs inside this
+// crate.
+pub use content_projection::{
+    ProjectedContentEdge, ProjectedContentNode, list_projected_content_edges,
+    list_projected_content_nodes,
+};
 // The op-log's first crate-internal API surface (#524): the MINTING primitives + the op
 // vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
@@ -124,7 +133,7 @@ pub use content_projection::rebuild_all_content_projections_if_stale;
 pub use identity::{LocalDevice, load_local_device, local_device};
 pub use op::{
     DeviceFingerprint, EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus,
-    ParseDeviceFingerprintError,
+    ParseDeviceFingerprintError, ResolvedAnchor,
 };
 // The `/1` shadow-projection read seams (`ProjectedState` / `load_projection`) and the
 // standalone (own-txn) `/1` authoring wrappers (`author_batch` / `author_op`) — test-only

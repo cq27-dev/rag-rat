@@ -38,8 +38,8 @@ pub use registry::{
     RegisteredRepo, active_generation, active_repo_id, clear_repo_removed,
     connection_context_value, earliest_recorded_root, is_repo_removed,
     is_root_already_indexed_conn, live_files_generation, mark_repo_removed, periphery_repo_scope,
-    periphery_repo_scope_clause, register_repo, register_repo_read_only, registered_repos,
-    repo_has_recorded_root, repo_id_is_registered, repo_indexed_at_this_root,
+    periphery_repo_scope_clause, real_repo_ids, register_repo, register_repo_read_only,
+    registered_repos, repo_has_recorded_root, repo_id_is_registered, repo_indexed_at_this_root,
     repo_removal_generation, resolve_config_repo_id, scope_context_repo_id, sole_repo_id,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};

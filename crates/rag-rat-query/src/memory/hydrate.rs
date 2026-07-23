@@ -98,10 +98,14 @@ pub fn upsert_memory_fts(conn: &Connection, memory_id: &str) -> anyhow::Result<(
     conn.execute("DELETE FROM repo_memory_fts WHERE memory_id = ?1", [memory_id])?;
     let tags = tags_for_memory(conn, memory_id)?.join(" ");
     // Post-A5 the FTS carries a `repo_id UNINDEXED` mirror of the parent memory's, so
-    // `memory_search` can filter it after the MATCH. Stamp it from `repo_memories.repo_id`
-    // (already set by the time this runs). On the pre-A5 schema the column does not exist, so
-    // write the original row shape.
-    if memory_repo_scope(conn)?.is_some() {
+    // `memory_search` can filter it after the MATCH. Stamp it by COPYING `repo_memories.repo_id`
+    // (already set by the time this runs). The branch keys on the SCHEMA capability (does the
+    // column exist?), NOT on the connection's active-repo scope: a scope-less writer on the current
+    // schema (e.g. the synced-content drain at open, before `set_context`) must still stamp the
+    // repo_id it copies from the row, or `memory_search`'s repo filter would never match the row
+    // and a subsequent no-op write would never repair it. On the pre-A5 schema the column does not
+    // exist, so write the original row shape.
+    if rag_rat_db::schema::column_exists(conn, "repo_memories", "repo_id")? {
         conn.execute(
             "
             INSERT INTO repo_memory_fts(repo_id, memory_id, title, body, kind, tags)

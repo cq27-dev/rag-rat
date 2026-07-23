@@ -469,6 +469,12 @@ fn run_pass(
         }
     }
     let _ = timings.stage("memory_validate", || db.memory_validate());
+    // Materialize any accepted synced `/3` content pulled since the last pass into the local memory
+    // tables (#691 A1) — the reverse of the reconcile. Best-effort like `memory_validate` above (a
+    // failure rides the next pass); a store with no synced content or no minted account is a cheap
+    // no-op. This is the long-running-process backstop so a pull after open surfaces without a
+    // reopen; open + consolidate drain at their own seams.
+    let _ = timings.stage("memory_drain", || db.drain_synced_memory());
     if shutdown_reconcile_pending && base_reconcile_status.as_deref() == Some("Current") {
         db.clear_watch_shutdown_reconcile_pending()?;
     }

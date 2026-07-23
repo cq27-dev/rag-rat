@@ -1291,8 +1291,9 @@ fn resolve_by_root_or_sole(conn: &Connection, root: &Path) -> rusqlite::Result<O
 }
 
 /// Every registered `repo_id` that is a real (adopted) id — i.e. excluding the [`LEGACY_REPO_ID`]
-/// placeholder. A single-repo DB returns at most one.
-fn real_repo_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+/// placeholder. A single-repo DB returns at most one. The store-global memory drain iterates these
+/// to mirror each repo's synced `/3` content at open.
+pub fn real_repo_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt =
         conn.prepare("SELECT repo_id FROM repos WHERE repo_id != ?1 ORDER BY repo_id")?;
     let ids = stmt.query_map([LEGACY_REPO_ID], |row| row.get::<_, String>(0))?;

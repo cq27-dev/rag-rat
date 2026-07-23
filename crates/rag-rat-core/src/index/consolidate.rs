@@ -349,6 +349,16 @@ fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<Cons
         rag_rat_base::time::now_ms(),
     )?;
 
+    // The REVERSE direction (#691 A1): mirror any accepted SYNCED /3 content on this repo's owner
+    // stream back into the local memory tables as `origin='synced'` rows. Paired with the reconcile
+    // above so the consolidated store's synced rows are materialized, not just its local ones. A
+    // legacy import usually carries no synced content, so this is a near-no-op there.
+    crate::memory_write::drain_synced_stream_for_repo(
+        target_conn,
+        &repo_id,
+        rag_rat_base::time::now_ms(),
+    )?;
+
     // Rename the legacy file so a keyless config now resolves to the global store (via the
     // `.imported` latch), and a re-run is a no-op. AFTER the import commits, so a failure leaves
     // the legacy file in place to retry. The WAL sidecars travel WITH the archive: a bare

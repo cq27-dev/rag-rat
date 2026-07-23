@@ -29,7 +29,9 @@ use super::account::{
     open_sealed_payload, stream_owner_account,
 };
 use super::identity::load_local_device;
-use super::op::{self, DecodedOp, Entry, OpMeta};
+use super::op::{
+    self, DecodedOp, EdgeSpec, Entry, NodeContent, NodeStatus, OpMeta, ResolvedAnchor,
+};
 use super::project;
 use super::project::ProjectedState;
 use super::store::{EdgeSpecRow, NodeContentRow, ResolvedAnchorRow};
@@ -346,4 +348,91 @@ fn load_accepted_entries(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::R
         }
     }
     Ok(entries)
+}
+
+/// One projected `/3` node, decoded for a projection consumer: the stable node id, the folded
+/// content register, and the folded status. The memory drain (rag-rat-core) reads these to mirror
+/// a stream's accepted nodes into `repo_memories` as `origin='synced'` rows — the reverse direction
+/// of the local reconcile. Owned + flat: the private row DTOs stay inside this crate.
+pub struct ProjectedContentNode {
+    pub node_id: String,
+    pub content: NodeContent,
+    pub status: NodeStatus,
+}
+
+/// One projected `/3` edge, decoded for a projection consumer: the stable key, the folded spec (the
+/// edge is self-describing — it carries its own `owner_repo_id`), the last resolved anchor if any,
+/// and `present` (a `false` row is a RETAINED tombstone the consumer honors, not a live edge).
+pub struct ProjectedContentEdge {
+    pub edge_key: String,
+    pub spec: EdgeSpec,
+    pub resolved: Option<ResolvedAnchor>,
+    pub present: bool,
+}
+
+/// Read one `/2` stream's projected nodes, decoded from the stored `content_json` back into the op
+/// model. Deterministic `node_id` order. An unknown status token FAILS (a newer binary folded it),
+/// mirroring the reconcile's authoring guard rather than silently coercing it.
+pub fn list_projected_content_nodes(
+    conn: &Connection,
+    stream_id: StreamId,
+) -> anyhow::Result<Vec<ProjectedContentNode>> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, content_json, status FROM content_projected_nodes
+         WHERE stream_id = ?1 ORDER BY node_id",
+    )?;
+    let rows = stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    })?;
+    let mut nodes = Vec::new();
+    for row in rows {
+        let (node_id, content_json, status) = row?;
+        let content: NodeContentRow = serde_json::from_str(&content_json)
+            .with_context(|| format!("decode projected /3 node content for `{node_id}`"))?;
+        let status = NodeStatus::from_db_str(&status).with_context(|| {
+            format!("projected /3 node `{node_id}` carries unknown status `{status}`")
+        })?;
+        nodes.push(ProjectedContentNode { node_id, content: NodeContent::from(content), status });
+    }
+    Ok(nodes)
+}
+
+/// Read one `/2` stream's projected edges (live AND tombstoned), decoded from the stored
+/// `spec_json` / `resolved_json` back into the op model. Deterministic `edge_key` order.
+pub fn list_projected_content_edges(
+    conn: &Connection,
+    stream_id: StreamId,
+) -> anyhow::Result<Vec<ProjectedContentEdge>> {
+    let mut stmt = conn.prepare(
+        "SELECT edge_key, spec_json, resolved_json, present FROM content_projected_edges
+         WHERE stream_id = ?1 ORDER BY edge_key",
+    )?;
+    let rows = stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut edges = Vec::new();
+    for row in rows {
+        let (edge_key, spec_json, resolved_json, present) = row?;
+        let spec_row: EdgeSpecRow = serde_json::from_str(&spec_json)
+            .with_context(|| format!("decode projected /3 edge spec for `{edge_key}`"))?;
+        let resolved = resolved_json
+            .map(|json| {
+                serde_json::from_str::<ResolvedAnchorRow>(&json)
+                    .with_context(|| format!("decode projected /3 edge anchor for `{edge_key}`"))
+                    .map(ResolvedAnchor::from)
+            })
+            .transpose()?;
+        edges.push(ProjectedContentEdge {
+            edge_key,
+            spec: EdgeSpec::try_from(spec_row)?,
+            resolved,
+            present: present != 0,
+        });
+    }
+    Ok(edges)
 }

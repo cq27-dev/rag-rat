@@ -9,6 +9,9 @@ mod api;
 // The op-log authoring seam: row→op translation, the one-time full backfill, and the live
 // `author_*` helpers the memory mutations call in-transaction (#532).
 mod authoring;
+// The REVERSE of the authoring reconcile (#691 A1): mirror a stream's accepted synced `/3` content
+// back into `repo_memories` / `repo_node_edges` as `origin='synced'` rows.
+mod drain;
 mod edges;
 #[cfg(test)]
 mod oracle_relocation_tests;
@@ -23,6 +26,10 @@ pub(crate) use authoring::backfill_memory_oplog;
 // `index::consolidate` names this through this re-export (Task 5 of #541).
 pub(crate) use authoring::reconcile_owner_stream_for_repo;
 pub(crate) use authoring::{catch_up_enrolled_device_keys, enable_sealed_authoring};
+// The synced-content drain entries (#691 A1): the per-repo drain (consolidate) and the
+// store-global drain (open/migrate) that materialize accepted synced `/3` content into the
+// local memory tables.
+pub(crate) use drain::{drain_synced_stream_for_repo, drain_synced_streams_for_all_repos};
 pub(crate) use edges::{add_edge, remove_edge};
 
 // The `rag-rat rm` removal-tombstone guard (#767 review) the memory mutations call inside

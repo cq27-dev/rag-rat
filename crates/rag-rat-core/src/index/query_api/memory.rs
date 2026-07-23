@@ -345,6 +345,21 @@ impl IndexDatabase {
         )
     }
 
+    /// Materialize any accepted SYNCED `/3` content into the local memory tables — the reverse of
+    /// the memory reconcile (#691 A1). Store-global (one pass per registered real repo); a repo
+    /// with no minted account or no synced content is a cheap no-op. Called from the watcher's
+    /// maintenance pass so a long-running process picks up content pulled AFTER open without a
+    /// reopen (open and consolidate drain at their own seams). The eventual live sync-session
+    /// driver should call `drain_synced_stream_for_repo` per session for immediacy; this pass
+    /// is the backstop.
+    pub fn drain_synced_memory(&self) -> anyhow::Result<()> {
+        crate::memory_write::drain_synced_streams_for_all_repos(
+            self.storage.connection(),
+            rag_rat_base::time::now_ms(),
+        )?;
+        Ok(())
+    }
+
     pub fn memory_doctor(&self) -> anyhow::Result<Vec<rag_rat_query::memory::MemoryDoctorEntry>> {
         rag_rat_query::memory::doctor_report(self.storage.connection())
     }

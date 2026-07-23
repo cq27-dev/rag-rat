@@ -119,6 +119,15 @@ impl IndexDatabase {
         // V070-tables guard inside skips cleanly); idempotent and serialized by its own
         // IMMEDIATE txn, so racing openers converge.
         rag_rat_oplog::rebuild_all_content_projections_if_stale(storage.connection())?;
+        // #691 A1: mirror any accepted SYNCED /3 content into the local memory tables now that the
+        // projection is current above — the reverse of the authoring reconcile. Store-global (one
+        // pass per real repo). A repo with no minted account or no synced content is a cheap no-op,
+        // so a single-device store's open is unaffected; a store that has pulled a peer's content
+        // materializes it as `origin='synced'` rows here, so it is a real local row on next read.
+        crate::memory_write::drain_synced_streams_for_all_repos(
+            storage.connection(),
+            rag_rat_base::time::now_ms(),
+        )?;
         Ok(storage)
     }
 
