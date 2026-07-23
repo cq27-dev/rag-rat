@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use rag_rat_base::config::{
-    Config, DEFAULT_QUERY_ENDPOINT, EmbeddingBackend, OracleConfig, RemoteBackend,
-    RemoteEmbeddingConfig, VersionCheckConfig,
+    Config, DEFAULT_QUERY_ENDPOINT, DistillLlmConfig, EmbeddingBackend, OracleConfig,
+    RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, Tracker, VersionCheckConfig,
 };
 use rag_rat_base::language::Language;
-use toml_edit::{Array, DocumentMut, Item, Table};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table};
 
 use crate::init::render::{config_root_value, display_rel, render_config};
 use crate::init::scan::{candidate_dirs, estimated_chunks, recommend_backend};
@@ -53,6 +53,104 @@ pub(crate) struct RemoteDraft {
     pub max_batch_chars: usize,
     /// Name of the env-var holding the bearer token, if auth is needed.
     pub auth_env: Option<String>,
+}
+
+// ── Tracker (papertrail) draft ──────────────────────────────────────────────────
+
+/// How the wizard binds an issue tracker.
+///
+/// `AutoDetect` writes no `[[tracker]]` block — `resolve_trackers` derives the binding from the
+/// `origin` remote at index time (zero-config, the product default). `Configure` writes an explicit
+/// `[[tracker]]` block, which *replaces* auto-detection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TrackerMode {
+    AutoDetect,
+    Configure,
+}
+
+/// The auth source for an explicit tracker binding — exactly one of `env` / `token_command`, or
+/// none (anonymous), mirroring `TrackerAuth`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TrackerAuthMode {
+    Anonymous,
+    Env,
+    Command,
+}
+
+/// The issue-tracker draft — written as a `[[tracker]]` binding only in `Configure` mode.
+#[derive(Clone, Debug)]
+pub(crate) struct TrackerDraft {
+    pub mode: TrackerMode,
+    /// Provider for an explicit binding (unused in `AutoDetect`).
+    pub provider: Tracker,
+    pub auth: TrackerAuthMode,
+    /// Env-var NAME (for `Env`) or shell command (for `Command`); ignored for `Anonymous`.
+    pub auth_value: String,
+    /// Self-hosted / enterprise instance URL; empty = the provider's cloud host.
+    pub base_url: String,
+    /// `owner/repo` (code hosts) or the project KEY (Jira, required); empty = derive from remote.
+    pub project: String,
+    /// The git remote `project` is derived from; empty = the config default (`origin`). Not edited
+    /// in the UI, but round-tripped so a reconfigure never drops a non-`origin` remote.
+    pub remote: String,
+    /// Comma-separated tracked tags; empty = track all.
+    pub tags: String,
+}
+
+impl Default for TrackerDraft {
+    fn default() -> Self {
+        Self {
+            mode: TrackerMode::AutoDetect,
+            provider: Tracker::Github,
+            auth: TrackerAuthMode::Anonymous,
+            auth_value: String::new(),
+            base_url: String::new(),
+            project: String::new(),
+            remote: String::new(),
+            tags: String::new(),
+        }
+    }
+}
+
+// ── Distill draft ───────────────────────────────────────────────────────────────
+
+/// How the wizard serves the distillation model pass.
+///
+/// `Off` writes `[llm.distill] enabled = false`. `ValidatedBox` writes the validated 30B ephemeral
+/// serving block ([`RemoteDreamConfig::distill_default`]). `Connect` writes a connect
+/// `[llm.distill.remote]` pointing at an already-running server.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DistillMode {
+    Off,
+    ValidatedBox,
+    Connect,
+}
+
+/// The distillation draft — off by default. The pass is gated in the UI on a resolvable issue
+/// tracker (nothing to distill without one); the emitted config is a plain `[llm.distill]` block.
+#[derive(Clone, Debug)]
+pub(crate) struct DistillDraft {
+    pub mode: DistillMode,
+    /// Connect-mode server URL (ignored otherwise).
+    pub endpoint: String,
+    /// Connect-mode server-side model name (ignored otherwise).
+    pub model: String,
+    /// Set when `ValidatedBox` was loaded from an EXISTING ephemeral block (reconfigure). Such a
+    /// box is preserved verbatim and already provisioned, so it doesn't re-demand the paid-box
+    /// confirmation. A deliberate switch TO `ValidatedBox` in the wizard clears this (a fresh box
+    /// needs the acknowledgement and emits the shipped default).
+    pub preserved_ephemeral: bool,
+}
+
+impl Default for DistillDraft {
+    fn default() -> Self {
+        Self {
+            mode: DistillMode::Off,
+            endpoint: String::new(),
+            model: String::new(),
+            preserved_ephemeral: false,
+        }
+    }
 }
 
 // ── Cookbook + GPU constants ────────────────────────────────────────────────────
@@ -246,6 +344,10 @@ pub(crate) struct WizardDraft {
     pub version_check: bool,
     /// Hook installation selections (Task 16 fills `git` from current hook status).
     pub hooks: HooksDraft,
+    /// `[[tracker]]` issue-tracker binding (auto-detect by default).
+    pub tracker: TrackerDraft,
+    /// `[llm.distill]` model pass (off by default; gated in the UI on a resolvable tracker).
+    pub distill: DistillDraft,
 }
 
 impl WizardDraft {
@@ -310,6 +412,8 @@ impl WizardDraft {
             oracle_min_interval_secs: oracle.auto_run_min_interval_secs,
             version_check: VersionCheckConfig::default().enabled,
             hooks: HooksDraft::default(),
+            tracker: TrackerDraft::default(),
+            distill: DistillDraft::default(),
         }
     }
 
@@ -358,6 +462,10 @@ impl WizardDraft {
             version_check: cfg.version_check.enabled,
             // Task 16 fills git from the current installed hook status.
             hooks: HooksDraft::default(),
+            // Tracker mode can't be told from the resolved `cfg.trackers` (which folds in
+            // auto-detection); `from_existing` refines it from the raw `[[tracker]]` block.
+            tracker: TrackerDraft::default(),
+            distill: distill_draft_from_config(&cfg.llm.distill),
         }
     }
 
@@ -380,6 +488,14 @@ impl WizardDraft {
         if let Some(remote) = raw_remote_draft(&doc) {
             draft.remote = Some(remote);
         }
+        // An explicit `[[tracker]]` block means the user configured a binding (not auto-detect);
+        // recover its literals so reconfigure round-trips them.
+        if let Some(tracker) = raw_tracker_draft(&doc) {
+            draft.tracker = tracker;
+        }
+        // An ephemeral distill block (even a disabled/staged one) is preserved verbatim; flag it
+        // precisely from the raw doc so a defaulted (block-less) config isn't mistaken for one.
+        draft.distill.preserved_ephemeral = distill_remote_has_key(&doc, "cookbook");
         draft
     }
 
@@ -406,6 +522,7 @@ impl WizardDraft {
             bindings: self.bindings.clone(),
             backend,
             oracle_auto_run: self.oracle_auto_run,
+            distill_enabled: !matches!(self.distill.mode, DistillMode::Off),
         }
     }
 
@@ -542,7 +659,129 @@ impl WizardDraft {
         // [version_check] enabled
         doc["version_check"]["enabled"] = toml_edit::value(self.version_check);
 
+        self.emit_distill(&mut doc);
+        self.emit_tracker(&mut doc);
+
         Ok(doc.to_string())
+    }
+
+    /// Emit `[llm.distill]` (the `enabled` flag always; the `[llm.distill.remote]` serving block
+    /// set or removed by mode). The validated-box serving values come straight from
+    /// [`RemoteDreamConfig::distill_default`], so the wizard and the shipped default never drift.
+    fn emit_distill(&self, doc: &mut DocumentMut) {
+        doc["llm"]["distill"]["enabled"] =
+            toml_edit::value(!matches!(self.distill.mode, DistillMode::Off));
+        match self.distill.mode {
+            // Off sets `enabled = false` (above) but LEAVES any existing `[llm.distill.remote]`
+            // intact — a disabled remote is inert, and a user may have staged a serving block to
+            // enable later. Removing it would silently discard that config on an unrelated
+            // reconfigure. (A fresh off config simply has no remote block to leave.)
+            DistillMode::Off => {},
+            // Reconfigure safety: if the file already has an ephemeral serving block, the user may
+            // have customized its model/gpu/cookbook/timeouts — leave it untouched rather than
+            // clobber it with the shipped default. Only synthesize the default when there is no
+            // ephemeral block to keep (a fresh init, or a switch from off/connect).
+            DistillMode::ValidatedBox
+                if self.distill.preserved_ephemeral && distill_remote_has_key(doc, "cookbook") => {
+            },
+            DistillMode::ValidatedBox => {
+                let d = RemoteDreamConfig::distill_default();
+                if let Some(t) = distill_remote_table(doc) {
+                    t.insert("backend", toml_edit::value(d.backend.as_db_str()));
+                    if let Some(cb) = &d.cookbook {
+                        t.insert("cookbook", toml_edit::value(cb.clone()));
+                    }
+                    t.remove("endpoint");
+                    if let Some(gpu) = &d.gpu {
+                        t.insert("gpu", toml_edit::value(gpu.clone()));
+                    }
+                    t.insert("model", toml_edit::value(d.model.clone()));
+                    if let Some(pt) = d.provision_timeout_s {
+                        t.insert("provision_timeout_s", toml_edit::value(clamp_i64(pt)));
+                    }
+                    t.insert("request_timeout_s", toml_edit::value(clamp_i64(d.request_timeout_s)));
+                }
+            },
+            DistillMode::Connect => {
+                // Preserve an existing connect block's serving fields (`backend`,
+                // `request_timeout_s`, `auth_env`): the wizard only edits endpoint/model, so a
+                // plain reconfigure must not reset a custom backend or timeout. A fresh connect (or
+                // a switch from box/off) omits `backend` so it defaults to ollama and uses the low
+                // distill request cap.
+                let fresh = !distill_remote_has_key(doc, "endpoint");
+                if let Some(t) = distill_remote_table(doc) {
+                    t.insert(
+                        "endpoint",
+                        toml_edit::value(self.distill.endpoint.trim().to_string()),
+                    );
+                    t.insert("model", toml_edit::value(self.distill.model.trim().to_string()));
+                    t.remove("cookbook");
+                    t.remove("gpu");
+                    t.remove("provision_timeout_s");
+                    if fresh {
+                        // A stale `backend = "vllm"` would send an ollama model name to a vLLM
+                        // server; omit it so a fresh connect defaults to ollama.
+                        t.remove("backend");
+                        t.insert("request_timeout_s", toml_edit::value(240_i64));
+                    }
+                }
+            },
+        }
+    }
+
+    /// Emit an explicit `[[tracker]]` binding in `Configure` mode. `AutoDetect` DROPS every
+    /// `[[tracker]]` block so `resolve_trackers` auto-detects from `origin` again — it auto-detects
+    /// only when the binding list is *empty*, so a partial removal would leave the remainder in
+    /// control and contradict the chosen mode. (The wizard manages the whole tracker section: a
+    /// multi-binding config isn't representable in its single-tracker UI, so auto-detect means "no
+    /// explicit bindings".)
+    fn emit_tracker(&self, doc: &mut DocumentMut) {
+        if self.tracker.mode == TrackerMode::AutoDetect {
+            doc.as_table_mut().remove("tracker");
+            return;
+        }
+        let t = &self.tracker;
+        let mut table = Table::new();
+        table.insert("provider", toml_edit::value(t.provider.as_db_str()));
+        let remote = t.remote.trim();
+        if !remote.is_empty() && remote != "origin" {
+            table.insert("remote", toml_edit::value(remote.to_string()));
+        }
+        let project = t.project.trim();
+        if !project.is_empty() {
+            table.insert("project", toml_edit::value(project.to_string()));
+        }
+        let base_url = t.base_url.trim();
+        if !base_url.is_empty() {
+            table.insert("base_url", toml_edit::value(base_url.to_string()));
+        }
+        match t.auth {
+            TrackerAuthMode::Anonymous => {},
+            TrackerAuthMode::Env => {
+                table.insert("auth", toml_edit::value(auth_inline("env", t.auth_value.trim())));
+            },
+            TrackerAuthMode::Command => {
+                table.insert(
+                    "auth",
+                    toml_edit::value(auth_inline("token_command", t.auth_value.trim())),
+                );
+            },
+        }
+        let tags: Vec<&str> =
+            t.tags.split(',').map(str::trim).filter(|tag| !tag.is_empty()).collect();
+        if !tags.is_empty() {
+            let mut arr = Array::new();
+            for tag in tags {
+                arr.push(tag);
+            }
+            table.insert("tags", toml_edit::value(arr));
+        }
+        // The wizard owns the whole tracker section (its UI represents a single binding): replace
+        // any existing array with exactly this one table, so hidden extra `[[tracker]]` entries
+        // can't keep syncing behind the user's back (AutoDetect clears the section the same way).
+        let mut aot = ArrayOfTables::new();
+        aot.push(table);
+        doc["tracker"] = Item::ArrayOfTables(aot);
     }
 }
 
@@ -571,6 +810,106 @@ fn remote_draft_from_config(r: &RemoteEmbeddingConfig) -> RemoteDraft {
         max_batch_chars: r.max_batch_chars,
         auth_env: r.auth_env.clone(),
     }
+}
+
+/// Map the resolved `[llm.distill]` config back to the wizard's mode. The resolved config can't
+/// tell "the validated box" from any other ephemeral block, so an enabled ephemeral binding maps
+/// to `ValidatedBox` (the only ephemeral serving the wizard offers).
+fn distill_draft_from_config(cfg: &DistillLlmConfig) -> DistillDraft {
+    let connect = cfg.remote.is_connect();
+    // Populate the serving fields from the remote REGARDLESS of `enabled`, so a staged (disabled)
+    // remote's values are visible when the user enables it — only the initial MODE reflects
+    // `enabled`. `from_existing` refines `preserved_ephemeral` precisely from the raw doc.
+    let mode = if !cfg.enabled {
+        DistillMode::Off
+    } else if connect {
+        DistillMode::Connect
+    } else {
+        DistillMode::ValidatedBox
+    };
+    DistillDraft {
+        mode,
+        endpoint: cfg.remote.endpoint.clone().unwrap_or_default(),
+        model: if connect { cfg.remote.model.clone() } else { String::new() },
+        preserved_ephemeral: !connect,
+    }
+}
+
+/// Recover a `Configure`-mode [`TrackerDraft`] from the first raw `[[tracker]]` block, if any.
+/// Returns `None` when there is no explicit binding (the auto-detect default stands).
+fn raw_tracker_draft(doc: &DocumentMut) -> Option<TrackerDraft> {
+    let t = doc.get("tracker")?.as_array_of_tables()?.get(0)?;
+    let provider = t
+        .get("provider")
+        .and_then(Item::as_str)
+        .and_then(|s| Tracker::from_db_str(s).ok())
+        .unwrap_or(Tracker::Github);
+    // `as_table_like` recovers BOTH the inline `auth = { env = ... }` and the standard
+    // `[tracker.auth]` table forms — `as_inline_table` would miss the latter and silently drop the
+    // credential source on reconfigure.
+    let (auth, auth_value) = match t.get("auth").and_then(Item::as_table_like) {
+        Some(auth) =>
+            if let Some(env) = auth.get("env").and_then(Item::as_str) {
+                (TrackerAuthMode::Env, env.to_string())
+            } else if let Some(cmd) = auth.get("token_command").and_then(Item::as_str) {
+                (TrackerAuthMode::Command, cmd.to_string())
+            } else {
+                (TrackerAuthMode::Anonymous, String::new())
+            },
+        None => (TrackerAuthMode::Anonymous, String::new()),
+    };
+    let str_field =
+        |key: &str| t.get(key).and_then(Item::as_str).map(str::to_string).unwrap_or_default();
+    let tags = t
+        .get("tags")
+        .and_then(Item::as_array)
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    Some(TrackerDraft {
+        mode: TrackerMode::Configure,
+        provider,
+        auth,
+        auth_value,
+        base_url: str_field("base_url"),
+        project: str_field("project"),
+        remote: str_field("remote"),
+        tags,
+    })
+}
+
+/// Whether the existing `[llm.distill.remote]` block carries `key`. Used to tell a reconfigure of
+/// an ephemeral (`cookbook`) or connect (`endpoint`) block from a fresh one, so the wizard can
+/// preserve a user's custom serving fields instead of overwriting them.
+fn distill_remote_has_key(doc: &DocumentMut, key: &str) -> bool {
+    doc.get("llm")
+        .and_then(Item::as_table_like)
+        .and_then(|t| t.get("distill"))
+        .and_then(Item::as_table_like)
+        .and_then(|t| t.get("remote"))
+        .and_then(Item::as_table_like)
+        .and_then(|t| t.get(key))
+        .is_some()
+}
+
+/// `doc["llm"]["distill"]["remote"]` as a mutable table, creating it if absent.
+fn distill_remote_table(doc: &mut DocumentMut) -> Option<&mut dyn toml_edit::TableLike> {
+    let item = doc["llm"]["distill"]["remote"].or_insert(Item::Table(Table::new()));
+    if item.as_table_like_mut().is_none() {
+        *item = Item::Table(Table::new());
+    }
+    item.as_table_like_mut()
+}
+
+/// A `{ <key> = <value> }` inline auth table (`env` or `token_command`).
+fn auth_inline(key: &str, value: &str) -> InlineTable {
+    let mut inline = InlineTable::new();
+    inline.insert(key, value.into());
+    inline
+}
+
+/// Clamp a `u64` timeout to `i64` for TOML emission (TOML integers are i64).
+fn clamp_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
 }
 
 fn raw_target_bindings(doc: &DocumentMut) -> Option<BTreeMap<Language, Vec<PathBuf>>> {
@@ -1266,5 +1605,293 @@ mod tests {
         assert!(!d.hooks.git);
         // root_abs must be the absolute path passed in.
         assert_eq!(d.root_abs, root_abs);
+    }
+
+    // ── Distill + tracker emission ──────────────────────────────────────────────
+
+    fn fresh_draft() -> WizardDraft {
+        let mut d = WizardDraft::from_scan(&RepoScan::default(), ".".into(), PathBuf::from("."));
+        d.bindings.insert(Language::Rust, vec!["src".into()]);
+        d
+    }
+
+    #[test]
+    fn distill_off_by_default_writes_disabled_and_no_remote() {
+        let doc: DocumentMut = fresh_draft().write_fresh().parse().unwrap();
+        assert_eq!(doc["llm"]["distill"]["enabled"].as_bool(), Some(false));
+        let has_remote = doc["llm"]["distill"]
+            .as_table_like()
+            .and_then(|t| t.get("remote"))
+            .and_then(Item::as_table_like)
+            .is_some();
+        assert!(!has_remote, "distill-off must not emit a remote serving table");
+    }
+
+    #[test]
+    fn distill_validated_box_emits_the_shipped_default_serving_block() {
+        let mut d = fresh_draft();
+        d.distill.mode = DistillMode::ValidatedBox;
+        let doc: DocumentMut = d.write_fresh().parse().unwrap();
+        assert_eq!(doc["llm"]["distill"]["enabled"].as_bool(), Some(true));
+        let remote = doc["llm"]["distill"]["remote"].as_table_like().unwrap();
+        // The emitted values come from the shipped default, so they can't drift from it.
+        let default = RemoteDreamConfig::distill_default();
+        assert_eq!(remote.get("backend").and_then(Item::as_str), Some(default.backend.as_db_str()));
+        assert_eq!(remote.get("model").and_then(Item::as_str), Some(default.model.as_str()));
+        assert_eq!(remote.get("gpu").and_then(Item::as_str), default.gpu.as_deref());
+        assert_eq!(
+            remote.get("provision_timeout_s").and_then(Item::as_integer),
+            default.provision_timeout_s.map(clamp_i64),
+        );
+        assert!(remote.get("endpoint").is_none(), "the validated box is ephemeral, not connect");
+    }
+
+    #[test]
+    fn a_disabled_connect_distill_still_populates_the_draft_fields() {
+        // Loaded Off (disabled) but the endpoint/model are visible so enabling it doesn't require
+        // re-entering values already in the config.
+        let cfg = DistillLlmConfig {
+            enabled: false,
+            remote: RemoteDreamConfig {
+                backend: RemoteBackend::Ollama,
+                endpoint: Some("http://localhost:11434".to_string()),
+                cookbook: None,
+                model: "staged-model".to_string(),
+                gpu: None,
+                auth_env: None,
+                request_timeout_s: 240,
+                provision_timeout_s: None,
+            },
+        };
+        let draft = distill_draft_from_config(&cfg);
+        assert_eq!(draft.mode, DistillMode::Off);
+        assert_eq!(draft.endpoint, "http://localhost:11434");
+        assert_eq!(draft.model, "staged-model");
+    }
+
+    #[test]
+    fn a_disabled_distill_keeps_its_staged_remote_block() {
+        // A config that stages a distill remote while enabled = false must not lose it on an
+        // unrelated reconfigure: `from_config` loads Off, and emit must LEAVE the inert remote.
+        let original = "[index]\nroot = \".\"\n[llm.embedding]\nmodel = \"m\"\n\
+                        [llm.distill]\nenabled = false\n[llm.distill.remote]\nbackend = \"ollama\"\n\
+                        endpoint = \"http://localhost:11434\"\nmodel = \"staged\"\n";
+        let mut d = fresh_draft();
+        d.distill.mode = DistillMode::Off;
+        let doc: DocumentMut = d.patch_existing(original).unwrap().parse().unwrap();
+        assert_eq!(doc["llm"]["distill"]["enabled"].as_bool(), Some(false));
+        let remote = doc["llm"]["distill"]["remote"].as_table_like().unwrap();
+        assert_eq!(remote.get("endpoint").and_then(Item::as_str), Some("http://localhost:11434"));
+        assert_eq!(remote.get("model").and_then(Item::as_str), Some("staged"));
+    }
+
+    #[test]
+    fn distill_connect_emits_endpoint_and_model() {
+        let mut d = fresh_draft();
+        d.distill.mode = DistillMode::Connect;
+        d.distill.endpoint = "http://localhost:11434".to_string();
+        d.distill.model = "qwen3:4b-instruct".to_string();
+        let doc: DocumentMut = d.write_fresh().parse().unwrap();
+        assert_eq!(doc["llm"]["distill"]["enabled"].as_bool(), Some(true));
+        let remote = doc["llm"]["distill"]["remote"].as_table_like().unwrap();
+        assert_eq!(remote.get("endpoint").and_then(Item::as_str), Some("http://localhost:11434"));
+        assert_eq!(remote.get("model").and_then(Item::as_str), Some("qwen3:4b-instruct"));
+        assert!(remote.get("cookbook").is_none());
+    }
+
+    #[test]
+    fn tracker_auto_detect_writes_no_binding() {
+        let doc: DocumentMut = fresh_draft().write_fresh().parse().unwrap();
+        assert!(doc.get("tracker").is_none(), "auto-detect must not emit a [[tracker]] block");
+    }
+
+    #[test]
+    fn tracker_configure_emits_a_binding_with_auth_and_tags() {
+        let mut d = fresh_draft();
+        d.tracker.mode = TrackerMode::Configure;
+        d.tracker.provider = Tracker::Gitlab;
+        d.tracker.auth = TrackerAuthMode::Command;
+        d.tracker.auth_value = "glab auth token".to_string();
+        d.tracker.base_url = "https://gitlab.example.com".to_string();
+        d.tracker.project = "group/sub/repo".to_string();
+        d.tracker.tags = "bug, perf".to_string();
+        let doc: DocumentMut = d.write_fresh().parse().unwrap();
+        let t = doc["tracker"].as_array_of_tables().unwrap().get(0).unwrap().clone();
+        assert_eq!(t.get("provider").and_then(Item::as_str), Some("gitlab"));
+        assert_eq!(t.get("base_url").and_then(Item::as_str), Some("https://gitlab.example.com"));
+        assert_eq!(t.get("project").and_then(Item::as_str), Some("group/sub/repo"));
+        let auth = t.get("auth").and_then(Item::as_inline_table).unwrap();
+        assert_eq!(auth.get("token_command").and_then(|v| v.as_str()), Some("glab auth token"));
+        let tags: Vec<&str> = t
+            .get("tags")
+            .and_then(Item::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(tags, vec!["bug", "perf"]);
+    }
+
+    #[test]
+    fn configured_tracker_round_trips_through_raw_recovery() {
+        let mut d = fresh_draft();
+        d.tracker.mode = TrackerMode::Configure;
+        d.tracker.provider = Tracker::Github;
+        d.tracker.auth = TrackerAuthMode::Env;
+        d.tracker.auth_value = "GH_TOKEN".to_string();
+        let doc: DocumentMut = d.write_fresh().parse().unwrap();
+        let recovered = raw_tracker_draft(&doc).expect("configured tracker must round-trip");
+        assert_eq!(recovered.mode, TrackerMode::Configure);
+        assert_eq!(recovered.provider, Tracker::Github);
+        assert_eq!(recovered.auth, TrackerAuthMode::Env);
+        assert_eq!(recovered.auth_value, "GH_TOKEN");
+    }
+
+    #[test]
+    fn auto_detect_on_reconfigure_removes_all_explicit_trackers() {
+        // Two bindings: auto-detect must drop BOTH, since resolve_trackers only auto-detects when
+        // the binding list is empty — a partial removal would leave the remainder in control.
+        let original = "[index]\nroot = \".\"\n[target_bindings]\nrust = \
+                        [\"src\"]\n[llm.embedding]\nmodel = \"m\"\n[[tracker]]\nprovider = \
+                        \"github\"\nauth = { token_command = \"gh auth token\" \
+                        }\n[[tracker]]\nprovider = \"jira\"\nproject = \"PROJ\"\n";
+        let mut d = fresh_draft();
+        d.tracker.mode = TrackerMode::AutoDetect;
+        let doc: DocumentMut = d.patch_existing(original).unwrap().parse().unwrap();
+        assert!(
+            doc.get("tracker").is_none(),
+            "auto-detect must drop every [[tracker]] so origin detection runs again"
+        );
+    }
+
+    #[test]
+    fn validated_box_preserves_a_custom_ephemeral_distill_on_reconfigure() {
+        let original = "[index]\nroot = \".\"\n[llm.embedding]\nmodel = \
+                        \"m\"\n[llm.distill]\nenabled = true\n[llm.distill.remote]\nbackend = \
+                        \"vllm\"\ncookbook = \"@me/cookbook custom\"\ngpu = \"H100\"\nmodel = \
+                        \"my/custom-model\"\nprovision_timeout_s = 1700\n";
+        let mut d = fresh_draft();
+        d.distill.mode = DistillMode::ValidatedBox;
+        d.distill.preserved_ephemeral = true; // as `from_config` flags a loaded ephemeral box
+        let doc: DocumentMut = d.patch_existing(original).unwrap().parse().unwrap();
+        let remote = doc["llm"]["distill"]["remote"].as_table_like().unwrap();
+        // The user's custom ephemeral serving survives an unrelated reconfigure.
+        assert_eq!(remote.get("model").and_then(Item::as_str), Some("my/custom-model"));
+        assert_eq!(remote.get("gpu").and_then(Item::as_str), Some("H100"));
+        assert_eq!(remote.get("cookbook").and_then(Item::as_str), Some("@me/cookbook custom"));
+        assert_eq!(doc["llm"]["distill"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn configured_tracker_round_trips_a_non_origin_remote() {
+        let mut d = fresh_draft();
+        d.tracker.mode = TrackerMode::Configure;
+        d.tracker.provider = Tracker::Github;
+        d.tracker.remote = "upstream".to_string();
+        let doc: DocumentMut = d.write_fresh().parse().unwrap();
+        let t = doc["tracker"].as_array_of_tables().unwrap().get(0).unwrap().clone();
+        assert_eq!(t.get("remote").and_then(Item::as_str), Some("upstream"));
+        assert_eq!(raw_tracker_draft(&doc).unwrap().remote, "upstream");
+    }
+
+    #[test]
+    fn switching_a_box_to_connect_on_reconfigure_drops_the_vllm_backend() {
+        // A reconfigure from the ephemeral box to a connect endpoint must not leave `backend =
+        // "vllm"` behind — that would send an ollama model name to a vLLM server.
+        let original = "[index]\nroot = \".\"\n[llm.embedding]\nmodel = \
+                        \"m\"\n[llm.distill]\nenabled = true\n[llm.distill.remote]\nbackend = \
+                        \"vllm\"\ncookbook = \"@rag-rat/cookbook modal\"\ngpu = \"L40S\"\nmodel = \
+                        \"big\"\n";
+        let mut d = fresh_draft();
+        d.distill.mode = DistillMode::Connect;
+        d.distill.endpoint = "http://localhost:11434".to_string();
+        d.distill.model = "qwen3:4b-instruct".to_string();
+        let doc: DocumentMut = d.patch_existing(original).unwrap().parse().unwrap();
+        let remote = doc["llm"]["distill"]["remote"].as_table_like().unwrap();
+        assert!(remote.get("backend").is_none(), "stale vllm backend must be dropped");
+        assert!(remote.get("cookbook").is_none());
+        assert_eq!(remote.get("endpoint").and_then(Item::as_str), Some("http://localhost:11434"));
+    }
+
+    #[test]
+    fn configure_replaces_all_existing_trackers_with_the_single_binding() {
+        // Two existing bindings; Configure must leave exactly the one the wizard manages, else the
+        // hidden extra keeps syncing.
+        let original = "[index]\nroot = \".\"\n[llm.embedding]\nmodel = \
+                        \"m\"\n[[tracker]]\nprovider = \"github\"\nproject = \
+                        \"a/b\"\n[[tracker]]\nprovider = \"jira\"\nproject = \"OLD\"\n";
+        let mut d = fresh_draft();
+        d.tracker.mode = TrackerMode::Configure;
+        d.tracker.provider = Tracker::Github;
+        d.tracker.project = "owner/repo".to_string();
+        let doc: DocumentMut = d.patch_existing(original).unwrap().parse().unwrap();
+        let aot = doc["tracker"].as_array_of_tables().unwrap();
+        assert_eq!(aot.len(), 1, "the wizard owns the whole tracker section");
+        assert_eq!(aot.get(0).unwrap().get("project").and_then(Item::as_str), Some("owner/repo"));
+    }
+
+    #[test]
+    fn an_existing_ephemeral_distill_loads_as_a_preserved_box() {
+        let cfg = DistillLlmConfig { enabled: true, remote: RemoteDreamConfig::distill_default() };
+        let draft = distill_draft_from_config(&cfg);
+        assert_eq!(draft.mode, DistillMode::ValidatedBox);
+        assert!(
+            draft.preserved_ephemeral,
+            "an existing ephemeral box is preserved, not re-confirmed"
+        );
+    }
+
+    #[test]
+    fn a_fresh_validated_box_replaces_an_existing_custom_cookbook() {
+        // preserved_ephemeral=false (a deliberate box choice in the wizard) → the shipped default
+        // is written even though the original still carries a custom cookbook.
+        let original = "[index]\nroot = \".\"\n[llm.embedding]\nmodel = \
+                        \"m\"\n[llm.distill]\nenabled = true\n[llm.distill.remote]\nbackend = \
+                        \"vllm\"\ncookbook = \"@me/custom modal\"\ngpu = \"H100\"\nmodel = \
+                        \"custom\"\n";
+        let mut d = fresh_draft();
+        d.distill.mode = DistillMode::ValidatedBox;
+        d.distill.preserved_ephemeral = false;
+        let doc: DocumentMut = d.patch_existing(original).unwrap().parse().unwrap();
+        let remote = doc["llm"]["distill"]["remote"].as_table_like().unwrap();
+        let default = RemoteDreamConfig::distill_default();
+        assert_eq!(remote.get("model").and_then(Item::as_str), Some(default.model.as_str()));
+        assert_eq!(remote.get("cookbook").and_then(Item::as_str), default.cookbook.as_deref());
+    }
+
+    #[test]
+    fn connect_reconfigure_preserves_a_custom_backend_and_timeout() {
+        // A plain reconfigure of an existing connect block must keep its backend + request timeout;
+        // the wizard only edits endpoint/model.
+        let original = "[index]\nroot = \".\"\n[llm.embedding]\nmodel = \"m\"\n\
+                        [llm.distill]\nenabled = true\n[llm.distill.remote]\nbackend = \"vllm\"\n\
+                        endpoint = \"http://gpu:8000\"\nmodel = \"old\"\nrequest_timeout_s = 600\n";
+        let mut d = fresh_draft();
+        d.distill.mode = DistillMode::Connect;
+        d.distill.endpoint = "http://gpu:8000".to_string();
+        d.distill.model = "new-model".to_string();
+        let doc: DocumentMut = d.patch_existing(original).unwrap().parse().unwrap();
+        let remote = doc["llm"]["distill"]["remote"].as_table_like().unwrap();
+        assert_eq!(remote.get("model").and_then(Item::as_str), Some("new-model"));
+        assert_eq!(remote.get("backend").and_then(Item::as_str), Some("vllm"));
+        assert_eq!(remote.get("request_timeout_s").and_then(Item::as_integer), Some(600));
+    }
+
+    #[test]
+    fn table_form_tracker_auth_is_recovered() {
+        // Auth expressed as a STANDARD table (not the inline `{ ... }`): `as_inline_table` would
+        // miss it and load anonymous, dropping the credential on reconfigure.
+        let mut doc = DocumentMut::new();
+        let mut auth = Table::new();
+        auth.insert("env", toml_edit::value("GH_TOKEN"));
+        let mut tracker = Table::new();
+        tracker.insert("provider", toml_edit::value("github"));
+        tracker.insert("auth", Item::Table(auth));
+        let mut aot = ArrayOfTables::new();
+        aot.push(tracker);
+        doc["tracker"] = Item::ArrayOfTables(aot);
+        let recovered = raw_tracker_draft(&doc).expect("tracker present");
+        assert_eq!(recovered.auth, TrackerAuthMode::Env);
+        assert_eq!(recovered.auth_value, "GH_TOKEN");
     }
 }

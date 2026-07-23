@@ -18,7 +18,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use super::draft::RemoteMode;
+use super::draft::{DistillMode, RemoteMode, TrackerAuthMode, TrackerMode};
 use super::probe::{ProbeKind, ProbeStatus};
 use super::state::WizardState;
 use super::steps::{CheckResult, Sev as CheckSeverity, StepId, can_write};
@@ -84,6 +84,49 @@ impl ReviewModel {
             },
         }
 
+        // Papertrail / tracker
+        match draft.tracker.mode {
+            TrackerMode::AutoDetect => {
+                let detected = state
+                    .detected_origin
+                    .as_ref()
+                    .map(|d| format!("{}: {}", d.provider.as_db_str(), d.project))
+                    .unwrap_or_else(|| "none detected".to_string());
+                summary.push(format!("  tracker:    auto-detect  ({detected})"));
+            },
+            TrackerMode::Configure => {
+                let auth = match draft.tracker.auth {
+                    TrackerAuthMode::Anonymous => "anonymous".to_string(),
+                    TrackerAuthMode::Env => format!("env {}", draft.tracker.auth_value.trim()),
+                    TrackerAuthMode::Command =>
+                        format!("command {}", draft.tracker.auth_value.trim()),
+                };
+                summary.push(format!(
+                    "  tracker:    {}  auth={}",
+                    draft.tracker.provider.as_db_str(),
+                    auth
+                ));
+            },
+        }
+
+        // Distillation — shown as the EFFECTIVE state: off whenever the tracker gate isn't
+        // satisfied (matching what `build_result` writes), regardless of the draft's mode.
+        let distill = if !super::steps::tracker_is_set_up(state) {
+            "off (needs a tracker)".to_string()
+        } else {
+            match draft.distill.mode {
+                DistillMode::Off => "off".to_string(),
+                DistillMode::ValidatedBox =>
+                    if draft.distill.preserved_ephemeral {
+                        "GPU box (existing config)".to_string()
+                    } else {
+                        "validated 30B GPU box".to_string()
+                    },
+                DistillMode::Connect => format!("connect  {}", draft.distill.endpoint.trim()),
+            }
+        };
+        summary.push(format!("  distill:    {distill}"));
+
         // Oracle auto_run
         summary.push(format!(
             "  oracle:     auto_run={}",
@@ -118,8 +161,10 @@ impl ReviewModel {
             .collect();
 
         // ── diff ─────────────────────────────────────────────────────────────────
+        // Diff the NORMALIZED draft (the same one `build_result` writes) so the preview matches the
+        // saved file — e.g. distillation forced off when no tracker resolves.
         let diff = original.and_then(|orig| {
-            let patched = draft.patch_existing(orig).ok()?;
+            let patched = super::normalized_write_draft(state).patch_existing(orig).ok()?;
             Some(line_diff(orig, &patched))
         });
 

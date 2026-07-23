@@ -183,10 +183,10 @@ pub use discovery::{
 pub(crate) use discovery::{main_worktree_root, normalize_existing_dir, resolve_default_database};
 #[cfg(test)]
 pub(crate) use load::{anchor_root_to_main_worktree, resolve_targets};
-pub use raw::endpoint_authority_has_userinfo;
 pub(crate) use raw::{RawConfig, RawTarget, resolve_relative_cookbook_path};
 #[cfg(test)]
 pub(crate) use raw::{RawMemory, RawOracle, RawSearch, RawVersionCheck, RawWatch};
+pub use raw::{endpoint_authority_has_userinfo, valid_tracker_base_url, valid_tracker_project};
 pub use types::{
     Config, DEFAULT_QUERY_ENDPOINT, DistillLlmConfig, DreamLlmConfig, EmbeddingBackend,
     EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,

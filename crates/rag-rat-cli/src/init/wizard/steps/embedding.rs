@@ -445,7 +445,7 @@ pub(super) fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
     }
 }
 
-fn one_line_field<'a>(value: &'a str, title: &'a str, border: Style) -> Paragraph<'a> {
+pub(super) fn one_line_field<'a>(value: &'a str, title: &'a str, border: Style) -> Paragraph<'a> {
     Paragraph::new(Line::from(Span::raw(value)))
         .style(theme::base())
         .block(theme::block(title).border_style(border))

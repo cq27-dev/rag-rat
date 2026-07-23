@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+use rag_rat_papertrail::ResolvedTracker;
+
 use super::catalog::CookbookCatalog;
-use super::draft::WizardDraft;
+use super::draft::{TrackerMode, WizardDraft};
 use super::probe::ProbeRegistry;
 use super::steps::hooks::HookConflict;
 use super::steps::{CheckResult, StepId, StepState};
@@ -77,9 +79,35 @@ pub(crate) fn provision_confirm_satisfied(ui: &WizardUiState) -> bool {
     ui.provision_confirm.trim() == PROVISION_CONFIRM_WORD
 }
 
+/// Seed the explicit-binding defaults from auto-detection — but ONLY for a still-auto-detect draft.
+/// A reconfigure draft that already recovered an explicit `[[tracker]]` (mode `Configure`) keeps
+/// its own provider/base_url; overwriting them with the origin-derived values would silently
+/// corrupt a binding (e.g. a Jira tracker in a GitHub-hosted repo becomes GitHub while keeping the
+/// Jira project/auth). For a fresh draft it just pre-selects the detected provider so switching to
+/// Configure starts from the right place.
+fn seed_tracker_from_detection(draft: &mut WizardDraft, detected: Option<&ResolvedTracker>) {
+    if draft.tracker.mode != TrackerMode::AutoDetect {
+        return;
+    }
+    if let Some(det) = detected {
+        draft.tracker.provider = det.provider;
+        if let Some(base) = &det.base_url {
+            draft.tracker.base_url = base.clone();
+        }
+    }
+}
+
 pub(crate) struct WizardState {
     pub draft: WizardDraft,
     pub cookbooks: CookbookCatalog,
+    /// What auto-detection resolves from the `origin` remote — the AutoDetect gate + panel
+    /// (runtime auto-detection always uses `origin`, regardless of a binding's configured
+    /// remote).
+    pub detected_origin: Option<ResolvedTracker>,
+    /// What the binding's CONFIGURED remote resolves to (`origin` by default) — the Configure
+    /// gate. Distinct from `detected_origin` only for an explicit non-`origin` remote. Both
+    /// are computed once at construction (git-remote reads), never re-run per frame.
+    pub detected_configured: Option<ResolvedTracker>,
     pub ui: WizardUiState,
     pub scan: RepoScan,
     pub probes: ProbeRegistry,
@@ -98,14 +126,27 @@ impl WizardState {
     }
 
     pub(crate) fn with_cookbooks(
-        draft: WizardDraft,
+        mut draft: WizardDraft,
         scan: RepoScan,
         cookbooks: CookbookCatalog,
     ) -> Self {
         let n = StepId::COUNT;
+        // Detect against BOTH origin (what AutoDetect binds at runtime) and the binding's
+        // configured remote (what a Configure binding derives from) — they differ only for an
+        // explicit non-`origin` remote, and conflating them makes the gate use the wrong one.
+        let detected_origin = rag_rat_papertrail::auto_detect_tracker(&draft.root_abs);
+        let configured_remote = match draft.tracker.remote.trim() {
+            "" => "origin",
+            other => other,
+        };
+        let detected_configured =
+            rag_rat_papertrail::detect_tracker_for_remote(&draft.root_abs, configured_remote);
+        seed_tracker_from_detection(&mut draft, detected_configured.as_ref());
         Self {
             draft,
             cookbooks,
+            detected_origin,
+            detected_configured,
             ui: WizardUiState::new(),
             scan,
             probes: ProbeRegistry::new(),
@@ -174,5 +215,37 @@ impl WizardState {
         if disconnected {
             self.provision_log_rx = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rag_rat_base::config::Tracker;
+
+    use super::*;
+    use crate::init::RepoScan;
+    use crate::init::wizard::draft::WizardDraft;
+
+    fn draft() -> WizardDraft {
+        WizardDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."))
+    }
+
+    #[test]
+    fn detection_seeds_an_auto_detect_draft_but_never_a_configured_one() {
+        let github = rag_rat_papertrail::detect_tracker_from_remote_url("https://github.com/o/r");
+
+        // Fresh auto-detect draft: the detected provider is seeded.
+        let mut d = draft();
+        d.tracker.provider = Tracker::Bitbucket; // a stale placeholder
+        seed_tracker_from_detection(&mut d, github.as_ref());
+        assert_eq!(d.tracker.provider, Tracker::Github);
+
+        // Reconfigure draft (already Configure): detection must NOT overwrite the recovered
+        // provider — a Jira binding in a GitHub-hosted repo must stay Jira.
+        let mut d = draft();
+        d.tracker.mode = TrackerMode::Configure;
+        d.tracker.provider = Tracker::Jira;
+        seed_tracker_from_detection(&mut d, github.as_ref());
+        assert_eq!(d.tracker.provider, Tracker::Jira, "a configured binding must be preserved");
     }
 }

@@ -131,9 +131,19 @@ fn resolve_binding(binding: &TrackerConfig, root: &Path) -> Option<ResolvedTrack
     })
 }
 
-/// Zero-config detection from the `origin` remote URL.
-fn auto_detect_tracker(root: &Path) -> Option<ResolvedTracker> {
-    detect_tracker_from_remote_url(&git_remote_url(root, "origin")?)
+/// Zero-config detection from the `origin` remote URL — the same detection `resolve_trackers`
+/// applies when no `[[tracker]]` binding is configured. Exposed so callers (the `rag-rat init`
+/// wizard) can show what auto-detection would bind and gate tracker-dependent features on it.
+pub fn auto_detect_tracker(root: &Path) -> Option<ResolvedTracker> {
+    detect_tracker_for_remote(root, "origin")
+}
+
+/// Detect the tracker a specific git remote resolves to — the same host/path derivation
+/// auto-detection applies to `origin`, for any named remote. Returns `None` when the remote is
+/// missing or its host is not a recognized code host. Exposed so the `rag-rat init` wizard can
+/// verify a configured non-`origin` remote instead of trusting it.
+pub fn detect_tracker_for_remote(root: &Path, remote: &str) -> Option<ResolvedTracker> {
+    detect_tracker_from_remote_url(&git_remote_url(root, remote)?)
 }
 
 /// Detect (provider, project, base_url) from one git remote URL: `github.com` → GitHub, a

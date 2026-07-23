@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use tui_tree_widget::TreeState;
 
 use super::super::state::WizardState;
+use super::distillation::{handle_distillation, render_distillation, validate_distillation};
 use super::embedding::{
     handle_embedding, init_embedding_step, render_embedding, scroll_embedding, validate_embedding,
 };
@@ -18,6 +19,7 @@ use super::indexing::{
 };
 use super::integration::{handle_integration, render_integration, validate_hooks};
 use super::oracle::{handle_oracle, render_oracle};
+use super::tracker::{handle_papertrail, render_papertrail, validate_papertrail};
 use super::types::{CheckResult, IndexZone, Outcome, StepId, StepState};
 
 pub(crate) fn step_title(id: StepId) -> &'static str {
@@ -25,6 +27,8 @@ pub(crate) fn step_title(id: StepId) -> &'static str {
         StepId::Indexing => "Indexing",
         StepId::Oracle => "Oracle",
         StepId::Embedding => "Embedding",
+        StepId::Papertrail => "Papertrail",
+        StepId::Distill => "Distill",
         StepId::Integration => "Integration",
     }
 }
@@ -37,6 +41,8 @@ pub(crate) fn step_footer(id: StepId) -> &'static str {
         StepId::Embedding =>
             "Tab/Shift-Tab field  ↑↓/j/k move  PgUp/PgDn scroll  Space select  type edit  d \
              download  t/p test  l log",
+        StepId::Papertrail => "↑↓ move  ←→ change  type edit  Enter next",
+        StepId::Distill => "↑↓ move  ←→ change  type edit  Enter next",
         StepId::Integration => "↑↓ navigate  Space toggle  t version check  g git  Enter next",
     }
 }
@@ -47,6 +53,8 @@ fn step_matches(id: StepId, step: &Option<StepState>) -> bool {
         (StepId::Indexing, Some(StepState::Indexing { .. }))
             | (StepId::Oracle, Some(StepState::Oracle))
             | (StepId::Embedding, Some(StepState::Embedding { .. }))
+            | (StepId::Papertrail, Some(StepState::Papertrail { .. }))
+            | (StepId::Distill, Some(StepState::Distill { .. }))
             | (StepId::Integration, Some(StepState::Integration { .. }))
     )
 }
@@ -74,6 +82,8 @@ pub(crate) fn init_step(id: StepId, state: &WizardState) -> StepState {
         },
         StepId::Embedding => init_embedding_step(state),
         StepId::Oracle => StepState::Oracle,
+        StepId::Papertrail => StepState::Papertrail { focus: 0 },
+        StepId::Distill => StepState::Distill { focus: 0 },
         StepId::Integration => StepState::Integration { focus: 0 },
     }
 }
@@ -83,6 +93,8 @@ pub(crate) fn render_step(id: StepId, f: &mut Frame, area: Rect, state: &mut Wiz
         StepId::Indexing => render_indexing(f, area, state),
         StepId::Oracle => render_oracle(f, area, state),
         StepId::Embedding => render_embedding(f, area, state),
+        StepId::Papertrail => render_papertrail(f, area, state),
+        StepId::Distill => render_distillation(f, area, state),
         StepId::Integration => render_integration(f, area, state),
     }
 }
@@ -96,6 +108,8 @@ pub(crate) fn step_handle_key(id: StepId, key: KeyEvent, state: &mut WizardState
         StepId::Indexing => handle_indexing(key, state),
         StepId::Oracle => handle_oracle(key, state),
         StepId::Embedding => handle_embedding(key, state),
+        StepId::Papertrail => handle_papertrail(key, state),
+        StepId::Distill => handle_distillation(key, state),
         StepId::Integration => handle_integration(key, state),
     }
 }
@@ -105,6 +119,8 @@ pub(crate) fn validate_step(id: StepId, state: &WizardState) -> CheckResult {
         StepId::Indexing => validate_indexing(state),
         StepId::Oracle => CheckResult::ok(),
         StepId::Embedding => validate_embedding(state),
+        StepId::Papertrail => validate_papertrail(state),
+        StepId::Distill => validate_distillation(state),
         StepId::Integration => validate_hooks(state),
     }
 }

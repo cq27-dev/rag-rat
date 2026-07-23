@@ -77,6 +77,21 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
          \"./recipes/my-provider.mjs\"\n# gpus = [\"small\", \"large\"]\n\n",
     );
 
+    text.push_str("[llm.distill]\n");
+    text.push_str(
+        "# Turn closed issues & PRs into typed decision records (opt-in model pass; needs an \
+         issue\n# tracker below). Run it with `rag-rat distill drain`.\n",
+    );
+    text.push_str(&format!("enabled = {}\n", plan.distill_enabled));
+    text.push_str(
+        "# Serving — the wizard writes this block when you enable distillation. Default is an \
+         ephemeral\n# 30B GPU box; a connect endpoint is the alternative.\n# \
+         [llm.distill.remote]\n# backend = \"vllm\"\n# cookbook = \"@rag-rat/cookbook modal\"\n# \
+         gpu = \"L40S\"\n# model = \"Qwen/Qwen3-30B-A3B-Instruct-2507-FP8\"\n# \
+         provision_timeout_s = 1500   # cold-pull budget, under the box's 30-min lifetime\n# \
+         request_timeout_s = 240\n\n",
+    );
+
     text.push_str(
         "# Background file watcher — keeps the index fresh as files change (defaults shown).\n# \
          [watch]\n# enabled = true\n# debounce_ms = 400           # quiet window before a reindex \
@@ -90,6 +105,21 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
     text.push_str(
         "# Check crates.io for a newer rag-rat and surface it. Best-effort, cached, never \
          blocks.\n# [version_check]\n# enabled = true\n\n",
+    );
+
+    text.push_str(
+        "# Issue tracker (optional). With NO [[tracker]] block the binding is auto-detected from \
+         the\n# git origin remote (github.com / gitlab.* / bitbucket.org). Write one to pin auth, a \
+         self-\n# hosted instance, or Jira (never auto-detected). `auth` is exactly one of env / \
+         token_command.\n# [[tracker]]\n# provider = \"github\"           # github | gitlab | \
+         bitbucket | jira\n# project = \"owner/repo\"        # optional for code hosts (derived from \
+         the remote); required for jira\n# base_url = \"https://gitlab.example.com\"  # self-hosted / \
+         enterprise only\n# auth = { token_command = \"gh auth token\" }  # or { env = \
+         \"GITHUB_TOKEN\" }\n# tags = [\"bug\", \"perf\"]        # only mirror matching issues/PRs; \
+         empty = all\n#\n# Papertrail sync cadence (defaults shown).\n# [papertrail]\n# \
+         probe_interval_secs = 900\n# sync_min_interval_secs = 900\n# full_sync_interval_secs = \
+         86400\n# rate_limit_reserve = 0.35     # fraction of the API quota kept for your own \
+         tools\n\n",
     );
 
     text.push_str(

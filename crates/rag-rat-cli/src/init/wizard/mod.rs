@@ -46,6 +46,17 @@ pub(crate) struct WizardResult {
     pub hook_conflicts: HashMap<&'static str, HookConflict>,
 }
 
+/// The draft as it will be WRITTEN: distillation is forced off when no tracker resolves (the pass
+/// depends on one). Both `build_result` and the review diff go through this, so the previewed diff
+/// always matches the file saved on confirmation.
+pub(super) fn normalized_write_draft(state: &WizardState) -> WizardDraft {
+    let mut result = state.draft.clone();
+    if !steps::tracker_is_set_up(state) {
+        result.distill.mode = draft::DistillMode::Off;
+    }
+    result
+}
+
 struct TerminalGuard(Terminal<CrosstermBackend<Stdout>>);
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
@@ -363,7 +374,10 @@ impl Wizard {
     }
 
     fn build_result(&self) -> anyhow::Result<WizardResult> {
-        let draft = &self.state.draft;
+        // The write goes through `normalized_write_draft` (distill forced off without a resolvable
+        // tracker), the single authoritative normalization — the user can reach review/save without
+        // the Distill handler ever running (Ctrl-navigation, a tab click, `w` from Papertrail).
+        let draft = normalized_write_draft(&self.state);
         let toml = match &self.original {
             Some(orig) => draft.patch_existing(orig)?,
             None => draft.write_fresh(),
@@ -983,6 +997,24 @@ mod tests {
 
     fn ctrl_right() -> KeyEvent {
         KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn build_result_forces_distill_off_without_a_resolvable_tracker() {
+        // Distillation enabled in the draft, but no tracker resolves: the write path must normalize
+        // it off regardless of how review was reached (no Distill handler ever runs here).
+        let mut w = headless(test_scan(), None);
+        w.state.draft.tracker.mode = super::draft::TrackerMode::AutoDetect;
+        w.state.detected_origin = None;
+        w.state.detected_configured = None;
+        w.state.draft.distill.mode = super::draft::DistillMode::ValidatedBox;
+        let result = w.build_result().unwrap();
+        let doc: toml_edit::DocumentMut = result.toml.parse().unwrap();
+        assert_eq!(
+            doc["llm"]["distill"]["enabled"].as_bool(),
+            Some(false),
+            "no tracker → the written config must not enable distillation"
+        );
     }
 
     fn focus_embedding(w: &mut Wizard) {

@@ -17,11 +17,20 @@ pub(crate) enum StepId {
     Indexing    = 0,
     Oracle      = 1,
     Embedding   = 2,
-    Integration = 3,
+    Papertrail  = 3,
+    Distill     = 4,
+    Integration = 5,
 }
 impl StepId {
-    pub const COUNT: usize = 4;
-    pub const ALL: [StepId; 4] = [Self::Indexing, Self::Oracle, Self::Embedding, Self::Integration];
+    pub const COUNT: usize = 6;
+    pub const ALL: [StepId; 6] = [
+        Self::Indexing,
+        Self::Oracle,
+        Self::Embedding,
+        Self::Papertrail,
+        Self::Distill,
+        Self::Integration,
+    ];
     pub fn index(self) -> usize {
         self as usize
     }
@@ -110,6 +119,12 @@ pub(crate) enum StepState {
         focus: EmbedFocus,
     },
     Oracle,
+    Papertrail {
+        focus: usize,
+    },
+    Distill {
+        focus: usize,
+    },
     Integration {
         focus: usize,
     },
@@ -119,4 +134,29 @@ pub(crate) enum StepState {
 pub(crate) enum IndexZone {
     Toggles,
     Tree,
+}
+
+/// Focusable zones on the Papertrail step, in render order. Which zones are actually present
+/// depends on the tracker mode — `papertrail_zones` returns only the visible ones, and the step's
+/// `focus: usize` indexes into that list (the same variable-length-focus shape the Embedding step
+/// uses).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PapertrailZone {
+    Mode,
+    Provider,
+    Auth,
+    AuthValue,
+    BaseUrl,
+    Project,
+    Tags,
+}
+
+/// Focusable zones on the Distill step, in render order — mode-gated like Papertrail, and empty
+/// entirely when no tracker is set up (the step is inactive then).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DistillZone {
+    Mode,
+    Endpoint,
+    Model,
+    ProvisionConfirm,
 }

@@ -50,7 +50,10 @@ use serde::{Deserialize, Serialize};
 pub use store::{rebuild_fts, *};
 pub use sync::*;
 pub(crate) use trackers::resolve_trackers;
-pub use trackers::{ResolvedTracker, detect_tracker_from_remote_url, normalized_tags};
+pub use trackers::{
+    ResolvedTracker, auto_detect_tracker, detect_tracker_for_remote,
+    detect_tracker_from_remote_url, normalized_tags,
+};
 
 /// Resolved tracker context, injected into the sync/query paths instead of being resolved inside
 /// the library. Resolution runs ONLY at the real-usage boundary (`IndexDatabase::open_config`)

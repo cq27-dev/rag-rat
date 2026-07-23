@@ -68,6 +68,9 @@ pub(crate) struct InitPlan {
     /// compiler-grade (SCIP) importance ranking. Default false (matches `OracleConfig`'s
     /// default).
     oracle_auto_run: bool,
+    /// Whether to write `[llm.distill] enabled = true` — the opt-in distillation model pass.
+    /// Default false; the wizard only turns it on with a resolvable issue tracker.
+    distill_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -280,6 +283,7 @@ mod tests {
             ]),
             backend: EmbeddingBackend::model2vec(),
             oracle_auto_run: false,
+            distill_enabled: false,
         };
 
         let text = render_config(&plan);
@@ -314,6 +318,7 @@ mod tests {
             bindings: BTreeMap::from([(Language::Rust, vec![PathBuf::from("src")])]),
             backend: EmbeddingBackend::fast_embed(),
             oracle_auto_run: true,
+            distill_enabled: false,
         };
         assert!(render_config(&plan).contains("auto_run = true"));
     }
@@ -330,6 +335,7 @@ mod tests {
             bindings: BTreeMap::from([(Language::Swift, vec![PathBuf::from("Sources")])]),
             backend: EmbeddingBackend::fast_embed(),
             oracle_auto_run: false,
+            distill_enabled: false,
         };
 
         let text = render_config(&plan);
@@ -361,6 +367,7 @@ mod tests {
             ])]),
             backend: EmbeddingBackend::fast_embed(),
             oracle_auto_run: false,
+            distill_enabled: false,
         };
         let text = render_config(&plan);
         assert!(text.contains("# [[target]]"), "documents the expanded target form");
@@ -413,6 +420,7 @@ mod tests {
             bindings: BTreeMap::from([(Language::Rust, vec![PathBuf::from("src")])]),
             backend: EmbeddingBackend::fast_embed(),
             oracle_auto_run: false,
+            distill_enabled: false,
         };
         std::fs::write(root.join("rag-rat.toml"), render_config(&plan)).unwrap();
 

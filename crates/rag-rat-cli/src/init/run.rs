@@ -308,7 +308,14 @@ pub(crate) fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
         languages.into_iter().filter(|language| bindings.contains_key(language)).collect();
     let backend = recommend_backend(estimated_chunks(scan.total_source_bytes));
     // Non-interactive default mirrors `OracleConfig`'s default: off until explicitly enabled.
-    InitPlan { root_value, languages, bindings, backend, oracle_auto_run: false }
+    InitPlan {
+        root_value,
+        languages,
+        bindings,
+        backend,
+        oracle_auto_run: false,
+        distill_enabled: false,
+    }
 }
 pub(crate) fn setup_index(config: &Config, config_path: &Path) -> anyhow::Result<IndexDatabase> {
     eprintln!("init: migrating SQLite schema");

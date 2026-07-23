@@ -138,17 +138,7 @@ impl TryFrom<RawTracker> for TrackerConfig {
         let base_url = match trimmed(raw.base_url) {
             None => None,
             Some(url) => {
-                let Some((scheme, rest)) = url.split_once("://") else {
-                    return Err(ConfigError::TrackerBaseUrlNotHttp(url));
-                };
-                let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-                let suffix = &rest[authority.len()..];
-                if !matches!(scheme, "http" | "https")
-                    || authority.is_empty()
-                    || authority.starts_with(':')
-                    || authority.chars().any(char::is_whitespace)
-                    || !suffix.chars().all(|ch| ch == '/')
-                {
+                if !valid_tracker_base_url_scheme_authority(&url) {
                     return Err(ConfigError::TrackerBaseUrlNotHttp(url));
                 }
                 if endpoint_authority_has_userinfo(&url) {
@@ -176,7 +166,11 @@ impl TryFrom<RawTracker> for TrackerConfig {
     }
 }
 
-fn valid_tracker_project(provider: Tracker, project: &str) -> bool {
+/// Whether `project` is a valid identity for `provider`: `owner/repo` for GitHub/Bitbucket, a
+/// `namespace/.../repo` path for GitLab, an uppercase-alphanumeric KEY for Jira. Exposed so the
+/// `rag-rat init` wizard rejects a malformed project before writing a config `Config::load` would
+/// reject post-write.
+pub fn valid_tracker_project(provider: Tracker, project: &str) -> bool {
     let parts = project.split('/').collect::<Vec<_>>();
     let valid_code_host_segment = |part: &&str| {
         !part.is_empty()
@@ -194,6 +188,28 @@ fn valid_tracker_project(provider: Tracker, project: &str) -> bool {
                 && project.chars().next().is_some_and(|first| first.is_ascii_uppercase())
                 && project.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()),
     }
+}
+
+/// A valid `base_url` scheme + authority: `http`/`https`, a non-empty host authority, and only
+/// `/`-suffix after it. Does NOT check for embedded credentials — see [`valid_tracker_base_url`].
+fn valid_tracker_base_url_scheme_authority(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let suffix = &rest[authority.len()..];
+    matches!(scheme, "http" | "https")
+        && !authority.is_empty()
+        && !authority.starts_with(':')
+        && !authority.chars().any(char::is_whitespace)
+        && suffix.chars().all(|ch| ch == '/')
+}
+
+/// The full tracker `base_url` predicate: a valid http(s) scheme + authority AND no embedded
+/// credentials — mirrors the `[[tracker]] base_url` acceptance in `TrackerConfig::try_from`.
+/// Exposed for the `rag-rat init` wizard's pre-write validation.
+pub fn valid_tracker_base_url(url: &str) -> bool {
+    valid_tracker_base_url_scheme_authority(url) && !endpoint_authority_has_userinfo(url)
 }
 
 impl TryFrom<RawTrackerAuth> for TrackerAuth {
