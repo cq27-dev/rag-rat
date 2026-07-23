@@ -1276,7 +1276,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ghost, 0, "the wholesale clear dropped the row with no accepted content");
-        assert_eq!(stored_stamp(&conn).as_deref(), Some("2"), "the store-global stamp upgraded");
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("3"), "the store-global stamp upgraded");
 
         assert!(
             !content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap(),
@@ -1319,9 +1319,9 @@ mod tests {
         // The upgrade re-fold makes the store current; from then on per-stream reprojects
         // maintain the stamp.
         assert!(content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap());
-        assert_eq!(stored_stamp(&conn).as_deref(), Some("2"));
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("3"));
         author_committed(&conn, stream, &[node_create("n2", "second")]);
-        assert_eq!(stored_stamp(&conn).as_deref(), Some("2"), "a current store stays current");
+        assert_eq!(stored_stamp(&conn).as_deref(), Some("3"), "a current store stays current");
         assert_eq!(projected_node_count(&conn, stream), 2);
     }
 

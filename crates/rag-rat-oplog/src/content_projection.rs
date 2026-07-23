@@ -41,7 +41,11 @@ use super::stream::StreamId;
 /// the open/migrate seam and re-folds every stream before stamping — never trusted incrementally;
 /// a NEWER stamp blocks this binary from reprojecting at all (see
 /// [`assert_content_projector_not_newer`]).
-const CONTENT_PROJECTOR_VERSION: i64 = 2;
+// v3 (#691 A-pre): `content_projected_edges` now retains edge TOMBSTONES (present=0) instead of
+// dropping removed edges. The bump forces a rebuild so existing stores materialize tombstones for
+// already-removed edges (else a foreign EdgeRemove folded before the upgrade would never
+// tombstone).
+const CONTENT_PROJECTOR_VERSION: i64 = 3;
 
 /// The `oplog_meta` key holding the `/3` projector version the content projection was last folded
 /// by. DISTINCT from the `/1` `projector_version` (they evolve independently and share one meta
@@ -224,20 +228,34 @@ fn write_projection(
             ],
         )?;
     }
-    for (edge_key, edge) in &state.edges {
-        let spec_json = serde_json::to_string(&EdgeSpecRow::from(&edge.spec))
-            .context("serialize projected /3 edge spec")?;
-        let resolved_json = edge
-            .resolved
-            .as_ref()
-            .map(|resolved| serde_json::to_string(&ResolvedAnchorRow::from(resolved)))
-            .transpose()
-            .context("serialize projected /3 edge resolved anchor")?;
-        tx.execute(
-            "INSERT INTO content_projected_edges(stream_id, edge_key, spec_json, resolved_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![stream_bytes.as_slice(), edge_key.as_str(), spec_json, resolved_json],
-        )?;
+    // Live edges (present=1) AND tombstones (present=0). The tombstones are RETAINED, not dropped,
+    // so a projection consumer honors a foreign `EdgeRemove`: the memory reconcile treats a
+    // tombstoned edge as authored (never re-adds it) and the projection deletes the read-table
+    // row. Dropping them lets a foreign remove be re-authored at a fresh Lamport — a
+    // cross-device growth loop (#691 A-pre).
+    for (present, edges) in [(1, &state.edges), (0, &state.removed_edges)] {
+        for (edge_key, edge) in edges {
+            let spec_json = serde_json::to_string(&EdgeSpecRow::from(&edge.spec))
+                .context("serialize projected /3 edge spec")?;
+            let resolved_json = edge
+                .resolved
+                .as_ref()
+                .map(|resolved| serde_json::to_string(&ResolvedAnchorRow::from(resolved)))
+                .transpose()
+                .context("serialize projected /3 edge resolved anchor")?;
+            tx.execute(
+                "INSERT INTO content_projected_edges(stream_id, edge_key, spec_json, \
+                 resolved_json,
+                 present) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    stream_bytes.as_slice(),
+                    edge_key.as_str(),
+                    spec_json,
+                    resolved_json,
+                    present
+                ],
+            )?;
+        }
     }
     Ok(())
 }

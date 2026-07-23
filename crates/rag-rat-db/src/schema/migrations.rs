@@ -1370,6 +1370,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_082_ID => Some(82),
             MIGRATION_083_ID => Some(83),
             MIGRATION_084_ID => Some(84),
+            MIGRATION_085_ID => Some(85),
             _ => None,
         })
         .max()
@@ -1463,6 +1464,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_082_ID
             | MIGRATION_083_ID
             | MIGRATION_084_ID
+            | MIGRATION_085_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1553,6 +1555,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_082_ID => migration.checksum != MIGRATION_082_CHECKSUM,
         MIGRATION_083_ID => migration.checksum != MIGRATION_083_CHECKSUM,
         MIGRATION_084_ID => migration.checksum != MIGRATION_084_CHECKSUM,
+        MIGRATION_085_ID => migration.checksum != MIGRATION_085_CHECKSUM,
         _ => false,
     }
 }
@@ -5873,6 +5876,42 @@ pub fn apply_distill_evidence_source_part(conn: &Connection) -> rusqlite::Result
         "ALTER TABLE papertrail_distill_evidence
              ADD COLUMN source_part TEXT CHECK(source_part IN ('title', 'body', 'comment'));",
     )
+}
+
+/// V085 (#691 A-pre): memory-sync provenance + edge tombstones — the write-path foundation for
+/// projecting synced content into the read tables without corrupting the local reconcile.
+///
+/// - `origin` on `repo_memories` / `repo_node_edges` distinguishes a locally-authored row from one
+///   projected from a synced sibling's `/3` content. It is LOAD-BEARING on the WRITE path: the
+///   memory reconcile authors every read-table row MISSING from the accepted-`/3` projection, so a
+///   synced row whose acceptance is later revoked must NOT be re-authored as local `/3` (that
+///   forges local authorship and re-legitimizes revoked content). The reconcile gates on `origin =
+///   'local'`. Every existing row is locally authored, so the `'local'` default is a correct
+///   backfill.
+/// - `present` on `content_projected_edges` retains edge TOMBSTONES (`present = 0`) rather than
+///   dropping removed edges. Without it a foreign `EdgeRemove` leaves the local `repo_node_edges`
+///   row a ghost, the reconcile re-authors it at a fresh Lamport, and the remove loses LWW forever
+///   — a cross-device op-log growth loop. Live edges default `present = 1`; the projector-version
+///   bump rebuilds the projection to write tombstones going forward.
+///
+/// Additive columns with correct defaults; atomic under one immediate txn; idempotent via
+/// `add_column_if_missing`.
+pub fn apply_sync_origin_and_edge_tombstone(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    add_column_if_missing(
+        &tx,
+        "repo_memories",
+        "origin",
+        "TEXT NOT NULL DEFAULT 'local' CHECK (origin IN ('local', 'synced'))",
+    )?;
+    add_column_if_missing(
+        &tx,
+        "repo_node_edges",
+        "origin",
+        "TEXT NOT NULL DEFAULT 'local' CHECK (origin IN ('local', 'synced'))",
+    )?;
+    add_column_if_missing(&tx, "content_projected_edges", "present", "INTEGER NOT NULL DEFAULT 1")?;
+    tx.commit()
 }
 
 #[cfg(test)]

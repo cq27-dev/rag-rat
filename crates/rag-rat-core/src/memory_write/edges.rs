@@ -181,9 +181,15 @@ pub(crate) fn unauthored_edges(
         "owner stream has a pending content refold; settle pending content refolds before reading \
          edge completeness"
     );
+    // `origin = 'local'` gates out SYNCED edges (#691 A-pre): only locally-authored edges are the
+    // reconcile's to complete. The `NOT EXISTS` also now skips a TOMBSTONED edge — a removed edge
+    // is retained in `content_projected_edges` (present=0), so it exists here and is never
+    // re-authored; dropping the tombstone let a foreign `EdgeRemove` be re-added at a fresh
+    // Lamport (a growth loop).
     let mut stmt = conn.prepare(&format!(
         "{EDGE_SELECT} e
          WHERE e.repo_id = ?1
+           AND e.origin = 'local'
            AND NOT EXISTS (
                  SELECT 1 FROM content_projected_edges p
                  WHERE p.stream_id = ?2 AND p.edge_key = e.edge_key)
@@ -304,6 +310,48 @@ mod tests {
             missing[0].target_repo_id, REPO,
             "reresolve_on_read must repair the stale stored target_repo_id to the CURRENT owner \
              before the reconcile signs it"
+        );
+    }
+
+    /// A TOMBSTONED edge (retained in the projection with `present = 0`) is NOT returned as
+    /// unauthored — so a foreign `EdgeRemove` is honored, not re-authored at a fresh Lamport (the
+    /// edge-resurrection growth loop, #691 A-pre). Before tombstones were retained, the removed
+    /// edge was absent from the projection and came back here.
+    #[test]
+    fn a_tombstoned_edge_is_not_re_authored() {
+        let conn = scoped_conn();
+        insert_memory(&conn, "mem_a", "active", 100);
+        insert_memory(&conn, "mem_b", "active", 200);
+        let key = insert_raw_node_edge(&conn, "mem_a", "relates_to", "mem_b");
+        let stream = StreamId::from_bytes([0x11; 32]);
+        conn.execute(
+            "INSERT INTO content_projected_edges(
+                 stream_id, edge_key, spec_json, resolved_json, present)
+             VALUES (?1, ?2, '{}', NULL, 0)",
+            params![stream.to_bytes().as_slice(), key],
+        )
+        .unwrap();
+        assert!(
+            unauthored_edges(&conn, REPO, stream).unwrap().is_empty(),
+            "a tombstoned edge is honored, never re-authored",
+        );
+    }
+
+    /// A SYNCED edge is never the reconcile's to author — even if its projection row is absent (its
+    /// acceptance was revoked) — or the local device would forge authorship of removed content
+    /// (#691 A-pre, Trace 2). A local edge in the same position WOULD be re-authored.
+    #[test]
+    fn a_synced_edge_is_never_re_authored() {
+        let conn = scoped_conn();
+        insert_memory(&conn, "mem_a", "active", 100);
+        insert_memory(&conn, "mem_b", "active", 200);
+        let key = insert_raw_node_edge(&conn, "mem_a", "relates_to", "mem_b");
+        conn.execute("UPDATE repo_node_edges SET origin = 'synced' WHERE edge_key = ?1", [&key])
+            .unwrap();
+        let stream = StreamId::from_bytes([0x22; 32]);
+        assert!(
+            unauthored_edges(&conn, REPO, stream).unwrap().is_empty(),
+            "a synced edge is not re-authored even when absent from the projection",
         );
     }
 }

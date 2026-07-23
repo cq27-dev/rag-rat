@@ -30,6 +30,14 @@ use super::op::{
 pub struct ProjectedState {
     pub nodes: BTreeMap<NodeId, ProjectedNode>,
     pub edges: BTreeMap<EdgeKey, ProjectedEdge>,
+    /// Edges that were ADDED and then REMOVED — the tombstones. Retained (not dropped like the
+    /// fold used to) so a projection consumer honors the remove instead of re-authoring the
+    /// edge as a ghost: the reconcile treats a tombstoned edge as authored (never re-adds it),
+    /// and the memory projection deletes the corresponding read-table row. An edge that was
+    /// never added (a remove-only or rebind-only key) is absent from BOTH maps. The
+    /// spec/resolved carried here are the last-known values, kept only so the projection row's
+    /// non-null columns can be written.
+    pub removed_edges: BTreeMap<EdgeKey, ProjectedEdge>,
 }
 
 /// A projected node: its winning content and status. Presence in `ProjectedState::nodes` IS its
@@ -126,6 +134,23 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
         }
     }
 
+    // Split edges into live and tombstoned. `spec` is set only by an `EdgeAdd`, so `spec.is_some()`
+    // means the edge was added at some point: `(present, added)` → live, `(removed, added)` →
+    // tombstone, `(_, never-added)` → no row at all.
+    let mut live_edges = BTreeMap::new();
+    let mut removed_edges = BTreeMap::new();
+    for (key, acc) in edges {
+        match acc.spec {
+            Some(spec) if acc.present => {
+                live_edges.insert(key, ProjectedEdge { spec, resolved: acc.resolved });
+            },
+            Some(spec) => {
+                removed_edges.insert(key, ProjectedEdge { spec, resolved: acc.resolved });
+            },
+            None => {},
+        }
+    }
+
     ProjectedState {
         nodes: nodes
             .into_iter()
@@ -135,14 +160,8 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 Some((id, ProjectedNode { content, status: acc.status.unwrap_or_default() }))
             })
             .collect(),
-        edges: edges
-            .into_iter()
-            .filter_map(|(key, acc)| {
-                // Present iff the last presence op was an add; the resolved anchor rides along.
-                let spec = acc.present.then_some(acc.spec).flatten()?;
-                Some((key, ProjectedEdge { spec, resolved: acc.resolved }))
-            })
-            .collect(),
+        edges: live_edges,
+        removed_edges,
     }
 }
 
@@ -285,6 +304,31 @@ mod tests {
             at(3, 1, MemoryOp::EdgeAdd { edge }),
         ]);
         assert!(state.edges.contains_key(&key), "the newest op is the add → edge present");
+        assert!(!state.removed_edges.contains_key(&key), "re-added → not a tombstone");
+    }
+
+    #[test]
+    fn an_added_then_removed_edge_is_a_retained_tombstone() {
+        // The tombstone is retained in `removed_edges` (not dropped), so a projection consumer can
+        // honor the remove instead of re-authoring it as a ghost (#691).
+        let edge = spec("mem_a", "mem_b");
+        let key = edge.edge_key();
+        let state = project(&[
+            at(1, 1, MemoryOp::EdgeAdd { edge }),
+            at(2, 1, MemoryOp::EdgeRemove { edge_key: key.clone() }),
+        ]);
+        assert!(!state.edges.contains_key(&key), "removed → absent from live edges");
+        assert!(state.removed_edges.contains_key(&key), "removed → retained as a tombstone");
+    }
+
+    #[test]
+    fn a_remove_only_or_rebind_only_edge_is_not_a_tombstone() {
+        // An edge that was never ADDED has no tombstone — nothing to honor.
+        let edge = spec("mem_a", "mem_b");
+        let key = edge.edge_key();
+        let state = project(&[at(1, 1, MemoryOp::EdgeRemove { edge_key: key.clone() })]);
+        assert!(!state.edges.contains_key(&key));
+        assert!(!state.removed_edges.contains_key(&key), "never added → no tombstone");
     }
 
     #[test]

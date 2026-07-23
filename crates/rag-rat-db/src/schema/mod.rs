@@ -24,6 +24,7 @@ pub use migrations::{
     apply_papertrail_distill_substrate, apply_papertrail_mirror_resume_state,
     apply_papertrail_provider_neutral_schema, apply_repo_id_core_scoping,
     apply_repo_id_periphery_scoping, apply_repos_registry, apply_scip_moniker_anchors,
+    apply_sync_origin_and_edge_tombstone,
 };
 pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_exists};
 pub use purge::{RepoRowCounts, count_repo_rows, purge_repo_rows, repo_scoped_table_names};
@@ -46,7 +47,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 84;
+pub const LATEST_SCHEMA_VERSION: u32 = 85;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -622,6 +623,16 @@ const MIGRATION_084_DESCRIPTION: &str =
      chunk→symbol resolution, which could not disambiguate same-name symbols that nest or share a \
      physical line. Nullable; backfills on the next reindex of each file (derived data, no SQL \
      backfill)";
+
+const MIGRATION_085_ID: &str = "085_sync_origin_and_edge_tombstone";
+const MIGRATION_085_CHECKSUM: &str = "sha256:rag-rat-sync-origin-and-edge-tombstone-v85";
+const MIGRATION_085_DESCRIPTION: &str =
+    "Add repo_memories.origin and repo_node_edges.origin ('local'|'synced') and \
+     content_projected_edges.present. The origin column gates the memory reconcile so a synced \
+     row is never re-authored as local /3 content (forging local authorship / re-legitimizing \
+     revoked content); the present column retains edge tombstones so a foreign EdgeRemove is \
+     honored instead of resurrected in an op-log growth loop. Additive; existing rows default to \
+     local/present";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1317,6 +1328,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_084_CHECKSUM,
         description: MIGRATION_084_DESCRIPTION,
         apply: MigrationFn::Plain(apply_chunk_symbol_id),
+    },
+    Migration {
+        id: MIGRATION_085_ID,
+        checksum: MIGRATION_085_CHECKSUM,
+        description: MIGRATION_085_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_sync_origin_and_edge_tombstone),
     },
 ];
 

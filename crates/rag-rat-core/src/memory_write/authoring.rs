@@ -930,9 +930,15 @@ fn read_unauthored_memory_rows(
          memory completeness"
     );
     let mut stmt = conn.prepare(
+        // `origin = 'local'` is load-bearing (#691 A-pre): a SYNCED row (projected from a
+        // sibling's /3) must never be re-authored as local /3 — even if its acceptance is
+        // later revoked and its projection row vanishes — or the local device would forge
+        // authorship of, and re-legitimize, content the account revoked. Only
+        // locally-authored rows are the reconcile's to complete.
         "SELECT m.id, m.kind, m.title, m.body, m.confidence, m.status, m.source, m.payload_json
          FROM repo_memories m
          WHERE m.repo_id = ?1
+           AND m.origin = 'local'
            AND NOT EXISTS (
                  SELECT 1 FROM content_projected_nodes p
                  WHERE p.stream_id = ?2 AND p.node_id = m.id)
@@ -1294,6 +1300,23 @@ mod tests {
         assert_eq!(missing.iter().map(|r| r.memory_id.as_str()).collect::<Vec<_>>(), ["mem_ghost"]);
     }
 
+    /// A SYNCED memory is never the reconcile's to author — even absent from the projection (its
+    /// acceptance was revoked) — or the local device would forge authorship of, and re-legitimize,
+    /// content the account revoked (#691 A-pre, Trace 2). A local ghost in the same position WOULD
+    /// be authored.
+    #[test]
+    fn a_synced_memory_is_never_re_authored() {
+        let conn = scoped_conn();
+        insert_memory(&conn, "mem_synced", "active", 100);
+        conn.execute("UPDATE repo_memories SET origin = 'synced' WHERE id = 'mem_synced'", [])
+            .unwrap();
+        let stream = StreamId::from_bytes([0x22; 32]);
+        assert!(
+            read_unauthored_memory_rows(&conn, REPO, stream).unwrap().is_empty(),
+            "a synced memory is not re-authored even when absent from the projection",
+        );
+    }
+
     // --- the per-node/edge self-healing reconcile (#541) ---
 
     #[test]
@@ -1600,8 +1623,14 @@ mod tests {
 
     // --- live write-path wiring (#532) ---
 
+    /// Count LIVE projected edges (`present = 1`). A removed edge is retained as a tombstone
+    /// (`present = 0`, #691 A-pre) rather than deleted, so "how many edges are present" filters
+    /// them.
     fn projected_edge_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM content_projected_edges", [], |r| r.get(0)).unwrap()
+        conn.query_row("SELECT COUNT(*) FROM content_projected_edges WHERE present = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
     }
 
     /// Create an unanchored `Concept` (needs no code binding) through the LIVE `create_memory`.

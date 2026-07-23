@@ -663,7 +663,7 @@ fn consolidate_rebuilds_stale_content_projection_before_reconcile() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(stamp, "2", "consolidate upgraded the store-global projector stamp");
+    assert_eq!(stamp, "3", "consolidate upgraded the store-global projector stamp");
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);

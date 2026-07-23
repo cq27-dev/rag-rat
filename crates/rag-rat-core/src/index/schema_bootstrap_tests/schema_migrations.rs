@@ -3704,11 +3704,10 @@ fn migration_083_relabels_logical_groups_by_evidence() {
     assert_eq!(reason(300), "single");
 }
 
-/// V084 links each chunk to the symbol it was cut from, and is the schema tip.
+/// V084 links each chunk to the symbol it was cut from. (The absolute schema-tip pin moved to
+/// `migration_085_*` — V085 is the tip now; this test keeps only a per-migration check.)
 #[test]
-fn migration_084_is_the_tip_and_links_chunks_to_symbols() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 84, "move this pin with the next schema migration");
-
+fn migration_084_links_chunks_to_symbols() {
     // The chunks table predates the column (it lives in the baseline). Build bare chunks + symbols
     // tables WITHOUT symbol_id, seed pre-migration rows, apply V084 in ISOLATION, and confirm the
     // column appears AND the backfill links each chunk — asserting absence against this migration's
@@ -3847,4 +3846,84 @@ fn migration_084_is_the_tip_and_links_chunks_to_symbols() {
         )
         .unwrap();
     assert_eq!(recorded, 1, "the forward migration records V084");
+}
+
+/// V085 adds sync provenance (`origin`) to the read tables + edge tombstones (`present`) to the
+/// content-edge projection, and is the schema tip.
+#[test]
+fn migration_085_is_the_tip_and_adds_origin_and_edge_present() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 85, "move this pin with the next schema migration");
+
+    // Bare pre-V085 tables (no origin / present), each with a pre-existing row, so the migration is
+    // asserted against its OWN precondition — not the full ladder's end state.
+    let legacy = rusqlite::Connection::open_in_memory().unwrap();
+    legacy
+        .execute_batch(
+            "CREATE TABLE repo_memories(id TEXT PRIMARY KEY, repo_id TEXT);
+             CREATE TABLE repo_node_edges(edge_key TEXT PRIMARY KEY, repo_id TEXT);
+             CREATE TABLE content_projected_edges(
+                 stream_id BLOB NOT NULL, edge_key TEXT NOT NULL,
+                 spec_json TEXT NOT NULL, resolved_json TEXT,
+                 PRIMARY KEY(stream_id, edge_key)) STRICT;
+             INSERT INTO repo_memories(id, repo_id) VALUES ('mem_1', 'r');
+             INSERT INTO repo_node_edges(edge_key, repo_id) VALUES ('e_1', 'r');
+             INSERT INTO content_projected_edges(stream_id, edge_key, spec_json)
+                 VALUES (x'00', 'e_1', '{}');",
+        )
+        .unwrap();
+    let added = [
+        ("repo_memories", "origin"),
+        ("repo_node_edges", "origin"),
+        ("content_projected_edges", "present"),
+    ];
+    for (t, c) in added {
+        assert!(!schema::column_exists(&legacy, t, c).unwrap(), "pre-V085 {t} has no {c}");
+    }
+
+    schema::apply_sync_origin_and_edge_tombstone(&legacy).unwrap();
+
+    for (t, c) in added {
+        assert!(schema::column_exists(&legacy, t, c).unwrap(), "V085 adds {t}.{c}");
+    }
+    // Pre-existing rows backfill to the correct defaults.
+    let mem_origin: String = legacy
+        .query_row("SELECT origin FROM repo_memories WHERE id = 'mem_1'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mem_origin, "local", "existing memories default to local origin");
+    let edge_origin: String = legacy
+        .query_row("SELECT origin FROM repo_node_edges WHERE edge_key = 'e_1'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(edge_origin, "local");
+    let present: i64 = legacy
+        .query_row("SELECT present FROM content_projected_edges WHERE edge_key = 'e_1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(present, 1, "existing projected edges default to present");
+    // The CHECK rejects an out-of-domain origin.
+    assert!(
+        legacy
+            .execute(
+                "INSERT INTO repo_memories(id, repo_id, origin) VALUES ('mem_2','r','bogus')",
+                []
+            )
+            .is_err(),
+        "the origin CHECK rejects a value that is neither local nor synced",
+    );
+
+    // The full ladder ends with the columns present and records V085.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    for (t, c) in added {
+        assert!(schema::column_exists(&conn, t, c).unwrap(), "the full ladder ends with {t}.{c}");
+    }
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '085_sync_origin_and_edge_tombstone'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V085");
 }
