@@ -29,6 +29,7 @@ mod id;
 #[allow(dead_code, reason = "some C4.1 primitives still precede their C5 consumers (#607)")]
 mod keywrap;
 mod limits;
+mod node_binding;
 mod ops;
 mod registers;
 // C4.2b: the account secrets log (`log_id = 1`) — the `StreamKeyWrap` op + owner-gated acceptance
@@ -85,6 +86,9 @@ pub use id::AccountId;
 // C4.1 content-key primitives the C4.3b sealing surface exposes: `ContentKey` is the `Ready`
 // payload C5's seal path consumes; `KeyId` is the selection identity (#607).
 pub use keywrap::{ContentKey, KeyId};
+// The phase-D (#881) node-authorization seam: mint + verify a signed transport-node ↔
+// account-device binding. Consumed by the transport crate's auth handshake.
+pub use node_binding::{NodeAuthError, sign_local_node_binding, verify_node_binding};
 pub use ops::{DeviceCut, DeviceRole, GrantRole};
 // The in-tx content-key mint + owner-gated `StreamKeyWrap` author seam (C4.3a), the C4.3b READ
 // side (derive-on-read sealing-key selection + the key_id adoption cross-check), and the C4.4

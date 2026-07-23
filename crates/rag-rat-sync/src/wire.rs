@@ -13,9 +13,11 @@
 
 use minicbor::{Decoder, Encoder};
 
-/// The ALPN this protocol speaks (#406). Versioned: a breaking wire change bumps the suffix so an
-/// old peer declines the handshake instead of misreading frames.
-pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/1";
+/// The ALPN this protocol speaks. Versioned: a breaking wire change bumps the suffix so an old peer
+/// declines the handshake instead of misreading frames. Bumped to `/2` for the #881 auth phase (the
+/// `Auth` frame exchanged before any inventory) — a `/1` peer, which would stream its inventory
+/// without authenticating, must not interoperate.
+pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/2";
 
 /// Domain tag committed into every frame's leading array element, so a frame from another protocol
 /// (or a truncated one) cannot be mistaken for a valid frame.
@@ -32,13 +34,26 @@ pub const MAX_ENTRIES_PER_PAGE: usize = 256;
 /// accounts D targets the cap is never reached.
 pub const MAX_HELLO_HASHES: usize = 65_536;
 
+/// The maximum bytes an [`Frame::Auth`] binding carries. A node binding is a small fixed shape
+/// (~224 bytes: domain + three 32-byte keys + a timestamp + a 64-byte signature); this is a
+/// decode-time sanity bound on that field. The actual PRE-ALLOCATION bound for an unauthenticated
+/// peer is the auth phase's frame-level cap, enforced from the length prefix before the body is
+/// allocated (`auth::MAX_AUTH_FRAME_BYTES` via `codec::read_frame_within`) — not this, which is
+/// checked only after the frame is read.
+pub const MAX_AUTH_BINDING_BYTES: usize = 512;
+
 type Hash = [u8; 32];
 
 /// One protocol frame. The discriminant is the second array element (after the domain tag).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    /// Opens a session: the account being synced and every account-log entry hash the sender holds.
-    /// The peer replies with the entries in ITS store that are not in this set.
+    /// Authorizes the sender to the peer BEFORE any inventory is revealed (#881): names the account
+    /// and carries the sender's signed transport-node ↔ account-device binding. The peer verifies
+    /// it against its roster and the connection's authenticated remote node id under its own
+    /// admission policy, and reveals nothing (not even account confirmation) until it passes.
+    Auth { account_id: Hash, binding: Vec<u8> },
+    /// Opens the data phase: the account being synced and every account-log entry hash the sender
+    /// holds. The peer replies with the entries in ITS store that are not in this set.
     Hello { account_id: Hash, have: Vec<Hash> },
     /// A page of `signed_bytes` the peer lacked. `more` is true when further pages follow.
     Entries { entries: Vec<Vec<u8>>, more: bool },
@@ -51,6 +66,7 @@ mod tag {
     pub const HELLO: u8 = 0;
     pub const ENTRIES: u8 = 1;
     pub const DONE: u8 = 2;
+    pub const AUTH: u8 = 3;
 }
 
 /// A frame that failed to decode. Kept distinct from an I/O error so the session can treat a
@@ -83,6 +99,13 @@ impl Frame {
         let mut enc = Encoder::new(&mut buf);
         // `[domain, tag, ..variant fields]`.
         match self {
+            Frame::Auth { account_id, binding } => {
+                enc.array(4).expect(INFALLIBLE);
+                enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
+                enc.u8(tag::AUTH).expect(INFALLIBLE);
+                enc.bytes(account_id).expect(INFALLIBLE);
+                enc.bytes(binding).expect(INFALLIBLE);
+            },
             Frame::Hello { account_id, have } => {
                 enc.array(3).expect(INFALLIBLE);
                 enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
@@ -129,6 +152,7 @@ impl Frame {
             tag::HELLO => 3,
             tag::ENTRIES => 4,
             tag::DONE => 2,
+            tag::AUTH => 4,
             other => return Err(WireError::Malformed(format!("unknown frame tag {other}"))),
         };
         if outer != expected_outer {
@@ -147,6 +171,17 @@ impl Frame {
 
     fn decode_body(tag: u8, dec: &mut Decoder<'_>) -> Result<Frame, WireError> {
         match tag {
+            tag::AUTH => {
+                let account_id = fixed_hash(dec.bytes().map_err(m)?)?;
+                let binding = dec.bytes().map_err(m)?;
+                if binding.len() > MAX_AUTH_BINDING_BYTES {
+                    return Err(WireError::OverCap(format!(
+                        "auth binding {} > {MAX_AUTH_BINDING_BYTES}",
+                        binding.len()
+                    )));
+                }
+                Ok(Frame::Auth { account_id, binding: binding.to_vec() })
+            },
             tag::HELLO => {
                 let inner = dec.array().map_err(m)?;
                 if inner != Some(2) {
@@ -209,11 +244,22 @@ mod tests {
 
     #[test]
     fn every_frame_roundtrips() {
+        roundtrip(&Frame::Auth { account_id: [0xbb; 32], binding: vec![1, 2, 3, 4] });
+        roundtrip(&Frame::Auth { account_id: [0; 32], binding: vec![] });
         roundtrip(&Frame::Hello { account_id: [0xaa; 32], have: vec![[1; 32], [2; 32]] });
         roundtrip(&Frame::Hello { account_id: [0; 32], have: vec![] });
         roundtrip(&Frame::Entries { entries: vec![vec![1, 2, 3], vec![]], more: true });
         roundtrip(&Frame::Entries { entries: vec![], more: false });
         roundtrip(&Frame::Done);
+    }
+
+    #[test]
+    fn an_over_cap_auth_binding_is_rejected() {
+        // An Auth frame whose binding exceeds the cap is hostile — bounds the first-frame
+        // allocation an unauthenticated peer can force.
+        let frame =
+            Frame::Auth { account_id: [3; 32], binding: vec![0u8; MAX_AUTH_BINDING_BYTES + 1] };
+        assert!(matches!(Frame::decode(&frame.encode()), Err(WireError::OverCap(_))));
     }
 
     #[test]

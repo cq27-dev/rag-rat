@@ -260,6 +260,83 @@ async fn foreign_account_content_is_not_stored() {
     );
 }
 
+/// The op-log store's [`NodeAuth`] wiring works end to end (#881): a store authorizes a binding it
+/// minted for a transport node, and refuses the same binding presented from any other node — the
+/// replay defense, verified through the real oplog sign/verify seams (not the fake used by the
+/// protocol tests).
+#[test]
+fn a_store_authorizes_its_own_binding_but_not_from_another_node() {
+    use rag_rat_sync::NodeAuth;
+
+    let db = fresh_db();
+    let account = local_account(&db, NOW).unwrap();
+    let store = OplogSyncStore::new(&db, account, NOW);
+
+    let node = [4u8; 32];
+    let binding = store.local_binding(&node, NOW).unwrap();
+    assert!(!binding.is_empty(), "a store with a local device mints a real binding");
+    assert!(store.authorize(&binding, &node, NOW).unwrap(), "its own node id is authorized");
+    assert!(
+        !store.authorize(&binding, &[5u8; 32], NOW).unwrap(),
+        "the same binding from a different node id is refused",
+    );
+}
+
+/// Auth freshness tracks the per-handshake clock, not the store's construction time (#881): a
+/// long-lived store constructed long ago still mints and verifies a binding at the current
+/// handshake time. Were the construction time reused, a binding minted "now" would read as
+/// implausibly far in the future and be refused.
+#[test]
+fn a_store_authorizes_against_the_handshake_clock_not_its_construction_time() {
+    use rag_rat_sync::NodeAuth;
+
+    let db = fresh_db();
+    let account = local_account(&db, NOW).unwrap();
+    let stale = OplogSyncStore::new(&db, account, NOW); // constructed with an old clock
+    let node = [4u8; 32];
+
+    let much_later = NOW + 10 * 24 * 60 * 60 * 1000; // ten days after construction
+    let binding = stale.local_binding(&node, much_later).unwrap();
+    assert!(
+        stale.authorize(&binding, &node, much_later).unwrap(),
+        "a long-lived store still authorizes using the current handshake time",
+    );
+}
+
+/// A store with no local account (a fresh onboarding peer) presents an empty, anonymous binding and
+/// authorizes nothing — so it can complete an `Open` handshake but never passes `Closed`.
+#[test]
+fn a_store_without_an_account_presents_an_empty_binding_and_authorizes_nothing() {
+    use rag_rat_sync::NodeAuth;
+
+    let db = fresh_db(); // schema only, no account
+    let account = AccountId::from_bytes([7u8; 32]);
+    let store = OplogSyncStore::new(&db, account, NOW);
+    assert!(
+        store.local_binding(&[1u8; 32], NOW).unwrap().is_empty(),
+        "no local device => an anonymous (empty) binding",
+    );
+    assert!(
+        !store.authorize(&[0u8; 10], &[1u8; 32], NOW).unwrap(),
+        "an accountless store authorizes no peer",
+    );
+}
+
+/// The content store carries the same account-level node authorization as the account-log store —
+/// the binding is about the account + transport node, not the payload.
+#[test]
+fn the_content_store_carries_the_same_node_auth() {
+    use rag_rat_sync::{NodeAuth, OplogContentSyncStore};
+
+    let db = fresh_db();
+    let account = local_account(&db, NOW).unwrap();
+    let store = OplogContentSyncStore::new(&db, account, NOW);
+    let node = [4u8; 32];
+    let binding = store.local_binding(&node, NOW).unwrap();
+    assert!(store.authorize(&binding, &node, NOW).unwrap(), "own node authorized");
+    assert!(!store.authorize(&binding, &[5u8; 32], NOW).unwrap(), "other node refused");
+}
+
 /// LIVE: the real iroh endpoint, dialed peer-to-peer over the configured relay. Ignored by default
 /// (needs network + the relay); run with `--ignored` to exercise the actual transport rather than
 /// the in-process duplex the other tests use.
@@ -279,9 +356,15 @@ async fn a_real_iroh_round_trip_restores_an_account() {
 
     let mut source_store = OplogSyncStore::new(&source, account_id, NOW);
     let mut dest_store = OplogSyncStore::new(&dest, account_id, NOW);
-    let server = async { rag_rat_sync::accept_and_sync(&listener, &mut source_store).await };
-    let client =
-        async { rag_rat_sync::connect_and_sync(&dialer, listener_addr, &mut dest_store).await };
+    // The dest is a fresh peer with no local device (onboarding), so this round-trip uses `Open`;
+    // the node-authorization path is covered directly by the auth-phase tests below and the oplog
+    // node_binding unit tests.
+    let policy = rag_rat_sync::AuthPolicy::Open;
+    let server =
+        async { rag_rat_sync::accept_and_sync(&listener, &mut source_store, policy, NOW).await };
+    let client = async {
+        rag_rat_sync::connect_and_sync(&dialer, listener_addr, &mut dest_store, policy, NOW).await
+    };
     let (server_r, client_r) = tokio::join!(server, client);
     server_r.unwrap();
     client_r.unwrap();

@@ -9,10 +9,45 @@ use rag_rat_oplog::{
     AccountId, ContentIngestOutcome, IngestOutcome, account_entries_for_sync, account_entry_ref,
     account_ingest, account_signed_entry_exists, account_signed_hash, content_entries_for_sync,
     content_entry_ref, content_ingest, content_signed_entry_exists, content_signed_hash,
+    sign_local_node_binding, verify_node_binding,
 };
 use rusqlite::Connection;
 
+use crate::auth::NodeAuth;
 use crate::session::{Ingested, SyncStore};
+
+/// Mint this account's signed node binding for `local_node`. A store with no local device yet (a
+/// fresh peer being onboarded) has nothing to prove, so it returns an EMPTY binding rather than
+/// failing: an `Open` peer ignores it, while a `Closed` peer fails to verify it (an empty binding
+/// decodes to nothing) and correctly refuses — onboarding a not-yet-roster device is the deferred
+/// invite-token flow, not something `Closed` admits. Shared by both op-log stores — the binding is
+/// account-level, identical whether the session moves account entries or content.
+fn sign_binding(
+    conn: &Connection,
+    account_id: AccountId,
+    local_node: &[u8; 32],
+    now_ms: i64,
+) -> anyhow::Result<Vec<u8>> {
+    match sign_local_node_binding(conn, account_id, local_node, now_ms)? {
+        Ok(bytes) => Ok(bytes),
+        // No local device to sign with — send an anonymous (empty) binding. Never authorizes under
+        // `Closed`; harmless under `Open`.
+        Err(_no_local_device) => Ok(Vec::new()),
+    }
+}
+
+/// Whether a peer's binding authorizes it for `account_id`, given its authenticated `remote_node`.
+/// Collapses the internal failure taxonomy to a bool so the transport's wire refusal stays uniform;
+/// a `?`-propagated error here is a real DB fault, not a rejected peer.
+fn authorize_binding(
+    conn: &Connection,
+    account_id: AccountId,
+    binding: &[u8],
+    remote_node: &[u8; 32],
+    now_ms: i64,
+) -> anyhow::Result<bool> {
+    Ok(verify_node_binding(conn, account_id, binding, remote_node, now_ms)?.is_ok())
+}
 
 /// A [`SyncStore`] over one account's op log on a live connection. Scoped to a single account: a
 /// session syncs one account, and the hello handshake refuses a peer naming a different one.
@@ -165,5 +200,41 @@ impl SyncStore for OplogContentSyncStore<'_> {
             ContentIngestOutcome::Rejected(_) | ContentIngestOutcome::CapacityReached { .. } =>
                 Ok(Ingested::NoChange),
         }
+    }
+}
+
+// Both op-log stores carry the same account-level node-authorization capability (the binding is
+// about the account + transport node, independent of whether the session moves account entries or
+// content), so both delegate to the shared helpers above.
+// Both auth methods take `now_ms` per HANDSHAKE (not the store's construction-time `now_ms`, which
+// stays the ingest timestamp for received entries): binding freshness must track the live clock, or
+// a reused store would mint stale bindings and never advance the replay window.
+impl NodeAuth for OplogSyncStore<'_> {
+    fn local_binding(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<Vec<u8>> {
+        sign_binding(self.conn, self.account_id, local_node, now_ms)
+    }
+
+    fn authorize(
+        &self,
+        binding: &[u8],
+        remote_node: &[u8; 32],
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
+    }
+}
+
+impl NodeAuth for OplogContentSyncStore<'_> {
+    fn local_binding(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<Vec<u8>> {
+        sign_binding(self.conn, self.account_id, local_node, now_ms)
+    }
+
+    fn authorize(
+        &self,
+        binding: &[u8],
+        remote_node: &[u8; 32],
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
     }
 }

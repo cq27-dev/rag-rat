@@ -66,6 +66,17 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 
 /// Read one frame, or [`CodecError::Eof`] if the stream ends cleanly before the next length prefix.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, CodecError> {
+    read_frame_within(r, MAX_FRAME_BYTES).await
+}
+
+/// [`read_frame`] with a caller-supplied maximum, checked against the length prefix BEFORE any
+/// allocation. The auth phase passes a tight bound so an unauthenticated peer cannot force the full
+/// [`MAX_FRAME_BYTES`] allocation with its first frame (#881) — the frame-level cap is what
+/// actually bounds the pre-auth allocation, since the body is sized from the length prefix.
+pub async fn read_frame_within<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max_bytes: u32,
+) -> Result<Frame, CodecError> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf).await {
         Ok(_) => {},
@@ -73,7 +84,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, CodecE
         Err(e) => return Err(CodecError::Io(e)),
     }
     let len = u32::from_be_bytes(len_buf);
-    if len > MAX_FRAME_BYTES {
+    if len > max_bytes {
         return Err(CodecError::FrameTooLarge(len));
     }
     let mut body = vec![0u8; len as usize];
@@ -118,5 +129,19 @@ mod tests {
         a.write_all(&(MAX_FRAME_BYTES + 1).to_be_bytes()).await.unwrap();
         drop(a);
         assert!(matches!(read_frame(&mut b).await, Err(CodecError::FrameTooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn a_capped_read_refuses_a_prefix_over_its_smaller_limit() {
+        // The auth phase reads with a tight cap so an unauthenticated peer cannot force the full
+        // MAX_FRAME_BYTES allocation. A 2 KiB prefix under a 1 KiB cap is refused from the prefix
+        // alone — the 2 KiB body is never allocated.
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_all(&2048u32.to_be_bytes()).await.unwrap();
+        drop(a);
+        assert!(matches!(
+            read_frame_within(&mut b, 1024).await,
+            Err(CodecError::FrameTooLarge(2048)),
+        ));
     }
 }

@@ -9,16 +9,16 @@
 //! directory, so discovery happens ONLY through the relay this deployment pins — a peer is
 //! reachable iff it shares the configured relay, never via a third-party lookup.
 //!
-//! # Authorization is NOT enforced here (see #881)
+//! # Authorization (#881)
 //!
-//! iroh authenticates the transport KEY, but this slice does not check that the connecting node
-//! belongs to a device in the account. Any node that holds the endpoint address can complete the
-//! handshake and pull the account's inventory and signed entries. That is bounded — account entries
-//! are signed (a peer cannot forge one) and content is sealed (it needs keys this transport never
-//! carries), so an unauthorized peer learns the roster shape but cannot decrypt content or inject a
-//! valid entry — and no production path calls [`accept_and_sync`] yet. The node↔device binding and
-//! admission control are the pairing slice (D4); until then, treat a shared address as out-of-band
-//! trust between peers that already know each other.
+//! iroh authenticates the transport KEY; on top of that, both [`connect_and_sync`] and
+//! [`accept_and_sync`] run the mutual node-authorization handshake ([`run_auth_phase`]) BEFORE any
+//! inventory is exchanged. Under [`AuthPolicy::Closed`] a peer is admitted only if it presents a
+//! signed binding proving its authenticated node id belongs to a roster device of the account;
+//! under [`AuthPolicy::Open`] any peer is admitted (for a future public read-only knowledge base).
+//! The ONBOARDING case — admitting a not-yet-roster device via a one-time invite token
+//! ([`AuthPolicy::InviteToken`]) — is not implemented in this slice and fails closed; it is the
+//! pairing flow (`sync init` / `sync pair` / `sync join`) that the CLI slice wires up.
 
 use std::str::FromStr;
 
@@ -26,6 +26,9 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey};
 use tokio::time::timeout;
 
+use crate::auth::{
+    AuthConfig, AuthPolicy, AuthRole, DEFAULT_PRE_AUTH_TIMEOUT, NodeAuth, run_auth_phase,
+};
 use crate::session::{DEFAULT_IDLE_TIMEOUT, SessionError, SessionReport, SyncStore, run_session};
 use crate::wire::SYNC_ALPN;
 
@@ -76,20 +79,38 @@ pub fn endpoint_addr(endpoint: &Endpoint) -> EndpointAddr {
     endpoint.addr()
 }
 
-/// Dial `peer` and run one sync session against it, returning what moved.
-pub async fn connect_and_sync<S: SyncStore>(
+/// Dial `peer`, authorize each other under `policy`, then run one sync session, returning what
+/// moved. The auth handshake (#881) runs BEFORE any inventory: the dialer presents its binding,
+/// then verifies the acceptor's before revealing anything, so a poisoned address never leaks the
+/// account log to an impostor.
+pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
     endpoint: &Endpoint,
     peer: impl Into<EndpointAddr>,
     store: &mut S,
+    policy: AuthPolicy,
+    now_ms: i64,
 ) -> Result<SessionReport, SyncFailure> {
+    let local_node = *endpoint.id().as_bytes();
     let conn = endpoint
         .connect(peer, SYNC_ALPN)
         .await
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
-    let (send, recv) = conn
+    let remote_node = *conn.remote_id().as_bytes();
+    let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+    run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
+        role: AuthRole::Dialer,
+        account_id: store.account_id(),
+        local_node,
+        remote_node,
+        policy,
+        now_ms,
+        pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+    })
+    .await
+    .map_err(SyncFailure::Auth)?;
     let report = run_session(store, send, recv).await.map_err(SyncFailure::Session)?;
     // Best-effort graceful close; the session already exchanged an explicit Done both ways.
     conn.close(0u32.into(), b"done");
@@ -103,10 +124,13 @@ pub async fn connect_and_sync<S: SyncStore>(
 /// bounded by [`DEFAULT_IDLE_TIMEOUT`]. `run_session`'s own idle timeout only starts once the
 /// stream is open, so without these a peer that connects and then stalls (never opening a stream)
 /// would hold this single-session server forever, blocking every later peer.
-pub async fn accept_and_sync<S: SyncStore>(
+pub async fn accept_and_sync<S: SyncStore + NodeAuth>(
     endpoint: &Endpoint,
     store: &mut S,
+    policy: AuthPolicy,
+    now_ms: i64,
 ) -> Result<SessionReport, SyncFailure> {
+    let local_node = *endpoint.id().as_bytes();
     let incoming = endpoint
         .accept()
         .await
@@ -115,19 +139,36 @@ pub async fn accept_and_sync<S: SyncStore>(
         .await
         .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("handshake timed out".into())))?
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
-    let (send, recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.accept_bi())
+    let remote_node = *conn.remote_id().as_bytes();
+    let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.accept_bi())
         .await
         .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("peer opened no stream".into())))?
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+    // Authorize the dialer BEFORE run_session so no inventory (not even account confirmation)
+    // leaves this peer until the remote passes our policy (#881).
+    run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
+        role: AuthRole::Acceptor,
+        account_id: store.account_id(),
+        local_node,
+        remote_node,
+        policy,
+        now_ms,
+        pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+    })
+    .await
+    .map_err(SyncFailure::Auth)?;
     let report = run_session(store, send, recv).await.map_err(SyncFailure::Session)?;
     conn.close(0u32.into(), b"done");
     Ok(report)
 }
 
-/// A sync attempt that failed either setting up the connection or running the session.
+/// A sync attempt that failed setting up the connection, authorizing the peer, or running the
+/// session.
 #[derive(Debug)]
 pub enum SyncFailure {
     Endpoint(EndpointError),
+    /// The node-authorization handshake refused the peer (or we could not authorize to it).
+    Auth(crate::auth::AuthError),
     Session(SessionError),
 }
 
@@ -135,6 +176,7 @@ impl std::fmt::Display for SyncFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SyncFailure::Endpoint(e) => write!(f, "{e}"),
+            SyncFailure::Auth(e) => write!(f, "{e}"),
             SyncFailure::Session(e) => write!(f, "{e}"),
         }
     }

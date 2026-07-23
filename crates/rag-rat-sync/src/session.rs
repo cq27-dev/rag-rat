@@ -247,6 +247,11 @@ where
                 Ok(Frame::Hello { .. }) => {
                     return Err(SessionError::Protocol("a second hello mid-session".into()));
                 },
+                Ok(Frame::Auth { .. }) => {
+                    // Auth belongs to the handshake the endpoint runs BEFORE `run_session`; an Auth
+                    // frame in the data phase is out of sequence.
+                    return Err(SessionError::Protocol("an auth frame mid-session".into()));
+                },
                 // `read_frame_before` has already mapped EOF (truncated transfer) and idle timeout
                 // into a `SessionError`, so any error here just propagates.
                 Err(e) => return Err(e),

@@ -15,12 +15,14 @@
 //! - [`endpoint`] — the iroh endpoint that binds the ALPN over a pinned relay and runs a session
 //!   per connection.
 
+pub mod auth;
 pub mod codec;
 pub mod endpoint;
 pub mod session;
 pub mod store;
 pub mod wire;
 
+pub use auth::{AuthConfig, AuthError, AuthPolicy, AuthRole, NodeAuth, run_auth_phase};
 pub use endpoint::{
     EndpointError, SyncFailure, accept_and_sync, build_endpoint, connect_and_sync, endpoint_addr,
 };
