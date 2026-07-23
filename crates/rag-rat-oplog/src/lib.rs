@@ -96,6 +96,7 @@ pub use account::{
     GrantDeviceBoundary, GrantRole, IngestOutcome, KeyId, LiveKeyEpoch, LiveKeyTargets,
     OwnerAuthority, OwnerChainAuthority, PreparedContentAuthoring, RosterContentAuthority,
     RotationOutcome, SealPolicy, SealingKeyOutcome, SelectedWrap, SnapshotAuthorOutcome,
+    SyncAccountEntry, account_entries_for_sync, account_entry_exists, account_entry_ref,
     account_ingest, auth_len_freshness, author_content_batch, author_content_batch_in_tx,
     author_prepared_content_batch_in_tx, author_snapshot_in_tx, backfill_authority_projection,
     catch_up_stream_keys_for_device_in_tx, content_op_is_authorable,

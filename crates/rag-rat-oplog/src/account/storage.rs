@@ -1579,6 +1579,85 @@ fn load_candidates(conn: &Connection, account_id: AccountId) -> anyhow::Result<V
     Ok(out)
 }
 
+/// One account-log entry as it goes on the wire (phase D, #406): its chain coordinates plus the
+/// exact stored `signed_bytes`. The bytes are opaque here — a peer re-runs [`account_ingest`] over
+/// them, which re-verifies the signature and canonicity from scratch, so the sender is never
+/// trusted. Every HELD entry is offered, accepted or not: the fold is grow-only (I8) and
+/// order-free, so a peer must see equivocation branches too to reach the same accepted set.
+#[derive(Debug, Clone)]
+pub struct SyncAccountEntry {
+    pub device_fingerprint: DeviceFingerprint,
+    pub log_id: u8,
+    pub seq: u64,
+    pub entry_hash: [u8; 32],
+    pub signed_bytes: Vec<u8>,
+}
+
+/// Peek the `(account_id, entry_hash)` a signed account entry claims, WITHOUT ingesting it. The
+/// sync layer uses this to refuse an entry for a different account before it reaches
+/// [`account_ingest`] (an account-scoped session must not let a peer inject entries for other
+/// accounts), and to skip re-offering one it already holds. Structure only — a full verify still
+/// happens in `account_ingest`; a decode failure here just means the bytes are not a well-formed
+/// account entry, which the session treats as a peer to distrust.
+pub fn account_entry_ref(signed_bytes: &[u8]) -> anyhow::Result<(AccountId, [u8; 32])> {
+    let signed = envelope::decode_account_signed(signed_bytes)?;
+    Ok((signed.header.account_id, signed.entry_hash))
+}
+
+/// Whether `account_id` already holds the entry `entry_hash`. A cheap existence probe so the sync
+/// layer can report real transfer versus redelivery without decoding the fold verdict.
+pub fn account_entry_exists(
+    conn: &Connection,
+    account_id: AccountId,
+    entry_hash: [u8; 32],
+) -> anyhow::Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM account_entries WHERE account_id = ?1 AND entry_hash = ?2",
+            params![account_id.to_bytes().as_slice(), entry_hash.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// Every held account-log entry for `account_id`, ordered by `entry_hash` for a deterministic wire
+/// order (the fold is order-free regardless). The sync layer diffs these against what a peer
+/// already holds and streams the difference; re-ingesting a held entry is an idempotent no-op.
+pub fn account_entries_for_sync(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Vec<SyncAccountEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT entry_hash, device_fingerprint, seq, log_id, signed_bytes
+         FROM account_entries WHERE account_id = ?1
+         ORDER BY entry_hash",
+    )?;
+    let rows = stmt
+        .query_map(params![account_id.to_bytes().as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (hash, fp, seq, log_id, signed_bytes) in rows {
+        out.push(SyncAccountEntry {
+            device_fingerprint: DeviceFingerprint::from_bytes(fixed(&fp)?),
+            log_id: u8::try_from(log_id)
+                .map_err(|_| anyhow::anyhow!("stored log_id {log_id} out of range"))?,
+            seq: seq as u64,
+            entry_hash: fixed(&hash)?,
+            signed_bytes,
+        });
+    }
+    Ok(out)
+}
+
 /// Insert one verified entry into the candidate DAG under the caller's txn, enforcing the
 /// operational admission budgets. `pub(super)` so [`super::bootstrap`] can store its local-account
 /// genesis through the same seam the ingest path uses.

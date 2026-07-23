@@ -12,6 +12,7 @@ members = [
   "crates/rag-rat-cli",
   "crates/rag-rat-core",
   "crates/rag-rat-mcp",
+  "crates/rag-rat-sync",
 ]
 resolver = "3"
 
@@ -48,6 +49,7 @@ rag-rat-papertrail = { version = "0.20.0", path = "crates/rag-rat-papertrail", d
 rag-rat-query = { version = "0.20.0", path = "crates/rag-rat-query", default-features = false }
 rag-rat-core = { version = "0.20.0", path = "crates/rag-rat-core", default-features = false }
 rag-rat-mcp = { version = "0.20.0", path = "crates/rag-rat-mcp", default-features = false }
+rag-rat-sync = { version = "0.20.0", path = "crates/rag-rat-sync", default-features = false }
 anyhow = "1.0"
 # ed25519 device-identity signing for the op-log's signed entry envelope (§C4 layer-1). Default
 # features (incl. `zeroize`, which zeroizes a `SigningKey`'s seed on drop) are kept; the `rand_core`
@@ -125,6 +127,8 @@ strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0"
 # `time` backs the papertrail transport's rate-limit backoff sleeps (tokio::time::sleep).
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-std", "time"] }
+iroh = { version = "1.0.0", default-features = false, features = ["tls-ring"] }
+iroh-tickets = "1.0.0"
 # Minimal blocking HTTP for the crates.io version check. rustls (no system OpenSSL); gzip off —
 # the responses are tiny. Tracker REST traffic lives on `reqwest` (papertrail transport, #589).
 ureq = { version = "3", default-features = false, features = ["rustls"] }

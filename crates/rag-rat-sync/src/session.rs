@@ -1,0 +1,393 @@
+//! The symmetric sync session (phase D, #406).
+//!
+//! One protocol for both roles. Each peer sends [`Frame::Hello`] with the account it is syncing and
+//! every account-log entry hash it holds, then streams the entries the other lacks and ends with
+//! [`Frame::Done`]. The two directions run concurrently over one bidirectional stream, so a large
+//! transfer in one direction never blocks the other (the deadlock a send-then-receive ordering
+//! would cause on a bounded stream).
+//!
+//! The session is transport-agnostic — generic over any [`AsyncRead`]/[`AsyncWrite`] pair — and
+//! trusts nothing it receives: every entry is handed to [`SyncStore::ingest`], which re-verifies it
+//! from scratch. It is deliberately NOT `Send`-bound: [`SyncStore`] wraps a SQLite connection, so a
+//! caller runs one session at a time on a single task (concurrent sessions are a later slice).
+
+use std::collections::HashSet;
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+use crate::codec::{self, CodecError};
+use crate::wire::{Frame, MAX_ENTRIES_PER_PAGE, MAX_HELLO_HASHES};
+
+type Hash = [u8; 32];
+
+/// Cap the outgoing hello inventory to what the wire allows the peer to decode.
+///
+/// Advertising a SUBSET of what we hold is always correct, only ever less efficient: the peer sends
+/// every entry it has that is not in the advertised set — which, past the cap, includes some
+/// entries we already hold, and re-ingesting a held entry is an idempotent no-op. So an account
+/// with more than [`MAX_HELLO_HASHES`] entries still converges to the union; it just pays some
+/// redundant transfer. This deliberately avoids a "remainder reconcile" protocol: correctness does
+/// not need one, and the accounts D targets stay well under the cap regardless.
+fn bounded_inventory(hashes: impl Iterator<Item = Hash>) -> Vec<Hash> {
+    hashes.take(MAX_HELLO_HASHES).collect()
+}
+
+/// The store side of a session: what a peer offers and where received entries land. Implemented
+/// over the op log for production and over an in-memory map for tests.
+pub trait SyncStore {
+    /// The account this session is scoped to. A peer whose hello names a different account is a
+    /// misdirected connection and the session aborts.
+    fn account_id(&self) -> Hash;
+
+    /// Every held account-log entry as `(entry_hash, signed_bytes)`, read ONCE at session start.
+    /// Snapshotting up front keeps what we send independent of what we concurrently ingest, so the
+    /// two session halves never contend for the store.
+    fn snapshot(&self) -> anyhow::Result<Vec<(Hash, Vec<u8>)>>;
+
+    /// Ingest one received entry's `signed_bytes`. Must be idempotent (re-ingesting a held entry is
+    /// a no-op) and must re-verify — the bytes came off the wire from an untrusted peer.
+    fn ingest(&mut self, signed_bytes: &[u8]) -> anyhow::Result<Ingested>;
+}
+
+/// Whether an ingested entry was newly stored, so a session can report real transfer versus
+/// redelivery without the store leaking its verdict taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ingested {
+    /// The entry was accepted into the store (or durably parked pending its signer).
+    Stored,
+    /// Already held, or refused by verification — either way nothing new landed.
+    NoChange,
+}
+
+/// What one session moved. Symmetric: each peer both sends and receives.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SessionReport {
+    pub entries_sent: usize,
+    pub entries_received: usize,
+    pub entries_newly_stored: usize,
+}
+
+/// A session that could not complete.
+#[derive(Debug)]
+pub enum SessionError {
+    /// The transport failed or the peer sent an unreadable frame.
+    Codec(CodecError),
+    /// The peer opened with something other than a hello, or named a different account.
+    Protocol(String),
+    /// Reading the local entry snapshot failed.
+    Store(anyhow::Error),
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::Codec(e) => write!(f, "sync session transport: {e}"),
+            SessionError::Protocol(m) => write!(f, "sync session protocol violation: {m}"),
+            SessionError::Store(e) => write!(f, "sync session store: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+/// Run one session to completion over `send`/`recv`, syncing account entries with the peer.
+///
+/// Both halves run under `join!` on the current task — no spawn, so `store` (and its SQLite
+/// connection) need not be `Send`. The sender owns an up-front snapshot of local entries; the
+/// receiver holds `&mut store` to ingest. Because the sender reads only the snapshot, the two never
+/// alias the store.
+pub async fn run_session<S, R, W>(
+    store: &mut S,
+    mut send: W,
+    mut recv: R,
+) -> Result<SessionReport, SessionError>
+where
+    S: SyncStore,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let account_id = store.account_id();
+    let snapshot = store.snapshot().map_err(SessionError::Store)?;
+    let have = bounded_inventory(snapshot.iter().map(|(h, _)| *h));
+
+    // Channel the peer's inventory from the receiver (which parses the peer hello) to the sender
+    // (which needs it to decide what to stream). A oneshot: exactly one hello per session.
+    let (peer_have_tx, peer_have_rx) = tokio::sync::oneshot::channel::<HashSet<Hash>>();
+
+    let sender = async move {
+        codec::write_frame(&mut send, &Frame::Hello { account_id, have })
+            .await
+            .map_err(SessionError::Codec)?;
+        // If the receiver aborted before delivering the peer hello, there is nothing to stream.
+        let Ok(peer_have) = peer_have_rx.await else {
+            return Ok(0usize);
+        };
+        let mut to_send: Vec<Vec<u8>> = snapshot
+            .into_iter()
+            .filter(|(hash, _)| !peer_have.contains(hash))
+            .map(|(_, bytes)| bytes)
+            .collect();
+        let total = to_send.len();
+        // Drain into fixed pages so no single frame exceeds the per-page cap.
+        let mut rest = to_send.split_off(0);
+        while !rest.is_empty() {
+            let tail = rest.split_off(rest.len().min(MAX_ENTRIES_PER_PAGE));
+            let page = std::mem::replace(&mut rest, tail);
+            let more = !rest.is_empty();
+            codec::write_frame(&mut send, &Frame::Entries { entries: page, more })
+                .await
+                .map_err(SessionError::Codec)?;
+        }
+        codec::write_frame(&mut send, &Frame::Done).await.map_err(SessionError::Codec)?;
+        // Cleanly finish the send half. On an iroh stream `shutdown` maps to quinn `finish` (a FIN
+        // the peer sees after the last frame); dropping without it would RESET and could truncate
+        // the final page. On a duplex it just closes the write half → clean EOF for the peer.
+        send.shutdown().await.map_err(|e| SessionError::Codec(CodecError::Io(e)))?;
+        Ok::<usize, SessionError>(total)
+    };
+
+    let receiver = async {
+        // The peer must open with a hello for the account we are syncing.
+        let hello = codec::read_frame(&mut recv).await.map_err(SessionError::Codec)?;
+        let Frame::Hello { account_id: peer_account, have: peer_have } = hello else {
+            return Err(SessionError::Protocol("peer did not open with a hello".into()));
+        };
+        if peer_account != account_id {
+            return Err(SessionError::Protocol(
+                "peer hello names a different account than this session".into(),
+            ));
+        }
+        // Hand the peer's inventory to the sender; if it already gave up, we still drain the
+        // stream.
+        let _ = peer_have_tx.send(peer_have.into_iter().collect());
+
+        let mut received = 0usize;
+        let mut newly_stored = 0usize;
+        // Whether the peer's previous page declared more would follow. A `Done` is valid only after
+        // a `more: false` page (or with no pages at all); a peer that declared `more: true` then
+        // sent `Done` truncated a transfer it called incomplete.
+        let mut expect_more = false;
+        loop {
+            match codec::read_frame(&mut recv).await {
+                Ok(Frame::Entries { entries, more }) => {
+                    for bytes in entries {
+                        received += 1;
+                        match store.ingest(&bytes).map_err(SessionError::Store)? {
+                            Ingested::Stored => newly_stored += 1,
+                            Ingested::NoChange => {},
+                        }
+                    }
+                    expect_more = more;
+                },
+                Ok(Frame::Done) => {
+                    if expect_more {
+                        return Err(SessionError::Protocol(
+                            "peer sent Done after declaring more pages would follow".into(),
+                        ));
+                    }
+                    break;
+                },
+                Ok(Frame::Hello { .. }) => {
+                    return Err(SessionError::Protocol("a second hello mid-session".into()));
+                },
+                // EOF before an explicit Done is a TRUNCATED transfer, not a clean finish: the peer
+                // may have streamed only part of its pages (the last one carrying `more: true`).
+                // Reporting success here would let the caller treat the account as synced with
+                // entries silently missing, so it fails the session instead.
+                Err(CodecError::Eof) => {
+                    return Err(SessionError::Protocol(
+                        "peer closed the stream before sending Done — transfer truncated".into(),
+                    ));
+                },
+                Err(e) => return Err(SessionError::Codec(e)),
+            }
+        }
+        Ok::<(usize, usize), SessionError>((received, newly_stored))
+    };
+
+    // `try_join!`, not `join!`: if either half errors, the other is cancelled immediately. Without
+    // it, a peer that sends a bad frame and stops reading would leave the sender blocked on QUIC
+    // flow control mid-stream, and the session would hang instead of failing.
+    let (entries_sent, (entries_received, entries_newly_stored)) =
+        tokio::try_join!(sender, receiver)?;
+    Ok(SessionReport { entries_sent, entries_received, entries_newly_stored })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    /// An in-memory store: entries are `(hash, bytes)`, ingest inserts if absent. Enough to
+    /// exercise the protocol without a database — the DB-backed store has its own integration
+    /// test.
+    struct MemStore {
+        account: Hash,
+        entries: HashMap<Hash, Vec<u8>>,
+    }
+
+    impl MemStore {
+        fn new(account: Hash, entries: &[(Hash, Vec<u8>)]) -> Self {
+            Self { account, entries: entries.iter().cloned().collect() }
+        }
+    }
+
+    impl SyncStore for MemStore {
+        fn account_id(&self) -> Hash {
+            self.account
+        }
+        fn snapshot(&self) -> anyhow::Result<Vec<(Hash, Vec<u8>)>> {
+            let mut v: Vec<_> = self.entries.iter().map(|(h, b)| (*h, b.clone())).collect();
+            v.sort_by_key(|(h, _)| *h);
+            Ok(v)
+        }
+        fn ingest(&mut self, signed_bytes: &[u8]) -> anyhow::Result<Ingested> {
+            // The test's "hash" is the first 32 bytes of the payload it authored below.
+            let hash: Hash = signed_bytes[..32].try_into().unwrap();
+            match self.entries.entry(hash) {
+                std::collections::hash_map::Entry::Occupied(_) => Ok(Ingested::NoChange),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(signed_bytes.to_vec());
+                    Ok(Ingested::Stored)
+                },
+            }
+        }
+    }
+
+    fn entry(seed: u8) -> (Hash, Vec<u8>) {
+        let mut bytes = vec![seed; 40];
+        bytes[..32].copy_from_slice(&[seed; 32]);
+        ([seed; 32], bytes)
+    }
+
+    async fn sync_pair(a: &mut MemStore, b: &mut MemStore) -> (SessionReport, SessionReport) {
+        let (a_send, b_recv) = tokio::io::duplex(1 << 20);
+        let (b_send, a_recv) = tokio::io::duplex(1 << 20);
+        let (ra, rb) =
+            tokio::join!(run_session(a, a_send, a_recv), run_session(b, b_send, b_recv),);
+        (ra.unwrap(), rb.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_peer_with_nothing_restores_the_full_set_from_the_other() {
+        let full: Vec<_> = (0u8..5).map(entry).collect();
+        let mut a = MemStore::new([0xac; 32], &full);
+        let mut b = MemStore::new([0xac; 32], &[]);
+        let (ra, rb) = sync_pair(&mut a, &mut b).await;
+
+        assert_eq!(ra.entries_sent, 5, "the full peer sends all five");
+        assert_eq!(rb.entries_newly_stored, 5, "the empty peer stores all five");
+        assert_eq!(a.entries.len(), 5, "the full peer is unchanged");
+        assert_eq!(b.entries.len(), 5, "the empty peer is now complete");
+        assert_eq!(a.entries, b.entries, "both hold the same set — restore-from-peer");
+    }
+
+    #[tokio::test]
+    async fn disjoint_peers_converge_to_the_union_both_directions() {
+        let mut a = MemStore::new([1; 32], &[entry(1), entry(2), entry(3)]);
+        let mut b = MemStore::new([1; 32], &[entry(3), entry(4), entry(5)]);
+        let (ra, rb) = sync_pair(&mut a, &mut b).await;
+
+        // Each sends only what the other lacks; the shared entry(3) is sent by neither... actually
+        // both send their non-shared entries. a lacks 4,5; b lacks 1,2.
+        assert_eq!(rb.entries_newly_stored, 2, "b gains 1 and 2");
+        assert_eq!(ra.entries_newly_stored, 2, "a gains 4 and 5");
+        let union: HashSet<Hash> = (1u8..=5).map(|s| [s; 32]).collect();
+        assert_eq!(a.entries.keys().copied().collect::<HashSet<_>>(), union);
+        assert_eq!(b.entries.keys().copied().collect::<HashSet<_>>(), union);
+    }
+
+    #[tokio::test]
+    async fn already_in_sync_transfers_nothing() {
+        let same: Vec<_> = (10u8..13).map(entry).collect();
+        let mut a = MemStore::new([2; 32], &same);
+        let mut b = MemStore::new([2; 32], &same);
+        let (ra, rb) = sync_pair(&mut a, &mut b).await;
+        assert_eq!(ra.entries_sent, 0);
+        assert_eq!(rb.entries_sent, 0);
+        assert_eq!(ra.entries_newly_stored, 0);
+        assert_eq!(rb.entries_newly_stored, 0);
+    }
+
+    /// A stream that ends after a `more: true` page — a truncated transfer — must FAIL, not report
+    /// success, or the caller would treat a partial account as complete.
+    #[tokio::test]
+    async fn a_truncated_transfer_fails_rather_than_reporting_success() {
+        use crate::codec::write_frame;
+        let mut receiver = MemStore::new([5; 32], &[]);
+        // Feed the receiver a hello then one page claiming more follows, then close abruptly.
+        let (mut peer_send, recv) = tokio::io::duplex(1 << 16);
+        let (send, _peer_recv) = tokio::io::duplex(1 << 16);
+        let feeder = tokio::spawn(async move {
+            write_frame(&mut peer_send, &Frame::Hello { account_id: [5; 32], have: vec![] })
+                .await
+                .unwrap();
+            write_frame(&mut peer_send, &Frame::Entries {
+                entries: vec![entry(7).1],
+                more: true, // a page CLAIMING more will follow …
+            })
+            .await
+            .unwrap();
+            // … then drop without Done: a truncated stream.
+        });
+        let result = run_session(&mut receiver, send, recv).await;
+        feeder.await.unwrap();
+        assert!(
+            matches!(result, Err(SessionError::Protocol(_))),
+            "EOF before Done is a truncated transfer, not success: {result:?}",
+        );
+    }
+
+    /// A peer that sends `Done` right after a `more: true` page declared an incomplete transfer
+    /// and then stopped — the receiver must reject it, not report success.
+    #[tokio::test]
+    async fn done_after_a_more_true_page_is_rejected() {
+        use crate::codec::write_frame;
+        let mut receiver = MemStore::new([6; 32], &[]);
+        let (mut peer_send, recv) = tokio::io::duplex(1 << 16);
+        let (send, _peer_recv) = tokio::io::duplex(1 << 16);
+        let feeder = tokio::spawn(async move {
+            write_frame(&mut peer_send, &Frame::Hello { account_id: [6; 32], have: vec![] })
+                .await
+                .unwrap();
+            write_frame(&mut peer_send, &Frame::Entries { entries: vec![entry(1).1], more: true })
+                .await
+                .unwrap();
+            write_frame(&mut peer_send, &Frame::Done).await.unwrap();
+        });
+        let result = run_session(&mut receiver, send, recv).await;
+        feeder.await.unwrap();
+        assert!(
+            matches!(result, Err(SessionError::Protocol(_))),
+            "Done after more:true is a declared-incomplete transfer: {result:?}",
+        );
+    }
+
+    #[test]
+    fn the_outgoing_inventory_is_capped_to_the_wire_limit() {
+        let over = MAX_HELLO_HASHES + 100;
+        let hashes = (0..over).map(|i| {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            h
+        });
+        let bounded = bounded_inventory(hashes);
+        assert_eq!(bounded.len(), MAX_HELLO_HASHES, "never advertises more than the peer decodes");
+        // And the frame it produces is decodable (would be rejected as over-cap otherwise).
+        let frame = Frame::Hello { account_id: [0; 32], have: bounded };
+        assert!(Frame::decode(&frame.encode()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_account_aborts_the_session() {
+        let mut a = MemStore::new([1; 32], &[entry(1)]);
+        let mut b = MemStore::new([2; 32], &[entry(2)]);
+        let (a_send, b_recv) = tokio::io::duplex(1 << 16);
+        let (b_send, a_recv) = tokio::io::duplex(1 << 16);
+        let (ra, rb) =
+            tokio::join!(run_session(&mut a, a_send, a_recv), run_session(&mut b, b_send, b_recv),);
+        assert!(matches!(ra, Err(SessionError::Protocol(_))));
+        assert!(matches!(rb, Err(SessionError::Protocol(_))));
+    }
+}

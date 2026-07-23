@@ -1,0 +1,22 @@
+[package]
+name = "rag-rat-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Peer/p2p transport for the rag-rat op log: an iroh QUIC session that exchanges signed account entries between peers, feeding each through the op-log ingest seams (phase D, #406)."
+
+[dependencies]
+anyhow.workspace = true
+rag-rat-base.workspace = true
+rag-rat-oplog.workspace = true
+rusqlite.workspace = true
+minicbor.workspace = true
+tokio = { workspace = true, features = ["sync", "io-util"] }
+iroh.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+rag-rat-db.workspace = true

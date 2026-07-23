@@ -1,0 +1,286 @@
+//! The sync session wire protocol (phase D, #406).
+//!
+//! One symmetric protocol for device↔device and device↔server: both peers send [`Frame::Hello`]
+//! naming the account and every account-log entry hash they already hold, then each streams the
+//! entries the other lacks as [`Frame::Entries`] pages, ending with [`Frame::Done`]. The receiver
+//! feeds every entry through the op-log ingest seam, which re-verifies signature, canonicity, and
+//! chain continuity from scratch — the sender is never trusted, so a malformed or forged frame is
+//! rejected exactly as a malformed local write would be.
+//!
+//! Frames are canonical CBOR arrays tagged by a leading discriminant, encoded by hand with
+//! `minicbor::Encoder` to match the op-log's envelope style (no derive). The byte layout is a
+//! frozen wire — a golden-vector test pins it.
+
+use minicbor::{Decoder, Encoder};
+
+/// The ALPN this protocol speaks (#406). Versioned: a breaking wire change bumps the suffix so an
+/// old peer declines the handshake instead of misreading frames.
+pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/1";
+
+/// Domain tag committed into every frame's leading array element, so a frame from another protocol
+/// (or a truncated one) cannot be mistaken for a valid frame.
+const FRAME_DOMAIN: &str = "rag-rat/sync-frame/1";
+
+/// The maximum entries a single [`Frame::Entries`] page carries — a hard cap so one frame can never
+/// force an unbounded allocation on the receiver (#406: bounded frames, no amplification).
+pub const MAX_ENTRIES_PER_PAGE: usize = 256;
+
+/// The maximum entry hashes a single [`Frame::Hello`] inventory carries. Bounds the hello frame so
+/// a peer cannot force an unbounded allocation before any authentication. A sender with more
+/// entries than this advertises a bounded subset — still correct (the peer's extra sends are
+/// idempotently re-ingested), just less efficient; see `session::bounded_inventory`. For the
+/// accounts D targets the cap is never reached.
+pub const MAX_HELLO_HASHES: usize = 65_536;
+
+type Hash = [u8; 32];
+
+/// One protocol frame. The discriminant is the second array element (after the domain tag).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frame {
+    /// Opens a session: the account being synced and every account-log entry hash the sender holds.
+    /// The peer replies with the entries in ITS store that are not in this set.
+    Hello { account_id: Hash, have: Vec<Hash> },
+    /// A page of `signed_bytes` the peer lacked. `more` is true when further pages follow.
+    Entries { entries: Vec<Vec<u8>>, more: bool },
+    /// The sender has streamed every entry the peer lacked. A session ends when both directions are
+    /// `Done`.
+    Done,
+}
+
+mod tag {
+    pub const HELLO: u8 = 0;
+    pub const ENTRIES: u8 = 1;
+    pub const DONE: u8 = 2;
+}
+
+/// A frame that failed to decode. Kept distinct from an I/O error so the session can treat a
+/// protocol violation (drop the peer) differently from a transport hiccup.
+#[derive(Debug)]
+pub enum WireError {
+    /// The bytes are not a well-formed frame of this protocol.
+    Malformed(String),
+    /// A field exceeded its hard cap — a bounded-frame violation, treated as hostile.
+    OverCap(String),
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireError::Malformed(m) => write!(f, "malformed sync frame: {m}"),
+            WireError::OverCap(m) => write!(f, "sync frame over cap: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
+
+impl Frame {
+    /// Encode to canonical CBOR. Infallible for the in-memory shapes the session builds (the caps
+    /// are enforced by the builders), so encoding errors are a programmer bug, not a wire
+    /// condition.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        // `[domain, tag, ..variant fields]`.
+        match self {
+            Frame::Hello { account_id, have } => {
+                enc.array(3).expect(INFALLIBLE);
+                enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
+                enc.u8(tag::HELLO).expect(INFALLIBLE);
+                enc.array(2).expect(INFALLIBLE);
+                enc.bytes(account_id).expect(INFALLIBLE);
+                enc.array(have.len() as u64).expect(INFALLIBLE);
+                for h in have {
+                    enc.bytes(h).expect(INFALLIBLE);
+                }
+            },
+            Frame::Entries { entries, more } => {
+                enc.array(4).expect(INFALLIBLE);
+                enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
+                enc.u8(tag::ENTRIES).expect(INFALLIBLE);
+                enc.array(entries.len() as u64).expect(INFALLIBLE);
+                for e in entries {
+                    enc.bytes(e).expect(INFALLIBLE);
+                }
+                enc.bool(*more).expect(INFALLIBLE);
+            },
+            Frame::Done => {
+                enc.array(2).expect(INFALLIBLE);
+                enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
+                enc.u8(tag::DONE).expect(INFALLIBLE);
+            },
+        }
+        buf
+    }
+
+    /// Decode a frame, enforcing the domain tag and every hard cap. A caller treats `Err` as a
+    /// protocol violation and drops the peer.
+    pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
+        let mut dec = Decoder::new(bytes);
+        let outer = expect_len(dec.array().map_err(m)?, "frame")?;
+        let domain = dec.str().map_err(m)?;
+        if domain != FRAME_DOMAIN {
+            return Err(WireError::Malformed(format!("unknown frame domain {domain:?}")));
+        }
+        let tag = dec.u8().map_err(m)?;
+        // Pin the outer arity per variant: the wire is frozen, so a `Done` with extra fields or a
+        // `Hello` of the wrong length is a malformed frame, not a tolerated superset.
+        let expected_outer = match tag {
+            tag::HELLO => 3,
+            tag::ENTRIES => 4,
+            tag::DONE => 2,
+            other => return Err(WireError::Malformed(format!("unknown frame tag {other}"))),
+        };
+        if outer != expected_outer {
+            return Err(WireError::Malformed(format!(
+                "frame tag {tag} arity {outer}, expected {expected_outer}"
+            )));
+        }
+        let frame = Self::decode_body(tag, &mut dec)?;
+        // A canonical frame consumes ALL its bytes: trailing CBOR after a valid frame is malformed,
+        // never silently ignored.
+        if dec.position() != bytes.len() {
+            return Err(WireError::Malformed("trailing bytes after frame".into()));
+        }
+        Ok(frame)
+    }
+
+    fn decode_body(tag: u8, dec: &mut Decoder<'_>) -> Result<Frame, WireError> {
+        match tag {
+            tag::HELLO => {
+                let inner = dec.array().map_err(m)?;
+                if inner != Some(2) {
+                    return Err(WireError::Malformed("hello payload arity".into()));
+                }
+                let account_id = fixed_hash(dec.bytes().map_err(m)?)?;
+                let n = expect_len(dec.array().map_err(m)?, "hello.have")?;
+                if n > MAX_HELLO_HASHES as u64 {
+                    return Err(WireError::OverCap(format!("hello.have {n} > {MAX_HELLO_HASHES}")));
+                }
+                let mut have = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    have.push(fixed_hash(dec.bytes().map_err(m)?)?);
+                }
+                Ok(Frame::Hello { account_id, have })
+            },
+            tag::ENTRIES => {
+                let n = expect_len(dec.array().map_err(m)?, "entries")?;
+                if n > MAX_ENTRIES_PER_PAGE as u64 {
+                    return Err(WireError::OverCap(format!(
+                        "entries page {n} > {MAX_ENTRIES_PER_PAGE}"
+                    )));
+                }
+                let mut entries = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    entries.push(dec.bytes().map_err(m)?.to_vec());
+                }
+                let more = dec.bool().map_err(m)?;
+                Ok(Frame::Entries { entries, more })
+            },
+            tag::DONE => Ok(Frame::Done),
+            other => Err(WireError::Malformed(format!("unknown frame tag {other}"))),
+        }
+    }
+}
+
+const INFALLIBLE: &str = "encoding into an owned Vec cannot fail";
+
+fn m(e: minicbor::decode::Error) -> WireError {
+    WireError::Malformed(e.to_string())
+}
+
+fn expect_len(len: Option<u64>, field: &str) -> Result<u64, WireError> {
+    len.ok_or_else(|| WireError::Malformed(format!("indefinite-length {field} array")))
+}
+
+fn fixed_hash(bytes: &[u8]) -> Result<Hash, WireError> {
+    Hash::try_from(bytes)
+        .map_err(|_| WireError::Malformed(format!("expected 32-byte hash, got {}", bytes.len())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(frame: &Frame) {
+        let bytes = frame.encode();
+        assert_eq!(&Frame::decode(&bytes).unwrap(), frame, "encode∘decode is identity");
+    }
+
+    #[test]
+    fn every_frame_roundtrips() {
+        roundtrip(&Frame::Hello { account_id: [0xaa; 32], have: vec![[1; 32], [2; 32]] });
+        roundtrip(&Frame::Hello { account_id: [0; 32], have: vec![] });
+        roundtrip(&Frame::Entries { entries: vec![vec![1, 2, 3], vec![]], more: true });
+        roundtrip(&Frame::Entries { entries: vec![], more: false });
+        roundtrip(&Frame::Done);
+    }
+
+    #[test]
+    fn a_foreign_domain_is_rejected() {
+        // A CBOR array that is well-formed but not our protocol.
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.str("some/other-protocol/1").unwrap();
+        enc.u8(0).unwrap();
+        assert!(matches!(Frame::decode(&buf), Err(WireError::Malformed(_))));
+    }
+
+    #[test]
+    fn an_over_cap_entries_page_is_rejected_as_hostile() {
+        // Hand-build an Entries frame claiming more elements than the cap allows, without
+        // allocating them — the decoder must reject on the declared length alone.
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(4).unwrap();
+        enc.str(FRAME_DOMAIN).unwrap();
+        enc.u8(tag::ENTRIES).unwrap();
+        enc.array((MAX_ENTRIES_PER_PAGE + 1) as u64).unwrap();
+        // no elements written; the length prefix alone must trip the cap
+        assert!(matches!(Frame::decode(&buf), Err(WireError::OverCap(_))));
+    }
+
+    #[test]
+    fn a_truncated_frame_is_malformed_not_a_panic() {
+        let full = Frame::Hello { account_id: [7; 32], have: vec![[9; 32]] }.encode();
+        for cut in 0..full.len() {
+            // Every prefix either decodes (unlikely) or errors — never panics.
+            let _ = Frame::decode(&full[..cut]);
+        }
+    }
+
+    #[test]
+    fn a_wrong_outer_arity_is_rejected() {
+        // A Done tag inside a 3-element outer array (Hello's arity) is malformed, not tolerated.
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(3).unwrap();
+        enc.str(FRAME_DOMAIN).unwrap();
+        enc.u8(tag::DONE).unwrap();
+        enc.u8(0).unwrap(); // an extra field a lax decoder might ignore
+        assert!(matches!(Frame::decode(&buf), Err(WireError::Malformed(_))));
+    }
+
+    #[test]
+    fn trailing_bytes_after_a_valid_frame_are_rejected() {
+        let mut buf = Frame::Done.encode();
+        buf.push(0xff); // one byte of garbage after an otherwise-valid frame
+        assert!(matches!(Frame::decode(&buf), Err(WireError::Malformed(_))));
+    }
+
+    /// The wire is frozen: pin the exact bytes of a representative frame so an accidental layout
+    /// change (field order, tag value, domain string) breaks the build rather than a live peer.
+    #[test]
+    fn done_frame_bytes_are_frozen() {
+        let bytes = Frame::Done.encode();
+        assert_eq!(
+            bytes,
+            // array(2), text "rag-rat/sync-frame/1", u8 2
+            [
+                0x82, 0x74, b'r', b'a', b'g', b'-', b'r', b'a', b't', b'/', b's', b'y', b'n', b'c',
+                b'-', b'f', b'r', b'a', b'm', b'e', b'/', b'1', 0x02,
+            ],
+        );
+    }
+}
