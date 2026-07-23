@@ -2101,6 +2101,145 @@ fn status_for(tx: &Transaction<'_>, hash: &EntryHash) -> rusqlite::Result<Option
     .optional()
 }
 
+/// One `/3` content entry as it goes on the wire (phase D, #406): its chain coordinates plus the
+/// exact stored `signed_bytes`. The bytes are opaque here — a peer re-runs [`content_ingest`] over
+/// them, which re-resolves the roster key and re-verifies the signature from scratch, so the sender
+/// is never trusted. Every HELD candidate is offered, accepted or not: acceptance is a per-refold
+/// verdict (#652) each peer recomputes locally, so peers must see the same candidate set to reach
+/// the same accepted set.
+#[derive(Debug, Clone)]
+pub struct SyncContentEntry {
+    pub stream_id: StreamId,
+    pub author_account_id: AccountId,
+    pub seq: u64,
+    pub entry_hash: [u8; 32],
+    pub signed_bytes: Vec<u8>,
+}
+
+/// Peek the `(stream_id, author_account_id, entry_hash)` a signed content entry claims, WITHOUT
+/// ingesting it. The sync layer uses this to refuse an entry whose claimed author is a DIFFERENT
+/// account than the session is scoped to, before it reaches [`content_ingest`].
+///
+/// The claimed author is attacker-settable header material, so this is a session-scope PRE-FILTER
+/// only, NEVER a trust boundary: [`content_ingest`] is the boundary — it re-resolves the roster key
+/// for the claimed `(stream, author, roster_ref)` and rejects anything not signed by a device in
+/// that roster, so a forged author claim cannot land a candidate. A decode failure means the bytes
+/// are not a well-formed content entry — the session treats that as a peer to distrust.
+pub fn content_entry_ref(signed_bytes: &[u8]) -> anyhow::Result<(StreamId, AccountId, [u8; 32])> {
+    let signed = envelope::decode_content_signed(signed_bytes)?;
+    Ok((signed.header.stream_id, signed.header.author_account_id, signed.entry_hash))
+}
+
+/// The wire dedup key for a signed content entry: `sha256(signed_bytes)`, the SAME hash
+/// `content_pre_verify` keys its rows by. Distinguishes competing SIGNATURES of one body — two
+/// envelopes can share an `entry_hash` yet differ in signature — so the sync layer treats them as
+/// distinct. Never diff content sync inventory by `entry_hash`.
+pub fn content_signed_hash(signed_bytes: &[u8]) -> [u8; 32] {
+    cbor::sha256(signed_bytes)
+}
+
+/// Whether `account_id` already holds this EXACT signed content envelope — as a stored candidate
+/// (matched by its bytes) OR a durably parked pre-verify row (matched by `signed_hash`). Scoped to
+/// the account's OWN authored content, the same scope [`content_entries_for_sync`] offers.
+/// Signed-envelope precise, not `entry_hash` precise: a distinct signature that happens to share an
+/// entry_hash is a different entry the peer may still need.
+pub fn content_signed_entry_exists(
+    conn: &Connection,
+    account_id: AccountId,
+    signed_bytes: &[u8],
+) -> anyhow::Result<bool> {
+    let signed_hash = cbor::sha256(signed_bytes);
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM content_entries
+             WHERE author_account_id = ?1 AND signed_bytes = ?2
+             UNION ALL
+             SELECT 1 FROM content_pre_verify
+             WHERE claimed_author_account_id = ?1 AND signed_hash = ?3
+             LIMIT 1",
+            params![account_id.to_bytes().as_slice(), signed_bytes, signed_hash.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// Every `/3` content entry authored under `account_id` that a peer may need — the held candidates
+/// AND the ones durably PARKED in `content_pre_verify` awaiting their roster key.
+///
+/// Scoped to the account's OWN content (`author_account_id = account_id`): this restores a device's
+/// own memories onto a fresh sibling. Content authored by OTHER accounts (shared streams) is a
+/// later slice (#407); offering it through an account-scoped session would let a peer flood the
+/// pre-verify table with foreign candidates the session never authorized.
+///
+/// Held candidates come first, ordered `(stream_id, seq, entry_hash)` — a causal-leaning per-stream
+/// order so a cooperative receiver folds predecessors before successors and avoids
+/// park-then-promote churn. Parked rows follow, since they depend on roster material in the held
+/// set. It is NOT a topological guarantee against an adversarial sender (that is a reconciliation
+/// concern at the caller, #878); it makes the honest restore converge in one session.
+pub fn content_entries_for_sync(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Vec<SyncContentEntry>> {
+    let mut out = Vec::new();
+
+    // `seq` is stored big-endian (`u64::to_be_bytes`), so ordering the BLOB column directly yields
+    // numeric order.
+    let mut held = conn.prepare(
+        "SELECT entry_hash, stream_id, seq, signed_bytes
+         FROM content_entries WHERE author_account_id = ?1
+         ORDER BY stream_id, seq, entry_hash",
+    )?;
+    let held_rows = held
+        .query_map(params![account_id.to_bytes().as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (hash, stream, seq, signed_bytes) in held_rows {
+        out.push(SyncContentEntry {
+            stream_id: StreamId::from_bytes(fixed::<32>(&stream)?),
+            author_account_id: account_id,
+            seq: u64::from_be_bytes(fixed::<8>(&seq)?),
+            entry_hash: fixed::<32>(&hash)?,
+            signed_bytes,
+        });
+    }
+
+    // Parked rows carry raw signed bytes; decode the header for the stream/seq the wire records
+    // (informational — the session diffs on the signed hash). A parked row that no longer decodes
+    // is skipped rather than failing the whole read.
+    let mut parked = conn.prepare(
+        "SELECT entry_hash, raw_bytes
+         FROM content_pre_verify WHERE claimed_author_account_id = ?1
+         ORDER BY entry_hash",
+    )?;
+    let parked_rows = parked
+        .query_map(params![account_id.to_bytes().as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (hash, signed_bytes) in parked_rows {
+        let (stream_id, seq) = match envelope::decode_content_signed(&signed_bytes) {
+            Ok(signed) => (signed.header.stream_id, signed.header.seq),
+            Err(_) => continue,
+        };
+        out.push(SyncContentEntry {
+            stream_id,
+            author_account_id: account_id,
+            seq,
+            entry_hash: fixed::<32>(&hash)?,
+            signed_bytes,
+        });
+    }
+
+    Ok(out)
+}
+
 fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
     bytes.try_into().map_err(|_| anyhow::anyhow!("expected {N} bytes, got {}", bytes.len()))
 }
@@ -2437,6 +2576,65 @@ mod tests {
             pending_refold_count(&conn),
             1,
             "promoting the parked entry marks its stream so a later settle refolds + reprojects it",
+        );
+    }
+
+    /// A PARKED content entry (roster key not yet resolvable) is part of what a peer must be
+    /// offered for sync (#406): a peer holding the roster material promotes it, and omitting it
+    /// would let a session complete with the dependent memory silently missing.
+    /// `content_entries_for_sync` offers both held candidates and parked rows, with the exact
+    /// bytes so a peer re-ingests the real entry.
+    #[test]
+    fn content_entries_for_sync_offers_a_parked_entry() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[7; 32]);
+        let (account, roster) = signed_roster(&secret);
+        // The roster is deliberately NOT ingested, so the content's roster key cannot resolve and
+        // it parks in pre-verify rather than becoming a stored candidate.
+        let parked = content(&secret, account, roster.entry_hash, 0, None);
+        assert_eq!(
+            content_ingest(&conn, &parked.signed_bytes, 1).unwrap(),
+            ContentIngestOutcome::PreVerify,
+        );
+
+        let offered = content_entries_for_sync(&conn, account).unwrap();
+        let row = offered
+            .iter()
+            .find(|e| e.entry_hash == parked.entry_hash)
+            .expect("the parked content entry is offered, not hidden");
+        assert_eq!(row.signed_bytes, parked.signed_bytes, "the exact parked bytes are offered");
+    }
+
+    /// `content_signed_entry_exists` is signed-envelope precise, not entry_hash precise, and
+    /// `content_signed_hash` gives distinct wire dedup keys to distinct envelopes — so a competing
+    /// signature of the same body is never suppressed as already-held (the reason the pre-verify
+    /// table keys on the signed hash).
+    #[test]
+    fn content_signed_entry_existence_is_by_exact_envelope() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[7; 32]);
+        let (account, roster) = signed_roster(&secret);
+        super::super::super::storage::account_ingest(&conn, &roster.signed_bytes, 1).unwrap();
+        let entry = content(&secret, account, roster.entry_hash, 0, None);
+        content_ingest(&conn, &entry.signed_bytes, 2).unwrap();
+
+        assert!(
+            content_signed_entry_exists(&conn, account, &entry.signed_bytes).unwrap(),
+            "the exact stored envelope is held",
+        );
+        // A corrupted-signature variant of the same body is a DISTINCT envelope: not held, and a
+        // distinct wire dedup key.
+        let mut variant = entry.signed_bytes.clone();
+        *variant.last_mut().unwrap() ^= 0x01;
+        assert_ne!(variant, entry.signed_bytes);
+        assert!(
+            !content_signed_entry_exists(&conn, account, &variant).unwrap(),
+            "a distinct signed envelope is not suppressed as already-held",
+        );
+        assert_ne!(
+            content_signed_hash(&entry.signed_bytes),
+            content_signed_hash(&variant),
+            "distinct envelopes get distinct wire dedup keys",
         );
     }
 

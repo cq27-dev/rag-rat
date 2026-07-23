@@ -28,5 +28,5 @@ pub use session::{
     DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES, SessionError, SessionReport, SyncStore,
     run_session, run_session_with_idle_timeout,
 };
-pub use store::OplogSyncStore;
+pub use store::{OplogContentSyncStore, OplogSyncStore};
 pub use wire::{Frame, SYNC_ALPN, WireError};

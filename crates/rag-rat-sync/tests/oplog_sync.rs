@@ -94,6 +94,172 @@ async fn two_peers_in_sync_transfer_nothing() {
     let _ = AccountId::from_bytes(account_id.to_bytes()); // account_id API is public
 }
 
+/// A device restores its own `/3` CONTENT — the memories themselves — onto a fresh peer, after the
+/// account log that authorizes them has synced. Load-bearing test for D3: content moves through the
+/// same session machinery as the account log, feeding `OplogContentSyncStore`, and the moved bytes
+/// fold accepted on the peer once authority is in place.
+#[tokio::test]
+async fn a_fresh_peer_restores_the_accounts_content_after_the_account_log() {
+    use rag_rat_oplog::{
+        ContentRefoldBudget, MemoryOp, NodeContent, NodeId, SealPolicy, author_content_batch,
+        content_entries_for_sync, ensure_owned_stream_v2_in_tx, settle_pending_content_refolds,
+    };
+    use rag_rat_sync::OplogContentSyncStore;
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    // Source: an account, an owned stream, and two authored content ops (the memories).
+    let source = fresh_db();
+    let account_id = local_account(&source, NOW).unwrap();
+    let stream = {
+        let tx = Transaction::new_unchecked(&source, TransactionBehavior::Immediate).unwrap();
+        let s = ensure_owned_stream_v2_in_tx(&tx, "repo-a", NOW).unwrap();
+        tx.commit().unwrap();
+        s
+    };
+    let node = |id: &str, title: &str| MemoryOp::NodeCreate {
+        node_id: NodeId::from(id),
+        content: NodeContent {
+            kind: "Invariant".into(),
+            title: title.into(),
+            body: "body".into(),
+            confidence: "high".into(),
+            source: "agent".into(),
+            tags: Vec::new(),
+            payload: None,
+        },
+    };
+    author_content_batch(
+        &source,
+        stream,
+        &[node("n1", "first"), node("n2", "second")],
+        SealPolicy::Plaintext,
+        NOW,
+    )
+    .unwrap();
+    let source_content = content_entries_for_sync(&source, account_id).unwrap();
+    assert_eq!(source_content.len(), 2, "the source authored two content entries to move");
+
+    let dest = fresh_db();
+
+    // 1) Account log first — the roster + stream ownership that authorize content acceptance. A
+    //    content session run before this would still transfer the bytes, but they would park until
+    //    authority arrived; restore runs the logs in dependency order.
+    {
+        let mut src = OplogSyncStore::new(&source, account_id, NOW);
+        let mut dst = OplogSyncStore::new(&dest, account_id, NOW);
+        let (a_send, b_recv) = tokio::io::duplex(1 << 20);
+        let (b_send, a_recv) = tokio::io::duplex(1 << 20);
+        let (ra, rb) = tokio::join!(
+            run_session(&mut src, a_send, a_recv),
+            run_session(&mut dst, b_send, b_recv),
+        );
+        ra.unwrap();
+        rb.unwrap();
+    }
+
+    // 2) Content — the memories.
+    let dest_report = {
+        let mut src = OplogContentSyncStore::new(&source, account_id, NOW);
+        let mut dst = OplogContentSyncStore::new(&dest, account_id, NOW);
+        let (a_send, b_recv) = tokio::io::duplex(1 << 20);
+        let (b_send, a_recv) = tokio::io::duplex(1 << 20);
+        let (ra, rb) = tokio::join!(
+            run_session(&mut src, a_send, a_recv),
+            run_session(&mut dst, b_send, b_recv),
+        );
+        ra.unwrap();
+        rb.unwrap()
+    };
+    assert_eq!(
+        dest_report.entries_newly_stored,
+        source_content.len(),
+        "every content entry landed on the fresh peer",
+    );
+
+    // The fresh peer holds byte-identical content — restore-from-peer.
+    let dest_content = content_entries_for_sync(&dest, account_id).unwrap();
+    let mut source_bytes: Vec<Vec<u8>> =
+        source_content.iter().map(|e| e.signed_bytes.clone()).collect();
+    let mut dest_bytes: Vec<Vec<u8>> =
+        dest_content.iter().map(|e| e.signed_bytes.clone()).collect();
+    source_bytes.sort();
+    dest_bytes.sort();
+    assert_eq!(
+        dest_bytes, source_bytes,
+        "the account's content is byte-identical on the fresh peer"
+    );
+
+    // And the moved bytes are usable: once the deferred refold settles, the peer accepts them —
+    // acceptance the peer recomputes from the synced authority, never trusting the sender.
+    settle_pending_content_refolds(&dest, &ContentRefoldBudget::unbounded()).unwrap();
+    let accepted: i64 = dest
+        .query_row(
+            "SELECT count(*) FROM content_entries WHERE author_account_id = ?1 AND accepted = 1",
+            [account_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted, 2, "the restored content folds accepted once authority is in place");
+}
+
+/// A content entry authored by a DIFFERENT account than the session is scoped to must not be stored
+/// — the account-scoped content store refuses it before ingest, so a peer cannot flood this
+/// account's pre-verify table with foreign candidates through a session that never named them.
+#[tokio::test]
+async fn foreign_account_content_is_not_stored() {
+    use rag_rat_oplog::{
+        MemoryOp, NodeContent, NodeId, SealPolicy, author_content_batch, content_entries_for_sync,
+        ensure_owned_stream_v2_in_tx,
+    };
+    use rag_rat_sync::{OplogContentSyncStore, SyncStore};
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    // Another account authors real content in its own DB.
+    let other = fresh_db();
+    let other_account = local_account(&other, NOW).unwrap();
+    let other_stream = {
+        let tx = Transaction::new_unchecked(&other, TransactionBehavior::Immediate).unwrap();
+        let s = ensure_owned_stream_v2_in_tx(&tx, "repo-a", NOW).unwrap();
+        tx.commit().unwrap();
+        s
+    };
+    author_content_batch(
+        &other,
+        other_stream,
+        &[MemoryOp::NodeCreate {
+            node_id: NodeId::from("n1"),
+            content: NodeContent {
+                kind: "Invariant".into(),
+                title: "t".into(),
+                body: "body".into(),
+                confidence: "high".into(),
+                source: "agent".into(),
+                tags: Vec::new(),
+                payload: None,
+            },
+        }],
+        SealPolicy::Plaintext,
+        NOW,
+    )
+    .unwrap();
+    let foreign = content_entries_for_sync(&other, other_account).unwrap()[0].signed_bytes.clone();
+
+    // A content store scoped to MY account is handed the OTHER account's content.
+    let mine = fresh_db();
+    let my_account = local_account(&mine, NOW).unwrap();
+    assert_ne!(my_account.to_bytes(), other_account.to_bytes());
+    let mut store = OplogContentSyncStore::new(&mine, my_account, NOW);
+    assert_eq!(
+        store.ingest(&foreign).unwrap(),
+        rag_rat_sync::Ingested::NoChange,
+        "foreign-account content is refused before ingest",
+    );
+    assert!(
+        content_entries_for_sync(&mine, other_account).unwrap().is_empty(),
+        "the other account was not grown through my session",
+    );
+}
+
 /// LIVE: the real iroh endpoint, dialed peer-to-peer over the configured relay. Ignored by default
 /// (needs network + the relay); run with `--ignored` to exercise the actual transport rather than
 /// the in-process duplex the other tests use.
