@@ -624,8 +624,8 @@ pub(crate) fn shutdown_discover(config: &Config) -> anyhow::Result<bool> {
             // it preserves #460's shutdown-reconcile debt: a content change on the way out marks
             // the base reconcile owed so the next startup pays it down.
             match IndexDatabase::index_discover_reporting(config) {
-                Ok((db, content_changed)) => {
-                    if content_changed {
+                Ok((db, pass)) => {
+                    if pass.content_changed {
                         db.mark_watch_shutdown_reconcile_pending()?;
                         return Ok(true);
                     }

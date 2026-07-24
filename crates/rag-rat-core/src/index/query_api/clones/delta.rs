@@ -26,6 +26,31 @@
 //!   every sub-block token uncapped, so the delta does too, or a stable-hot shared token would
 //!   silently drop edges a full rebuild keeps (pinned by
 //!   `delta_keeps_hot_token_edges_the_build_would_emit`).
+//!
+//! CHANGED-SET HINT + SELF-HEAL (#830): the delta's file set is derived either from a full DB scan
+//! ([`delta_paths`], the [`CloneDeltaHint::FullScan`]/[`CloneDeltaHint::SelfHeal`] paths) or from a
+//! reconcile-supplied set of the base paths a pass reindexed or deleted ([`delta_paths_from_hint`],
+//! the [`CloneDeltaHint::Paths`] path). The hint replaces the two per-pass corpus scans with
+//! indexed point-lookups; it is sound ONLY because it is a SUPERSET of the truly-changed
+//! clone-relevant paths: post-#828 `content_revision()` moves iff the `(path, sha256)` multiset of
+//! non-deleted files changes, so a revision-moving edit reaches the changed-set derivation, and the
+//! reconcile hint (reindexed ∪ deleted) names every file whose `(path, sha256)` it moved.
+//!
+//! Two things the hint cannot see, both closed by the gc-cadence [`CloneDeltaHint::SelfHeal`]
+//! sweep: (1) a stale-overlay heal changes `files` rows the reindexed/deleted set does not name —
+//! the reconcile withholds the hint for a healed pass, so it falls to a scan anyway; (2) a
+//! `generated`-flag flip changes `files.generated` (not `path`/`sha256`), so it moves NO revision
+//! and every `Paths`/`FullScan` delta returns `Noop` before the derivation — only `SelfHeal`, which
+//! bypasses that revision-equality early return, scans and repairs it. The watcher runs `SelfHeal`
+//! on the gc cadence (`GC_EVERY_PASSES`), so drift the digest cannot reflect is bounded to that
+//! window. When `SelfHeal` finds MORE such drift than the delta cap (`CLONE_DELTA_MAX_FILES`, e.g.
+//! a mass generated-reclassification) it `Escalate`s; because that drift is revision-neutral the
+//! quiet gate never arms (the graph looks fresh against the revision), so the watcher forces a full
+//! rebuild past the gate for exactly that fresh-graph Escalate (see `watch::pass`) rather than
+//! leaving it to the `delta_files_applied >= CLONE_GRAPH_DRIFT_REBUILD_FILES` drift rebuild, which
+//! a revision-neutral Escalate never advances. The `SelfHeal` scan is load-bearing, NOT redundant —
+//! do not "optimize" it into a plain `FullScan`, whose early `Noop` would leave generated-flip
+//! drift for the full rebuild alone.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
@@ -87,14 +112,61 @@ pub struct CloneDeltaReport {
 /// token sharing is cheap in absolute terms — never flap a healthy delta to Escalate.
 const CLONE_DELTA_MIN_POSTING_ROW_BUDGET: u64 = 100_000;
 
+/// How a delta derives its changed-file set (#830). `Paths` and `FullScan` produce the SAME set
+/// when the hint is a superset of the truly-changed clone-relevant paths (see the module doc's
+/// soundness note); `SelfHeal` is the gc-cadence sweep that also repairs drift the content digest
+/// cannot see.
+#[derive(Clone, Copy)]
+pub(crate) enum CloneDeltaHint<'a> {
+    /// Derive the changed set from the full DB scan ([`delta_paths`]), but honor the
+    /// revision-equality fast path: the default for callers with no reconcile hint (the CLI
+    /// one-shot) and the fallback when a pass cannot offer a hint yet the revision moved
+    /// (a stale-overlay heal / bootstrap rebuild).
+    FullScan,
+    /// Restrict the changed set to the pass's touched base paths ([`delta_paths_from_hint`]), using
+    /// indexed point-lookups instead of the two corpus scans.
+    Paths(&'a BTreeSet<String>),
+    /// A full DB scan that runs EVEN when `content_revision()` is unchanged — the gc-cadence
+    /// self-heal. It is the only path that repairs drift the digest does not reflect: a
+    /// `generated`-flag flip changes `files.generated` (not `path`/`sha256`), so it never moves the
+    /// revision, and a `Paths`/`FullScan` delta returns `Noop` before the changed-set derivation.
+    /// Bypassing that early return here is what makes the self-heal on `run_gc` genuinely
+    /// load-bearing rather than defeated by the fast path.
+    SelfHeal,
+}
+
+impl CloneDeltaHint<'_> {
+    /// Whether this hint scans regardless of revision movement — only [`Self::SelfHeal`] does.
+    fn scans_when_revision_unchanged(&self) -> bool {
+        matches!(self, CloneDeltaHint::SelfHeal)
+    }
+}
+
 impl IndexDatabase {
     /// Apply one clone-graph delta toward the current `content_revision()`, bounded to
     /// `max_files` changed files (larger deltas escalate — a branch switch is cheaper to rebuild).
     /// MUST run under the caller's write lock (like `reconcile_clone_edges_pass`); the read phase
     /// runs lock-stable outside a transaction, and all writes commit in ONE transaction, so a
     /// reader sees either the old graph or the fully-applied delta.
+    ///
+    /// Derives the changed set from the full DB scan ([`CloneDeltaHint::FullScan`]) — the
+    /// self-healing default for callers with no reconcile-supplied changed-set (the CLI one-shot,
+    /// the differential parity pin). The watcher uses [`Self::apply_clone_graph_delta_hinted`] to
+    /// pass the pass's touched paths (#830).
     pub fn apply_clone_graph_delta(&self, max_files: usize) -> anyhow::Result<CloneDeltaReport> {
-        self.apply_clone_graph_delta_inner(max_files, None)
+        self.apply_clone_graph_delta_inner(max_files, CloneDeltaHint::FullScan, None)
+    }
+
+    /// [`Self::apply_clone_graph_delta`] with an explicit changed-set `hint` (#830): the watcher
+    /// passes [`CloneDeltaHint::Paths`] with the base paths the reconcile just reindexed/deleted so
+    /// the read phase skips the two corpus scans, and [`CloneDeltaHint::FullScan`] on a cadence so
+    /// any hint/DB drift self-heals.
+    pub(crate) fn apply_clone_graph_delta_hinted(
+        &self,
+        max_files: usize,
+        hint: CloneDeltaHint,
+    ) -> anyhow::Result<CloneDeltaReport> {
+        self.apply_clone_graph_delta_inner(max_files, hint, None)
     }
 
     /// [`Self::apply_clone_graph_delta`] with an explicit posting-row work budget — the test seam
@@ -107,12 +179,17 @@ impl IndexDatabase {
         max_files: usize,
         posting_row_budget: u64,
     ) -> anyhow::Result<CloneDeltaReport> {
-        self.apply_clone_graph_delta_inner(max_files, Some(posting_row_budget))
+        self.apply_clone_graph_delta_inner(
+            max_files,
+            CloneDeltaHint::FullScan,
+            Some(posting_row_budget),
+        )
     }
 
     fn apply_clone_graph_delta_inner(
         &self,
         max_files: usize,
+        hint: CloneDeltaHint,
         posting_row_budget: Option<u64>,
     ) -> anyhow::Result<CloneDeltaReport> {
         let started = Instant::now();
@@ -167,7 +244,12 @@ impl IndexDatabase {
         // trigger-maintained digest (#828), so it always reflects the `files` rows as committed —
         // there is no scan to pin or reuse.
         let revision = self.content_revision()?;
-        if live.source_revision == revision {
+        // Revision-equality fast path: nothing content-addressable changed, so skip the changed-set
+        // derivation — EXCEPT for a `SelfHeal` sweep (#830), which scans anyway to repair drift the
+        // content digest cannot see (a `generated`-flag flip moves no `(path, sha256)`, so it never
+        // moves the revision). Without this exception the gc-cadence self-heal would always return
+        // here and never reach `delta_paths`, leaving that drift for the full rebuild alone.
+        if live.source_revision == revision && !hint.scans_when_revision_unchanged() {
             return Ok(CloneDeltaReport {
                 full_rebuild_owed: live.delta_files_applied >= CLONE_GRAPH_DRIFT_REBUILD_FILES,
                 ..report("Noop", None, 0, 0, 0, started)
@@ -180,7 +262,13 @@ impl IndexDatabase {
 
         // ---- Read phase (write lock held; no transaction needed for consistency) ----
 
-        let paths = delta_paths(conn, generation)?;
+        // #830: FullScan / SelfHeal derive the changed set from the whole postings/fingerprint
+        // corpus (the self-heal); Paths restricts it to the reconcile's touched base paths via
+        // indexed point-lookups. Everything after keys off this `paths` Vec identically.
+        let paths = match hint {
+            CloneDeltaHint::FullScan | CloneDeltaHint::SelfHeal => delta_paths(conn, generation)?,
+            CloneDeltaHint::Paths(touched) => delta_paths_from_hint(conn, generation, touched)?,
+        };
         if paths.len() > max_files {
             return Ok(report(
                 "Escalate",
@@ -192,15 +280,22 @@ impl IndexDatabase {
             ));
         }
         if paths.is_empty() {
-            // The revision moved but no clone-relevant file changed (e.g. a docs-target edit):
-            // the graph is semantically current — just re-pin the freshness key.
-            conn.execute(
-                "UPDATE clone_graph_generations SET source_revision = ?1 WHERE generation = ?2",
-                params![revision, generation],
-            )?;
+            // Nothing clone-relevant changed. Two ways here: the revision MOVED but only a
+            // clone-irrelevant file did (e.g. a docs-target edit) — re-pin the freshness key; or a
+            // `SelfHeal` sweep ran with the revision UNCHANGED and found no drift — leave the stamp
+            // alone so an idle gc pass stays write-free (#63). The `revision != source_revision`
+            // guard collapses to "always re-pin" on every non-`SelfHeal` path (they only reach here
+            // past the moved-revision check above).
+            let repinned = revision != live.source_revision;
+            if repinned {
+                conn.execute(
+                    "UPDATE clone_graph_generations SET source_revision = ?1 WHERE generation = ?2",
+                    params![revision, generation],
+                )?;
+            }
             return Ok(CloneDeltaReport {
                 full_rebuild_owed: drift_after(0),
-                ..report("Applied", None, 0, 0, 0, started)
+                ..report(if repinned { "Applied" } else { "Noop" }, None, 0, 0, 0, started)
             });
         }
 
@@ -370,6 +465,7 @@ impl IndexDatabase {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> anyhow::Result<(u64, u64)> {
             let mut edges_removed = 0u64;
+            let mut postings_removed = 0u64;
             for chunk in paths.chunks(DELTA_SQL_CHUNK) {
                 let placeholders: Vec<String> =
                     (0..chunk.len()).map(|i| format!("?{}", i + 2)).collect();
@@ -391,27 +487,35 @@ impl IndexDatabase {
                     ),
                     params_from_iter(values.clone()),
                 )? as u64;
-                // Indexed by V049's idx_clone_subblock_postings_path.
-                conn.execute(
+                // Indexed by V049's idx_clone_subblock_postings_path. Capture the deleted row
+                // count to maintain the cached `postings_row_count` (#830) below.
+                postings_removed += conn.execute(
                     &format!(
                         "DELETE FROM clone_subblock_postings WHERE build_generation = ?1 AND path \
                          IN ({in_list})"
                     ),
                     params_from_iter(values),
-                )?;
+                )? as u64;
             }
             let edges_added = insert_edge_rows(conn, generation, &edge_batch)?;
-            insert_posting_groups(conn, generation, &posting_groups)?;
+            let postings_added = insert_posting_groups(conn, generation, &posting_groups)?;
             conn.execute(
+                // #830: `postings_row_count` is maintained by the net (added − removed) delta in
+                // the SAME transaction as the postings writes, so it always equals
+                // `COUNT(*)` for this generation. `MAX(…, 0)` guards it exactly
+                // like `edges_written` — a defensive floor against a torn prior
+                // state, never expected to bind.
                 "UPDATE clone_graph_generations
                     SET source_revision = ?1,
                         delta_files_applied = delta_files_applied + ?2,
-                        edges_written = MAX(edges_written + ?3, 0)
-                  WHERE generation = ?4",
+                        edges_written = MAX(edges_written + ?3, 0),
+                        postings_row_count = MAX(postings_row_count + ?4, 0)
+                  WHERE generation = ?5",
                 params![
                     revision,
                     paths.len() as i64,
                     edges_added as i64 - edges_removed as i64,
+                    postings_added as i64 - postings_removed as i64,
                     generation
                 ],
             )?;
@@ -509,6 +613,71 @@ fn delta_paths(conn: &Connection, generation: i64) -> anyhow::Result<Vec<String>
     Ok(set.into_iter().collect())
 }
 
+/// [`delta_paths`] RESTRICTED to a reconcile-supplied changed-set `hint` (#830): keep only the
+/// hinted paths that are actually clone-relevant under this generation, decided by INDEXED
+/// point-lookups per path — never a corpus scan (avoiding that scan is the entire point). The
+/// result equals `delta_paths()` ∩ `hint`, which is `delta_paths()` itself when the hint is a
+/// superset of the truly-changed clone-relevant paths (the module doc's soundness note).
+///
+/// A hinted path is included iff EITHER predicate from `delta_paths`, narrowed to that one path:
+/// - STALE: it has postings under this generation whose `(path, file_sha)` no longer matches an
+///   eligible current file (edited / deleted / generated-flipped); or
+/// - FRESH: it is an eligible fingerprinted file (`generated = 0`, baseline + `NORM_VERSION`,
+///   non-NULL bag) with NO postings under this generation yet.
+///
+/// The STALE lookup and the FRESH `NOT EXISTS` both key `clone_subblock_postings` on
+/// `(build_generation, path)` — served by V050's `idx_clone_subblock_postings_path` — and the
+/// file lookups key `files.path`, so no full postings scan runs (verified via EXPLAIN QUERY PLAN).
+fn delta_paths_from_hint(
+    conn: &Connection,
+    generation: i64,
+    hint: &BTreeSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    // STALE: postings under this generation for `?2` with no eligible matching current file. The
+    // `p.path = ?2` seek matches `delta_paths`' STALE predicate narrowed to one path.
+    let mut stale = conn.prepare(
+        "SELECT EXISTS(
+            SELECT 1 FROM clone_subblock_postings p
+             WHERE p.build_generation = ?1 AND p.path = ?2
+               AND NOT EXISTS (SELECT 1 FROM files f
+                                WHERE f.path = p.path AND f.sha256 = p.file_sha
+                                  AND f.generated = 0))",
+    )?;
+    // FRESH: `?2` is an eligible fingerprinted file with no postings under this generation yet.
+    // Semantically `delta_paths`' FRESH predicate narrowed to one path, but written with `files f`
+    // as the SOLE outer table so the planner drives from the `f.path = ?2` seek (indexed via the
+    // scoped `files` view) instead of scanning every baseline fingerprint — the eligible-symbol
+    // check and the postings check are correlated EXISTS keyed by `s.file_id` / the postings path
+    // index.
+    let mut fresh = conn.prepare(
+        "SELECT EXISTS(
+            SELECT 1 FROM files f
+             WHERE f.path = ?2 AND f.generated = 0
+               AND EXISTS (SELECT 1 FROM symbols s
+                             JOIN symbol_fingerprints sf ON sf.symbol_id = s.id
+                            WHERE s.file_id = f.id
+                              AND sf.normalizer_kind = 'baseline'
+                              AND sf.normalizer_version = ?3
+                              AND sf.token_bag IS NOT NULL)
+               AND NOT EXISTS (SELECT 1 FROM clone_subblock_postings p
+                                WHERE p.build_generation = ?1 AND p.path = f.path))",
+    )?;
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for path in hint {
+        let is_stale: i64 = stale.query_row(params![generation, path], |r| r.get(0))?;
+        if is_stale != 0 {
+            set.insert(path.clone());
+            continue;
+        }
+        let is_fresh: i64 =
+            fresh.query_row(params![generation, path, NORM_VERSION], |r| r.get(0))?;
+        if is_fresh != 0 {
+            set.insert(path.clone());
+        }
+    }
+    Ok(set.into_iter().collect())
+}
+
 /// `(path, start_byte, file_sha)` anchors for every scoped, non-generated symbol in `paths` —
 /// `resolve_symbol_anchors` narrowed to the delta files.
 fn anchors_for_paths(conn: &Connection, paths: &[String]) -> anyhow::Result<BTreeMap<i64, Anchor>> {
@@ -576,12 +745,15 @@ fn old_struct_partners(
     Ok(partners)
 }
 
-/// The generation's persisted posting-row count — sizes the default #598 work budget.
-/// (`clone_subblock_postings` is generation-keyed, not `repo_id`-scoped: the generation id —
-/// itself resolved repo-scoped — is the scope.)
+/// The generation's cached posting-row count — sizes the default #598 work budget. Read from the
+/// maintained `clone_graph_generations.postings_row_count` column (#830) rather than a full
+/// `COUNT(*)` of the postings table: the column is seeded at build (`complete_generation`) and kept
+/// exact by each delta write-back, so it equals `COUNT(*)` for the generation on every read. (The
+/// generation id — itself resolved repo-scoped — is the scope; `clone_subblock_postings` is
+/// generation-keyed, not `repo_id`-scoped.)
 fn postings_row_count(conn: &Connection, generation: i64) -> anyhow::Result<u64> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM clone_subblock_postings WHERE build_generation = ?1",
+        "SELECT postings_row_count FROM clone_graph_generations WHERE generation = ?1",
         [generation],
         |r| r.get(0),
     )?;
@@ -836,8 +1008,8 @@ impl<'a> CandidateHydrator<'a> {
 mod tests {
     use super::super::precompute::tests::{clone_fixture_config, edge_keys};
     use super::{
-        BTreeSet, CLONE_PRECOMPUTE_THETA, load_scoped_baseline_bags_for_paths, params,
-        sub_block_tokens,
+        BTreeSet, CLONE_PRECOMPUTE_THETA, CloneDeltaHint, load_scoped_baseline_bags_for_paths,
+        params, sub_block_tokens,
     };
     use crate::index::query_api::clones::precompute::CloneEdgeOptions;
 
@@ -1454,6 +1626,344 @@ mod tests {
         assert!(
             report.posting_rows_fetched < report.posting_rows_requested,
             "shared tokens are served from the per-application cache: {report:?}"
+        );
+    }
+
+    /// #830: the hinted changed-set derivation must NEVER full-scan the (large) postings table —
+    /// that scan is exactly what the hint exists to avoid. Pin the query plans: both the STALE
+    /// point-lookup and the FRESH `NOT EXISTS` reach `clone_subblock_postings` through
+    /// `idx_clone_subblock_postings_path` (a SEARCH), and neither plan contains a full
+    /// `SCAN clone_subblock_postings`.
+    #[test]
+    fn hinted_changed_set_lookups_never_full_scan_the_postings_table() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-hint-qplan");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        let conn = db.storage.connection();
+
+        let plan = |sql: &str, binds: &[super::Value]| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map(super::params_from_iter(binds.iter().cloned()), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .join(" | ")
+        };
+        let generation = super::Value::Integer(1);
+        let path = super::Value::Text("src/a.rs".to_string());
+        let norm = super::Value::Integer(rag_rat_clones::NORM_VERSION);
+
+        let stale_plan = plan(
+            "SELECT EXISTS(SELECT 1 FROM clone_subblock_postings p WHERE p.build_generation = ?1 \
+             AND p.path = ?2 AND NOT EXISTS (SELECT 1 FROM files f WHERE f.path = p.path AND \
+             f.sha256 = p.file_sha AND f.generated = 0))",
+            &[generation.clone(), path.clone()],
+        );
+        assert!(
+            stale_plan.contains("idx_clone_subblock_postings_path"),
+            "STALE lookup must seek the postings path index: {stale_plan}"
+        );
+        assert!(
+            !stale_plan.contains("SCAN clone_subblock_postings"),
+            "STALE lookup must not full-scan the postings table: {stale_plan}"
+        );
+
+        let fresh_plan = plan(
+            "SELECT EXISTS(SELECT 1 FROM files f WHERE f.path = ?2 AND f.generated = 0 AND EXISTS \
+             (SELECT 1 FROM symbols s JOIN symbol_fingerprints sf ON sf.symbol_id = s.id WHERE \
+             s.file_id = f.id AND sf.normalizer_kind = 'baseline' AND sf.normalizer_version = ?3 \
+             AND sf.token_bag IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM clone_subblock_postings \
+             p WHERE p.build_generation = ?1 AND p.path = f.path))",
+            &[generation, path, norm],
+        );
+        assert!(
+            !fresh_plan.contains("SCAN clone_subblock_postings"),
+            "FRESH NOT EXISTS must not full-scan the postings table: {fresh_plan}"
+        );
+        assert!(
+            fresh_plan.contains("idx_clone_subblock_postings_path"),
+            "FRESH NOT EXISTS must seek the postings path index: {fresh_plan}"
+        );
+        // The FRESH check must drive from the `files.path` seek (via the scoped view's composite
+        // indexes), NOT scan every baseline fingerprint — otherwise the per-path cost grows with
+        // the corpus and the hint stops being a win.
+        assert!(
+            !fresh_plan.contains("SCAN sf") && !fresh_plan.contains("SCAN symbol_fingerprints"),
+            "FRESH check must not scan the fingerprint table: {fresh_plan}"
+        );
+    }
+
+    /// #830: the cached `clone_graph_generations.postings_row_count` is maintained transactionally
+    /// by each delta write-back (net inserted − deleted), so it stays EQUAL to a live `COUNT(*)` of
+    /// the generation's postings across an edit sequence — that equality is what makes the cheap
+    /// column read a sound substitute for the per-pass table scan the work budget used to pay.
+    #[test]
+    fn delta_maintains_the_cached_postings_row_count() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-postings-count");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        let built = db.precompute_clone_graph(None).unwrap();
+        assert_eq!(built.status, "Complete");
+        let generation = built.generation;
+
+        // The build's COUNT seed already matches the postings it just wrote.
+        let cached_matches_scan = |db: &crate::IndexDatabase| {
+            let conn = db.storage.connection();
+            let cached: i64 = conn
+                .query_row(
+                    "SELECT postings_row_count FROM clone_graph_generations WHERE generation = ?1",
+                    [generation],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let scanned: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM clone_subblock_postings WHERE build_generation = ?1",
+                    [generation],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(cached, scanned, "cached postings_row_count must equal COUNT(*)");
+        };
+        cached_matches_scan(&db);
+        drop(db);
+
+        // An edit sequence that both REMOVES postings (edited/deleted files) and ADDS them (a new
+        // near-clone member), each applied in place — the net-delta maintenance must track both.
+        let steps: &[(&str, Option<&str>)] = &[
+            (
+                "src/c.rs",
+                Some(
+                    "pub fn load_invoice(db: Db) -> i32 { let v = db.get(30); validate(v); v + 1 \
+                     }\n",
+                ),
+            ),
+            (
+                "src/a.rs",
+                Some(
+                    "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 \
+                     }\npub fn compute_totals(items: Vec<i64>) -> i64 { let mut s = 0; for it in \
+                     items { s += it * 2; } s + 1 }\npub fn sum_figures(rows: Vec<i64>) -> i64 { \
+                     let mut f = 0; for r in rows { f += r * 2; } f + 1 }\n",
+                ),
+            ),
+            ("src/b.rs", None),
+        ];
+        for (path, content) in steps {
+            let target = config.root.join(path);
+            match content {
+                Some(text) => std::fs::write(&target, text).unwrap(),
+                None => std::fs::remove_file(&target).unwrap(),
+            }
+            let db = reindex(&config);
+            assert_eq!(
+                db.apply_clone_graph_delta(64).unwrap().status,
+                "Applied",
+                "delta for {path}"
+            );
+            cached_matches_scan(&db);
+        }
+    }
+
+    /// THE #830 correctness pin: a delta driven by a `Paths` hint produces the IDENTICAL result as
+    /// one driven by the `FullScan` DB derivation — same `CloneDeltaReport` (files_changed,
+    /// edges_added/removed, full_rebuild_owed) AND the same resulting edge set. The hint is
+    /// exercised with a set that COULD disagree: it names an UNCHANGED base file alongside the
+    /// changed/new ones, so `delta_paths_from_hint` must filter the unchanged one back out to match
+    /// the scan (a hint that blindly trusted its paths would emit different edges). Run on two
+    /// identical DBs — the delta mutates, so the two derivations can't share one.
+    #[test]
+    fn a_hinted_delta_equals_the_full_scan_delta() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+
+        // Two byte-identical fixtures, taken through the SAME rebuild + precompute + edit +
+        // reindex, so only the delta's changed-set derivation differs between them.
+        let prepare = |tag: &str| -> (rag_rat_base::config::Config, crate::IndexDatabase) {
+            let config = clone_fixture_config(tag);
+            let db = crate::IndexDatabase::rebuild(&config).unwrap();
+            assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+            drop(db);
+            // Edit an existing clone-family file AND add a new near-clone member; src/b.rs is left
+            // untouched (the "could disagree" element the hint names but the scan excludes).
+            std::fs::write(
+                config.root.join("src/a.rs"),
+                "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\npub \
+                 fn compute_totals(items: Vec<i64>) -> i64 { let mut s = 0; for it in items { s \
+                 += it * 2; } s + 1 }\npub fn sum_figures(rows: Vec<i64>) -> i64 { let mut f = 0; \
+                 for r in rows { f += r * 2; } f + 1 }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                config.root.join("src/c.rs"),
+                "pub fn load_invoice(db: Db) -> i32 { let v = db.get(30); validate(v); v + 1 }\n",
+            )
+            .unwrap();
+            let db = reindex(&config);
+            (config, db)
+        };
+
+        let (_scan_config, scan_db) = prepare("delta-hint-scan");
+        let scan_report =
+            scan_db.apply_clone_graph_delta_hinted(64, CloneDeltaHint::FullScan).unwrap();
+        let scan_edges = edge_keys(&scan_db);
+
+        let (_hint_config, hint_db) = prepare("delta-hint-paths");
+        // The hint the reconcile would supply: the reindexed/new paths PLUS an unchanged base file.
+        let touched: BTreeSet<String> =
+            ["src/a.rs", "src/b.rs", "src/c.rs"].iter().map(|s| s.to_string()).collect();
+        let hint_report =
+            hint_db.apply_clone_graph_delta_hinted(64, CloneDeltaHint::Paths(&touched)).unwrap();
+        let hint_edges = edge_keys(&hint_db);
+
+        assert_eq!(scan_report.status, "Applied", "scan applied: {scan_report:?}");
+        assert_eq!(hint_report.status, "Applied", "hint applied: {hint_report:?}");
+        assert_eq!(
+            (hint_report.files_changed, hint_report.edges_added, hint_report.edges_removed),
+            (scan_report.files_changed, scan_report.edges_added, scan_report.edges_removed),
+            "hinted counts must equal the scan's: hint={hint_report:?} scan={scan_report:?}"
+        );
+        assert_eq!(
+            hint_report.full_rebuild_owed, scan_report.full_rebuild_owed,
+            "hinted drift bookkeeping must equal the scan's"
+        );
+        assert_eq!(
+            hint_edges, scan_edges,
+            "the hinted delta's resulting edge set must equal the full-scan delta's"
+        );
+    }
+
+    /// #830: a `Paths` hint whose every path is clone-IRRELEVANT (a docs / fingerprint-less edit)
+    /// makes `delta_paths_from_hint` return empty, so the delta takes the same re-pin branch as an
+    /// empty `delta_paths` — `Applied` with zero files, no edge churn, freshness key re-pinned —
+    /// and never touches the postings corpus.
+    #[test]
+    fn a_clone_irrelevant_hint_repins_without_scanning() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-hint-irrelevant");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        let edges_before = edge_keys(&db);
+        drop(db);
+
+        // A type-only file: indexed (revision moves) but no function fingerprints →
+        // clone-irrelevant.
+        std::fs::write(config.root.join("src/j.rs"), "pub struct MarkerOnly;\n").unwrap();
+        let db = reindex(&config);
+        let touched: BTreeSet<String> = ["src/j.rs"].iter().map(|s| s.to_string()).collect();
+        let report =
+            db.apply_clone_graph_delta_hinted(64, CloneDeltaHint::Paths(&touched)).unwrap();
+        assert_eq!(report.status, "Applied", "{report:?}");
+        assert_eq!(report.files_changed, 0, "no clone-relevant path in the hint");
+        assert_eq!(report.edges_added + report.edges_removed, 0);
+        assert_eq!(edge_keys(&db), edges_before, "the graph itself is untouched");
+        assert!(!db.pending_clone_graph().unwrap(), "the freshness key is re-pinned");
+    }
+
+    /// #830 SelfHeal: a `generated`-flag flip changes `files.generated`, not `(path, sha256)`, so
+    /// `content_revision()` does NOT move and a `FullScan`/`Paths` delta returns `Noop` before the
+    /// changed-set derivation — the flipped file's now-ineligible postings linger. `SelfHeal`
+    /// bypasses that revision-equality early return, scans, and removes them. This pins the exact
+    /// gap the gc-cadence self-heal closes: a plain `FullScan` on the SAME drift `Noop`s past it,
+    /// so the two derivations must DISAGREE here or the self-heal would be dead code.
+    #[test]
+    fn self_heal_repairs_generated_flip_drift_a_full_scan_noops_past() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-selfheal-genflip");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+
+        let flipped: String = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT DISTINCT path FROM clone_subblock_postings ORDER BY path LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let postings_for = |db: &crate::IndexDatabase| -> i64 {
+            db.storage
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM clone_subblock_postings WHERE path = ?1",
+                    [&flipped],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert!(postings_for(&db) > 0, "the flipped file starts with postings");
+
+        // Flip it to generated = 1 directly (the `rederive_generated_flags` mechanism); the #828
+        // content-digest trigger keys on path/sha256/kind, so the revision is unmoved.
+        let revision_before = db.content_revision().unwrap();
+        db.storage
+            .connection()
+            .execute("UPDATE main.files SET generated = 1 WHERE path = ?1", [&flipped])
+            .unwrap();
+        assert_eq!(
+            db.content_revision().unwrap(),
+            revision_before,
+            "a generated-flag flip does not move content_revision"
+        );
+
+        // A plain FullScan honors the revision-equality fast path: Noop, drift left in place.
+        let full = db.apply_clone_graph_delta_hinted(64, CloneDeltaHint::FullScan).unwrap();
+        assert_eq!(full.status, "Noop", "FullScan Noops when the revision is unchanged: {full:?}");
+        assert!(
+            postings_for(&db) > 0,
+            "FullScan left the stale postings — the gap SelfHeal closes"
+        );
+
+        // SelfHeal scans past the early return and drops the now-ineligible file's postings.
+        let heal = db.apply_clone_graph_delta_hinted(64, CloneDeltaHint::SelfHeal).unwrap();
+        assert_eq!(heal.status, "Applied", "SelfHeal applies the drift repair: {heal:?}");
+        assert_eq!(postings_for(&db), 0, "SelfHeal removed the generated file's stale postings");
+    }
+
+    /// #830: when `SelfHeal` finds MORE revision-neutral drift than the delta cap it `Escalate`s
+    /// WHILE `clone_graph_stale_against` still reports the graph fresh (the revision never moved).
+    /// That is the exact `(Escalate, !stale)` state the watcher keys its forced full rebuild on —
+    /// the quiet gate keys on revision movement and would otherwise suppress the rebuild forever.
+    /// Uses a tiny `max_files` so two generated-flipped files exceed the cap.
+    #[test]
+    fn self_heal_escalates_while_fresh_when_revision_neutral_drift_exceeds_the_cap() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-selfheal-escalate");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+
+        let conn = db.storage.connection();
+        let flip: Vec<String> = conn
+            .prepare("SELECT DISTINCT path FROM clone_subblock_postings ORDER BY path LIMIT 2")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(flip.len(), 2, "fixture has at least two files with postings");
+        let revision_before = db.content_revision().unwrap();
+        for path in &flip {
+            conn.execute("UPDATE main.files SET generated = 1 WHERE path = ?1", [path]).unwrap();
+        }
+        assert_eq!(
+            db.content_revision().unwrap(),
+            revision_before,
+            "flipping generated flags does not move the revision"
+        );
+
+        // Cap of 1 < 2 drifted paths → Escalate; and the graph still reads fresh against the
+        // (unmoved) revision — the watcher's `force_revision_neutral_rebuild` condition.
+        let report = db.apply_clone_graph_delta_hinted(1, CloneDeltaHint::SelfHeal).unwrap();
+        assert_eq!(
+            report.status, "Escalate",
+            "oversized revision-neutral drift escalates: {report:?}"
+        );
+        assert!(
+            !db.clone_graph_stale().unwrap(),
+            "the graph is fresh against the revision, so the quiet gate would suppress the rebuild"
         );
     }
 }

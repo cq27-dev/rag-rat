@@ -1373,6 +1373,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_085_ID => Some(85),
             MIGRATION_086_ID => Some(86),
             MIGRATION_087_ID => Some(87),
+            MIGRATION_088_ID => Some(88),
             _ => None,
         })
         .max()
@@ -1469,6 +1470,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_085_ID
             | MIGRATION_086_ID
             | MIGRATION_087_ID
+            | MIGRATION_088_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1562,6 +1564,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_085_ID => migration.checksum != MIGRATION_085_CHECKSUM,
         MIGRATION_086_ID => migration.checksum != MIGRATION_086_CHECKSUM,
         MIGRATION_087_ID => migration.checksum != MIGRATION_087_CHECKSUM,
+        MIGRATION_088_ID => migration.checksum != MIGRATION_088_CHECKSUM,
         _ => false,
     }
 }
@@ -6073,6 +6076,39 @@ pub fn apply_table_sync_tables(conn: &Connection) -> rusqlite::Result<()> {
          ) STRICT;",
     )?;
     tx.commit()
+}
+
+/// V088 (#830): cache each clone generation's posting-row count on its generation row.
+///
+/// The #598 delta work budget is `max(100_000, 2 * postings_row_count(generation))`; deriving that
+/// with `COUNT(*) FROM clone_subblock_postings WHERE build_generation = ?` scanned the whole
+/// (generation-keyed) postings table on every delta pass. This adds a maintained
+/// `postings_row_count` column so the budget reads one generation row instead. The count is kept
+/// exact going forward — seeded at build (`complete_generation`) and adjusted by
+/// (inserted − deleted) in each delta write-back, both inside the same transaction as the postings
+/// change — so the column always equals `COUNT(*)` for that generation.
+///
+/// Additive + idempotent. The column type is STRICT-valid and defaulted so a row the backfill does
+/// not reach reads back 0. The backfill is UNCONDITIONAL (not gated on the column being freshly
+/// added): it recomputes the exact `COUNT(*)` the column is maintained to hold, so on a maintained
+/// DB a re-apply is a value no-op, and a torn add-then-crash retry (which re-enters with the column
+/// already present) still backfills instead of stranding an all-zero column. Re-scanning on the
+/// rare `index --full` re-apply is the acceptable cost of that robustness — the per-delta scan this
+/// migration removes is the hot one.
+pub fn apply_clone_postings_row_count(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(
+        conn,
+        "clone_graph_generations",
+        "postings_row_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    conn.execute_batch(
+        "UPDATE clone_graph_generations
+            SET postings_row_count = (
+                SELECT COUNT(*) FROM clone_subblock_postings
+                 WHERE build_generation = clone_graph_generations.generation);",
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

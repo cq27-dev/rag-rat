@@ -10,10 +10,10 @@ pub use migrations::{
     apply_account_authority_boundaries, apply_account_authority_projection,
     apply_account_candidate_dag, apply_chunk_symbol_id, apply_clone_delta_maintenance,
     apply_clone_df_epoch, apply_clone_fingerprint_tables, apply_clone_graph_tables,
-    apply_content_candidate_dag, apply_content_digest_state, apply_content_projected_tables,
-    apply_content_refold_queue_and_stats, apply_content_streams_pending_refold,
-    apply_distill_anchor_selection, apply_distill_enriched_context,
-    apply_distill_evidence_source_part, apply_distill_record_store,
+    apply_clone_postings_row_count, apply_content_candidate_dag, apply_content_digest_state,
+    apply_content_projected_tables, apply_content_refold_queue_and_stats,
+    apply_content_streams_pending_refold, apply_distill_anchor_selection,
+    apply_distill_enriched_context, apply_distill_evidence_source_part, apply_distill_record_store,
     apply_distill_safe_input_snapshot, apply_dream_findings, apply_edge_string_interning,
     apply_edge_target_qname_index, apply_external_symbols, apply_files_generation,
     apply_files_has_test_code, apply_git_change_couplings, apply_github_child_key_widening,
@@ -47,7 +47,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 87;
+pub const LATEST_SCHEMA_VERSION: u32 = 88;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -643,7 +643,6 @@ const MIGRATION_086_DESCRIPTION: &str =
      (index_meta fts_source_revision/content_revision, clone_graph_generations.source_revision, \
      the clone-graph quiet candidate) that equals the frozen legacy digest so no one-time \
      FTS/clone rebuild fires. Replaces the O(N) main.files scan with an O(1) state read";
-
 const MIGRATION_087_ID: &str = "087_table_sync_bookkeeping";
 const MIGRATION_087_CHECKSUM: &str = "sha256:rag-rat-table-sync-bookkeeping-v87";
 const MIGRATION_087_DESCRIPTION: &str =
@@ -655,6 +654,15 @@ const MIGRATION_087_DESCRIPTION: &str =
      table_sync_entries (the engine's own signed hash-chained entry log, separate from \
      oplog_entries so the memory-content re-fold never sees a table op). All STRICT; no authored \
      content — pure sync bookkeeping the fold and producer read";
+const MIGRATION_088_ID: &str = "088_clone_postings_row_count";
+const MIGRATION_088_CHECKSUM: &str = "sha256:rag-rat-clone-postings-row-count-v88";
+const MIGRATION_088_DESCRIPTION: &str =
+    "Cache each clone generation's posting-row count on the generation row (#830): add \
+     clone_graph_generations.postings_row_count and backfill it from COUNT(*) of \
+     clone_subblock_postings per generation. The #598 delta work budget sizes off this count; \
+     reading a maintained column replaces a full COUNT(*) scan of the postings table on every \
+     delta pass. Additive; existing rows backfill from the current postings, and the count is \
+     then maintained transactionally at build (complete_generation) and in each delta write-back";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1373,6 +1381,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_087_CHECKSUM,
         description: MIGRATION_087_DESCRIPTION,
         apply: MigrationFn::Plain(apply_table_sync_tables),
+    },
+    Migration {
+        id: MIGRATION_088_ID,
+        checksum: MIGRATION_088_CHECKSUM,
+        description: MIGRATION_088_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_clone_postings_row_count),
     },
 ];
 

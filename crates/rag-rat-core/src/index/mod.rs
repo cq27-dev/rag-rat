@@ -71,6 +71,7 @@ pub use lifecycle::{
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
 pub use parser_failures::ParserFailure;
 pub(crate) use prep::*;
+pub(crate) use query_api::CloneDeltaHint;
 pub use query_api::{
     CLONE_DELTA_MAX_FILES, CandidateCloneClass, CloneCheckInput, CloneCompleteness,
     CloneDeltaReport, CloneEdgeReport, CloneEligibility, CloneFingerprintHealth,

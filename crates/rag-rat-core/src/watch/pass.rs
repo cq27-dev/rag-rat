@@ -325,13 +325,17 @@ fn run_pass(
     // appears. A recorded root going empty still prunes (not first-time → not refused). The
     // one-shot `index` command instead surfaces the same error to the operator.
     let discover = timings.stage("discover", || IndexDatabase::index_discover_reporting(config));
-    let (mut db, content_changed) = match discover {
+    let (mut db, pass) = match discover {
         Ok(result) => result,
         Err(err) if err.downcast_ref::<crate::index::EmptyIndexRefused>().is_some() => {
             return Ok(());
         },
         Err(err) => return Err(err),
     };
+    let content_changed = pass.content_changed;
+    // #830: the clone-delta changed-set hint this pass produced (the base paths it reindexed or
+    // deleted, or `None` when the pass can't offer a reliable superset — a heal / bootstrap).
+    let clone_delta_hint = pass.clone_delta_hint;
     // Persist the resident watcher's watch-placement failure count (as a high-water mark) so
     // `index_status` can surface silently-dropped watches — a directory whose watch failed (ENOSPC
     // on Linux) falls back to this very sweep, but without this the degradation is invisible. This
@@ -446,15 +450,43 @@ fn run_pass(
         // the next pass. `content_revision()` is an O(1) state read (#828), so the delta recomputes
         // it directly against the `files` rows as committed — no pinned digest is threaded from the
         // probe.
-        let clone_full_rebuild_owed = match timings.stage("clone_delta", || {
-            db.apply_clone_graph_delta(crate::index::CLONE_DELTA_MAX_FILES)
-        }) {
-            Ok(delta) if delta.status == "Applied" || delta.status == "Noop" =>
-                delta.full_rebuild_owed,
+        // #830: normally derive the delta's changed set from this pass's reindexed/deleted paths
+        // (`Paths`) — indexed point-lookups instead of two corpus scans. On the gc cadence run the
+        // `SelfHeal` sweep instead: a full scan that runs EVEN when the revision is unchanged, so
+        // it repairs drift the content digest cannot see (a generated-flag flip, which
+        // moves no revision and would otherwise sit until the full rebuild). Reusing
+        // `run_gc` — the same periodic full-reconcile cadence gc already runs (prune + the
+        // #828 parity scan) — bounds that drift window. When a non-gc pass cannot offer a
+        // reliable hint (a stale-overlay heal / bootstrap left `clone_delta_hint = None`)
+        // the revision has still moved, so a plain `FullScan` derives the set. Load-bearing
+        // — do not collapse `SelfHeal` into `FullScan`.
+        let hint = if run_gc {
+            crate::index::CloneDeltaHint::SelfHeal
+        } else {
+            match &clone_delta_hint {
+                Some(touched) => crate::index::CloneDeltaHint::Paths(touched),
+                None => crate::index::CloneDeltaHint::FullScan,
+            }
+        };
+        let delta = timings.stage("clone_delta", || {
+            db.apply_clone_graph_delta_hinted(crate::index::CLONE_DELTA_MAX_FILES, hint)
+        });
+        let clone_full_rebuild_owed = match &delta {
+            Ok(d) if d.status == "Applied" || d.status == "Noop" => d.full_rebuild_owed,
             _ => true,
         };
+        // #830: a gc-cadence `SelfHeal` that ESCALATED while the graph is still FRESH against the
+        // revision found more revision-neutral drift (a mass generated-reclassification) than the
+        // delta cap. The quiet gate (`clone_graph_due`) keys on revision movement, so it never arms
+        // for a fresh-looking graph — that drift would sit unrepaired across every gc pass. Force
+        // the rebuild past the gate for exactly that case. A revision-MOVED Escalate leaves
+        // `source_revision != content_revision` (stale), so the quiet gate handles it as usual and
+        // this bypass does not weaken that thrash-prevention; a `Paths` delta only escalates on a
+        // moved revision, so it is never fresh here.
+        let force_revision_neutral_rebuild =
+            matches!(&delta, Ok(d) if d.status == "Escalate") && !db.clone_graph_stale()?;
         if clone_full_rebuild_owed
-            && clone_graph_due
+            && (clone_graph_due || force_revision_neutral_rebuild)
             && let Some(options) = budget.next_options()
         {
             let _ = timings.stage("clone_rebuild", || {

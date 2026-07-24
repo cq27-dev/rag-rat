@@ -992,13 +992,16 @@ fn index_discover_reporting_flags_content_changes() {
     IndexDatabase::rebuild(&config).unwrap();
 
     // No change → reports false, so the watch loop skips the reconcile / memory-validate tail.
-    let (_db, changed) = IndexDatabase::index_discover_reporting(&config).unwrap();
-    assert!(!changed, "an unchanged discover sweep must report no content change");
+    let (_db, pass) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(!pass.content_changed, "an unchanged discover sweep must report no content change");
 
     // A new file on disk → reports true.
     fs::write(root.join("docs/extra.md"), "# Extra\nbody text\n").unwrap();
-    let (_db, changed) = IndexDatabase::index_discover_reporting(&config).unwrap();
-    assert!(changed, "a discover sweep that indexes a new file must report a content change");
+    let (_db, pass) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(
+        pass.content_changed,
+        "a discover sweep that indexes a new file must report a content change"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1023,10 +1026,10 @@ fn discover_relanguages_h_when_binding_changes_c_to_cpp() {
     assert_eq!(lang, "c", "indexed as C under the c binding");
     drop(db);
 
-    let (db, changed) =
+    let (db, pass) =
         IndexDatabase::index_discover_reporting(&source_config(root.clone(), Language::Cpp))
             .unwrap();
-    assert!(changed, "re-languaging a .h with unchanged content must report a change");
+    assert!(pass.content_changed, "re-languaging a .h with unchanged content must report a change");
     let lang: String = db
         .storage
         .connection()

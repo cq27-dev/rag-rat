@@ -132,8 +132,8 @@ fn a_head_move_carries_unchanged_rows_and_rederives_only_the_diff() {
     let new_head = head_sha(&root);
     assert_ne!(old_head, new_head);
 
-    let (db, content_changed) = IndexDatabase::index_discover_reporting(&config).unwrap();
-    assert!(content_changed, "the edited file is a real content change");
+    let (db, pass) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(pass.content_changed, "the edited file is a real content change");
 
     // keep.rs: the SAME row (and its chunks) re-stamped to the new commit — no re-derive.
     let keep_rows = committed_rows(&db, "src/keep.rs");
@@ -205,8 +205,8 @@ fn a_branch_switch_back_carries_everything_with_no_rederive() {
     // old row — left behind at the main head with main's content — matches disk again. Nothing
     // re-derives, so the pass reports no content change.
     run_git(&root, &["checkout", "-q", "main"]);
-    let (db, content_changed) = IndexDatabase::index_discover_reporting(&config).unwrap();
-    assert!(!content_changed, "a switch back to already-derived content re-derives nothing");
+    let (db, pass) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(!pass.content_changed, "a switch back to already-derived content re-derives nothing");
     assert_eq!(active_row_id(&db, "src/keep.rs"), Some(keep_id));
     assert_eq!(
         active_row_id(&db, "src/edit.rs"),
@@ -555,8 +555,8 @@ fn a_carry_only_pass_still_refreshes_package_roots() {
     run_git(&root, &["commit", "-q", "-m", "docs only"]);
     let new_head = head_sha(&root);
 
-    let (db, content_changed) = IndexDatabase::index_discover_reporting(&config).unwrap();
-    assert!(!content_changed, "no indexed content changed across the move");
+    let (db, pass) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(!pass.content_changed, "no indexed content changed across the move");
     let package_rows: Vec<(String, String)> = {
         let conn = db.storage.connection();
         let mut stmt =

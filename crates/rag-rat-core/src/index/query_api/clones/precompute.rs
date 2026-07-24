@@ -169,6 +169,15 @@ impl IndexDatabase {
 
     /// The staleness core of [`Self::pending_clone_graph`], against an already-computed
     /// `content_revision()` so the quiet gate pays the digest once per probe.
+    /// Whether the live clone generation is stale against the CURRENT `content_revision()` — the
+    /// revision-keyed staleness the quiet gate reads. `false` for a graph that looks fresh, which
+    /// is why a revision-neutral `SelfHeal` Escalate needs a forced rebuild (#830,
+    /// `watch::pass`): the drift is real but the revision — hence this check — cannot see it.
+    pub(crate) fn clone_graph_stale(&self) -> anyhow::Result<bool> {
+        let revision = self.content_revision()?;
+        self.clone_graph_stale_against(&revision)
+    }
+
     fn clone_graph_stale_against(&self, content_revision: &str) -> anyhow::Result<bool> {
         let conn = self.storage.connection();
         let Some(live) = live_generation_row(conn)? else {
@@ -548,9 +557,14 @@ impl IndexDatabase {
     fn complete_generation(&self, generation: i64, edges_written: u64) -> anyhow::Result<()> {
         let conn = self.storage.connection();
         conn.execute(
+            // Seed the cached posting-row count (#830) from one COUNT at publish time — the
+            // generation's postings are fully written by now, and the delta pass maintains this
+            // incrementally thereafter, so this is the only full COUNT the graph ever pays.
             "UPDATE clone_graph_generations
                 SET status = 'Complete', finished_at_ms = ?1, edges_written = ?2,
-                    postings_written = 1
+                    postings_written = 1,
+                    postings_row_count = (SELECT COUNT(*) FROM clone_subblock_postings
+                                           WHERE build_generation = ?3)
               WHERE generation = ?3",
             params![now_ms(), edges_written as i64, generation],
         )?;
@@ -846,12 +860,16 @@ pub(super) fn insert_edge_rows(
 }
 
 /// Insert every posting group's per-token rows for `generation` (idempotent, content-key PK).
-/// Shared by `flush_batch` and the delta pass; runs inside the CALLER's transaction.
+/// Shared by `flush_batch` and the delta pass; runs inside the CALLER's transaction. Returns the
+/// number of rows ACTUALLY inserted (the `INSERT OR IGNORE` row-change sum, so a content-key
+/// collision is not counted) — the exact delta the delta pass adds to the cached
+/// `postings_row_count` (#830).
 pub(super) fn insert_posting_groups(
     conn: &Connection,
     generation: i64,
     postings: &[PostingGroup],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
+    let mut inserted = 0u64;
     let mut stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO clone_subblock_postings
             (build_generation, token_hash, path, start_byte, file_sha)
@@ -860,10 +878,11 @@ pub(super) fn insert_posting_groups(
     for g in postings {
         let (path, start_byte, file_sha) = &g.anchor;
         for &token_hash in &g.tokens {
-            stmt.execute(params![generation, token_hash, path, start_byte, file_sha])?;
+            inserted +=
+                stmt.execute(params![generation, token_hash, path, start_byte, file_sha])? as u64;
         }
     }
-    Ok(())
+    Ok(inserted)
 }
 
 /// Whether `generation`'s postings can be ORDERED for serving (#479): its pinned df epoch

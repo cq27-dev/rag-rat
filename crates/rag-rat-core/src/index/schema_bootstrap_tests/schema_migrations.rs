@@ -3850,7 +3850,7 @@ fn migration_084_links_chunks_to_symbols() {
 
 /// V085 adds sync provenance (`origin`) to the read tables + edge tombstones (`present`) to the
 /// content-edge projection. The absolute schema-tip pin lives on the newest migration's test
-/// (V087, `migration_087_is_the_tip_and_adds_table_sync_tables`).
+/// (V088, `migration_088_caches_the_generation_posting_row_count`).
 #[test]
 fn migration_085_adds_origin_and_edge_present() {
     // Bare pre-V085 tables (no origin / present), each with a pre-existing row, so the migration is
@@ -3927,11 +3927,10 @@ fn migration_085_adds_origin_and_edge_present() {
     assert_eq!(recorded, 1, "the forward migration records V085");
 }
 
-/// V087 adds the table→log sync engine's bookkeeping tables, and is the schema tip.
+/// V087 adds the table→log sync engine's bookkeeping tables. (No longer the schema tip — the
+/// absolute pin moved to `migration_088_caches_the_generation_posting_row_count`.)
 #[test]
-fn migration_087_is_the_tip_and_adds_table_sync_tables() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 87, "move this pin with the next schema migration");
-
+fn migration_087_adds_table_sync_tables() {
     let added =
         ["table_sync_entries", "sync_published_rows", "sync_row_tombstones", "sync_row_clocks"];
 
@@ -3982,4 +3981,68 @@ fn migration_087_is_the_tip_and_adds_table_sync_tables() {
         )
         .unwrap();
     assert_eq!(recorded, 1, "the forward migration records V087");
+}
+
+/// V088 (#830) caches each clone generation's posting-row count on its generation row so the #598
+/// delta work budget reads one column instead of a full `COUNT(*)` scan of the postings table.
+/// Carries the absolute schema-tip pin now that V088 is newest. Verifies the column exists on a
+/// fresh ladder and that the applier backfills an existing generation from its actual postings.
+#[test]
+fn migration_088_caches_the_generation_posting_row_count() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 88, "move this pin with the next schema migration");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
+    assert!(
+        conn_table_columns(&conn, "clone_graph_generations")
+            .contains(&"postings_row_count".to_string()),
+        "generations carry the cached posting-row count that sizes the #598 work budget (#830)"
+    );
+
+    // Seed a generation with three postings, then DROP the column and re-run the applier in
+    // isolation: the backfill must recompute the count from the actual postings, not leave it 0.
+    conn.execute(
+        "INSERT INTO clone_graph_generations
+            (generation, status, theta_floor, normalizer_kind, normalizer_version,
+             source_revision, started_at_ms, postings_written)
+         VALUES (7, 'Complete', 0.7, 'baseline', 3, 'rev', 0, 1)",
+        [],
+    )
+    .unwrap();
+    for token in [10, 20, 30] {
+        conn.execute(
+            "INSERT INTO clone_subblock_postings
+                (build_generation, token_hash, path, start_byte, file_sha)
+             VALUES (7, ?1, 'src/a.rs', ?1, 'sha')",
+            [token],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("ALTER TABLE clone_graph_generations DROP COLUMN postings_row_count;")
+        .unwrap();
+    schema::apply_clone_postings_row_count(&conn).unwrap();
+    let backfilled: i64 = conn
+        .query_row(
+            "SELECT postings_row_count FROM clone_graph_generations WHERE generation = 7",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(backfilled, 3, "the backfill counts the generation's actual postings");
+
+    // Additive + idempotent: a re-apply keeps the column and its value.
+    schema::apply_clone_postings_row_count(&conn).unwrap();
+    let after_reapply: i64 = conn
+        .query_row(
+            "SELECT postings_row_count FROM clone_graph_generations WHERE generation = 7",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(after_reapply, 3, "a re-apply recomputes the same exact count");
 }

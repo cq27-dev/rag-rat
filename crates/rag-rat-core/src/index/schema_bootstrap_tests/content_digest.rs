@@ -74,7 +74,8 @@ const FOLD_TRIGGERS: [&str; 3] =
 
 /// V086 creates `content_digest_state` (seeded empty on a fresh ladder) and the three fold
 /// triggers. The absolute schema-tip pin has moved forward to the newest migration's test
-/// (V087, `migration_087_is_the_tip_and_adds_table_sync_tables`).
+/// (V088, `migration_088_caches_the_generation_posting_row_count`); this keeps only the symbolic
+/// "schema at LATEST after apply" check per the ladder convention.
 #[test]
 fn content_digest_state_has_live_fold_triggers() {
     let conn = apply_schema();

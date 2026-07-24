@@ -40,6 +40,38 @@ struct PreparedIncrementalPass {
     deleted: BTreeSet<PathBuf>,
 }
 
+impl PreparedIncrementalPass {
+    /// The repo-relative base paths this pass will reindex or delete — the clone-delta changed-set
+    /// hint (#830). Uses the SAME `path_string` normalization the file writes use, so the strings
+    /// match `files.path` / `clone_subblock_postings.path` byte-for-byte. A superset of the paths
+    /// whose `(path, sha256)` actually changes (an unchanged prepared file writes nothing but is
+    /// still listed) — which is exactly what the delta hint requires (see `delta.rs`).
+    fn touched_base_paths(&self) -> BTreeSet<String> {
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        for prepared in &self.prepared_files {
+            set.insert(rag_rat_base::paths::path_string(&prepared.file.relative_path));
+        }
+        for deleted in &self.deleted {
+            set.insert(rag_rat_base::paths::path_string(deleted));
+        }
+        set
+    }
+}
+
+/// The outcome of one incremental/discover pass the watcher tail consumes: whether index *content*
+/// changed (gates the reconcile / memory-validate tail on an idle sweep, #63) and the clone-delta
+/// changed-set hint (#830).
+pub(crate) struct IncrementalPassReport {
+    pub(crate) content_changed: bool,
+    /// The base paths this pass reindexed ∪ deleted, as the clone-delta changed-set hint. `Some`
+    /// only when the pass's content change is FULLY captured by this set; `None` forces the
+    /// delta's full DB scan — a stale-overlay heal changes `files` rows the set does not name,
+    /// and a bootstrap full rebuild reindexed the whole corpus. An empty `Some` is valid (the
+    /// revision moved but no base file was touched), letting the delta re-pin freshness
+    /// without a scan.
+    pub(crate) clone_delta_hint: Option<BTreeSet<String>>,
+}
+
 impl IndexDatabase {
     pub fn index_changed(config: &Config) -> anyhow::Result<Self> {
         Self::index_changed_with_progress(config, |_| {})
@@ -92,7 +124,9 @@ impl IndexDatabase {
     /// Like [`Self::index_discover`], but also reports whether the pass changed index *content*
     /// (a file was added / edited / removed). The watch loop uses this to skip the
     /// reconcile / memory-validate tail on an idle no-change sweep (issue #63).
-    pub fn index_discover_reporting(config: &Config) -> anyhow::Result<(Self, bool)> {
+    pub(crate) fn index_discover_reporting(
+        config: &Config,
+    ) -> anyhow::Result<(Self, IncrementalPassReport)> {
         Self::index_incremental_with_progress(config, IndexMode::Discover, None, &mut |_| {})
     }
 
@@ -101,7 +135,7 @@ impl IndexDatabase {
         mode: IndexMode,
         explicit_paths: Option<&[PathBuf]>,
         progress: &mut F,
-    ) -> anyhow::Result<(Self, bool)>
+    ) -> anyhow::Result<(Self, IncrementalPassReport)>
     where
         F: FnMut(IndexProgress),
     {
@@ -120,7 +154,12 @@ impl IndexDatabase {
                 }
                 .into());
             }
-            return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
+            // A bootstrap full rebuild reindexed the whole corpus and rebuilt the clone graph from
+            // scratch, so there is no incremental changed-set to hint — `None` forces the delta's
+            // self-healing full scan next pass (#830).
+            return Self::rebuild_with_progress(config, progress).map(|db| {
+                (db, IncrementalPassReport { content_changed: true, clone_delta_hint: None })
+            });
         }
 
         // Acquire the per-repo write flock BEFORE opening + scoping the connection (#560/#561). It
@@ -227,7 +266,12 @@ impl IndexDatabase {
                 }
                 .into());
             }
-            return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
+            // A bootstrap full rebuild reindexed the whole corpus and rebuilt the clone graph from
+            // scratch, so there is no incremental changed-set to hint — `None` forces the delta's
+            // self-healing full scan next pass (#830).
+            return Self::rebuild_with_progress(config, progress).map(|db| {
+                (db, IncrementalPassReport { content_changed: true, clone_delta_hint: None })
+            });
         }
         // A commit advances HEAD before committed-scope rows have been stamped for it. Likewise, a
         // target-set change can make the active scope marker stale even when the old rows still
@@ -296,6 +340,12 @@ impl IndexDatabase {
             None => None,
         };
         let prepare_ms = prepare_started.elapsed().as_millis() as u64;
+        // #830: the clone-delta changed-set hint — the base paths this pass reindexes or deletes —
+        // captured from the prepared plan before the write txn (a pure read of `prepared`). Whether
+        // it is offered to the delta is decided after apply, once `healed` is known: a
+        // stale-overlay heal touches `files` rows NOT in this set, so a healed pass falls
+        // back to the full scan.
+        let touched_base_paths = prepared.touched_base_paths();
 
         // WRITE — ONE `BEGIN IMMEDIATE` .. COMMIT (#560). The incremental path writes the LIVE
         // generation directly (no staging, no pointer flip — unlike the full rebuild), so every
@@ -502,7 +552,12 @@ impl IndexDatabase {
         // transaction is closed by now); write-free when nothing is pending (one meta read),
         // so the #63 idle-pass posture holds. On failure the marker survives for the next pass.
         db.apply_pending_logical_rebuild()?;
-        Ok((db, content_changed))
+        // #830: offer the changed-set hint ONLY when the pass's content change is fully captured by
+        // the reindexed/deleted set. A stale-overlay heal (`healed > 0`) mutates `files` rows that
+        // are NOT in `touched_base_paths`, so a healed pass yields `None` and the delta self-heals
+        // via its full DB scan.
+        let clone_delta_hint = (healed == 0).then_some(touched_base_paths);
+        Ok((db, IncrementalPassReport { content_changed, clone_delta_hint }))
     }
 
     /// Standalone full-corpus indexing into the CURRENT context — no generation staging, no
