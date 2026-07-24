@@ -588,6 +588,15 @@ impl IndexDatabase {
             super::migration_gate::MigrationGate::from_env()
                 .ensure_migration_permitted(path, state)?;
             schema::apply(conn, &crate::index::migration_hooks())?;
+            // A store migration can rewrite whole tables (a 0.20 → 0.21 store refolded ~GBs);
+            // those one-time buffers are freed by here but sit in glibc's arenas as retained
+            // RSS unless returned (#906). `shrink_memory` first: the migration's page-cache
+            // fill is still LIVE on this kept connection, where the trim cannot reach it —
+            // release it (`sqlite3_db_release_memory`), then trim. Best-effort: a failed
+            // shrink only leaves cached pages behind. Inside the `!Compatible` arm only — the
+            // common already-current open applies nothing and must not pay either call.
+            let _ = conn.execute_batch("PRAGMA shrink_memory;");
+            rag_rat_base::heap::release_freed_heap();
         }
         Ok(())
     }

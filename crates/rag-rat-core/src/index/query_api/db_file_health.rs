@@ -303,6 +303,10 @@ pub fn reclaim_freelist_at(database: &Path) -> anyhow::Result<FreelistReclaim> {
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0))?;
     let (main_bytes_after, freelist_pages_after) = freelist_snapshot(&vacuum_conn, database)?;
     drop(vacuum_conn);
+    // VACUUM rewrote the file through this connection's page cache, all freed by the drop above
+    // — but SQLite allocates through the C allocator, so without a trim glibc's arenas retain
+    // that rewrite peak as RSS for as long as the calling process lives (#906).
+    rag_rat_base::heap::release_freed_heap();
     Ok(FreelistReclaim::Reclaimed(FreelistReclaimReport {
         main_bytes_before,
         main_bytes_after,

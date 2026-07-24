@@ -337,13 +337,27 @@ impl IndexDatabase {
             // gc-swept).
             let _ = db.storage.execute_batch("ROLLBACK");
         }
-        // cache_size is left bumped — harmless for the short remaining lifetime of the connection.
-        // The coarse bulk-build autocheckpoint is NOT left in place: watcher heals and startup
-        // catch-up KEEP the returned connection for later passes, and a lingering autocheckpoint
-        // would fire passive checkpoints mid-pass — exactly what `wal_autocheckpoint = 0` at open
-        // exists to prevent (#818). Restore it on success AND failure; best-effort, since a failed
-        // restore only leaves the coarser cadence behind.
-        let _ = db.storage.execute_batch("PRAGMA wal_autocheckpoint = 0;");
+        // Neither bulk-build pragma is left in place: watcher heals and startup catch-up KEEP
+        // the returned connection for later passes, so a lingering autocheckpoint would fire
+        // passive checkpoints mid-pass — exactly what `wal_autocheckpoint = 0` at open exists
+        // to prevent (#818) — and the lingering 256 MiB cache_size would keep that many LIVE
+        // pages on the kept connection (and let later passes refill to it) where the heap trim
+        // below cannot reach them (#906). Restore both to their open-time values on success
+        // AND failure; best-effort, since a failed restore only leaves the coarser/bigger
+        // setting behind. `shrink_memory` then drops the connection's now-over-cap cached
+        // pages immediately (`sqlite3_db_release_memory`) instead of waiting for lazy
+        // eviction, so they are actually FREE when the trim runs.
+        let _ = db.storage.execute_batch(
+            "PRAGMA wal_autocheckpoint = 0;
+             PRAGMA cache_size = -65536;
+             PRAGMA shrink_memory;",
+        );
+        // The rebuild's transient working set — the bulk-build page cache released above, the
+        // staged waves' prepared files, the accumulated base-edge graph — was just dropped (or
+        // rolled back). Return it to the OS on success AND failure, before the early `?` below:
+        // SQLite's share lives in glibc's arenas (the C allocator, not Rust's), which otherwise
+        // retain the rebuild peak as RSS for the life of the process (#906).
+        rag_rat_base::heap::release_freed_heap();
         result?;
         // #828 §9.1: the sanctioned full rebuild is a reseed by definition — the
         // `files_content_digest_*` triggers maintained `content_digest_state` through every staged

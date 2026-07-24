@@ -427,6 +427,9 @@ fn run_pass(
     if !run_base_tail && !overlays_changed {
         timings.stage("wal", || maybe_checkpoint_wal(&db, crate::index::WAL_CHECKPOINT_MIN_BYTES));
         timings.emit(false, content_changed, overlays_changed);
+        // No heap trim on the idle exit: a discover-only sweep allocates nothing worth
+        // returning, and any earlier heavy pass already trimmed at its own terminal — trimming
+        // here would just take the malloc locks every 60 s for nothing.
         return Ok(());
     }
     let mut base_reconcile_status = None;
@@ -508,6 +511,16 @@ fn run_pass(
         db.clear_watch_shutdown_reconcile_pending()?;
     }
     timings.stage("wal", || maybe_checkpoint_wal(&db, crate::index::WAL_CHECKPOINT_MIN_BYTES));
+    // This exit is only reached when the pass did real work (a base tail ran or an overlay
+    // refresh wrote), so the transient working set — SQLite's page cache and
+    // `temp_store = MEMORY` sorts (#815) plus the pass's own buffers — is what the pass peak
+    // is made of. Close the pass connection FIRST (the drop below is the same close that
+    // otherwise happens at return, moved before the trim) so SQLite actually frees its cache,
+    // then hand the freed heap back to the OS — or glibc's arenas retain the pass peak as RSS
+    // for the life of the server (#906). Timed as a stage so a pathological trim shows up in
+    // the pass summary.
+    drop(db);
+    timings.stage("trim", rag_rat_base::heap::release_freed_heap);
     timings.emit(true, content_changed, overlays_changed);
     Ok(())
 }

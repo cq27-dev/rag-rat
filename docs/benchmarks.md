@@ -205,6 +205,10 @@ MEM_TRACE probes miss).
   trade speed for peak RSS on a memory-constrained box.
 - `RAG_RAT_MEM_TRACE=1` — emit the per-phase rebuild RSS + sqlite-memory curve to stderr. (Note: it
   does not instrument the post-COMMIT phases — use the sampler CSV for those.)
+- `MALLOC_ARENA_MAX` (glibc env var, e.g. `MALLOC_ARENA_MAX=2`) — cap glibc's per-thread malloc
+  arenas on a memory-constrained host. rag-rat already returns freed heap at pass/rebuild/
+  migration/VACUUM terminals (`malloc_trim`), but fewer arenas also lower the *peak* between
+  those points, at some allocation-contention cost.
 - `RAG_RAT_KERNEL_SUBDIRS` (bench only) — bound the indexed subtree (e.g. `"kernel mm fs net lib"`)
   to go faster while iterating; `.` is the whole tree (the headline).
 - `RAG_RAT_KERNEL_VECTORS=1` (bench only) — add the opt-in `+vectors` pass to the run, reporting

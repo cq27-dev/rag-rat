@@ -8,6 +8,7 @@ pub mod config;
 pub mod data_dir;
 pub mod embedding_models;
 pub mod hash;
+pub mod heap;
 pub mod language;
 pub mod locks;
 pub mod logging;
