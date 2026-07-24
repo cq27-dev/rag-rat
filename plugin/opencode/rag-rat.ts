@@ -3,7 +3,7 @@
 // opencode's plugin shape differs from Claude Code / Codex (no hooks.json manifest, no
 // additionalContext channel on tool.execute.before), so this module is a thin shim over the same
 // shared pieces the other harnesses use:
-//   - MCP: registered via the `config` hook as `npx -y @rag-rat/bin@0.21.0<version> mcp` (pinned; kept
+//   - MCP: registered via the `config` hook as `npx -y @rag-rat/bin@0.21.1<version> mcp` (pinned; kept
 //     in lockstep with the release by tools/sync-plugin-version.mjs).
 //   - Hooks: routed through the shared launcher (`../scripts/launch.js --no-install agent-hook`)
 //     when this file lives in the repo's plugin bundle, or — for a standalone single-file install
@@ -35,7 +35,7 @@ const BUNDLED_LAUNCHER = path.join(PLUGIN_DIR, "..", "scripts", "launch.js");
 
 // Single source of truth for the version: the pinned npm package (kept in lockstep with the
 // release by tools/sync-plugin-version.mjs — do not hand-edit the pin).
-const MCP_PACKAGE = "@rag-rat/bin@0.21.0";
+const MCP_PACKAGE = "@rag-rat/bin@0.21.1";
 const VERSION = MCP_PACKAGE.split("@").pop()!;
 
 const TOOL_TIMEOUT_MS = 10_000;
