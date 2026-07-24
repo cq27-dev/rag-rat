@@ -25,8 +25,8 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::account::{
-    KeyId, content_projected_tables_exist, decode_content_signed, historical_content_keyring,
-    open_sealed_payload, stream_owner_account,
+    KeyId, content_projected_tables_exist, content_stream_has_pending_refold,
+    decode_content_signed, historical_content_keyring, open_sealed_payload, stream_owner_account,
 };
 use super::identity::load_local_device;
 use super::op::{
@@ -127,20 +127,39 @@ pub fn rebuild_all_content_projections_if_stale(conn: &Connection) -> anyhow::Re
 /// first so a row whose stream's accepted set emptied since its last reproject (a full
 /// retro-condemn) cannot linger, then fold each stream (mirrors [`crate::store`]'s
 /// `reproject_all_streams`). Runs inside the caller's txn; the caller stamps after.
+///
+/// The rebuild set is captured BEFORE the clear and includes streams that currently have projection
+/// ROWS but no accepted content (an emptied acceptance set). Reprojecting such a stream to empty
+/// still advances its projection epoch, so the memory drain re-runs and retro-condemns its
+/// now-unbacked `origin='synced'` rows — otherwise the wholesale clear would drop the projection
+/// rows while leaving the drain watermark matched, and the stale synced memories would stay
+/// searchable.
 fn reproject_all_accepted_content_streams(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    let streams = accepted_or_projected_content_streams(tx)?;
     tx.execute("DELETE FROM content_projected_nodes", [])?;
     tx.execute("DELETE FROM content_projected_edges", [])?;
-    for stream_id in accepted_content_streams(tx)? {
+    for stream_id in streams {
         reproject_stream_projection(tx, stream_id)?;
     }
     Ok(())
 }
 
-/// Every distinct `/2` stream the log currently holds ACCEPTED `/3` content for — the rebuild set
-/// for a projector upgrade (mirrors [`crate::store`]'s `streams_present`).
-fn accepted_content_streams(conn: &Connection) -> anyhow::Result<Vec<StreamId>> {
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT stream_id FROM content_entries WHERE accepted = 1")?;
+/// Every distinct `/2` stream that holds ACCEPTED `/3` content OR currently has projection rows —
+/// the rebuild set for a projector upgrade (mirrors [`crate::store`]'s `streams_present`). Read
+/// BEFORE the wholesale clear so a stream whose accepted set emptied is still reprojected (to
+/// empty), which advances its epoch for the memory drain (see the caller). The projection selects
+/// are gated to a well-formed 32-byte `stream_id`: a projection row can carry a malformed/ghost
+/// stream id that is never a real owner stream (the wholesale clear drops it and there is nothing
+/// to reproject or drain for it), while a non-32-byte id from `content_entries` is genuine
+/// corruption and still trips the length check below.
+fn accepted_or_projected_content_streams(conn: &Connection) -> anyhow::Result<Vec<StreamId>> {
+    let mut stmt = conn.prepare(
+        "SELECT stream_id FROM content_entries WHERE accepted = 1
+         UNION
+         SELECT stream_id FROM content_projected_nodes WHERE length(stream_id) = 32
+         UNION
+         SELECT stream_id FROM content_projected_edges WHERE length(stream_id) = 32",
+    )?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     let mut streams = Vec::new();
     for row in rows {
@@ -158,7 +177,16 @@ fn accepted_content_streams(conn: &Connection) -> anyhow::Result<Vec<StreamId>> 
 fn reproject_stream_projection(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::Result<()> {
     let entries = load_accepted_entries(tx, stream_id)?;
     let state = project::project(&entries);
-    write_projection(tx, stream_id, &state)
+    write_projection(tx, stream_id, &state)?;
+    // Advance this stream's projection epoch. A consumer that MATERIALIZES the projection (the
+    // memory drain, `memory_write::drain`) gates its O(projection) scan on this epoch, so it must
+    // move whenever the projection is rewritten — through EITHER path that reaches here (the local
+    // author's inline reproject and the ingest settle's deferred reproject). Bumping on every
+    // rewrite, even an idempotent one, is deliberately conservative: it can only cause an extra
+    // no-op drain, never a missed one. Distinct from the store-global projector VERSION stamp,
+    // which tracks the binary's projector, not per-stream content change.
+    bump_content_projection_epoch(tx, stream_id)?;
+    Ok(())
 }
 
 /// Error if a NEWER `/3` projector already folded this store's content projection — an older binary
@@ -200,6 +228,88 @@ fn stored_content_projector_version(conn: &Connection) -> anyhow::Result<Option<
     .optional()?
     .map(|value| value.parse::<i64>().context("oplog content_projector_version is not an integer"))
     .transpose()
+}
+
+// ── per-stream projection epoch + memory-drain watermark ───────────────────────────────────────
+//
+// A monotonic per-stream counter (`content:proj-epoch:<hex>` in `oplog_meta`) bumped on every
+// projection rewrite, plus the epoch a consumer last materialized (`content:drain-wm:<hex>`). This
+// lets the memory drain (`memory_write::drain`) skip its O(projection) scan when the projection is
+// unchanged since it last ran — the store-global watcher pass would otherwise re-scan every stream
+// every pass. `oplog_meta` (a KV table) is reused so this needs no schema migration; the stream is
+// keyed via SQLite's own `hex()` (no Rust hex dependency).
+
+/// Advance `stream`'s projection epoch by one (creating it at 1). Called from the single reproject
+/// choke point, so it moves on every rewrite regardless of which path triggered it. `hex(?1)` keys
+/// the row by the stream without a Rust hex dependency (UPPERCASE, matched by the reads below).
+fn bump_content_projection_epoch(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO oplog_meta(key, value) VALUES ('content:proj-epoch:' || hex(?1), '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        params![stream_id.to_bytes().as_slice()],
+    )?;
+    Ok(())
+}
+
+/// `stream`'s current projection epoch — `0` if it has never been projected. Accepts a
+/// `&Connection` or (via deref) a `&Transaction`, so the drain can read it both in its read-only
+/// pre-check and inside its write txn.
+pub fn content_projection_epoch(conn: &Connection, stream_id: StreamId) -> anyhow::Result<u64> {
+    let value: Option<i64> = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM oplog_meta WHERE key = 'content:proj-epoch:' || \
+             hex(?1)",
+            params![stream_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.unwrap_or(0).max(0) as u64)
+}
+
+/// The epoch the memory drain last materialized for `stream`, or `None` if it has never drained it.
+fn content_drain_watermark(conn: &Connection, stream_id: StreamId) -> anyhow::Result<Option<u64>> {
+    let value: Option<i64> = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM oplog_meta WHERE key = 'content:drain-wm:' || \
+             hex(?1)",
+            params![stream_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.map(|v| v.max(0) as u64))
+}
+
+/// Whether the memory drain needs to run for `stream`: it has never drained it (backfill), a refold
+/// is pending (un-projected content whose settle has not folded it into the projection yet, so the
+/// epoch has not moved), or the projection changed since the last drain (epoch moved past the
+/// watermark). A cheap READ-ONLY pre-check (indexed lookups, no write txn) so an idle watcher pass
+/// skips opening a transaction and scanning the whole projection. CONSERVATIVE — any doubt is
+/// `true`, so a drain is never wrongly skipped; the worst case is one redundant no-op scan.
+pub fn content_drain_needed(conn: &Connection, stream_id: StreamId) -> anyhow::Result<bool> {
+    if content_stream_has_pending_refold(conn, stream_id)? {
+        return Ok(true);
+    }
+    match content_drain_watermark(conn, stream_id)? {
+        None => Ok(true),
+        Some(watermark) => Ok(content_projection_epoch(conn, stream_id)? != watermark),
+    }
+}
+
+/// Record that the drain has materialized `stream` up to its CURRENT projection epoch. Called
+/// inside the drain's write txn AFTER its settle (which may have advanced the epoch), so the
+/// watermark reflects exactly what was scanned. The next [`content_drain_needed`] returns `false`
+/// until the projection changes again.
+pub fn record_content_drained(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::Result<()> {
+    let epoch = content_projection_epoch(tx, stream_id)?;
+    tx.execute(
+        "INSERT INTO oplog_meta(key, value) VALUES ('content:drain-wm:' || hex(?1), ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![stream_id.to_bytes().as_slice(), epoch.to_string()],
+    )?;
+    Ok(())
 }
 
 /// Rewrite one stream's rows in `content_projected_nodes` / `content_projected_edges` — clear the
@@ -435,4 +545,143 @@ pub fn list_projected_content_edges(
         });
     }
     Ok(edges)
+}
+
+#[cfg(test)]
+mod drain_gate_tests {
+    use rag_rat_db::schema;
+
+    use super::*;
+
+    fn conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
+        conn
+    }
+
+    /// The drain gate tracks the three conditions it must run under — never drained (backfill), a
+    /// pending refold, and an epoch advanced past the recorded watermark — and short-circuits only
+    /// when the projection is provably unchanged since the last drain.
+    #[test]
+    fn content_drain_needed_tracks_epoch_watermark_and_pending() {
+        let mut conn = conn();
+        let stream = StreamId::from_bytes([7; 32]);
+
+        // Never projected, never drained → backfill owed; epoch starts at 0.
+        assert!(content_drain_needed(&conn, stream).unwrap(), "a never-drained stream is owed");
+        assert_eq!(content_projection_epoch(&conn, stream).unwrap(), 0);
+
+        // A projection rewrite advances the epoch; still owed (no watermark yet).
+        {
+            let tx = conn.transaction().unwrap();
+            bump_content_projection_epoch(&tx, stream).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(content_projection_epoch(&conn, stream).unwrap(), 1);
+        assert!(content_drain_needed(&conn, stream).unwrap(), "no watermark yet, still owed");
+
+        // The drain records the watermark at the current epoch → no longer owed.
+        {
+            let tx = conn.transaction().unwrap();
+            record_content_drained(&tx, stream).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(!content_drain_needed(&conn, stream).unwrap(), "caught up: not owed");
+
+        // A pending refold (un-projected content) makes it owed even at the same epoch.
+        conn.execute("INSERT INTO content_streams_pending_refold(stream_id) VALUES (?1)", params![
+            stream.to_bytes().as_slice()
+        ])
+        .unwrap();
+        assert!(content_drain_needed(&conn, stream).unwrap(), "a pending refold is owed");
+        conn.execute("DELETE FROM content_streams_pending_refold WHERE stream_id = ?1", params![
+            stream.to_bytes().as_slice()
+        ])
+        .unwrap();
+        assert!(!content_drain_needed(&conn, stream).unwrap(), "cleared pending: not owed");
+
+        // Another rewrite advances the epoch past the watermark → owed again.
+        {
+            let tx = conn.transaction().unwrap();
+            bump_content_projection_epoch(&tx, stream).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(content_projection_epoch(&conn, stream).unwrap(), 2);
+        assert!(content_drain_needed(&conn, stream).unwrap(), "epoch past watermark is owed");
+    }
+
+    /// A projector-version rebuild clears a stream whose accepted set emptied. Its epoch MUST still
+    /// advance (via a reproject-to-empty), or a drain that already watermarked the old epoch would
+    /// skip and leave the stream's now-unbacked `origin='synced'` rows searchable forever.
+    #[test]
+    fn a_projector_rebuild_bumps_the_epoch_of_a_stream_whose_projection_emptied() {
+        let mut conn = conn();
+        let stream = StreamId::from_bytes([9; 32]);
+        // A stale projection row with NO backing accepted content entry (an emptied acceptance
+        // set), plus a drain watermark recorded at the current (0) epoch → nothing owed
+        // yet.
+        conn.execute(
+            "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
+             VALUES (?1, 'n', '{}', 'active')",
+            params![stream.to_bytes().as_slice()],
+        )
+        .unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            record_content_drained(&tx, stream).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(
+            !content_drain_needed(&conn, stream).unwrap(),
+            "watermark matches epoch 0: not owed"
+        );
+
+        // Age the stored projector stamp so the next open triggers a store-global rebuild.
+        conn.execute(
+            "INSERT INTO oplog_meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![CONTENT_PROJECTOR_VERSION_KEY, (CONTENT_PROJECTOR_VERSION - 1).to_string()],
+        )
+        .unwrap();
+        assert!(
+            rebuild_all_content_projections_if_stale(&conn).unwrap(),
+            "the stale stamp triggers a rebuild",
+        );
+
+        // The emptied stream was reprojected (to empty), advancing its epoch past the watermark.
+        assert_eq!(
+            content_projection_epoch(&conn, stream).unwrap(),
+            1,
+            "an emptied stream's epoch is bumped by the rebuild",
+        );
+        assert!(
+            content_drain_needed(&conn, stream).unwrap(),
+            "the emptied projection is owed a drain"
+        );
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM content_projected_nodes WHERE stream_id = ?1",
+                params![stream.to_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "the stale projection row was cleared by the rebuild");
+    }
+
+    /// Epochs and watermarks are per-stream: draining one stream never clears another's.
+    #[test]
+    fn the_epoch_and_watermark_are_per_stream() {
+        let mut conn = conn();
+        let a = StreamId::from_bytes([1; 32]);
+        let b = StreamId::from_bytes([2; 32]);
+        {
+            let tx = conn.transaction().unwrap();
+            bump_content_projection_epoch(&tx, a).unwrap();
+            bump_content_projection_epoch(&tx, b).unwrap();
+            record_content_drained(&tx, a).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(!content_drain_needed(&conn, a).unwrap(), "a is caught up");
+        assert!(content_drain_needed(&conn, b).unwrap(), "b was never drained, still owed");
+    }
 }

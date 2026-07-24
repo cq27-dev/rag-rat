@@ -108,6 +108,17 @@ pub(crate) fn drain_synced_stream_for_repo(
         return Ok(DrainOutcome::default());
     };
 
+    // Cheap read-only gate: skip the write txn + O(projection) scan entirely when the projection is
+    // unchanged since this stream was last drained and nothing is pending. Every drain seam routes
+    // through here (open, consolidate, and the long-running watcher pass), so all three go O(1)
+    // when idle instead of O(projection); the first-ever drain has no watermark and always runs
+    // (the backfill). Read-only and outside the txn, so a concurrent author that advances the
+    // epoch right after this check is simply picked up by the next drain — delayed one pass,
+    // never lost.
+    if !rag_rat_oplog::content_drain_needed(conn, stream)? {
+        return Ok(DrainOutcome::default());
+    }
+
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Settle the owner stream's deferred refold HERE, inside the write's own transaction and before
     // the projection read, so the drain mirrors a CURRENT accepted set. A settle failure propagates
@@ -115,6 +126,10 @@ pub(crate) fn drain_synced_stream_for_repo(
     // reconcile).
     rag_rat_oplog::settle_pending_content_refold_for_stream_in_tx(&tx, stream)?;
     let outcome = drain_synced_stream_in_tx(&tx, repo_id, stream, now_ms)?;
+    // Stamp the watermark to the epoch AFTER the settle above (which may have advanced it), so the
+    // next `content_drain_needed` short-circuits until the projection changes again. In the same
+    // txn as the scan, so a rolled-back drain never records progress it did not make.
+    rag_rat_oplog::record_content_drained(&tx, stream)?;
     tx.commit()?;
     Ok(outcome)
 }
@@ -1707,6 +1722,66 @@ mod tests {
         assert_eq!(origin_of(&conn, "mem_peer"), "synced");
         assert!(memory_by_id(&conn, "mem_peer").unwrap().is_some(), "readable as a local row");
         assert_eq!(origin_of(&conn, &local_id), "local", "the local row is left untouched");
+    }
+
+    /// Advance a stream's projection epoch WITHOUT rewriting the projection — the way to simulate
+    /// "the projection changed" while keeping directly-seeded poison rows in place (a real
+    /// reproject would rebuild them away). Mutates the internal `oplog_meta` epoch key by hand
+    /// on purpose.
+    fn bump_projection_epoch(conn: &Connection, stream: StreamId) {
+        conn.execute(
+            "UPDATE oplog_meta SET value = CAST(value AS INTEGER) + 1 WHERE key = \
+             'content:proj-epoch:' || hex(?1)",
+            params![stream.to_bytes().as_slice()],
+        )
+        .unwrap();
+    }
+
+    /// The drain gate must SKIP its scan when the projection is unchanged since the last drain —
+    /// and the skip must be load-bearing, not luck. Poison the projection with a node the scan
+    /// WOULD materialize but WITHOUT advancing the epoch (a direct insert bypasses the
+    /// reproject that bumps it); a gated re-drain must not pick it up. Then advance the epoch
+    /// and confirm the SAME drain now does — proving the gate, not an empty projection, is what
+    /// suppressed the first pass.
+    #[test]
+    fn the_drain_gate_skips_an_unchanged_projection_then_runs_when_the_epoch_advances() {
+        let conn = scoped_conn();
+        // Mints the account + owner stream and reprojects the local seed (epoch -> 1).
+        create_concept(&conn, "seed");
+        let stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
+
+        // First drain records the watermark at the current epoch → nothing owed afterwards.
+        drain_synced_streams_for_all_repos(&conn, 1_000).unwrap();
+        assert!(
+            !rag_rat_oplog::content_drain_needed(&conn, stream).unwrap(),
+            "nothing is owed immediately after a drain",
+        );
+
+        // Poison: a projected node the scan WOULD materialize, inserted directly so the epoch does
+        // NOT move (a real peer op would reproject and bump it).
+        seed_projected_node(&conn, stream, "mem_poison", "Invariant", "p", "b", "active", &[]);
+
+        // Gated re-drain: the epoch equals the watermark and nothing is pending, so the gate skips
+        // the scan — the poison stays unseen.
+        let skipped = drain_synced_streams_for_all_repos(&conn, 2_000).unwrap();
+        assert_eq!(skipped, DrainOutcome::default(), "the gate skipped the scan");
+        assert!(
+            memory_by_id(&conn, "mem_poison").unwrap().is_none(),
+            "a gated skip does not materialize a projected row the scan would have",
+        );
+
+        // Advance the epoch as a real reproject would; the SAME drain now runs and materializes it.
+        bump_projection_epoch(&conn, stream);
+        assert!(
+            rag_rat_oplog::content_drain_needed(&conn, stream).unwrap(),
+            "an epoch past the watermark is owed",
+        );
+        let ran = drain_synced_streams_for_all_repos(&conn, 3_000).unwrap();
+        assert_eq!(ran.nodes_written, 1, "the drain runs once the epoch advances");
+        assert!(
+            memory_by_id(&conn, "mem_poison").unwrap().is_some(),
+            "and materializes the row the earlier gated pass skipped",
+        );
     }
 
     /// The public entry no-ops on an unstable repo id (legacy / local-only) — such an id can never

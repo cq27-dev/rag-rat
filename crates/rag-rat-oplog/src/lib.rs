@@ -126,6 +126,12 @@ pub use content_projection::{
     ProjectedContentEdge, ProjectedContentNode, list_projected_content_edges,
     list_projected_content_nodes,
 };
+// The drain-gate seam (#902): a per-stream projection epoch + last-drained watermark (both in
+// `oplog_meta`) so the memory drain skips its O(projection) scan when nothing changed since it
+// last ran — the store-global watcher pass would otherwise re-scan every stream every pass.
+pub use content_projection::{
+    content_drain_needed, content_projection_epoch, record_content_drained,
+};
 // The op-log's first crate-internal API surface (#524): the MINTING primitives + the op
 // vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
