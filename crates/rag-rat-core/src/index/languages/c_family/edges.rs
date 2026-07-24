@@ -34,10 +34,11 @@ pub(super) fn c_like_edges(
         },
         "call_expression" => {
             let function = node.child_by_field_name("function").unwrap_or(node);
-            let identifiers = identifiers_under(function, text);
-            // Parallel to `identifiers` so the callee `.last()` node matches the string pick (#67).
-            let identifier_nodes = identifier_nodes_under(function);
-            if let Some(name) = identifiers.last().cloned().or_else(|| call_target_name(node, text))
+            let identifiers = IdentifierPath::under(function, text);
+            if let Some(name) = identifiers
+                .last_text()
+                .map(ToOwned::to_owned)
+                .or_else(|| call_target_name(node, text))
             {
                 out.push(symbol_edge_with_context(
                     symbols,
@@ -47,13 +48,13 @@ pub(super) fn c_like_edges(
                     EdgeKind::CallsName,
                     EdgeConfidence::NameOnly,
                     EdgeContext {
-                        target_qualified_name: c_like_qualified_name(&identifiers),
+                        target_qualified_name: identifiers.qualified_name(),
                         receiver_hint: identifiers
-                            .first()
+                            .first_text()
                             .filter(|_| identifiers.len() > 1)
-                            .cloned(),
+                            .map(ToOwned::to_owned),
                     },
-                    identifier_nodes.last().copied().map(CalleeRange::of_node),
+                    identifiers.last_node().map(CalleeRange::of_node),
                 ));
             }
         },

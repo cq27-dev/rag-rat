@@ -27,12 +27,11 @@ pub(super) fn kotlin_edges(
             }
         },
         "call_expression" => {
-            let identifiers = identifiers_under(node, text);
-            // Parallel to `identifiers` (same node, same traversal order) so the callee `.last()`
-            // and receiver/constructor `.first()` nodes line up with the string picks (#67).
-            let identifier_nodes = identifier_nodes_under(node);
-            if let Some(name) =
-                identifiers.last().cloned().or_else(|| first_identifier_text(node, text))
+            let identifiers = IdentifierPath::under(node, text);
+            if let Some(name) = identifiers
+                .last_text()
+                .map(ToOwned::to_owned)
+                .or_else(|| first_identifier_text(node, text))
             {
                 out.push(symbol_edge_with_context(
                     symbols,
@@ -42,35 +41,38 @@ pub(super) fn kotlin_edges(
                     EdgeKind::CallsName,
                     EdgeConfidence::NameOnly,
                     EdgeContext {
-                        target_qualified_name: dotted_qualified_name(&identifiers),
+                        target_qualified_name: identifiers.qualified_name(),
                         receiver_hint: identifiers
-                            .first()
+                            .first_text()
                             .filter(|_| identifiers.len() > 1)
-                            .cloned(),
+                            .map(ToOwned::to_owned),
                     },
-                    identifier_nodes.last().copied().map(CalleeRange::of_node),
+                    identifiers.last_node().map(CalleeRange::of_node),
                 ));
             }
-            if let Some(receiver) = identifiers.first().filter(|_| identifiers.len() > 1).cloned() {
+            if let Some(receiver) =
+                identifiers.first_text().filter(|_| identifiers.len() > 1).map(ToOwned::to_owned)
+            {
                 out.push(symbol_edge(
                     symbols,
                     node,
                     receiver,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
-                    identifier_nodes
-                        .first()
-                        .filter(|_| identifier_nodes.len() > 1)
-                        .copied()
+                    identifiers
+                        .first_node()
+                        .filter(|_| identifiers.len() > 1)
                         .map(CalleeRange::of_node),
                 ));
             }
-            if let Some(constructor) =
-                identifiers.first().filter(|name| looks_like_type_name(name)).cloned()
+            if let Some(constructor) = identifiers
+                .first_text()
+                .filter(|name| looks_like_type_name(name))
+                .map(ToOwned::to_owned)
             {
                 // Both the type reference and the construct point at the constructor — the FIRST
                 // identifier (matching `identifiers.first()`).
-                let constructor_range = identifier_nodes.first().copied().map(CalleeRange::of_node);
+                let constructor_range = identifiers.first_node().map(CalleeRange::of_node);
                 out.push(symbol_edge(
                     symbols,
                     node,

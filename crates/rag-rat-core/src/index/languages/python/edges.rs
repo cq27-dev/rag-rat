@@ -86,14 +86,13 @@ pub(super) fn python_edges(
         // resolving it is the oracle's job, not the heuristic's).
         "call" => {
             let function = node.child_by_field_name("function").unwrap_or(node);
-            let identifiers = identifiers_under(function, text);
-            let identifier_nodes = identifier_nodes_under(function);
+            let identifiers = IdentifierPath::under(function, text);
             // `handlers[key]()` — the callee is the subscript RESULT, not the index variable
             // `last()` would pick. There's no clean callee identifier, so emit nothing (a wrong
             // `calls_name key` is worse than a missing edge).
             if function.kind() == "subscript" {
                 // fall through to recursion without emitting a call edge
-            } else if let Some(name) = identifiers.last().cloned() {
+            } else if let Some(name) = identifiers.last_text().map(ToOwned::to_owned) {
                 out.push(symbol_edge_with_context(
                     symbols,
                     node,
@@ -102,13 +101,13 @@ pub(super) fn python_edges(
                     EdgeKind::CallsName,
                     EdgeConfidence::NameOnly,
                     EdgeContext {
-                        target_qualified_name: dotted_qualified_name(&identifiers),
+                        target_qualified_name: identifiers.qualified_name(),
                         receiver_hint: identifiers
-                            .first()
+                            .first_text()
                             .filter(|_| identifiers.len() > 1)
-                            .cloned(),
+                            .map(ToOwned::to_owned),
                     },
-                    identifier_nodes.last().copied().map(CalleeRange::of_node),
+                    identifiers.last_node().map(CalleeRange::of_node),
                 ));
             }
         },
@@ -178,12 +177,14 @@ pub(super) fn python_edges(
         "decorator" => {
             if let Some(inner) = node.named_child(0)
                 && matches!(inner.kind(), "identifier" | "attribute")
-                && let Some(name) = last_identifier_text(inner, text)
             {
+                let identifiers = IdentifierPath::under(inner, text);
+                let Some(name) = identifiers.last_text().map(ToOwned::to_owned) else {
+                    return;
+                };
                 // Preserve the qualifier so a qualified decorator (`@pytest.fixture`) carries its
                 // `pytest` receiver + dotted path — same context the call arm records — so the
                 // resolver doesn't fall back to a bare local `fixture` of the same name.
-                let identifiers = identifiers_under(inner, text);
                 out.push(symbol_edge_with_context(
                     symbols,
                     node,
@@ -192,13 +193,13 @@ pub(super) fn python_edges(
                     EdgeKind::CallsName,
                     EdgeConfidence::NameOnly,
                     EdgeContext {
-                        target_qualified_name: dotted_qualified_name(&identifiers),
+                        target_qualified_name: identifiers.qualified_name(),
                         receiver_hint: identifiers
-                            .first()
+                            .first_text()
                             .filter(|_| identifiers.len() > 1)
-                            .cloned(),
+                            .map(ToOwned::to_owned),
                     },
-                    last_identifier_node(inner).map(final_segment_node).map(CalleeRange::of_node),
+                    identifiers.last_node().map(final_segment_node).map(CalleeRange::of_node),
                 ));
             }
         },
@@ -252,13 +253,13 @@ fn emit_python_type_refs(
         // for `User` resolves `User::Inner`, not bare `Inner` (#174 review). Without the
         // qualified name the rebind would have nothing to rewrite and resolution would fall
         // back to the ambiguous bare tail.
-        "attribute" | "dotted_name" =>
-            if let Some(name) = last_identifier_text(node, text) {
-                let identifiers = identifiers_under(node, text);
+        "attribute" | "dotted_name" => {
+            let identifiers = IdentifierPath::under(node, text);
+            if let Some(name) = identifiers.last_text().map(ToOwned::to_owned) {
                 let receiver = node
                     .child_by_field_name("object")
                     .map(|object| node_text(object, text))
-                    .or_else(|| identifiers.first().cloned());
+                    .or_else(|| identifiers.first_text().map(ToOwned::to_owned));
                 out.push(symbol_edge_with_context(
                     symbols,
                     node,
@@ -268,11 +269,12 @@ fn emit_python_type_refs(
                     EdgeConfidence::NameOnly,
                     EdgeContext {
                         receiver_hint: receiver,
-                        target_qualified_name: dotted_qualified_name(&identifiers),
+                        target_qualified_name: identifiers.qualified_name(),
                     },
-                    last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
+                    identifiers.last_node().map(final_segment_node).map(CalleeRange::of_node),
                 ));
-            },
+            }
+        },
         _ => {},
     }
 }

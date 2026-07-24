@@ -39,12 +39,6 @@ pub(crate) fn target_qualified_name(node: Node<'_>, text: &str) -> Option<String
     let value = strip_generics(&node_text(function, text));
     (value.contains("::") || value.contains('.')).then(|| value.replace('.', "::"))
 }
-pub(crate) fn dotted_qualified_name(identifiers: &[String]) -> Option<String> {
-    (identifiers.len() > 1).then(|| identifiers.join("::"))
-}
-pub(crate) fn c_like_qualified_name(identifiers: &[String]) -> Option<String> {
-    (identifiers.len() > 1).then(|| identifiers.join("::"))
-}
 /// The smallest-span symbol whose byte range covers `byte` (a call/reference site's owner). When
 /// that smallest is a `const`/`property`/`static` — a value binding whose initializer is where the
 /// call actually lives, so the enclosing definition is the better owner — the smallest-span
@@ -145,28 +139,109 @@ pub(crate) fn first_identifier_text(node: Node<'_>, text: &str) -> Option<String
 pub(crate) fn last_identifier_text(node: Node<'_>, text: &str) -> Option<String> {
     identifiers_under(node, text).into_iter().last()
 }
-pub(crate) fn identifiers_under(node: Node<'_>, text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_identifiers(node, text, &mut out);
-    out
+
+/// An identifier token captured together with the source text at that exact node.
+///
+/// Keeping both representations in one segment prevents callers from walking a subtree twice and
+/// relying on two parallel vectors to stay positionally aligned.
+pub(crate) struct IdentifierSegment<'tree> {
+    node: Node<'tree>,
+    text: String,
 }
-pub(crate) fn collect_identifiers(node: Node<'_>, text: &str, out: &mut Vec<String>) {
+
+/// The identifier tokens below one syntax node, in document order.
+pub(crate) struct IdentifierPath<'tree> {
+    segments: Vec<IdentifierSegment<'tree>>,
+}
+
+impl<'tree> IdentifierPath<'tree> {
+    pub(crate) fn under(node: Node<'tree>, text: &str) -> Self {
+        let mut segments = Vec::new();
+        collect_identifier_segments(node, text, &mut segments);
+        Self { segments }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub(crate) fn first_text(&self) -> Option<&str> {
+        self.segments.first().map(|segment| segment.text.as_str())
+    }
+
+    pub(crate) fn last_text(&self) -> Option<&str> {
+        self.segments.last().map(|segment| segment.text.as_str())
+    }
+
+    pub(crate) fn first_node(&self) -> Option<Node<'tree>> {
+        self.segments.first().map(|segment| segment.node)
+    }
+
+    pub(crate) fn last_node(&self) -> Option<Node<'tree>> {
+        self.segments.last().map(|segment| segment.node)
+    }
+
+    pub(crate) fn qualified_name(&self) -> Option<String> {
+        (self.segments.len() > 1).then(|| {
+            self.segments.iter().map(|segment| segment.text.as_str()).collect::<Vec<_>>().join("::")
+        })
+    }
+
+    fn into_texts(self) -> Vec<String> {
+        self.segments.into_iter().map(|segment| segment.text).collect()
+    }
+}
+
+fn collect_identifier_segments<'tree>(
+    node: Node<'tree>,
+    text: &str,
+    out: &mut Vec<IdentifierSegment<'tree>>,
+) {
     if is_identifier_kind(node.kind()) {
         if let Ok(value) = node.utf8_text(text.as_bytes())
             && !value.is_empty()
         {
-            out.push(value.to_string());
+            out.push(IdentifierSegment { node, text: value.to_string() });
         }
         return;
     }
-    // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep subtree
-    // (#543).
+    // grow_stack: full-subtree recursion; keep the same hostile-input guard as the legacy
+    // text-only and node-only collectors.
     rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            collect_identifiers(child, text, out);
+            collect_identifier_segments(child, text, out);
         }
     });
+}
+
+#[cfg(test)]
+mod identifier_path_tests {
+    use super::*;
+
+    #[test]
+    fn captures_text_and_nodes_in_one_ordered_path() {
+        let source = "client.api.run();";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let statement = tree.root_node().named_child(0).unwrap();
+        let call = statement.named_child(0).unwrap();
+        let callee = call.child_by_field_name("function").unwrap();
+
+        let path = IdentifierPath::under(callee, source);
+
+        assert_eq!(path.len(), 3);
+        assert_eq!(path.first_text(), Some("client"));
+        assert_eq!(path.last_text(), Some("run"));
+        assert_eq!(path.qualified_name().as_deref(), Some("client::api::run"));
+        let last = path.last_node().unwrap();
+        assert_eq!(&source[last.byte_range()], "run");
+    }
+}
+
+pub(crate) fn identifiers_under(node: Node<'_>, text: &str) -> Vec<String> {
+    IdentifierPath::under(node, text).into_texts()
 }
 /// Node-returning twin of [`first_identifier_text`]: the first identifier-kind node in document
 /// order, so its byte range can be recorded for the SCIP join (#67). Same traversal, so the node it
