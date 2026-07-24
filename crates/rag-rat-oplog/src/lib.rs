@@ -61,6 +61,7 @@ mod op;
 mod project;
 mod store;
 mod stream;
+mod table_sync;
 
 // C1's curated authority seam for the C2 `/3` content envelope and candidate DAG. The account
 // implementation stays private; only typed ingest results and snapshot-consistent point queries

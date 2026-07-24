@@ -24,7 +24,7 @@ pub use migrations::{
     apply_papertrail_distill_substrate, apply_papertrail_mirror_resume_state,
     apply_papertrail_provider_neutral_schema, apply_repo_id_core_scoping,
     apply_repo_id_periphery_scoping, apply_repos_registry, apply_scip_moniker_anchors,
-    apply_sync_origin_and_edge_tombstone,
+    apply_sync_origin_and_edge_tombstone, apply_table_sync_tables,
 };
 pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_exists};
 pub use purge::{RepoRowCounts, count_repo_rows, purge_repo_rows, repo_scoped_table_names};
@@ -47,7 +47,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 86;
+pub const LATEST_SCHEMA_VERSION: u32 = 87;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -643,6 +643,18 @@ const MIGRATION_086_DESCRIPTION: &str =
      (index_meta fts_source_revision/content_revision, clone_graph_generations.source_revision, \
      the clone-graph quiet candidate) that equals the frozen legacy digest so no one-time \
      FTS/clone rebuild fires. Replaces the O(N) main.files scan with an O(1) state read";
+
+const MIGRATION_087_ID: &str = "087_table_sync_bookkeeping";
+const MIGRATION_087_CHECKSUM: &str = "sha256:rag-rat-table-sync-bookkeeping-v87";
+const MIGRATION_087_DESCRIPTION: &str =
+    "Add the table→log sync engine's bookkeeping tables: sync_published_rows (post-apply \
+     synced-column hash that stops a remotely-applied row being re-signed and rebroadcast — the \
+     anti-echo record), sync_row_clocks (the per-row whole-row last-writer-wins clock an upsert \
+     or delete must beat to win the row), sync_row_tombstones (a per-row deletion clock so an \
+     out-of-order stale delete cannot win and an even older insert cannot resurrect), and \
+     table_sync_entries (the engine's own signed hash-chained entry log, separate from \
+     oplog_entries so the memory-content re-fold never sees a table op). All STRICT; no authored \
+     content — pure sync bookkeeping the fold and producer read";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1355,6 +1367,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_086_CHECKSUM,
         description: MIGRATION_086_DESCRIPTION,
         apply: MigrationFn::Plain(apply_content_digest_state),
+    },
+    Migration {
+        id: MIGRATION_087_ID,
+        checksum: MIGRATION_087_CHECKSUM,
+        description: MIGRATION_087_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_table_sync_tables),
     },
 ];
 

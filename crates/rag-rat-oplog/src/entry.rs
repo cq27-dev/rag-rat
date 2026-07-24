@@ -127,11 +127,11 @@ pub(super) fn sign_entry(
     }
 }
 
-/// Sign a body over ARBITRARY op bytes (not `op::encode` of a known op) — the storage layer's
-/// poison guard and its unknown-op retention path need entries whose `op_bytes` are undecodable or
-/// decode to `Unknown`, which the typed [`sign_entry`] can't produce. Test-only; the production
-/// wire is untouched.
-#[cfg(test)]
+/// Sign a body over ARBITRARY op bytes (not `op::encode` of a known [`MemoryOp`]). The table-sync
+/// engine ([`super::table_sync`]) signs its row ops through this — their bytes are a different op
+/// vocabulary the typed [`sign_entry`] can't produce — and the storage layer's tests use it to
+/// forge undecodable / unknown `op_bytes`. The entry layer treats `op_bytes` as opaque, so the wire
+/// is unchanged whether the payload is a memory op or a table op.
 pub(super) fn sign_entry_from_op_bytes(
     secret: &DeviceSecret,
     stream_id: StreamId,

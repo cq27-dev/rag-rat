@@ -1372,6 +1372,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_084_ID => Some(84),
             MIGRATION_085_ID => Some(85),
             MIGRATION_086_ID => Some(86),
+            MIGRATION_087_ID => Some(87),
             _ => None,
         })
         .max()
@@ -1467,6 +1468,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_084_ID
             | MIGRATION_085_ID
             | MIGRATION_086_ID
+            | MIGRATION_087_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1559,6 +1561,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_084_ID => migration.checksum != MIGRATION_084_CHECKSUM,
         MIGRATION_085_ID => migration.checksum != MIGRATION_085_CHECKSUM,
         MIGRATION_086_ID => migration.checksum != MIGRATION_086_CHECKSUM,
+        MIGRATION_087_ID => migration.checksum != MIGRATION_087_CHECKSUM,
         _ => false,
     }
 }
@@ -6000,6 +6003,75 @@ pub fn apply_content_digest_state(conn: &Connection) -> rusqlite::Result<()> {
         params![new_digest, legacy_digest],
     )?;
 
+    tx.commit()
+}
+
+/// V087 — the table→log sync engine's bookkeeping tables (transport-independent).
+///
+/// The engine replicates derived/metadata rows as self-describing typed-CBOR ops on a signed
+/// per-scope stream, folded by WHOLE-ROW last-writer-wins. The side tables carry the state the fold
+/// and producer need; none holds authored content (that lives in the replicated tables themselves)
+/// — these are pure sync bookkeeping.
+///
+/// - `sync_published_rows` is the anti-echo record: the post-apply hash of a row's SYNCED columns.
+///   The producer skips a row whose current synced-hash already matches, so a remotely-applied row
+///   is never re-signed and rebroadcast (the echo-republish loop). Local re-resolution churn must
+///   never enter this hash, so it covers synced columns only.
+/// - `sync_row_tombstones` is the per-row deletion clock: a `Remove` records `(lamport,
+///   device_fingerprint)`, and a later `Upsert` older than it is suppressed (never resurrects a
+///   deleted row) while a newer one overrides it. Without it, out-of-order delivery would let a
+///   stale delete win and an even older insert resurrect.
+/// - `sync_row_clocks` is the per-row latest-write clock — the whole-row LWW authority. An `Upsert`
+///   wins the entire row, and a `Remove` deletes it, only when it beats this clock; the winner then
+///   raises it. So convergence and delete/insert ordering hold regardless of arrival order.
+/// - `table_sync_entries` is the engine's OWN signed hash-chained entry log — deliberately separate
+///   from `oplog_entries`, whose upgrade re-fold (`reproject_all_streams`) decodes every stored
+///   stream as a memory-content op and would choke on a table op. One chain per `(stream_id,
+///   device_fingerprint)`, `lamport` strictly increasing.
+///
+/// All STRICT; `CREATE TABLE IF NOT EXISTS` so the migration is idempotent; one IMMEDIATE txn.
+pub fn apply_table_sync_tables(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS table_sync_entries(
+             entry_hash         BLOB    NOT NULL PRIMARY KEY,
+             stream_id          BLOB    NOT NULL,
+             device_fingerprint BLOB    NOT NULL,
+             lamport            INTEGER NOT NULL,
+             prev_hash          BLOB,
+             signed_bytes       BLOB    NOT NULL,
+             received_at_ms     INTEGER NOT NULL,
+             UNIQUE(stream_id, device_fingerprint, lamport)
+         ) STRICT;
+         -- Read the stream's Lamport tip (`MAX(lamport) WHERE stream_id = ?`, on every author and
+         -- accept) from an index tail instead of scanning the stream; the UNIQUE index above leads
+         -- with device_fingerprint, so it cannot answer a per-stream MAX.
+         CREATE INDEX IF NOT EXISTS table_sync_entries_stream_lamport
+             ON table_sync_entries(stream_id, lamport);
+         CREATE TABLE IF NOT EXISTS sync_published_rows(
+             repo_id     TEXT NOT NULL,
+             table_name  TEXT NOT NULL,
+             row_pk      TEXT NOT NULL,
+             synced_hash TEXT NOT NULL,
+             PRIMARY KEY(repo_id, table_name, row_pk)
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS sync_row_tombstones(
+             repo_id            TEXT    NOT NULL,
+             table_name         TEXT    NOT NULL,
+             row_pk             TEXT    NOT NULL,
+             lamport            INTEGER NOT NULL,
+             device_fingerprint TEXT    NOT NULL,
+             PRIMARY KEY(repo_id, table_name, row_pk)
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS sync_row_clocks(
+             repo_id            TEXT    NOT NULL,
+             table_name         TEXT    NOT NULL,
+             row_pk             TEXT    NOT NULL,
+             lamport            INTEGER NOT NULL,
+             device_fingerprint TEXT    NOT NULL,
+             PRIMARY KEY(repo_id, table_name, row_pk)
+         ) STRICT;",
+    )?;
     tx.commit()
 }
 

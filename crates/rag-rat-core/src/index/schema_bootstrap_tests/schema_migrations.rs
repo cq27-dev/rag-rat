@@ -3850,7 +3850,7 @@ fn migration_084_links_chunks_to_symbols() {
 
 /// V085 adds sync provenance (`origin`) to the read tables + edge tombstones (`present`) to the
 /// content-edge projection. The absolute schema-tip pin lives on the newest migration's test
-/// (V086, `content_digest_state_is_the_tip_with_live_fold_triggers`).
+/// (V087, `migration_087_is_the_tip_and_adds_table_sync_tables`).
 #[test]
 fn migration_085_adds_origin_and_edge_present() {
     // Bare pre-V085 tables (no origin / present), each with a pre-existing row, so the migration is
@@ -3925,4 +3925,61 @@ fn migration_085_adds_origin_and_edge_present() {
         )
         .unwrap();
     assert_eq!(recorded, 1, "the forward migration records V085");
+}
+
+/// V087 adds the table→log sync engine's bookkeeping tables, and is the schema tip.
+#[test]
+fn migration_087_is_the_tip_and_adds_table_sync_tables() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 87, "move this pin with the next schema migration");
+
+    let added =
+        ["table_sync_entries", "sync_published_rows", "sync_row_tombstones", "sync_row_clocks"];
+
+    // Absence asserted against the migration's OWN precondition (a bare connection), not the full
+    // ladder's end state — a fresh in-memory DB has none of these tables before the applier runs.
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    for t in added {
+        assert!(!schema::table_exists(&bare, t).unwrap(), "pre-V087 has no {t}");
+    }
+
+    schema::apply_table_sync_tables(&bare).unwrap();
+
+    for t in added {
+        assert!(schema::table_exists(&bare, t).unwrap(), "V087 adds {t}");
+    }
+    // The applier is idempotent (CREATE TABLE IF NOT EXISTS) — a second run is a no-op, not an
+    // error.
+    schema::apply_table_sync_tables(&bare).unwrap();
+    // The whole-row LWW clock is keyed per row; a duplicate row key collides on the composite PK.
+    bare.execute(
+        "INSERT INTO sync_row_clocks(repo_id, table_name, row_pk, lamport, device_fingerprint) \
+         VALUES ('r', 't', 'pk', 1, 'dev')",
+        [],
+    )
+    .unwrap();
+    assert!(
+        bare.execute(
+            "INSERT INTO sync_row_clocks(repo_id, table_name, row_pk, lamport, \
+             device_fingerprint) VALUES ('r', 't', 'pk', 2, 'dev')",
+            [],
+        )
+        .is_err(),
+        "the row write clock has one row per (repo, table, row_pk)",
+    );
+
+    // The full ladder ends with the tables present and records V087.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    for t in added {
+        assert!(schema::table_exists(&conn, t).unwrap(), "the full ladder ends with {t}");
+    }
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '087_table_sync_bookkeeping'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V087");
 }

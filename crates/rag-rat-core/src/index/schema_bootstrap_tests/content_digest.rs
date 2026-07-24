@@ -72,11 +72,11 @@ const FOLD_TRIGGERS: [&str; 3] =
 
 // ---- schema tip + trigger contract ----
 
-/// The absolute schema-tip pin lives on the newest migration's test (moved here from V085). V086
-/// creates `content_digest_state` (seeded empty on a fresh ladder) and the three fold triggers.
+/// V086 creates `content_digest_state` (seeded empty on a fresh ladder) and the three fold
+/// triggers. The absolute schema-tip pin has moved forward to the newest migration's test
+/// (V087, `migration_087_is_the_tip_and_adds_table_sync_tables`).
 #[test]
-fn content_digest_state_is_the_tip_with_live_fold_triggers() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 86, "move this pin with the next schema migration");
+fn content_digest_state_has_live_fold_triggers() {
     let conn = apply_schema();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 
