@@ -639,7 +639,11 @@ mod tests {
     async fn blocking_tool_work_reports_panics_as_mcp_errors() {
         let err = blocking::run_blocking_tool(
             "panic_test_tool".to_string(),
-            Duration::from_secs(1),
+            // Generous budget: the tool panics immediately, but a 1 s timeout races cold
+            // Windows-CI worker-pool startup (measured >1 s), turning the expected
+            // panic error into a spurious timeout error. This test exercises panic
+            // REPORTING, not the timeout.
+            Duration::from_secs(30),
             ToolTimeoutPolicy::ReturnTimeout,
             test_tool_workers(1),
             || panic!("intentional panic from blocking tool"),

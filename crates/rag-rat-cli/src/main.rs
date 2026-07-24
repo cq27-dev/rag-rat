@@ -690,7 +690,12 @@ mod tests {
         let config = discover_target_config_optional(&root)
             .unwrap()
             .expect("the existing target checkout's governing config should load");
-        assert_eq!(config.database, root.join("custom/index.sqlite"));
+        // Config::load resolves the relative `database` against the CANONICALIZED config dir
+        // (normalize_existing_dir → fs::canonicalize): /var→/private/var on macOS, \\?\ + long name
+        // on Windows. Canonicalize the base and join components so the expectation matches
+        // natively.
+        let root = root.canonicalize().unwrap();
+        assert_eq!(config.database, root.join("custom").join("index.sqlite"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

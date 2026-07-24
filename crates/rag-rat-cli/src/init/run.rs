@@ -666,12 +666,15 @@ mod default_plan_tests {
         std::fs::create_dir_all(root.path().join("src")).unwrap();
         let db_path = root.path().join("index.sqlite");
         let config_path = root.path().join("rag-rat.toml");
+        // A Windows path (C:\...) in a TOML BASIC (double-quoted) string parses its backslashes as
+        // escape sequences (\U, \r, …) → a load error. Forward slashes are valid TOML and stay
+        // absolute on Windows, so `database` resolves to the same path.
+        let db_literal = db_path.display().to_string().replace('\\', "/");
         std::fs::write(
             &config_path,
             format!(
                 "[index]\nroot = \".\"\nrepo_id = \"rm-victim\"\ndatabase = \
-                 \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
-                db_path.display()
+                 \"{db_literal}\"\n[target_bindings]\nrust = [\"src\"]\n",
             ),
         )
         .unwrap();

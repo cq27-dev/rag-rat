@@ -32,7 +32,7 @@ pub(crate) fn policy_fromtext_calls() -> usize {
 /// stale-but-matching stamp would let the fast path serve mixed-code counts). A version mismatch
 /// instead correctly forces the slow recompute. See the freshness-model Risk memory bound to this
 /// file.
-pub(crate) const EMBEDDING_POLICY_VERSION: &str = "c426172dd063e4c0";
+pub(crate) const EMBEDDING_POLICY_VERSION: &str = "cc6a08883bce0a23";
 
 /// `repo_meta` keys carrying the embedding-policy freshness stamp a full rebuild writes
 /// (`mark_embedding_policy_current`). PER-REPO, not the DB-global `index_meta`: one database can
@@ -121,7 +121,12 @@ pub(crate) fn cheap_skip_policy(
     trimmed: &str,
     max_embedding_chars: usize,
 ) -> Option<EmbeddingPolicyDecision> {
-    let path_text = path.to_string_lossy();
+    // Use the SAME normalization the stored `files.path` uses (`paths::path_string`), so this
+    // index-time stamp classifies generated/fixture paths byte-identically to the reconcile
+    // recompute — which reads `files.path`. The raw `relative_path` is OS-native (`\` on Windows),
+    // so without this the stamp disagrees with the recompute there; going through `path_string`
+    // keeps it in lockstep with storage on every platform.
+    let path_text = rag_rat_base::paths::path_string(path);
     if trimmed.chars().count() > max_embedding_chars.saturating_mul(4)
         && (file_kind == "generated" || chunk_kind == "generated" || symbol_path.is_none())
     {
@@ -171,7 +176,9 @@ pub(crate) fn embedding_policy_for_chunk(
     if low_signal.is_low_signal(language, chunk_kind, symbol_path, trimmed) {
         return policy("SkipLowSignal", 9, false);
     }
-    let path_text = path.to_string_lossy();
+    // Normalize via `paths::path_string` as `cheap_skip_policy` does, so `embedding_priority`'s
+    // path heuristics see the same form the stored `files.path` uses on every platform.
+    let path_text = rag_rat_base::paths::path_string(path);
     policy("Embed", embedding_priority(&path_text, language, chunk_kind, symbol_path), true)
 }
 
@@ -612,6 +619,31 @@ mod policy_version_tests {
             (
                 "test_fixture_path",
                 "pkg/fixtures/a.rs",
+                "rust",
+                "source",
+                "code",
+                Some("s"),
+                "fn a() { let value = compute(); process(value); }",
+                4000,
+            ),
+            // Backslash paths (Windows `relative_path`): these classify as SkipGenerated /
+            // SkipTestFixture ONLY because the policy `/`-normalizes via `paths::path_string` — so
+            // they pin that normalization AND bump the version, which forces existing Windows
+            // indexes (stamped before the normalization) to re-stamp their
+            // `chunks.embedding_policy`.
+            (
+                "backslash_generated_path",
+                "pkg\\target\\a.rs",
+                "rust",
+                "source",
+                "code",
+                Some("s"),
+                "fn a() { let value = compute(); process(value); }",
+                4000,
+            ),
+            (
+                "backslash_test_fixture_path",
+                "pkg\\fixtures\\a.rs",
                 "rust",
                 "source",
                 "code",

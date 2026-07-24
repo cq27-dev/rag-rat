@@ -425,11 +425,18 @@ mod tests {
         git(&main, &["worktree", "add", linked_b.to_str().unwrap(), "-b", "linked-b"]);
 
         let worktrees = worktree_dirs_for(&linked_a).unwrap();
-        let dirs = worktrees.dirs;
         assert!(worktrees.warnings.is_empty());
-        assert!(dirs.contains(&main));
-        assert!(dirs.contains(&linked_a));
-        assert!(dirs.contains(&linked_b));
+        // gix returns canonical worktree paths; the raw temp paths do not match on macOS (TempDir
+        // under /var → /private/var symlink) or Windows (canonicalize adds a \\?\-verbatim
+        // long-name form, and the temp dir uses an 8.3 short name). Canonicalize BOTH sides
+        // — the worktrees exist — so the compare is separator/prefix/symlink agnostic (and
+        // the set dedups too).
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+        let dirs: std::collections::BTreeSet<std::path::PathBuf> =
+            worktrees.dirs.iter().map(|p| canon(p)).collect();
+        assert!(dirs.contains(&canon(&main)));
+        assert!(dirs.contains(&canon(&linked_a)));
+        assert!(dirs.contains(&canon(&linked_b)));
         assert_eq!(dirs.len(), 3, "overlapping root/current/proxy paths are deduplicated");
     }
 

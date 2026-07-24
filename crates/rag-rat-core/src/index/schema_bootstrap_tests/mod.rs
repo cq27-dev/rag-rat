@@ -95,6 +95,10 @@ fn rag_rat_config(root: &Path) -> Config {
 fn git_history_test_config(root: &Path) -> Config {
     fs::create_dir_all(root.join("docs")).unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
+    // Keep the live index out of the tree: a later `git add .` in this test would otherwise commit
+    // .rag-rat/index.sqlite, and the checkout/squash round-trip then removes/restores (and under
+    // Windows autocrlf can corrupt) that committed db, failing the subsequent index open.
+    fs::write(root.join(".gitignore"), ".rag-rat/\n").unwrap();
     run_git(root, &["init"]);
     run_git(root, &["config", "user.name", "Rag Rat"]);
     run_git(root, &["config", "user.email", "rag@example.com"]);
@@ -543,8 +547,23 @@ fn first_chunk_id(db: &IndexDatabase) -> i64 {
         .unwrap()
 }
 
+/// A `git` invocation with line-ending conversion forced OFF for this child process only. GitHub's
+/// windows-latest runner sets `core.autocrlf=true` globally, which rewrites the LF fixtures these
+/// tests write+index as CRLF on checkout — changing file bytes and thus the content sha256, which
+/// defeats the HEAD-move carry (#502) sha match and corrupts the committed index db. `GIT_CONFIG_*`
+/// overrides global config without touching the user's config.
+fn git_command(root: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.autocrlf")
+        .env("GIT_CONFIG_VALUE_0", "false");
+    cmd
+}
+
 fn run_git(root: &Path, args: &[&str]) {
-    let output = Command::new("git").args(args).current_dir(root).output().unwrap();
+    let output = git_command(root, args).output().unwrap();
     assert!(
         output.status.success(),
         "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
@@ -555,17 +574,12 @@ fn run_git(root: &Path, args: &[&str]) {
 }
 
 fn run_git_with_env(root: &Path, args: &[&str], env: &[(&str, &str)]) {
-    let output = Command::new("git")
-        .args(args)
-        .envs(env.iter().copied())
-        .current_dir(root)
-        .output()
-        .unwrap();
+    let output = git_command(root, args).envs(env.iter().copied()).output().unwrap();
     assert!(output.status.success(), "git {:?} failed", args);
 }
 
 fn git_output(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git").args(args).current_dir(root).output().unwrap();
+    let output = git_command(root, args).output().unwrap();
     assert!(output.status.success(), "git {:?} failed", args);
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }

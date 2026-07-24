@@ -4248,7 +4248,7 @@ mod tests {
         // a deep chain must fold to a classification, never recurse to a stack overflow.
         // Delivered DEEPEST-FIRST (the crash-inducing order) and folded on a SMALL stack,
         // so a recursive regression would abort loudly here.
-        const N: u32 = 800;
+        const N: u32 = 2500;
         let founder = Dev::seeded(0);
         let mut f = Fixture::genesis(&founder);
         let genesis_hash = f.genesis_hash;
@@ -4262,10 +4262,15 @@ mod tests {
         let mut entries = f.entries.clone();
         entries.reverse(); // deepest-first — memoization can't keep the recursion shallow
 
-        // A 64 KiB stack fits the iterative fold's constant call depth but would overflow an
-        // N-deep recursion many times over.
+        // A 256 KiB stack comfortably fits the iterative fold's constant call depth (a few frames)
+        // yet is overflowed several times over by an N-deep recursion (2500 frames). 64 KiB was too
+        // small for Windows, whose per-thread overhead and wider (shadow-space) frames need more
+        // headroom to run even the iterative fold — so the stack is sized above that floor, and N
+        // keeps the recursion-vs-iterative margin (a regression aborts here) while staying under
+        // the 60 s slow-test budget (the fold is O(N²): deepest-first delivery defeats
+        // memoization).
         let effective = std::thread::Builder::new()
-            .stack_size(64 * 1024)
+            .stack_size(256 * 1024)
             .spawn(move || fold_account(&entries).is_effective(&genesis_hash))
             .unwrap()
             .join()
