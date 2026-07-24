@@ -726,6 +726,10 @@ struct FoldState {
     /// SOURCE (not just presence) so condemning a superseded / duplicate add for a device does not
     /// erase the enrollment a DIFFERENT, still-valid add contributed.
     roster: HashMap<DeviceFingerprint, [u8; 32]>,
+    /// Immutable role granted by the effective enrollment entry. `OwnerPromote` is deliberately
+    /// limited to authoring-capable enrollments: otherwise a later promotion could retroactively
+    /// re-bless content a read-only device authored before it had write authority.
+    enrollment_roles: HashMap<DeviceFingerprint, DeviceRole>,
     /// Each device holding an OPEN owner incarnation → that incarnation's `owner_id`. Keyed by
     /// incarnation (not just device) so a stale `OwnerDemote` naming a since-superseded `owner_id`
     /// cannot close a device's freshly-reopened incarnation.
@@ -1473,6 +1477,7 @@ fn fold_account_pass(
                             && state.roster.get(&c.subject_device()) == Some(&c.hash())
                         {
                             state.roster.remove(&c.subject_device());
+                            state.enrollment_roles.remove(&c.subject_device());
                         }
                     }
                 },
@@ -2144,7 +2149,11 @@ fn classify_effect(
             let enrolled = state.roster.contains_key(device_fingerprint);
             let already_owner = state.owners.contains_key(device_fingerprint);
             let tombstoned = state.tombstoned.contains(device_fingerprint);
-            if enrolled && !already_owner && !tombstoned {
+            let authoring_role = state
+                .enrollment_roles
+                .get(device_fingerprint)
+                .is_some_and(|role| role.can_author_content());
+            if enrolled && authoring_role && !already_owner && !tombstoned {
                 effective(state)
             } else {
                 Outcome::Rejected(RejectReason::BadPromote)
@@ -2231,11 +2240,13 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
         AccountOp::AccountGenesis { .. } => {
             state.genesis_seen = true;
             state.roster.insert(c.subject_device(), c.hash());
+            state.enrollment_roles.insert(c.subject_device(), DeviceRole::Owner);
             state.owners.insert(c.subject_device(), c.hash());
             state.live.insert(c.hash());
         },
         AccountOp::DeviceAdd { device_fingerprint, role, .. } => {
             state.roster.insert(*device_fingerprint, c.hash());
+            state.enrollment_roles.insert(*device_fingerprint, *role);
             if *role == DeviceRole::Owner {
                 state.owners.insert(*device_fingerprint, c.hash());
                 state.live.insert(c.hash());
@@ -2265,6 +2276,7 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
         // roster/owner sets. The register it installed handles condemning its beyond-cut entries.
         AccountOp::DeviceRemove { device_fingerprint, .. } => {
             state.roster.remove(device_fingerprint);
+            state.enrollment_roles.remove(device_fingerprint);
             state.owners.remove(device_fingerprint);
             state.tombstoned.insert(*device_fingerprint);
         },
@@ -3924,6 +3936,33 @@ mod tests {
         assert_eq!(
             h.roster_ref_effective(add, member.fp),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
+        );
+    }
+
+    #[test]
+    fn a_read_only_enrollment_cannot_be_promoted_and_re_bless_prior_content() {
+        let founder = Dev::new(1);
+        let read_only = Dev::new(2);
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let mut f = Fixture::genesis(&founder);
+        let add =
+            f.author(&founder, Some(f.genesis_hash), &device_add(&read_only, DeviceRole::ReadOnly));
+        let promote = f.author(&founder, Some(f.genesis_hash), &owner_promote(&read_only));
+
+        let h = f.fold();
+        assert_eq!(
+            h.outcome(&promote),
+            Some(Outcome::Rejected(RejectReason::BadPromote)),
+            "promotion cannot turn a read-only enrollment into retroactive write authority",
+        );
+        assert_eq!(
+            h.roster_content_authority(add, read_only.fp, stream),
+            AuthorityQuery::Effective(RosterContentAuthority {
+                device_fingerprint: read_only.fp,
+                role: DeviceRole::ReadOnly,
+                boundary: AuthorityBoundary::Open,
+            }),
+            "the cited roster fact remains read-only after the rejected promotion",
         );
     }
 
