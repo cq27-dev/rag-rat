@@ -277,6 +277,10 @@ pub enum AuthorityBoundary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RosterContentAuthority {
     pub device_fingerprint: DeviceFingerprint,
+    /// The device's roster role, carried so the content gate can reject a device that is on the
+    /// roster but not permitted to author content (a `ReadOnly` device). Without this the gate
+    /// would see only membership + boundary and admit a read-only device's content.
+    pub role: DeviceRole,
     pub boundary: AuthorityBoundary,
 }
 
@@ -461,6 +465,7 @@ impl AccountAuthHistory {
         });
         AuthorityQuery::Effective(RosterContentAuthority {
             device_fingerprint: fact.authority.device_fingerprint,
+            role: fact.authority.current_role,
             boundary,
         })
     }

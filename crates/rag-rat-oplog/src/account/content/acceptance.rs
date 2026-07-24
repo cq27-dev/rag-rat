@@ -107,6 +107,9 @@ pub enum ContentRejectReason {
     GrantRequired,
     UnexpectedGrant,
     GrantDoesNotPermitWrite,
+    /// The signing device is on the roster but its role forbids authoring content (a `ReadOnly`
+    /// device). The fold-level backstop for the read-only capability.
+    RoleForbidsAuthoring,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +153,8 @@ impl ContentAcceptance {
             Self::Rejected(ContentRejectReason::UnexpectedGrant) => "rejected{unexpected_grant}",
             Self::Rejected(ContentRejectReason::GrantDoesNotPermitWrite) =>
                 "rejected{grant_not_writer}",
+            Self::Rejected(ContentRejectReason::RoleForbidsAuthoring) =>
+                "rejected{role_forbids_authoring}",
         }
     }
 }
@@ -272,6 +277,16 @@ where
         AuthorityQuery::Effective(_) =>
             return rejected(ContentRejectReason::RosterReferenceInvalid),
     };
+    // A device whose roster role forbids content authoring (a `ReadOnly` device) is rejected here,
+    // before the owner/grant coupling — read-only grants read access, never write, and this holds
+    // on BOTH paths (the owner account's own stream and a grantee stream). The fold is the ONLY
+    // enforcement point today: an entry from any source (local author or a synced push) that
+    // reaches the fold fails closed here. A wire-level gate that refuses a read-only peer's
+    // pushes BEFORE they are stored as candidates is a later slice; until it lands such content
+    // is still ingested and quota-charged, then rejected here — never accepted.
+    if !roster.authority.role.can_author_content() {
+        return rejected(ContentRejectReason::RoleForbidsAuthoring);
+    }
     let mut boundaries = vec![roster.authority.boundary];
 
     if !is_owner {
@@ -386,7 +401,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::{DeviceCut, GrantAuthority};
+    use crate::account::{DeviceCut, DeviceRole, GrantAuthority};
     use crate::op::DeviceFingerprint;
 
     const ENTRY_HASH: EntryHash = [9; 32];
@@ -432,6 +447,7 @@ mod tests {
             stream_id: header.stream_id,
             authority: RosterContentAuthority {
                 device_fingerprint: header.device_fingerprint,
+                role: DeviceRole::Member,
                 boundary,
             },
         })
@@ -525,6 +541,40 @@ mod tests {
                 AncestryRelation::OnBranch
             ),
             ContentAcceptance::Rejected(ContentRejectReason::GrantDoesNotPermitWrite)
+        );
+    }
+
+    #[test]
+    fn a_read_only_roster_role_forbids_content_on_both_paths() {
+        // The role gate runs before the owner/grant coupling, so a ReadOnly device is rejected
+        // whether it authors on its own account's stream OR as a would-be grantee — even with an
+        // otherwise-valid writer grant. This is the fold backstop for the read-only capability.
+        let read_only = |header: &ContentEntryHeader| {
+            AuthorityQuery::Effective(CitedRosterAuthority {
+                account_id: header.author_account_id,
+                roster_ref: header.roster_ref,
+                stream_id: header.stream_id,
+                authority: RosterContentAuthority {
+                    device_fingerprint: header.device_fingerprint,
+                    role: DeviceRole::ReadOnly,
+                    boundary: AuthorityBoundary::Open,
+                },
+            })
+        };
+        let owner_hdr = header(owner(), None, 0);
+        assert_eq!(
+            evaluate(&owner_hdr, read_only(&owner_hdr), None, AncestryRelation::OnBranch),
+            ContentAcceptance::Rejected(ContentRejectReason::RoleForbidsAuthoring),
+        );
+        let contributor = header(author(), Some([7; 32]), 0);
+        assert_eq!(
+            evaluate(
+                &contributor,
+                read_only(&contributor),
+                Some(grant(&contributor, GrantRole::Writer, GrantDeviceBoundary::Open)),
+                AncestryRelation::OnBranch,
+            ),
+            ContentAcceptance::Rejected(ContentRejectReason::RoleForbidsAuthoring),
         );
     }
 
@@ -1172,6 +1222,7 @@ mod tests {
             CitedRosterAuthority {
                 authority: RosterContentAuthority {
                     device_fingerprint: DeviceFingerprint::from_bytes([0xa4; 32]),
+                    role: DeviceRole::Member,
                     boundary: AuthorityBoundary::Open,
                 },
                 ..valid_roster

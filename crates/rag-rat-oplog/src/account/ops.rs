@@ -46,16 +46,28 @@ pub(super) mod entry_type {
 }
 
 /// A device's role in an account roster (§9). Owner holds all control/secrets ops; a member authors
-/// content on granted streams only.
+/// content on granted streams only; a read-only device syncs and reads but authors NO content — its
+/// authored content folds rejected (`RoleForbidsAuthoring`), and it never holds a live owner
+/// incarnation so it cannot author control ops either. Read-only is the default an enrolling owner
+/// grants (least privilege). Roles are exact-matched, never ordered — the wire/DB tags carry no
+/// rank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceRole {
+    ReadOnly,
     Member,
     Owner,
 }
 
 impl DeviceRole {
+    /// Whether this role may author content (a member on a granted stream, or an owner directly). A
+    /// read-only device may not — this is the single predicate the content-authority gate consults.
+    pub(in crate::account) fn can_author_content(self) -> bool {
+        matches!(self, DeviceRole::Member | DeviceRole::Owner)
+    }
+
     pub(super) fn as_db_str(self) -> &'static str {
         match self {
+            DeviceRole::ReadOnly => "read_only",
             DeviceRole::Member => "member",
             DeviceRole::Owner => "owner",
         }
@@ -63,16 +75,25 @@ impl DeviceRole {
 
     pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
         match value {
+            "read_only" => Ok(DeviceRole::ReadOnly),
             "member" => Ok(DeviceRole::Member),
             "owner" => Ok(DeviceRole::Owner),
             other => anyhow::bail!("unknown persisted device role `{other}`"),
         }
     }
 
+    // The DeviceAdd payload carries the role as this u8 tag — a frozen wire constant. Tags 1/2 are
+    // unchanged; ReadOnly took the next free tag 3. Adding a role variant is a de-facto protocol
+    // addition, not backward-compatible: a peer built before this change decodes tag 3 as an error
+    // (`from_u8`), so it REFUSES to ingest a role-3 DeviceAdd (fail-closed — never a silent decode
+    // as Member/Owner). Enrolling a ReadOnly device therefore makes that account's control log
+    // unsyncable to a pre-change peer. Accepted pre-GA (all peers upgrade together); a new role
+    // must take a fresh tag and never renumber 1/2/3.
     pub(in crate::account) fn as_u8(self) -> u8 {
         match self {
             DeviceRole::Member => 1,
             DeviceRole::Owner => 2,
+            DeviceRole::ReadOnly => 3,
         }
     }
 
@@ -80,6 +101,7 @@ impl DeviceRole {
         match value {
             1 => Ok(DeviceRole::Member),
             2 => Ok(DeviceRole::Owner),
+            3 => Ok(DeviceRole::ReadOnly),
             other => Err(CborError::message(format!("unknown device role {other}"))),
         }
     }
@@ -890,7 +912,11 @@ mod tests {
 
     #[test]
     fn persisted_role_tokens_round_trip_and_reject_unknown_values() {
-        for (role, token) in [(DeviceRole::Member, "member"), (DeviceRole::Owner, "owner")] {
+        for (role, token) in [
+            (DeviceRole::ReadOnly, "read_only"),
+            (DeviceRole::Member, "member"),
+            (DeviceRole::Owner, "owner"),
+        ] {
             assert_eq!(role.as_db_str(), token);
             assert_eq!(DeviceRole::from_db_str(token).unwrap(), role);
         }
@@ -901,6 +927,26 @@ mod tests {
             assert_eq!(GrantRole::from_db_str(token).unwrap(), role);
         }
         assert!(GrantRole::from_db_str("owner").is_err());
+    }
+
+    #[test]
+    fn device_role_wire_tags_round_trip_and_reject_unknown_values() {
+        // The DeviceAdd payload carries the role as a u8; tags are frozen wire constants.
+        for (role, tag) in
+            [(DeviceRole::Member, 1u8), (DeviceRole::Owner, 2), (DeviceRole::ReadOnly, 3)]
+        {
+            assert_eq!(role.as_u8(), tag);
+            assert_eq!(DeviceRole::from_u8(tag).unwrap(), role);
+        }
+        assert!(DeviceRole::from_u8(0).is_err());
+        assert!(DeviceRole::from_u8(4).is_err());
+    }
+
+    #[test]
+    fn only_member_and_owner_may_author_content() {
+        assert!(DeviceRole::Member.can_author_content());
+        assert!(DeviceRole::Owner.can_author_content());
+        assert!(!DeviceRole::ReadOnly.can_author_content());
     }
 
     #[test]
@@ -999,7 +1045,7 @@ mod tests {
 
     #[test]
     fn closed_tokens_reject_unknown_values() {
-        // role 3, grant_role 9, chain_kind 5 are all rejected.
+        // role 4 (past ReadOnly=3), grant_role 9, chain_kind 5 are all rejected.
         let mut buf = Vec::new();
         {
             let mut enc = Encoder::new(&mut buf);
@@ -1016,10 +1062,10 @@ mod tests {
             enc.bytes(&founder_fp().to_bytes()).unwrap();
             enc.bytes(&ed25519()).unwrap();
             enc.bytes(&x25519()).unwrap();
-            enc.u8(3).unwrap();
+            enc.u8(4).unwrap();
             enc.null().unwrap();
         }
-        assert!(decode(entry_type::DEVICE_ADD, &bad_role).is_err(), "role 3 is rejected");
+        assert!(decode(entry_type::DEVICE_ADD, &bad_role).is_err(), "role 4 is rejected");
     }
 
     #[test]

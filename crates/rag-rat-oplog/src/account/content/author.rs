@@ -1539,6 +1539,79 @@ mod tests {
     }
 
     #[test]
+    fn author_device_add_in_tx_enrolls_a_joiner_at_the_chosen_role() {
+        use crate::account::{DeviceRole, EnrollingDevice, author_device_add_in_tx};
+        use crate::device::{DeviceSecret, DeviceX25519Secret};
+
+        for (seed, role, token) in [
+            (0x60u8, DeviceRole::ReadOnly, "read_only"),
+            (0x61, DeviceRole::Member, "member"),
+            (0x62, DeviceRole::Owner, "owner"),
+        ] {
+            let conn = db();
+            // Mints the store's local account; the founder (local device) is the enrolling owner.
+            owned_v2(&conn);
+            let joiner = DeviceSecret::from_seed(&[seed; 32]);
+            let joiner_x = DeviceX25519Secret::from_seed(&[seed.wrapping_add(0x80); 32]);
+            let joiner_fp = joiner.public().fingerprint();
+
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            // Returns Ok only if the joiner folded roster-effective — the seam verifies the fact,
+            // so a rejected DeviceAdd (non-owner author) would surface here as an error.
+            author_device_add_in_tx(
+                &tx,
+                EnrollingDevice {
+                    ed25519_pubkey: joiner.public().to_bytes(),
+                    x25519_pubkey: joiner_x.public().to_bytes(),
+                    label: Some("laptop".to_string()),
+                },
+                role,
+                NOW,
+            )
+            .expect("the founder owner enrolls the joiner");
+            tx.commit().unwrap();
+
+            let persisted: String = conn
+                .query_row(
+                    "SELECT role FROM account_roster_history WHERE device_fingerprint = ?1 AND \
+                     closed_at IS NULL",
+                    params![joiner_fp.to_bytes().as_slice()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(persisted, token, "the granted role is persisted on the roster");
+        }
+    }
+
+    #[test]
+    fn author_device_add_in_tx_rejects_an_already_enrolled_device() {
+        use crate::account::{DeviceRole, EnrollingDevice, author_device_add_in_tx};
+        use crate::device::{DeviceSecret, DeviceX25519Secret};
+
+        let conn = db();
+        owned_v2(&conn);
+        let joiner = DeviceSecret::from_seed(&[0x70; 32]);
+        let joiner_x = DeviceX25519Secret::from_seed(&[0x71; 32]);
+        let mk = || EnrollingDevice {
+            ed25519_pubkey: joiner.public().to_bytes(),
+            x25519_pubkey: joiner_x.public().to_bytes(),
+            label: None,
+        };
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_add_in_tx(&tx, mk(), DeviceRole::Member, NOW).expect("first enrollment");
+        tx.commit().unwrap();
+
+        // A second enrollment of the same fingerprint would fold DuplicateAdd (rejected); the seam
+        // must reject it up front rather than return the prior — or a rejected — entry's hash as
+        // success.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = author_device_add_in_tx(&tx, mk(), DeviceRole::Member, NOW)
+            .expect_err("re-enrolling an existing device is rejected");
+        assert!(err.to_string().contains("already enrolled"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn a_sealed_batch_authors_suite_1_entries_that_fold_accepted_locally() {
         let conn = db();
         let (account, stream) = owned_v2(&conn);

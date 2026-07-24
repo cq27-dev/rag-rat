@@ -417,6 +417,7 @@ pub fn roster_content_authority_in_snapshot(
     };
     Ok(fold::AuthorityQuery::Effective(fold::RosterContentAuthority {
         device_fingerprint: roster.device_fingerprint,
+        role: roster.current_role,
         boundary,
     }))
 }
@@ -6123,6 +6124,7 @@ mod tests {
             roster_content_authority(&conn, account, roster_ref, member.fp, listed).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterContentAuthority {
                 device_fingerprint: member.fp,
+                role: DeviceRole::Member,
                 boundary: fold::AuthorityBoundary::Cut { seq: u64::MAX, hash: [0xa5; 32] },
             }),
         );
@@ -6130,10 +6132,45 @@ mod tests {
             roster_content_authority(&conn, account, roster_ref, member.fp, unlisted).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterContentAuthority {
                 device_fingerprint: member.fp,
+                role: DeviceRole::Member,
                 boundary: fold::AuthorityBoundary::Closed,
             }),
             "an omitted content chain is the empty cut, never open",
         );
+    }
+
+    #[test]
+    fn roster_content_authority_carries_the_read_only_role() {
+        // A ReadOnly device folds onto the roster (read is role-blind), and the storage reader that
+        // the fold consults must surface its role — the thread the content gate rejects on. If this
+        // regressed to dropping the role, `authority_verdict` would silently admit read-only
+        // content.
+        let conn = db();
+        let founder = Dev::new(1);
+        let reader = Dev::new(2);
+        let (account, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (add_bytes, roster_ref) = op(
+            account,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(genesis_hash),
+            &device_add(&reader, DeviceRole::ReadOnly),
+        );
+        account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
+        let stream = StreamId::from_bytes([0x41; 32]);
+        match roster_content_authority(&conn, account, roster_ref, reader.fp, stream).unwrap() {
+            fold::AuthorityQuery::Effective(fact) => {
+                assert_eq!(fact.device_fingerprint, reader.fp);
+                assert_eq!(
+                    fact.role,
+                    DeviceRole::ReadOnly,
+                    "the read-only role must reach the content-authority fact",
+                );
+            },
+            other => panic!("expected an effective read-only roster fact, got {other:?}"),
+        }
     }
 
     #[test]

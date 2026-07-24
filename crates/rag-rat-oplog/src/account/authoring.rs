@@ -197,6 +197,95 @@ fn author_account_op_in_tx(
     Ok(verified.entry_hash)
 }
 
+/// A device being enrolled onto the roster: the account signing identity the joiner generated (its
+/// ed25519 + x25519 PUBLIC keys) and an optional human label. The `DeviceFingerprint` is DERIVED
+/// (`sha256(ed25519_pubkey)`), never supplied — matching the op's own canonicalization.
+pub struct EnrollingDevice {
+    pub ed25519_pubkey: [u8; 32],
+    pub x25519_pubkey: [u8; 32],
+    pub label: Option<String>,
+}
+
+/// Author a `DeviceAdd` enrolling `joiner` onto the local account's roster at `role`, signed by the
+/// local owner device, and refold WITHIN the caller's transaction. Returns the authored entry hash
+/// (which, for `role == Owner`, IS the added device's owner-incarnation id). Neither opens nor
+/// commits the txn — the pairing/enrollment seam a durable core wrapper drives.
+///
+/// FOUNDER-owner only for now: like [`author_account_op_in_tx`] it cites the account genesis as
+/// `authority_ref`, so the LOCAL device must be the account founder. A `DeviceAdd` authored by a
+/// non-founder (or any non-owner) folds `Rejected`; this verifies the joiner became
+/// roster-effective and errors otherwise, rather than reporting a rejected enrollment as success.
+/// Enrolling from a PROMOTED owner (citing that owner's own incarnation, not genesis) is a
+/// follow-up.
+pub fn author_device_add_in_tx(
+    tx: &Transaction<'_>,
+    joiner: EnrollingDevice,
+    role: ops::DeviceRole,
+    now_ms: i64,
+) -> anyhow::Result<EntryHash> {
+    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
+        "cannot enroll a device before the store's local account is minted (call local_account \
+         first)",
+    )?;
+    let device = local_device(tx, now_ms)?;
+    // The fingerprint is derived, not trusted from the caller — the op's canonicalization derives
+    // it the same way, so this keeps the roster checks below honest.
+    let fingerprint = DeviceFingerprint::from_bytes(crate::cbor::sha256(&joiner.ed25519_pubkey));
+
+    // Enrollment is for a NOT-yet-roster device. If the fingerprint is ALREADY roster-effective, a
+    // fresh `DeviceAdd` folds `DuplicateAdd` (rejected) while the post-author presence check below
+    // would still pass on the OLD enrollment — so without this pre-check we'd return a rejected
+    // entry's hash as success (and for `role == Owner` a hash that is NOT a live owner-incarnation
+    // id) and silently keep whatever role the device already held. Reject up front; re-enrolling or
+    // changing an existing device's role is a separate operation. (Read in the caller's snapshot.)
+    if storage::list_effective_roster_fingerprints(tx, account_id)?.contains(&fingerprint) {
+        anyhow::bail!(
+            "the device is already enrolled on this account's roster; enrollment adds a \
+             not-yet-roster device (changing an existing device's role is a separate operation)",
+        );
+    }
+
+    let op = AccountOp::DeviceAdd {
+        device_fingerprint: fingerprint,
+        ed25519_pubkey: joiner.ed25519_pubkey,
+        x25519_pubkey: joiner.x25519_pubkey,
+        role,
+        label: joiner.label,
+    };
+    let entry_hash = author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, now_ms)?;
+
+    // Verify the FACT, and the SPECIFIC fact — the joiner's effective roster row is THIS DeviceAdd
+    // (`roster_ref == entry_hash`) at the REQUESTED role — never the authored entry's status. Bare
+    // presence is not enough: `author_account_op_in_tx` refolds the WHOLE account, so a
+    // concurrently-ingested parked sibling `DeviceAdd` for the same fingerprint (authored by
+    // another owner device, parked `auth_len_ahead` until our count advanced) can unpark and
+    // win the fold while OUR entry folds `Rejected(DuplicateAdd)`. Presence alone would then
+    // pass on the sibling's row and we'd return our rejected hash at the sibling's role.
+    // Asserting `roster_ref` + role ties the result to our entry — and a `DeviceAdd` from a
+    // device without effective owner authority folds `Rejected` (leaving no effective row of
+    // ours), so this still errors for a non-owner.
+    let effective: Option<(Vec<u8>, String)> = tx
+        .query_row(
+            "SELECT roster_ref, role FROM account_roster_history WHERE account_id = ?1 AND \
+             device_fingerprint = ?2 AND closed_at IS NULL",
+            params![account_id.to_bytes().as_slice(), fingerprint.to_bytes().as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match effective {
+        Some((roster_ref, role_str))
+            if roster_ref.as_slice() == entry_hash.as_slice()
+                && ops::DeviceRole::from_db_str(&role_str)? == role => {},
+        _ => anyhow::bail!(
+            "the DeviceAdd did not become the joiner's effective roster entry at the requested \
+             role — the local device lacks effective owner authority to enroll (founder-owner \
+             enrollment only for now), the device was previously removed, or a concurrent \
+             enrollment won the fold",
+        ),
+    }
+    Ok(entry_hash)
+}
+
 /// One `(account, log_id, device)` chain's tail: its highest-`seq` entry as `(seq, entry_hash)`, or
 /// `None` for an empty chain. The empty case is the CALLER's to interpret: on the CONTROL log a
 /// non-genesis author treats it as a programming error (the genesis is always seq 0), while on the

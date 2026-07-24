@@ -43,7 +43,8 @@ mod storage;
 // `established_owned_stream_v2` (derivation + effective-ownership fact — the reconcile's fast-path
 // probe). #664 wires all three into `query::memory`, so they are plain re-exports.
 pub use authoring::{
-    ensure_owned_stream_v2_in_tx, established_owned_stream_v2, owned_stream_v2_id,
+    EnrollingDevice, author_device_add_in_tx, ensure_owned_stream_v2_in_tx,
+    established_owned_stream_v2, owned_stream_v2_id,
 };
 pub use bootstrap::{local_account, read_local_account};
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
