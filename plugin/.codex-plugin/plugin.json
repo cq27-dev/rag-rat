@@ -1,6 +1,6 @@
 {
   "name": "rag-rat",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "description": "Local repo-intelligence index + MCP server: semantic search, symbol/graph navigation, impact-surface preflight, git + GitHub papertrail, and a source-anchored memory graph.",
   "author": { "name": "Kristaps Karlsons", "url": "https://github.com/cq27-dev/rag-rat" },
   "homepage": "https://github.com/cq27-dev/rag-rat",
