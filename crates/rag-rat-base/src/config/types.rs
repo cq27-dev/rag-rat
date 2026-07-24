@@ -243,11 +243,24 @@ pub struct SyncConfig {
     /// [`DEFAULT_SYNC_RELAY`]; set `[sync] relay_url` to point at a different relay. The
     /// `RAG_RAT_SYNC_RELAY` env var overrides this at the call site (ops/tests).
     pub relay_url: String,
+    /// Server peer node ids this device replicates its account log with on the maintenance path,
+    /// each dialed via [`relay_url`](Self::relay_url). Empty (the default) disables device-side
+    /// sync entirely. Entries are trimmed, de-duplicated, and non-empty here; the node-id FORMAT
+    /// is validated at dial time (the config layer has no iroh dependency), where an
+    /// unparseable entry is warned and skipped rather than failing the whole sync.
+    pub server_peers: Vec<String>,
+    /// Minimum seconds between device-side sync attempts on the maintenance path (default 300).
+    /// `0` attempts on every trigger. Only consulted when `server_peers` is non-empty.
+    pub push_interval_secs: u64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
-        Self { relay_url: DEFAULT_SYNC_RELAY.to_string() }
+        Self {
+            relay_url: DEFAULT_SYNC_RELAY.to_string(),
+            server_peers: Vec::new(),
+            push_interval_secs: 300,
+        }
     }
 }
 

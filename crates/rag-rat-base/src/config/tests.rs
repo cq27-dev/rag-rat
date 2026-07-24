@@ -2257,6 +2257,26 @@ fn sync_relay_defaults_to_the_shipped_relay_and_parses_an_override() {
 }
 
 #[test]
+fn sync_server_peers_default_empty_and_dedupe_while_push_interval_defaults() {
+    let default: SyncConfig = RawSync::default().into();
+    assert!(default.server_peers.is_empty(), "device-side sync is off until server_peers is set");
+    assert_eq!(default.push_interval_secs, 300, "the default device-sync cadence is 300s");
+
+    let raw: RawConfig = toml::from_str(
+        "[index]\nroot = \".\"\n\n[sync]\nserver_peers = [\" node-a \", \"node-b\", \"node-a\", \
+         \"  \"]\npush_interval_secs = 60\n",
+    )
+    .unwrap();
+    let sync: SyncConfig = raw.sync.into();
+    assert_eq!(
+        sync.server_peers,
+        vec!["node-a".to_string(), "node-b".to_string()],
+        "server_peers are trimmed, de-duplicated, and blanks dropped, order preserved"
+    );
+    assert_eq!(sync.push_interval_secs, 60, "[sync] push_interval_secs overrides the default");
+}
+
+#[test]
 fn dream_absent_defaults_to_off_and_local_ollama_connect() {
     // No `[llm.dream]` at all → disabled, with a local-Ollama CONNECT serving default
     // (byte-for-byte the pre-migration `[dream.model]` default).

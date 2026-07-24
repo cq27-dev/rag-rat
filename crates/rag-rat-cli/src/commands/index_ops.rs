@@ -381,6 +381,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         // watcher's own worker through the flight lock). This path is only reachable for
         // hook triggers (post-checkout / post-merge).
         let papertrail = papertrail_hook_trigger(config);
+        let device_sync = sync_hook_trigger(config);
         print_output(&serde_json::json!({
             "trigger": trigger,
             "status": "skipped",
@@ -388,6 +389,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
             "old_head": old_head,
             "new_head": new_head,
             "papertrail": papertrail,
+            "device_sync": device_sync,
         }))?;
         return Ok(());
     }
@@ -427,6 +429,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
             // this against any flight the holder (or the watcher) does run.
             if hook_trigger {
                 skip_report["papertrail"] = papertrail_hook_trigger(config);
+                skip_report["device_sync"] = sync_hook_trigger(config);
             }
             return print_output(&skip_report);
         },
@@ -447,8 +450,20 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
                        papertrail sync` for an explicit mirror pass",
         })
     };
+    // Device-side sync likewise rides git-hook triggers only (a manual/cron `maintenance` stays
+    // bounded by its index budget); the cadence watermark keeps it to at most one dial per
+    // interval.
+    let device_sync = if hook_trigger {
+        sync_hook_trigger(config)
+    } else {
+        serde_json::json!({
+            "status": "skipped",
+            "reason": "device-side sync rides git-hook triggers only",
+        })
+    };
     if let Some(report) = report.as_object_mut() {
         report.insert("papertrail".to_string(), papertrail);
+        report.insert("device_sync".to_string(), device_sync);
     }
     print_output(&report)
 }
@@ -485,6 +500,49 @@ fn papertrail_hook_trigger(config: &Config) -> serde_json::Value {
                 target: "rag_rat_core::papertrail",
                 error = %error,
                 "papertrail auto-sync failed; a later trigger retries"
+            );
+            serde_json::json!({"status": "error", "error": error.to_string()})
+        },
+    }
+}
+
+/// Best-effort device-side sync riding the git trigger: after ordinary maintenance, dial the
+/// configured `[sync] server_peers` and replicate this account's op log. Like papertrail it never
+/// holds the repo write lock (each account ingest is a short SQLite transaction) and every failure
+/// is folded into the report — a broken peer must never fail the git hook. The cadence watermark
+/// and the per-database session lock dedup the several triggers one git action fires.
+fn sync_hook_trigger(config: &Config) -> serde_json::Value {
+    use crate::commands::sync::{DeviceSyncOutcome, device_sync_run};
+    // Re-open the migrated index for the account-log sync (the pass closed its own connection). A
+    // Compatible store needs no migration, so this is cheap — the same shape autosync uses.
+    let db = match crate::open_index(config) {
+        Ok(db) => db,
+        Err(error) => return serde_json::json!({"status": "error", "error": error.to_string()}),
+    };
+    match device_sync_run(config, db.connection()) {
+        Ok(DeviceSyncOutcome::Disabled) => serde_json::json!({
+            "status": "disabled",
+            "reason": "no [sync] server_peers, no local account, or this device is not roster-effective",
+        }),
+        Ok(DeviceSyncOutcome::Skipped) => serde_json::json!({
+            "status": "skipped",
+            "reason": "within push_interval_secs since the last device sync",
+        }),
+        Ok(DeviceSyncOutcome::Deferred) => serde_json::json!({
+            "status": "deferred",
+            "reason": "this database's node identity is busy (a serve peer or another sync)",
+        }),
+        Ok(DeviceSyncOutcome::Ran { peers, ok, errors }) => serde_json::json!({
+            "status": "ran",
+            "peers": peers,
+            "ok": ok,
+            "errors": errors,
+        }),
+        Err(error) => {
+            tracing::warn!(
+                target: "rag_rat_core::sync",
+                error = %error,
+                "device sync failed; a later trigger retries"
             );
             serde_json::json!({"status": "error", "error": error.to_string()})
         },
@@ -1357,6 +1415,48 @@ mod papertrail_hook_tests {
         assert!(
             !rag_rat_base::locks::papertrail_pending_path(&config.database, &lock_repo).exists()
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maintenance_runs_device_sync_on_a_hook_trigger_without_failing_the_hook() {
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-device-sync-hook-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let mut config = config_with_unreachable_tracker(&root);
+        config.trackers.clear(); // isolate the trigger tail to device sync only
+        // A configured server peer but NO enrolled sync account: `device_sync_run` returns
+        // `Disabled` BEFORE binding any endpoint, so this stays offline while still exercising the
+        // `maintenance` → `sync_hook_trigger` wire-in and proving a hook trigger cannot fail there.
+        config.sync.server_peers = vec!["some-server-node-id".to_string()];
+        IndexDatabase::rebuild(&config).unwrap();
+
+        let args = super::MaintenanceArgs {
+            trigger: Some("post-commit".to_string()),
+            max_seconds: Some(0),
+            branch_checkout: None,
+            old_head: None,
+            new_head: None,
+        };
+        // Device-side sync rides the hook after the pass; a disabled peer must never fail the hook.
+        super::maintenance(&config, &args).unwrap();
+
+        // No account was enrolled, so device sync was disabled and never stamped its watermark.
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_meta WHERE key = 'sync_device_last_at_ms'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 0, "device sync stayed disabled (no account) — no watermark stamped");
 
         let _ = std::fs::remove_dir_all(&root);
     }

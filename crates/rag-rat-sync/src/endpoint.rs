@@ -23,7 +23,7 @@
 use std::str::FromStr;
 
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use tokio::time::timeout;
 
 use crate::auth::{
@@ -41,6 +41,8 @@ pub enum EndpointError {
     Bind(String),
     /// Dialling a peer, or accepting an inbound connection, failed.
     Connect(String),
+    /// A configured peer node id did not parse.
+    PeerId(String),
 }
 
 impl std::fmt::Display for EndpointError {
@@ -49,6 +51,7 @@ impl std::fmt::Display for EndpointError {
             EndpointError::RelayUrl(m) => write!(f, "invalid relay url: {m}"),
             EndpointError::Bind(m) => write!(f, "binding the sync endpoint failed: {m}"),
             EndpointError::Connect(m) => write!(f, "sync connection setup failed: {m}"),
+            EndpointError::PeerId(m) => write!(f, "invalid peer node id: {m}"),
         }
     }
 }
@@ -73,6 +76,24 @@ pub async fn build_endpoint(
         .map_err(|e| EndpointError::Bind(e.to_string()))
 }
 
+/// The iroh node id (public-key bytes) a `secret_key` yields — the exact id [`build_endpoint`]
+/// would bind. Lets a caller check its own transport identity WITHOUT binding an endpoint (no
+/// socket, no relay traffic), e.g. to gate on roster-effectiveness before paying for a bind.
+pub fn node_id_from_secret(secret_key: [u8; 32]) -> [u8; 32] {
+    *SecretKey::from_bytes(&secret_key).public().as_bytes()
+}
+
+/// Build a dialable [`EndpointAddr`] from a peer's node id (the z-base-32 form `endpoint.id()`
+/// prints) and the shared relay URL. The device-side sync driver configures server peers by node id
+/// and reaches each through the pinned relay — the CLI stays iroh-free by going through here.
+pub fn peer_addr(node_id: &str, relay_url: &str) -> Result<EndpointAddr, EndpointError> {
+    let id =
+        EndpointId::from_str(node_id.trim()).map_err(|e| EndpointError::PeerId(e.to_string()))?;
+    let relay =
+        RelayUrl::from_str(relay_url.trim()).map_err(|e| EndpointError::RelayUrl(e.to_string()))?;
+    Ok(EndpointAddr::new(id).with_relay_url(relay))
+}
+
 /// This endpoint's dialable address — hand it (or a ticket wrapping it) to a peer so it can
 /// [`connect_and_sync`] back.
 pub fn endpoint_addr(endpoint: &Endpoint) -> EndpointAddr {
@@ -91,14 +112,20 @@ pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
     now_ms: i64,
 ) -> Result<SessionReport, SyncFailure> {
     let local_node = *endpoint.id().as_bytes();
-    let conn = endpoint
-        .connect(peer, SYNC_ALPN)
+    // Bound every peer-controlled wait explicitly (mirroring `accept_and_sync`), rather than
+    // inheriting a transport dependency's idle default: a dead or unreachable configured peer must
+    // fail this dial promptly — a device-side sync holds the per-database session lock while it
+    // runs.
+    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, SYNC_ALPN))
         .await
+        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("dial timed out".into())))?
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
     let remote_node = *conn.remote_id().as_bytes();
-    let (mut send, mut recv) = conn
-        .open_bi()
+    let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.open_bi())
         .await
+        .map_err(|_| {
+            SyncFailure::Endpoint(EndpointError::Connect("opening a stream timed out".into()))
+        })?
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
     run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
         role: AuthRole::Dialer,

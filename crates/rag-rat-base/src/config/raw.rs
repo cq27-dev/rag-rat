@@ -341,6 +341,8 @@ impl From<RawSearch> for SearchConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawSync {
     relay_url: Option<String>,
+    server_peers: Option<Vec<String>>,
+    push_interval_secs: Option<u64>,
 }
 
 impl From<RawSync> for SyncConfig {
@@ -353,7 +355,17 @@ impl From<RawSync> for SyncConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or(default.relay_url);
-        Self { relay_url }
+        // Trim, drop blanks, and de-duplicate the peer list; the node-id FORMAT is validated at
+        // dial time (this crate has no iroh dependency to parse an `EndpointId`).
+        let mut server_peers = Vec::new();
+        for peer in raw.server_peers.unwrap_or_default() {
+            let peer = peer.trim().to_string();
+            if !peer.is_empty() && !server_peers.contains(&peer) {
+                server_peers.push(peer);
+            }
+        }
+        let push_interval_secs = raw.push_interval_secs.unwrap_or(default.push_interval_secs);
+        Self { relay_url, server_peers, push_interval_secs }
     }
 }
 

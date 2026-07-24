@@ -25,6 +25,7 @@ pub mod wire;
 pub use auth::{AuthConfig, AuthError, AuthPolicy, AuthRole, NodeAuth, run_auth_phase};
 pub use endpoint::{
     EndpointError, SyncFailure, accept_and_sync, build_endpoint, connect_and_sync, endpoint_addr,
+    node_id_from_secret, peer_addr,
 };
 pub use session::{
     DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES, SessionError, SessionReport, SyncStore,
