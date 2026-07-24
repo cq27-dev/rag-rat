@@ -5,6 +5,7 @@
 //! never link domain code downward.
 
 pub mod chunk_text_store;
+pub mod content_digest;
 pub mod hooks;
 pub mod meta;
 pub mod schema;

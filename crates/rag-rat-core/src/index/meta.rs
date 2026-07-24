@@ -7,21 +7,6 @@ use rag_rat_db::meta::*;
 
 use super::*;
 
-/// A [`IndexDatabase::content_revision`] digest pinned to the connection state it was computed
-/// under (#821), so a LATER stage of the same pass can reuse the digest instead of paying the
-/// full `main.files` scan again — but only when nothing can have moved it in between. Consumed
-/// through [`IndexDatabase::content_revision_reusing`], which enforces the reuse rule.
-#[derive(Debug)]
-pub(crate) struct ContentRevisionSnapshot {
-    revision: String,
-    /// `PRAGMA data_version` at capture — moves iff ANOTHER connection committed to this
-    /// database since. The database is shared cross-process (and, consolidated, cross-repo:
-    /// a sibling repo's writer moves the GLOBAL digest without touching this repo's rows).
-    data_version: i64,
-    /// SQL `total_changes()` at capture — moves iff THIS connection wrote any row since.
-    total_changes: i64,
-}
-
 impl IndexDatabase {
     pub(super) fn record_content_revision(&self) -> anyhow::Result<String> {
         let revision = self.content_revision()?;
@@ -40,77 +25,6 @@ impl IndexDatabase {
         // the global `index_meta`. (V040's `move_repo_meta_keys_to_global` migrates any stale
         // per-repo copy back; the shared relocate helper no longer re-relocates it.)
         self.set_meta("content_revision", revision)
-    }
-
-    /// The connection's `PRAGMA data_version` — differs between two reads on THIS connection iff
-    /// ANOTHER connection committed to the database in between.
-    pub(super) fn connection_data_version(&self) -> anyhow::Result<i64> {
-        Ok(self.storage.connection().query_row("PRAGMA data_version", [], |row| row.get(0))?)
-    }
-
-    /// The connection's SQL `total_changes()` — moves iff THIS connection wrote any row.
-    fn connection_total_changes(&self) -> anyhow::Result<i64> {
-        Ok(self.storage.connection().query_row("SELECT total_changes()", [], |row| row.get(0))?)
-    }
-
-    /// Pin `revision` — a digest [`Self::content_revision`] just computed on this connection —
-    /// to the connection's current write state, for [`Self::content_revision_reusing`] (#821).
-    ///
-    /// `data_version_before_digest` is [`Self::connection_data_version`] captured BEFORE the
-    /// digest was computed: it brackets the digest against the cross-connection TOCTOU. Without
-    /// it, another connection committing between the digest read and this capture would bake the
-    /// NEW `data_version` into a pin whose digest describes the OLD rows — a later no-write
-    /// window would then validate the mismatched pin. When the bracket detects such a commit the
-    /// pin is refused (`None`) and the consumer recomputes.
-    pub(super) fn pin_content_revision(
-        &self,
-        revision: String,
-        data_version_before_digest: i64,
-    ) -> anyhow::Result<Option<ContentRevisionSnapshot>> {
-        let data_version = self.connection_data_version()?;
-        if data_version != data_version_before_digest {
-            return Ok(None);
-        }
-        Ok(Some(ContentRevisionSnapshot {
-            revision,
-            data_version,
-            total_changes: self.connection_total_changes()?,
-        }))
-    }
-
-    /// The pinned digest when it is PROVABLY still current, else a fresh recompute (#821).
-    ///
-    /// REUSE RULE: a pinned digest describes `main.files` only while nothing has written to the
-    /// database, and stages run between the pin and its consumer — in the watcher pass, the base
-    /// reconcile runs between the clone quiet-gate probe and the clone delta. No stage report
-    /// distinguishes "wrote `files` rows" (the reconcile's `"Current"` covers both a no-op and a
-    /// completed embedding run), and other processes share the database file. So the gate is the
-    /// connection's own counters: reuse ONLY when `PRAGMA data_version` (other connections) AND
-    /// `total_changes()` (this connection) both still match the capture — ANY intervening write,
-    /// `files` or not, forces the recompute. Conservative by design: a false negative costs one
-    /// redundant digest; a false positive would let the consumer stamp or compare a digest that
-    /// does not describe the rows it actually read.
-    pub(super) fn content_revision_reusing(
-        &self,
-        pinned: Option<&ContentRevisionSnapshot>,
-    ) -> anyhow::Result<String> {
-        // Validation order matters: own-connection `total_changes()` FIRST, the cross-connection
-        // `data_version` LAST — read last, it covers every sibling commit up to this moment, so
-        // the validation itself has no internal race window. What remains is the gap between
-        // this check and the consumer's own reads — the SAME gap the recompute path always had
-        // (a digest is computed, then consumed outside a transaction) — and it is benign: the
-        // consumer holds the per-repo write lock, so the rows it reads cannot move; only ANOTHER
-        // repo's rows in a consolidated DB can, which lags the GLOBAL freshness stamp by one
-        // pass (the next probe recomputes and the delta re-pins) and fails safe wherever the
-        // stamp is compared for exact freshness (an older-than-content stamp disables the
-        // postings fast path, never enables it).
-        if let Some(pinned) = pinned
-            && self.connection_total_changes()? == pinned.total_changes
-            && self.connection_data_version()? == pinned.data_version
-        {
-            return Ok(pinned.revision.clone());
-        }
-        self.content_revision()
     }
 
     /// Read a per-repo meta value (`repo_meta`) for the repo owning this connection — the ergonomic
@@ -254,29 +168,104 @@ impl IndexDatabase {
         read_meta(self.storage.connection(), key)
     }
 
-    /// The content digest over EVERY indexed file row — read from the GLOBAL `main.files`, NOT the
-    /// scoped `temp.files` view. The FTS mirror (`chunk_fts`), the `content_revision` meta, and the
-    /// `fts_dirty` flag are all GLOBAL (one FTS5 index over the whole `chunks` table), so their
-    /// freshness must track global content. Reading the scoped view here made `fts_source_revision`
-    /// ALTERNATE: `sync_fts` under a linked-overlay scope recorded the overlay-view digest, then a
-    /// base read recomputed the base-view digest, saw a mismatch, and rebuilt FTS — and the next
-    /// overlay read rebuilt it back, so interleaved base/overlay reads rebuilt the global FTS every
-    /// time even though the per-row FTS entries were already in sync (#219 review). The global
-    /// digest is scope-invariant, so the freshness check is stable regardless of the active
-    /// connection scope.
+    /// The content digest over EVERY indexed file row — an O(1) read of the incrementally
+    /// maintained `content_digest_state` (#828), rendered `ms1-<64 hex>`. GLOBAL (no repo/scope
+    /// filter): the FTS mirror (`chunk_fts`), the `content_revision` meta, and the clone-graph
+    /// stamps are all global, so their freshness must track global content — reading a scoped view
+    /// here once made `fts_source_revision` ALTERNATE between base/overlay digests and rebuild FTS
+    /// every interleaved read (#219). The digest is a pure function of the current multiset
+    /// `{(path, sha256) : main.files, kind != 'deleted'}`, so it is content-stable across rebuilds,
+    /// generation flips, gc, and row-order/rowid churn — see the `rag_rat_db::content_digest`
+    /// module doc for the multiset-hash invariant.
+    ///
+    /// Maintained by the `files_content_digest_*` triggers on every write, so this is a single-row
+    /// SELECT. If the row is ABSENT (pathological — hand-deleted, or a future migration bug), fall
+    /// back to the from-scratch scan fold, WARN, and do NOT write from this read path (read-only
+    /// opens exist). A write-lock-holding context reseeds via
+    /// [`Self::verify_content_digest_parity`].
     pub(super) fn content_revision(&self) -> anyhow::Result<String> {
-        // group_concat over an ORDER BY subquery, not `string_agg(... ORDER BY path)`: string_agg()
-        // and aggregate ORDER BY are SQLite 3.44+, and this portable idiom (works on any SQLite)
-        // avoids tying the query to a SQLite version. The subquery's ORDER BY feeds rows to
-        // group_concat in path order, so the digest input is the same deterministic string. Order
-        // only has to be stable per-machine (this digest is compared against a previously-stored
-        // value on the same DB), which this idiom guarantees.
-        let value = self.storage.connection().query_row(
-            "SELECT COALESCE(group_concat(pv, ','), '') FROM (SELECT path || ':' || sha256 AS pv \
-             FROM main.files WHERE kind != 'deleted' ORDER BY path)",
-            [],
-            |row| row.get::<_, String>(0),
+        let stored: Option<String> = self
+            .storage
+            .connection()
+            .query_row("SELECT state FROM content_digest_state WHERE id = 1", [], |row| row.get(0))
+            .optional()?;
+        match stored {
+            Some(state) =>
+                Ok(format!("{}{state}", rag_rat_db::content_digest::CONTENT_REVISION_PREFIX)),
+            None => {
+                tracing::warn!(
+                    "content_digest_state row absent; falling back to a from-scratch \
+                     content_revision scan (reseed via gc or `heal_index`)"
+                );
+                self.content_revision_from_scan()
+            },
+        }
+    }
+
+    /// The from-scratch, order-free content digest over the current non-deleted `main.files`,
+    /// rendered `ms1-…` — using the SAME per-row hash the trigger fold and the migration seed use,
+    /// so a recompute can never disagree with the trigger-maintained state. Shared by the read
+    /// fallback above and the parity self-check. Read-only.
+    pub(super) fn content_revision_from_scan(&self) -> anyhow::Result<String> {
+        let (state, _rows_folded) = self.content_digest_from_scan()?;
+        Ok(rag_rat_db::content_digest::render_revision(&state))
+    }
+
+    /// `(state, rows_folded)` recomputed from a full `main.files` scan — the raw form the parity
+    /// self-check and reseed compare and write. Ordering is irrelevant (the fold is commutative).
+    fn content_digest_from_scan(
+        &self,
+    ) -> anyhow::Result<(rag_rat_db::content_digest::DigestState, i64)> {
+        let conn = self.storage.connection();
+        let mut state = [0u64; 4];
+        let mut rows_folded = 0i64;
+        let mut stmt =
+            conn.prepare("SELECT path, sha256 FROM main.files WHERE kind != 'deleted'")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let sha256: String = row.get(1)?;
+            let hash = rag_rat_db::content_digest::content_row_hash(&path, &sha256);
+            rag_rat_db::content_digest::fold_row(&mut state, &hash, true);
+            rows_folded += 1;
+        }
+        Ok((state, rows_folded))
+    }
+
+    /// Belt-and-suspenders parity self-check (#828 §9.1): recompute the digest from a full scan and
+    /// compare it (state + `rows_folded`) with the maintained `content_digest_state`. On a
+    /// mismatch — which no KNOWN path can cause (the triggers are fail-closed), so it means a
+    /// migration bug or corruption — `tracing::error!` both values and RESEED the state row in
+    /// place. MUST run only under a write lock (gc cadence, `heal_index`, full-index finalize).
+    /// Deliberately does NOT re-stamp `fts_source_revision`/clone stamps: a drift has unknown
+    /// provenance, so letting the mismatch drive the normal freshness rebuilds is the safe
+    /// direction. Also reseeds when the row is absent.
+    pub(super) fn verify_content_digest_parity(&self) -> anyhow::Result<()> {
+        let (state, rows_folded) = self.content_digest_from_scan()?;
+        let expected_state = rag_rat_db::content_digest::encode_state(&state);
+        let conn = self.storage.connection();
+        let stored: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT state, rows_folded FROM content_digest_state WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if stored.as_ref() == Some(&(expected_state.clone(), rows_folded)) {
+            return Ok(());
+        }
+        tracing::error!(
+            ?stored,
+            expected_state,
+            expected_rows_folded = rows_folded,
+            "content_digest_state parity mismatch — reseeding from scan (a trigger/migration \
+             regression drifted the incrementally maintained content_revision)"
+        );
+        conn.execute(
+            "INSERT OR REPLACE INTO content_digest_state(id, state, rows_folded) VALUES (1, ?1, \
+             ?2)",
+            params![expected_state, rows_folded],
         )?;
-        Ok(hex_sha256(value.as_bytes()))
+        Ok(())
     }
 }

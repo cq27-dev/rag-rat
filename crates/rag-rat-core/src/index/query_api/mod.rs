@@ -646,6 +646,11 @@ impl IndexDatabase {
             report.healed_files += 1;
         }
 
+        // #828 §9.1: heal is the explicit operator remedy — verify the content-digest parity and
+        // reseed `content_digest_state` on drift BEFORE the FTS freshness pass below, so
+        // `ensure_fts_fresh` compares against a healed digest rather than a drifted one.
+        self.verify_content_digest_parity()?;
+
         // Probe for FTS shadow corruption BEFORE the freshness pass (#582): a dirty-flagged
         // index would otherwise be incidentally repaired by `ensure_fts_fresh`'s rebuild and the
         // report would under-attribute what was actually corrupt.

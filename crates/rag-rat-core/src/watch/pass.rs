@@ -384,19 +384,19 @@ fn run_pass(
     // for a gc pass. Probe permission is "the base tail already runs" — including a startup
     // embedding-backlog tail, which doesn't flip `base_tail_forced` — so every base-tail pass can
     // at least ARM an unarmed pending graph. Overlay-only passes deliberately carry NO permission
-    // (#817): overlay churn never moves `content_revision()` (it digests base files only), so an
-    // unarmed probe there could only re-observe the same base staleness while paying the
-    // corpus-scale revision digest every pass. An unarmed pending graph therefore rides overlay
-    // churn until a content, gc, or backlog pass arms it; an ALREADY-ARMED candidate still probes
-    // on every pass — candidate presence bypasses the permission — so a quiet-elapsed owed
-    // rebuild lands even mid-churn. When nothing is armed and nothing grants permission the gate
-    // costs one meta read. When it DOES probe, the probe hands back the content digest it
-    // computed (pinned to the connection state) so the clone delta below can reuse it instead of
-    // paying the corpus-scale `main.files` digest a second time this pass (#821).
-    let clone_probe = db
-        .clone_graph_rebuild_probe(CLONE_GRAPH_QUIET_MS, base_tail_forced || base_embedding_backlog)
-        .unwrap_or_default();
-    let clone_graph_due = clone_probe.due;
+    // (#817): overlay file rows ARE ordinary `main.files` rows, so an overlay edit that changes a
+    // row's sha256 DOES move the GLOBAL `content_revision()` (correctly — overlay chunks live in
+    // the one global `chunk_fts`). But an overlay-only pass skips the whole base tail
+    // (`run_base_tail` below), so arming a quiet candidate there would only queue a base rebuild
+    // this pass will not run; an unarmed pending graph therefore rides overlay churn until a
+    // content, gc, or backlog pass arms it. An ALREADY-ARMED candidate still probes on every pass —
+    // candidate presence bypasses the permission — so a quiet-elapsed owed rebuild lands even
+    // mid-churn. `content_revision()` is now an O(1) state read (#828), so the probe here and the
+    // clone delta below each recompute it freely; when nothing is armed and nothing grants
+    // permission the gate costs one meta read.
+    let clone_graph_due = db
+        .clone_graph_rebuild_due(CLONE_GRAPH_QUIET_MS, base_tail_forced || base_embedding_backlog)
+        .unwrap_or(false);
     // Idle backstop (issue #63, facet 2): when the sweep changed nothing, skip everything past
     // discovery — an idle server should do no work. `run_gc` (every GC_EVERY_PASSES) still forces
     // a full tail, so the cases that DON'T flip content_changed are still caught within that
@@ -406,12 +406,13 @@ fn run_pass(
     // discover that marked base reconcile owed, and an already-indexed base embedding backlog
     // left by a time-capped or blocked prior pass.
     // Overlay changes do NOT force the base tail (#817): the overlay stage above already
-    // reconciled a changed overlay's embeddings inline, and every base stage keys off
-    // `content_revision()` (base files only) — on an overlay-only pass the base reconcile is
-    // already Current and the clone delta is a guaranteed no-op that still pays two revision
-    // scans plus a corpus-scale `delta_paths` sweep (measured 66–94 s per pass under worktree
-    // churn). Such a pass runs only `memory_validate` below — cheap next to the base stages, and
-    // overlay edits can move memory anchors.
+    // reconciled a changed overlay's embeddings inline, so running the full base tail on every
+    // overlay keystroke would treadmill the base reconcile, the clone delta (whose corpus-scale
+    // `delta_paths` sweep was measured at 66–94 s per pass under worktree churn), and gc. An
+    // overlay edit does move the GLOBAL `content_revision()` (overlay rows are `main.files` rows),
+    // so that digest move — and any base work it implies — is picked up on the next content, gc,
+    // or backlog pass instead. Such a pass runs only `memory_validate` below — cheap next to the
+    // base stages, and overlay edits can move memory anchors.
     let run_base_tail = should_run_base_tail(
         content_changed,
         run_gc,
@@ -442,15 +443,11 @@ fn run_pass(
         // quiet window (`clone_graph_due`) so sustained editing defers it instead of
         // treadmilling. Best-effort + resumable, with whatever budget the embedding reconcile
         // left (shared PASS_RECONCILE_MAX_SECONDS so a pass can't overrun); `None` budget → rides
-        // the next pass. The quiet-gate probe's pinned digest is threaded in (#821); the base
-        // reconcile above ran in between, so the delta reuses it only when the connection
-        // counters prove no write intervened — see `content_revision_reusing` — and recomputes
-        // otherwise.
+        // the next pass. `content_revision()` is an O(1) state read (#828), so the delta recomputes
+        // it directly against the `files` rows as committed — no pinned digest is threaded from the
+        // probe.
         let clone_full_rebuild_owed = match timings.stage("clone_delta", || {
-            db.apply_clone_graph_delta_reusing_revision(
-                crate::index::CLONE_DELTA_MAX_FILES,
-                clone_probe.revision.as_ref(),
-            )
+            db.apply_clone_graph_delta(crate::index::CLONE_DELTA_MAX_FILES)
         }) {
             Ok(delta) if delta.status == "Applied" || delta.status == "Noop" =>
                 delta.full_rebuild_owed,

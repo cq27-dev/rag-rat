@@ -16,6 +16,7 @@ anyhow.workspace = true
 rag-rat-base.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 zstd = "0.13"
 

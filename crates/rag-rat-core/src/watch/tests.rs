@@ -575,11 +575,13 @@ fn startup_catchup_does_not_force_the_expensive_tail() {
 
 #[test]
 fn overlay_changes_do_not_force_the_base_tail() {
-    // #817: a changed overlay's embeddings are reconciled inline by the overlay stage, and every
-    // base-tail stage keys off `content_revision()` (base files only) — so overlay churn must not
-    // buy the corpus-scale reconcile/clone scans that are guaranteed no-ops there. The base tail
-    // is forced by base-side state only; `run_pass` still runs memory_validate on overlay-changed
-    // passes (covered by `overlay_only_pass_skips_base_tail_but_still_validates_memories`).
+    // #817: a changed overlay's embeddings are reconciled inline by the overlay stage, so running
+    // the corpus-scale base reconcile/clone stages on every overlay keystroke would treadmill.
+    // Overlay rows DO move the GLOBAL `content_revision()` (they are `main.files` rows), but that
+    // digest move and any base work it implies are picked up on the next content/gc/backlog pass,
+    // not forced here. The base tail is forced by base-side state only; `run_pass` still runs
+    // memory_validate on overlay-changed passes (covered by
+    // `overlay_only_pass_skips_base_tail_but_still_validates_memories`).
     assert!(
         !base_tail_forced_by_state(false, false, false),
         "no base-side state forces the base tail — overlay changes are not in the force set",

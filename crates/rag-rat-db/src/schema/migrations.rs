@@ -1371,6 +1371,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_083_ID => Some(83),
             MIGRATION_084_ID => Some(84),
             MIGRATION_085_ID => Some(85),
+            MIGRATION_086_ID => Some(86),
             _ => None,
         })
         .max()
@@ -1465,6 +1466,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_083_ID
             | MIGRATION_084_ID
             | MIGRATION_085_ID
+            | MIGRATION_086_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1556,6 +1558,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_083_ID => migration.checksum != MIGRATION_083_CHECKSUM,
         MIGRATION_084_ID => migration.checksum != MIGRATION_084_CHECKSUM,
         MIGRATION_085_ID => migration.checksum != MIGRATION_085_CHECKSUM,
+        MIGRATION_086_ID => migration.checksum != MIGRATION_086_CHECKSUM,
         _ => false,
     }
 }
@@ -5911,6 +5914,92 @@ pub fn apply_sync_origin_and_edge_tombstone(conn: &Connection) -> rusqlite::Resu
         "TEXT NOT NULL DEFAULT 'local' CHECK (origin IN ('local', 'synced'))",
     )?;
     add_column_if_missing(&tx, "content_projected_edges", "present", "INTEGER NOT NULL DEFAULT 1")?;
+    tx.commit()
+}
+
+/// V086 (#828): stand up the incrementally-maintained `content_revision` digest.
+///
+/// Invariant established here: `content_digest_state.state` (one row, id = 1) is the 256-bit
+/// additive multiset hash of `{(path, sha256) : main.files, kind != 'deleted'}` at every
+/// transaction boundary, maintained by the three `files_content_digest_*` triggers
+/// [`crate::content_digest::ensure_content_digest`] creates. `content_revision()` becomes an O(1)
+/// read of that row (rendered `ms1-…`) instead of the O(N) `main.files` scan-sort-concat-hash.
+///
+/// The body runs in ONE immediate transaction, in order:
+///  1. Create the state table + triggers (idempotent; a future `files`-rebuild migration MUST call
+///     the same helper and reseed, because `DROP TABLE files` silently drops the triggers).
+///  2. Seed the state row with a from-scratch Rust fold over the current non-deleted `files` — the
+///     SAME per-row hash the trigger fold uses, so the trigger-maintained state and a recompute can
+///     never disagree. Atomic with trigger creation, so no write slips between.
+///  3. Re-stamp every freshness stamp that equals the FROZEN legacy digest (the pre-#828
+///     `hex_sha256(group_concat(path||':'||sha256 ORDER BY path))`, inlined because migrations are
+///     snapshots) to the new rendered digest. This is the ONLY place the digest value change is
+///     absorbed: a stamp equal to the legacy value was fresh, so pointing it at the new value
+///     avoids a one-time full FTS re-tokenize (`fts_source_revision`), a ~1 GB clone-graph rebuild
+///     (`clone_graph_generations.source_revision`), and a reset of the clone quiet window
+///     (`clone_graph_quiet_candidate_revision`). A stamp that did NOT equal the legacy digest was
+///     already stale and is left for the normal freshness machinery — exactly as it would have
+///     been.
+///
+/// If step 3 were dropped everything still self-heals (one FTS rebuild, one quiet-gated clone
+/// rebuild); the re-stamp is one cheap legacy scan that avoids that first-use rebuild storm.
+pub fn apply_content_digest_state(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+
+    // 1. Table + triggers.
+    crate::content_digest::ensure_content_digest(&tx)?;
+
+    // 2. From-scratch seed fold over the current non-deleted rows (order-free — the fold is
+    //    commutative, so no ORDER BY is needed).
+    let mut state = [0u64; 4];
+    let mut rows_folded: i64 = 0;
+    {
+        let mut stmt = tx.prepare("SELECT path, sha256 FROM main.files WHERE kind != 'deleted'")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let sha256: String = row.get(1)?;
+            let hash = crate::content_digest::content_row_hash(&path, &sha256);
+            crate::content_digest::fold_row(&mut state, &hash, true);
+            rows_folded += 1;
+        }
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO content_digest_state(id, state, rows_folded) VALUES (1, ?1, ?2)",
+        params![crate::content_digest::encode_state(&state), rows_folded],
+    )?;
+
+    // 3. Re-stamp the frozen legacy digest -> the new rendered digest wherever it was still
+    //    current.
+    let legacy_concat: String = tx.query_row(
+        "SELECT COALESCE(group_concat(pv, ','), '') FROM (SELECT path || ':' || sha256 AS pv FROM \
+         main.files WHERE kind != 'deleted' ORDER BY path)",
+        [],
+        |row| row.get(0),
+    )?;
+    let legacy_digest = rag_rat_base::hash::hex_sha256(legacy_concat.as_bytes());
+    let new_digest = crate::content_digest::render_revision(&state);
+    // The GLOBAL freshness stamps (`content_revision` keeps `global_status`'s rollup consistent;
+    // `fts_source_revision` prevents a full chunk-text re-tokenize on first `ensure_fts_fresh`).
+    tx.execute(
+        "UPDATE index_meta SET value = ?1
+         WHERE key IN ('fts_source_revision', 'content_revision') AND value = ?2",
+        params![new_digest, legacy_digest],
+    )?;
+    // Every clone-graph generation stamped at the legacy digest keeps the postings fast path
+    // serving and skips a one-time full rebuild.
+    tx.execute(
+        "UPDATE clone_graph_generations SET source_revision = ?1 WHERE source_revision = ?2",
+        params![new_digest, legacy_digest],
+    )?;
+    // A per-repo armed quiet-window candidate survives the upgrade instead of resetting its
+    // stability clock (the key literal matches CLONE_GRAPH_QUIET_REVISION_META in rag-rat-core).
+    tx.execute(
+        "UPDATE repo_meta SET value = ?1
+         WHERE key = 'clone_graph_quiet_candidate_revision' AND value = ?2",
+        params![new_digest, legacy_digest],
+    )?;
+
     tx.commit()
 }
 

@@ -345,6 +345,12 @@ impl IndexDatabase {
         // restore only leaves the coarser cadence behind.
         let _ = db.storage.execute_batch("PRAGMA wal_autocheckpoint = 0;");
         result?;
+        // #828 §9.1: the sanctioned full rebuild is a reseed by definition — the
+        // `files_content_digest_*` triggers maintained `content_digest_state` through every staged
+        // wave and the terminal flip, so verify parity here and reseed in place if a trigger/seam
+        // regression drifted it. Unconditional (unlike gc's cadence) because a full rebuild is the
+        // authoritative freshness baseline.
+        db.verify_content_digest_parity()?;
         // Poison-sibling test harness (compiled out of production): after the rebuild flips,
         // register a second `poison-sibling` repo with tripwire rows in every repo-scoped
         // table, so any unscoped read/count/delete downstream trips an EXISTING test.

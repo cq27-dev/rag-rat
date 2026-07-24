@@ -103,7 +103,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # driven on the papertrail module's private runtime at the sync boundary.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rmcp = { version = "2.2.0", features = ["transport-io"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 rayon = "1.12"
 regex = "1.12"
 schemars = { version = "1.2.1", features = ["derive"] }

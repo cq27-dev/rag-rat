@@ -7219,6 +7219,9 @@ fn a_rebuild_carrying_overlays_defers_the_key_version_stamp() {
     // Once the overlay rows are gone, the next rebuild's corpus is exactly what it re-parses.
     {
         let conn = rusqlite::Connection::open(&config.database).unwrap();
+        // A bare `files` writer must carry the #828 content-digest fold so the delete trigger
+        // resolves (a real writer registers it via `IndexConnection::setup`).
+        rag_rat_db::content_digest::register_content_digest_fold(&conn).unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn.execute("DELETE FROM files WHERE commit_sha = ''", []).unwrap();
     }

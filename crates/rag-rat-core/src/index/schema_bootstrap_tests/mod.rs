@@ -935,6 +935,7 @@ fn fingerprinted_symbol_id_for_ref(db: &IndexDatabase, qualified_name: &str) -> 
 mod change_coupling;
 mod chunk_store_migrations;
 mod clones;
+mod content_digest;
 mod dir_memory_tree;
 mod dispatch;
 mod embedding_policy_fast_path;

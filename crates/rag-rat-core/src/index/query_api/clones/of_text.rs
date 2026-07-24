@@ -1107,6 +1107,10 @@ mod tests {
         // matches the postings' anchor sha (2nd WAL connection; the index handle is idle).
         {
             let c = rusqlite::Connection::open(&db_path).unwrap();
+            // A `files` writer must carry the #828 content-digest fold (a real external writer
+            // registers it via `IndexConnection::setup`); this bare 2nd connection registers it
+            // explicitly so the triggers resolve.
+            rag_rat_db::content_digest::register_content_digest_fold(&c).unwrap();
             c.execute("UPDATE files SET sha256 = 'stale-not-matching-any-posting'", []).unwrap();
         }
         let stale = corpus.near_candidate_bags(conn, &probe, "rust").unwrap();
@@ -1127,6 +1131,8 @@ mod tests {
         // A content edit since the build → source_revision drift → NOT eligible (review R1).
         {
             let c = rusqlite::Connection::open(&db_path).unwrap();
+            // A 2nd-connection `files` writer must carry the #828 fold (see the note above).
+            rag_rat_db::content_digest::register_content_digest_fold(&c).unwrap();
             c.execute("UPDATE files SET sha256 = 'drift-' || sha256", []).unwrap();
         }
         assert!(

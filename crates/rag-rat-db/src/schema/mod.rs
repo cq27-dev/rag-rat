@@ -10,7 +10,7 @@ pub use migrations::{
     apply_account_authority_boundaries, apply_account_authority_projection,
     apply_account_candidate_dag, apply_chunk_symbol_id, apply_clone_delta_maintenance,
     apply_clone_df_epoch, apply_clone_fingerprint_tables, apply_clone_graph_tables,
-    apply_content_candidate_dag, apply_content_projected_tables,
+    apply_content_candidate_dag, apply_content_digest_state, apply_content_projected_tables,
     apply_content_refold_queue_and_stats, apply_content_streams_pending_refold,
     apply_distill_anchor_selection, apply_distill_enriched_context,
     apply_distill_evidence_source_part, apply_distill_record_store,
@@ -47,7 +47,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 85;
+pub const LATEST_SCHEMA_VERSION: u32 = 86;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -633,6 +633,16 @@ const MIGRATION_085_DESCRIPTION: &str =
      revoked content); the present column retains edge tombstones so a foreign EdgeRemove is \
      honored instead of resurrected in an op-log growth loop. Additive; existing rows default to \
      local/present";
+const MIGRATION_086_ID: &str = "086_content_digest_state";
+const MIGRATION_086_CHECKSUM: &str = "sha256:rag-rat-content-digest-state-v86";
+const MIGRATION_086_DESCRIPTION: &str =
+    "Incrementally maintain content_revision (#828): add the one-row content_digest_state table \
+     and the three files_content_digest_* triggers that fold a 256-bit additive multiset hash of \
+     {(path, sha256) : main.files, kind != 'deleted'} via the registered rr_content_digest_fold \
+     scalar, seed the state from a from-scratch Rust fold, and re-stamp every freshness stamp \
+     (index_meta fts_source_revision/content_revision, clone_graph_generations.source_revision, \
+     the clone-graph quiet candidate) that equals the frozen legacy digest so no one-time \
+     FTS/clone rebuild fires. Replaces the O(N) main.files scan with an O(1) state read";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -759,6 +769,11 @@ fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn apply(conn: &Connection, hooks: &MigrationHooks) -> rusqlite::Result<()> {
+    // The V086 content-digest triggers call `rr_content_digest_fold`, and the migration seeds the
+    // state via the shared Rust fold; a raw `rusqlite::Connection` that applies the real schema
+    // (many tests do, then write `files` rows) needs the function registered before any `files`
+    // write. Idempotent and connection-local (no DB write), so it is safe ahead of the baseline.
+    crate::content_digest::register_content_digest_fold(conn)?;
     provision_baseline(conn)?;
     // Every additive migration in order. A fresh DB runs them all; data backfills on empty tables
     // are no-ops. (An EXISTING DB takes the forward-only path via `migrate_forward`, not this.)
@@ -1335,6 +1350,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_085_DESCRIPTION,
         apply: MigrationFn::Plain(apply_sync_origin_and_edge_tombstone),
     },
+    Migration {
+        id: MIGRATION_086_ID,
+        checksum: MIGRATION_086_CHECKSUM,
+        description: MIGRATION_086_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_content_digest_state),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -1352,6 +1373,10 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
 /// autocommit write is one fewer `SQLITE_BUSY` hazard against ordinary per-repo writers, which
 /// the schema lock deliberately does not serialize against.
 pub fn migrate_forward(conn: &Connection, hooks: &MigrationHooks) -> anyhow::Result<()> {
+    // Same rationale as `apply`: a raw connection that forward-migrates the real schema then writes
+    // `files` needs the V086 fold function. Connection-local, so it does not count as a DB write
+    // and never breaks the loser-discipline "nothing owed ⇒ write nothing" guarantee below.
+    crate::content_digest::register_content_digest_fold(conn)?;
     let applied: std::collections::HashSet<String> =
         applied_migrations(conn)?.into_iter().map(|migration| migration.id).collect();
     if applied.contains(MIGRATION_001_ID)

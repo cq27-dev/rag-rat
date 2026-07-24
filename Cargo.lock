@@ -4993,6 +4993,7 @@ dependencies = [
  "rag-rat-base",
  "rusqlite",
  "serde",
+ "sha2",
  "tempfile",
  "tracing",
  "zstd",

@@ -3849,11 +3849,10 @@ fn migration_084_links_chunks_to_symbols() {
 }
 
 /// V085 adds sync provenance (`origin`) to the read tables + edge tombstones (`present`) to the
-/// content-edge projection, and is the schema tip.
+/// content-edge projection. The absolute schema-tip pin lives on the newest migration's test
+/// (V086, `content_digest_state_is_the_tip_with_live_fold_triggers`).
 #[test]
-fn migration_085_is_the_tip_and_adds_origin_and_edge_present() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 85, "move this pin with the next schema migration");
-
+fn migration_085_adds_origin_and_edge_present() {
     // Bare pre-V085 tables (no origin / present), each with a pre-existing row, so the migration is
     // asserted against its OWN precondition — not the full ladder's end state.
     let legacy = rusqlite::Connection::open_in_memory().unwrap();

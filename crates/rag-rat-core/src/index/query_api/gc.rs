@@ -41,7 +41,13 @@ impl IndexDatabase {
         live_commits.dedup();
         live_worktrees.sort();
         live_worktrees.dedup();
-        self.prune_to_live(&live_commits, &live_worktrees)
+        let report = self.prune_to_live(&live_commits, &live_worktrees)?;
+        // #828 §9.1: gc runs under the write flock every GC_EVERY_PASSES passes — the low-cadence
+        // home for the content-digest parity self-check. It recomputes the digest from scan and, on
+        // the (fail-closed-so-unexpected) mismatch a trigger/migration regression would cause,
+        // reseeds `content_digest_state` in place. Deliberately does NOT re-stamp fts/clone stamps.
+        self.verify_content_digest_parity()?;
+        Ok(report)
     }
 
     /// Prune file rows (and their derived rows) whose `commit_sha` and `worktree_id` are both

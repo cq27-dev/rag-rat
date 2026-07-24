@@ -220,6 +220,12 @@ impl IndexConnection {
             PRAGMA wal_autocheckpoint = 0;
             ",
         )?;
+        // Register the content-revision fold on every production open (#828). The three
+        // `files_content_digest_*` triggers call it, so a write connection MUST carry it — an
+        // unregistered writer fails a `files` write with `no such function` and rolls back
+        // (fail-closed) rather than silently drifting the incrementally-maintained digest.
+        // Idempotent and pure, so registering it on read-only-ish opens too is harmless.
+        crate::content_digest::register_content_digest_fold(&self.conn)?;
         // The delete→WAL transition needs an EXCLUSIVE lock, and SQLite deliberately does NOT run
         // the busy handler on parts of that upgrade path (it returns SQLITE_BUSY immediately to
         // break potential deadlocks among racing upgraders) — so busy_timeout alone does NOT save
