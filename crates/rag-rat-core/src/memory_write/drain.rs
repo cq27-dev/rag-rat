@@ -120,6 +120,15 @@ pub(crate) fn drain_synced_stream_for_repo(
     }
 
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Re-check the removal tombstone INSIDE the write txn (#767).
+    // `drain_synced_streams_for_all_repos` snapshots `real_repo_ids` outside any txn, so a
+    // concurrent `rag-rat rm` can purge this repo and commit its removal marker between that
+    // snapshot and here. Both are IMMEDIATE txns and serialize: if `rm` took the lock first,
+    // its tombstone is visible now — materializing would RESURRECT the synced rows `rm` just
+    // purged and reported gone. Skip a removed repo before any write.
+    if rag_rat_db::schema::is_repo_removed(&tx, repo_id)? {
+        return Ok(DrainOutcome::default());
+    }
     // Settle the owner stream's deferred refold HERE, inside the write's own transaction and before
     // the projection read, so the drain mirrors a CURRENT accepted set. A settle failure propagates
     // and rolls the drain back, so the barrier stays fail-closed (same discipline as the
@@ -1735,6 +1744,28 @@ mod tests {
             params![stream.to_bytes().as_slice()],
         )
         .unwrap();
+    }
+
+    /// A concurrent `rag-rat rm` that commits its removal tombstone after the store-global drain
+    /// has snapshotted the repo list must NOT re-materialize the removed repo's synced content.
+    /// The in-transaction tombstone recheck skips it — without the guard, the projected peer
+    /// node would be resurrected into `repo_memories` after `rm` reported it gone.
+    #[test]
+    fn a_drain_skips_a_repo_with_a_removal_tombstone() {
+        let conn = scoped_conn();
+        create_concept(&conn, "seed");
+        let stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
+        // A peer node in the projection that a drain WOULD materialize.
+        seed_projected_node(&conn, stream, "mem_peer", "Invariant", "peer", "b", "active", &[]);
+        // `rm` tombstones the repo (its purge cleared the rows; the drain must not put them back).
+        rag_rat_db::schema::mark_repo_removed(&conn, REPO, 1).unwrap();
+
+        let outcome = drain_synced_stream_for_repo(&conn, REPO, 2_000).unwrap();
+        assert_eq!(outcome, DrainOutcome::default(), "a tombstoned repo's drain is a no-op");
+        assert!(
+            memory_by_id(&conn, "mem_peer").unwrap().is_none(),
+            "the removed repo's synced content is not resurrected by the drain",
+        );
     }
 
     /// The drain gate must SKIP its scan when the projection is unchanged since the last drain —
