@@ -81,6 +81,24 @@ The grep-augmentation PreToolUse hook augments Claude Code's `Grep` and Bash gre
 symbol and repo-memory context automatically; it ships with the rag-rat plugin (install the plugin —
 see the README's "Connect it to your agent (MCP)" section).
 
+## Public artifacts describe the change, not the process that produced it
+
+PR descriptions, commit messages, and issue text are read by humans reviewing the **change**. Keep
+them about the code — the problem, the fix, the rationale, how it was verified. Do **not** narrate
+the process that produced them:
+
+- No agent/subagent counts or fan-out language ("a 12-agent sweep found…", "each verifier reported…").
+- No multi-agent / workflow / orchestration / delegation framing, and no internal phase or round
+  codes (`C3.1`, "round 6"). Give the change a descriptive title and reference the issue number.
+- No naming of AI assistants or AI review tooling, and no review play-by-play ("caught in review and
+  fixed before merge"). State the final behavior; if a concern shaped the design, explain the concern
+  on its own terms.
+
+A reviewer should not be able to tell from a PR whether one agent or twenty produced it — only what
+changed and why. Durable, checkable references are encouraged: issue/PR numbers, commit SHAs, test
+names, file paths. (This is about *public* artifacts; rag-rat memories are the internal cross-agent
+layer and may record provenance freely.)
+
 ## Repo orientation
 
 - Rust workspace, nine crates in a layered DAG (Rust 2024 edition):
