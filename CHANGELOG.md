@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.21.0...rag-rat-base-v0.21.1) - 2026-07-24
+
+### Other
+
+- *(index)* return freed heap to the OS at heavy-pass terminals ([#910](https://github.com/cq27-dev/rag-rat/pull/910))
+
 ## [0.21.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.20.0...rag-rat-base-v0.21.0) - 2026-07-24
 
 ### Added

@@ -4848,7 +4848,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rag-rat"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4882,7 +4882,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-base"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "filetime",
@@ -4906,7 +4906,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-clones"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "rag-rat-base",
@@ -4922,7 +4922,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-core"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -4987,7 +4987,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-db"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "rag-rat-base",
@@ -5001,7 +5001,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-dream"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "rag-rat-base",
@@ -5020,7 +5020,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-llm"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "fastembed",
@@ -5041,7 +5041,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-mcp"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -5063,7 +5063,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-oplog"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -5085,7 +5085,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-oracle"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "protobuf",
@@ -5103,7 +5103,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-papertrail"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -5123,7 +5123,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-query"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "minicbor",
@@ -5142,7 +5142,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-sync"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "iroh",
