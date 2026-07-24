@@ -88,21 +88,12 @@ name = "rag-rat-oplog"
 version_group = "rag-rat"
 changelog_path = "./CHANGELOG.md"
 
-# rag-rat-sync joined the workspace in #406. It versions in lockstep with the group, but its FIRST
-# crates.io publish is deferred to a manual bootstrap (`publish = false`), for two reasons that both
-# apply only to a brand-new crate:
-#   1. The CI registry token can publish new VERSIONS of crates it already owns, but not RESERVE a
-#      new crate name. The first publish must come from a maintainer's token, which then `cargo
-#      owner --add`s the CI token so later releases publish it automatically.
-#   2. `cargo publish --verify` builds the packaged crate against the crates.io copies of its path
-#      deps. A new crate that uses APIs added to a sibling (rag-rat-oplog) in the same PR cannot
-#      verify until that sibling's new version is on the registry — which only happens at the next
-#      lockstep release.
-# Bootstrap once the next release has published the siblings: `cargo publish -p rag-rat-sync`, then
-# `cargo owner --add <ci-token-user> rag-rat-sync`, then delete this line so releases publish it in
-# lockstep like every other crate. Until then nothing depends on it downstream, so deferring is safe.
+# rag-rat-sync joined the workspace in #406 and was bootstrapped onto crates.io by hand for its
+# first two releases (0.21.0, 0.21.1): release-plz's registry token can publish new versions of a
+# crate it already owns but cannot RESERVE a new name, so the first publish had to come from a
+# maintainer's token — which now owns the crate. Bootstrap complete, so it publishes in lockstep
+# like every other member (no `publish = false`).
 [[package]]
 name = "rag-rat-sync"
 version_group = "rag-rat"
 changelog_path = "./CHANGELOG.md"
-publish = false
