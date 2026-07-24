@@ -2,7 +2,7 @@
   "name": "rag-rat",
   "displayName": "rag-rat",
   "description": "Local repo-intelligence index + MCP server: semantic search, symbol/graph navigation, impact-surface preflight, git + GitHub papertrail, and a source-anchored memory graph.",
-  "version": "0.21.0",
+  "version": "0.21.1",
   "author": { "name": "Kristaps Karlsons" },
   "homepage": "https://github.com/cq27-dev/rag-rat",
   "repository": "https://github.com/cq27-dev/rag-rat",
@@ -11,7 +11,7 @@
   "mcpServers": {
     "rag-rat": {
       "command": "npx",
-      "args": ["-y", "@rag-rat/bin@0.21.0", "mcp"]
+      "args": ["-y", "@rag-rat/bin@0.21.1", "mcp"]
     }
   }
 }
