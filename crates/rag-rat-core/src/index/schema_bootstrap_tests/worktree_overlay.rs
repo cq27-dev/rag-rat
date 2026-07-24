@@ -3023,3 +3023,229 @@ fn the_scoped_rederive_drops_a_removed_symbols_group() {
 
     let _ = fs::remove_dir_all(&main);
 }
+
+fn rust_symbol_selector(name: &str) -> rag_rat_query::symbol::SymbolSelector {
+    rag_rat_query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some(name.to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: true,
+        limit: 10,
+    }
+}
+
+/// #897: a symbol present in BOTH the base commit and a linked worktree's overlay (same key) has a
+/// STORED `variant_count` of 2 (`scope_replica`), but under the linked worktree's scope only ONE
+/// member is visible. `symbol_lookup` must report the SCOPE-VISIBLE count (1) / `single` — matching
+/// the member list it returns — not the corpus-level stored total.
+#[test]
+fn overlay_scope_symbol_lookup_reports_scope_visible_variant_count() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn foo() -> i32 {\n    1\n}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Body-only edit keeps foo's key line, so foo is a 2-member scope_replica group (base +
+    // overlay).
+    fs::write(linked.join("src/a.rs"), "pub fn foo() -> i32 {\n    2\n}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch body edit"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    // index_worktree_overlay leaves the connection in the overlay scope — symbol_lookup sees ONE
+    // foo.
+    let hit = db.symbol_candidates(&rust_symbol_selector("foo"), false).unwrap();
+    assert!(!hit.candidates.is_empty(), "foo resolves in the overlay scope");
+    assert_eq!(
+        hit.candidates[0].logical_variant_count,
+        Some(1),
+        "overlay scope sees ONE foo — variant_count must be the scope-visible count, not the \
+         corpus total (2)"
+    );
+    assert_eq!(hit.candidates[0].logical_group_reason.as_deref(), Some("single"));
+
+    // The graph/impact variant LIST must be scoped too, or it would disagree with the count and
+    // leak the hidden base member (#897 review): one visible member in the overlay scope, not two.
+    let logical_id = hit.candidates[0].logical_symbol_id.expect("logical id");
+    let members =
+        rag_rat_query::symbol::logical_members(db.storage.connection(), logical_id).unwrap();
+    assert_eq!(members.len(), 1, "the scoped variant list matches the scope-visible count (1)");
+
+    // The STORED corpus-level count is still 2: the fix is at surfacing time, not in the table.
+    let stored: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT variant_count FROM main.logical_symbols WHERE repo_id = ?1 AND logical_name = \
+             ?2",
+            rusqlite::params![db.active_repo_id, "foo"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, 2, "the stored corpus-level variant_count remains 2");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// #897 (rename half): under the overlay scope, `symbol_lookup` reflects the BRANCH's renamed symbol
+/// and NOT the pre-rename name; the base scope is the reverse — per-branch symbol visibility.
+#[test]
+fn overlay_scope_symbol_lookup_reflects_a_branch_rename() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn target_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn renamed_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "rename"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    let resolves = |db: &IndexDatabase, name: &str| {
+        !db.symbol_candidates(&rust_symbol_selector(name), false).unwrap().candidates.is_empty()
+    };
+    // Overlay scope (left installed by index_worktree_overlay):
+    assert!(resolves(&db, "renamed_fn"), "overlay scope sees the branch rename");
+    assert!(!resolves(&db, "target_fn"), "overlay scope does not see the pre-rename name");
+    // Base scope:
+    set_base_scope(&mut db, &main);
+    assert!(resolves(&db, "target_fn"), "base scope keeps the original name");
+    assert!(!resolves(&db, "renamed_fn"), "base scope does not see the branch rename");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// #898: with TWO simultaneously-live worktree overlays holding divergent branch-only content,
+/// removing exactly ONE worktree and running gc prunes only that worktree's `files` rows — the
+/// other live worktree's overlay rows remain intact.
+#[test]
+fn gc_prunes_only_the_removed_worktrees_overlay_with_two_live_overlays() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/base.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let wt_a = unique_temp_root();
+    let _ = fs::remove_dir_all(&wt_a);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-a", wt_a.to_str().unwrap()]);
+    fs::write(wt_a.join("src/a_only.rs"), "pub fn a_only() {}\n").unwrap();
+    run_git(&wt_a, &["add", "."]);
+    run_git(&wt_a, &["commit", "-q", "-m", "branch a"]);
+    let wt_b = unique_temp_root();
+    let _ = fs::remove_dir_all(&wt_b);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-b", wt_b.to_str().unwrap()]);
+    fs::write(wt_b.join("src/b_only.rs"), "pub fn b_only() {}\n").unwrap();
+    run_git(&wt_b, &["add", "."]);
+    run_git(&wt_b, &["commit", "-q", "-m", "branch b"]);
+
+    db.index_worktree_overlay(&config, &wt_a, &mut |_| {}).unwrap();
+    db.index_worktree_overlay(&config, &wt_b, &mut |_| {}).unwrap();
+    let a_id = worktree_id_of(&wt_a);
+    let b_id = worktree_id_of(&wt_b);
+    assert!(
+        overlay_rows(&db, &a_id).iter().any(|(path, _)| path == "src/a_only.rs"),
+        "worktree A's branch-only file is in its overlay"
+    );
+    assert!(
+        overlay_rows(&db, &b_id).iter().any(|(path, _)| path == "src/b_only.rs"),
+        "worktree B's branch-only file is in its overlay"
+    );
+
+    // Remove ONLY worktree B, then gc.
+    run_git(&main, &["worktree", "remove", "--force", wt_b.to_str().unwrap()]);
+    set_base_scope(&mut db, &main);
+    db.garbage_collect().unwrap();
+    assert!(overlay_rows(&db, &b_id).is_empty(), "gc pruned the removed worktree B's overlay rows");
+    assert!(
+        overlay_rows(&db, &a_id).iter().any(|(path, _)| path == "src/a_only.rs"),
+        "the still-live worktree A's overlay rows are untouched"
+    );
+    crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&wt_a);
+}
+
+/// #899: a linked worktree that DROPS a symbol via `index_worktree_overlay` (the Inline #826 route,
+/// NOT the Deferred batch fallback): the dropped symbol's group is removed by the scoped re-derive,
+/// the surviving symbol is kept, ZERO whole-repo rebuilds, and the result is the full rebuild's
+/// fixed point. Covers the #826 scoped path for a linked-worktree rename/removal (previously only
+/// the addition case exercised the Inline route).
+#[test]
+fn a_linked_worktree_symbol_drop_scopes_the_logical_rederive() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/one.rs"), "pub fn one_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds one_fn"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    // Dirty-add two_fn — it exists ONLY in the overlay (never committed).
+    fs::write(linked.join("src/one.rs"), "pub fn one_fn() {}\npub fn two_fn() {}\n").unwrap();
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(logical_symbol_named(&db, "two_fn"), "the dirty-added overlay symbol is grouped");
+
+    // Dirty-remove two_fn (the `// edited` line keeps one.rs dirty vs the feat commit, so this
+    // stays the Inline scoped route, not a stale-overlay heal). two_fn is now gone from EVERY
+    // live scope.
+    fs::write(linked.join("src/one.rs"), "// edited\npub fn one_fn() {}\n").unwrap();
+    let before = db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        db.logical_symbol_rebuilds.load(std::sync::atomic::Ordering::Relaxed) - before,
+        0,
+        "the drop is served by the Inline scoped re-derive, not a whole-repo rebuild"
+    );
+    assert!(
+        !logical_symbol_named(&db, "two_fn"),
+        "the removed overlay symbol's group is dropped via the scoped path"
+    );
+    assert!(logical_symbol_named(&db, "one_fn"), "the surviving symbol's group is intact");
+
+    let scoped = logical_grouping_snapshot(&db);
+    db.rebuild_logical_symbols(crate::index::graph_index::KeyVersionStamp::Defer).unwrap();
+    assert_eq!(
+        logical_grouping_snapshot(&db),
+        scoped,
+        "the scoped drop equals the whole-repo rebuild"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}

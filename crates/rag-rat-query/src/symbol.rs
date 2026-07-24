@@ -396,19 +396,39 @@ fn lookup_name(
     Ok(hits)
 }
 
+/// The `variant_count` and `group_reason` columns computed from the SCOPE-VISIBLE members of a
+/// `logical_symbols` row, not the stored corpus-level totals (#897). The stored `variant_count` is
+/// `members.len()` across ALL of a repo's scopes (a symbol in a dirty-overlaid file has one member
+/// per scope), but the member LIST every consumer reads is scope-filtered through the `files` view
+/// — so a scoped (worktree-overlay) `symbol_lookup` would otherwise report a count/label that
+/// disagrees with the members it returns (e.g. `variant_count=2` / `scope_replica` for one visible
+/// member). Joining the `files` view here filters to the members whose file is visible in the
+/// active scope, matching `lookup_logical_members`; the `group_reason` CASE mirrors
+/// `logical_group_reason` (single / same-file-multi / scope-replica) over that visible set. On an
+/// UNSCOPED connection (`files` resolves to `main.files`) these equal the stored columns.
+const SCOPED_LOGICAL_STATS: &str =
+    "\
+    (SELECT COUNT(*) FROM logical_symbol_members m JOIN symbols s ON s.id = m.symbol_id JOIN files \
+     f ON f.id = s.file_id WHERE m.logical_symbol_id = logical_symbols.id), (SELECT CASE WHEN \
+     COUNT(*) <= 1 THEN 'single' WHEN COUNT(*) > COUNT(DISTINCT s.file_id) THEN 'same_file_multi' \
+     ELSE 'scope_replica' END FROM logical_symbol_members m JOIN symbols s ON s.id = m.symbol_id \
+     JOIN files f ON f.id = s.file_id WHERE m.logical_symbol_id = logical_symbols.id)";
+
 pub fn lookup_logical_by_id(
     conn: &Connection,
     logical_symbol_id: i64,
 ) -> anyhow::Result<Option<LogicalSymbolHit>> {
     conn.query_row(
-        "
+        &format!(
+            "
         SELECT logical_symbols.id, logical_symbols.language, logical_symbols.path,
                logical_symbols.logical_name, qn.value, logical_symbols.kind,
-               logical_symbols.variant_count, logical_symbols.group_reason
+               {SCOPED_LOGICAL_STATS}
         FROM logical_symbols
         LEFT JOIN name_strings qn ON qn.id = logical_symbols.qualified_name_id
         WHERE logical_symbols.id = ?1
-        ",
+        "
+        ),
         [logical_symbol_id],
         logical_symbol_hit_row,
     )
@@ -421,15 +441,17 @@ pub fn logical_for_symbol_id(
     symbol_id: i64,
 ) -> anyhow::Result<Option<LogicalSymbolHit>> {
     conn.query_row(
-        "
+        &format!(
+            "
         SELECT logical_symbols.id, logical_symbols.language, logical_symbols.path,
                logical_symbols.logical_name, qn.value, logical_symbols.kind,
-               logical_symbols.variant_count, logical_symbols.group_reason
+               {SCOPED_LOGICAL_STATS}
         FROM logical_symbol_members
         JOIN logical_symbols ON logical_symbols.id = logical_symbol_members.logical_symbol_id
         LEFT JOIN name_strings qn ON qn.id = logical_symbols.qualified_name_id
         WHERE logical_symbol_members.symbol_id = ?1
-        ",
+        "
+        ),
         [symbol_id],
         logical_symbol_hit_row,
     )
@@ -441,12 +463,20 @@ pub fn logical_members(
     conn: &Connection,
     logical_symbol_id: i64,
 ) -> anyhow::Result<Vec<LogicalSymbolMember>> {
+    // Scope-filter through the `files` view (#897): a logical symbol is scope-independent (one
+    // member per scope of a path), so an unscoped list would surface members hidden by the
+    // active worktree-overlay scope — and disagree with the scope-visible `variant_count` this
+    // same graph / impact response reports (via `SCOPED_LOGICAL_STATS`). The JOIN filters to
+    // members whose file is visible in the active scope, matching `lookup_logical_members`; on
+    // an unscoped connection (`files` → `main.files`) the list is unchanged.
     let mut stmt = conn.prepare(
         "
-        SELECT symbol_id, cfg_expr, signature_hash, start_line, end_line
-        FROM logical_symbol_members
-        WHERE logical_symbol_id = ?1
-        ORDER BY start_line, symbol_id
+        SELECT m.symbol_id, m.cfg_expr, m.signature_hash, m.start_line, m.end_line
+        FROM logical_symbol_members m
+        JOIN symbols s ON s.id = m.symbol_id
+        JOIN files f ON f.id = s.file_id
+        WHERE m.logical_symbol_id = ?1
+        ORDER BY m.start_line, m.symbol_id
         ",
     )?;
     let rows = stmt.query_map([logical_symbol_id], |row| {
