@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use rag_rat_base::config::Config;
 use rag_rat_base::{hash, locks, time};
-use rag_rat_sync::{AuthPolicy, NodeAuth, OplogSyncStore};
+use rag_rat_sync::{AuthPolicy, NodeAuth, OplogContentSyncStore, OplogSyncStore};
 use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
 
@@ -70,9 +70,10 @@ fn effective_relay_url(config: &Config) -> String {
 }
 
 /// Run a headless store-and-forward peer for this account's op log: bind the sync endpoint over the
-/// configured relay and replicate the account log with peers the roster authorizes. Serves the
-/// account log only — the wire is scoped to one stream per session, so content replication is a
-/// separate stream a later slice adds. Runs until interrupted; `once` serves a single connection.
+/// configured relay and replicate with peers the roster authorizes. Serves BOTH streams a peer may
+/// negotiate — the account log (`SYNC_ALPN`) and `/3` content (`CONTENT_SYNC_ALPN`) — routing
+/// each connection by its ALPN. Runs until interrupted; `once` serves a single connection (one
+/// stream), so a full account+content sync a device drives needs two connections.
 fn serve(config: &Config, once: bool) -> anyhow::Result<()> {
     let relay = effective_relay_url(config);
     // Hold a database-scoped session lock for the SERVER'S WHOLE LIFETIME. `sync_node_secret` is
@@ -150,12 +151,21 @@ fn serve(config: &Config, once: bool) -> anyhow::Result<()> {
         // delivered between iterations be swallowed by tokio's driver and missed.
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
         loop {
-            let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
+            // One endpoint, one accept loop: a connection carries the ACCOUNT-LOG ALPN or the
+            // CONTENT ALPN, and `accept_and_dispatch` routes it to the matching store after the
+            // (account-level) auth phase. Both stores are cheap handles reconstructed per accept.
+            let mut account_store = OplogSyncStore::new(conn, account_id, time::now_ms);
+            let mut content_store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
             let outcome = tokio::select! {
-                // `accept_and_sync` reads `now_ms` once a peer connects — the server may wait here
-                // arbitrarily long, so the auth timestamp must not predate the connection.
-                report = rag_rat_sync::accept_and_sync(&endpoint, &mut store, policy, time::now_ms)
-                    => Some(report),
+                // `accept_and_dispatch` reads `now_ms` once a peer connects — the server may wait
+                // here arbitrarily long, so the auth timestamp must not predate the connection.
+                result = rag_rat_sync::accept_and_dispatch(
+                    &endpoint,
+                    &mut account_store,
+                    &mut content_store,
+                    policy,
+                    time::now_ms,
+                ) => Some(result),
                 _ = &mut shutdown => None,
             };
             match outcome {
@@ -163,7 +173,8 @@ fn serve(config: &Config, once: bool) -> anyhow::Result<()> {
                     tracing::info!("interrupted; shutting down");
                     break;
                 },
-                Some(Ok(report)) => tracing::info!(
+                Some(Ok((alpn, report))) => tracing::info!(
+                    stream = %String::from_utf8_lossy(&alpn),
                     sent = report.entries_sent,
                     received = report.entries_received,
                     stored = report.entries_newly_stored,
@@ -280,29 +291,63 @@ pub(crate) fn device_sync_run(
                     continue;
                 },
             };
-            let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
-            match rag_rat_sync::connect_and_sync(
-                &endpoint,
-                addr,
-                &mut store,
-                AuthPolicy::Closed,
-                time::now_ms(),
-            )
-            .await
-            {
-                Ok(report) => {
-                    ok += 1;
-                    tracing::info!(
+            // Account log FIRST — it carries the roster + stream ownership that AUTHORIZE content, so
+            // leading with it minimizes parking on the peer. The account-log result IS the peer's
+            // outcome, so `ok + errors` stays equal to the number of configured peers. `/3` content
+            // rides on top: best-effort, attempted only once the account log reached the peer, and a
+            // content hiccup is logged — never a peer failure.
+            let account_ok = {
+                let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
+                match rag_rat_sync::connect_and_sync(
+                    &endpoint,
+                    addr.clone(),
+                    rag_rat_sync::SYNC_ALPN,
+                    &mut store,
+                    AuthPolicy::Closed,
+                    time::now_ms(),
+                )
+                .await
+                {
+                    Ok(report) => {
+                        tracing::info!(
+                            peer,
+                            sent = report.entries_sent,
+                            stored = report.entries_newly_stored,
+                            "device sync (account log) complete"
+                        );
+                        true
+                    },
+                    Err(e) => {
+                        tracing::warn!(peer, error = %e, "device sync (account log) failed");
+                        false
+                    },
+                }
+            };
+            if account_ok {
+                let mut store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
+                match rag_rat_sync::connect_and_sync(
+                    &endpoint,
+                    addr,
+                    rag_rat_sync::CONTENT_SYNC_ALPN,
+                    &mut store,
+                    AuthPolicy::Closed,
+                    time::now_ms(),
+                )
+                .await
+                {
+                    Ok(report) => tracing::info!(
                         peer,
                         sent = report.entries_sent,
                         stored = report.entries_newly_stored,
-                        "device sync with a server peer complete"
-                    );
-                },
-                Err(e) => {
-                    errors += 1;
-                    tracing::warn!(peer, error = %e, "device sync to a server peer failed");
-                },
+                        "device sync (content) complete"
+                    ),
+                    Err(e) => tracing::warn!(peer, error = %e, "device sync (content) failed"),
+                }
+            }
+            if account_ok {
+                ok += 1;
+            } else {
+                errors += 1;
             }
         }
         anyhow::Ok((ok, errors))

@@ -13,11 +13,19 @@
 
 use minicbor::{Decoder, Encoder};
 
-/// The ALPN this protocol speaks. Versioned: a breaking wire change bumps the suffix so an old peer
-/// declines the handshake instead of misreading frames. Bumped to `/2` for the #881 auth phase (the
-/// `Auth` frame exchanged before any inventory) — a `/1` peer, which would stream its inventory
-/// without authenticating, must not interoperate.
+/// The ALPN for the ACCOUNT-LOG stream. Versioned: a breaking wire change bumps the suffix so an
+/// old peer declines the handshake instead of misreading frames. Bumped to `/2` for the #881 auth
+/// phase (the `Auth` frame exchanged before any inventory) — a `/1` peer, which would stream its
+/// inventory without authenticating, must not interoperate.
 pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/2";
+
+/// The ALPN for the `/3` CONTENT stream — the memories themselves (#907). Same frame protocol and
+/// same account-level auth phase as [`SYNC_ALPN`]; only the STORE differs (`OplogContentSyncStore`
+/// vs `OplogSyncStore`). The stream is discriminated by the ALPN, not a frame field, so the
+/// acceptor picks the store from `conn.alpn()` and the account-log wire stays byte-identical. A
+/// peer that does not speak this ALPN simply never exchanges content — account-log sync is
+/// unaffected.
+pub const CONTENT_SYNC_ALPN: &[u8] = b"rag-rat/content/1";
 
 /// Domain tag committed into every frame's leading array element, so a frame from another protocol
 /// (or a truncated one) cannot be mistaken for a valid frame.
@@ -240,6 +248,16 @@ mod tests {
     fn roundtrip(frame: &Frame) {
         let bytes = frame.encode();
         assert_eq!(&Frame::decode(&bytes).unwrap(), frame, "encode∘decode is identity");
+    }
+
+    /// The ALPN identifiers are a frozen wire contract — an accidental rename would silently split
+    /// peers (an old peer declines the handshake). Pin both, and that they are distinct so the
+    /// acceptor can route account-log vs content by ALPN.
+    #[test]
+    fn alpn_identifiers_are_frozen() {
+        assert_eq!(SYNC_ALPN, b"rag-rat/sync/2");
+        assert_eq!(CONTENT_SYNC_ALPN, b"rag-rat/content/1");
+        assert_ne!(SYNC_ALPN, CONTENT_SYNC_ALPN);
     }
 
     #[test]

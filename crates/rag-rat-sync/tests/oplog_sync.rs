@@ -363,7 +363,15 @@ async fn a_real_iroh_round_trip_restores_an_account() {
     let server =
         async { rag_rat_sync::accept_and_sync(&listener, &mut source_store, policy, || NOW).await };
     let client = async {
-        rag_rat_sync::connect_and_sync(&dialer, listener_addr, &mut dest_store, policy, NOW).await
+        rag_rat_sync::connect_and_sync(
+            &dialer,
+            listener_addr,
+            rag_rat_sync::SYNC_ALPN,
+            &mut dest_store,
+            policy,
+            NOW,
+        )
+        .await
     };
     let (server_r, client_r) = tokio::join!(server, client);
     server_r.unwrap();
@@ -371,6 +379,131 @@ async fn a_real_iroh_round_trip_restores_an_account() {
 
     let got = account_entries_for_sync(&dest, account_id).unwrap();
     assert_eq!(got.len(), want.len(), "the account restored over real iroh transport");
+}
+
+/// LIVE: content (`/3`) restores over the real iroh transport via ALPN dispatch (#907). One
+/// endpoint binds both ALPNs; the dialer syncs the account log (`SYNC_ALPN`) then content
+/// (`CONTENT_SYNC_ALPN`), and `accept_and_dispatch` routes each connection to the matching store.
+#[tokio::test]
+#[ignore = "live: binds iroh endpoints and dials over the relay"]
+async fn a_real_iroh_round_trip_restores_content_via_alpn_dispatch() {
+    use rag_rat_oplog::{
+        MemoryOp, NodeContent, NodeId, SealPolicy, author_content_batch, content_entries_for_sync,
+        ensure_owned_stream_v2_in_tx,
+    };
+    use rag_rat_sync::{CONTENT_SYNC_ALPN, OplogContentSyncStore, SYNC_ALPN};
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    let relay = std::env::var("RAG_RAT_SYNC_RELAY").expect("set RAG_RAT_SYNC_RELAY to run this");
+
+    // Source: an account, an owned stream, two authored content entries.
+    let source = fresh_db();
+    let account_id = local_account(&source, NOW).unwrap();
+    let stream = {
+        let tx = Transaction::new_unchecked(&source, TransactionBehavior::Immediate).unwrap();
+        let s = ensure_owned_stream_v2_in_tx(&tx, "repo-a", NOW).unwrap();
+        tx.commit().unwrap();
+        s
+    };
+    let node = |id: &str, title: &str| MemoryOp::NodeCreate {
+        node_id: NodeId::from(id),
+        content: NodeContent {
+            kind: "Invariant".into(),
+            title: title.into(),
+            body: "body".into(),
+            confidence: "high".into(),
+            source: "agent".into(),
+            tags: Vec::new(),
+            payload: None,
+        },
+    };
+    author_content_batch(
+        &source,
+        stream,
+        &[node("n1", "first"), node("n2", "second")],
+        SealPolicy::Plaintext,
+        NOW,
+    )
+    .unwrap();
+    let want = content_entries_for_sync(&source, account_id).unwrap();
+    assert_eq!(want.len(), 2, "the source authored two content entries to move");
+
+    let dest = fresh_db();
+    let listener = rag_rat_sync::build_endpoint([3u8; 32], &relay).await.unwrap();
+    let dialer = rag_rat_sync::build_endpoint([4u8; 32], &relay).await.unwrap();
+    let listener_addr = rag_rat_sync::endpoint_addr(&listener);
+    let policy = rag_rat_sync::AuthPolicy::Open;
+
+    // Account log FIRST — carries the roster + stream ownership that authorize content acceptance.
+    {
+        let mut src_account = OplogSyncStore::new(&source, account_id, || NOW);
+        let mut src_content = OplogContentSyncStore::new(&source, account_id, || NOW);
+        let mut dst_account = OplogSyncStore::new(&dest, account_id, || NOW);
+        let server = async {
+            rag_rat_sync::accept_and_dispatch(
+                &listener,
+                &mut src_account,
+                &mut src_content,
+                policy,
+                || NOW,
+            )
+            .await
+        };
+        let client = async {
+            rag_rat_sync::connect_and_sync(
+                &dialer,
+                listener_addr.clone(),
+                SYNC_ALPN,
+                &mut dst_account,
+                policy,
+                NOW,
+            )
+            .await
+        };
+        let (server_r, client_r) = tokio::join!(server, client);
+        let (alpn, _) = server_r.unwrap();
+        assert_eq!(alpn, SYNC_ALPN, "the account-log connection routes to the account store");
+        client_r.unwrap();
+    }
+
+    // Content next — accepted now that its authority is present on the dest.
+    {
+        let mut src_account = OplogSyncStore::new(&source, account_id, || NOW);
+        let mut src_content = OplogContentSyncStore::new(&source, account_id, || NOW);
+        let mut dst_content = OplogContentSyncStore::new(&dest, account_id, || NOW);
+        let server = async {
+            rag_rat_sync::accept_and_dispatch(
+                &listener,
+                &mut src_account,
+                &mut src_content,
+                policy,
+                || NOW,
+            )
+            .await
+        };
+        let client = async {
+            rag_rat_sync::connect_and_sync(
+                &dialer,
+                listener_addr,
+                CONTENT_SYNC_ALPN,
+                &mut dst_content,
+                policy,
+                NOW,
+            )
+            .await
+        };
+        let (server_r, client_r) = tokio::join!(server, client);
+        let (alpn, _) = server_r.unwrap();
+        assert_eq!(alpn, CONTENT_SYNC_ALPN, "the content connection routes to the content store");
+        client_r.unwrap();
+    }
+
+    let got = content_entries_for_sync(&dest, account_id).unwrap();
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "content restored over real iroh transport via ALPN dispatch"
+    );
 }
 
 /// A peer that offers a valid entry for a DIFFERENT account than the session is scoped to must not
