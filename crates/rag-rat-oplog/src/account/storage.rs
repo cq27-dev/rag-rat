@@ -1941,6 +1941,26 @@ pub(super) fn list_effective_roster_fingerprints(
     rows.into_iter().map(|fp| Ok(DeviceFingerprint::from_bytes(fixed(&fp)?))).collect()
 }
 
+/// The effective enrollment entry and current role for `fingerprint`, read in the caller's
+/// snapshot. This is the exact fact an enrollment author verifies after refolding: the returned
+/// `roster_ref` identifies which `DeviceAdd` won, not merely that some enrollment exists.
+pub(super) fn effective_roster_entry_in_snapshot(
+    conn: &Connection,
+    account_id: AccountId,
+    fingerprint: DeviceFingerprint,
+) -> anyhow::Result<Option<(EntryHash, ops::DeviceRole)>> {
+    let row: Option<(Vec<u8>, String)> = conn
+        .query_row(
+            "SELECT roster_ref, role FROM account_roster_history
+             WHERE account_id = ?1 AND device_fingerprint = ?2 AND closed_at IS NULL",
+            params![account_id.to_bytes().as_slice(), fingerprint.to_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(roster_ref, role)| Ok((fixed(&roster_ref)?, ops::DeviceRole::from_db_str(&role)?)))
+        .transpose()
+}
+
 /// The x25519 key the ONE accepted enrollment entry at `roster_ref` certifies for `fingerprint`
 /// (genesis → its founder / header device; DeviceAdd → the ADDED device), routed through the
 /// small-order / identity blocklist. Bound to that exact `entry_hash`, so a rejected/forked sibling

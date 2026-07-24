@@ -264,18 +264,9 @@ pub fn author_device_add_in_tx(
     // Asserting `roster_ref` + role ties the result to our entry — and a `DeviceAdd` from a
     // device without effective owner authority folds `Rejected` (leaving no effective row of
     // ours), so this still errors for a non-owner.
-    let effective: Option<(Vec<u8>, String)> = tx
-        .query_row(
-            "SELECT roster_ref, role FROM account_roster_history WHERE account_id = ?1 AND \
-             device_fingerprint = ?2 AND closed_at IS NULL",
-            params![account_id.to_bytes().as_slice(), fingerprint.to_bytes().as_slice()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    match effective {
-        Some((roster_ref, role_str))
-            if roster_ref.as_slice() == entry_hash.as_slice()
-                && ops::DeviceRole::from_db_str(&role_str)? == role => {},
+    match storage::effective_roster_entry_in_snapshot(tx, account_id, fingerprint)? {
+        Some((roster_ref, effective_role))
+            if roster_ref == entry_hash && effective_role == role => {},
         _ => anyhow::bail!(
             "the DeviceAdd did not become the joiner's effective roster entry at the requested \
              role — the local device lacks effective owner authority to enroll (founder-owner \
