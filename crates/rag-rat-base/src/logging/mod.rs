@@ -131,6 +131,7 @@ mod tests {
         Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: dir.to_path_buf(),

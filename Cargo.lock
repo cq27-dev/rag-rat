@@ -4853,6 +4853,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dialoguer",
+ "getrandom 0.4.3",
  "gix",
  "libc",
  "path-slash",
@@ -4866,6 +4867,7 @@ dependencies = [
  "rag-rat-oracle",
  "rag-rat-papertrail",
  "rag-rat-query",
+ "rag-rat-sync",
  "ratatui",
  "rusqlite",
  "serde",
@@ -4878,6 +4880,7 @@ dependencies = [
  "toon-format",
  "tracing",
  "tui-tree-widget",
+ "zeroize",
 ]
 
 [[package]]

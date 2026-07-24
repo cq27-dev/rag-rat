@@ -33,8 +33,8 @@ async fn a_fresh_peer_restores_an_account_over_the_session() {
         "the destination starts empty for this account",
     );
 
-    let mut source_store = OplogSyncStore::new(&source, account_id, NOW);
-    let mut dest_store = OplogSyncStore::new(&dest, account_id, NOW);
+    let mut source_store = OplogSyncStore::new(&source, account_id, || NOW);
+    let mut dest_store = OplogSyncStore::new(&dest, account_id, || NOW);
 
     let (a_send, b_recv) = tokio::io::duplex(1 << 20);
     let (b_send, a_recv) = tokio::io::duplex(1 << 20);
@@ -70,7 +70,7 @@ async fn two_peers_in_sync_transfer_nothing() {
     // Seed b with the same entries by ingesting a's, so both hold the identical set.
     let b = fresh_db();
     {
-        let mut b_store = OplogSyncStore::new(&b, account_id, NOW);
+        let mut b_store = OplogSyncStore::new(&b, account_id, || NOW);
         for e in &entries {
             use rag_rat_sync::SyncStore;
             b_store.ingest(&e.signed_bytes).unwrap();
@@ -78,8 +78,8 @@ async fn two_peers_in_sync_transfer_nothing() {
     }
     assert_eq!(account_entries_for_sync(&b, account_id).unwrap().len(), entries.len());
 
-    let mut a_store = OplogSyncStore::new(&a, account_id, NOW);
-    let mut b_store = OplogSyncStore::new(&b, account_id, NOW);
+    let mut a_store = OplogSyncStore::new(&a, account_id, || NOW);
+    let mut b_store = OplogSyncStore::new(&b, account_id, || NOW);
     let (a_send, b_recv) = tokio::io::duplex(1 << 16);
     let (b_send, a_recv) = tokio::io::duplex(1 << 16);
     let (ra, rb) = tokio::join!(
@@ -145,8 +145,8 @@ async fn a_fresh_peer_restores_the_accounts_content_after_the_account_log() {
     //    content session run before this would still transfer the bytes, but they would park until
     //    authority arrived; restore runs the logs in dependency order.
     {
-        let mut src = OplogSyncStore::new(&source, account_id, NOW);
-        let mut dst = OplogSyncStore::new(&dest, account_id, NOW);
+        let mut src = OplogSyncStore::new(&source, account_id, || NOW);
+        let mut dst = OplogSyncStore::new(&dest, account_id, || NOW);
         let (a_send, b_recv) = tokio::io::duplex(1 << 20);
         let (b_send, a_recv) = tokio::io::duplex(1 << 20);
         let (ra, rb) = tokio::join!(
@@ -159,8 +159,8 @@ async fn a_fresh_peer_restores_the_accounts_content_after_the_account_log() {
 
     // 2) Content — the memories.
     let dest_report = {
-        let mut src = OplogContentSyncStore::new(&source, account_id, NOW);
-        let mut dst = OplogContentSyncStore::new(&dest, account_id, NOW);
+        let mut src = OplogContentSyncStore::new(&source, account_id, || NOW);
+        let mut dst = OplogContentSyncStore::new(&dest, account_id, || NOW);
         let (a_send, b_recv) = tokio::io::duplex(1 << 20);
         let (b_send, a_recv) = tokio::io::duplex(1 << 20);
         let (ra, rb) = tokio::join!(
@@ -248,7 +248,7 @@ async fn foreign_account_content_is_not_stored() {
     let mine = fresh_db();
     let my_account = local_account(&mine, NOW).unwrap();
     assert_ne!(my_account.to_bytes(), other_account.to_bytes());
-    let mut store = OplogContentSyncStore::new(&mine, my_account, NOW);
+    let mut store = OplogContentSyncStore::new(&mine, my_account, || NOW);
     assert_eq!(
         store.ingest(&foreign).unwrap(),
         rag_rat_sync::Ingested::NoChange,
@@ -270,7 +270,7 @@ fn a_store_authorizes_its_own_binding_but_not_from_another_node() {
 
     let db = fresh_db();
     let account = local_account(&db, NOW).unwrap();
-    let store = OplogSyncStore::new(&db, account, NOW);
+    let store = OplogSyncStore::new(&db, account, || NOW);
 
     let node = [4u8; 32];
     let binding = store.local_binding(&node, NOW).unwrap();
@@ -292,7 +292,7 @@ fn a_store_authorizes_against_the_handshake_clock_not_its_construction_time() {
 
     let db = fresh_db();
     let account = local_account(&db, NOW).unwrap();
-    let stale = OplogSyncStore::new(&db, account, NOW); // constructed with an old clock
+    let stale = OplogSyncStore::new(&db, account, || NOW); // constructed with an old clock
     let node = [4u8; 32];
 
     let much_later = NOW + 10 * 24 * 60 * 60 * 1000; // ten days after construction
@@ -311,7 +311,7 @@ fn a_store_without_an_account_presents_an_empty_binding_and_authorizes_nothing()
 
     let db = fresh_db(); // schema only, no account
     let account = AccountId::from_bytes([7u8; 32]);
-    let store = OplogSyncStore::new(&db, account, NOW);
+    let store = OplogSyncStore::new(&db, account, || NOW);
     assert!(
         store.local_binding(&[1u8; 32], NOW).unwrap().is_empty(),
         "no local device => an anonymous (empty) binding",
@@ -330,7 +330,7 @@ fn the_content_store_carries_the_same_node_auth() {
 
     let db = fresh_db();
     let account = local_account(&db, NOW).unwrap();
-    let store = OplogContentSyncStore::new(&db, account, NOW);
+    let store = OplogContentSyncStore::new(&db, account, || NOW);
     let node = [4u8; 32];
     let binding = store.local_binding(&node, NOW).unwrap();
     assert!(store.authorize(&binding, &node, NOW).unwrap(), "own node authorized");
@@ -354,14 +354,14 @@ async fn a_real_iroh_round_trip_restores_an_account() {
     let dialer = rag_rat_sync::build_endpoint([2u8; 32], &relay).await.unwrap();
     let listener_addr = rag_rat_sync::endpoint_addr(&listener);
 
-    let mut source_store = OplogSyncStore::new(&source, account_id, NOW);
-    let mut dest_store = OplogSyncStore::new(&dest, account_id, NOW);
+    let mut source_store = OplogSyncStore::new(&source, account_id, || NOW);
+    let mut dest_store = OplogSyncStore::new(&dest, account_id, || NOW);
     // The dest is a fresh peer with no local device (onboarding), so this round-trip uses `Open`;
     // the node-authorization path is covered directly by the auth-phase tests below and the oplog
     // node_binding unit tests.
     let policy = rag_rat_sync::AuthPolicy::Open;
     let server =
-        async { rag_rat_sync::accept_and_sync(&listener, &mut source_store, policy, NOW).await };
+        async { rag_rat_sync::accept_and_sync(&listener, &mut source_store, policy, || NOW).await };
     let client = async {
         rag_rat_sync::connect_and_sync(&dialer, listener_addr, &mut dest_store, policy, NOW).await
     };
@@ -390,7 +390,7 @@ async fn an_entry_for_another_account_is_not_stored() {
     assert_ne!(my_account.to_bytes(), other_account.to_bytes());
 
     // A store scoped to MY account is handed the OTHER account's (perfectly valid) entry.
-    let mut store = OplogSyncStore::new(&mine, my_account, NOW);
+    let mut store = OplogSyncStore::new(&mine, my_account, || NOW);
     let outcome = store.ingest(&other_entry).unwrap();
     assert_eq!(outcome, rag_rat_sync::Ingested::NoChange, "a foreign-account entry is refused");
     // And it did not land: my account holds only its own genesis, the other account holds nothing.

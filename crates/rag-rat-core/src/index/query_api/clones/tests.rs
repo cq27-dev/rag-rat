@@ -196,6 +196,7 @@ fn find_clones_rejects_nan_and_non_finite_min_similarity() {
     let config = rag_rat_base::config::Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -784,6 +785,7 @@ fn recall_candidates_identical_blob_vs_postings_grouping() {
     let config = rag_rat_base::config::Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

@@ -74,6 +74,7 @@ fn rag_rat_config(root: &Path) -> Config {
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.to_path_buf(),
@@ -200,6 +201,7 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -358,6 +360,7 @@ fn source_config_dirs(root: PathBuf, language: Language, dirs: &[&str]) -> Confi
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -753,6 +756,7 @@ fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -886,6 +890,7 @@ fn four_clone_config(root: &Path) -> Config {
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.to_path_buf(),

@@ -6,7 +6,8 @@ use std::str::FromStr;
 use super::{
     self as config, Config, ConfigError, DistillLlmConfig, DreamLlmConfig, EmbeddingConfig,
     LlmConfig, LogConfig, MemoryConfig, OracleConfig, PapertrailConfig, RawConfig, RawTarget,
-    ResolvedTarget, SearchConfig, TargetKind, TrackerConfig, VersionCheckConfig, WatchConfig,
+    ResolvedTarget, SearchConfig, SyncConfig, TargetKind, TrackerConfig, VersionCheckConfig,
+    WatchConfig,
 };
 use crate::language::Language;
 
@@ -271,6 +272,7 @@ impl Config {
         let version_check = raw.version_check.into();
         let oracle = raw.oracle.into();
         let search = raw.search.into();
+        let sync = raw.sync.into();
         let memory = MemoryConfig::try_from(raw.memory)?;
         let trackers =
             raw.tracker.into_iter().map(TrackerConfig::try_from).collect::<Result<Vec<_>, _>>()?;
@@ -299,6 +301,7 @@ impl Config {
             memory,
             trackers,
             papertrail,
+            sync,
             log,
             repo_id_override,
             database_key_pinned,
@@ -329,6 +332,7 @@ impl Config {
             memory: MemoryConfig::default(),
             trackers: Vec::new(),
             papertrail: PapertrailConfig::default(),
+            sync: SyncConfig::default(),
             repo_id_override: None,
             database_key_pinned: false,
             source_root_reanchored_from: None,

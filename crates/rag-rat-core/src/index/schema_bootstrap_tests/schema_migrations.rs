@@ -10,6 +10,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

@@ -66,6 +66,7 @@ pub fn bench_config(subdir: &str) -> Config {
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: corpus_dir(),

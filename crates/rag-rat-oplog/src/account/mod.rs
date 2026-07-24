@@ -45,7 +45,7 @@ mod storage;
 pub use authoring::{
     ensure_owned_stream_v2_in_tx, established_owned_stream_v2, owned_stream_v2_id,
 };
-pub use bootstrap::local_account;
+pub use bootstrap::{local_account, read_local_account};
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, ContentRefoldBudget,

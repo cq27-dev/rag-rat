@@ -54,12 +54,15 @@ fn authorize_binding(
 pub struct OplogSyncStore<'a> {
     conn: &'a Connection,
     account_id: AccountId,
-    now_ms: i64,
+    /// A CLOCK, not a captured instant: `ingest` reads it when an entry actually arrives, so a
+    /// long-idle acceptor stamps `received_at_ms` (and drives pre-verify eviction ordering) with
+    /// the receipt time, not a stale construction time.
+    now_fn: fn() -> i64,
 }
 
 impl<'a> OplogSyncStore<'a> {
-    pub fn new(conn: &'a Connection, account_id: AccountId, now_ms: i64) -> Self {
-        Self { conn, account_id, now_ms }
+    pub fn new(conn: &'a Connection, account_id: AccountId, now_fn: fn() -> i64) -> Self {
+        Self { conn, account_id, now_fn }
     }
 }
 
@@ -102,7 +105,7 @@ impl SyncStore for OplogSyncStore<'_> {
         // A structurally rejected entry is NOT an error — a peer may legitimately offer something
         // this binary refuses (e.g. over a future cap) — so map it to NoChange, not a failure that
         // would abort the whole session.
-        match account_ingest(self.conn, signed_bytes, self.now_ms)? {
+        match account_ingest(self.conn, signed_bytes, (self.now_fn)())? {
             // Newly durable: stored, or durably parked pending its signer. Every `Ingested*`
             // variant added state (the `RejectedPromotions` suffixes report collateral pre-verify
             // eviction of OTHER parked rows, not a failure of THIS entry).
@@ -137,12 +140,14 @@ impl SyncStore for OplogSyncStore<'_> {
 pub struct OplogContentSyncStore<'a> {
     conn: &'a Connection,
     account_id: AccountId,
-    now_ms: i64,
+    /// A CLOCK read at ingest time (see [`OplogSyncStore::now_fn`]), not a captured instant, so a
+    /// long-idle acceptor stamps received content with its receipt time.
+    now_fn: fn() -> i64,
 }
 
 impl<'a> OplogContentSyncStore<'a> {
-    pub fn new(conn: &'a Connection, account_id: AccountId, now_ms: i64) -> Self {
-        Self { conn, account_id, now_ms }
+    pub fn new(conn: &'a Connection, account_id: AccountId, now_fn: fn() -> i64) -> Self {
+        Self { conn, account_id, now_fn }
     }
 }
 
@@ -189,7 +194,7 @@ impl SyncStore for OplogContentSyncStore<'_> {
         // budgets. A structural refusal (Rejected) or a capacity block is NOT a session error — a
         // peer may legitimately offer what this binary declines (e.g. content over the remote-flood
         // cap) — so map both to NoChange rather than aborting the whole session.
-        match content_ingest(self.conn, signed_bytes, self.now_ms)? {
+        match content_ingest(self.conn, signed_bytes, (self.now_fn)())? {
             // Newly durable: stored as a candidate, or durably parked pending its roster key. The
             // `Eviction` suffix reports collateral pre-verify eviction of OTHER parked rows, not a
             // failure of THIS entry.
@@ -206,9 +211,9 @@ impl SyncStore for OplogContentSyncStore<'_> {
 // Both op-log stores carry the same account-level node-authorization capability (the binding is
 // about the account + transport node, independent of whether the session moves account entries or
 // content), so both delegate to the shared helpers above.
-// Both auth methods take `now_ms` per HANDSHAKE (not the store's construction-time `now_ms`, which
-// stays the ingest timestamp for received entries): binding freshness must track the live clock, or
-// a reused store would mint stale bindings and never advance the replay window.
+// Both auth methods take `now_ms` per HANDSHAKE (distinct from the store's `now_fn` ingest clock):
+// binding freshness must track the live clock, or a reused store would mint stale bindings and
+// never advance the replay window.
 impl NodeAuth for OplogSyncStore<'_> {
     fn local_binding(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<Vec<u8>> {
         sign_binding(self.conn, self.account_id, local_node, now_ms)

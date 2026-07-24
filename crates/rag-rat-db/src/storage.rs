@@ -164,6 +164,18 @@ impl IndexConnection {
         &self.conn
     }
 
+    /// Size-gated ([`WAL_CHECKPOINT_MIN_BYTES`]), best-effort `wal_checkpoint(TRUNCATE)`. The
+    /// Drop-time fold and any long-lived holder's cadence fold (the watcher per pass, `sync serve`
+    /// between sessions) share this so the gate and best-effort semantics live in one place — a
+    /// busy or failed truncate simply rides the next fold.
+    pub fn fold_wal(&self) {
+        if wal_bytes(&self.database_path) < WAL_CHECKPOINT_MIN_BYTES {
+            return;
+        }
+        let _ =
+            self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0));
+    }
+
     pub fn source_root(&self) -> Option<&Path> {
         self.source_root.as_deref()
     }
@@ -284,11 +296,7 @@ impl Drop for IndexConnection {
         if !self.fold_wal_on_close || std::thread::panicking() {
             return;
         }
-        if wal_bytes(&self.database_path) < WAL_CHECKPOINT_MIN_BYTES {
-            return;
-        }
-        let _ =
-            self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0));
+        self.fold_wal();
     }
 }
 

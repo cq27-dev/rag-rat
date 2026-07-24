@@ -2507,6 +2507,7 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -2596,6 +2597,7 @@ fn repo_clusters_groups_cotouched_files() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

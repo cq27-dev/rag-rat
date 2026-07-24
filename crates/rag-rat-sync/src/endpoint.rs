@@ -124,11 +124,15 @@ pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
 /// bounded by [`DEFAULT_IDLE_TIMEOUT`]. `run_session`'s own idle timeout only starts once the
 /// stream is open, so without these a peer that connects and then stalls (never opening a stream)
 /// would hold this single-session server forever, blocking every later peer.
+///
+/// `now_ms` is a CLOCK, read once a peer has connected — never a timestamp captured before the
+/// accept wait. A server may idle arbitrarily long between connections, so the auth phase must
+/// stamp and verify bindings against the time the connection actually arrived (see the read below).
 pub async fn accept_and_sync<S: SyncStore + NodeAuth>(
     endpoint: &Endpoint,
     store: &mut S,
     policy: AuthPolicy,
-    now_ms: i64,
+    now_ms: impl Fn() -> i64,
 ) -> Result<SessionReport, SyncFailure> {
     let local_node = *endpoint.id().as_bytes();
     let incoming = endpoint
@@ -144,6 +148,10 @@ pub async fn accept_and_sync<S: SyncStore + NodeAuth>(
         .await
         .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("peer opened no stream".into())))?
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+    // Read the clock only now that a peer has connected — NOT before the accept wait above. A
+    // long-idle server whose stamp/verify time predated the wait would treat a peer's freshly
+    // minted binding (and its own) as future-skewed and reject the session.
+    let now_ms = now_ms();
     // Authorize the dialer BEFORE run_session so no inventory (not even account confirmation)
     // leaves this peer until the remote passes our policy (#881).
     run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {

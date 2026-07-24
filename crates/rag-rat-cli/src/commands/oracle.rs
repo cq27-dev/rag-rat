@@ -457,6 +457,7 @@ mod tests {
         let config = Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -510,6 +511,7 @@ mod tests {
         let config_with = |include: Vec<String>, exclude: Vec<String>| Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: PathBuf::from("/x"),

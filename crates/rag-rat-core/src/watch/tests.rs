@@ -37,6 +37,7 @@ fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> Config {
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.to_path_buf(),
@@ -1398,6 +1399,7 @@ fn event_touches_worktree_matches_checkout_targets_and_registry() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: PathBuf::from("/main"),
@@ -2157,6 +2159,7 @@ fn event_touches_worktree_rebases_subdir_rooted_config() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: config_root,
@@ -2207,6 +2210,7 @@ fn event_is_relevant_skips_gitignored_paths_consistently_with_walker() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -2273,6 +2277,7 @@ fn gitignore_edit_is_relevant_and_recompile_reflects_new_rules() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -2350,6 +2355,7 @@ fn worktree_root_gitignore_edit_recompiles_for_subdir_config_root() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: sub.clone(),
@@ -2958,6 +2964,7 @@ fn worktree_watch_targets_excludes_the_main_checkout_for_a_subdir_config_root() 
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: sub.clone(),
@@ -3309,6 +3316,7 @@ fn a_bare_directory_create_is_not_relevant_so_placement_must_be_unconditional() 
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

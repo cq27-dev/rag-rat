@@ -675,6 +675,7 @@ mod tests {
         let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -792,6 +793,7 @@ mod tests {
         let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -863,6 +865,7 @@ mod tests {
         let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -965,6 +968,7 @@ mod tests {
         let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),

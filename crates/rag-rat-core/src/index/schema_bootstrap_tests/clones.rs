@@ -1081,6 +1081,7 @@ fn multi_language_clone_integration_finds_within_language_no_cross() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -1298,6 +1299,7 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

@@ -94,7 +94,7 @@ impl CorpusProfile {
         // order, so this byte stream is stable for a given profile value.
         let canonical = serde_json::to_vec(self).expect("CorpusProfile is always serializable");
         let digest = Sha256::digest(&canonical);
-        hex_lower(&digest)
+        rag_rat_base::hash::hex_lower(&digest)
     }
 }
 
@@ -249,15 +249,6 @@ pub struct ResolutionBefore {
 
 fn ratio(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 { 1.0 } else { numerator as f64 / denominator as f64 }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 #[cfg(test)]

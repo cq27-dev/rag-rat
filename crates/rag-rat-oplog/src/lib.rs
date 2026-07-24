@@ -109,10 +109,11 @@ pub use account::{
     established_owned_stream_v2, grant_effective_for_device, historical_content_keyring,
     live_stream_key_targets_for_device, local_account, mint_and_author_stream_key_wrap_in_tx,
     owned_stream_v2_id, owner_control_authority, owner_secrets_authority,
-    prepare_content_authoring, roster_content_authority, rotate_stream_key_in_tx,
-    select_current_sealing_wrap, settle_pending_content_refold_for_stream_in_tx,
-    settle_pending_content_refolds, sign_local_node_binding, stream_key_rotation_needed,
-    stream_owner_effective, verify_node_binding,
+    prepare_content_authoring, read_local_account, roster_content_authority,
+    rotate_stream_key_in_tx, select_current_sealing_wrap,
+    settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
+    sign_local_node_binding, stream_key_rotation_needed, stream_owner_effective,
+    verify_node_binding,
 };
 // The `/3` content projection's store-global upgrade re-fold (#688): wired into the index
 // open/migrate seam by rag-rat-core, so a stale store is rebuilt (every stream, then the one

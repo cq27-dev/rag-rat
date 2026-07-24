@@ -292,7 +292,7 @@ pub fn row_pk_string(pk: &[TypedValue]) -> String {
         let mut enc = Encoder::new(&mut buf);
         encode_values(&mut enc, pk);
     }
-    hex_lower(&buf)
+    rag_rat_base::hash::hex_lower(&buf)
 }
 
 /// The anti-echo identity of a row: the hex `sha256` of the canonical CBOR of its synced cells
@@ -306,7 +306,7 @@ pub(crate) fn cells_hash(cells: &[Cell]) -> String {
         let mut enc = Encoder::new(&mut buf);
         encode_cells(&mut enc, cells);
     }
-    hex_lower(&cbor::sha256(&buf))
+    rag_rat_base::hash::hex_lower(&cbor::sha256(&buf))
 }
 
 /// Recover the pk values from a `row_pk` produced by [`row_pk_string`] — the inverse, so the
@@ -329,15 +329,6 @@ fn hex_decode(text: &str) -> anyhow::Result<Vec<u8>> {
             u8::from_str_radix(&text[i..i + 2], 16).map_err(|err| anyhow::anyhow!("bad hex: {err}"))
         })
         .collect()
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from_digit((byte >> 4) as u32, 16).expect("nibble is 0..=15"));
-        out.push(char::from_digit((byte & 0x0f) as u32, 16).expect("nibble is 0..=15"));
-    }
-    out
 }
 
 #[cfg(test)]
@@ -474,7 +465,7 @@ mod tests {
     #[test]
     fn upsert_golden_vector() {
         let bytes = encode(&sample_upsert());
-        assert_eq!(hex_lower(&bytes), GOLDEN_UPSERT_HEX);
+        assert_eq!(rag_rat_base::hash::hex_lower(&bytes), GOLDEN_UPSERT_HEX);
     }
 
     const GOLDEN_UPSERT_HEX: &str = "83727261672d7261742f7461626c652d6f702f31667570736572748366745f64656d6f82617207848265636f756e74038264646f6e65f582646e6f7465f682657469746c65626869";

@@ -743,6 +743,7 @@ mod tests {
         let config = Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -804,6 +805,7 @@ mod tests {
         let config = Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: main.clone(),
@@ -887,6 +889,7 @@ mod tests {
         let config = Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: main.clone(),
@@ -968,6 +971,7 @@ mod tests {
         let config = Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -1040,6 +1044,7 @@ mod tests {
         let config = Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -1116,6 +1121,7 @@ mod tests {
         let config = Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -1193,6 +1199,7 @@ mod tests {
         let config = Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.clone(),
@@ -1284,6 +1291,7 @@ mod papertrail_hook_tests {
                 tags: Vec::new(),
             }],
             papertrail: Default::default(),
+            sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
             root: root.to_path_buf(),

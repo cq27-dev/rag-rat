@@ -59,6 +59,22 @@ impl IndexDatabase {
         self.storage.database_path()
     }
 
+    /// The raw SQLite connection this index opened, already MIGRATED through the sanctioned gate.
+    /// Exposed for store-global (op-log) operations that are not repo-scoped — `rag-rat sync serve`
+    /// reads the account/node identity and ingests received entries through it. Repo-scoped
+    /// readers/writers use the scoped helpers, never this.
+    pub fn connection(&self) -> &rusqlite::Connection {
+        self.storage.connection()
+    }
+
+    /// A cadence WAL fold for a long-lived holder (#818): `setup()` pins `wal_autocheckpoint = 0`,
+    /// so a connection that never closes would strand its writes in the `-wal` sidecar. Size-gated
+    /// and best-effort, same as the Drop fold; `sync serve` calls it between sessions, as the
+    /// watcher folds per pass.
+    pub fn fold_wal(&self) {
+        self.storage.fold_wal();
+    }
+
     /// Open the DB at `path` and bring its schema current, migrating FORWARD under the index write
     /// lock when it lags this binary. Shared by every open path; resolves NO repo scope (the caller
     /// does — a bare open via [`sole_repo_id`](schema::sole_repo_id), a config-bearing open via

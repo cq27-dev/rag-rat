@@ -166,6 +166,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

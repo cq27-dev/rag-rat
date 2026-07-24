@@ -179,11 +179,13 @@ pub(super) fn local_account_ref(conn: &Connection) -> anyhow::Result<Option<Loca
     Ok(Some(LocalAccountRef { account_id, genesis_hash }))
 }
 
-/// Resolve this store's local account from the pointer, or `None` if none is minted yet. The
-/// pointer is a content address; the account_id is recovered by looking the genesis up in the
-/// candidate DAG (§4 commits the account_id inside the genesis payload, so this is the one true
-/// id).
-fn read_local_account(conn: &Connection) -> anyhow::Result<Option<AccountId>> {
+/// Resolve this store's local account from the pointer, or `None` if none is minted yet — the
+/// read-only, non-minting twin of [`local_account`] (which mints a genesis on first call). Callers
+/// that must NOT create identity state (e.g. a server that requires an already-enrolled account)
+/// use this. The pointer is a content address; the account_id is recovered by looking the genesis
+/// up in the candidate DAG (§4 commits the account_id inside the genesis payload, so this is the
+/// one true id).
+pub fn read_local_account(conn: &Connection) -> anyhow::Result<Option<AccountId>> {
     let Some(genesis_hash) = read_pointer_hash(conn)? else {
         return Ok(None);
     };

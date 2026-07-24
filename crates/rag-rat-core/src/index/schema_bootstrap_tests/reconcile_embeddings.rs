@@ -733,6 +733,7 @@ fn policy_skip_summary_recomputes_exactly_for_a_non_default_char_cap() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -982,6 +983,7 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

@@ -24,6 +24,7 @@ pub struct Config {
     pub memory: MemoryConfig,
     pub trackers: Vec<TrackerConfig>,
     pub papertrail: PapertrailConfig,
+    pub sync: SyncConfig,
     /// Optional `[index] repo_id` override for the consolidated global store — pins the repo's
     /// identity instead of deriving it from the root-commit hash. `None` = derive. Consumed by
     /// `crate::repo_identity::resolve_repo_identity`. An EXPLICIT `database` path never depends on
@@ -228,6 +229,25 @@ pub struct VersionCheckConfig {
 impl Default for VersionCheckConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// The project's shipped default sync relay. iroh discovery is pinned to a single relay (no
+/// third-party node directory), so a peer is reachable iff it shares this relay. Overridable via
+/// `[sync] relay_url`, and per-invocation via the `RAG_RAT_SYNC_RELAY` env var at the call site.
+pub const DEFAULT_SYNC_RELAY: &str = "https://relay.cq27.dev";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncConfig {
+    /// The iroh relay URL peers pin for discovery and relay fallback. Defaults to
+    /// [`DEFAULT_SYNC_RELAY`]; set `[sync] relay_url` to point at a different relay. The
+    /// `RAG_RAT_SYNC_RELAY` env var overrides this at the call site (ops/tests).
+    pub relay_url: String,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self { relay_url: DEFAULT_SYNC_RELAY.to_string() }
     }
 }
 

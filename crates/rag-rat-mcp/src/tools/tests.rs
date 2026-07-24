@@ -1062,6 +1062,7 @@ fn mixed_config() -> (PathBuf, Config) {
     (root.clone(), Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -1103,6 +1104,7 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
     (root.clone(), Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -1131,6 +1133,7 @@ fn rust_config(root: PathBuf) -> Config {
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

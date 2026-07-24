@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use path_slash::PathExt;
 
 use super::{
-    self as config, Config, ConfigError, DistillLlmConfig, EmbeddingRuntimeConfig, LlmConfig,
-    LogConfig, LogFormat, LogLevel, MemoryConfig, MemorySurface, OracleConfig, RawConfig,
-    RawMemory, RawOracle, RawSearch, RawTarget, RawVersionCheck, RawWatch, RemoteBackend,
-    RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, TargetKind,
-    TrackerAuth, VersionCheckConfig, WatchConfig,
+    self as config, Config, ConfigError, DEFAULT_SYNC_RELAY, DistillLlmConfig,
+    EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel, MemoryConfig, MemorySurface,
+    OracleConfig, RawConfig, RawMemory, RawOracle, RawSearch, RawSync, RawTarget, RawVersionCheck,
+    RawWatch, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget,
+    SearchConfig, SyncConfig, TargetKind, TrackerAuth, VersionCheckConfig, WatchConfig,
 };
 use crate::language::Language;
 
@@ -2226,6 +2226,37 @@ fn search_defaults_off_and_parses_opt_in() {
 }
 
 #[test]
+fn sync_relay_defaults_to_the_shipped_relay_and_parses_an_override() {
+    let default: SyncConfig = RawSync::default().into();
+    assert_eq!(
+        default.relay_url, DEFAULT_SYNC_RELAY,
+        "an absent [sync] block uses the shipped default relay"
+    );
+
+    let raw: RawConfig = toml::from_str(
+        "[index]\nroot = \".\"\n\n[sync]\nrelay_url = \"https://relay.example.test\"\n",
+    )
+    .unwrap();
+    let sync: SyncConfig = raw.sync.into();
+    assert_eq!(
+        sync.relay_url, "https://relay.example.test",
+        "[sync] relay_url overrides the default"
+    );
+
+    // A blank value falls back to the default rather than binding an empty relay URL.
+    let raw: RawConfig =
+        toml::from_str("[index]\nroot = \".\"\n\n[sync]\nrelay_url = \"   \"\n").unwrap();
+    let sync: SyncConfig = raw.sync.into();
+    assert_eq!(sync.relay_url, DEFAULT_SYNC_RELAY, "a blank relay_url falls back to the default");
+
+    // An unknown key under [sync] is rejected, not silently dropped.
+    assert!(
+        toml::from_str::<RawConfig>("[index]\nroot = \".\"\n\n[sync]\nrelay = \"x\"\n").is_err(),
+        "[sync] rejects unknown keys (deny_unknown_fields)"
+    );
+}
+
+#[test]
 fn dream_absent_defaults_to_off_and_local_ollama_connect() {
     // No `[llm.dream]` at all → disabled, with a local-Ollama CONNECT serving default
     // (byte-for-byte the pre-migration `[dream.model]` default).
@@ -2955,6 +2986,7 @@ fn target_directories_deduplicates_across_targets() {
     let cfg = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: dir.path().to_path_buf(),

@@ -309,6 +309,7 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -543,6 +544,7 @@ fn dir_tree_truncates_at_max_nodes() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -694,6 +696,7 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

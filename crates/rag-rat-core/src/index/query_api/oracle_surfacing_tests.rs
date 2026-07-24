@@ -31,6 +31,7 @@ fn rust_config(root: PathBuf) -> Config {
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),
@@ -1151,6 +1152,7 @@ fn deleted_and_generated_paths_counted_in_skipped() {
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
+        sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: root.clone(),

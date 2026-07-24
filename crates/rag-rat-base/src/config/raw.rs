@@ -7,8 +7,8 @@ use super::{
     ConfigError, DEFAULT_QUERY_ENDPOINT, DistillLlmConfig, DreamLlmConfig, EmbeddingBackend,
     EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,
     MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, PapertrailConfig,
-    RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig, Tracker, TrackerAuth,
-    TrackerConfig, VersionCheckConfig, WatchConfig,
+    RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig, SyncConfig, Tracker,
+    TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig,
 };
 use crate::embedding_models::Backend;
 
@@ -42,6 +42,8 @@ pub(crate) struct RawConfig {
     pub(crate) oracle: RawOracle,
     #[serde(default)]
     pub(crate) search: RawSearch,
+    #[serde(default)]
+    pub(crate) sync: RawSync,
     #[serde(default)]
     pub(crate) memory: RawMemory,
     #[serde(default, rename = "tracker")]
@@ -332,6 +334,26 @@ impl From<RawSearch> for SearchConfig {
                 .graded_git_rerank
                 .unwrap_or(SearchConfig::default().graded_git_rerank),
         }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawSync {
+    relay_url: Option<String>,
+}
+
+impl From<RawSync> for SyncConfig {
+    fn from(raw: RawSync) -> Self {
+        let default = SyncConfig::default();
+        // A blank/whitespace value falls back to the shipped default rather than binding an empty
+        // relay URL that would fail at endpoint construction with a less obvious error.
+        let relay_url = raw
+            .relay_url
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or(default.relay_url);
+        Self { relay_url }
     }
 }
 

@@ -202,6 +202,18 @@ pub(crate) enum SyncCommand {
         #[arg(value_name = "DEVICE_FINGERPRINT")]
         target: rag_rat_oplog::DeviceFingerprint,
     },
+    /// Run a headless store-and-forward peer: bind the sync endpoint over the configured relay and
+    /// exchange this account's op-log with authorized peers.
+    #[command(long_about = "Binds an iroh endpoint pinned to the configured relay ([sync] \
+                            relay_url, default relay.cq27.dev; RAG_RAT_SYNC_RELAY overrides), \
+                            then accepts connections and replicates this account's op log with \
+                            peers authorized against the account roster. Runs until interrupted; \
+                            --once serves a single connection and exits.")]
+    Serve {
+        /// Serve exactly one connection, then exit (useful for scripted checks).
+        #[arg(long)]
+        once: bool,
+    },
 }
 
 #[derive(Debug, Args)]

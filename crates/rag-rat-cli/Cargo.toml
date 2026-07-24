@@ -31,12 +31,17 @@ gix.workspace = true
 rag-rat-core = { workspace = true }
 rag-rat-oracle.workspace = true
 rag-rat-oplog.workspace = true
+rag-rat-sync.workspace = true
 rag-rat-query.workspace = true
 rag-rat-mcp = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+rusqlite.workspace = true
+# Minting the persisted sync node key (OS CSPRNG) and scrubbing the in-memory copy.
+getrandom.workspace = true
+zeroize.workspace = true
 
 # Consumed only by the unix-gated terminal-reset guard (`init/mod.rs`) — dead on non-unix targets,
 # so gate it there to match rag-rat-core / rag-rat-mcp (#240).
@@ -58,8 +63,6 @@ tikv-jemalloc-ctl = "0.7"
 # MCP tool results render as TOON; integration tests decode them back to JSON Values to assert.
 toon-format.workspace = true
 tempfile.workspace = true
-# The consolidate integration tests assert sibling-repo repo_meta state directly in the global DB.
-rusqlite.workspace = true
 # Test helpers embed a temp path into a TOML value; path-slash makes it TOML-safe cross-platform.
 path-slash.workspace = true
 
