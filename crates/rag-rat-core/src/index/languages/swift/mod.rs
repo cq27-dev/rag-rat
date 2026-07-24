@@ -2,8 +2,9 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{EdgeBackend, KindPreference, ParserBackend, ResolverPolicy, SymbolMatch};
-use crate::index::edges::{EdgeCandidate, IndexedSymbol};
+use super::{
+    EdgeBackend, EdgeEmitter, EdgeVisit, KindPreference, ParserBackend, ResolverPolicy, SymbolMatch,
+};
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -271,15 +272,8 @@ fn direct_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tr
 }
 
 impl EdgeBackend for Swift {
-    fn edges(
-        &self,
-        text: &str,
-        node: Node<'_>,
-        symbols: &[IndexedSymbol],
-        path: &Path,
-        out: &mut Vec<EdgeCandidate>,
-    ) {
-        edges::swift_edges(text, node, symbols, path, out);
+    fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>) {
+        edges::swift_edges(visit, emit);
     }
 }
 

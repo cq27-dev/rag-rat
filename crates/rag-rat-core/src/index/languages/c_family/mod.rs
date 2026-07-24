@@ -2,8 +2,7 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{EdgeBackend, ParserBackend, ResolverPolicy, SymbolMatch};
-use crate::index::edges::{EdgeCandidate, IndexedSymbol};
+use super::{EdgeBackend, EdgeEmitter, EdgeVisit, ParserBackend, ResolverPolicy, SymbolMatch};
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -107,15 +106,8 @@ fn function_name(node: Node<'_>) -> Option<Node<'_>> {
 macro_rules! impl_edges {
     ($backend:ty) => {
         impl EdgeBackend for $backend {
-            fn edges(
-                &self,
-                text: &str,
-                node: Node<'_>,
-                symbols: &[IndexedSymbol],
-                path: &Path,
-                out: &mut Vec<EdgeCandidate>,
-            ) {
-                edges::c_like_edges(text, node, symbols, path, out);
+            fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>) {
+                edges::c_like_edges(visit, emit);
             }
         }
     };

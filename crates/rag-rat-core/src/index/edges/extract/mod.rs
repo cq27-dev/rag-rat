@@ -148,6 +148,8 @@ pub(crate) fn collect_edges(
     let Some(backend) = crate::index::languages::edge_backend(language) else {
         return;
     };
+    let context = EdgeExtractionContext { text, symbols, path };
+    let mut emit = EdgeEmitter { out };
     let mut stack = vec![root];
     let mut cursor = root.walk();
     let mut named_children = Vec::new();
@@ -155,12 +157,47 @@ pub(crate) fn collect_edges(
         if node.is_error() || node.is_missing() {
             continue;
         }
-        backend.edges(text, node, symbols, path, out);
+        backend.edges(context.visit(node), &mut emit);
         named_children.clear();
         named_children.extend(node.named_children(&mut cursor));
         for &child in named_children.iter().rev() {
             stack.push(child);
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct EdgeExtractionContext<'source> {
+    text: &'source str,
+    symbols: &'source [IndexedSymbol],
+    path: &'source Path,
+}
+
+impl<'source> EdgeExtractionContext<'source> {
+    fn visit<'tree>(&self, node: Node<'tree>) -> EdgeVisit<'tree, 'source> {
+        EdgeVisit { text: self.text, node, symbols: self.symbols, path: self.path }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct EdgeVisit<'tree, 'source> {
+    pub(crate) text: &'source str,
+    pub(crate) node: Node<'tree>,
+    pub(crate) symbols: &'source [IndexedSymbol],
+    pub(crate) path: &'source Path,
+}
+
+pub(crate) struct EdgeEmitter<'out> {
+    out: &'out mut Vec<EdgeCandidate>,
+}
+
+impl EdgeEmitter<'_> {
+    pub(crate) fn push(&mut self, candidate: EdgeCandidate) {
+        self.out.push(candidate);
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &EdgeCandidate> {
+        self.out.iter()
     }
 }
 

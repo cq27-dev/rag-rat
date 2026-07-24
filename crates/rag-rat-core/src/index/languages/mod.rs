@@ -11,7 +11,7 @@ use std::path::Path;
 use rag_rat_base::language::Language;
 use tree_sitter::Node;
 
-use super::edges::{EdgeCandidate, IndexedSymbol};
+pub(super) use super::edges::extract::{EdgeEmitter, EdgeVisit};
 use super::parser::ParserKind;
 
 mod c_family;
@@ -85,14 +85,7 @@ pub(super) trait ParserBackend: Sync {
 
 /// Grammar-specific edge recognition for one node visited by the shared depth-safe edge walk.
 pub(super) trait EdgeBackend: Sync {
-    fn edges(
-        &self,
-        text: &str,
-        node: Node<'_>,
-        symbols: &[IndexedSymbol],
-        path: &Path,
-        out: &mut Vec<EdgeCandidate>,
-    );
+    fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>);
 }
 
 #[derive(Clone, Copy)]

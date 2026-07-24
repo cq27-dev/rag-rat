@@ -1,7 +1,5 @@
 //! Rust graph-edge extraction for the shared structural edge walk. It recognizes calls, types,
 //! constructions, imports, impl headers, and dispatch facts.
-use std::path::Path;
-
 use tree_sitter::Node;
 
 use super::dispatch;
@@ -9,12 +7,10 @@ use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(super) fn rust_edges(
-    text: &str,
-    node: Node<'_>,
-    symbols: &[IndexedSymbol],
-    path: &Path,
-    out: &mut Vec<EdgeCandidate>,
+    EdgeVisit { text, node, symbols, path }: EdgeVisit<'_, '_>,
+    emit: &mut EdgeEmitter<'_>,
 ) {
+    let out = emit;
     match node.kind() {
         "use_declaration" => {
             let names = identifiers_under(node, text);
@@ -208,7 +204,7 @@ pub(super) fn rust_impl_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     let node_text = node_text(node, text);
     let header = node_text.split('{').next().unwrap_or_default();

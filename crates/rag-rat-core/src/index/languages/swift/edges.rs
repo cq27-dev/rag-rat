@@ -1,7 +1,5 @@
 //! Swift graph-edge extraction for the shared structural edge walk.
 
-use std::path::Path;
-
 use tree_sitter::Node;
 
 use super::syntax;
@@ -9,12 +7,10 @@ use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(super) fn swift_edges(
-    text: &str,
-    node: Node<'_>,
-    symbols: &[IndexedSymbol],
-    path: &Path,
-    out: &mut Vec<EdgeCandidate>,
+    EdgeVisit { text, node, symbols, path }: EdgeVisit<'_, '_>,
+    emit: &mut EdgeEmitter<'_>,
 ) {
+    let out = emit;
     match node.kind() {
         "source_file"
             if text.contains(',')
@@ -135,7 +131,7 @@ fn swift_operator_or_shorthand_case_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     let Some(operation) =
         node.child_by_field_name("op").or_else(|| node.child_by_field_name("operation"))
@@ -186,7 +182,7 @@ fn swift_qualified_case_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     if node.parent().is_some_and(|parent| {
         parent.kind() == "call_expression" && swift_call_target(parent) == Some(node)
@@ -218,7 +214,7 @@ fn swift_call_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     if swift_subscript_suffix(node, text).is_some() {
         let Some(target) = swift_call_target(node).map(swift_callee_operand) else {
@@ -255,7 +251,7 @@ fn swift_constructor_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     let Some(constructed_type) = node.child_by_field_name("constructed_type") else {
         return;
@@ -275,7 +271,7 @@ fn emit_swift_call_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
     identifiers: Vec<String>,
     callee_range: Option<CalleeRange>,
     constructs: bool,
@@ -315,7 +311,7 @@ fn swift_macro_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     let Some(name_node) = syntax::identifier_nodes(node).first().copied() else {
         return;
@@ -350,7 +346,7 @@ fn swift_attribute_macro_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     let Some(attribute_name) = node.named_child(0) else {
         return;
@@ -393,7 +389,7 @@ fn swift_precedence_group_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     let Some(group) = syntax::identifier_nodes(node).last().copied() else {
         return;
@@ -412,7 +408,7 @@ fn swift_precedence_group_relation_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     let identifiers = syntax::identifier_nodes(node);
     let Some((relation, dependencies)) = identifiers.split_first() else {
@@ -454,7 +450,7 @@ fn swift_precedence_group_relation_list_edges(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     let source = node_text(node, text);
     let code = swift_code_without_comments_or_strings(&source);
@@ -525,7 +521,7 @@ fn swift_recovered_precedence_relations(
     body_start: usize,
     body_end: usize,
     source_symbol: Option<&IndexedSymbol>,
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     let mut cursor = body_start;
     while cursor < body_end {

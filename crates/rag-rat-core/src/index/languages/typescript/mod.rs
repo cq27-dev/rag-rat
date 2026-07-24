@@ -2,8 +2,7 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{EdgeBackend, ParserBackend, SymbolMatch};
-use crate::index::edges::{EdgeCandidate, IndexedSymbol};
+use super::{EdgeBackend, EdgeEmitter, EdgeVisit, ParserBackend, SymbolMatch};
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -56,14 +55,7 @@ impl ParserBackend for TypeScript {
 }
 
 impl EdgeBackend for TypeScript {
-    fn edges(
-        &self,
-        text: &str,
-        node: Node<'_>,
-        symbols: &[IndexedSymbol],
-        path: &Path,
-        out: &mut Vec<EdgeCandidate>,
-    ) {
-        edges::typescript_edges(text, node, symbols, path, out);
+    fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>) {
+        edges::typescript_edges(visit, emit);
     }
 }

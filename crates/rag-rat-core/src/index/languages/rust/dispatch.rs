@@ -6,6 +6,7 @@
 //! false-edge-is-a-bug contract is documented in the repo memories bound here and on the parent.
 use tree_sitter::Node;
 
+use crate::index::edges::extract::EdgeEmitter;
 use crate::index::edges::*;
 
 /// PascalCase test for the enum/variant convention (#200): first char uppercase AND at least one
@@ -665,7 +666,7 @@ pub(super) fn rust_dispatch_handle_facts(
     text: &str,
     node: Node<'_>,
     symbols: &[IndexedSymbol],
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     let Some(pattern) = node.child_by_field_name("pattern") else {
         return;

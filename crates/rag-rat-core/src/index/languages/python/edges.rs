@@ -9,12 +9,10 @@ use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(super) fn python_edges(
-    text: &str,
-    node: Node<'_>,
-    symbols: &[IndexedSymbol],
-    path: &Path,
-    out: &mut Vec<EdgeCandidate>,
+    EdgeVisit { text, node, symbols, path }: EdgeVisit<'_, '_>,
+    emit: &mut EdgeEmitter<'_>,
 ) {
+    let out = emit;
     match node.kind() {
         // `from <module> import <name|name as alias>, ...` — emit Imports edges to the MODULE and
         // to each imported NAME, never the local alias. A relative import (`.sessions`)
@@ -221,7 +219,7 @@ fn emit_python_type_refs(
     node: Node<'_>,
     symbols: &[IndexedSymbol],
     text: &str,
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     match node.kind() {
         "type" | "generic_type" | "subscript" | "binary_operator" | "list" | "tuple"
@@ -518,7 +516,7 @@ fn python_import_target(
     record_alias: bool,
     import_start: usize,
     module_root: Option<Node<'_>>,
-    out: &mut Vec<EdgeCandidate>,
+    out: &mut EdgeEmitter<'_>,
 ) {
     if child.kind() == "import_list" {
         // grow_stack: uniform depth guard for a tree descender (#543); `import_list` doesn't nest

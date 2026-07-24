@@ -1,18 +1,12 @@
 //! Kotlin graph-edge extraction for the shared structural edge walk.
-use std::path::Path;
-
-use tree_sitter::Node;
-
 use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(super) fn kotlin_edges(
-    text: &str,
-    node: Node<'_>,
-    symbols: &[IndexedSymbol],
-    path: &Path,
-    out: &mut Vec<EdgeCandidate>,
+    EdgeVisit { text, node, symbols, path }: EdgeVisit<'_, '_>,
+    emit: &mut EdgeEmitter<'_>,
 ) {
+    let out = emit;
     match node.kind() {
         "import" | "import_header" | "import_directive" => {
             for name in identifiers_under(node, text) {

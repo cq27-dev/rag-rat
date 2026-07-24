@@ -2,8 +2,7 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{EdgeBackend, ParserBackend, ResolverPolicy, SymbolMatch};
-use crate::index::edges::{EdgeCandidate, IndexedSymbol};
+use super::{EdgeBackend, EdgeEmitter, EdgeVisit, ParserBackend, ResolverPolicy, SymbolMatch};
 use crate::index::parser::{self, ParsedSymbolFact, ParserKind};
 
 mod dispatch;
@@ -133,15 +132,8 @@ fn attribute_items(text: &str, node: Node<'_>) -> Vec<String> {
 }
 
 impl EdgeBackend for Rust {
-    fn edges(
-        &self,
-        text: &str,
-        node: Node<'_>,
-        symbols: &[IndexedSymbol],
-        path: &Path,
-        out: &mut Vec<EdgeCandidate>,
-    ) {
-        edges::rust_edges(text, node, symbols, path, out);
+    fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>) {
+        edges::rust_edges(visit, emit);
     }
 }
 
