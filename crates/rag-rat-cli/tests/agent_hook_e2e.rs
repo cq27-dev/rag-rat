@@ -19,11 +19,22 @@ fn run_hook(stdin_body: &str, cwd: &std::path::Path) -> (String, std::process::E
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Capture (do not discard) stderr so a non-zero exit — e.g. a startup abort before the
+        // hook's own always-Ok handler runs — surfaces its reason in the failing test's output
+        // instead of a bare `status.success()` assertion.
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let _ = child.stdin.as_mut().unwrap().write_all(stdin_body.as_bytes());
     let out = child.wait_with_output().unwrap();
+    if !out.status.success() {
+        eprintln!(
+            "run_hook: `rag-rat agent-hook` exited unsuccessfully: {:?}\n--- captured stderr \
+             ---\n{}\n--- end stderr ---",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     (String::from_utf8_lossy(&out.stdout).into_owned(), out.status)
 }
 

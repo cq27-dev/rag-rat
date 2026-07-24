@@ -597,6 +597,10 @@ mod listener_tests {
 /// A read-only hook connection cannot heal FTS corruption, and the hook is latency-critical —
 /// degrade to the hook's designed null-context reply and let `on_corrupt` kick recovery. Every
 /// other error propagates unchanged.
+// The FTS-corruption degrade/heal pair is reached only from the `#[cfg(unix)]` listener path
+// (and the test module); on non-unix targets the listener is compiled out, leaving these unused
+// under `--all-targets` clippy. They compile everywhere, so allow rather than cfg them out.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn degrade_when_fts_corrupt<T>(
     result: anyhow::Result<Option<T>>,
     on_corrupt: impl FnOnce(),
@@ -614,6 +618,7 @@ fn degrade_when_fts_corrupt<T>(
 /// listener's read-only connection cannot rebuild. Without this, a grep-hook-only session
 /// (no MCP queries to trigger the query-layer self-heal) would serve null context indefinitely
 /// after a torn write, even though the repair is one lossless rebuild away.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn spawn_background_fts_heal(config: rag_rat_base::config::Config) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static HEAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
