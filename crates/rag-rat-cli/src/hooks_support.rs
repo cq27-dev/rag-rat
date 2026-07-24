@@ -22,8 +22,9 @@ pub(crate) fn git_paths(root: &Path) -> anyhow::Result<GitPaths> {
     let hooks_dir = repo
         .config_snapshot()
         .trusted_path("core.hooksPath")
-        .and_then(Result::ok)
-        .map(|path| if path.is_absolute() { path.into_owned() } else { worktree_root.join(path) })
+        .ok()
+        .flatten()
+        .map(|path| if path.is_absolute() { path } else { worktree_root.join(path) })
         .unwrap_or_else(|| git_common_dir.join("hooks"));
     Ok(GitPaths { worktree_root, git_dir, git_common_dir, hooks_dir })
 }

@@ -25,9 +25,9 @@ version = "0.21.1"
 authors = ["Kristaps Karlsons"]
 edition = "2024"
 # Bundled SQLite (rusqlite `bundled` -> libsqlite3-sys 0.38.1) compiles a build script that uses the
-# `cfg_select!` macro, stabilized in Rust 1.95 — so the whole workspace's MSRV is 1.95 on every
-# platform. (Latest non-SQLite deps need only 1.88: darling, ort-sys.)
-rust-version = "1.95"
+# `cfg_select!` macro, stabilized in Rust 1.95. The workspace tracks Rust 1.96 so dependencies can
+# use the next stable standard-library baseline without compatibility shims.
+rust-version = "1.96"
 license = "MIT"
 repository = "https://github.com/cq27-dev/rag-rat"
 readme = "README.md"
@@ -85,7 +85,7 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 # through the existing deterministic `SigningKey::from_bytes`. The lowest-level entropy source (no
 # `rand`/`rand_core` pulled in for this), keeping `from_seed` the sole key constructor.
 getrandom = "0.4"
-gix = { version = "0.85.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
+gix = { version = "0.86.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
 httpdate = "1.0"
 libc = "0.2"
 # Separator-aware path→forward-slash conversion. Unlike a raw `\`→`/` replace, it only rewrites the
@@ -105,7 +105,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rmcp = { version = "2.2.0", features = ["transport-io"] }
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 rayon = "1.12"
-regex = "1.12"
+regex = "1.13"
 schemars = { version = "1.2.1", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -114,7 +114,7 @@ sha2 = "0.11"
 # size budget is explicitly waived for SCIP; do NOT feature-gate or hand-copy the proto.
 # `protobuf` is scip's own transitive dep, pulled in directly so we can call `Message::parse_*`
 # on the generated SCIP types; pinned to the version scip 0.9 generates against.
-minicbor = { version = "2.2.2", features = ["alloc"] }
+minicbor = { version = "2.3.0", features = ["alloc"] }
 protobuf = "=3.7.2"
 scip = "0.9.0"
 unicode-normalization = "0.1.25"
@@ -126,8 +126,8 @@ stacker = "0.1"
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0"
 # `time` backs the papertrail transport's rate-limit backoff sleeps (tokio::time::sleep).
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-std", "time"] }
-iroh = { version = "1.0.0", default-features = false, features = ["tls-ring"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "io-std", "time"] }
+iroh = { version = "1.0.3", default-features = false, features = ["tls-ring"] }
 iroh-tickets = "1.0.0"
 # Minimal blocking HTTP for the crates.io version check. rustls (no system OpenSSL); gzip off —
 # the responses are tiny. Tracker REST traffic lives on `reqwest` (papertrail transport, #589).
@@ -145,7 +145,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "registry"] }
 tracing-appender = "0.2"
 # Grammar crates are exact-pinned so parser node coverage changes deliberately.
-tree-sitter = "=0.26.9"
+tree-sitter = "=0.26.11"
 tree-sitter-c = "=0.24.2"
 tree-sitter-cpp = "=0.23.4"
 tree-sitter-kotlin = { package = "tree-sitter-kotlin-ng", version = "1.1.0" }

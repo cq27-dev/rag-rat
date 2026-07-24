@@ -25,7 +25,6 @@ use_small_heuristics = "Max"
 trailing_comma = "Vertical"
 brace_style = "SameLineWhere"
 fn_params_layout = "Tall"
-struct_lit_style = "Block"
 struct_lit_width = 80
 enum_discrim_align_threshold = 20
 match_arm_blocks = false
