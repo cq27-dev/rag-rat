@@ -1,0 +1,686 @@
+[
+ {
+  "id": "reviewed_00",
+  "source_commit": "c5303848",
+  "finding_id": "cdd32d9999d72a12",
+  "memory_id": "mem_19f961012bd_f319b32d824d",
+  "reviewed_status": "accepted",
+  "expected_verdict": "diverged",
+  "expected_direction": "note_ahead",
+  "original_evidence": "model verdict: diverged (direction: note_ahead); cited: `discover_peers` -> NOT FOUND anywhere in the source tree | `discover_peers(account_id) -> Vec<EndpointAddr>` -> NOT FOUND anywhere in the source tree | `pairing-and-open-projects-design.md` -> NOT FO\u2026 [reality]",
+  "reviewed_at_ms": 1784970235600,
+  "kind": "Decision",
+  "title": "Sync admission: read (open=anyone / closed=roster) and write (ALWAYS roster) are ORTHOGONAL; capability decided per-connection and enforced in-session",
+  "body": "Product requirement (user, 2026-07). Openness and write-authorization are ORTHOGONAL axes \u2014 NOT a single open/private switch:\n\n- READ admission (open/closed axis): an OPEN project commits its identifier into a CHECKED-IN `rag-rat.sync.toml` (distinct from the machine-local, gitignored `rag-rat.toml`); any peer with it downloads read-only with NO pairing. A CLOSED project serves reads only to its roster.\n- WRITE admission is ALWAYS roster-gated, open AND closed alike. Invite-token pairing grants roster membership in both kinds; an open project merely ADDITIONALLY permits anonymous read. Matrix: open={read: anyone, write: roster}; closed={read: roster, write: roster} \u2014 differ only on the read axis.\n\nTHREE-LEVEL ROLE (selectable at enroll, default least-privilege). `DeviceRole` grows `{Member,Owner}` \u2192 `{ReadOnly, Writer, Owner}`: read-only (default) = read/sync only; writer = +write content; owner = +enroll devices. The per-connection CAPABILITY derives from role \u2014 anonymous downloader AND read-only roster device both \u2192 read-only; writer/owner \u2192 read-write; only owner runs enrollment. Enforcement is two-layer: FOLD backstop (a read-only/off-roster device's pushed entries carry no content authority \u2192 fold-rejected, the durable guarantee) + IN-SESSION gate (read-only peer's push frames refused at the wire; `run_session` is symmetric today with no per-peer capability \u2014 this gate is net-new). A read-only joiner still gets content KEYS (#763 catch-up) \u2014 read-only gates write, not decrypt.\n\nTOPOLOGY (user's model): author + peer are the SAME level (full P2P devices); `serve` is an OPTIONAL stateful store-and-forward hub, never a required party, never owner authority. Enrollment is a P2P moment \u2014 the owner (author) device enrolls the joiner directly (ticket carries the owner's node addr); serve is uninvolved. AUTO-DISCOVERY between online peers is DEFERRED but must be stubbed: leave a documented `discover_peers(account_id) -> Vec<EndpointAddr>` seam (explicit-config impl today, relay-side account-keyed discovery later \u2014 mirrors held's discovery-node ALPN), so the device-sync driver just iterates the resolver's output.\n\nChosen internal defaults: custom canonical-CBOR ticket `{account_id, node addr, token, expiry}` (not iroh EndpointTicket); dedicated enrollment ALPN `rag-rat/enroll/1`; auto-enroll on redemption (token IS the approval; `sync init --role --label`); `sync open` generates `rag-rat.sync.toml {account_id,node_id,relay_url,open,name?}`. The account id is content-derived from genesis \u2192 self-certifying, so a downloader verifies everything cryptographically and the committed node id only says WHERE to look. Enrollment authoring (`DeviceAdd`) is OWNER-only and has NO production seam yet (test-only `pub(super)`); #763 key catch-up requires the target already roster-effective (enroll \u2192 fold effective \u2192 then catch-up). Full design: `pairing-and-open-projects-design.md`. See [[rag-rat-sync-content-alpn-dispatch]] and the node-auth memories.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-sync/src/auth.rs"
+  }
+ },
+ {
+  "id": "reviewed_01",
+  "source_commit": "c5303848",
+  "finding_id": "5c508dcf94c799ac",
+  "memory_id": "mem_19f8ee2b917_cb7e50dc5be6",
+  "reviewed_status": "accepted",
+  "expected_verdict": "diverged",
+  "expected_direction": "note_ahead",
+  "original_evidence": "model verdict: diverged (direction: note_ahead); cited: `own_account` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970235686,
+  "kind": "FollowUp",
+  "title": "candidate_capacity own-account exemption needs AUTHORING-TIME provenance, not roster membership (#884\u2192#888)",
+  "body": "`candidate_capacity` (this file) applies the \u00a718b remote-flood caps (4,096/author, 16,384 global) to `/3` content ingest. Own-account content (the account's own memories, from any of its devices) should be exempt from these caps \u2014 otherwise a same-account restore larger than the caps stalls (#884). BUT this is NOT correctly solvable with a roster-membership check at the ingest budget layer, and a naive attempt was reverted:\n\n- Keying the exemption/exclusion on CURRENT membership (`account_roster_history ... closed_at IS NULL`) truncates the historical content of a device REMOVED before the restore (normal device-removal history) \u2014 the restore drops the tail.\n- Keying it on EVER-membership (retain closed rows) lets a REVOKED device flood: its key still resolves against an old roster ref, so post-removal content is exempted forever.\n\nDistinguishing \"authored while an effective member\" from \"submitted after removal\" is the authoring-time authority question the acceptance fold owns and candidate_capacity deliberately defers (#652). The correct fix is a per-row `own_account` provenance flag on `content_entries`, set at `insert_candidate` from the verified authoring authority (NEVER from the attacker-settable `author_account_id` \u2014 see the sibling SecurityNote), with the exemption admitting own-account entries uncapped and the counts excluding `own_account = 1`. Schema migration + backfill hook. Tracked in #888; lands with foreign-account ingest (#407) that makes the counts live.\n\nUntil then candidate_capacity keeps its pre-#884 local-device-only exclusion (`WHERE device_fingerprint != ?local_fp OR ?local_fp IS NULL`) \u2014 do NOT re-add a roster-membership check thinking it fixes #884; it does not, and it adds a hot-path read plus a P1 either way. This only bites at >16,384-memory accounts (real usage ~330), so the incompleteness is latent. Related: the exemption entry point for content sync is `OplogContentSyncStore` in crates/rag-rat-sync/src/store.rs.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-oplog/src/account/content/storage.rs"
+  }
+ },
+ {
+  "id": "reviewed_02",
+  "source_commit": "c5303848",
+  "finding_id": "cc176e49e8188fe6",
+  "memory_id": "mem_19f4cc07f1d_8c624334a30b",
+  "reviewed_status": "accepted",
+  "expected_verdict": "diverged",
+  "expected_direction": "note_ahead",
+  "original_evidence": "model verdict: diverged (direction: note_ahead); cited: `gouqi` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970235762,
+  "kind": "Risk",
+  "title": "Tracker generalization (GitLab/Bitbucket/Jira): GitHub-shaped assumptions live in the keys, not the client \u2014 and no usable cross-forge crate exists",
+  "body": "Scout-era risk, updated post-#591/#593: the `PapertrailClient` trait (index/papertrail/mod.rs) serves all providers with batch-first async operations; item/comment identity includes `ItemKind` and keys are TEXT (Jira `PROJ-123`). GitHub AND GitLab now have native clients dispatched through the `ProviderClient` enum in api.rs (`tracker_synchronization` is the single source of native-vs-pending for BOTH the manual and scheduled paths \u2014 never gate on the provider enum directly). The per-provider ref grammar shipped with #590 (parse.rs routes per tracker; the old \"parse_issue_ref hard-codes GitHub\" concern is resolved). REMAINING RISK for #594 (Bitbucket) and #596 (Jira): GitHub-shaped assumptions hide in KEY handling, not clients \u2014 the #654 twin bug (repo-lane comment kind resolved by item_key alone, wrong under namespaced numbering) is the canonical example; audit any query that matches items by key without kind. No usable cross-forge crate exists; `gouqi` is the only viable Jira client. Auto-sync: maintenance-hook + 15-min probe + daily full re-walk; rate governor reserves 35% for CLI tools.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-papertrail/src/lib.rs"
+  }
+ },
+ {
+  "id": "reviewed_03",
+  "source_commit": "c5303848",
+  "finding_id": "5577dd1d8a648d30",
+  "memory_id": "mem_19f23dc4d0c_03815c8a34ea",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `clear_reconcile_meta` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970235834,
+  "kind": "Decision",
+  "title": "Active embedding model is seeded from config on a fresh index \u2014 it does NOT default to embedding-hash (#394)",
+  "body": "BUG (#394) + fix. `active_embedding_model_id(conn)` (index/ai/helpers.rs) falls back to `HASH_MODEL_ID` when the `active_embedding_model` meta is UNSET, and nothing seeded it from config \u2014 so a fresh index silently used `embedding-hash` regardless of `[llm.embedding] model`, and `reconcile` blocked naming `embedding-hash` instead of the configured model. `EmbeddingBackend::default()` is all-MiniLM, NEVER hash.\n\nFIX: `seed_active_embedding_model(conn, configured_model_id)` (index/ai/reconcile/model_lifecycle.rs) activates `config.llm.embedding.backend.model_id()` when a seed is owed. Called from every config-aware open: `rebuild` + `index_incremental_with_progress` (both INSIDE their txn \u2014 see atomicity), `open_config`, and `try_open_config_read_only` (returns None when a seed is owed \u2192 read-only tools fall back to the healing write path).\n\nSEED-OWED = PROVENANCE, NOT A PROXY (load-bearing lesson). Don't infer \"was the active model a user choice?\" from `ai_models.installed` (a recovered cache is installed too) or `current_embedding_count` (explicit install has 0 embeddings pre-reconcile, AND it's an O(index) scan every open). RECORD it: `ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META` (\"active_embedding_model_provisional\") = \"1\" AUTOMATIC / \"0\" or absent EXPLICIT|CONFIRMED. `activate_model_with_version(conn, id, version, provisional)` is the SINGLE writer stamping model+version+provenance together \u2014 `install_model` false (explicit), `recover_cached_fastembed_model` + the seed true (automatic). A reconcile committing embeddings (`embed_loop.rs`, `report.embeddings_written > 0`) calls `clear_active_embedding_model_provisional` \u2192 confirmed. `active_embedding_model_seed_owed`: model selected \u21d2 owed when active unset OR (active != config AND `active_embedding_model_is_provisional`) \u2014 O(1). Absent flag \u21d2 non-provisional \u21d2 respected (pre-#394 indexes + explicit/committed models safe). One signal: explicit install sticks before first reconcile; recovered cache yields to config; config edit before install adopted; committed model never clobbered; no per-open scan.\n\nEMBEDDINGS-OFF SYMMETRY (config `model=\"none\"`, model_id()==None): reconcile/status are config-BLIND (`reconcile_with_options_progress`/`status.rs` read `active_embedding_model_id` from the active meta, NOT config; the CLI reconcile cmd does NOT gate on config=None), so the SEED is the ONLY config\u2192meta bridge \u2014 disabling must flow through it too. `seed_owed(None)` owes a write only to CLEAR a still-active PROVISIONAL model (explicit/confirmed preserved) \u2192 `clear_active_embedding_model` drops model id + freshness version + provenance flag + remote config, so `active_embedding_model_id` returns to the hash fallback and nothing stale lingers. Restores the \"embeddings-off \u21d2 active unset\" invariant; without it a repo first opened with a real embedder then switched to `none` keeps prompting for the disabled model. `delete_meta` is the index_meta counterpart of `clear_reconcile_meta` (`clear_active_remote_config` now builds on it).\n\nTWO GAPS THE SEED SHARED WITH install (fix both when touching activation): (1) the seed clears `active_remote_config` (like `install_model`'s local branch) \u2014 else a reseed away from a remote activation lets `active_embedder` build an `OpenAiEmbedder` against the STALE endpoint \u2192 vectors in the wrong embedding space. (2) ATOMICITY \u2014 BOTH write-path seeds run INSIDE their transaction, never autocommit-before-BEGIN (a failed pass would otherwise strand the active model on a newly configured MISSING model, losing the old fallback): the `rebuild` seed before COMMIT (after set_meta indexed_at_ms); the `index_incremental_with_progress` seed inside its BEGIN IMMEDIATE block, folded into the `mutated` flag so a heal COMMITs while an idle pass with no heal owed stays a no-op read (preserves the #63 no-write invariant).\n\nSeeding does NOT install \u2014 reconcile still BLOCKS until the configured model is installed \u2014 but the block message (`embed_loop.rs` / `status.rs`) names the CONFIGURED model.\n\nTEST FOOTGUN: schema_bootstrap tests use `embedding-hash` as the no-download test embedder and used to rely on active-defaults-to-hash. A fresh index now adopts the CONFIGURED model, so a test that installs/uses hash must SELECT it (`config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap()` before `rebuild`): fixed `reconcile_requires_explicit_model_install_and_ignores_stale_artifacts`, `full_rebuild_preserves_installed_model_manifest`. Provenance unit tests (in-memory conn): respects_an_explicitly_installed_model, config_wins_over_a_provisionally_recovered_model, reseeds_a_provisional_model_when_the_config_changes, a_confirmed_model_is_respected_over_a_config_change, embeddings_off_clears_a_provisional_active_model, embeddings_off_preserves_an_explicit_active_model, embeddings_off_leaves_the_active_model_unset. Integration: reconcile_confirms_a_provisional_model_against_a_config_change; an_incremental_pass_heals_a_missing_active_model_atomically. `activate_model_with_version_writes_all_metas` asserts the provenance meta. PR #395.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/ai/reconcile/model_lifecycle.rs"
+  }
+ },
+ {
+  "id": "reviewed_04",
+  "source_commit": "c5303848",
+  "finding_id": "1f73d259b994c226",
+  "memory_id": "mem_19f33fa95f9_146975e12c65",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `below_sqlite_bind_limit` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970235907,
+  "kind": "BugPattern",
+  "title": "Test HTTP stubs: macOS/BSD accept() inherits the listener's O_NONBLOCK \u2192 force blocking or large bodies truncate (#446)",
+  "body": "CROSS-PLATFORM TEST-HARNESS FOOTGUNS (#446) in the in-process HTTP stubs (embed_loop.rs `spawn_reconcile_embed_stub`/`spawn_selective_failure_embed_stub`; openai.rs `spawn_stub`/`spawn_body_capture_stub` + the concurrency stub). TWO distinct Windows/macOS socket bugs, both surfacing only on requests too big for ONE TCP segment:\n\n1) macOS/BSD accept() INHERITS the listener's O_NONBLOCK (Linux/Windows do NOT \u2014 accept yields a blocking socket). The reconcile stubs `set_nonblocking(true)` for a poll-accept loop; the accepted socket is then non-blocking on macOS, so `set_read_timeout` (SO_RCVTIMEO) is a NO-OP and `read()` returns `WouldBlock` the instant no bytes are buffered. `read_request_body` treats `Err(_)` (incl. WouldBlock) as `break`, so a multi-segment body TRUNCATES \u2192 stub returns too few embeddings \u2192 reconcile batch fails the count check \u2192 `embeddings_written: 0`. FIX: `stream.set_nonblocking(false).ok();` at the TOP of `read_request_body`, before `set_read_timeout`. Tripped `remote_reconcile_chunks_large_selection_below_sqlite_bind_limit` (1005 chunks, one 4096-batch request); 4-item stub tests fit one segment and never saw it.\n\n2) Windows abortive (RST) close on unread request bytes. openai.rs `spawn_stub` accepts, calls `drain_request` (originally a SINGLE `read`), writes the response, then DROPS the stream. On Windows a request can arrive in multiple segments, so one read leaves the tail in the recv buffer \u2014 and closing a socket with unread RECEIVED data is an ABORTIVE (RST) close there, which the client (ureq) surfaces as a transport error INSTEAD of the HTTP response. So `embed_batch_errors_on_{dim_mismatch,count_mismatch,http_500}` got a connection error, and their assertions on the error message (\"512\"/\"3\"/\"http status 500\"/\"boom\") failed. The happy-path test uses the same stub and passed only because its request landed in one segment \u2014 LOAD-DEPENDENT flaky, not deterministic. FIX: `drain_request` now delegates to `read_request_body` (full headers + Content-Length drain), leaving the recv buffer empty so the drop is a graceful FIN and the client reads the full response.\n\nRULE for any in-process test HTTP stub: (a) if the listener is non-blocking, reset each accepted socket to blocking before a timeout-governed read; (b) FULLY consume the request (Content-Length body), never a one-shot read, before responding+closing \u2014 a partial drain triggers Windows RST-on-close. (rusqlite is `bundled`, so SQLite `SQLITE_MAX_VARIABLE_NUMBER` is identical across platforms \u2014 the \"below_sqlite_bind_limit\" 1005-vs-999 theory is a RED HERRING; the cause is always the socket.)",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/ai/reconcile/embed_loop.rs"
+  }
+ },
+ {
+  "id": "reviewed_05",
+  "source_commit": "c5303848",
+  "finding_id": "1896eee5f4459397",
+  "memory_id": "mem_19f37cc601f_82f8846e2ce4",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `allows_already_indexed_to_go_empty` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970235978,
+  "kind": "Decision",
+  "title": "#427: same-identity checkouts share ONE scope by design; index only warns (never re-scopes), plus a zero-file hard error",
+  "body": "Issue #427 asked whether an explicit-config `rag-rat index` of a linked worktree / same-identity clone SHOULD adopt the primary checkout's `source_root` + files. Decision (user-confirmed): **keep the A7 identity semantics unchanged** \u2014 `resolve_repo_identity` derives the SAME portable `repo_id` for the primary checkout, its linked worktrees, and any fresh `git clone`, so `register_repo` folds them into ONE scoped row-set. Load-bearing, not a bug. The fix is to make it LOUD, not to re-scope.\n\n**Two loud-adoption warnings** (`crates/rag-rat-cli/src/commands/index_ops.rs::surface_adoption_warnings`, on BOTH one-shot and `--watch` paths, NOT `--worktree` overlays): (1) worktree re-anchor \u2014 `config.source_root_reanchored_from.is_some()`, see [[mem_19f374e0156_7f96768c59d6]]; (2) same-identity join \u2014 `same_identity_join_note(config)`.\n\n**Empty-index invariant \u2014 enforce BEFORE adoption records the root, at the two INDEXING entry points, each OPEN+MIGRATE then check.** `index_incremental_with_progress` (incremental.rs): `open_bare(AdoptionPending)` (migrates) \u2192 `is_first_time_empty_conn(conn, config)?` \u2192 `adopt_repo_from_config`. `rebuild_with_progress` (rebuild.rs) SPLIT around `create_or_migrate`: PHASE 1 (fresh DB `!db.exists()`) refuses would-discover-nothing pre-create (no stray file, the `maintenance` contract); PHASE 2 (existing DB) refuses `is_first_time_empty_conn` post-migrate (a pre-registry/older DB is unreadable until migrated). `--allow-empty` (`Config::allow_empty`) opts in.\n\n**ROOT-RECORDING IS INTENT-GATED (the same-identity-clone-prune fix, register_repo now has TWO public entries).** `schema::register_repo` (records the working-tree root in `repo_roots`) vs `schema::register_repo_read_only` (registers identity, records NO root) \u2014 both delegate to `register_repo_inner(.., record_root)`; `record_root` gates ONLY the `repo_roots` INSERT (idempotent path, adoption txn, and `merge_local_incumbent_into_registered`), every identity decision is identical. `adopt_repo_from_config(config, AdoptIntent)` (lifecycle.rs) picks: `AdoptIntent::Indexing` (rebuild/incremental/generation_rebuild test) \u2192 `register_repo`; `AdoptIntent::ReadOnly` (`open_config`: doctor/MCP/query) \u2192 `register_repo_read_only`. WHY: a recorded root is the \"this checkout was INDEXED here\" signal, so a mere READ must not create one (else a `doctor`/MCP read of a fresh same-identity clone makes it look indexed \u2192 a later empty index prunes the shared scope). `consolidate` uses `register_repo` (imports an indexed repo). The 63 direct `register_repo(4-arg)` test callers are unchanged.\n\n**ONE recognition helper, INDEXING-ONLY signals (adoption_hints.rs `repo_indexed_at_this_root`), shared by the empty-index guard AND `same_identity_join_note`.** Two signals, either proves an indexing pass ran at THIS checkout: (1) PRIMARY \u2014 `schema::repo_has_recorded_root(repo_id, root)`; recording is now indexing-only, so this is immune to a read-only open AND to a same-identity SIBLING clone stealing recognition (each checkout records its OWN `repo_roots` row, so B indexing the shared repo leaves A's row intact). (2) FALLBACK \u2014 persisted `repo_meta[repo_id][source_root] == root`, for an identity-less (non-git/unborn) root that never gets a `repo_roots` entry (`adopt_repo_from_config` sole-picks WITHOUT `register_repo`). The single-valued `source_root` alone was WRONG: last-writer-wins, so a sibling clone's index overwrote it and made the earlier checkout look un-indexed \u2192 its empty prune got refused (#427 review \"Preserve pruning for earlier same-identity checkouts\"). `is_root_already_indexed[_conn]`: resolve repo_id \u2192 `repo_indexed_at_this_root`; PLUS a sole-placeholder fallback (`!multiple_real_repos && sole_repo_id`) for a legacy pre-adoption index. `is_first_time_empty[_conn]` = `!is_root_already_indexed && !would_discover_any_file` (`&&` short-circuits the walk).\n\n`open_ro_compatible` (the SELF-opening probe) accepts a migrateable `Older` schema ONLY once `schema::table_exists(conn,\"repos\")` (the registry was ADDED in V038; probes run BEFORE the write-open migration, so a pre-V038 `Older` DB has no `repos` table and would fault `no such table: repos`).\n\nCallers REACT to the typed `EmptyIndexRefused` (never re-derive): one-shot `index` surfaces it; watcher `run_pass`/`shutdown_discover` and `maintenance` `downcast_ref` \u2192 defer. **No-watchable-target `--watch` errors at STARTUP** \u2014 `run_watch` refuses `!config.allow_empty && config.target_directories().is_empty()` (keyed on `target_directories()`, not `targets.is_empty()`: a target with an empty dir list watches nothing).\n\nDefault SAFE: an indexing caller inherits the refusal; a read-open can't smuggle an empty scope. Index a clone/worktree as its OWN repo by pinning `[index] repo_id`. Tests: index_guards.rs (refuses_zero, allows_already_indexed_to_go_empty, discover_refuses_first_time_empty_against_existing_db, full_rebuild_prunes_existing_placeholder, maintenance_defers, watch_on_no_target/empty_target_dirs_errors, watch_with_targets_but_no_files_defers) + adoption_hints.rs (a_sibling_index_does_not_steal_an_earlier_checkouts_prune_right, a_read_only_open_does_not_make_an_unindexed_repo_look_indexed, same_identity_join_warns_even_after_a_read_only_open_of_the_clone, recognizes_non_git/legacy_placeholder, pre_registry_no_fault, tracks_indexing_not_shared_identity) + watch.rs maintenance_pass_defers.\n\n**REBASED onto #460 (`0ee6562`, gix 0.85 / incremental-churn work). PR #458.** History squashed: commit `9b8657d` = the whole #427 empty-index + warnings work; a follow-up commit = the intent-gated root-recording + recognition rework above. The pre-#460 review-iteration commits (3434518/c8c71e0/5d5ebbe/31a36f3/68b443c + the superseded leaf-patch ones) were collapsed by the rebase.\n\nKNOWN COSMETIC EDGE (defer): an explicit `--config` naming a linked-worktree absolute path against a shared DB with main already indexed trips BOTH warnings \u2014 `anchor_root_to_main_worktree` returns `main_root.join(\"\")` \u2192 trailing slash so the re-anchored root no longer string-matches the recorded root. Registry helpers reused via [[mem_19f372f8d6c_9c541381eb09]].",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-cli/src/commands/index_ops.rs"
+  }
+ },
+ {
+  "id": "reviewed_06",
+  "source_commit": "c5303848",
+  "finding_id": "540261ba53d37f35",
+  "memory_id": "mem_19f3e5f98cc_276b010fd437",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `write_bytes` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236051,
+  "kind": "Risk",
+  "title": "Clone-graph treadmill: global content_revision gate rebuilds the full generation every watcher pass under continuous edits (~1 GB writes/pass)",
+  "body": "MEASURED (2026-07-07, `rag-rat mcp` serving this repo, agent editing continuously): 242 GB write_bytes / 470 GB rchar in ~6 h; one watcher pass = ~4.8 GB written, ~9.5 GB read, ~4.5 min; `clone_graph_generations.generation` counter reached 324 in that window (\u22481 full generation per ~64 s while edits land).\n\nMECHANISM: `pending_clone_graph()` gates freshness on `live.source_revision != content_revision()` \u2014 a GLOBAL digest over every indexed file. Any edit anywhere flips it, so every watcher pass tail (`watch.rs::run_pass`) spends leftover budget in `reconcile_clone_edges_pass`. Phase 1 there DISCARDS a Building generation whose `source_revision` no longer matches (CASCADE drops its edges/postings) and restarts from symbol 0. Under a continuously-editing agent the graph is rebuilt from scratch every pass: a Complete generation on this corpus is ~155k `clone_edges` + ~220k `clone_subblock_postings` (~100 MB of table+index rows), and each cycle pays INSERT of the new generation + DELETE of the old one, doubled again by WAL + checkpoint. A budget-tripped Partial generation (e.g. 93k edges) is pure waste \u2014 discarded next pass because the revision moved again.\n\nThe design assumed hook-driven cadence (rebuild after commit, then idle). An agent editing every few seconds turned it into a treadmill that never converged and dominated disk I/O.\n\nSTATUS: mitigated by the #472 quiet-window gate (PR #475): `IndexDatabase::clone_graph_rebuild_due` (precompute.rs) defers the background rebuild until `content_revision()` has been stable for `watch::CLONE_GRAPH_QUIET_MS` (5 min), shared by the watcher and CLI maintenance tails via per-repo meta (`clone_graph_quiet_*` keys). Explicit `clones --precompute` / full `index` stay immediate. The ROOT fix \u2014 incremental delta maintenance so small edits never trigger full rebuilds \u2014 is #473 (design in the issue): edges are df-independent verification results, prefix filtering is lossless under any single frozen token order, so per-changed-file deltas against the persisted postings are sound. Do NOT \"fix\" further by relaxing the exact-freshness eligibility of the postings fast path (see the CloneCorpus R1 memory).",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/query_api/clones/precompute.rs"
+  }
+ },
+ {
+  "id": "reviewed_07",
+  "source_commit": "c5303848",
+  "finding_id": "5706435d98ba5e4a",
+  "memory_id": "mem_19f4afef645_f887d9db27a2",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `RuntimeAiConfig` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236124,
+  "kind": "Risk",
+  "title": "chunks.embedding_policy freshness model: single writer chain, hardcoded-DEFAULT cap stamp, and the files.generated trap",
+  "body": "Facts that constrain any design that trusts the persisted `chunks.embedding_policy` column (e.g. a version-stamped GROUP BY fast path for the skip summary, #530):\n\n1. SINGLE WRITER CHAIN: `chunks.embedding_policy` is written only by `prepare_chunks` (prep.rs) -> `insert_prepared_file` -> `insert_chunks` (file_index.rs). Full rebuild, incremental, and the heal path (post-#518/#552, via `prepare_index_content_from_text` -> `insert_prepared_file`) all route through it. `chunk_embeddings.embedding_policy` (ai/store.rs) is a SECOND, independent copy stamped at embed time with `LowSignalCheck::FromText` \u2014 it can legitimately differ from the chunks-table value (FromSpan) for chunks slicing into long comments/strings.\n\n2. CAP INCONSISTENCY: `prepare_chunks` stamps the column at hardcoded `ai::DEFAULT_MAX_EMBEDDING_CHARS` (prep.rs) even though `max_embedding_chars` is user-configurable in rag-rat.toml (config.rs `RuntimeAiConfig`). `status.rs` calls `embedding_policy_skip_summary(conn, DEFAULT_MAX_EMBEDDING_CHARS)` unconditionally while `reconcile_with_options_progress` passes the runtime cap \u2014 so for a non-default-cap user, status and reconcile skip summaries ALREADY disagree today (SkipTooLarge/truncation only).\n\n3. THE files.generated TRAP: the policy's generated gate reads `file_kind` (the stored `files.kind` from the target config) plus its own `looks_generated_path` \u2014 NOT the healed `files.generated` flag. `ensure_generated_flags_current` rewrites `files.generated` on write-bearing opens WITHOUT touching chunks. If anyone \"unifies\" the policy's generated gate onto `files.generated` (a tempting cleanup per the #202 decision memory), any persisted-policy fast path silently desyncs, because flag heals don't restamp chunk policies.\n\n4. POLICY BEHAVIOR SURFACE is wider than `embedding_policy_for_chunk`: `cheap_skip_policy`, `MIN_EMBEDDING_CHARS`, `looks_generated_path`, `is_test_fixture_path`, `Language::supports_embeddings`, `is_plumbing_node`/`span_is_plumbing`, and the tree-sitter GRAMMAR CRATE VERSIONS (a grammar bump changes low-signal node kinds with zero rag-rat source change). A hand-bumped policy-version const cannot cover grammar bumps even in principle; only a behavior-corpus tripwire test (hash policy decisions over fixture snippets that really parse) catches those.\n\n5. SCOPE: the skip summary's recompute joins `chunks JOIN files JOIN chunk_text` where `files` is the temp scope VIEW (repo + live generation). Bare `chunks` contains dead-generation rows and other repos' rows in a shared DB; any GROUP BY replacement must keep the identical FROM/JOIN. Note the chunk_text JOIN also silently excludes chunks lacking a chunk_text row.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/ai/policy.rs"
+  }
+ },
+ {
+  "id": "reviewed_08",
+  "source_commit": "c5303848",
+  "finding_id": "dbff17c72e7ef032",
+  "memory_id": "mem_19f5bea3f64_64d4d8646d1c",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `EdgeEmitter` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236197,
+  "kind": "Decision",
+  "title": "Split language metadata registry from structural capabilities",
+  "body": "`LANGUAGE_SPECS` retains static metadata indexed by `Language`. Structural behavior lives in `index/languages/<language>/`: `ParserBackend` handles grammar, scope, signatures, and declared symbol kinds; stateless `EdgeExtractor` functions handle per-node edges through `EdgeVisit`/`EdgeEmitter`; typed `ResolutionPolicy` values bundle semantic resolution choices and callbacks. Persisted edge-kind strings are parsed into `EdgeKind` once at the DB resolver boundary. Resolver drivers use `files.language` only, never infer it from the symbol index. Add a language via metadata, package, grammar mapping, completeness tests, and a row in the table-driven policy test; register only needed capabilities.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/language.rs"
+  }
+ },
+ {
+  "id": "reviewed_09",
+  "source_commit": "c5303848",
+  "finding_id": "a79f1e7e67da8eaf",
+  "memory_id": "mem_19f61fc9058_ff10dbbd558c",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `ReferenceShape::UnqualifiedOnly` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236268,
+  "kind": "Invariant",
+  "title": "Bare-name fallback is where wrong edges get manufactured",
+  "body": "`edges::resolve::resolve_symbol` only falls back to bare-name matching after qualified-shape resolution fails. A language's typed `ResolutionPolicy::target_shape` may return `ReferenceShape::UnqualifiedOnly` for an `(EdgeKind, target_kind)` pair; then qualified or receiver-bearing references must not bind that target in the bare-name fallback. Swift uses this for `CallsName` to `enum_case`. Unresolved `uses_operator` rows are only allowed if `rag-rat-query`'s `RESOLVED_OPERATOR_ONLY` rule is preserved; otherwise they bind only to built-in operators. Never let bare-name fallback manufacture an edge the source shape did not express.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/edges/resolve/mod.rs"
+  }
+ },
+ {
+  "id": "reviewed_10",
+  "source_commit": "c5303848",
+  "finding_id": "677aa3e5c719999a",
+  "memory_id": "mem_19f93c14fca_bde6b106e54f",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `content_digest::ensure_content_digest(conn)` -> not a defined symbol; appears verbatim as source text [reality]",
+  "reviewed_at_ms": 1784970236339,
+  "kind": "Invariant",
+  "title": "V086 content_digest triggers own content_revision: files writers must register the fold; a files-table rebuild must ensure_content_digest + reseed",
+  "body": "The incrementally-maintained `content_revision` (#828, schema V086) is kept correct by three `AFTER INSERT/UPDATE/DELETE` triggers on `files` (`files_content_digest_ai/ad/au`) that call the registered DETERMINISTIC scalar `rr_content_digest_fold`. Two footguns for future work:\n\n(1) EVERY connection that writes `files` rows MUST call `content_digest::register_content_digest_fold(conn)` first. Production opens do it in `IndexConnection::open` (storage.rs); `schema::apply` and `schema::migrate_forward` register it up front for raw test connections that apply the real schema then write `files`. A writer WITHOUT the function registered fails the `files` write with `no such function: rr_content_digest_fold` and ROLLS BACK \u2014 fail-closed BY DESIGN: a silent no-op would drift the digest under version skew. If you open a bare `rusqlite::Connection` and write `files`, register the fold.\n\n(2) A files-table REBUILD migration (the `CREATE files_new \u2026 / copy / DROP TABLE files / ALTER \u2026 RENAME` pattern used by V040/V043) SILENTLY DROPS the triggers \u2014 they are objects ON the dropped table. Such a migration MUST call `content_digest::ensure_content_digest(conn)` again (recreates table+triggers, idempotent) AND reseed `content_digest_state`, or every subsequent `files` write drifts the digest with no error.\n\nBackstop only: `verify_content_digest_parity` (run under the write lock at gc cadence, `heal_index`, and full-rebuild finalize) recomputes from a full scan and reseeds on mismatch \u2014 it heals drift but is NOT a substitute for calling `ensure_content_digest` in the rebuild migration. Tripwire tests: `schema_bootstrap_tests/content_digest.rs::{a_files_table_rebuild_drops_the_fold_triggers_and_ensure_recreates_them, a_files_write_without_the_fold_function_fails_closed}`. See [[#828 content_revision = MULTISET of (path,sha256) over ALL non-deleted main.files rows (overlays + staged gens included); XOR and counters are wrong]].",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-db/src/content_digest.rs"
+  }
+ },
+ {
+  "id": "reviewed_11",
+  "source_commit": "c5303848",
+  "finding_id": "a06d14c6f83caf96",
+  "memory_id": "mem_19f9650d429_87d9c37c7763",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `ConfigSnapshot::trusted_path` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236415,
+  "kind": "Invariant",
+  "title": "gix 0.86 trusted_path errors must preserve the hooks fallback",
+  "body": "`ConfigSnapshot::trusted_path` changed in gix 0.86 from `Option<Result<Cow<Path>>>` to `Result<Option<PathBuf>>`. `git_paths` intentionally discards interpolation errors and falls back to the common Git hooks directory, matching the pre-0.86 `.and_then(Result::ok)` behavior. Keep the new `.ok().flatten()` before mapping the path; replacing it with `?` changes hook install/status behavior for malformed or unexpandable `core.hooksPath`.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-cli/src/hooks_support.rs"
+  }
+ },
+ {
+  "id": "reviewed_12",
+  "source_commit": "c5303848",
+  "finding_id": "656d38621e9d150b",
+  "memory_id": "mem_19f965e5e48_2d92b9dbe619",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `minimatch` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236490,
+  "kind": "SecurityNote",
+  "title": "scip-python requires a brace-expansion 5.0.8 override",
+  "body": "`@sourcegraph/scip-python` 0.6.6 pins `glob` 7 -> `minimatch` 3 -> `brace-expansion` ^1.1.7, but every brace-expansion release through 5.0.7 is affected by GHSA-mh99-v99m-4gvg. Keep the root npm override at 5.0.8 or newer until scip-python updates its glob chain. Although this crosses minimatch's declared range, scip-python 0.6.6 version/help and a real index of `tests/fixtures/held-mini/src/Main.py` succeed with 5.0.8; rerun that smoke test when changing the override.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "tools/oracle-toolchain/package.json"
+  }
+ },
+ {
+  "id": "reviewed_13",
+  "source_commit": "c5303848",
+  "finding_id": "514972587eb910ea",
+  "memory_id": "mem_19f9682ab5f_2657095b23d4",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `FoldState::enrollment_roles` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236562,
+  "kind": "SecurityNote",
+  "title": "ReadOnly enrollment is immutable across OwnerPromote to prevent retroactive write re-blessing",
+  "body": "`OwnerPromote` may only mint an owner incarnation for a device whose immutable enrollment role (`AccountGenesis` / effective `DeviceAdd`) can already author content. In practice this permits `Member` and originally-`Owner` recovery, but rejects `ReadOnly`. Why: content entries cite a roster ref while the projected roster fact carries the current role; allowing a ReadOnly device to promote would make an account refold revisit its earlier rejected content under `Owner` and retroactively accept it. Blocking ReadOnly promotion also means `OwnerDemote` never needs to reconstruct a ReadOnly baseline: promotable members demote to `Member`, while originally-owner recovery retains the existing re-promotion semantics. Keep `FoldState::enrollment_roles` source-coupled to `roster` on genesis/add, condemnation rollback, and removal. Regression: `a_read_only_enrollment_cannot_be_promoted_and_re_bless_prior_content`.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-oplog/src/account/fold.rs"
+  }
+ },
+ {
+  "id": "reviewed_14",
+  "source_commit": "c5303848",
+  "finding_id": "01f225712833f9d5",
+  "memory_id": "mem_19f968ed36e_9112ede40834",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `EdgeEmitter` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236633,
+  "kind": "Decision",
+  "title": "Edge extractors receive typed visits and emit through a constrained sink",
+  "body": "`collect_edges` owns the only whole-tree traversal and calls the language capability returned by `edge_extractor(Language)`. Each capability is a stateless higher-ranked `EdgeExtractor` function that receives an `EdgeVisit` and may emit only through `EdgeEmitter`; manual and future query-backed implementations share that boundary without forwarding trait impls. Languages such as Markdown return `None`. Keep traversal, source-owner lookup, and emission policy in the shared driver.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/edges/extract/mod.rs"
+  }
+ },
+ {
+  "id": "reviewed_15",
+  "source_commit": "c5303848",
+  "finding_id": "216ab6ddcae80c21",
+  "memory_id": "mem_19f96c85fe9_a6568f34ce43",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `sync_invites` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236705,
+  "kind": "SecurityNote",
+  "title": "Enrollment role stays server-side; consume, DeviceAdd, and key catch-up are atomic",
+  "body": "Enrollment invite tickets contain routing/account data plus an opaque nonce, but never the granted DeviceRole or label; those remain in the owner's sync_invites row so ticket editing cannot escalate authority. Redemption holds one IMMEDIATE SQLite transaction across the conditional unused/unexpired consume, author_device_add_in_tx, loading the exact signed DeviceAdd response, and catch_up_stream_keys_for_device_in_tx. This makes the roster entry effective before key wrapping and ensures any DeviceAdd or catch-up failure rolls back token consumption. Preserve simultaneous-redemption coverage: one success, one Used, one committed DeviceAdd.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-sync/src/enrollment.rs"
+  }
+ },
+ {
+  "id": "reviewed_16",
+  "source_commit": "c5303848",
+  "finding_id": "d04d0233e708ded7",
+  "memory_id": "mem_19f8ef86127_9d51a4c01531",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `remote_node_id` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236777,
+  "kind": "Decision",
+  "title": "Node-auth (#881): symmetric hello order must break \u2014 dialer-first Auth, verify before ANY inventory/account bytes; mutual verification required",
+  "body": "Security review of the #881 node-auth design fixed these protocol requirements for the sync session:\n\n1. The current symmetric session (both sides send Hello{account_id, have} concurrently) leaks the acceptor's account_id + full inventory hash set to an unverified dialer, and the dialer's to an impostor server. The authorized handshake must be sequential: dialer sends a small Auth frame (account_id + signed NodeBinding incl. device ed25519 pubkey) FIRST; acceptor verifies (scope, sig over domain-tagged canonical bytes, sha256(pubkey)==fingerprint, roster-effective in local fold, binding.node_pubkey == authenticated Connection::remote_node_id()) before sending ANY frame; then acceptor replies with its own Auth; dialer verifies it against remote_node_id (iroh guarantees this equals the dialed node id) BEFORE sending its inventory. Entry streaming stays concurrent after the auth exchange.\n2. Mutual verification is required, not optional: it is what closes the poisoned-ticket hole (a dialer handed a hostile EndpointAddr would otherwise stream its whole signed account log to an impostor that claims an empty have-set).\n3. Acceptor behavior pre-auth: do NOT call SyncStore::snapshot() before the binding verifies (currently run_session snapshots up front); use a short pre-auth first-frame timeout (seconds, not the 60s idle timeout \u2014 an unauthorized staller otherwise occupies the single-session accept slot); all pre-auth failures close uniformly (one generic error, no wrong-account vs not-on-roster vs bad-signature distinction \u2014 that distinction is an account-hosting oracle).\n4. Admission class (Open/Closed/InviteToken) is local per-side, per-account config, never negotiated on the wire (a negotiated mode is a downgrade vector). Each side's class governs what IT reveals.\n5. The NodeBinding canonical bytes must carry their own domain tag + version (device keys also sign account-log CBOR; without domain separation a binding could collide with an op preimage). Design the canonical statement once so a future persisted NodeBind account op (Design B) can embed the identical statement.\n6. Do not bolt the binding onto the frozen Hello frame (arity-pinned decode); introduce the new handshake frame(s) and revise goldens/ALPN before any serve loop ships \u2014 after that the shape is compat-locked.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-sync/src/session.rs"
+  }
+ },
+ {
+  "id": "reviewed_17",
+  "source_commit": "c5303848",
+  "finding_id": "285fad62a2becf91",
+  "memory_id": "mem_19f90bbed7a_d3fbb47a1ebd",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: note_ahead); cited: `never_echoes` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236849,
+  "kind": "Invariant",
+  "title": "Table-sync anti-echo: apply records the row's synced hash ONLY when the op wins the row, so produce never re-emits a received row",
+  "body": "**Invariant (#893, whole-row LWW):** every apply that WINS a row records the row's synced-column hash into `sync_published_rows`, and `produce::produce_row_ops` emits an op only when the current row's hash differs. This stops the echo-republish loop: a row applied from a peer is recorded, so the next producer pass sees no delta and never re-signs/rebroadcasts it.\n\n**The two halves:**\n1. Only a WINNING op records the published hash. `apply_upsert` returns early (no published write) when the op loses the whole-row LWW (doesn't beat `sync_row_clocks`) \u2014 critical so a stale/losing op can't stamp an unsent LOCAL edit as published and make the producer drop it. A winning op replaces the whole row, then records the hash.\n2. The hash is read back through the SAME path (`read_synced_cells`, mapping each column by its declared `ValueType`) the producer uses, so apply's recorded hash is byte-identical to what produce computes. It covers SYNCED columns only (`spec.columns`), never pk or `local_columns` \u2014 local re-resolution churn must never dirty it.\n\n`produce_and_author` self-applies each authored op (which always wins, lamport = stream max+1) so the author's own row is recorded too (no self-echo). A `Remove` clears the published record.\n\n**How to apply:** put re-derived/volatile columns in `TableSpec.local_columns`, never `columns`, so they stay out of the hash. Regression tests: `produce::tests::a_received_row_is_never_re_emitted`, `apply::tests::a_losing_upsert_does_not_publish_an_unsent_local_edit`, `engine::tests::...never_echoes`. See [[table-sync-removes-are-lww-ordered-via-sync-row-tombstones-order-independent-no-resurrection]].",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-oplog/src/table_sync/apply.rs"
+  }
+ },
+ {
+  "id": "reviewed_18",
+  "source_commit": "c5303848",
+  "finding_id": "c0c5634ad40e429e",
+  "memory_id": "mem_19f46912a7d_bcc7a6928ec1",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `NODE_AUTH_TOKEN` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236921,
+  "kind": "Decision",
+  "title": "Releases: release-plz cuts the tag + crates.io publish; cargo-dist owns the GitHub release + prebuilt binaries + npm publish (@rag-rat/bin)",
+  "body": "Since #550 the release pipeline is split between two tools; understand the handoff before touching `release-plz.toml`, `dist-workspace.toml`, or `.github/workflows/release.yml`.\n\n**release-plz** (`.github/workflows/release-plz.yml`, `release-plz.toml`): bumps the lockstep version across the 3 crates, updates CHANGELOG.md, publishes all 3 to **crates.io**, and cuts exactly one `vX.Y.Z` git tag (only the `rag-rat` package has `git_tag_enable = true`). It does **NOT** create the GitHub release: `git_release_enable = false` on both `[workspace]` and the `rag-rat` `[[package]]`.\n\n**cargo-dist** (`dist-workspace.toml` + generated `.github/workflows/release.yml`): the `vX.Y.Z` tag push (pattern `**[0-9]+.[0-9]+.[0-9]+*`) triggers it to build prebuilt binaries for the 5 targets, generate installers (shell/powershell/npm), **create + publish the GitHub release** (`dist host --steps=create/upload/release`), and `npm publish --access public` the npm installer package (`publish-jobs = [\"npm\"]`, `NODE_AUTH_TOKEN` \u2190 the `NPM_TOKEN` repo secret).\n\n**FOOTGUN (do not do):** never set `git_release_enable = true` on the `rag-rat` package in `release-plz.toml` \u2014 release-plz and cargo-dist would both try to create the same GitHub release and race.\n\n**Two binary install channels:** `cargo install rag-rat` (crates.io, compiles from source, Rust toolchain) and `npx @rag-rat/bin` (prebuilt, no toolchain). `@rag-rat/bin` = `npm-scope = \"@rag-rat\"` + `npm-package = \"bin\"`.\n\n**Constraints / how to apply:**\n- cargo-dist `targets` MUST stay within ort's supported platforms \u2014 FastEmbed links ONNX Runtime statically via `ort-download-binaries`, so an unsupported target fails to build. Current set: aarch64/x86_64 apple-darwin, aarch64/x86_64 linux-gnu, x86_64 windows-msvc.\n- Edit `dist-workspace.toml` then run `dist generate` to regenerate `.github/workflows/release.yml` \u2014 never hand-edit the generated workflow.\n- Failure isolation: if the cargo-dist workflow fails, crates.io publish + the tag still happened (release-plz owns them), so `cargo install` is unaffected; only the GitHub release / prebuilt binaries / npm publish are at risk.\n- This is phase 1 of the `@rag-rat/setup` milestone (#544); `@rag-rat/setup` (#545) builds on the `@rag-rat/bin` channel.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "release-plz.toml"
+  }
+ },
+ {
+  "id": "reviewed_19",
+  "source_commit": "c5303848",
+  "finding_id": "479df0a9fff3dd59",
+  "memory_id": "mem_19f4778edd1_9a04c86e5dd4",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `__imp_tolower` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970236994,
+  "kind": "PlatformQuirk",
+  "title": "cargo-dist prebuilt binaries: the ort/ONNX-Runtime prebuilt forces per-target linker config (glibc image, dynamic CRT, no Intel Mac)",
+  "body": "rag-rat's embeddings pull in `ort` (fastembed feature), which at build time DOWNLOADS a prebuilt ONNX Runtime (`libort_sys`, from ort.pyke.io) and statically links it. That prebuilt's ABI + availability vary by target and fight cargo-dist's default build environment. The first cargo-dist release (v0.15.0) built ONLY aarch64-apple-darwin; the other four targets all failed to link `libort_sys`. Root cause is singular (the ONNX prebuilt), but the fix differs per platform \u2014 all in `dist-workspace.toml` (see PR #557):\n\n- Linux (x86_64 + aarch64): dist builds on `ubuntu-22.04` (glibc 2.35), but the ONNX prebuilt references the C23 strtol family (`__isoc23_strtoll/strtoull/strtol`) added in glibc 2.38 \u2192 `undefined symbol` at link. FIX: pin the build image to glibc-2.39 via `[dist.github-custom-runners]` \u2192 `x86_64-unknown-linux-gnu = \"ubuntu-24.04\"`, `aarch64-unknown-linux-gnu = \"ubuntu-24.04-arm\"` (arm builds natively, not cross). No portability loss: the binary already required glibc \u22652.38 because it embeds that ONNX build.\n- Windows (x86_64-pc-windows-msvc): needs TWO CRT fixes, both required together. (1) dist defaults to STATIC CRT (`+crt-static` \u2192 libcmt); the ONNX prebuilt is DYNAMIC (`/MD` \u2192 MSVCRT) \u2192 LNK2019 `__imp_tolower` etc. + LNK4098. FIX: `msvc-crt-static = false` (flips Rust's own objects to /MD). (2) That alone leaves `esaxx-rs` (C++ dep via tokenizers \u2190 model2vec/fastembed), which HARDCODES cc `.static_crt(true)` \u2192 /MT, as the odd one out \u2192 LNK2038/LNK1319. FIX: force `CFLAGS=-MD`/`CXXFLAGS=-MD` on WINDOWS ONLY (cc appends env flags after its own /MT; cl.exe is last-flag-wins). Injected before `dist build` via `github-build-setup = \"dist-build-setup/steps.yml\"` (steps file in a workflows SUBDIR so GitHub doesn't parse it as a workflow). Mirrors the proven `.github/workflows/ci-cross-platform.yml` step. MUST stay Windows-gated: on macOS clang `-MD` means \"emit make deps\" and breaks the build.\n- Intel Mac (x86_64-apple-darwin): `ort` ships NO prebuilt ONNX for this target/feature-set \u2014 hard block short of compiling ONNX from source. FIX: DROP the target. Apple Silicon (aarch64-apple-darwin) is the only Mac that links. Note bare `cargo install rag-rat` ALSO fails on Intel Mac (default features enable fastembed \u2192 ort \u2192 same missing target); the only source path is the pure-Rust embedder: `cargo install rag-rat --no-default-features --features model2vec`.\n\nHOW TO APPLY: any new cargo-dist target must be one `ort` provides a prebuilt for AND satisfy the glibc/CRT constraints above. Don't re-add x86_64-apple-darwin without an ONNX-from-source build. dist-workspace.toml owns targets/runners/CRT/build-setup; release.yml resolves targets+runners at runtime from `dist plan`, so `dist generate` yields an identical workflow EXCEPT for trigger config (pr-run-mode, #555 set \"skip\") and github-build-setup steps (those ARE inlined into release.yml). The release build does NOT need ci-cross-platform.yml's `cargo clean -p ort-sys` \u2014 that was for rust-cache restore-key staleness; cargo-dist's build target isn't cached (only the `dist` binary is). ESCAPE HATCH: if ONNX linking ever becomes intolerable, switching the embedding backend to pure-Rust `tract` (ort's own error suggests `ort-tract`) removes all prebuilt-binary linking \u2014 every target builds from source, incl. Intel Mac \u2014 at a perf/op-support cost.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "dist-workspace.toml"
+  }
+ },
+ {
+  "id": "reviewed_20",
+  "source_commit": "c5303848",
+  "finding_id": "4e77c1d4954d497b",
+  "memory_id": "mem_19f8c23b049_f67e19b355a2",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `readinessProbe` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237065,
+  "kind": "Decision",
+  "title": "Cookbook Modal readiness is the endpoint serve-probe, NOT sb.waitUntilReady (which hangs on cold vLLM)",
+  "body": "**What:** The Modal recipe (`@rag-rat/cookbook` \u2265 0.8.1) resolves the tunnel first, then gates readiness ONLY on the endpoint HTTP serve-probe (`verifyChat`/`verifyEmbed`, which poll until a real completion/vector, tolerating connection-refused during boot). It no longer calls `sb.waitUntilReady()` and no longer sets a `readinessProbe: Probe.withTcp(...)` on `sandboxes.create`.\n\n**Why:** On a COLD vLLM boot (esp. 30B FP8 on L40S), Modal JS SDK 0.9.0 `sb.waitUntilReady()` (the `sandboxWaitUntilReady` command-router RPC, gated on the TCP `readinessProbe`) HANGS INDEFINITELY even after uvicorn has bound `0.0.0.0:8000` and the encrypted tunnel already serves HTTP 200 \u2014 verified by curling the tunnel and by `modal.Sandbox.from_id(id).tunnels()` resolving instantly from Python while the JS wait was stuck 20+ min. The box bills the whole time and never emits `ready`; the provision subprocess stalls to the budget deadline and tears the box down with zero work. 0.9.0 is the newest Modal Labs SDK (the `modal` 1.x on npm are unrelated 2015 packages), so no version bump fixes it.\n\n**How to apply:** Never reintroduce `sb.waitUntilReady()` as the readiness gate for a cold box. `sb.tunnels()` returns the tunnel URL as soon as it is allocated at creation (independent of the in-box server), so resolve it first and let the serve-probe be the sole readiness signal. Escape hatch if a box is stuck-but-serving: get its tunnel via the Python SDK (`modal.Sandbox.from_id(sbid).tunnels()`), point rag-rat at it in CONNECT mode (`[llm.*.remote] endpoint = <tunnel>`), and `sb.terminate()` when done.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "cookbook/recipes/modal.mts"
+  }
+ },
+ {
+  "id": "reviewed_21",
+  "source_commit": "c5303848",
+  "finding_id": "beecbfe96a0cd6d9",
+  "memory_id": "mem_19f2c3a696a_cad2d0ae5fc8",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: note_ahead); cited: `pre_owner` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237143,
+  "kind": "Decision",
+  "title": "A7 global-DB default flip + consolidate importer + multi-repo register_repo + V044 github key widening (memory-sync phase A7)",
+  "body": "A7 of the global-DB consolidation (A1/V038..A6/V043; issue #402, PR #419, head 4cc202e \u2014 two adversary waves + nine Codex batches + a worktree-centralization directive, all resolved; standing directive since batch 9: STABLE ROOT FIXES over per-callsite patching). The FLIP: the default DB is the consolidated GLOBAL store when rag-rat.toml has no `database` key; an explicit key keeps a repo per-repo (deprecated but honored).\n\n*** LADDER-NUMBER COLLISION WARNING: this PR takes V044 (github natural keys) AND V045 (github child keys). The dream-v2 pass-0 branch stacked on A7 also claimed \"V045\" for `apply_memory_verification_tables` \u2014 it must RENUMBER to V046+ at rebase (its tip-pin/checksum tests will force it loudly). ***\n\n1. CONFIG FLIP (config.rs). Keyless resolution: (0) IDENTITY GATE (identity-less \u21d2 per-root legacy silently). (1) `.imported` marker \u21d2 GLOBAL latch. (2) legacy file \u21d2 legacy + nudge. (3) global. INIT KEYLESS. TEST FOOTGUNS: keylessness asserts by line-prefix; init -y tests sandbox RAG_RAT_DATA_DIR; global-resolution fixtures must be COMMITTED git repos.\n\n*** IDENTITY GATE HAS TWO ENTRANCES (batch 8 #5): explicit pin AT the global path from an identity-less root refused at Config::load (ConfigError::GlobalPinWithoutIdentity). STRUCTURAL BACKSTOP in adopt_repo_from_config: identity-Absent open NEVER sole-picks on a multi-repo DB. ***\n\n*** GOVERNING SEAM + DISCOVERY (batches 7/8/9 \u2014 full detail in the sibling config.rs invariant memory): load's seam = which config WINS (main's, wholesale, topology-triggered); `config::discover_config_path` = where the CLI LOOKS by default (local if exists, else main's in linked checkouts). CLI `--config` is Option<String>: None \u21d2 discovery, Some \u21d2 literal. New default-path constructions must use discover_config_path, never dir.join(\"rag-rat.toml\"). init refuses in linked worktrees, proceeds from main subdirs. ***\n\n2. `rag-rat consolidate` (core run()). GUARD ORDER: AlreadyGlobal (probes default legacy path \u2014 marker-less lingering legacy under a global pin IMPORTS) \u2192 PINNED\u21d2REFUSED (path-aware remedy, before missing-source exits) \u2192 AlreadyImported/NoLegacyIndex. SCHEMA-ONLY migrate for TARGET; SOURCE LADDER RUN before snapshot. LOCKS: target-side + legacy-side drain of every id the source registry records. SIDECARS TRAVEL via rename_wal_sidecars; checkpoint best-effort. run(config) \u2014 no config_path param.\n\n*** THE MIRROR INVARIANT (batch 9, closes the retry-window CLASS \u2014 stated at import_from_source with a per-artifact disposition table; a NEW copied artifact must be classified there at birth): until the archive rename lands, the legacy DB is AUTHORITATIVE for this repo's imported slice \u2014 every copied artifact is REFRESHED to match the source on every run; post-rename the latch makes re-runs unreachable. Dispositions: repo_memories = content-gated UPSERT (12-col row-value IS NOT + repo_id ownership in the gate; foreign rows never updated; remap path + ownership bail intact); children of ALL mapped ids (same-repo AND remapped) = REPLACED UNCONDITIONALLY (refresh_children deletes tags/bindings/call_paths/call_path_edges for every mapped target id, copies reinsert \u2014 NO parent-edit gate: the batch-8 gate relied on updated_at_ms chaining and missed remapped parents, whose pre_owner is the FOREIGN owner of the source id); honest counts via per-table before/after SLICE DIGESTS (child_slice_digest: SELECT * per mapped id, type-tagged serialization, sorted, SHA-256; identical slice \u21d2 table reports 0, else the reinserted rows \u2014 no-edit retries report zeros); repo_memory_fts = whole-repo re-derive (covers remapped refreshes); repo_meta model-state unit = per-key MIRROR (value-gated upsert when present, DELETE when a carried key is absent in source \u2014 a window model switch dropping the remote config must not tear the unit; SUPERSEDES the batch-4 \"config-seeded target value wins\" posture \u2014 nothing else can write a mid-consolidate repo's meta under the held locks, so a differing target value is a stale crashed-run copy); ai_models readiness = restore-style, re-derived from the SOURCE's active model each run (window model change restores the NEW model on retry; machine-level disabled never overridden); embedding_cache = INSERT OR IGNORE, the ONE documented exemption (content-addressed: (input_hash, model_id) determines the vector bytes). Tests: a_retry_after_a_failed_rename_carries_legacy_edits_made_in_the_window, a_retry_carries_window_edits_to_a_remapped_memory, a_retry_carries_a_window_model_switch (all red-verified), carried_meta_mirrors_the_source_over_a_stale_target_value. ***\n\n3. register_repo MULTI-REPO (registry.rs). Registry lock; IMMEDIATE txn; ROOT\u2227BOUNDARY upgrade; late-upgrade merge exception; adoption re-points main.-qualified; read-only mirror. MERGE REGISTRY-STALL tradeoff documented at the merge site. TABLE COVERAGE: a future migration adding a NEW repo_id table must join the merge DELETE lists.\n\n4. OPEN-TIME HEALERS + UNREGISTERED-SUBJECT RULE (class closed). Witness scoped_repo_witness gates ensure_model_manifest + recover_cached_fastembed_model_at; consolidate + init use migrate_schema_only. ADOPTION-RESET RULE: adoption resets all connection-carried repo-derived state before deferred heals.\n\n5. GITHUB KEY WIDENING \u2014 V044 (natural keys) + V045 (child keys (repo_id,id), per-owning-parent backfill; tip pin LATEST==45; github_fts re-derived INSIDE the V045 txn, classification carried by (item_kind,item_id)).\n\n6. REPORTING SCOPE SWEEP: gc counts via scoped_table_row_count(files) + util::scoped_chunk_row_count; util::table_row_count is #[cfg(test)].\n\n7. POISON HARNESS: sibling real registry row when primary_is_real; spawn_paused_rebuild propagates the poison opt-out.\n\nALSO: current_embedding_count scoped through the files view. Config gained `database_key_pinned: bool` \u2014 every Config literal must set it. DEFERRED: dream_findings/reconcile_attempts predicate scoping (A8); `consolidate --from <path>` follow-up. KNOWN TASKSET FLAKE (pre-existing #417): openai embed_batch_dispatches_sub_batches_concurrently.\n\nOPS NOTES: merged worktrees' target/ dirs are pure cache \u2014 delete them when NVMe fills. mv-restoring a .bak keeps the OLD mtime \u21d2 cargo reuses the stale binary \u2014 `touch` after restore. Do NOT run a background `nextest --workspace` concurrently with foreground taskset nextest rounds on the same checkout \u2014 they collide on lock/flock fixtures and produce phantom failures.\n\nGATES (head 4cc202e): nextest --workspace 1589 passed; clippy 0; taskset -c 0,1 3/3 core + CLI integration rounds clean; +nightly fmt clean.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/schema/migrations.rs"
+  }
+ },
+ {
+  "id": "reviewed_22",
+  "source_commit": "c5303848",
+  "finding_id": "481b3f016d368d28",
+  "memory_id": "mem_19f5c2cebf5_67508516fb53",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `last_full_sync` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237222,
+  "kind": "Invariant",
+  "title": "Papertrail item and repo-comment progress are independent cursor lanes",
+  "body": "Durable mirror progress must preserve every provider state dimension and validate a continuation before any page content or cursor state is committed. Item delta, backfill, item-comment, and repo-comment lanes checkpoint independently. GitHub REST item and repository-comment deltas walk updated timestamps ascending, but page-number continuations are mutable: a completed paginated scan may promote only the first page's inclusive maximum updated_at, because only that prefix is proven consumed. Item deltas persist item_delta_replay_required and clear the probe ETag until one complete overlapped verification walk sees the same frontier; a stable >100-row timestamp tie then settles and returns to conditional probes. Empty or raced list responses never advance to an unobserved probe timestamp. Repository-comment streams retain the same first-page candidate across pauses and promote it only after the stream completes. GitHub 404 is ambiguous between absent and inaccessible resources, so an item-comment 404 atomically unpins the active thread and keeps the last complete cached item/comments; successful full rewalk mark/sweep owns authoritative absence pruning. V063 checksum must change whenever its additive cursor shape changes so already-applied branch databases replay missing columns. GitHub historical backfill is a compound issue/pull-request Search cycle: each physical stream drains its first-page timestamp tie, and the next strict updated:< boundary is the newer (maximum) of the two stream boundaries. Pre-split SearchContinuation JSON remains a legacy combined stream and finishes without entering the split PR phase. Item comment refresh retains the previous complete set while pages arrive; paginated mutable walks require two identical complete ID sets before absence is accepted as deletion, and a process-level resume restarts the mark phase at page one. Full rewalk pruning, whole-table FTS rebuild, clearing full_rewalk, and last_full_sync persistence form one transaction. Provider payloads must have valid positive identities and the updated_at values used for cursor progress; malformed 2xx pages fail without advancing or storing content. Provider-declared repo-comment streams each persist independent high-water, token, scan-boundary, and candidate-high state, while GitHub secondary holds remain shared across core/Search lanes for one credential snapshot. Mirror identity is repo/provider/project, so duplicate resolved provider/project bindings must be rejected before writes.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-papertrail/src/mirror.rs"
+  }
+ },
+ {
+  "id": "reviewed_23",
+  "source_commit": "c5303848",
+  "finding_id": "78f00034f0fa4f71",
+  "memory_id": "mem_19f6b907267_1edbfae36bfe",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `refold_streams_for_account` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237298,
+  "kind": "Decision",
+  "title": "C4 key_wrap: owner-only via existing control projection; wrap state is a set (never LWW); key_id check at adoption, not the fold",
+  "body": "Consult verdict for the C4 secrets log (log_id=1), grounded in the frozen C1 contract (sync-phase-c-design.md \u00a79/\u00a710/\u00a715) and main's code. WHO: StreamKeyWrap (mint AND rotation re-wrap) is owner-only \u2014 a device of the stream's OWNING account citing a live owner incarnation in authority_ref, with an effective StreamOwn{S} preceding it (\u00a710: \"every grant/revoke/wrap for S requires an earlier effective StreamOwn{S}\"). No special authority for the epoch-minting device; mint vs rotation differ in trigger, not authority. Gate per OP TYPE, not per log (a future member-self-scope DeviceName must not widen key_wrap's gate). HOW: no second authority evaluation \u2014 the secrets acceptance evaluator mirrors content/acceptance.rs and consumes the EXISTING control-projection fact queries: owner_secrets_authority (fold.rs, reads RosterFact/OwnerIncarnationFact secrets_boundary from DeviceRemove/OwnerDemote secrets_cut), stream_owner_effective, and auth_len_freshness LAST \u2014 all read in one snapshot inside refold_in_tx (storage.rs), same IMMEDIATE txn as rewrite_authority_projection, so a control refold retro-condemns wraps atomically (mirrors refold_streams_for_account). fold_account keeps folding ONLY log 0 (test a_known_op_on_a_non_control_log_is_not_folded \u2014 a DeviceAdd on log 1 mints nothing; keep that). CutExtend{chain_kind: Secrets} currently parks DeferredStreamAuthorization \u2014 C4.2 must admit it (the candidate.rs cut walk is already log-generic over (account, log, device)). WRAP STATE IS A SET, NOT A REGISTER: seals are randomized, so multiple effective wraps per (stream, key_id, recipient) are interchangeable once the key_id check passes \u2014 adoption tries them in deterministic order; NO LWW anywhere (I9). Sealing epoch = max (key_epoch, tiebreak smaller minting entry_hash) over effective StreamKeyWraps. KEY_ID CROSS-CHECK: at the unwrap/adoption seam (C4.3), never the fold (non-recipients must fold without unwrapping): require ContentKey::key_id(unwrapped) == the op's plaintext signed key_id field (\"peers carry\" = that shared field; HKDF collision resistance \u21d2 same key_id \u21d2 same key). Mismatch: do NOT install for sealing, keep the fold verdict (it is shared; the mismatch is local evidence), surface a security event, fail closed on sealing if the mismatched epoch is current. The authority gate \u2014 not the key_id check \u2014 defeats attacker-minted self-consistent \"rotations\"; the key_id check closes the split-view/wrong-key-in-valid-op residue. Accepted residual: a wrap folded effective before its author's revocation arrives can cause sealing under a later-condemned key = the \u00a715 lazy-rotation forward-secrecy window (slowest sync lag); mitigation is derived (never cached) sealing-key selection recomputed on refold + owner re-mint when the current epoch's wrap flips to condemned.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-oplog/src/account/keywrap.rs"
+  }
+ },
+ {
+  "id": "reviewed_24",
+  "source_commit": "c5303848",
+  "finding_id": "d140df764b5fabca",
+  "memory_id": "mem_19f23bd4d7a_5e91d6de53e0",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `text_zstd` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237370,
+  "kind": "Invariant",
+  "title": "files.has_test_code marker set lives in 3 places that MUST match (#77 Phase 1)",
+  "body": "impact_surface's \"tests touching this symbol\" detection uses a precomputed `files.has_test_code` flag instead of scanning `chunks.text` for test markers (#77 Phase 1, PR #223). The marker set \u2014 `#[cfg(test)]` / `describe(` / `it(` / `test(` (the `it(`/`test(` substrings are intentionally broad; they reproduce the original `LIKE '%it(%'`/`'%test(%'` behavior, noise included) \u2014 is encoded in THREE places that must stay byte-identical, or a forward-migrated index and a freshly-indexed one disagree:\n\n1. `index::text_has_test_marker` (crates/rag-rat-core/src/index/util.rs) \u2014 the index-time compute, called in `insert_prepared_file` from the chunk text.\n2. The V024 backfill SQL in `schema::migrations::apply_files_has_test_code` \u2014 `UPDATE files SET has_test_code=1 WHERE id IN (SELECT file_id FROM chunks WHERE text LIKE '%#[cfg(test)]%' OR ...)`.\n3. `test_items`'s filter (crates/rag-rat-query/src/impact/items.rs, moved from core's `query/impact/` in the query-crate split) reads the flag (no longer the markers directly, but its semantics assume the flag means \"contains a marker\").\n\nIf you change the markers, change all three. Also note: the scope VIEW `temp.files` (`lifecycle::install_scope_view`) must list `has_test_code` in BOTH its SELECT branches, or `files.has_test_code` resolves to the view and errors \"no such column\" (this bit during dev \u2014 the view enumerates columns explicitly, it is not `SELECT *`).\n\nRelated: the chunk-mention match in `section_like_items` + `neighbors::textual_fallback` now uses `chunk_fts MATCH` (via `impact::fts_phrase_query`), not `chunks.text LIKE` \u2014 together these mean impact_surface reads no raw `chunks.text`, the prerequisite for #77 Phase 2 (compress `chunks.text` into a `chunk_text(chunk_id, text_zstd)` sister table; sqlite-zstd is viable ON the sister table since it never gets ALTERed, unlike the evolving chunks/files).\n\n(Re-created after a `.rag-rat` index loss; originally mem_19edc79f42a.)",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/util.rs"
+  }
+ },
+ {
+  "id": "reviewed_25",
+  "source_commit": "c5303848",
+  "finding_id": "6d3c89f39af0dcd1",
+  "memory_id": "mem_19f4cef9647_cd7286ff4773",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `roster_epoch` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237441,
+  "kind": "Decision",
+  "title": "Phase C membership model PROPOSAL (#405): account=principal, account-level grants, cut/prefix-freeze revocation, fold-indexed epochs \u2014 pending human freeze",
+  "body": "A designed-but-not-yet-frozen resolution of the #405 membership/revocation blockers (supersedes the sync-phase-c-design.md \u00a74\u2013\u00a78 draft where they conflict). Key mechanisms, so the next agent doesn't re-derive them:\n\n1. ACCOUNT = PRINCIPAL (person or org), a self-sovereign device roster with device roles owner/member. Streams are owned by one account; write/read access is granted account\u2192account via StreamGrant{stream_id, grantee_account_id, role} in the OWNER's control log \u2014 never per foreign device. Multi-maintainer = org account with owner devices of several humans. Revocation levels: StreamRevoke (grant level, departures) vs DeviceRemove (device level, lost device, in the principal's own log).\n\n2. REVOCATION = VALIDITY CUT (prefix freeze). Every remove/revoke op carries per-chain watermarks (seq, entry_hash) freezing the revoked party's chains to an exact hash-verified prefix. Below/at cut + ancestor-of-watermark-hash = valid forever (late delivery safe); beyond cut = condemned (quarantined, never deleted). Unlisted chains cut to empty; CutExtend (extend-only LWW register per chain) is the deliberate owner-mediated recovery for honest beyond-cut work. Back-dated forgery is impossible below the cut (would need a hash collision) and rejected above it regardless of claimed lamport. \"The cut defines legitimacy\"; \"remove wins over concurrency\".\n\n3. EPOCH = FOLD-DERIVED INDEX, not authored: epoch N = state after the Nth EFFECTIVE control op in (lamport, device_fp, entry_hash) order. Header roster_epoch is an assertion/freshness hint only (fetch-before-fold when an entry asserts an epoch ahead of the local history \u2014 this is the truncated-relay/rollback mitigation). Fold output = epoch-indexed AccountAuthHistory (Vec<EpochRecord> with roster+grants+cuts snapshots, rejected list, condemned set); point-in-time authorization = binary search by order key.\n\n4. FOLD = iterated-exclusion fixpoint: single ascending pass with authority-at-ordering-point, then condemn cut-violating entries (condemned set only grows \u2192 terminates \u2264 n iterations, deterministic, pure function of the entry set). Over-condemnation is conservative and recoverable via CutExtend. Last-owner protection (WouldOrphanAccount), mutual owner-removal resolved by first-in-order-wins, removed fingerprints tombstoned forever (re-enroll = new key), effects attributed to the account (removing an owner does NOT cascade its past grants).\n\n5. Forced contract changes: account envelope becomes 12 fields (lamport distinct from dense per-chain seq); the op-log entry envelope needs a /3 bump adding author_account_id + asserted epochs + crypto_suite/key_epoch, content chain key becomes (stream, account, device). Company forward-read revocation = StreamRevoke + key_epoch rotation wrapped only to remaining granted accounts' devices.\n\nJudgment calls flagged for the human: org-as-account vs delegated admin grants; unlisted-chains-cut-to-empty; permanent fingerprint tombstones; conservative fixpoint; the 12-field header. Do NOT treat this memory as the frozen contract until the human confirms and the design doc is updated.",
+  "confidence": "medium",
+  "binding": {
+   "kind": "dir",
+   "value": "crates/rag-rat-oplog/src/account"
+  }
+ },
+ {
+  "id": "reviewed_26",
+  "source_commit": "c5303848",
+  "finding_id": "e7f25efa423ce0a0",
+  "memory_id": "mem_19f441f3f37_8259e14751fe",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `edges::all_edges_from` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237512,
+  "kind": "Invariant",
+  "title": "Op-log authoring + full backfill (#524): store author_op/author_batch minting, oplog re-export layering, memory\u2192op translation, idempotent backfill",
+  "body": "Shipped on feat/oplog-authoring (PR #526, issue #524) \u2014 the seventh phase-B op-log increment, after the persisted device identity (#513/#523). Freezes the machinery that turns memories into signed log entries: minting primitives, row\u2192op translation, and the one-time full backfill. Still NOT wired to the live write path; `mod oplog` stays `#[allow(dead_code)]` and `query/memory/authoring.rs` is `#[cfg_attr(not(test), allow(dead_code))]`.\n\nMINTING PRIMITIVES (`oplog/store.rs`), all take `&LocalDevice` (keeps `DeviceSecret`/`DevicePublic` `pub(super)`; `LocalDevice::fingerprint()` is `pub(crate)`, `secret()`/`public()` `pub(super)` \u2014 a `pub(crate)` accessor returning a `pub(super)` type trips `private_interfaces`):\n- `author_in_tx(tx, stream, device, op, now_ms) -> [u8;32]`: ONE op WITHIN a caller's txn (lamport from `chain_tail(stream, device.fingerprint())`, `sign_entry`, `insert_entry`, `reproject_after_write`, `stamp`) \u2014 NO open/commit. The seam the wiring increment uses to make the table write + op-append ONE atomic unit (no nested txns). `author_op(conn,...)` = standalone wrapper.\n- `author_genesis_in_tx(tx, stream, device, ops, now_ms) -> bool`: the GENESIS batch WITHIN a caller's txn \u2014 `assert_projector_not_newer`, GATE on empty chain (`chain_tail(tx,...).is_some()` \u2192 false), author all ops chained from genesis, ONE `reproject_after_write`, `stamp` \u2014 NO open/commit. `author_batch(conn,...)` = standalone wrapper (opens IMMEDIATE, delegates, commits; empty ops \u2192 false).\n- Unlike `append` (foreign pre-signed entry, may Fork) these MINT a valid continuation from the tail, always Continuous under the single write-locked local writer. `append`'s reproject branch factored into shared `reproject_after_write(tx, stream)`.\n\nLAYERING (avoids a cycle \u2014 do not violate): `oplog/mod.rs` gained its FIRST crate-internal API surface \u2014 curated `pub(crate) use` (`author_genesis_in_tx`, `chain_tail`, `local_device`, `owner_stream`, op vocab `EdgeSpec`/`MemoryOp`/`NodeContent`/`NodeId`/`NodeStatus`); `author_batch`/`author_op`/`author_in_tx` re-exported for completeness under `#[allow(unused_imports)]` (unconsumed until wiring). Every oplog submodule is otherwise PRIVATE. Translation + backfill live in `query/memory` (owns repo_memories/repo_node_edges), calling INTO oplog \u2014 ONE direction. NEVER add `oplog \u2192 query::memory`.\n\nTRANSLATION (`authoring.rs::memory_to_ops`): row \u2192 `NodeCreate{content: NodeContent{kind,title,body,confidence,source,tags,payload}}`, then `NodeStatus{status}` ONLY when status != \"active\" \u2014 an UNKNOWN status token FAILS the backfill (not silently dropped to `active` in the SIGNED history), then an `EdgeAdd` per node-edge in `edge_key` order, DELIBERATELY no `Rebind`: the resolved dimension (`target_node_id`, `anchor_status`) is PER-DEVICE state recomputed on read by `reresolve_on_read` \u2014 signing it would bake one device's view into the immutable log (excluded for the SAME reason code-anchor BINDINGS are; the projection's `resolved_json` stays NULL for backfilled edges, recomputed locally on read).\n\nBACKFILL (`backfill_memory_oplog(conn, now_ms)`): authors every ACTIVE-repo memory into `owner_stream(repo_id)` \u2014 the complete signed history. Idempotent + scope-gated. NO-OP when: `memory_repo_scope` is None (unscoped); OR the repo id is NOT STABLE \u2014 the legacy `__unassigned__` placeholder (`schema::LEGACY_REPO_ID`) OR a machine-local `local:` shallow-clone id (`repo_identity::LOCAL_ONLY_ID_PREFIX`); BOTH get re-pointed later (adoption / LocalOnly\u2192Portable upgrade) and an immutable stream signed on the old id would be stranded; OR the owner chain is already non-empty (cheap pre-txn `chain_tail().is_some()` FAST-PATH). ATOMIC SNAPSHOT: opens the `IMMEDIATE` write txn FIRST (the lock blocks concurrent memory writers), THEN reads the memory/edge snapshot INSIDE that txn and calls `author_genesis_in_tx(&tx, ...)`, committing \u2014 so a memory created between the read and the batch can't be silently omitted (after which the idempotency gate would hide it forever). Reads ALL statuses (obsolete/rejected included), ordered `(created_at_ms, memory_id)`. Reuses `hydrate::tags_for_memory`.\n- EDGE READ USES `edges::all_edges_from`, NOT `edges_from`: (1) `edges_from` applies `LIVE_SOURCE_PREDICATE` (status IN active/stale) \u2192 a non-live source's edges would be DROPPED; the complete-history log needs them. (2) `all_edges_from` KEEPS `reresolve_on_read` so `target_repo_id` is repaired to CURRENT before it is SIGNED (the stored column is an add-time snapshot, stale after a repo-id re-point). `all_edges_from` = `edges_from` MINUS the live-source predicate; both share private `edges_from_source(conn, id, SourceScope)`.\n\nDEFERRED (next increment, the wiring): call `backfill_memory_oplog` + `author_in_tx` INSIDE create_memory/update_memory/mark_obsolete + the edge paths, in the SAME txn as the table write (making create_memory/update_memory transactional; today only rebind_memory is). Backfill must run BEFORE the first live entry (the chain-emptiness gate depends on this). Open decisions: failure posture (strict-atomic vs best-effort); ~13-caller create_memory blast radius (mostly tests, most scope=None \u2192 authoring no-ops). Also deferred: multi-repo backfill; snapshot compaction of the O(n)-per-append reproject; a projection-read path that recomputes per-device edge resolution.\n\nGATES: store author tests (author_op genesis chain; author_batch genesis-gate + no-op-on-nonempty; author_in_tx commits/rolls-back with a caller txn) + authoring tests (translation incl. no-Rebind, unknown-status FAILS, end-to-end backfill w/ an edge from a NOW-OBSOLETE source + idempotency, unscoped/placeholder/local:/empty no-ops); workspace 2064 pass; clippy clean default AND --no-default-features; +nightly fmt clean (WORKSPACE ROOT). Codex CLI + @codex GitHub bot converged across 4 rounds after folding: dead-source edges, atomic idempotency gate, stale target_repo_id, author_op re-export, txn-scoped author_in_tx, placeholder + local: no-op, unknown-status fail, resolved-dimension dropped, atomic read-snapshot (open IMMEDIATE before reading).",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/memory_write/authoring.rs"
+  }
+ },
+ {
+  "id": "reviewed_27",
+  "source_commit": "c5303848",
+  "finding_id": "c9a5ecf1adaca928",
+  "memory_id": "mem_19f67941118_aa3cadbde4e6",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: note_ahead); cited: `unmaintained` -> NOT FOUND anywhere in the source tree | `unsound` -> NOT FOUND anywhere in the source tree | `vulnerability` -> NOT FOUND anywhere in the source tree | `yanked` -> NOT FOUND anywhere\u2026 [reality]",
+  "reviewed_at_ms": 1784970237587,
+  "kind": "Decision",
+  "title": "Supply-chain gate: deny.toml + cargo-audit, and the cargo-deny v2 config gotchas",
+  "body": "The workspace has a supply-chain gate: `deny.toml` (repo root) + `.github/workflows/security.yml` running `cargo deny check` and `cargo audit` on dependency/policy-touching PRs & pushes plus a daily cron. (Added via the \"add cargo-audit + cargo-deny\" and \"all-features clippy\" PRs.)\n\nTriage posture (how to respond when the gate goes red): vulnerabilities and unsound advisories must be FIXED \u2014 `cargo update -p <crate>` within semver to the patched version \u2014 never ignored. Only transitive `unmaintained` advisories with no upstream fix get `[advisories].ignore` entries, each with a `reason`. A new license shows up \u2192 review it, then add to `[licenses].allow` (or a scoped exception), don't widen blindly.\n\ncargo-deny v2 config model (`version = 2`), empirically verified against cargo-deny 0.19.6 \u2014 these are NON-OBVIOUS and cost real investigation:\n\n[advisories]\n- `vulnerability`, `notice`, `severity-threshold` are DEPRECATED/removed under version=2 (using them \u2192 `error[deprecated]`). Vulnerabilities ALWAYS error \u2014 there is no vulnerability scope to set.\n- `unsound` and `unmaintained` are advisory SCOPE enums: \"all\" | \"workspace\" | \"transitive\" | \"none\". They are NOT lint levels \u2014 `unsound = \"deny\"` is a PARSE ERROR (`unexpected-value`).\n- Default `unsound` scope is \"workspace\", so a TRANSITIVE-only unsound advisory PASSES GREEN by default. Set `unsound = \"all\"` to fail on transitive unsound (verified: reverting memmap2 to 0.9.10 \u2192 `error[unsound]` only with `unsound = \"all\"`). Default `unmaintained` is \"all\".\n- `yanked` IS a lint level (\"deny\"/\"warn\"/\"allow\").\n\n[licenses]\n- Dev- AND build-dependencies are EXCLUDED from the license check by default. Set `include-dev = true` and `include-build = true` to cover them (both are valid `[licenses]` keys). Proven to expand coverage (~67 more crates in this tree). NOTE: `cargo deny list` does NOT reflect `include-dev`; test coverage via `cargo deny check licenses` with a restrictive allow, not `list`.\n- Prefer a per-crate `[[licenses.exceptions]]` (`crate = \"...\"`, `allow = [...]`) over a blanket `allow` entry for a narrow/weak-copyleft license, so a future crate with that license is forced through review. Here MPL-2.0 is scoped to `option-ext` this way rather than allowed workspace-wide.\n- `[graph] all-features = true` so cargo-deny sees the full feature-gated dependency set (matches what `cargo audit` reads from Cargo.lock \u2014 e.g. feature-gated quinn-proto).\n\nCLI gotcha: `cargo deny` does NOT accept `--config` BEFORE the subcommand (`cargo deny --config X check` \u2192 \"unexpected argument\"); it's `cargo deny check --config X`, or just run in the dir with `deny.toml`. cargo-deny DOES hard-error on unknown config keys (`error[unexpected-keys]` lists the valid set), so a typo'd field fails loudly rather than silently no-op'ing.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "deny.toml"
+  }
+ },
+ {
+  "id": "reviewed_28",
+  "source_commit": "c5303848",
+  "finding_id": "548aa5ed40b3667d",
+  "memory_id": "mem_19f5d8b8afd_b91ca3db107b",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: note_ahead); cited: `index/papertrail/autosync.rs` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237659,
+  "kind": "Risk",
+  "title": "Auto-sync must not hold the repo write lock across network waits",
+  "body": "Auto-sync must not hold the repo write lock (or the maintenance coordination lock) across network waits: a mirror flight blocks on pages and rate-governor sleeps for arbitrarily long, and either lock held across it starves ordinary index maintenance or makes concurrent git triggers coalesce-skip their passes. IMPLEMENTED in #592 (PR #646): `autosync::run` takes only the papertrail flight lock; `sync_mirror_scheduled`/`mirror_binding` commit through short synchronous transactions between awaits on the single-threaded papertrail runtime (commits serialized by construction, no transaction/guard spans an await); the CLI hook trigger runs after `run_maintenance_pass` returns and the maintenance lock is dropped. When touching this path, keep the rule: no SQLite transaction, connection guard, repository write lock, or maintenance lock may span an await or rate-limit sleep. See the companion Invariant memory on `crates/rag-rat-core/src/index/papertrail_autosync.rs` (renamed from `index/papertrail/autosync.rs` in the papertrail-crate split) for the single-flight/marker rules.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/papertrail_autosync.rs"
+  }
+ },
+ {
+  "id": "reviewed_29",
+  "source_commit": "c5303848",
+  "finding_id": "6b6bd72d9856448d",
+  "memory_id": "mem_19f57699630_f1bd49640fc8",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `accepted_head` -> NOT FOUND anywhere in the source tree | `previous_seq` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237735,
+  "kind": "Invariant",
+  "title": "C1 accepted branches stay chain-coherent; payload validation preserves opaque entries",
+  "body": "C1 storage branch selection must produce one coherent, CONTIGUOUS accepted hash-chain per (log_id, device): roots are seq 0 and every chosen child must have both `prev_hash == accepted_head` and `seq == previous_seq + 1`; effective descendants of a losing or gapped head remain `forked`. Structural validation runs BEFORE pre-verify parking and decodes only current-version plaintext CONTROL-log payloads; sealed, future-version, and non-control payloads remain opaque. Every stored seq must fit SQLite i64. Device-key discovery follows the same current/control/plaintext gate and genesis self-certification requires payload pubkey fingerprint == header signer. V059 keys `account_pre_verify` by sha256(full signed envelope), retaining competing signatures for one body hash, while indexing claimed_account_id for promotion under the IMMEDIATE writer transaction.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-oplog/src/account/storage.rs"
+  }
+ },
+ {
+  "id": "reviewed_30",
+  "source_commit": "c5303848",
+  "finding_id": "f3c8936fcf99747e",
+  "memory_id": "mem_19f77247d44_87f6843add07",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `Command::Status` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237809,
+  "kind": "Concept",
+  "title": "`rag-rat status` (global_status): authoritative source + repo_id scoping for each cross-repo field (#766)",
+  "body": "`IndexDatabase::global_status(path)` (crates/rag-rat-core/src/index/query_api/global_status.rs) is the read-only cross-repo aggregator behind `rag-rat status`. It mirrors `global_store_overview`: opens ONE `IndexConnection::open_read_only_blocking`, never auto-migrates, returns `exists:false` on an absent file, and bails to empty `repos` when the schema is not `Compatible`. The CLI shim is `commands/status.rs` (thin; dispatched by `run_status` in main.rs, config-tolerant like `doctor`); `Command::Status` is a UNIT clap variant \u2014 do NOT add a per-command `--json` (it collides with the global `--json`; `print_output` reads that).\n\nAuthoritative source per field, and how each is repo_id-scoped (the whole correctness bar \u2014 a sibling repo's rows must never bleed in):\n- Roster: `schema::registered_repos(conn)` (excludes the `__unassigned__` placeholder). Reuse it; do not reimplement registry reads.\n- Freshness (PER-REPO): `rag_rat_db::meta::repo_meta(conn, repo_id, key)` for `git_commit` (indexed head), `git_dirty`, `indexed_at_ms`; plus `schema::live_files_generation(conn, repo_id)` (A6 pointer).\n- Content sizing: `files` carries `repo_id` DIRECTLY. `chunks`/`symbols`/`edges_data` do NOT \u2014 they scope TRANSITIVELY through `files.repo_id` via `file_id` (edges via `source_file_id`, so file-level edges with NULL source are excluded); embeddings one hop further: `chunk_embeddings.chunk_id -> chunks -> files`.\n- Memories: `repo_memories.repo_id` DIRECTLY (column exists since V042) \u2014 GROUP BY (kind,status). Scope by `repo_memories.repo_id`, NEVER via `repo_memory_bindings` (would double-count multi-bound memories and drop unanchored ones). status values are `active`/`obsolete`/`stale`.\n- Papertrail: `papertrail_items`/`papertrail_comments`/`papertrail_refs`/`papertrail_sync_cursor` all carry `repo_id` directly. Items GROUP BY `item_kind` (`issue`/`change_request`); the cursor row is the (tracker,project) binding + `last_probe_ms`/`last_full_sync_ms`/`backfill_done`.\n- Worktree overlays: distinct NON-EMPTY `files.worktree_id` per repo. The BASE checkout stores `worktree_id = ''` (verified against the live store), so a non-empty id is always a linked-worktree overlay.\n- GLOBAL rollup (NOT per-repo): file health reuses `db_file_health::database_file_health_from_conn(conn, path)` (extracted free fn sharing `compute_database_file_health` with the `IndexDatabase::database_file_health` method). `content_revision` + FTS freshness (`fts_source_revision`/`fts_synced_at_ms`/`fts_dirty`) are GLOBAL keys in `index_meta` (one FTS5 index over the whole store, V040 round-5) \u2014 read cheaply via `rag_rat_db::meta::read_meta(conn, key)`, never recomputed; they live in the top-level rollup, not per repo.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/query_api/global_status.rs"
+  }
+ },
+ {
+  "id": "reviewed_31",
+  "source_commit": "c5303848",
+  "finding_id": "7a67c7c1c780bdc1",
+  "memory_id": "mem_19f254367c4_d8b756427aa6",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `clone_precompute` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237883,
+  "kind": "Decision",
+  "title": "V042 clone/oracle/reconcile/memory periphery repo_id scoping + integration onto V041 (memory-sync phase A5)",
+  "body": "A5 of the global-DB consolidation (on A1/V038, A2/V039, A3/V040, A4/V041). Scopes the DIRECT periphery tables the A3/A4 sweeps left GLOBAL. LATEST 41->42; MIGRATION_042 arms in known_version/known_migration/migration_checksum_mismatch (checksum `sha256:rag-rat-repo-id-periphery-scoping-v42`) \u2014 the same \"arms not enough / add all three or current_version caps at prior tip\" footgun the A2-A4 memories flag.\n\nV042 = `apply_repo_id_periphery_scoping` (migrations.rs). SENTINEL = `column_exists(conn,\"repo_memories\",\"repo_id\")` (all-or-nothing; the whole migration is ONE self-wrapped `PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;\u2026COMMIT; foreign_keys=ON` because the ladder runs apply fns in AUTOCOMMIT \u2014 the V040 recipe). Each rebuild starts `DROP TABLE IF EXISTS <t>_new` for torn-state re-convergence. THREE shapes:\n- ADDITIVE column (`A5_ADDITIVE_SCOPED_TABLES`, add_column_if_missing REPO_ID_COLUMN_DEF): clone_graph_generations, oracle_runs, reconcile_attempts, repo_memories, repo_memory_bindings.\n- KEY REBUILD (repo_id joins the PK/UNIQUE \u2192 table rebuild): clone_token_df PK(repo_id,normalizer_kind,token_hash); clone_refinements PK(repo_id,class_key); edge_oracle content-key PK prepends repo_id (+3 idx); logical_symbol_monikers PK(repo_id,logical_symbol_id,tool) (+1 idx); dream_findings UNIQUE(repo_id,kind,subject,claim_hash) (+2 idx). STRICT preserved.\n- STANDALONE FTS: repo_memory_fts DROP+CREATE with `repo_id UNINDEXED`, repopulated from repo_memories (so repo_id comes from each memory's freshly-added column; group_concat reads repo_memory_tags).\nclone_edges/clone_subblock_postings are NOT scoped \u2014 the clone GENERATION integer stays GLOBALLY unique (allocated MAX(generation)+1 over ALL repos), so a build_generation belongs to exactly one repo and those children scope transitively; only the generation SWEEPS (complete_generation, Building cleanup, postings invalidation) got a repo_id predicate so a repo's precompute never deletes a sibling's gens. symbol_fingerprints/symbol_token_postings stay symbol_id-keyed (transitive via symbols->files.repo_id) \u2014 the CLONE_FINGERPRINT_DDL \"never add scope columns\" rule is about the COMMIT/WORKTREE axis; repo_id is a different cross-repo axis and only clone_token_df/clone_refinements there take it.\n\nGATING (schema/registry.rs `periphery_repo_scope(conn, probe_table) -> Option<String>` + `periphery_repo_scope_clause(&Option<String>, qualifier)`): every periphery query sweep gates its repo_id predicate on the probe \u2014 Some(active_repo_id) when the column is present (a normal open runs the full ladder incl. V042), None on a raw connection that never ran the ladder (\u2192 original unscoped SQL). Reads interpolate an escaped-literal ` AND t.repo_id='\u2026'` (NOT a bind param \u2014 these carry positional/`IN(...)` lists; the id is registry-validated content, quotes doubled); writers embed the id as a per-call literal prefix so bound params + ON-CONFLICT targets are the only thing that changes when scoped. The rebuilt PKs force write_edge_oracle / write_logical_symbol_moniker / the df bump / clone_refinements INSERT-OR-REPLACE to WIDEN their ON CONFLICT target in the scoped branch. Sweeps touched: query/memory (create stamp; memory_search, memories_for_*, list_memories, doctor_* filter repo_id; duplicate_memory_id +repo_id so dedupe never crosses repos; upsert_memory_fts writes repo_id; moniker_for_logical_symbol* filter); clones (precompute generation sweeps, substrate/of_text df reads, refine/cache read+write, file_index df bump, rebuild refresh_clone_token_df); oracle/store (oracle_runs record/read/prune, edge_oracle write/clear/prune, monikers count/clear/write).\n\nADOPTION: `A5_PERIPHERY_DIRECT_SCOPED_TABLES` (registry.rs, the 5 additive + 5 rebuilt + repo_memory_fts) re-pointed in register_repo's adoption txn, each guarded by `column_exists(tx, table, \"repo_id\")`. This is a STRONGER guard than A4's `adoption_table_present` (table-existence) and it MUST be: several periphery tables (dream_findings, edge_oracle, clone_token_df, logical_symbol_monikers, oracle_runs) predate V042 and exist at earlier schema versions WITHOUT the column, so a partial-schema fixture that stopped before V042 has the table but not the column.\n\nDEFERRED (schema column + adoption done, QUERY scoping not): dream_findings + reconcile_attempts writers use no ON CONFLICT so they don't break on the scoped schema \u2014 they operate on the '__unassigned__' partition, single-repo-correct for phase A; multi-repo dream/reconcile isn't reachable until A7. edge_oracle metric READS (edge_oracle_scope_join, clear_edge_oracle_for_tool) stay transitively scoped via their files join (the WRITE stamps repo_id); only a cross-repo path+sha256 collision could leak.\n\nINTEGRATION (this A5 branch = A4's V041 commit + ONE A5 commit). A5 was authored UNREGISTERED (a sibling owned V041) then registered here: purely additive (consts + LATEST bump + ADDITIVE_MIGRATIONS entry after V041 + the 3 recognizer arms + drop the `#[cfg_attr(not(test), allow(dead_code))]` off the apply fn/6 rebuild helpers/A5_ADDITIVE_SCOPED_TABLES). Rebase conflicts (both stacked on A3/627e8d8): migrations.rs \u2014 A4's V041 fns and A5's V042 block both insert after rebuild_git_commits_tables_with_repo_id and git aligned their trailing braces; resolve by co-locating BOTH (additive) and inserting the missing `}` for rebuild_github_fts_with_repo_id between them. multi_repo_scope.rs \u2014 both APPEND-ONLY (single `@@ -180` hunk each), A5 namespaces its helpers a5_/A5_ so no collision; reconstruct = A4's full file + A5's block (lines 183+). registry.rs/mod.rs auto-merged (A4 renamed V040_DIRECT_SCOPED_TABLES->DIRECT_SCOPED_ADOPTION_TABLES; A5 added its own const/loop after).\n\nTESTS: repo_registry.rs owns the migration-shape coverage (A4's placement convention). migration_042_is_the_latest_tip_and_scopes_periphery owns the absolute LATEST==42 pin (V041's tip test dropped to symbolic \u2014 \"pin moves to the new tip\"). migration_042_periphery_rebuild_preserves_rows_and_reconverges_from_torn_state is the DIRECT-FN ISOLATION test: builds the pre-V042 schema via `seed_pre_v042_periphery_schema` = calling the real pub(crate) DDL fns (apply_baseline + apply_oracle_tables + apply_scip_moniker_anchors + apply_clone_fingerprint_tables + apply_clone_graph_tables + apply_dream_findings + apply_repos_registry) \u2014 DRIFT-PROOF vs hand-copied CREATE TABLEs (per the \"assert deferred-absence against the migration DDL in isolation\" Risk memory). FOOTGUN: that isolation test must NOT call register_repo \u2014 apply_baseline creates `files` WITHOUT repo_id (V040 not run in a periphery-only fixture), so adoption's DIRECT_SCOPED_ADOPTION_TABLES loop (table-presence guard) would `UPDATE files SET repo_id` \u2192 \"no such column\". Adoption is instead covered by full_ladder_v037_to_v042_scopes_both_workstreams_data (full schema): seed A4 (github) + A5 (memory/oracle/clone) rows under the placeholder, truncate_schema_to(37), migrate_forward re-runs the WHOLE A-phase (safe: V038 INSERT OR IGNORE...WHERE NOT EXISTS + V039 copy-before-delete are idempotent, V040/V041/V042 sentinel-short-circuit), assert rows intact under the placeholder, then ONE register_repo re-points BOTH workstreams' rows to the real id. The multi_repo_scope A5 tests were converted from direct-fn to the LADDER (drop the explicit apply_repo_id_periphery_scoping call \u2014 schema::apply now runs V042; the clone_precompute test's DROP-VIEW-then-apply workaround is gone because V042 runs at open BEFORE install_scope_view).\n\nGates: cargo nextest run --workspace 1445 passed; clippy --all-targets -D warnings clean; +nightly fmt clean (the struct_lit_style warnings are pre-existing rustfmt.toml config noise). HANDOFF A6: generation-staged rebuild adds files.generation; the scope view's write_scope_view gains `AND files.generation=<live>`. A7: register_repo becomes multi-repo (drops the single-repo refusal); the deferred dream_findings/reconcile_attempts query scoping + the github uniqueness-key widening land then.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/schema/migrations.rs"
+  }
+ },
+ {
+  "id": "reviewed_32",
+  "source_commit": "c5303848",
+  "finding_id": "33e15165953913fe",
+  "memory_id": "mem_19f2992101e_5d94b2cf7a93",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `a_tail_failure_leaves_the_old_generation_live` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970237957,
+  "kind": "Decision",
+  "title": "A6 generation-staged full rebuild + per-repo write locks (V043) (memory-sync phase A6)",
+  "body": "A6 of the global-DB consolidation (A1/V038..A5/V042; PR #416 \u2014 five P2 batches, 17 findings, + the coverage barrier incident, all in ONE commit 35891d7 on origin/main e5536e6). A full rebuild STAGES a fresh `files.generation` in CHUNKED per-wave transactions, then publishes via ONE TERMINAL transaction. LATEST 42->43; MIGRATION_043 arms in all three recognizers (`sha256:rag-rat-files-generation-v43`).\n\nV043 = `apply_files_generation`: sentinel `column_exists(files,generation)`; FK-OFF self-wrapped txn; DROP files_new torn re-convergence; `generation INTEGER NOT NULL DEFAULT 0`; UNIQUE -> (repo_id,path,commit_sha,worktree_id,generation); id verbatim. NO sole-repo backfill (repo-neutral; pointer absent=>0). First rebuild publishes generation 1.\n\nRUNTIME. repo_meta[live_files_generation] pointer; registry.rs live_files_generation/active_generation (context else live fallback); active_generation stamped on every file INSERT. set_context_at_generation = rebuild seam. EVERY connection resolves `files` through a generation view: write_scope_view (config opens), write_repo_generation_view (BARE opens \u2014 repo+generation only, preserves #360; the MCP read path).\n\n*** TERMINAL-FLIP + ROWS-INERT/CURSORS-LAST: the flip is the LAST fallible write; bulky KEYED rows may land pre-terminal ONLY when readers treat cursors/meta as authority. AUTHORITY set riding the flip: live_files_generation (last), indexed_at_ms, model seed, graph/flags marks, parser_failures staged apply, git_commit/git_dirty + git_history_indexed_* cursors (rows land Phase 2 via apply_prepared_git_history_deferring_cursors), and \u2014 batch 5 \u2014 repo_meta[source_root] (fs-fallback authority for memory validation/heals; the rebuild sets only the IN-MEMORY root early; a failed rebuild from a NEW checkout leaves old readers on the OLD root; audit found no further early authority keys \u2014 the FTS freshness trio is global infrastructure). Phase-3 order: carry_forward -> per carried overlay view-swap+resolve_overlay_edges -> restore base -> rebuild_logical_symbols -> apply_staged_parser_failures -> marks -> source_root + git meta + cursors -> pointer + seed -> COMMIT. Tests: a_tail_failure_leaves_the_old_generation_live..., ..._git_meta_and_history_cursors_on_the_old_state, ..._source_root_on_the_old_checkout, carried_overlay_edges_re_resolve... ***\n\n*** CANONICAL LOCK ORDER (batch 5, SUPERSEDES the role-based incoming-then-outgoing argument \u2014 it broke when the fence-gap writer appeared with roles reversed): multi-per-repo-lock flows sort ids by `locks::canonical_lock_order` (lexicographic on the sanitized discriminator; locks.rs module doc owns the rule) and acquire in that order from a clean slate; an acquisition violating the order (earlier-sorting lock wanted while a later-sorting one is pre-held \u2014 unavoidable since entry locks are taken identity-blind) MUST be BOUNDED (acquire_timeout, never blocking): in-order unbounded edges cannot cycle under a total order, and any cycle containing a bounded edge self-breaks within the timeout as a retryable refusal. register_repo's upgrade acquires BOTH ids' locks in canonical order (reentrant-instant for a held entry lock), guards through commit. ***\n\n*** FENCE GAP (batch 5): a writer's held lock must match the repo id it writes under. Entry locks key off the PRE-open derived id; an unshallow between derivation and adoption resolves+upgrades to portable \u2014 the writer would keep writing portable rows under only the stale local: lock. Fix: adopt_repo_from_config detects \"thread holds SOME rag-rat-write-* lock for this DB (locks::thread_holds_any_repo_write_lock) but NOT the resolved id's (thread_holds_write_lock)\" and stashes the resolved id's lock in IndexDatabase._identity_lock for the CONNECTION'S LIFETIME (bounded acquire; timeout = retryable \"identity changed; re-run\"). Lockless openers stay lockless. Test: a_writer_whose_identity_upgrades_mid_run_extends_its_lock_to_the_resolved_id (repo_registry.rs). ***\n\n*** LOCK-HELD => NO IN-FLIGHT REBUILD => FULL RECLAMATION (batch 5, supersedes the batch-3 `< live` predicate): gc deadness is `generation != live` UNDER A DOCUMENTED FLOCK PRECONDITION \u2014 every production rebuild entry runs under the per-repo flock (CLI index, watcher/maintenance; verified \u2014 only tests call library rebuild() bare, and the test harness spawn_paused_rebuild now acquires it too), so a collector HOLDING the flock (Cmd::Gc belt, maintenance, watcher \u2014 all verified holders) knows above-live rows are ABANDONED staging from failed rebuilds (which `< live` could never reclaim \u2014 a persistently failing tail leaked a staged copy per retry). A flock-less embedded collector must use the lockless-safe `< live` form; do not silently weaken the precondition. Allocator still guarantees staging above live (max(row-MAX, live)+1). Tests: gc_reclaims_abandoned_staged_generations_from_failed_rebuilds, gc_serializes_on_the_flock_while_a_rebuild_is_mid_flight. ***\n\n*** PARSER_FAILURES = STAGED-UNTIL-PUBLISH: temp.rebuild_parser_failures via graph.is_some(); apply in terminal; orphan sweep judges BASE scope at target and excludes staged upserts (PREPARE failures have no file row). StagedSweep{DeadContext,DeadGeneration} keeps the cascade off it on the generation axis. GENERATION-BOUNDED DELETES: remove_file_in_scope + heal_stale probes carry the writer's generation. FTS RACE: ensure_fts_fresh defers while any chunk HAS an fts row but NO chunk_text row. EVERY-APPLY-PATH SCHEMA LOCK: apply_schema_under_lock (double-checked, global rag-rat-schema.lock) in create_or_migrate + migrate_with_fastembed_cache + open_and_migrate. ***\n\n*** INTERLEAVED WRITERS (proof at the per-wave commit, incremental.rs): (a) disjoint-table (MCP memory) \u2014 safe by disjointness + re-anchor lifecycle; (b) files-adjacent \u2014 generation discipline (bounded deletes, flock-preconditioned deadness, universal views); (c) schema appliers \u2014 global schema lock; (d) identity flux \u2014 canonical-order dual locks + the _identity_lock stash. ***\n\nEXACTNESS vs DRIFT raw main.* reads: EXACT (generation predicate): all_symbols, rebuild_logical_symbols, call_path_edge_relocatable, refresh_clone_token_df, summary_counts graph_edges, ensure_graph_index_current wipe, overlay tombstone probe, heal_stale probes. DRIFT (re-justified in code): lexical graph_boost, delete_repo_chunk_blame.\n\nTEST SEAM: barrier keyed BY DATABASE PATH + RAII WaveBarrierGuard (never process-global \u2014 libtest/coverage; class in the extended #409 flock memory; repro `taskset -c 0,1 cargo test`). spawn_paused_rebuild holds the production flock. Unrelated taskset flake: openai embed ordering, #417.\n\nFALLOUT RULES: fixtures inserting into main.files post-rebuild stamp db.active_generation; \"rebuild clears X\" tests gc after (with flock); non-git counts via the view; tip pins at V043; poison sibling files at generation 0; reader-consistency moves ONLY the generation axis.\n\nGates (final): nextest --workspace 1527 passed; clippy clean; +nightly fmt --check clean; taskset gen-suite (20 tests) 3/3 + lock/upgrade tests clean. HANDOFF A7 importer: do NOT set live_files_generation (absent=>0); register_repo goes multi-repo \u2014 revisit the single-incumbent upgrade guard, keep the canonical-order + outgoing-lock + fence-gap rules. A8: per-repo locks + flock-preconditioned dead-gen gc + the interleaving suite make the concurrent index-A/write-B matrix meaningful.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/index/rebuild.rs"
+  }
+ },
+ {
+  "id": "reviewed_33",
+  "source_commit": "c5303848",
+  "finding_id": "6e537d70fe8c83fb",
+  "memory_id": "mem_19f5161f815_02b096af271a",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `workflow_call` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970238031,
+  "kind": "Risk",
+  "title": "GITHUB_TOKEN-created releases do not trigger downstream release workflows",
+  "body": "A workflow triggered only by `release: published` will not start when the release is created by `.github/workflows/release.yml` using the repository `GITHUB_TOKEN`; GitHub suppresses downstream workflow runs for events caused by that token. Therefore Android build/asset upload and the sole `@rag-rat/bin` publish must be integrated into the tag workflow, invoked via `workflow_call`/`workflow_dispatch`, or the release must be created with a PAT/GitHub App token that can trigger downstream workflows. Preserve the prerelease publish gate when moving npm publication.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": ".github/workflows/release-android.yml"
+  }
+ },
+ {
+  "id": "reviewed_34",
+  "source_commit": "c5303848",
+  "finding_id": "53a7408639d63458",
+  "memory_id": "mem_19f2e6f90b0_131b425e4170",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `body_hash` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970238106,
+  "kind": "Invariant",
+  "title": "Dream churn-skip must invalidate on all 4 axes (body, inputs incl. dir-child files, prompt_version, uncitable terminal rows) or budget starves",
+  "body": "The dream verify/compact churn-skip predicate must invalidate on EVERY axis that changes what a stored verdict/summary means, AND every SURFACING reader must apply the SAME predicate the producer/queue uses \u2014 miss either and a stale row strands forever or shows obsolete data. (PR #428 review, six rounds.) verify.rs / verdict.rs / compact.rs / query/memory/hydrate.rs.\n\nAXES (a stored memory_reality/memory_summaries row is CURRENT iff all match a fresh check):\n1. content_hash \u2014 the NOTE content. `verify::note_content_hash(title, body)` = sha256 of trimmed title + \"\\n\" + trimmed body (house memory_input_hash style; NOT a bare title\u2016body concat). Covers TITLE **and** body because BOTH the verdict prompt and the compaction prompt audit the whole note \u2014 a title-only edit re-verifies/re-summarizes and drops the stale verdict/summary/marker. (Renamed FROM `body_hash`; the memory_reality/memory_summaries column is `content_hash`, PK of memory_summaries is (repo_id, memory_id, content_hash). Do NOT reuse repo_memories.input_hash \u2014 it also folds kind+tags AND is FROZEN at creation: update_memory (api.rs) updates title/body in place with the SAME id but does NOT recompute input_hash.) queue reason enum is VerificationReason::ContentChanged.\n2. checked_inputs_hash = the WHOLE evidence-pack fingerprint (column keeps this name). `verify::checked_inputs_hash` hashes sorted (path,sha) bound-file pairs `\\u{1e}`-joined, `\\u{1d}`, sorted (identifier,resolution) pairs. (a) bound files \u2014 resolve_bound_files expands a binding: empty path (`--dir .` root)\u2192ALL files, dir\u2192children via `path = ?1 OR path LIKE ?2 ESCAPE '\\\\'` with the dir LIKE-escaped (`_`/`%` are wildcards), file\u2192itself; the (path,sha) MULTISET not bare shas; and it returns PATH-SORTED (not files.id rowid order) because bound_file_excerpts consumes THAT order under the MAX_EXCERPT_LINES cap \u2014 rowid order would let a reindex with the same (path,sha) set change which files land in the pack while churn-skipped. (b) identifier resolutions via identifier_resolution_pairs, EXACTLY as evidence_pack resolves. AMBIGUITY (both resolvers, same class): resolve_symbol returns ALL live defs of a bare name and resolve_file_segment returns ALL suffix matches of a shorthand path (both path-sorted; an exact file path is definitive/alone); resolve_identifier renders >1 as `symbols (N): \u2026` / `files (N): \u2026` instead of LIMIT-1-pinning to an unrelated namesake/same-suffix file \u2014 so the model never audits against a wrong match AND the churn key flips when any same-named/same-suffix match is added/removed (deleting the one the note meant re-verifies even if a namesake survives). An all-NOT_FOUND uncitable memory also re-queues once the code adds the symbol.\n3. prompt_version \u2014 verdict `PROMPT_VERSION` / summary `COMPACT_PROMPT_VERSION` (pub(crate), re-exported through dream::mod as VERDICT_PROMPT_VERSION/COMPACT_PROMPT_VERSION). MUST gate EVERY reader: queue_reason (PromptChanged requeue), divergence_findings (SELECT+skip), hydrator summary (`AND prompt_version = COMPACT_PROMPT_VERSION`), hydrator marker (`AND prompt_version = VERDICT_PROMPT_VERSION`). Prompt heads live in dream/prompts/{verdict_head,compact_head}.md via include_str! (trimmed at render site); BUMP the matching *_PROMPT_VERSION when you edit a .md. Tests seeding these tables MUST stamp the current prompt_version.\n4. UNCITABLE \u2192 a TERMINAL verdict-less row, not a requeue. `EvidencePack::is_citable()` = \u22651 excerpt OR \u22651 identifier that RESOLVED (!= NOT_FOUND). NOT_FOUND-only does NOT count (pass-0 unverifiable; counting it lets the model open a divergence citing NOT_FOUND, burning budget against the \"unverifiable never asked of the model\" contract). run_verdict_pass writes record_uncitable (NULL verdict, stamped content/inputs/prompt) so it churn-skips. Same starvation CLASS as anchor-broken: anything queued that can never write a row loops forever.\n\nSURFACING STALE GATES = axes 1+2+3 at read time (SQLite has no sha256, so 1+2 recompute in Rust; hydrator needs the TITLE threaded from the caller). divergence_findings drops a `diverged` row unless prompt+content_hash+checked_inputs_hash all match current; hydrator (current_summary_and_verdict) drops the summary unless content_hash+compact prompt match and the marker unless content_hash(WHERE)+verdict prompt(WHERE)+evidence hash(Rust) match. A churn-SKIPPED but UNCHANGED memory keeps all axes matching so its finding/marker still surfaces (resolve-trap protection holds).\n\nFABRICATION GUARD (verdict.rs verdict_is_cited + parse_verdict): an excerpt renders `path:line: <code>`, so `is_bare_locator` rejects a citation that is only `<path>:<digits>` with no text after. AND parse_verdict RESETS accumulated direction/evidence on each new `VERDICT:` line, so a scratchpad/`<think>` block's earlier VERDICT+EVIDENCE can't back-justify a different final verdict.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-dream/src/findings.rs"
+  }
+ },
+ {
+  "id": "reviewed_35",
+  "source_commit": "c5303848",
+  "finding_id": "971f0d17d365e6a0",
+  "memory_id": "mem_19f360d6af7_e6d42eb44e31",
+  "reviewed_status": "dismissed",
+  "expected_verdict": "current",
+  "expected_direction": null,
+  "original_evidence": "model verdict: diverged (direction: code_ahead); cited: `src/pkg/lib.rs` -> NOT FOUND anywhere in the source tree [reality]",
+  "reviewed_at_ms": 1784970238179,
+  "kind": "Invariant",
+  "title": "Created-dir watch placement must arm maintenance for extensionless directory events",
+  "body": "`watch_created_dirs` cannot only install non-recursive watches; when it successfully places or refreshes target watches, the event loop must also debounce a maintenance pass. Created or moved directory events are extensionless, so `target_for_path` rejects them and normal base/linked relevance checks can be false even when the directory already contains indexable files (for example `mv pkg src/pkg` or a create event processed after `src/pkg/lib.rs` exists). The centralized helper therefore returns whether target watches were placed, and the event loop treats that as a pass request for both main and linked worktree overlays. When aggregating linked worktree states, do not use short-circuiting `any` for this side-effectful operation: visit every state and OR the result so multi-path events still update all applicable linked checkouts.",
+  "confidence": "high",
+  "binding": {
+   "kind": "path",
+   "value": "crates/rag-rat-core/src/watch.rs"
+  }
+ }
+]

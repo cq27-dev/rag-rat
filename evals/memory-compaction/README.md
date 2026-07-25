@@ -45,7 +45,7 @@ does **not** gate anything. The probe suite is the metric that matches the real 
 | gate | applies when | bar |
 |---|---|---|
 | **compaction** | the compactor model or prompt changes (`dream/compact.rs`) | **zero trap-flips** across all 39 traps, and zero critical false-asserts |
-| **verification** | the verdict model or prompt changes (`dream/verdict.rs`) | **≥ 70% verdict accuracy** on the 15-case model-verdict manifest |
+| **verification** | the verdict model or prompt changes (`dream/verdict.rs`) | **≥ 70% accuracy** on the 14-case model-verdict manifest; **0/33 false positives and ≥ 2/3 recall** on the reviewed replay |
 
 The zero-trap-flip bar is absolute: a single inverted negation is a correctness regression, not a
 coverage trade-off. Coverage (how many `gold: true` claims survive) is a *quality* number to
@@ -53,16 +53,33 @@ watch, not a hard gate — compression legitimately drops secondary facts.
 
 ### The verification manifest
 
-`VERIFY_MANIFEST` in `harness/eval_app.py` is the labeled ground truth for the verdict gate —
-15 model-verdict cases the shipped 2-way (`current | diverged`) prompt is graded on:
+`VERIFY_MANIFEST` in `harness/eval_app.py` is the compact labeled ground truth for the verdict
+gate — 14 model-verdict cases the shipped 2-way (`current | diverged`) prompt is graded on:
 
-- **8 `current`** — merged-work memories whose claims are visible in the checkout
-  (`real_16,17,20,21,22,26,27,29` at `/repo`).
-- **5 `diverged / note_ahead`** — memories describing in-flight work not yet in the checkout
-  (`real_0,1,3,9,14` at `/repo`). A real class this repo has whenever feature branches are open.
-- **2 `diverged / code_ahead`** — the **doctored-tree** cases (`real_22,27` at `/repo-drift`):
-  the note is still accurate but a hypothetical future commit removed the guard it describes.
-  These two depend on the drift tree — see below.
+- **12 `current`** — merged-work memories whose claims are visible in the checkout.
+- **2 `diverged / code_ahead`** — `real_3` against the current tree and `real_22` against the
+  doctored tree.
+
+The second verification gate is the fixed 36-case production replay in
+`reviewed-verify-replay.json`: 33 model-proposed divergences a human dismissed and three genuine
+`note_ahead` findings a human accepted. `reviewed_verify_replay` runs the prompt and
+`score-reviewed-verify.py` applies the production claim/citation guard before reporting precision,
+recall, and discarded completions. This is the precision gate the compact manifest could not
+provide.
+
+The v4 replay comparison (temperature 0, identical packs and guard) selected the existing
+Qwen3-4B deployment:
+
+| model | accepted false positives | true positives | deployment note |
+|---|---:|---:|---|
+| Qwen3-4B-Instruct-2507 | 0 / 33 | 2 / 3 | shipped L4 model |
+| Qwen3-8B | 0 / 33 | 1 / 3 | recall regression |
+| Gemma-3-12B-it | 4 / 33 | 0 / 3 | precision and recall regression |
+| Qwen3-Coder-Next-FP8 | 4 / 33 | 2 / 3 | 80B-total MoE; evaluated on H200 |
+
+MoE activation size is not the deployment memory floor: Coder-Next activates 3B parameters per
+token but its 80B FP8 checkpoint still requires an H200-class box in this harness. Keep model
+selection tied to the reviewed replay rather than general coding benchmarks.
 
 The two **`unverifiable`** synthetics (`syn_0,syn_2`) are **not** in this manifest: they are decided
 deterministically in **pass 0** (`verify.rs` `unverifiable_findings`) and never reach the model, and
@@ -81,9 +98,12 @@ evals/memory-compaction/
     drift-anchors.json   doctored anchors for the drift-detection variant
     verify-packs.json     mechanically-built evidence packs (verify-pack method), keyed id|root —
                           REGENERATE with harness/regen-verify-packs.py after any render_pack change
+    reviewed-verify-replay.json  36 manually reviewed production findings (33 current, 3 diverged)
+    reviewed-verify-packs.json   frozen evidence packs for that reviewed production batch
   harness/
     eval_app.py          Modal app: candidates, judge, HHEM, the v2 variants, verify + drift
     regen-verify-packs.py  rebuilds verify-packs.json against the current + doctored trees (#695)
+    export-reviewed-verify-replay.py  one-time freezer for the #954 reviewed production batch
     score.py             folds judge verdicts + HHEM + format checks into the round-1 scoreboard
     score_v2.py          scores the v2 variants; carries the offline ref-leakage metric
     make-drift-tree.py   regenerates the doctored crates/ copy the manifest's two cases need
@@ -117,6 +137,10 @@ modal run harness/eval_app.py::drift_test
 
 # round 4 — the verification gate
 modal run harness/eval_app.py::verify_pack_test   # evidence-pack method (the live design)
+modal run harness/eval_app.py::reviewed_verify_replay
+python3 harness/score-reviewed-verify.py           # precision/recall on 33 current + 3 diverged
+modal run harness/eval_app.py::reviewed_verify_candidates
+python3 harness/score-reviewed-verify.py --results results/reviewed-verify-candidate-results.json
 python3 harness/make-drift-tree.py                # needed for the agentic comparison arm
 modal run harness/eval_app.py::verify_test        # agentic grep/read method (the losing arm)
 ```
@@ -211,7 +235,7 @@ context**.
 **Historical baseline — measured with the original *research* prompt: 3-way
 (`current | diverged | unverifiable`) over the old 17-case manifest, including the two `syn_*`
 unverifiables.** This is **not** the shipped-prompt baseline. The shipped verdict prompt is now
-2-way (`current | diverged`) and the model gate is the **15-case** manifest above — `unverifiable`
+2-way (`current | diverged`) and the compact model gate is the **14-case** manifest above — `unverifiable`
 is a deterministic pass-0 decision, never asked of the model. Re-run `verify_pack_test` against the
 synced prompt to establish the current-prompt numbers; the table below is kept for provenance.
 
@@ -244,13 +268,14 @@ identifiers. The eval is the check for the ref classes the runtime deliberately 
 
 These prompts are LIVE in rag-rat, versioned so a change is traceable:
 
-- `dream/verdict.rs` — `PROMPT_VERSION = "verify-pack-v3"` (the evidence-pack verdict prompt).
+- `dream/verdict.rs` — `PROMPT_VERSION = "verify-pack-v6"` (the evidence-pack verdict prompt).
 - `dream/compact.rs` — `COMPACT_PROMPT_VERSION = "compact-v1"` (the self-containment compact prompt).
 
 The harness's `VERIFY_PACK_PROMPT` mirrors the shipped verdict prompt (`dream/verdict.rs`'s
-`VERDICT_PROMPT_HEAD` + the NOTE/PACK tail) at `PROMPT_VERSION = "verify-pack-v3"`. **Re-sync
+`VERDICT_PROMPT_HEAD` + the NOTE/PACK tail) at `PROMPT_VERSION = "verify-pack-v6"`. **Re-sync
 `VERIFY_PACK_PROMPT` whenever `PROMPT_VERSION` bumps**, or the gate stops exercising what ships.
 
 **Bumping either version string, or changing the dream model, means re-running this suite** —
-compaction changes against the zero-trap-flip bar, verification changes against the ≥70% 15-case
-manifest bar. Extend the probe set by mining negation sentences from new memories as they land.
+compaction changes against the zero-trap-flip bar, verification changes against both the compact
+14-case accuracy bar and the reviewed-production precision/recall bar. Extend the probe set by
+mining negation sentences from new memories as they land.

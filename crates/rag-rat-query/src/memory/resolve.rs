@@ -631,6 +631,98 @@ pub(crate) fn edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String {
         .as_bytes(),
     )
 }
+
+/// One live-edge candidate for call-path re-resolution: the exact fingerprint plus the loose
+/// name/kind/target identity a moved-line edge is re-found by.
+pub(crate) struct LiveEdgeMatch {
+    pub(crate) fingerprint: String,
+    pub(crate) from_name: Option<String>,
+    pub(crate) to_name: String,
+    pub(crate) edge_kind: String,
+    pub(crate) target_qualified_name: Option<String>,
+}
+
+fn live_edge_match_sql(identity_count: usize) -> String {
+    let disjunction = (0..identity_count)
+        .map(|identity| {
+            let from_name = identity * 4 + 1;
+            let to_name = from_name + 1;
+            let edge_kind = from_name + 2;
+            let target = from_name + 3;
+            format!(
+                "(edges.to_name_id = (SELECT id FROM name_strings WHERE value = ?{to_name}) AND \
+                 edges.edge_kind_id = (SELECT id FROM name_strings WHERE value = ?{edge_kind}) \
+                 AND ((?{from_name} IS NULL AND edges.from_name_id IS NULL) OR edges.from_name_id \
+                 = (SELECT id FROM name_strings WHERE value = ?{from_name})) AND ((?{target} IS \
+                 NULL AND edges.target_qualified_name_id IS NULL) OR \
+                 edges.target_qualified_name_id = (SELECT id FROM name_strings WHERE value = \
+                 ?{target})))"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    // Lead every OR arm with `to_name_id`: SQLite then uses `idx_edges_to_name` (MULTI-INDEX OR for
+    // multiple identities) instead of scanning `edges_data` through the view's value joins.
+    format!(
+        "SELECT files.path AS path, COALESCE(NULLIF(edges.source_start_line, 0), 1) AS \
+         start_line, COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, \
+         0), 1) AS end_line, edges.from_name, edges.to_name, edges.edge_kind, \
+         edges.target_qualified_name, edges.receiver_hint FROM edges JOIN files ON files.id = \
+         edges.source_file_id WHERE {disjunction}"
+    )
+}
+
+/// Load every live edge whose loose identity matches ANY persisted identity, in ONE bounded
+/// indexed query — validating a call path then costs one `to_name_id`-seeded lookup instead of a
+/// full edge-table scan per persisted edge ([`edge_by_fingerprint`] per edge, which dream's
+/// steady-state churn-key recomputation cannot afford). The value columns are projection-only:
+/// predicates MUST stay on the interned `*_id` columns so the edge indexes remain usable.
+pub(crate) fn live_edges_matching_identities(
+    conn: &Connection,
+    identities: &[(Option<String>, String, String, Option<String>)],
+) -> anyhow::Result<Vec<LiveEdgeMatch>> {
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The start/end-line expressions MUST match `edge_by_fingerprint`'s SELECT exactly, or the
+    // fingerprints computed here disagree with it.
+    let mut stmt = conn.prepare(&live_edge_match_sql(identities.len()))?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(identities.len() * 4);
+    for (from_name, to_name, edge_kind, target) in identities {
+        params.push(from_name);
+        params.push(to_name);
+        params.push(edge_kind);
+        params.push(target);
+    }
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        let path = row.get::<_, String>("path")?;
+        let start_line = row.get::<_, i64>("start_line")?;
+        let end_line = row.get::<_, i64>("end_line")?;
+        let from_name = row.get::<_, Option<String>>("from_name")?;
+        let to_name = row.get::<_, String>("to_name")?;
+        let edge_kind = row.get::<_, String>("edge_kind")?;
+        let target_qualified_name = row.get::<_, Option<String>>("target_qualified_name")?;
+        let receiver_hint = row.get::<_, Option<String>>("receiver_hint")?;
+        Ok(LiveEdgeMatch {
+            fingerprint: edge_fingerprint(EdgeFingerprintParts {
+                path: &path,
+                start_line,
+                end_line,
+                from_name: from_name.as_deref(),
+                to_name: Some(&to_name),
+                edge_kind: &edge_kind,
+                target_qualified_name: target_qualified_name.as_deref(),
+                receiver_hint: receiver_hint.as_deref(),
+            }),
+            from_name,
+            to_name,
+            edge_kind,
+            target_qualified_name,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Hash-algorithm version prefix for server-derived call-path hashes. Bump if the input
 /// composition changes so old hashes never silently collide with a new scheme (#38).
 pub(crate) const CALL_PATH_HASH_VERSION: &str = "cp1";
@@ -1003,4 +1095,37 @@ pub(crate) fn short_symbol_name<'a>(binding_id: &'a str, path: Option<&str>) -> 
         return name;
     }
     binding_id.rsplit("::").next().unwrap_or(binding_id)
+}
+
+#[cfg(test)]
+mod live_edge_match_tests {
+    use super::*;
+
+    #[test]
+    fn call_path_candidate_query_seeds_on_the_to_name_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN {}", live_edge_match_sql(2));
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let plan = stmt
+            .query_map(
+                rusqlite::params![
+                    Option::<String>::None,
+                    "first_target",
+                    "calls_name",
+                    Option::<String>::None,
+                    "source",
+                    "second_target",
+                    "calls_name",
+                    "qualified::target",
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("idx_edges_to_name"), "query plan must use to-name index:\n{plan}");
+        assert!(!plan.contains("SCAN d"), "query plan must not scan edges_data:\n{plan}");
+    }
 }

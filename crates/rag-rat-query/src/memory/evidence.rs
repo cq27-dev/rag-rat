@@ -1,6 +1,6 @@
 //! Dream v2 pass 0 — the DETERMINISTIC verification substrate (no LLM).
 //!
-//! Three surfaces, all repo-scoped and reading the whole-tree index as dream's source of truth (not
+//! Three surfaces, all repo-scoped and reading the active index as dream's source of truth (not
 //! the filesystem):
 //!   - [`verification_queue`] — active memories that need (re)verification, ranked and capped by a
 //!     budget. Churn-skip is the point: a memory is enqueued only when a binding anchor is
@@ -8,9 +8,10 @@
 //!     current body / bound-file inputs no longer match the last-checked hashes. This is the
 //!     substrate the phase-B model verdict pass consumes — it never writes here.
 //!   - [`evidence_pack`] — a deterministic, citation-checkable pack for one memory: an identifier
-//!     table (backticked spans + long snake_case tokens resolved EXHAUSTIVELY against
-//!     symbols/files, where "NOT FOUND anywhere" is authoritative because the index is whole-tree)
-//!     plus current text excerpts of the memory's bound file(s), windowed around identifier hits.
+//!     table (backticked spans + long snake_case tokens resolved against indexed symbols/files;
+//!     "NOT FOUND anywhere" is emitted only when exact live files or a live call path prove the
+//!     note's declared domain) plus current text excerpts of the memory's bound file(s), windowed
+//!     around identifier hits.
 //!   - [`unverifiable_findings`] — the deterministic `memory_unverifiable` decision: a memory whose
 //!     bindings are all gone/absent AND none of whose identifiers resolve. Decided HERE, never by a
 //!     model; folded into the identity-keyed `dream_findings` lifecycle by `dream_run`.
@@ -23,12 +24,18 @@ use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
-/// The authoritative "resolves nowhere" verdict — trustworthy precisely because the index is
-/// whole-tree, so a miss is a real absence, not a scoping artifact.
+use super::resolve;
+
+/// The authoritative "resolves nowhere" verdict, emitted only when the note's binding proves the
+/// searched domain is live and covered.
 const NOT_FOUND: &str = "NOT FOUND anywhere in the source tree";
 /// The resolution for a code-shaped-but-unresolved span that is uninformative — a paraphrase,
 /// snippet, or flag whose non-match is a shape artifact, NEVER evidence of divergence.
 const UNRESOLVABLE: &str = "not a resolvable identifier (no symbol, file, or verbatim-text match)";
+/// An absence cannot be authoritative when the note's own source binding falls outside the active
+/// index coverage (for example a workflow, TOML, or cookbook file excluded by `target_bindings`).
+const OUTSIDE_INDEX_COVERAGE: &str =
+    "absence indeterminate because the note binding is outside indexed source coverage";
 /// The resolution for a `mem_<hex>` id that is a cross-reference to ANOTHER repo memory, not a code
 /// entity — uninformative (never NOT_FOUND, never source presence). Shared by the tier-2.5 arms.
 const MEM_XREF: &str = "a cross-reference to another repo memory (not a code entity)";
@@ -83,7 +90,7 @@ const TEXT_PRESENCE_SCAN_CAP: usize = 2000;
 /// Version stamp of the verify/verdict prompt pack. Stamped into `memory_reality.prompt_version`
 /// by the verdict pass and compared by the queue + surfacing gates: a bump re-queues every memory
 /// (which is why prompt-observable changes ride version bumps backfill-free).
-pub const VERDICT_PROMPT_VERSION: &str = "verify-pack-v3";
+pub const VERDICT_PROMPT_VERSION: &str = "verify-pack-v6";
 /// Version stamp of the compaction prompt, gating `memory_summaries` reuse the same way.
 pub const COMPACT_PROMPT_VERSION: &str = "compact-v1";
 
@@ -501,6 +508,8 @@ fn identifier_resolution_pairs(
         return Ok(Vec::new());
     }
     let file_paths = indexed_file_paths(conn)?;
+    let absence_is_authoritative = memory_binding_is_index_covered(conn, memory_id, scope)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
     let mut out = Vec::with_capacity(identifiers.len());
     for ident in &identifiers {
         // Fold the rendered resolution STRING. It is now path-independent for every tier —
@@ -508,7 +517,10 @@ fn identifier_resolution_pairs(
         // are fixed — so the churn key re-verifies on a genuine tier flip or a symbol/file identity
         // change but stays stable against unrelated repo churn (adding a file carrying a cited
         // common token no longer re-queues the paid verdict).
-        out.push((ident.clone(), resolve_identifier(conn, ident, &file_paths)?.0));
+        out.push((
+            ident.clone(),
+            resolve_memory_identifier(conn, ident, &file_paths, absence_is_authoritative)?.0,
+        ));
     }
     Ok(out)
 }
@@ -534,9 +546,11 @@ pub fn evidence_pack(conn: &Connection, memory_id: &str) -> anyhow::Result<Evide
     };
     let identifiers = extract_identifiers(&title, &body);
     let file_paths = indexed_file_paths(conn)?;
+    let absence_is_authoritative = memory_binding_is_index_covered(conn, memory_id, &scope)?;
     let mut resolutions = Vec::with_capacity(identifiers.len());
     for ident in &identifiers {
-        let (resolution, kind) = resolve_identifier(conn, ident, &file_paths)?;
+        let (resolution, kind) =
+            resolve_memory_identifier(conn, ident, &file_paths, absence_is_authoritative)?;
         resolutions.push(IdentifierResolution { identifier: ident.clone(), resolution, kind });
     }
     // A `mem_<hex>` cross-reference is never source evidence, so it must not window an excerpt
@@ -607,7 +621,9 @@ pub fn extract_identifiers(title: &str, body: &str) -> Vec<String> {
     for cap in BACKTICK_RE.captures_iter(&text) {
         if let Some(span) = cap.get(1) {
             let span = span.as_str().trim();
-            if !span.is_empty() {
+            // A multi-line span would render its embedded newline INTO the identifier table,
+            // splitting a row into free-standing attacker-controlled pack lines — reject it.
+            if !span.is_empty() && !span.contains('\n') {
                 ids.insert(span.to_string());
             }
         }
@@ -769,12 +785,31 @@ fn resolve_identifier(
     //    a code-shaped span that is neither, and resolves nowhere, is a genuine absence; anything
     //    else is uninformative.
     if span_is_code_shaped(norm, file_paths)
+        && !norm.contains("::")
         && !is_qualified_call(norm)
         && !is_qualified_macro(norm)
     {
         Ok((NOT_FOUND.to_string(), ResolutionKind::Absent))
     } else {
         Ok((UNRESOLVABLE.to_string(), ResolutionKind::Unresolvable))
+    }
+}
+
+/// Apply note-level index-coverage authority to one otherwise whole-tree resolution. A terminal
+/// miss is only `Absent` when the note's own binding resolves inside the active index. If the
+/// binding points at an excluded workflow/config/cookbook file, the index cannot honestly claim
+/// the token is absent from that source domain, so downgrade the miss to `Unresolvable`.
+fn resolve_memory_identifier(
+    conn: &Connection,
+    ident: &str,
+    file_paths: &[String],
+    absence_is_authoritative: bool,
+) -> rusqlite::Result<(String, ResolutionKind)> {
+    let (resolution, kind) = resolve_identifier(conn, ident, file_paths)?;
+    if kind == ResolutionKind::Absent && !absence_is_authoritative {
+        Ok((OUTSIDE_INDEX_COVERAGE.to_string(), ResolutionKind::Unresolvable))
+    } else {
+        Ok((resolution, kind))
     }
 }
 
@@ -1226,6 +1261,150 @@ fn resolve_bound_files(
     Ok(out)
 }
 
+/// Whether one bound path gives absence authority in the note's declared domain. Only an EXACT
+/// FILE binding that resolves to a live indexed file qualifies. A repo-root or directory binding
+/// can cover children excluded by `target_bindings`, so complete coverage is unprovable there.
+fn bound_path_gives_absence_authority(conn: &Connection, path: &str) -> rusqlite::Result<bool> {
+    if path.is_empty() {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 AND kind != 'deleted')",
+        [path],
+        |r| r.get(0),
+    )
+}
+
+/// Whether a server-derived CALL-PATH binding gives absence authority: every persisted edge must
+/// currently resolve against the live graph — exact fingerprint, or loose name/kind/target for a
+/// moved-line edge (mirroring `validate_call_path_binding`'s `current`/`relocated` outcomes,
+/// recomputed live rather than read from the stored `anchor_status`). All candidate edges are
+/// loaded in ONE bounded query — [`resolve::edge_by_fingerprint`] per persisted edge would
+/// full-scan the live edge table once per edge, which the steady-state churn-key recomputation
+/// cannot afford. A client-supplied hash with no persisted edges is unverifiable → NO authority.
+fn call_path_gives_absence_authority(
+    conn: &Connection,
+    memory_id: &str,
+    edge_sequence_hash: &str,
+) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name FROM \
+         repo_memory_call_path_edges WHERE memory_id = ?1 AND edge_sequence_hash = ?2 ORDER BY \
+         ordinal",
+    )?;
+    let edges = stmt
+        .query_map(rusqlite::params![memory_id, edge_sequence_hash], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if edges.is_empty() {
+        return Ok(false);
+    }
+    let identities: Vec<(Option<String>, String, String, Option<String>)> = edges
+        .iter()
+        .map(|(_, from_name, to_name, edge_kind, target)| {
+            (
+                from_name.clone(),
+                to_name.clone().unwrap_or_default(),
+                edge_kind.clone(),
+                target.clone(),
+            )
+        })
+        .collect();
+    let mut candidates = resolve::live_edges_matching_identities(conn, &identities)?;
+    for (fingerprint, from_name, to_name, edge_kind, target) in &edges {
+        // Each persisted edge must CONSUME a distinct live candidate: with duplicate loose
+        // identities in one path, a single surviving call site cannot vouch for all of them —
+        // the sibling that fell out of the index must stay missing.
+        let matched = candidates
+            .iter()
+            .position(|candidate| candidate.fingerprint == *fingerprint)
+            .or_else(|| {
+                candidates.iter().position(|candidate| {
+                    (
+                        candidate.from_name.as_deref().unwrap_or(""),
+                        candidate.to_name.as_str(),
+                        candidate.edge_kind.as_str(),
+                        candidate.target_qualified_name.as_deref().unwrap_or(""),
+                    ) == (
+                        from_name.as_deref().unwrap_or(""),
+                        to_name.as_deref().unwrap_or(""),
+                        edge_kind.as_str(),
+                        target.as_deref().unwrap_or(""),
+                    )
+                })
+            });
+        match matched {
+            Some(pos) => {
+                candidates.swap_remove(pos);
+            },
+            None => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// Whether terminal identifier misses are authoritative for this note. Absence authority requires
+/// PROVABLE coverage of the note's domain, and on any partial index (for example only
+/// `crates`/`docs` ingested) no binding-free or loosely-scoped domain is provable:
+/// - an intentionally UNBOUND conceptual note (no binding rows at all) is checked against the whole
+///   index, but the index is not the whole TREE — its misses stay indeterminate;
+/// - ANY pathless binding that is not a server-derived call path (a commit or tracker anchor, `path
+///   IS NULL`) — even alongside a covered file binding — keeps absence indeterminate, because
+///   identifiers belonging to the historical or tracker side of the note live outside the indexed
+///   tree;
+/// - each call-path binding must independently resolve against the live graph;
+/// - otherwise EVERY bound path must be an exact live indexed file; directory/root bindings remain
+///   indeterminate because configured index coverage may omit children.
+fn memory_binding_is_index_covered(
+    conn: &Connection,
+    memory_id: &str,
+    scope: &Option<String>,
+) -> anyhow::Result<bool> {
+    let bind_clause = schema::periphery_repo_scope_clause(scope, "repo_memory_bindings");
+    let has_bindings: bool = conn
+        .prepare(&format!(
+            "SELECT EXISTS(SELECT 1 FROM repo_memory_bindings WHERE memory_id = ?1{bind_clause})"
+        ))?
+        .query_row([memory_id], |r| r.get(0))?;
+    if !has_bindings {
+        return Ok(false);
+    }
+    let has_pathless: bool = conn
+        .prepare(&format!(
+            "SELECT EXISTS(SELECT 1 FROM repo_memory_bindings WHERE memory_id = ?1 AND path IS \
+             NULL AND binding_kind != 'call_path'{bind_clause})"
+        ))?
+        .query_row([memory_id], |r| r.get(0))?;
+    if has_pathless {
+        return Ok(false);
+    }
+    let mut call_path_stmt = conn.prepare(&format!(
+        "SELECT binding_id FROM repo_memory_bindings WHERE memory_id = ?1 AND binding_kind = \
+         'call_path'{bind_clause}"
+    ))?;
+    let call_path_hashes = call_path_stmt
+        .query_map([memory_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for hash in &call_path_hashes {
+        if !call_path_gives_absence_authority(conn, memory_id, hash)? {
+            return Ok(false);
+        }
+    }
+    for path in bound_file_paths(conn, memory_id, scope)? {
+        if !bound_path_gives_absence_authority(conn, &path)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Current-text excerpt windows around identifier hits in the memory's bound files, from the
 /// indexed chunk text (the index, not the filesystem, is dream's source of truth). Bounded at
 /// `MAX_EXCERPT_LINES` total, ordered by (path, start_line).
@@ -1594,13 +1773,19 @@ mod tests {
         // NOT_FOUND rows.
         let c = mem_db();
         set_repo(&c, "r");
+        // One unrelated indexed file, bound: the exact file declares the note's source domain.
+        seed_file(&c, "src/lib.rs", "fn unrelated() {}\n", "r");
         seed_memory(&c, "m1", "t", "a note about `never_defined_symbol` and nothing else", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/lib.rs','src/lib.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
         let pack = evidence_pack(&c, "m1").unwrap();
         assert!(!pack.identifiers.is_empty(), "the identifier was extracted");
-        assert!(
-            pack.identifiers.iter().all(|id| id.resolution == NOT_FOUND),
-            "and it resolves nowhere"
-        );
+        assert!(pack.identifiers.iter().all(|id| id.resolution == NOT_FOUND));
         assert!(!pack.is_citable(), "an all-NOT_FOUND, no-excerpt pack is uncitable");
     }
 
@@ -1744,6 +1929,12 @@ mod tests {
         let (res, kind) = resolve("no_such_symbol_anywhere");
         assert_eq!(kind, ResolutionKind::Absent);
         assert_eq!(res, NOT_FOUND);
+
+        // A qualified name may denote a field/variant/member the symbol index does not cover.
+        // Without a call or a resolvable trailing symbol, its miss is not authoritative absence.
+        let (res, kind) = resolve("ConfigSnapshot::trusted_path");
+        assert_eq!(kind, ResolutionKind::Unresolvable, "qualified member: {res}");
+        assert_ne!(res, NOT_FOUND);
 
         // 4b: an attribute span, absent from text and not name-shaped → uninformative, NOT
         // NOT_FOUND.
@@ -2504,6 +2695,13 @@ mod tests {
         )
         .unwrap();
         seed_memory(&c, "m1", "t", "refs `real_symbol` and `ghost_symbol`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','crates/x/src/thing.rs','crates/x/src/thing.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
         let a = evidence_pack(&c, "m1").unwrap();
         let b = evidence_pack(&c, "m1").unwrap();
         assert_eq!(
@@ -2522,7 +2720,331 @@ mod tests {
             .iter()
             .find(|i| i.identifier == "ghost_symbol")
             .expect("ghost_symbol identifier present");
-        assert_eq!(missing.resolution, NOT_FOUND, "a whole-tree miss is authoritative NOT FOUND");
+        assert_eq!(missing.resolution, NOT_FOUND, "an exact-file-domain miss is authoritative");
+    }
+
+    #[test]
+    fn evidence_pack_downgrades_absence_when_the_binding_is_outside_index_coverage() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn indexed() {}\n", "r");
+        seed_memory(&c, "m1", "release config", "the workflow uses `git_release_enable`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','release-plz.toml','release-plz.toml','current',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "git_release_enable")
+            .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unresolvable);
+        assert_eq!(resolution.resolution, OUTSIDE_INDEX_COVERAGE);
+    }
+
+    #[test]
+    fn evidence_pack_downgrades_absence_when_only_some_bindings_are_index_covered() {
+        // A note bound to BOTH an indexed source file and an excluded config file: the covered
+        // binding must not lend absence authority to an identifier that lives only in the
+        // uncovered one — a whole-tree miss for `git_release_enable` stays indeterminate.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn indexed() {}\n", "r");
+        seed_memory(&c, "m1", "release config", "the workflow uses `git_release_enable`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/lib.rs','src/lib.rs','current',0,'r'), \
+             ('m1','path','release-plz.toml','release-plz.toml','current',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "git_release_enable")
+            .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unresolvable);
+        assert_eq!(resolution.resolution, OUTSIDE_INDEX_COVERAGE);
+    }
+
+    #[test]
+    fn evidence_pack_downgrades_absence_for_a_pathless_commit_binding() {
+        // A commit/tracker binding stores `path = NULL`: the note is anchored to history or an
+        // issue, not to the indexed tree, so a whole-tree miss must not read as an authoritative
+        // NOT FOUND just because the pack is otherwise citable.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn indexed() {}\n", "r");
+        seed_memory(&c, "m1", "historical", "the refactor removed `gone_helper`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','commit','deadbeef',NULL,'current',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "gone_helper")
+            .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unresolvable);
+        assert_eq!(resolution.resolution, OUTSIDE_INDEX_COVERAGE);
+    }
+
+    #[test]
+    fn evidence_pack_keeps_absence_indeterminate_for_an_unbound_note() {
+        // An intentionally unbound note is checked against the whole index, but the index is not
+        // the whole TREE on a partial index — its misses stay indeterminate whether or not the
+        // index is empty (here: non-empty).
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn indexed() {}\n", "r");
+        seed_memory(&c, "m1", "t", "the note describes `ghost_symbol`", "r");
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "ghost_symbol")
+            .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unresolvable);
+        assert_eq!(resolution.resolution, OUTSIDE_INDEX_COVERAGE);
+    }
+
+    #[test]
+    fn evidence_pack_downgrades_absence_for_an_unpersisted_call_path_binding() {
+        // A client-supplied call-path hash has no persisted edges to re-resolve against the live
+        // graph — unverifiable, so absence stays indeterminate.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn indexed() {}\n", "r");
+        seed_memory(&c, "m1", "t", "the note describes `gone_helper`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','call_path','client-hash',NULL,'current',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "gone_helper")
+            .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unresolvable);
+        assert_eq!(resolution.resolution, OUTSIDE_INDEX_COVERAGE);
+    }
+
+    #[test]
+    fn evidence_pack_downgrades_absence_for_a_call_path_binding_with_dead_edges() {
+        // Persisted edges that no longer resolve against the live graph (fingerprint AND loose
+        // identity both miss) mean the path's domain drifted out of the index — indeterminate.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn indexed() {}\n", "r");
+        seed_memory(&c, "m1", "t", "the note describes `gone_helper`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','call_path','hash1',NULL,'current',0,'r')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name) VALUES \
+             ('m1','hash1',0,'fp-unknown','deleted_caller','deleted_callee','calls_name',NULL)",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "gone_helper")
+            .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unresolvable);
+        assert_eq!(resolution.resolution, OUTSIDE_INDEX_COVERAGE);
+    }
+
+    #[test]
+    fn evidence_pack_downgrades_absence_for_a_call_path_with_a_missing_duplicate_edge() {
+        // Two persisted edges share one loose identity, but only ONE live call site remains: the
+        // multiset match must not let the survivor vouch for both — the path is incomplete and
+        // absence stays indeterminate.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "fn caller_fn() {}\n", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, target_qualified_name, \
+             source_file_id, source_start_line, source_end_line) VALUES \
+             ('caller_fn','gone_helper','calls_name','exact',NULL,?1,1,1)",
+            [file_id],
+        )
+        .unwrap();
+        seed_memory(&c, "m1", "t", "the note describes `gone_helper`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','call_path','hash1',NULL,'current',0,'r')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name) VALUES \
+             ('m1','hash1',0,'fp-a','caller_fn','gone_helper','calls_name',NULL), \
+             ('m1','hash1',1,'fp-b','caller_fn','gone_helper','calls_name',NULL)",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "gone_helper")
+            .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unresolvable);
+        assert_eq!(resolution.resolution, OUTSIDE_INDEX_COVERAGE);
+    }
+
+    #[test]
+    fn evidence_pack_call_path_binding_with_live_edges_keeps_absence_authoritative() {
+        // A server-derived call path whose persisted edges still resolve against the live graph
+        // (here by loose name/kind/target identity — the fingerprint is unknown) IS index-covered:
+        // its identifiers were resolved from this index, so a whole-tree miss is a real absence.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "fn caller_fn() {}\n", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, target_qualified_name, \
+             source_file_id, source_start_line, source_end_line) VALUES \
+             ('caller_fn','gone_helper','calls_name','exact',NULL,?1,1,1)",
+            [file_id],
+        )
+        .unwrap();
+        seed_memory(&c, "m1", "t", "the note describes `gone_helper`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','call_path','hash1',NULL,'current',0,'r')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name) VALUES \
+             ('m1','hash1',0,'fp-unknown','caller_fn','gone_helper','calls_name',NULL)",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "gone_helper")
+            .unwrap();
+        assert_eq!(
+            resolution.resolution, NOT_FOUND,
+            "a live call path keeps whole-tree absence authoritative"
+        );
+    }
+
+    #[test]
+    fn evidence_pack_downgrades_absence_for_a_mixed_file_and_commit_binding() {
+        // An indexed file binding PLUS a pathless commit anchor: the file alone would give
+        // absence authority, but identifiers belonging to the historical side of the note live
+        // outside the indexed tree — any pathless row keeps absence indeterminate.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn indexed() {}\n", "r");
+        seed_memory(&c, "m1", "mixed", "the refactor removed `gone_helper`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/lib.rs','src/lib.rs','current',0,'r'), \
+             ('m1','commit','deadbeef',NULL,'current',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "gone_helper")
+            .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unresolvable);
+        assert_eq!(resolution.resolution, OUTSIDE_INDEX_COVERAGE);
+    }
+
+    #[test]
+    fn evidence_pack_downgrades_absence_for_a_repo_root_binding_under_a_partial_index() {
+        // A `--dir .` binding in a partially indexed repository (only `crates`/`docs` ingested)
+        // must not grant absence authority: an identifier living only in an excluded root TOML or
+        // workflow would otherwise read as an authoritative NOT FOUND.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn indexed() {}\n", "r");
+        seed_memory(&c, "m1", "release config", "the workflow uses `git_release_enable`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES ('m1','dir','','','current',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "git_release_enable")
+            .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unresolvable);
+        assert_eq!(resolution.resolution, OUTSIDE_INDEX_COVERAGE);
+    }
+
+    #[test]
+    fn evidence_pack_downgrades_absence_for_a_directory_binding() {
+        // A directory binding can hold children the index never ingested (excluded by
+        // `target_bindings`), and the index cannot enumerate what it does not contain — so a
+        // directory NEVER gives absence authority even when every discovered child is indexed.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/dir/a.rs", "fn a() {}\n", "r");
+        seed_file(&c, "src/dir/b.rs", "fn b() {}\n", "r");
+        seed_memory(&c, "m1", "module note", "the module keeps `gone_helper` available", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','dir','src/dir','src/dir','current',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let resolution = pack
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier == "gone_helper")
+            .unwrap();
+        assert_eq!(resolution.kind, ResolutionKind::Unresolvable);
+        assert_eq!(resolution.resolution, OUTSIDE_INDEX_COVERAGE);
     }
 
     #[test]

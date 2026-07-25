@@ -38,8 +38,15 @@ hhem_image = (
     .env({"HF_HOME": CACHE_PATH})
 )
 
-DATA_DIR = pathlib.Path(__file__).parent.parent  # evals/memory-compaction
-REPO_ROOT = pathlib.Path(__file__).parents[3]  # repository root (…/evals/memory-compaction/harness → root)
+MODULE_PATH = pathlib.Path(__file__)
+if len(MODULE_PATH.parents) >= 4:
+    DATA_DIR = MODULE_PATH.parent.parent  # evals/memory-compaction
+    REPO_ROOT = MODULE_PATH.parents[3]  # repository root
+else:
+    # Modal imports the mounted function as `/root/eval_app.py`. Remote functions only need these
+    # paths while reconstructing image declarations; the source mounts already live under `/repo`.
+    DATA_DIR = pathlib.Path("/data")
+    REPO_ROOT = pathlib.Path("/repo")
 CORPUS = DATA_DIR / "corpus" / "eval-corpus.json"
 RESULTS = DATA_DIR / "results"
 RESULTS.mkdir(parents=True, exist_ok=True)
@@ -85,9 +92,8 @@ def strip_think(text: str) -> str:
     return text.strip()
 
 
-@app.function(image=vllm_image, gpu="L40S", volumes={CACHE_PATH: CACHE}, timeout=3600)
-def run_model(model_id: str, chat_kwargs: dict | None, system_prefix: str | None,
-              prompts: list[str], max_tokens: int, max_model_len: int = 8192) -> dict:
+def _run_model(model_id: str, chat_kwargs: dict | None, system_prefix: str | None,
+               prompts: list[str], max_tokens: int, max_model_len: int = 8192) -> dict:
     """Batch-generate with one model. Returns summaries + timings, or an error record.
 
     `max_model_len` defaults to 8192 (the round-1 candidate sweep — some candidates cap there), but
@@ -98,8 +104,13 @@ def run_model(model_id: str, chat_kwargs: dict | None, system_prefix: str | None
 
     t0 = time.monotonic()
     try:
+        engine_kwargs = {}
+        if model_id == "Qwen/Qwen3-Coder-Next-FP8":
+            # FlashInfer's Hopper GDN prefill path JITs with nvcc, which the slim eval image does
+            # not carry. vLLM's Triton backend is self-contained and is the supported fallback.
+            engine_kwargs["gdn_prefill_backend"] = "triton"
         llm = LLM(model=model_id, max_model_len=max_model_len, dtype="bfloat16",
-                  gpu_memory_utilization=0.92, enforce_eager=False)
+                  gpu_memory_utilization=0.92, enforce_eager=False, **engine_kwargs)
     except Exception as e:  # engine/arch unsupported -> report, don't crash the sweep
         return {"model": model_id, "error": f"engine init failed: {e!r}"}
     load_s = time.monotonic() - t0
@@ -125,6 +136,18 @@ def run_model(model_id: str, chat_kwargs: dict | None, system_prefix: str | None
     CACHE.commit()
     return {"model": model_id, "load_s": round(load_s, 1), "gen_s": round(gen_s, 1),
             "outputs": texts}
+
+
+@app.function(image=vllm_image, gpu="L40S", volumes={CACHE_PATH: CACHE}, timeout=3600)
+def run_model(model_id: str, chat_kwargs: dict | None, system_prefix: str | None,
+              prompts: list[str], max_tokens: int, max_model_len: int = 8192) -> dict:
+    return _run_model(model_id, chat_kwargs, system_prefix, prompts, max_tokens, max_model_len)
+
+
+@app.function(image=vllm_image, gpu="H200", volumes={CACHE_PATH: CACHE}, timeout=3600)
+def run_large_model(model_id: str, chat_kwargs: dict | None, system_prefix: str | None,
+                    prompts: list[str], max_tokens: int, max_model_len: int = 8192) -> dict:
+    return _run_model(model_id, chat_kwargs, system_prefix, prompts, max_tokens, max_model_len)
 
 
 @app.function(image=hhem_image, gpu="T4", volumes={CACHE_PATH: CACHE}, timeout=1800)
@@ -181,11 +204,13 @@ If the note is already self-sufficient, skip the tools and write the summary imm
 
 # /repo mounts the current checkout's crates; /repo-drift mounts the doctored tree that
 # `make-drift-tree.py` produces (regenerate it before running the tool-based verify entrypoints).
-vllm_repo_image = (
-    vllm_image
-    .add_local_dir(str(REPO_ROOT / "crates"), "/repo/crates", copy=True)
-    .add_local_dir(str(DATA_DIR / "drift-crates"), "/repo-drift/crates", copy=True)
+vllm_repo_image = vllm_image.add_local_dir(
+    str(REPO_ROOT / "crates"), "/repo/crates", copy=True
 )
+if (DATA_DIR / "drift-crates").is_dir():
+    vllm_repo_image = vllm_repo_image.add_local_dir(
+        str(DATA_DIR / "drift-crates"), "/repo-drift/crates", copy=True
+    )
 
 
 def _tool_grep(pattern: str, root: str = "/repo") -> str:
@@ -394,6 +419,12 @@ PASS0_UNVERIFIABLE = [
 
 @app.local_entrypoint()
 def verify_test():
+    if not (DATA_DIR / "drift-crates").is_dir():
+        raise SystemExit(
+            "drift fixture missing: the /repo-drift manifest rows need the doctored tree — "
+            "run harness/make-drift-tree.py first, or the agentic comparison scores an image "
+            "with no /repo-drift mount"
+        )
     items = json.loads(CORPUS.read_text())
     by_id = {it["id"]: it for it in items}
     mem_full = json.loads((DATA_DIR / "corpus" / "memories-full.json").read_text())
@@ -424,18 +455,18 @@ def verify_test():
 
 
 # Mirrors the SHIPPED evidence-pack verdict prompt: dream/verdict.rs `VERDICT_PROMPT_HEAD`
-# (prompts/verdict_head.md) + `render_verdict_prompt` tail (PROMPT_VERSION "verify-pack-v3"). It is a
+# (prompts/verdict_head.md) + `render_verdict_prompt` tail (PROMPT_VERSION "verify-pack-v6"). It is a
 # 2-way verdict (current | diverged) — `unverifiable` is decided deterministically in pass 0 and
 # NEVER asked of the model, so it is absent here. RE-SYNC this string whenever PROMPT_VERSION bumps
 # in dream/verdict.rs.
-VERIFY_PACK_PROMPT = """You are auditing a repo-intelligence memory NOTE against the repository as it exists RIGHT NOW. You are given a mechanically-generated EVIDENCE PACK from the current checkout: a whole-tree resolution of the identifiers the note mentions, plus the current text of the note's bound file. The note was written in the past: the code may have moved past it, the note may describe in-flight work not present in this checkout, or they may agree.
+VERIFY_PACK_PROMPT = """You are auditing a repo-intelligence memory NOTE against the repository as it exists RIGHT NOW. You are given a mechanically-generated EVIDENCE PACK from the current checkout: indexed resolutions of the identifiers the note mentions, plus current text excerpts from the note's bound files. The note was written in the past: the code may have moved past it, the note may describe in-flight work not present in this checkout, or they may agree.
 
 Read each identifier's resolution LITERALLY. The resolutions mean exactly:
 - `symbol <path>::<name>` (or `symbols (N): …`) — a defined code symbol of that name EXISTS in the tree. Present.
 - `file <path>` (or `files (N): …`) — a file of that path EXISTS in the tree. Present.
 - `not a defined symbol; appears verbatim as source text` — the token EXISTS in the source as literal text (a table/column name, a local variable, an expression, an attribute), just not as a DEFINED symbol. Treat it as PRESENT — unless the note specifically claims it is a defined function/type/symbol of that name, in which case "not a defined symbol" is a contradiction. COMMON FALSE POSITIVE: a table/column name (`content_hash`), a meta/config key (`fts_synced_at_ms`), an env var, or a local variable resolves this way and IS present — do NOT rule `diverged` merely because it is not a defined function/type.
 - `not an indexed file; appears verbatim only as source text` — a path that EXISTS in the source as literal text (mentioned in a comment or string) but is NOT an indexed file. Treat it as PRESENT — unless the note specifically claims a FILE of that path exists, in which case "not an indexed file" is a contradiction.
-- `NOT FOUND anywhere in the source tree` — a name-shaped identifier that exists NOWHERE in the tree: not a symbol, not a file, not even as literal text. This is the ONLY resolution that is evidence of ABSENCE.
+- `NOT FOUND anywhere in the source tree` — an authoritative miss emitted only when the note's exact live-file or live call-path domain is covered. This is the ONLY resolution that is evidence of ABSENCE.
 
 Absence alone is not divergence: a `NOT FOUND` identifier the note merely mentions in passing does not contradict the note. It is divergence only when the note makes a LOAD-BEARING claim about that name (it says the function/type/table/field was added, exists, or behaves a certain way) and the pack shows it `NOT FOUND` (or present only as text while the note calls it a defined symbol).
 
@@ -444,11 +475,12 @@ A note DOCUMENTING ITS OWN HISTORY agrees with reality, it does not contradict i
 Output EXACTLY this format and nothing else:
 VERDICT: current | diverged
 DIRECTION: code_ahead | note_ahead | unknown
+CLAIM: <for diverged, one load-bearing claim copied verbatim from the NOTE; for current, NONE>
 EVIDENCE:
 - <one line copied verbatim from the EVIDENCE PACK below that supports the verdict>
 REASON: <one sentence>
 
-Meanings: current = the note's load-bearing claims are visible in the pack as described (or nothing in the pack contradicts them). diverged = the pack clearly CONTRADICTS a load-bearing claim. code_ahead = the code changed after the note was written. note_ahead = the note describes work this checkout does not contain yet — a symbol the note says was added is `NOT FOUND` while the note's bound file DOES exist. DIRECTION is "unknown" unless VERDICT is diverged and you can tell which side is newer. Every EVIDENCE line must be copied verbatim from the EVIDENCE PACK below — never invent one.
+Meanings: current = the note's load-bearing claims are visible in the pack as described (or nothing in the pack contradicts them). diverged = the pack clearly CONTRADICTS a load-bearing claim. code_ahead = the code changed after the note was written. note_ahead = the note describes work its exact live-file or live call-path domain does not contain yet — an identifier the note says was added is authoritatively `NOT FOUND`. DIRECTION is "unknown" unless VERDICT is diverged and you can tell which side is newer. For `diverged`, CLAIM must copy the contradicted claim from the NOTE WHOLE and verbatim — the complete sentence or span from the TITLE or the BODY (never spliced across both, never a prefix with additions; capitalization and markdown punctuation may differ). Every EVIDENCE line must be a FULL line copied verbatim from the EVIDENCE PACK below, including its `- `identifier` -> …` row prefix or `path:line:` locator — never invent one, and never cite a bare resolution label such as `NOT FOUND`. For `diverged`, cite the `NOT FOUND` row of an identifier the claim names. Excerpts are context only: do not use an excerpt as the sole proof of contradiction. A `diverged` verdict supported only by an excerpt, present-as-source-text row, or symbol-present row will be rejected. For `current`, write `CLAIM: NONE`.
 
 NOTE (anchored to {binding}):
 TITLE: {title}
@@ -485,6 +517,124 @@ def verify_pack_test():
                         "expected_direction": exp_d, "calls_used": 0, "answer": ans})
         print(f"{model}: ok gen={r['gen_s']}s")
     (RESULTS / "verify-pack-results.json").write_text(json.dumps(out, indent=1))
+
+
+def _configured_dream_model() -> str:
+    """The production verifier model pinned in the checkout's rag-rat.toml
+    (`[llm.dream.remote].model`)."""
+    import tomllib
+
+    config = tomllib.loads((REPO_ROOT / "rag-rat.toml").read_text())
+    return config["llm"]["dream"]["remote"]["model"]
+
+
+@app.local_entrypoint()
+def reviewed_verify_replay():
+    """Run the shipped verifier prompt over the fixed 36-case human-reviewed #954 batch."""
+    cases = json.loads((DATA_DIR / "corpus" / "reviewed-verify-replay.json").read_text())
+    packs = json.loads((DATA_DIR / "corpus" / "reviewed-verify-packs.json").read_text())
+    prompts = [
+        VERIFY_PACK_PROMPT.format(
+            binding=case["binding"]["value"],
+            title=case["title"],
+            body=case["body"],
+            pack=packs[f"{case['id']}|/repo"],
+        )
+        for case in cases
+    ]
+    out = []
+    # This replay is the production precision gate, so run the model pinned by rag-rat.toml rather
+    # than the broader research comparison pair used by `verify_pack_test`. Fail loudly when the
+    # harness constant and the config drift apart, so a model upgrade can never ship on metrics
+    # measured with the old model.
+    configured = _configured_dream_model()
+    for model, chat_kwargs, system_prefix in V2_MODELS[:1]:
+        if model != configured:
+            raise SystemExit(
+                f"production gate mismatch: rag-rat.toml [llm.dream.remote].model is "
+                f"{configured!r} but V2_MODELS[0] pins {model!r} — update the harness constant "
+                f"(or the config) so the gate measures the shipped model"
+            )
+        result = run_model.remote(
+            model,
+            chat_kwargs,
+            system_prefix,
+            prompts,
+            450,
+            max_model_len=16384,
+        )
+        if "error" in result:
+            print(f"{model}: ERROR {result['error'][:80]}")
+            continue
+        for case, answer in zip(cases, result["outputs"]):
+            out.append(
+                {
+                    "model": model,
+                    "item": case["id"],
+                    "expected": case["expected_verdict"],
+                    "expected_direction": case["expected_direction"],
+                    "answer": answer,
+                }
+            )
+        print(f"{model}: ok gen={result['gen_s']}s")
+    RESULTS.mkdir(exist_ok=True)
+    (RESULTS / "reviewed-verify-results.json").write_text(json.dumps(out, indent=1))
+
+
+@app.local_entrypoint()
+def reviewed_verify_candidates():
+    """Compare larger candidate models on the identical fixed #954 production replay."""
+    cases = json.loads((DATA_DIR / "corpus" / "reviewed-verify-replay.json").read_text())
+    packs = json.loads((DATA_DIR / "corpus" / "reviewed-verify-packs.json").read_text())
+    prompts = [
+        VERIFY_PACK_PROMPT.format(
+            binding=case["binding"]["value"],
+            title=case["title"],
+            body=case["body"],
+            pack=packs[f"{case['id']}|/repo"],
+        )
+        for case in cases
+    ]
+    candidates = [
+        ("Qwen/Qwen3-8B", {"enable_thinking": False}, None),
+        ("unsloth/gemma-3-12b-it", None, None),
+        ("Qwen/Qwen3-Coder-Next-FP8", None, None),
+    ]
+    calls = [
+        (
+            (
+                run_large_model if model == "Qwen/Qwen3-Coder-Next-FP8" else run_model
+            ).spawn(
+                model,
+                chat_kwargs,
+                system_prefix,
+                prompts,
+                450,
+                max_model_len=16384,
+            ),
+            model,
+        )
+        for model, chat_kwargs, system_prefix in candidates
+    ]
+    out = []
+    for call, model in calls:
+        result = call.get()
+        if "error" in result:
+            print(f"{model}: ERROR {result['error'][:80]}")
+            continue
+        for case, answer in zip(cases, result["outputs"]):
+            out.append(
+                {
+                    "model": model,
+                    "item": case["id"],
+                    "expected": case["expected_verdict"],
+                    "expected_direction": case["expected_direction"],
+                    "answer": answer,
+                }
+            )
+        print(f"{model}: ok gen={result['gen_s']}s")
+    RESULTS.mkdir(exist_ok=True)
+    (RESULTS / "reviewed-verify-candidate-results.json").write_text(json.dumps(out, indent=1))
 
 
 @app.local_entrypoint()

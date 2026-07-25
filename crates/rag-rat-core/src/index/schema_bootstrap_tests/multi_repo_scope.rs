@@ -1593,7 +1593,7 @@ fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
         Some("NOT FOUND anywhere in the source tree"),
         "a name that exists ONLY in the sibling repo must NOT resolve — as a symbol OR as \
          verbatim text (its chunk IS in the global chunk_fts): every resolver tier is repo-scoped \
-         through the files view, so the miss is the authoritative NOT FOUND, not a sibling \
+         through the files view, so the exact-file-domain miss is NOT FOUND rather than sibling \
          text-presence",
     );
     let excerpt_text: String = pack.excerpts.iter().map(|e| e.text.as_str()).collect();

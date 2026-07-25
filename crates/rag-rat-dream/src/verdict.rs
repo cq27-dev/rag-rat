@@ -26,9 +26,10 @@ use rag_rat_llm::chat::ChatModel;
 /// change to [`VERDICT_PROMPT_HEAD`] or the pack rendering so a stale-prompt verdict is
 /// distinguishable — a bump re-queues every prior verdict
 /// (`VerificationReason::PromptChanged`) and the finding surface stops reporting stale-prompt
-/// verdicts until they are re-checked. v2: the identifier resolver gained a verbatim-text
-/// tier plus a shape-split terminal, and the prompt teaches those labels, so v1 verdicts
-/// (which over-reported divergence off bare NOT-FOUND rows) are not comparable.
+/// verdicts until they are re-checked. v6 requires a whole verbatim note claim for divergence,
+/// preserves identifier/operator shape, and accepts only a named authoritative NOT FOUND row
+/// as contradiction evidence; excerpts and presence rows remain context only. Earlier verdicts
+/// are not comparable.
 pub(crate) use rag_rat_query::memory::evidence::VERDICT_PROMPT_VERSION as PROMPT_VERSION;
 use rusqlite::Connection;
 
@@ -69,14 +70,28 @@ impl Verdict {
         }
     }
 
-    /// Parse the VERDICT word. `None` for `unverifiable` (pass-0 territory) or anything
-    /// unrecognized — the caller discards the completion.
+    /// Parse the VERDICT word. `None` for `unverifiable` (pass-0 territory), anything
+    /// unrecognized, or an ECHOED CHOICE (`VERDICT: current | diverged`, `current or diverged`)
+    /// — the model selected nothing, and taking the first word would silently store `current`
+    /// and churn-skip a real divergence. Trailing prose after a clear first word is tolerated.
     fn parse(word: &str) -> Option<Self> {
-        match word.trim().to_ascii_lowercase().as_str() {
-            "current" => Some(Self::Current),
-            "diverged" => Some(Self::Diverged),
-            _ => None,
-        }
+        let mut words = word.split_whitespace();
+        let first = words.next().unwrap_or("").trim_end_matches(|c: char| !c.is_alphanumeric());
+        let verdict = match first.to_ascii_lowercase().as_str() {
+            "current" => Self::Current,
+            "diverged" => Self::Diverged,
+            _ => return None,
+        };
+        let mut choice_connector = false;
+        let another_alternative = words.any(|word| {
+            let token = word.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+            let is_alternative =
+                choice_connector && matches!(token.as_str(), "current" | "diverged");
+            choice_connector = matches!(token.as_str(), "or" | "not")
+                || word.chars().any(|c| matches!(c, '|' | '/'));
+            is_alternative
+        });
+        if another_alternative { None } else { Some(verdict) }
     }
 }
 
@@ -113,6 +128,10 @@ impl Direction {
 struct ParsedVerdict {
     verdict: Verdict,
     direction: Direction,
+    /// A load-bearing claim copied from the note. Required for `diverged` verdicts so the
+    /// deterministic guard can verify that the cited source evidence contradicts something the
+    /// note actually says, rather than an identifier the model inferred importance for.
+    claim: Option<String>,
     /// The EVIDENCE lines (leading `- ` stripped), each of which the fabrication guard checks
     /// against the rendered pack.
     evidence: Vec<String>,
@@ -197,20 +216,21 @@ pub(super) fn run_verdict_pass(
         let pack_text = render_pack(&pack);
         let binding = binding_label(conn, &entry.memory_id, &scope)?;
         let prompt = render_verdict_prompt(&entry, &binding, &pack_text);
-        let accepted = match obtain_verdict(pass.model, &prompt, &pack_text) {
-            Ok(accepted) => accepted,
-            Err(failure) => {
-                super::removal_guarded_write_tx(conn, &scope, |tx| {
-                    failure::record_failure(tx, RecordFailure {
-                        stamp: failure_stamp,
-                        failure: &failure,
-                        now_ms,
+        let accepted =
+            match obtain_verdict(pass.model, &prompt, &entry.title, &entry.body, &pack_text) {
+                Ok(accepted) => accepted,
+                Err(failure) => {
+                    super::removal_guarded_write_tx(conn, &scope, |tx| {
+                        failure::record_failure(tx, RecordFailure {
+                            stamp: failure_stamp,
+                            failure: &failure,
+                            now_ms,
+                        })?;
+                        Ok(())
                     })?;
-                    Ok(())
-                })?;
-                continue;
-            },
-        };
+                    continue;
+                },
+            };
         // #767 review: the verdict UPSERT + failure clear commit in ONE guarded transaction — the
         // tombstone re-check inside serializes with `rag-rat rm`'s purge, so a removal landing
         // mid-pass cannot leave this repo-scoped `memory_reality` row behind.
@@ -250,6 +270,8 @@ pub(super) fn run_verdict_pass(
 fn obtain_verdict(
     model: &dyn ChatModel,
     prompt: &str,
+    note_title: &str,
+    note_body: &str,
     pack_text: &str,
 ) -> Result<AcceptedVerdict, DreamModelFailure> {
     for attempt in 1..=2 {
@@ -268,7 +290,7 @@ fn obtain_verdict(
             tracing::debug!(target: "rag_rat_core::dream::verdict", "discarding unparseable/unverifiable verdict completion");
             return Err(DreamModelFailure::new(DreamFailureReason::MalformedVerdict));
         };
-        if verdict_is_cited(pack_text, &parsed) {
+        if verdict_is_grounded(note_title, note_body, pack_text, &parsed) {
             return Ok(AcceptedVerdict {
                 verdict: parsed.verdict,
                 direction: parsed.direction,
@@ -316,7 +338,7 @@ fn render_verdict_prompt(entry: &VerificationQueueEntry, binding: &str, pack_tex
 /// fabrication guard; excerpt lines carry a `path:line:` prefix so a precise citation resolves.
 pub(super) fn render_pack(pack: &EvidencePack) -> String {
     let mut s = String::new();
-    s.push_str("IDENTIFIERS (resolved against the whole source tree):\n");
+    s.push_str("IDENTIFIERS (resolved against the active source index):\n");
     // A `ResolutionKind::Unresolvable` span (a paraphrase / snippet / flag that is not code-shaped
     // and matches no text) carries no presence-or-absence signal, so it is NOT rendered — the model
     // never sees it and so cannot cite it to (wrongly) rule `diverged`. Symbol / file /
@@ -375,12 +397,13 @@ fn binding_label(
 // ── Parsing + the fabrication guard ──────────────────────────────────────────────────────────
 
 /// Parse a model completion into a [`ParsedVerdict`]. Tolerant of surrounding prose: it scans for
-/// the `VERDICT:` / `DIRECTION:` / `EVIDENCE:` / `REASON:` markers (case-insensitive) anywhere in
-/// the output. `None` when there is no recognizable `current`/`diverged` VERDICT — malformed output
-/// and a stray `unverifiable` both discard.
+/// the `VERDICT:` / `DIRECTION:` / `CLAIM:` / `EVIDENCE:` / `REASON:` markers
+/// (case-insensitive) anywhere in the output. `None` when there is no recognizable
+/// `current`/`diverged` VERDICT — malformed output and a stray `unverifiable` both discard.
 fn parse_verdict(output: &str) -> Option<ParsedVerdict> {
     let mut verdict = None;
     let mut direction = Direction::Unknown;
+    let mut claim = None;
     let mut evidence = Vec::new();
     let mut in_evidence = false;
     for raw_line in output.lines() {
@@ -394,10 +417,15 @@ fn parse_verdict(output: &str) -> Option<ParsedVerdict> {
             // omitted evidence.
             verdict = Verdict::parse(rest);
             direction = Direction::Unknown;
+            claim = None;
             evidence.clear();
             in_evidence = false;
         } else if let Some(rest) = strip_ci(line, "DIRECTION:") {
             direction = Direction::parse(rest);
+            in_evidence = false;
+        } else if let Some(rest) = strip_ci(line, "CLAIM:") {
+            let rest = rest.trim();
+            claim = (!rest.is_empty()).then(|| rest.to_string());
             in_evidence = false;
         } else if strip_ci(line, "EVIDENCE:").is_some() {
             in_evidence = true;
@@ -410,7 +438,7 @@ fn parse_verdict(output: &str) -> Option<ParsedVerdict> {
             }
         }
     }
-    Some(ParsedVerdict { verdict: verdict?, direction, evidence })
+    Some(ParsedVerdict { verdict: verdict?, direction, claim, evidence })
 }
 
 /// Minimum normalized (non-whitespace) length for a citation to count — a floor that keeps a bare
@@ -440,6 +468,275 @@ fn verdict_is_cited(pack_text: &str, parsed: &ParsedVerdict) -> bool {
             && !is_bare_locator(&cite)
             && content.iter().any(|c| c.contains(&cite))
     })
+}
+
+/// Minimum normalized length of a copied note claim. This rejects vacuous fragments such as a
+/// single identifier while remaining below the shortest useful sentence in the reviewed replay
+/// set.
+const MIN_CLAIM_CHARS: usize = 20;
+const MIN_CLAIM_WORDS: usize = 4;
+
+/// Deterministic grounding guard for a parsed verdict.
+///
+/// Every verdict still needs real pack citations. A `diverged` verdict additionally needs a
+/// substantial `CLAIM:` copied from the note, and it cannot rest solely on `TextPresent`
+/// identifier rows. Text presence can support `current`, but by itself it is not proof that a
+/// load-bearing note claim is contradicted.
+fn verdict_is_grounded(
+    note_title: &str,
+    note_body: &str,
+    pack_text: &str,
+    parsed: &ParsedVerdict,
+) -> bool {
+    if !verdict_is_cited(pack_text, parsed) {
+        return false;
+    }
+    if parsed.verdict == Verdict::Current {
+        return true;
+    }
+    let Some(claim) = parsed.claim.as_deref() else {
+        return false;
+    };
+    let claim = normalize_ws(claim.trim().trim_matches('"'));
+    // The claim must ground in the title OR the body — never a span spliced across the seam the
+    // prompt renders between them (`TITLE: {title}\n{body}`), which would let the model assert a
+    // sentence the note never makes.
+    if claim.chars().filter(|c| !c.is_whitespace()).count() < MIN_CLAIM_CHARS
+        || claim.split_whitespace().count() < MIN_CLAIM_WORDS
+        || !(claim_grounds_in_span(&claim, note_title) || claim_grounds_in_span(&claim, note_body))
+    {
+        return false;
+    }
+
+    let content: Vec<String> =
+        pack_text.lines().filter(|line| is_pack_content_line(line)).map(normalize_ws).collect();
+    parsed.evidence.iter().any(|evidence| {
+        let cite = normalize_ws(evidence);
+        content.iter().any(|line| {
+            line.contains(&cite)
+                && !line.contains("-> not a defined symbol; appears verbatim as source text")
+                && !line.contains("-> not an indexed file; appears verbatim only as source text")
+                && match identifier_from_pack_line(line) {
+                    // An identifier row grounds divergence only as ABSENCE evidence the citation
+                    // actually names: a `symbol`/`file` PRESENCE row never contradicts a claim on
+                    // its own, and a bare resolution-label citation (`NOT FOUND …`) convicts
+                    // whatever row it substring-matches without naming an identifier.
+                    Some(ident) =>
+                        line.contains("-> NOT FOUND")
+                            && cite.contains(ident)
+                            && claim_mentions_identifier(&claim, ident),
+                    // Excerpts remain useful model context, but subject overlap cannot
+                    // deterministically prove that source contradicts the copied claim.
+                    None => false,
+                }
+        })
+    })
+}
+
+/// Whether `identifier` occurs case-exactly in `text`, preserving every separator (`/`, `::`,
+/// `.`, call punctuation) and delimited from surrounding word characters. Token-only comparison
+/// aliases shape-distinct names such as `foo/bar` and `foo::bar`; raw exact shape and boundaries
+/// are load-bearing for evidence links.
+fn text_mentions_identifier(text: &str, identifier: &str) -> bool {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(identifier).any(|(start, _)| {
+        let end = start + identifier.len();
+        let left_ok = start == 0 || text[..start].chars().next_back().is_none_or(|c| !is_word(c));
+        let right_ok = end == text.len() || text[end..].chars().next().is_none_or(|c| !is_word(c));
+        left_ok && right_ok
+    })
+}
+
+/// One item of a text's mixed stream: a word or a comparison/boolean operator, with the
+/// adjacency facts the grounding checks need.
+#[derive(Clone, Copy)]
+enum StreamItem<'a> {
+    /// `code` marks words inside a backtick span (identifiers): they match case-EXACTLY, per
+    /// occurrence — the same spelling in prose still case-folds. `glued_to_prev` records
+    /// zero-whitespace adjacency to the previous stream ITEM (word or operator).
+    Word { text: &'a str, code: bool, glued_to_prev: bool },
+    /// `glued_to_prev` as above — the matched claim window extends over glued operator chains
+    /// (`Vec<T>`, `Option<Vec<T>>`, `!ready`) but never across whitespace into a sibling
+    /// sentence.
+    Op { symbol: &'a str, glued_to_prev: bool },
+}
+
+/// Words and operators in source order. Word boundaries follow the alphanumeric/`_` rule;
+/// operators scan two-character forms first (so `<=` is not `<` + `=`, `!=` is not `!` + `=`),
+/// then the single-character comparisons `<`/`>`. Syntax arrows (`->`, `=>`) are punctuation,
+/// NOT operators. A unary `!` is an operator ONLY glued to a following word (`!ready`) — a
+/// prose exclamation (`Warning!`) is punctuation a copying model may drop. Advances by CHAR,
+/// not byte — notes are full of em-dashes, and a byte step off a multi-byte boundary panics.
+fn mixed_stream(text: &str) -> Vec<StreamItem<'_>> {
+    const OPS: &[&str] = &["==", "!=", "<=", ">=", "&&", "||"];
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+    let mut items: Vec<StreamItem<'_>> = Vec::new();
+    let mut rest = text;
+    let mut in_code = false;
+    // Byte offset of `rest` within `text` and the end of the last EMITTED item (glue detection).
+    let mut base = 0usize;
+    let mut prev_item_end: Option<usize> = None;
+    let glued = |start: usize, prev: Option<usize>| prev == Some(start);
+    while let Some(c) = rest.chars().next() {
+        if c == '`' {
+            in_code = !in_code;
+            base += 1;
+            rest = &rest[1..];
+            continue;
+        }
+        // Syntax arrows are punctuation, not comparison operators.
+        if rest.starts_with("->") || rest.starts_with("=>") {
+            base += 2;
+            rest = &rest[2..];
+            continue;
+        }
+        if let Some(pos) = OPS.iter().position(|op| rest.starts_with(op)) {
+            let end = base + 2;
+            items.push(StreamItem::Op {
+                symbol: OPS[pos],
+                glued_to_prev: glued(base, prev_item_end),
+            });
+            prev_item_end = Some(end);
+            base = end;
+            rest = &rest[2..];
+            continue;
+        }
+        if c == '<' || c == '>' || (c == '!' && rest[1..].chars().next().is_some_and(is_word_char))
+        {
+            let symbol = if c == '<' {
+                "<"
+            } else if c == '>' {
+                ">"
+            } else {
+                "!"
+            };
+            let end = base + 1;
+            items.push(StreamItem::Op { symbol, glued_to_prev: glued(base, prev_item_end) });
+            prev_item_end = Some(end);
+            base = end;
+            rest = &rest[1..];
+            continue;
+        }
+        if is_word_char(c) {
+            let end_rel = rest.find(|ch: char| !is_word_char(ch)).unwrap_or(rest.len());
+            items.push(StreamItem::Word {
+                text: &rest[..end_rel],
+                code: in_code,
+                glued_to_prev: glued(base, prev_item_end),
+            });
+            prev_item_end = Some(base + end_rel);
+            base += end_rel;
+            rest = &rest[end_rel..];
+            continue;
+        }
+        base += c.len_utf8();
+        rest = &rest[c.len_utf8()..];
+    }
+    items
+}
+
+/// Whether the WHOLE claim grounds in the span: its words form one contiguous verbatim run
+/// (prose case-folded, backticked identifiers case-exact per occurrence), and the claim's
+/// operators occur in the same positions as the matched WINDOW's operators — the window extended
+/// over operator chains GLUED to its boundary words (`Vec<T>`, `Option<Vec<T>>`, `!ready`) but
+/// never across whitespace into a sibling sentence. Flipped, invented, or DROPPED operators
+/// (`!ready` → `ready`) all reject. Operators stay out of the word comparison so a model that
+/// drops backticks still matches.
+fn claim_grounds_in_span(claim: &str, span: &str) -> bool {
+    let stream = mixed_stream(span);
+    let claim_stream = mixed_stream(claim);
+    let claim_words: Vec<&str> = claim_stream
+        .iter()
+        .filter_map(|item| match item {
+            StreamItem::Word { text, .. } => Some(*text),
+            StreamItem::Op { .. } => None,
+        })
+        .collect();
+    if claim_words.is_empty() {
+        return false;
+    }
+    let word_positions: Vec<usize> = stream
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| matches!(item, StreamItem::Word { .. }).then_some(idx))
+        .collect();
+    if word_positions.len() < claim_words.len() {
+        return false;
+    }
+    'windows: for start in 0..=(word_positions.len() - claim_words.len()) {
+        for (offset, claim_word) in claim_words.iter().enumerate() {
+            let StreamItem::Word { text: note_word, code, .. } =
+                stream[word_positions[start + offset]]
+            else {
+                unreachable!("word_positions indexes only Word items")
+            };
+            let matches = if code {
+                note_word == *claim_word
+            } else {
+                note_word.eq_ignore_ascii_case(claim_word)
+            };
+            if !matches {
+                continue 'windows;
+            }
+        }
+        let mut first = word_positions[start];
+        let mut last = word_positions[start + claim_words.len() - 1];
+        // Extend over operators glued to the boundary words (attached unary `!`, generic
+        // brackets — including CHAINS like `>>`): they belong to the copied expression even
+        // though they sit outside the first/last word.
+        while first > 0
+            && matches!(stream[first - 1], StreamItem::Op { .. })
+            && matches!(
+                stream[first],
+                StreamItem::Word { glued_to_prev: true, .. }
+                    | StreamItem::Op { glued_to_prev: true, .. }
+            )
+        {
+            first -= 1;
+        }
+        while last + 1 < stream.len()
+            && matches!(stream[last + 1], StreamItem::Op { glued_to_prev: true, .. })
+        {
+            last += 1;
+        }
+        let window_shape: Vec<Option<&str>> = stream[first..=last]
+            .iter()
+            .map(|item| match item {
+                StreamItem::Op { symbol, .. } => Some(*symbol),
+                StreamItem::Word { .. } => None,
+            })
+            .collect();
+        let claim_shape: Vec<Option<&str>> = claim_stream
+            .iter()
+            .map(|item| match item {
+                StreamItem::Op { symbol, .. } => Some(*symbol),
+                StreamItem::Word { .. } => None,
+            })
+            .collect();
+        if window_shape == claim_shape {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a cited identifier occurs in the claim with its COMPLETE, case-exact shape — not as a
+/// substring (`writer_state` vs `active_writer_stateful`), case variant (`foo` vs `Foo`), or
+/// separator variant (`foo/bar` vs `foo::bar`).
+fn claim_mentions_identifier(claim: &str, identifier: &str) -> bool {
+    text_mentions_identifier(claim, identifier)
+}
+
+/// Extract the identifier from a rendered table row (``- `identifier` -> resolution``). Divergence
+/// citations to identifier rows must name an identifier that also occurs in the copied claim; this
+/// prevents an incidental NOT-FOUND row elsewhere in a long note from back-justifying an unrelated
+/// load-bearing claim.
+fn identifier_from_pack_line(line: &str) -> Option<&str> {
+    line.trim().strip_prefix("- `")?.split_once("` ->").map(|(identifier, _)| identifier)
 }
 
 /// Whether a citation is ONLY a `path:line` (or `path:line:`) locator with no source text after it.
@@ -744,16 +1041,51 @@ mod tests {
         .unwrap();
     }
 
-    /// A well-formed `current` completion citing an identifier known to be in the pack.
-    fn current_citing(ident: &str) -> String {
-        format!("VERDICT: current\nDIRECTION: unknown\nEVIDENCE:\n- `{ident}`\nREASON: matches.")
+    fn seed_live_call_path(
+        c: &Connection,
+        memory_id: &str,
+        path: &str,
+        target: &str,
+        repo_id: &str,
+    ) {
+        let hash = format!("hash-{memory_id}");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, source_file_id, \
+             source_start_line, source_end_line) SELECT 'caller',?2,'calls_name','exact',id,1,1 \
+             FROM main.files WHERE path=?1",
+            rusqlite::params![path, target],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES (?1,'call_path',?2,NULL,'current',0,?3)",
+            rusqlite::params![memory_id, hash, repo_id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name) VALUES \
+             (?1,?2,0,'test-fingerprint','caller',?3,'calls_name',NULL)",
+            rusqlite::params![memory_id, hash, target],
+        )
+        .unwrap();
     }
 
-    fn diverged_citing(ident: &str) -> String {
+    /// A well-formed `current` completion citing an identifier known to be in the pack.
+    fn current_citing(ident: &str) -> String {
         format!(
-            "VERDICT: diverged\nDIRECTION: note_ahead\nEVIDENCE:\n- `{ident}`\nREASON: not \
-             present."
+            "VERDICT: current\nDIRECTION: unknown\nCLAIM: NONE\nEVIDENCE:\n- `{ident}`\nREASON: \
+             matches."
         )
+    }
+
+    /// A well-formed `diverged` completion for the seeded m1: the claim is the note's full body
+    /// verbatim and the citation names the note's ABSENT identifier (`gone_thing` resolves
+    /// NOT FOUND — a PRESENCE row never grounds divergence).
+    fn diverged_citing() -> String {
+        "VERDICT: diverged\nDIRECTION: note_ahead\nCLAIM: The note describes `resolvable_thing` \
+         and `gone_thing` as available.\nEVIDENCE:\n- `gone_thing`\nREASON: not present."
+            .to_string()
     }
 
     // ── parsing ────────────────────────────────────────────────────────────────
@@ -840,12 +1172,13 @@ mod tests {
         let cited = |frag: &str| ParsedVerdict {
             verdict: Verdict::Current,
             direction: Direction::Unknown,
+            claim: None,
             evidence: vec![frag.to_string()],
         };
         assert!(
             !verdict_is_cited(
                 &pack,
-                &cited("IDENTIFIERS (resolved against the whole source tree):")
+                &cited("IDENTIFIERS (resolved against the active source index):")
             ),
             "the identifier section header is not citable content"
         );
@@ -915,6 +1248,7 @@ mod tests {
         let cited = |frag: &str| ParsedVerdict {
             verdict: Verdict::Diverged,
             direction: Direction::Unknown,
+            claim: Some("the note makes a substantial claim".to_string()),
             evidence: vec![frag.to_string()],
         };
         assert!(
@@ -933,12 +1267,592 @@ mod tests {
     }
 
     #[test]
+    fn divergence_guard_requires_a_verbatim_note_claim() {
+        let note = "The `gone_symbol` function remains available to callers.";
+        let pack = "IDENTIFIERS:\n- `gone_symbol` -> NOT FOUND anywhere in the source tree\n";
+        let grounded = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `gone_symbol` function remains \
+             available to callers.\nEVIDENCE:\n- `gone_symbol` -> NOT FOUND anywhere in the \
+             source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &grounded),
+            "a substantial claim copied from the note plus absence evidence is grounded"
+        );
+        let quoted = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: \"The `gone_symbol` function \
+             remains available to callers.\"\nEVIDENCE:\n- `gone_symbol` -> NOT FOUND anywhere in \
+             the source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &quoted),
+            "harmless outer quotes around a verbatim claim are accepted"
+        );
+
+        let missing = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nEVIDENCE:\n- `gone_symbol` -> NOT FOUND \
+             anywhere in the source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &missing),
+            "divergence without a copied note claim is rejected"
+        );
+
+        let paraphrased = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: Callers can still use the gone \
+             function.\nEVIDENCE:\n- `gone_symbol` -> NOT FOUND anywhere in the source \
+             tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &paraphrased),
+            "a plausible paraphrase is not deterministic claim grounding"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_rejects_text_present_only_evidence() {
+        let note = "The content_hash column is persisted with each verdict.";
+        let pack = "IDENTIFIERS:\n- `content_hash` -> not a defined symbol; appears verbatim as \
+                    source text\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: unknown\nCLAIM: The content_hash column is persisted \
+             with each verdict.\nEVIDENCE:\n- `content_hash` -> not a defined symbol; appears \
+             verbatim as source text\nREASON: not a symbol.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &parsed),
+            "text presence alone cannot establish a contradiction"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_requires_cited_identifier_to_occur_in_the_claim() {
+        let note = "The active writer remains serialized. An old fixture used `gone_helper`.";
+        let pack = "IDENTIFIERS:\n- `gone_helper` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The active writer remains \
+             serialized.\nEVIDENCE:\n- `gone_helper` -> NOT FOUND anywhere in the source \
+             tree\nREASON: helper gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &parsed),
+            "an incidental absence elsewhere in the note cannot back-justify the copied claim"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_rejects_excerpt_only_contradictions() {
+        let note = "The `active_writer` guard remains serialized.";
+        let pack = "IDENTIFIERS:\n- `active_writer` -> symbol \
+                    crates/x/src/lib.rs::active_writer\n\nBOUND-FILE \
+                    EXCERPTS:\ncrates/x/src/lib.rs:12: let handle = \
+                    spawn();\ncrates/x/src/lib.rs:40: let active_writer = spawn();\n";
+        let unrelated = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `active_writer` guard remains \
+             serialized.\nEVIDENCE:\n- crates/x/src/lib.rs:12: let handle = spawn();\nREASON: \
+             contradicts.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &unrelated),
+            "an excerpt about an unrelated mechanism is not linked evidence"
+        );
+        let same_subject = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `active_writer` guard remains \
+             serialized.\nEVIDENCE:\n- crates/x/src/lib.rs:40: let active_writer = \
+             spawn();\nREASON: contradicts.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &same_subject),
+            "subject overlap cannot prove that an excerpt contradicts the claim"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_matches_the_cited_identifier_as_a_complete_token() {
+        let note = "The `active_writer_stateful` guard remains available. The legacy \
+                    `writer_state` was removed.";
+        let pack = "IDENTIFIERS:\n- `writer_state` -> NOT FOUND anywhere in the source tree\n- \
+                    `active_writer_stateful` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `active_writer_stateful` guard \
+             remains available.\nEVIDENCE:\n- `writer_state` -> NOT FOUND anywhere in the source \
+             tree\nREASON: writer gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &parsed),
+            "a substring of a longer identifier is not the cited identifier"
+        );
+        let grounded = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `active_writer_stateful` guard \
+             remains available.\nEVIDENCE:\n- `active_writer_stateful` -> NOT FOUND anywhere in \
+             the source tree\nREASON: contradicts the note.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &grounded),
+            "the exact identifier in the claim still grounds the verdict"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_preserves_identifier_separators() {
+        let note = "The `foo/bar` file remains available; legacy `foo::bar` was removed.";
+        let pack = "IDENTIFIERS:\n- `foo::bar` -> NOT FOUND anywhere in the source tree\n- \
+                    `foo/bar` -> NOT FOUND anywhere in the source tree\n";
+        let wrong_shape = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `foo/bar` file remains \
+             available.\nEVIDENCE:\n- `foo::bar` -> NOT FOUND anywhere in the source \
+             tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &wrong_shape),
+            "a `foo::bar` absence row does not link to the `foo/bar` file claim"
+        );
+        let exact = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `foo/bar` file remains \
+             available.\nEVIDENCE:\n- `foo/bar` -> NOT FOUND anywhere in the source tree\nREASON: \
+             gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &exact),
+            "the exact separator-preserving identifier still links"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_delimits_punctuation_edged_identifiers() {
+        assert!(!text_mentions_identifier("Status.idle", ".idle"));
+        assert!(text_mentions_identifier("state is `.idle`", ".idle"));
+        assert!(!text_mentions_identifier("foo()suffix", "foo()"));
+        assert!(text_mentions_identifier("call `foo()` now", "foo()"));
+    }
+
+    #[test]
+    fn divergence_guard_rejects_a_generic_word_excerpt_link() {
+        // A generic domain word (`error`) shared with an excerpt about something else must not
+        // establish the link — only a shared pack identifier does.
+        let note = "The `active_writer` guard reports an error and halts.";
+        let pack = "IDENTIFIERS:\n- `active_writer` -> symbol \
+                    crates/x/src/lib.rs::active_writer\n\nBOUND-FILE EXCERPTS:\nsrc/parser.rs:9: \
+                    // parse error recovery\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `active_writer` guard reports \
+             an error and halts.\nEVIDENCE:\n- src/parser.rs:9: // parse error recovery\nREASON: \
+             changed.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &parsed),
+            "`error` alone does not link an unrelated excerpt to the claim"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_rejects_an_excerpt_citation_without_its_locator() {
+        // Source text can mimic pack rows: an excerpt whose CODE reads like a NOT FOUND row must
+        // not ground a citation that omits the `path:line:` locator.
+        let note = "The `gone_helper` function remains available.";
+        let pack = "IDENTIFIERS:\n- `gone_helper` -> not a defined symbol; appears verbatim as \
+                    source text\n\nBOUND-FILE EXCERPTS:\ncrates/x/src/lib.rs:12: // - \
+                    `gone_helper` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `gone_helper` function remains \
+             available.\nEVIDENCE:\n- `gone_helper` -> NOT FOUND anywhere in the source \
+             tree\nREASON: spoofed.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &parsed),
+            "label text mimicked inside excerpt code is not a NOT FOUND row"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_rejects_an_operator_flipped_claim() {
+        let note = "The parser rejects input where `limit <= 0` and returns an error.";
+        let pack = "IDENTIFIERS:\n- `limit` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The parser rejects input where \
+             limit >= 0 and returns an error.\nEVIDENCE:\n- `limit` -> NOT FOUND anywhere in the \
+             source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &parsed),
+            "a claim that flips the note's operator asserts the opposite and must not ground"
+        );
+        let verbatim = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The parser rejects input where \
+             `limit <= 0` and returns an error.\nEVIDENCE:\n- `limit` -> NOT FOUND anywhere in \
+             the source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &verbatim),
+            "a verbatim operator copy still grounds"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_tolerates_non_ascii_note_text() {
+        // Regression: the operator scan must not panic on multi-byte characters (em-dash) —
+        // real notes are full of them.
+        let note = "The writer — serialized globally — rejects `limit <= 0` here.";
+        let pack = "IDENTIFIERS:\n- `limit` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The writer — serialized globally — \
+             rejects `limit <= 0` here.\nEVIDENCE:\n- `limit` -> NOT FOUND anywhere in the source \
+             tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &parsed),
+            "a grounded verdict over non-ASCII note text is accepted, not panicked on"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_rejects_a_single_char_operator_flip() {
+        let note = "The parser rejects input where `limit > 0` and returns an error.";
+        let pack = "IDENTIFIERS:\n- `limit` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The parser rejects input where \
+             limit < 0 and returns an error.\nEVIDENCE:\n- `limit` -> NOT FOUND anywhere in the \
+             source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &parsed),
+            "a single-character `>`→`<` flip asserts the opposite and must not ground"
+        );
+        let verbatim = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The parser rejects input where \
+             `limit > 0` and returns an error.\nEVIDENCE:\n- `limit` -> NOT FOUND anywhere in the \
+             source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &verbatim),
+            "a verbatim copy carrying the same operator still grounds"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_preserves_operator_to_operand_order() {
+        let note = "The range requires `low < value && value > high` before continuing.";
+        let pack = "IDENTIFIERS:\n- `value` -> NOT FOUND anywhere in the source tree\n";
+        let flipped = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The range requires `low > value && \
+             value < high` before continuing.\nEVIDENCE:\n- `value` -> NOT FOUND anywhere in the \
+             source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &flipped),
+            "the same operator multiset attached to different operands must not ground"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_does_not_alias_case_distinct_identifiers() {
+        // The note says `Foo` remains while legacy `foo` was removed; a claim that LOWERCASES
+        // `Foo` to `foo` and cites the `foo` absence row turns a confirmation into a false
+        // divergence. Backticked words match case-exactly, so the lowercased claim never grounds.
+        let note = "The `Foo` type remains available; legacy `foo` was removed.";
+        let pack = "IDENTIFIERS:\n- `foo` -> NOT FOUND anywhere in the source tree\n- `Foo` -> \
+                    symbol src/lib.rs::Foo\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The foo type remains available; \
+             legacy foo was removed.\nEVIDENCE:\n- `foo` -> NOT FOUND anywhere in the source \
+             tree\nREASON: foo gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &parsed),
+            "a case-variant of a backticked identifier is not the note's identifier"
+        );
+        let exact = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `Foo` type remains available; \
+             legacy `foo` was removed.\nEVIDENCE:\n- `foo` -> NOT FOUND anywhere in the source \
+             tree\nREASON: foo gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &exact),
+            "a case-exact verbatim copy still grounds and links"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_accepts_a_verbatim_leading_negation() {
+        // The matched window must extend over the operator glued to its first word, or a
+        // verbatim `!ready` claim is wrongly discarded.
+        let note = "The gate holds while `!ready` remains false.";
+        let pack = "IDENTIFIERS:\n- `ready` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The gate holds while `!ready` \
+             remains false.\nEVIDENCE:\n- `ready` -> NOT FOUND anywhere in the source \
+             tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &parsed),
+            "a verbatim claim beginning with an attached operator grounds"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_ignores_syntax_arrows() {
+        // `->` and `=>` are syntax punctuation, not comparison operators. A copied claim may
+        // omit them under punctuation-tolerant grounding without changing semantics.
+        let note = "The `load` function returns `Result` as `fn load() -> Result`; the mapper \
+                    uses `x => y`.";
+        let pack = "IDENTIFIERS:\n- `load` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `load` function returns \
+             `Result` as fn load Result; the mapper uses x y.\nEVIDENCE:\n- `load` -> NOT FOUND \
+             anywhere in the source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &parsed),
+            "dropping syntax arrows does not change the copied claim"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_accepts_nested_generic_closers() {
+        // The matched window must extend through the entire glued `>>` chain after its last word.
+        let note = "The `value` field stores `Option<Vec<T>>` unchanged.";
+        let pack = "IDENTIFIERS:\n- `value` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `value` field stores \
+             `Option<Vec<T>>` unchanged.\nEVIDENCE:\n- `value` -> NOT FOUND anywhere in the \
+             source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &parsed),
+            "a verbatim nested generic includes every glued closing bracket"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_tolerates_a_dropped_prose_exclamation() {
+        // `Warning!` is punctuation, not a unary operator — a model that copies the words but
+        // drops the bang still grounds.
+        let note = "Warning! The helper remains available.";
+        let pack = "IDENTIFIERS:\n- `helper` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: Warning! The helper remains \
+             available.\nEVIDENCE:\n- `helper` -> NOT FOUND anywhere in the source tree\nREASON: \
+             gone.",
+        )
+        .unwrap();
+        assert!(verdict_is_grounded("note", note, pack, &parsed), "verbatim with the bang grounds");
+        let dropped = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: Warning The helper remains \
+             available.\nEVIDENCE:\n- `helper` -> NOT FOUND anywhere in the source tree\nREASON: \
+             gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &dropped),
+            "a dropped prose exclamation still grounds"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_folds_case_for_prose_occurrences_of_a_backticked_word() {
+        // The SAME spelling appears backticked (identifier) and bare (prose): only the backticked
+        // occurrence is case-exact — a lowercased prose occurrence still grounds.
+        let note = "The `Foo` type remains the Foo alias.";
+        let pack = "IDENTIFIERS:\n- `Foo` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `Foo` type remains the foo \
+             alias.\nEVIDENCE:\n- `Foo` -> NOT FOUND anywhere in the source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &parsed),
+            "case is exact for the backticked occurrence, folded for the prose one"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_rejects_a_dropped_unary_negation() {
+        let note = "The `publisher` stays enabled when `!ready` is true.";
+        let pack = "IDENTIFIERS:\n- `publisher` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `publisher` stays enabled when \
+             ready is true.\nEVIDENCE:\n- `publisher` -> NOT FOUND anywhere in the source \
+             tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &parsed),
+            "dropping the note's unary `!` inverts the claim and must not ground"
+        );
+        let verbatim = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `publisher` stays enabled when \
+             `!ready` is true.\nEVIDENCE:\n- `publisher` -> NOT FOUND anywhere in the source \
+             tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            verdict_is_grounded("note", note, pack, &verbatim),
+            "a verbatim copy keeping the negation still grounds"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_pools_operators_only_within_the_grounding_span() {
+        // An operator elsewhere in the note must not satisfy a flip in the copied sentence:
+        // `old != new` in the TITLE does not excuse `<=`→`!=` in a claim copied from the BODY.
+        let title = "Migration from `old != new` semantics";
+        let body = "The parser rejects input where `limit <= 0` and returns an error.";
+        let pack = "IDENTIFIERS:\n- `limit` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The parser rejects input where \
+             limit != 0 and returns an error.\nEVIDENCE:\n- `limit` -> NOT FOUND anywhere in the \
+             source tree\nREASON: gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded(title, body, pack, &parsed),
+            "an unrelated operator elsewhere in the note does not satisfy a flipped claim"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_rejects_a_title_body_splice_claim() {
+        let pack = "IDENTIFIERS:\n- `sweeper` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: lazy and the sweeper runs \
+             hourly.\nEVIDENCE:\n- `sweeper` -> NOT FOUND anywhere in the source tree\nREASON: \
+             gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded(
+                "Cache eviction is lazy",
+                "and the sweeper runs hourly.",
+                pack,
+                &parsed
+            ),
+            "a span spliced across the title/body seam is a sentence the note never makes"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_an_echoed_verdict_choice() {
+        for echoed in [
+            "VERDICT: current | diverged\nEVIDENCE:\n- x\nREASON: y",
+            "VERDICT: current or diverged\nEVIDENCE:\n- x\nREASON: y",
+            "VERDICT: diverged, not current\nEVIDENCE:\n- x\nREASON: y",
+        ] {
+            assert!(parse_verdict(echoed).is_none(), "an echoed choice selects nothing: {echoed}");
+        }
+    }
+
+    #[test]
+    fn parse_accepts_a_chatty_verdict_line() {
+        let parsed = parse_verdict(
+            "VERDICT: diverged — the helper is gone\nDIRECTION: code_ahead\nEVIDENCE:\n- \
+             x\nREASON: y",
+        )
+        .unwrap();
+        assert_eq!(parsed.verdict, Verdict::Diverged, "trailing prose after the word is ignored");
+        let mentions_other_word = parse_verdict(
+            "VERDICT: diverged because current code removed the helper\nEVIDENCE:\n- x\nREASON: y",
+        )
+        .unwrap();
+        assert_eq!(mentions_other_word.verdict, Verdict::Diverged);
+    }
+
+    #[test]
+    fn divergence_guard_rejects_presence_row_and_bare_label_citations() {
+        // A `symbol`/`file` PRESENCE row never contradicts a claim on its own, and a bare
+        // resolution-label citation (`NOT FOUND …`) names no identifier — both must be rejected
+        // even when the copied claim is perfectly grounded.
+        let note = "The `gone_symbol` function remains available to callers.";
+        let present_pack = "IDENTIFIERS:\n- `gone_symbol` -> symbol src/lib.rs::gone_symbol\n";
+        let presence = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `gone_symbol` function remains \
+             available to callers.\nEVIDENCE:\n- `gone_symbol` -> symbol \
+             src/lib.rs::gone_symbol\nREASON: hallucinated.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, present_pack, &presence),
+            "a presence row is not contradiction evidence"
+        );
+        let absent_pack =
+            "IDENTIFIERS:\n- `gone_symbol` -> NOT FOUND anywhere in the source tree\n";
+        let bare_label = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The `gone_symbol` function remains \
+             available to callers.\nEVIDENCE:\n- NOT FOUND anywhere in the source tree\nREASON: \
+             gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, absent_pack, &bare_label),
+            "the citation must name the identifier it convicts"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_rejects_a_copied_prefix_with_invented_tail() {
+        let note = "The active writer remains serialized.";
+        let pack = "IDENTIFIERS:\n- `gone_helper` -> NOT FOUND anywhere in the source tree\n";
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: The active writer remains \
+             serialized and gone_helper remains available\nEVIDENCE:\n- `gone_helper` -> NOT \
+             FOUND anywhere in the source tree\nREASON: helper gone.",
+        )
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", note, pack, &parsed),
+            "a verbatim prefix must not ground invented prose appended to the claim"
+        );
+    }
+
+    #[test]
+    fn divergence_guard_rejects_a_bare_long_identifier_as_the_claim() {
+        let identifier = "a_tail_failure_leaves_the_old_generation_live";
+        let note = format!("The `{identifier}` test documents tail-failure recovery.");
+        let pack =
+            format!("IDENTIFIERS:\n- `{identifier}` -> NOT FOUND anywhere in the source tree\n");
+        let parsed = parse_verdict(&format!(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: \"{identifier}\"\nEVIDENCE:\n- \
+             `{identifier}` -> NOT FOUND anywhere in the source tree\nREASON: gone."
+        ))
+        .unwrap();
+        assert!(
+            !verdict_is_grounded("note", &note, &pack, &parsed),
+            "identifier length alone does not make it a load-bearing claim"
+        );
+    }
+
+    #[test]
     fn obtain_verdict_retries_once_then_accepts_bad_then_good() {
         let pack = "IDENTIFIERS:\n- `real_symbol` -> symbol src/lib.rs::real_symbol\n";
         // First completion fabricates; the retry cites a real line → accepted.
         let model =
             MockChatModel::new([current_citing("ghost_symbol"), current_citing("real_symbol")]);
-        let accepted = obtain_verdict(&model, "prompt", pack).expect("bad-then-good is accepted");
+        let accepted = obtain_verdict(&model, "prompt", "note", "body", pack)
+            .expect("bad-then-good is accepted");
         assert_eq!(accepted.verdict, Verdict::Current);
         assert_eq!(model.calls(), 2, "one fabrication triggers exactly one retry");
     }
@@ -947,7 +1861,8 @@ mod tests {
     fn obtain_verdict_discards_after_two_fabrications() {
         let pack = "IDENTIFIERS:\n- `real_symbol` -> symbol src/lib.rs::real_symbol\n";
         let model = MockChatModel::new([current_citing("ghost_a"), current_citing("ghost_b")]);
-        let err = obtain_verdict(&model, "prompt", pack).expect_err("two fabrications fail");
+        let err = obtain_verdict(&model, "prompt", "note", "body", pack)
+            .expect_err("two fabrications fail");
         assert_eq!(err.reason, DreamFailureReason::FabricatedEvidence);
         assert_eq!(model.calls(), 2, "retried exactly once");
     }
@@ -957,7 +1872,8 @@ mod tests {
         let pack = "IDENTIFIERS:\n- `real_symbol` -> symbol src/lib.rs::real_symbol\n";
         let model = MockChatModel::new(Vec::<String>::new());
 
-        let err = obtain_verdict(&model, "prompt", pack).expect_err("model error fails");
+        let err =
+            obtain_verdict(&model, "prompt", "note", "body", pack).expect_err("model error fails");
 
         assert_eq!(err.reason, DreamFailureReason::ModelCallFailed);
         assert!(
@@ -973,7 +1889,8 @@ mod tests {
         let model =
             MockChatModel::new(["not a verdict".to_string(), current_citing("real_symbol")]);
 
-        let err = obtain_verdict(&model, "prompt", pack).expect_err("malformed verdict fails");
+        let err = obtain_verdict(&model, "prompt", "note", "body", pack)
+            .expect_err("malformed verdict fails");
 
         assert_eq!(err.reason, DreamFailureReason::MalformedVerdict);
         assert_eq!(model.calls(), 1, "malformed completions are discarded without retry");
@@ -1009,7 +1926,7 @@ mod tests {
         let rendered_b = render_pack(&pack);
         assert_eq!(rendered_a, rendered_b, "pack rendering is deterministic");
         assert!(rendered_a.contains("`real_symbol` -> symbol"), "identifier table present");
-        assert!(rendered_a.contains("NOT FOUND"), "the ghost identifier's NOT FOUND is rendered");
+        assert!(rendered_a.contains("NOT FOUND"), "the exact-file-domain miss is rendered");
         assert!(rendered_a.contains("src/lib.rs:1: fn real_symbol()"), "excerpt line present");
 
         let entry = verification_queue(&c, 1, 10)
@@ -1019,6 +1936,7 @@ mod tests {
             .unwrap();
         let prompt = render_verdict_prompt(&entry, "src/lib.rs", &rendered_a);
         assert!(prompt.contains("VERDICT: current | diverged"), "the verdict format is stated");
+        assert!(prompt.contains("CLAIM:"), "the grounded-claim format is stated");
         assert!(prompt.contains("EVIDENCE PACK:"), "the pack section header is present");
         assert!(prompt.contains("TITLE: note"), "the note title is included");
         assert!(prompt.contains("`real_symbol` -> symbol"), "the pack is embedded in the prompt");
@@ -1026,20 +1944,28 @@ mod tests {
 
     // ── write path + churn-skip ──────────────────────────────────────────────────
 
-    /// Seed m1 with a resolvable identifier (so it is verifiable) and no bindings, run the verdict
-    /// pass, and return the connection. m1 is NeverChecked → the model is invoked once.
+    /// Seed m1 with a resolvable identifier (so it is verifiable) PLUS an absent one (so a
+    /// divergence has NOT FOUND evidence), bound to a live server-derived call path, run the
+    /// verdict pass, and return the connection. m1 is NeverChecked → the model is invoked once.
     fn seeded_verifiable_repo() -> Connection {
         let c = mem_db();
         set_repo(&c, "r");
         seed_symbol_file(&c, "src/lib.rs", "resolvable_thing", "r");
-        seed_memory(&c, "m1", "note", "describes `resolvable_thing`", "r");
+        seed_memory(
+            &c,
+            "m1",
+            "note",
+            "The note describes `resolvable_thing` and `gone_thing` as available.",
+            "r",
+        );
+        seed_live_call_path(&c, "m1", "src/lib.rs", "resolvable_thing", "r");
         c
     }
 
     #[test]
     fn verdict_pass_upserts_memory_reality_with_all_stamps() {
         let c = seeded_verifiable_repo();
-        let model = MockChatModel::new([diverged_citing("resolvable_thing")]);
+        let model = MockChatModel::new([diverged_citing()]);
         run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 5000).unwrap();
 
         let row: (String, String, String, String, String, i64) = c
@@ -1054,7 +1980,13 @@ mod tests {
         assert_eq!(row.1, "note_ahead");
         assert_eq!(row.2, "mock-chat-model");
         assert_eq!(row.3, PROMPT_VERSION);
-        assert_eq!(row.4, verify::note_content_hash("note", "describes `resolvable_thing`"));
+        assert_eq!(
+            row.4,
+            verify::note_content_hash(
+                "note",
+                "The note describes `resolvable_thing` and `gone_thing` as available."
+            )
+        );
         assert_eq!(row.5, 5000);
     }
 
@@ -1062,7 +1994,7 @@ mod tests {
     fn verdict_pass_budget_stops_before_second_memory() {
         let c = seeded_verifiable_repo();
         seed_symbol_file(&c, "src/other.rs", "second_thing", "r");
-        seed_memory(&c, "m2", "note", "describes `second_thing`", "r");
+        seed_memory(&c, "m2", "note", "The note describes `second_thing` as available.", "r");
         let model = MockChatModel::new([
             current_citing("resolvable_thing"),
             current_citing("second_thing"),
@@ -1117,7 +2049,8 @@ mod tests {
 
         // A body edit changes content_hash → re-enqueued → the model runs again.
         c.execute(
-            "UPDATE repo_memories SET body='describes `resolvable_thing` (edited)' WHERE id='m1'",
+            "UPDATE repo_memories SET body='The note describes `resolvable_thing` and \
+             `gone_thing` as available (edited).' WHERE id='m1'",
             [],
         )
         .unwrap();
@@ -1130,7 +2063,10 @@ mod tests {
         let c = seeded_verifiable_repo();
         let scope = Some("r".to_string());
         let inputs = verify::checked_inputs_hash(&c, "m1", &scope).unwrap();
-        let content_hash = verify::note_content_hash("note", "describes `resolvable_thing`");
+        let content_hash = verify::note_content_hash(
+            "note",
+            "The note describes `resolvable_thing` and `gone_thing` as available.",
+        );
         let stamp = FailureStamp {
             memory_id: "m1",
             repo_id: "r",
@@ -1149,7 +2085,8 @@ mod tests {
         assert_eq!(model.calls(), 0, "a current deterministic failure row suppresses the retry");
 
         c.execute(
-            "UPDATE repo_memories SET body='describes `resolvable_thing` v2' WHERE id='m1'",
+            "UPDATE repo_memories SET body='The note describes `resolvable_thing` and \
+             `gone_thing` as available v2.' WHERE id='m1'",
             [],
         )
         .unwrap();
@@ -1181,8 +2118,8 @@ mod tests {
 
         let c = seeded_verifiable_repo();
         let model = MockChatModel::new([
-            diverged_citing("resolvable_thing"), // run 1: opens the divergence finding
-            current_citing("resolvable_thing"),  // run 3 (after body edit): flips to current
+            diverged_citing(),                  // run 1: opens the divergence finding
+            current_citing("resolvable_thing"), // run 3 (after body edit): flips to current
         ]);
         let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
 
@@ -1210,7 +2147,8 @@ mod tests {
         // Run 3: edit the body to force a re-check; the model now returns `current` → the stored
         // verdict flips → the divergence finding is no longer reported → sync resolves it.
         c.execute(
-            "UPDATE repo_memories SET body='describes `resolvable_thing` v2' WHERE id='m1'",
+            "UPDATE repo_memories SET body='The note describes `resolvable_thing` and \
+             `gone_thing` as available v2.' WHERE id='m1'",
             [],
         )
         .unwrap();
@@ -1242,7 +2180,7 @@ mod tests {
         use super::super::{DreamOptions, dream_run, dream_run_with_passes};
 
         let c = seeded_verifiable_repo();
-        let model = MockChatModel::new([diverged_citing("resolvable_thing")]);
+        let model = MockChatModel::new([diverged_citing()]);
         let verify_opts =
             DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
         let r1 = dream_run_with_passes(
@@ -1284,7 +2222,7 @@ mod tests {
         use super::super::{DreamOptions, dream_run, dream_run_with_passes};
 
         let c = seeded_verifiable_repo();
-        let model = MockChatModel::new([diverged_citing("resolvable_thing")]);
+        let model = MockChatModel::new([diverged_citing()]);
         let verify_opts =
             DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
         dream_run_with_passes(
@@ -1300,7 +2238,8 @@ mod tests {
         // because the kind IS computed (verify on) with the memory absent, the open finding
         // resolves.
         c.execute(
-            "UPDATE repo_memories SET body='describes `resolvable_thing` v2' WHERE id='m1'",
+            "UPDATE repo_memories SET body='The note describes `resolvable_thing` and \
+             `gone_thing` as available v2.' WHERE id='m1'",
             [],
         )
         .unwrap();
@@ -1335,7 +2274,7 @@ mod tests {
         use super::super::{DreamOptions, dream_run, dream_run_with_passes};
 
         let c = seeded_verifiable_repo();
-        let model = MockChatModel::new([diverged_citing("resolvable_thing")]);
+        let model = MockChatModel::new([diverged_citing()]);
         dream_run_with_passes(
             &c,
             DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false },
@@ -1388,7 +2327,7 @@ mod tests {
             .unwrap()
         };
         let before = snap(&c);
-        let model = MockChatModel::new([diverged_citing("resolvable_thing")]);
+        let model = MockChatModel::new([diverged_citing()]);
         let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
         dream_run_with_passes(&c, opts, Some(VerdictPass { model: &model, budget: 10 }), None)
             .unwrap();
@@ -1412,8 +2351,19 @@ mod tests {
         // repo r1 gets a diverged verdict for its m1.
         set_repo(&c, "r1");
         seed_symbol_file(&c, "src/a.rs", "thing_one", "r1");
-        seed_memory(&c, "m1", "note", "describes `thing_one`", "r1");
-        let model_r1 = MockChatModel::new([diverged_citing("thing_one")]);
+        seed_memory(
+            &c,
+            "m1",
+            "note",
+            "The note describes `thing_one` and `gone_one` as available.",
+            "r1",
+        );
+        seed_live_call_path(&c, "m1", "src/a.rs", "thing_one", "r1");
+        let model_r1 = MockChatModel::new(["VERDICT: diverged\nDIRECTION: note_ahead\nCLAIM: \
+                                            The note describes `thing_one` and `gone_one` as \
+                                            available.\nEVIDENCE:\n- `gone_one`\nREASON: not \
+                                            present."
+            .to_string()]);
         run_verdict_pass(&c, VerdictPass { model: &model_r1, budget: 10 }, 1000).unwrap();
 
         // The reality row is stamped with r1.
@@ -1426,7 +2376,7 @@ mod tests {
         // query filters `mr.repo_id = 'r2'`), and r2 only verifies its OWN queued memory.
         set_repo(&c, "r2");
         seed_symbol_file(&c, "src/b.rs", "thing_two", "r2");
-        seed_memory(&c, "m2", "note", "describes `thing_two`", "r2");
+        seed_memory(&c, "m2", "note", "The note describes `thing_two` as available.", "r2");
         let model_r2 = MockChatModel::new([current_citing("thing_two")]);
         let opts = DreamOptions { now_ms: 2000, limit: 10, verify: true, include_reviewed: false };
         let r2 = dream_run_with_passes(

@@ -886,8 +886,8 @@
    {
     "memory_id": "mem_19f23ba09d4_f8d3f3f099fd",
     "binding_kind": "logical_symbol",
-    "binding_id": "crates/rag-rat-core/src/index/query_api/clones/precompute.rs::reconcile_clone_edges_pass",
-    "path": "crates/rag-rat-core/src/index/query_api/clones/precompute.rs",
+    "binding_id": "crates/rag-rat-core/src/index/query_api/clones/precompute/build.rs::reconcile_clone_edges_pass",
+    "path": "crates/rag-rat-core/src/index/query_api/clones/precompute/build.rs",
     "start_line": 214,
     "end_line": 333,
     "id": "sym_42cac378d210d61a",
