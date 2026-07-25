@@ -360,6 +360,11 @@ pub(crate) struct EdgeEmitter<'out> {
 }
 
 impl EdgeEmitter<'_> {
+    #[cfg(test)]
+    pub(crate) fn new(out: &mut Vec<EdgeCandidate>) -> EdgeEmitter<'_> {
+        EdgeEmitter { out }
+    }
+
     pub(crate) fn push(&mut self, candidate: EdgeCandidate) {
         self.out.push(candidate);
     }

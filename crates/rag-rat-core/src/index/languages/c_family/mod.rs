@@ -7,6 +7,8 @@ use crate::index::parser::{self, ParserKind};
 
 mod edges;
 pub(super) use edges::c_like_edges;
+#[cfg(test)]
+mod query_spike;
 
 pub(super) static C_SUPPORT: C = C;
 pub(super) static CPP_SUPPORT: Cpp = Cpp;
