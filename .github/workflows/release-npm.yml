@@ -28,6 +28,7 @@ on:
 
 permissions:
   contents: read # read the release assets (publishing goes to npm via NPM_TOKEN)
+  id-token: write # authenticate to the MCP Registry with GitHub OIDC
 
 jobs:
   publish:
@@ -113,6 +114,41 @@ jobs:
           else
             npm publish --access public
           fi
+
+      - name: Publish MCP server metadata
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          jq --arg version "$version" \
+            '.version = $version | .packages[0].version = $version' \
+            server.json > server.release.json
+          server_name="$(jq -r '.name | @uri' server.release.json)"
+          encoded_version="$(jq -rn --arg value "$version" '$value | @uri')"
+          registry_url="https://registry.modelcontextprotocol.io/v0.1/servers/${server_name}/versions/${encoded_version}"
+          status="$(
+            curl --silent --show-error --retry 3 --retry-all-errors \
+              --output registry-response.json --write-out '%{http_code}' "$registry_url"
+          )"
+          case "$status" in
+            200)
+              echo "MCP server metadata for $version is already published — skipping"
+              exit 0
+              ;;
+            404)
+              ;;
+            *)
+              cat registry-response.json >&2
+              echo "MCP Registry version lookup failed with HTTP $status" >&2
+              exit 1
+              ;;
+          esac
+          curl -L \
+            "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+            | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish server.release.json
 
       # ── @rag-rat/skills + @rag-rat/cookbook: publish only when their version is new ───────────────
       - name: Publish @rag-rat/plugin-opencode (only if this version is new)

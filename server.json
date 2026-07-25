@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.cq27-dev/rag-rat",
+  "title": "rag-rat",
+  "description": "Repository intelligence, code graph, history, papertrail, and cross-agent memory for coding agents.",
+  "version": "0.21.1",
+  "websiteUrl": "https://rag-rat.cq27.dev/",
+  "repository": {
+    "url": "https://github.com/cq27-dev/rag-rat",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@rag-rat/bin",
+      "version": "0.21.1",
+      "runtimeHint": "npx",
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "-y"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

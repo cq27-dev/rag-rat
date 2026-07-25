@@ -8,8 +8,9 @@
 // attach to the GitHub release separately (release-android.yml).
 //
 // This runs on the freshly generated package BEFORE publish and:
-//   1. adds an `aarch64-linux-android` entry to package.json `supportedPlatforms`, and
-//   2. inserts a `process.platform === "android"` short-circuit at the top of binary.js
+//   1. adds the MCP Registry ownership marker and public homepage to package.json,
+//   2. adds an `aarch64-linux-android` entry to package.json `supportedPlatforms`, and
+//   3. inserts a `process.platform === "android"` short-circuit at the top of binary.js
 //      getPlatform() — os.type() reports "Linux" on Termux, so the stock glibc/musl detection would
 //      mis-resolve to a triple that either errors or downloads a non-bionic binary.
 //
@@ -20,6 +21,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const ANDROID_TRIPLE = "aarch64-linux-android";
+const MCP_NAME = "io.github.cq27-dev/rag-rat";
+const HOMEPAGE = "https://rag-rat.cq27.dev/";
 
 // `.tar.gz`, not cargo-dist's default `.tar.xz`: Termux always ships gzip, but `xz-utils` is an
 // extra package the installer's `tar xf` would otherwise silently need.
@@ -69,6 +72,8 @@ if (!pkg.supportedPlatforms || typeof pkg.supportedPlatforms !== "object") {
 if (pkg.supportedPlatforms[ANDROID_TRIPLE]) {
   fail(`${pkgPath}: ${ANDROID_TRIPLE} already present — double patch?`);
 }
+pkg.mcpName = MCP_NAME;
+pkg.homepage = HOMEPAGE;
 pkg.supportedPlatforms[ANDROID_TRIPLE] = ANDROID_ENTRY;
 writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
 

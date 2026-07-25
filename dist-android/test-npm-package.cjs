@@ -12,6 +12,18 @@ const assert = require("assert");
 const pkgDir = path.resolve(process.argv[2] || "target/distrib/rag-rat-npm-package");
 const binaryPath = path.join(pkgDir, "binary.js");
 const pkgJsonPath = path.join(pkgDir, "package.json");
+const pkg = require(pkgJsonPath);
+
+assert.strictEqual(
+  pkg.mcpName,
+  "io.github.cq27-dev/rag-rat",
+  "npm package must carry the MCP Registry ownership marker",
+);
+assert.strictEqual(
+  pkg.homepage,
+  "https://rag-rat.cq27.dev/",
+  "npm package should direct users to the public homepage",
+);
 
 // Load a fresh binary.js under a faked os.type()/os.arch()/process.platform, and return the
 // download URL getPackage() would fetch. Cache-busts so each case re-evaluates getPlatform().
@@ -47,6 +59,6 @@ assert.ok(
   `desktop (darwin/arm64) should still resolve to apple-darwin, got: ${darwinUrl}`,
 );
 
-console.error("test-npm-package: android + desktop resolution OK");
+console.error("test-npm-package: registry metadata + android + desktop resolution OK");
 console.error(`  android: ${androidUrl}`);
 console.error(`  darwin:  ${darwinUrl}`);
