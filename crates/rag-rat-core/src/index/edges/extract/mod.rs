@@ -114,6 +114,22 @@ pub(crate) fn syntactic_edges(
     text: &str,
     symbols: &[IndexedSymbol],
 ) -> anyhow::Result<Vec<EdgeCandidate>> {
+    syntactic_edges_with_error_policy(
+        path,
+        language,
+        text,
+        symbols,
+        ErrorNodePolicy::DescendWithoutEmission,
+    )
+}
+
+fn syntactic_edges_with_error_policy(
+    path: &Path,
+    language: Language,
+    text: &str,
+    symbols: &[IndexedSymbol],
+    error_policy: ErrorNodePolicy,
+) -> anyhow::Result<Vec<EdgeCandidate>> {
     // The parser registry owns grammar selection; a language without a grammar yields no edges.
     let Some(grammar) = parser::grammar_for(parser::parser_kind(path, language)) else {
         return Ok(Vec::new());
@@ -129,14 +145,29 @@ pub(crate) fn syntactic_edges(
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    collect_edges(language, text, tree.root_node(), symbols, path, &mut out);
+    collect_edges_with_error_policy(
+        language,
+        text,
+        tree.root_node(),
+        symbols,
+        path,
+        &mut out,
+        error_policy,
+    );
     Ok(out)
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ErrorNodePolicy {
+    PruneSubtree,
+    DescendWithoutEmission,
+}
+
 /// Pre-order DFS over the named nodes of `root`, running the per-language edge extractor at each.
 ///
 /// An explicit heap stack keeps the call stack O(1) on deeply nested files. One reused cursor and
-/// child buffer keep traversal single-allocation; error/missing subtrees are pruned and named
-/// children are visited in document order.
+/// child buffer keep traversal single-allocation. Missing nodes are pruned; ERROR nodes do not emit
+/// edges themselves, but their recovered named descendants are visited in document order.
 pub(crate) fn collect_edges(
     language: Language,
     text: &str,
@@ -144,6 +175,26 @@ pub(crate) fn collect_edges(
     symbols: &[IndexedSymbol],
     path: &Path,
     out: &mut Vec<EdgeCandidate>,
+) {
+    collect_edges_with_error_policy(
+        language,
+        text,
+        root,
+        symbols,
+        path,
+        out,
+        ErrorNodePolicy::DescendWithoutEmission,
+    );
+}
+
+fn collect_edges_with_error_policy(
+    language: Language,
+    text: &str,
+    root: Node<'_>,
+    symbols: &[IndexedSymbol],
+    path: &Path,
+    out: &mut Vec<EdgeCandidate>,
+    error_policy: ErrorNodePolicy,
 ) {
     let Some(extract) = crate::index::languages::edge_extractor(language) else {
         return;
@@ -155,10 +206,16 @@ pub(crate) fn collect_edges(
     let mut cursor = root.walk();
     let mut named_children = Vec::new();
     while let Some(node) = stack.pop() {
-        if node.is_error() || node.is_missing() {
+        if node.is_missing() {
             continue;
         }
-        extract(context.visit(node), &mut emit);
+        if node.is_error() {
+            if error_policy == ErrorNodePolicy::PruneSubtree {
+                continue;
+            }
+        } else {
+            extract(context.visit(node), &mut emit);
+        }
         named_children.clear();
         named_children.extend(node.named_children(&mut cursor));
         for &child in named_children.iter().rev() {
@@ -172,6 +229,109 @@ pub(crate) struct EdgeExtractionContext<'source> {
     symbols: &'source [IndexedSymbol],
     path: &'source Path,
     locator: SymbolLocator<'source>,
+}
+
+#[cfg(test)]
+mod recovered_descendant_tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use rag_rat_base::language::Language;
+
+    use super::{ErrorNodePolicy, syntactic_edges_with_error_policy};
+    use crate::index::parser;
+
+    #[test]
+    fn malformed_error_descendants_have_bounded_edge_deltas() {
+        let fixtures = [
+            (
+                "rust",
+                "broken.rs",
+                Language::Rust,
+                "fn f() { if { target(); } }\n",
+                &[("calls_name", "target")][..],
+            ),
+            (
+                "typescript",
+                "broken.ts",
+                Language::TypeScript,
+                "function broken( { target(); }\n",
+                &[][..],
+            ),
+            ("kotlin", "broken.kt", Language::Kotlin, "fun broken( { target() }\n", &[][..]),
+            (
+                "c",
+                "broken.c",
+                Language::C,
+                "void broken( { target(); }\n",
+                &[("calls_name", "target")][..],
+            ),
+            (
+                "cpp",
+                "broken.cpp",
+                Language::Cpp,
+                "void broken( { target(); }\n",
+                &[("calls_name", "target")][..],
+            ),
+            ("python", "broken.py", Language::Python, "def broken(:\n    target()\n", &[][..]),
+            (
+                "swift",
+                "broken.swift",
+                Language::Swift,
+                "func f() { if { target() } }\n",
+                &[("calls_name", "target")][..],
+            ),
+        ];
+
+        for (label, path, language, source, expected) in fixtures {
+            let path = Path::new(path);
+            let grammar = parser::grammar_for(parser::parser_kind(path, language)).unwrap();
+            let tree = parser::parse_within_budget(grammar, source, parser::PARSE_BUDGET).unwrap();
+            assert!(tree.root_node().has_error(), "{label} fixture must remain malformed");
+
+            let pruned = syntactic_edges_with_error_policy(
+                path,
+                language,
+                source,
+                &[],
+                ErrorNodePolicy::PruneSubtree,
+            )
+            .unwrap();
+            let descended = syntactic_edges_with_error_policy(
+                path,
+                language,
+                source,
+                &[],
+                ErrorNodePolicy::DescendWithoutEmission,
+            )
+            .unwrap();
+            let recovered = descended
+                .iter()
+                .filter(|candidate| {
+                    !pruned.iter().any(|old| {
+                        old.edge_kind == candidate.edge_kind
+                            && old.to_name == candidate.to_name
+                            && old.source_span.start_byte == candidate.source_span.start_byte
+                    })
+                })
+                .map(|edge| (edge.edge_kind.as_str(), edge.to_name.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(recovered, expected, "{label}");
+
+            let unique = descended
+                .iter()
+                .map(|edge| {
+                    (
+                        edge.edge_kind,
+                        edge.to_name.as_str(),
+                        edge.source_span.start_byte,
+                        edge.source_span.end_byte,
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(unique.len(), descended.len(), "{label} duplicate candidates");
+        }
+    }
 }
 
 impl<'source> EdgeExtractionContext<'source> {
