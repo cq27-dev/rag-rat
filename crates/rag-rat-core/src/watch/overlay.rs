@@ -1,3 +1,4 @@
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -36,6 +37,10 @@ pub enum OverlayScope {
     /// base or linked commit is never missed just because no file event named the checkout. An
     /// empty set is a base-only pass: discovery covers the base scope regardless of this value.
     Linked(BTreeSet<PathBuf>),
+    /// Refresh exactly the event paths grouped by linked checkout. This avoids a full status walk
+    /// and base↔linked tree diff for ordinary file events. An empty path set means the checkout
+    /// was widened to a whole-delta refresh while scopes were merged.
+    Paths(BTreeMap<PathBuf, BTreeSet<PathBuf>>),
 }
 
 impl OverlayScope {
@@ -47,6 +52,8 @@ impl OverlayScope {
             Self::All => true,
             Self::Linked(roots) =>
                 roots.iter().any(|root| crate::index::worktree_id_of(root) == worktree_id),
+            Self::Paths(paths) =>
+                paths.keys().any(|root| crate::index::worktree_id_of(root) == worktree_id),
         }
     }
 
@@ -59,7 +66,41 @@ impl OverlayScope {
                 roots.extend(more);
                 Self::Linked(roots)
             },
+            (Self::Paths(mut paths), Self::Paths(more)) => {
+                for (root, more_paths) in more {
+                    match paths.entry(root) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(more_paths);
+                        },
+                        Entry::Occupied(mut entry) => {
+                            let current = entry.get_mut();
+                            if more_paths.is_empty() {
+                                current.clear();
+                            } else if !current.is_empty() {
+                                current.extend(more_paths);
+                            }
+                        },
+                    }
+                }
+                Self::Paths(paths)
+            },
+            (Self::Linked(roots), Self::Paths(mut paths))
+            | (Self::Paths(mut paths), Self::Linked(roots)) => {
+                for root in roots {
+                    paths.insert(root, BTreeSet::new());
+                }
+                Self::Paths(paths)
+            },
         }
+    }
+
+    fn paths_for(&self, worktree_id: &str) -> Option<&BTreeSet<PathBuf>> {
+        let Self::Paths(paths) = self else {
+            return None;
+        };
+        paths.iter().find_map(|(root, paths)| {
+            (crate::index::worktree_id_of(root) == worktree_id).then_some(paths)
+        })
     }
 }
 
@@ -174,13 +215,36 @@ pub fn refresh_worktree_overlays(
             logical_rebuild: OverlayLogicalRebuild::Deferred,
             basis: Some(OverlayBasisUpdate { base_sha: &base_sha, linked_head_sha: &linked_head }),
         };
-        match db.index_worktree_overlay_with_tail(
-            &overlay_config,
-            Path::new(&worktree),
-            tail,
-            &mut |_| {},
-        ) {
+        let event_paths = scope.paths_for(&worktree);
+        let overlay_wide_edit = event_paths.is_some_and(|paths| {
+            paths.is_empty()
+                || paths
+                    .iter()
+                    .any(|path| is_config_path(path) || super::placement::is_gitignore_path(path))
+        });
+        let report = match event_paths.filter(|_| basis_unchanged && !overlay_wide_edit) {
+            Some(event_paths) => {
+                let event_paths = event_paths.iter().cloned().collect::<Vec<_>>();
+                db.index_worktree_overlay_paths(
+                    &overlay_config,
+                    Path::new(&worktree),
+                    &event_paths,
+                    OverlayLogicalRebuild::Deferred,
+                    &mut |_| {},
+                )
+            },
+            None => db.index_worktree_overlay_with_tail(
+                &overlay_config,
+                Path::new(&worktree),
+                tail,
+                &mut |_| {},
+            ),
+        };
+        match report {
             Ok(report) => {
+                if !report.status_complete && !report.worktree_id.is_empty() {
+                    let _ = db.clear_worktree_overlay_basis(&report.worktree_id);
+                }
                 let this_changed = report.indexed > 0 || report.tombstoned > 0 || report.pruned > 0;
                 changed |= this_changed;
                 // Embed the overlay's chunks NOW, while the connection is still scoped to this
@@ -319,11 +383,10 @@ impl ReconcileBudget {
 /// - a path under a LINKED worktree goes through that checkout's OVERLAY instead. This is
 ///   load-bearing: `find_config` re-anchors `config.root` to the MAIN checkout, so a linked edit is
 ///   not in the base tree — a base pass would `strip_prefix` it away and silently drop it. NOTE the
-///   overlay pass is per-CHECKOUT, not per-path: [`IndexDatabase::index_worktree_overlay`]
-///   reindexes the worktree's whole base↔branch delta (there is no path-scoped overlay primitive
-///   today — see #679), so a linked `index --paths` also refreshes any OTHER pending change in that
-///   checkout. A failure PROPAGATES (unlike the best-effort watcher/maintenance sweep), so an edit
-///   hook can retry instead of exiting 0 on a drop.
+///   overlay pass is path-scoped through [`IndexDatabase::index_worktree_overlay_paths`], so a
+///   linked edit does not pull in unrelated in-flight changes in the same checkout. A failure
+///   PROPAGATES (unlike the best-effort watcher/maintenance sweep), so an edit hook can retry
+///   instead of exiting 0 on a drop.
 ///
 /// The per-repo `WriteLock` is held across BOTH halves (the base pass re-acquires it reentrantly),
 /// mirroring the maintenance path. Returns the base db so the caller can read base-scoped status.

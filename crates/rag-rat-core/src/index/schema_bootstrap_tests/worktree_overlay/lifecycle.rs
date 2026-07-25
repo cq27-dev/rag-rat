@@ -905,6 +905,100 @@ fn scoped_overlay_refresh_skips_an_unlisted_worktree_with_unchanged_basis() {
 }
 
 #[test]
+fn path_scoped_overlay_refresh_indexes_only_event_paths_and_clears_the_basis() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_a() {}\n").unwrap();
+    fs::write(main.join("src/b.rs"), "pub fn base_b() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let mut config = source_config(main.clone(), Language::Rust);
+    config.watch.overlay_quiet_secs = 0;
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-paths", linked.to_str().unwrap()]);
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    let worktree_id = crate::index::worktree_id_of(&linked);
+    assert!(db.worktree_overlay_basis(&worktree_id).unwrap().is_some());
+
+    fs::write(linked.join("src/a.rs"), "pub fn event_edit() {}\n").unwrap();
+    fs::write(linked.join("src/b.rs"), "pub fn unrelated_edit() {}\n").unwrap();
+    let scope = crate::watch::OverlayScope::Paths(std::collections::BTreeMap::from([(
+        linked.clone(),
+        std::collections::BTreeSet::from([linked.join("src/a.rs")]),
+    )]));
+    assert!(crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope));
+
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(names_in_scope(&db, "src/a.rs"), vec!["event_edit".to_string()]);
+    assert_eq!(
+        names_in_scope(&db, "src/b.rs"),
+        vec!["base_b".to_string()],
+        "the event pass must not discover an unrelated dirty path"
+    );
+    assert_eq!(
+        db.worktree_overlay_basis(&worktree_id).unwrap(),
+        None,
+        "a partial refresh cannot retain the complete-overlay skip proof"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn widened_directory_removal_prunes_descendants_without_a_periodic_sweep() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/base.rs"), "pub fn base() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let mut config = source_config(main.clone(), Language::Rust);
+    config.watch.periodic_sweep_secs = 0;
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-remove-dir", linked.to_str().unwrap()]);
+    fs::create_dir_all(linked.join("src/removed")).unwrap();
+    fs::write(linked.join("src/removed/stale.rs"), "pub fn stale_descendant() {}\n").unwrap();
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(names_in_scope(&db, "src/removed/stale.rs"), vec!["stale_descendant".to_string()]);
+
+    fs::remove_dir_all(linked.join("src/removed")).unwrap();
+    let widened = crate::watch::OverlayScope::Paths(std::collections::BTreeMap::from([(
+        linked.clone(),
+        std::collections::BTreeSet::new(),
+    )]));
+    assert!(crate::watch::refresh_worktree_overlays(&mut db, &config, None, &widened));
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert!(
+        names_in_scope(&db, "src/removed/stale.rs").is_empty(),
+        "the widened event pass must prune stale descendants even with periodic sweeps disabled"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
 fn scoped_overlay_refresh_refreshes_an_unlisted_worktree_whose_head_moved() {
     // #577: a commit in a linked worktree (a hook-driven pass, or a commit made without the
     // watcher observing file events) moves its HEAD. The recorded basis catches that: the pass

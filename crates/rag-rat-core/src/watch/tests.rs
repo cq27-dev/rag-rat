@@ -1,11 +1,13 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
-use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, Flag, ModifyKind};
+use notify::event::{
+    AccessKind, AccessMode, CreateKind, EventKind, Flag, ModifyKind, RemoveKind, RenameMode,
+};
 use notify::{Event, RecursiveMode, Watcher as _, recommended_watcher};
 use rag_rat_base::config::{
     Config, LlmConfig, RemoteBackend, RemoteEmbeddingConfig, ResolvedTarget, TargetKind,
@@ -615,6 +617,36 @@ fn overlay_scope_merge_unions_roots_and_all_absorbs() {
         a.clone().merge(OverlayScope::Linked(BTreeSet::new())),
         a,
         "a base-only contribution adds no roots"
+    );
+
+    let paths = OverlayScope::Paths(BTreeMap::from([
+        (PathBuf::from("/wt/a"), BTreeSet::from([PathBuf::from("/wt/a/src/a.rs")])),
+        (PathBuf::from("/wt/b"), BTreeSet::from([PathBuf::from("/wt/b/src/b.rs")])),
+    ]));
+    assert_eq!(
+        paths.merge(OverlayScope::Linked(BTreeSet::from([PathBuf::from("/wt/a")]))),
+        OverlayScope::Paths(BTreeMap::from([
+            (PathBuf::from("/wt/a"), BTreeSet::new()),
+            (PathBuf::from("/wt/b"), BTreeSet::from([PathBuf::from("/wt/b/src/b.rs")]),),
+        ])),
+        "a whole-checkout contribution widens only that checkout"
+    );
+
+    let a_paths = OverlayScope::Paths(BTreeMap::from([(
+        PathBuf::from("/wt/a"),
+        BTreeSet::from([PathBuf::from("/wt/a/src/a.rs")]),
+    )]));
+    let b_paths = OverlayScope::Paths(BTreeMap::from([(
+        PathBuf::from("/wt/b"),
+        BTreeSet::from([PathBuf::from("/wt/b/src/b.rs")]),
+    )]));
+    assert_eq!(
+        a_paths.merge(b_paths),
+        OverlayScope::Paths(BTreeMap::from([
+            (PathBuf::from("/wt/a"), BTreeSet::from([PathBuf::from("/wt/a/src/a.rs")])),
+            (PathBuf::from("/wt/b"), BTreeSet::from([PathBuf::from("/wt/b/src/b.rs")])),
+        ])),
+        "a newly-seen checkout retains its event paths"
     );
 }
 
@@ -1515,17 +1547,43 @@ fn event_touches_worktree_attributes_the_touched_checkout_roots() {
 
     assert_eq!(
         event_touches_worktree(&mutation_event(wt_a.join("src/a.rs")), &worktrees, None),
-        WorktreeEventHint::Roots(BTreeSet::from([wt_a.clone()])),
+        WorktreeEventHint::Paths(BTreeMap::from([(
+            wt_a.clone(),
+            BTreeSet::from([wt_a.join("src/a.rs")]),
+        )])),
         "a target edit is attributed to its own checkout only"
     );
     assert_eq!(
         event_touches_worktree(&mutation_event(wt_b.join("src/b.rs")), &worktrees, None),
-        WorktreeEventHint::Roots(BTreeSet::from([wt_b.clone()])),
+        WorktreeEventHint::Paths(BTreeMap::from([(
+            wt_b.clone(),
+            BTreeSet::from([wt_b.join("src/b.rs")]),
+        )])),
     );
     assert_eq!(
         event_touches_worktree(&mutation_event(wt_a.join("README.md")), &worktrees, None),
         WorktreeEventHint::None,
         "a non-target path implicates nothing"
+    );
+    assert_eq!(
+        event_touches_worktree(
+            &Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(wt_a.join("src/removed")),
+            &worktrees,
+            None,
+        ),
+        WorktreeEventHint::Paths(BTreeMap::from([(wt_a.clone(), BTreeSet::new())])),
+        "a removed directory widens its checkout because explicit-path indexing cannot tombstone \
+         descendants"
+    );
+    assert_eq!(
+        event_touches_worktree(
+            &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                .add_path(wt_b.join("src/moved")),
+            &worktrees,
+            None,
+        ),
+        WorktreeEventHint::Paths(BTreeMap::from([(wt_b.clone(), BTreeSet::new())])),
+        "a removal-side rename is directory-ambiguous and must widen its checkout"
     );
     assert_eq!(
         event_touches_worktree(
@@ -1547,7 +1605,10 @@ fn event_touches_worktree_attributes_the_touched_checkout_roots() {
     // its checkout so the overlay is refreshed with the new branch config.
     assert_eq!(
         event_touches_worktree(&mutation_event(wt_b.join("rag-rat.toml")), &worktrees, None),
-        WorktreeEventHint::Roots(BTreeSet::from([wt_b.clone()])),
+        WorktreeEventHint::Paths(BTreeMap::from([(
+            wt_b.clone(),
+            BTreeSet::from([wt_b.join("rag-rat.toml")]),
+        )])),
         "a linked checkout's config edit fires for that checkout"
     );
     assert_eq!(

@@ -1,8 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
+use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, RecursiveMode};
 use rag_rat_base::config::Config;
 
@@ -265,6 +266,15 @@ impl LinkedWorktreeWatch {
             .ok()
             .is_some_and(|rel| target_for_path(&self.config, rel).is_some())
     }
+
+    fn touches_tree_event(&self, path: &Path) -> bool {
+        self.touches_event(path)
+            || path.strip_prefix(&self.config.root).ok().is_some_and(|relative| {
+                self.target_dirs
+                    .iter()
+                    .any(|target| relative.starts_with(target) || target.starts_with(relative))
+            })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -329,17 +339,51 @@ impl LinkedWorktreeWatches {
         if !kind_is_mutation(&event.kind) {
             return WorktreeEventHint::None;
         }
-        let mut roots = BTreeSet::new();
+        // The path primitive can tombstone an explicit file, but it cannot enumerate stale
+        // descendants after a directory disappears. Widen removal-side directory/ambiguous rename
+        // events to a whole-checkout refresh; paired renames stay path-scoped only when the
+        // surviving destination proves this was a regular file.
+        let whole_checkout = match event.kind {
+            EventKind::Remove(RemoveKind::File) => false,
+            EventKind::Remove(_) => true,
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)) =>
+                event.paths.iter().any(|path| path.is_dir()),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)) =>
+                event.paths.last().is_none_or(|path| !path.is_file()),
+            EventKind::Modify(ModifyKind::Name(
+                RenameMode::From | RenameMode::Any | RenameMode::Other,
+            )) => true,
+            _ => false,
+        };
+        let mut paths = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
         for path in &event.paths {
             if registry.is_some_and(|reg| path.starts_with(reg)) {
                 // A worktree add/remove: the live set itself changed — unattributable.
                 return WorktreeEventHint::AllWorktrees;
             }
-            for state in self.states.iter().filter(|state| state.touches_event(path)) {
-                roots.insert(state.checkout_root.clone());
+            for state in self.states.iter().filter(|state| {
+                if whole_checkout {
+                    state.touches_tree_event(path)
+                } else {
+                    state.touches_event(path)
+                }
+            }) {
+                if whole_checkout {
+                    paths.entry(state.checkout_root.clone()).or_default().clear();
+                } else {
+                    match paths.entry(state.checkout_root.clone()) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(BTreeSet::from([path.clone()]));
+                        },
+                        Entry::Occupied(mut entry) if !entry.get().is_empty() => {
+                            entry.get_mut().insert(path.clone());
+                        },
+                        Entry::Occupied(_) => {},
+                    }
+                }
             }
         }
-        if roots.is_empty() { WorktreeEventHint::None } else { WorktreeEventHint::Roots(roots) }
+        if paths.is_empty() { WorktreeEventHint::None } else { WorktreeEventHint::Paths(paths) }
     }
 }
 
@@ -350,8 +394,8 @@ impl LinkedWorktreeWatches {
 pub(crate) enum WorktreeEventHint {
     /// No linked checkout is touched.
     None,
-    /// The event touches these linked checkout roots.
-    Roots(BTreeSet<PathBuf>),
+    /// The event touches these paths, grouped by linked checkout root.
+    Paths(BTreeMap<PathBuf, BTreeSet<PathBuf>>),
     /// Unattributable — refresh every overlay.
     AllWorktrees,
 }
@@ -641,7 +685,7 @@ pub(crate) fn event_requests_maintenance(
     }
     let scope = match worktree_hint {
         WorktreeEventHint::AllWorktrees => OverlayScope::All,
-        WorktreeEventHint::Roots(roots) => OverlayScope::Linked(roots),
+        WorktreeEventHint::Paths(paths) => OverlayScope::Paths(paths),
         WorktreeEventHint::None => OverlayScope::Linked(BTreeSet::new()),
     };
     Some(scope.merge(OverlayScope::Linked(linked_created_dir_roots)))
