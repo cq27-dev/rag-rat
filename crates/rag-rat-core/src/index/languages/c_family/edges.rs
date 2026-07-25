@@ -3,7 +3,7 @@ use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(super) fn c_like_edges(
-    EdgeVisit { text, node, symbols, path }: EdgeVisit<'_, '_>,
+    EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
     emit: &mut EdgeEmitter<'_>,
 ) {
     let out = emit;
@@ -35,7 +35,7 @@ pub(super) fn c_like_edges(
                 .or_else(|| call_target_name(node, text))
             {
                 out.push(symbol_edge_with_context(
-                    symbols,
+                    locator,
                     node,
                     text,
                     name,
@@ -55,7 +55,7 @@ pub(super) fn c_like_edges(
         "type_identifier" | "qualified_identifier" | "namespace_identifier" => {
             if let Some(name) = last_identifier_text(node, text) {
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     name,
                     EdgeKind::ReferencesType,

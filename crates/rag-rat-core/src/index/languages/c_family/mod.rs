@@ -106,7 +106,7 @@ fn function_name(node: Node<'_>) -> Option<Node<'_>> {
 macro_rules! impl_edges {
     ($backend:ty) => {
         impl EdgeBackend for $backend {
-            fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>) {
+            fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
                 edges::c_like_edges(visit, emit);
             }
         }

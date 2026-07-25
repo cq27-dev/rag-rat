@@ -3,7 +3,7 @@ use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(super) fn typescript_edges(
-    EdgeVisit { text, node, symbols, path }: EdgeVisit<'_, '_>,
+    EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
     emit: &mut EdgeEmitter<'_>,
 ) {
     let out = emit;
@@ -44,7 +44,7 @@ pub(super) fn typescript_edges(
                     EdgeKind::CallsName
                 };
                 out.push(symbol_edge_with_context(
-                    symbols,
+                    locator,
                     node,
                     text,
                     name,
@@ -64,7 +64,7 @@ pub(super) fn typescript_edges(
                 identifiers.first_text().filter(|_| identifiers.len() > 1).map(ToOwned::to_owned)
             {
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     receiver,
                     EdgeKind::ReferencesType,
@@ -81,7 +81,7 @@ pub(super) fn typescript_edges(
         "jsx_opening_element" | "jsx_self_closing_element" => {
             if let Some(name) = first_identifier_text(node, text) {
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     name,
                     EdgeKind::ReferencesType,
@@ -93,7 +93,7 @@ pub(super) fn typescript_edges(
         "type_identifier" => {
             if let Some(name) = node.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned) {
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     name,
                     EdgeKind::ReferencesType,

@@ -9,7 +9,7 @@ use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(super) fn python_edges(
-    EdgeVisit { text, node, symbols, path }: EdgeVisit<'_, '_>,
+    EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
     emit: &mut EdgeEmitter<'_>,
 ) {
     let out = emit;
@@ -92,7 +92,7 @@ pub(super) fn python_edges(
                 // fall through to recursion without emitting a call edge
             } else if let Some(name) = identifiers.last_text().map(ToOwned::to_owned) {
                 out.push(symbol_edge_with_context(
-                    symbols,
+                    locator,
                     node,
                     text,
                     name,
@@ -148,7 +148,7 @@ pub(super) fn python_edges(
                             .map(final_segment_node)
                             .map(CalleeRange::of_node);
                         out.push(symbol_edge(
-                            symbols,
+                            locator,
                             base,
                             name,
                             EdgeKind::Implements,
@@ -156,7 +156,7 @@ pub(super) fn python_edges(
                             callee,
                         ));
                     }
-                    emit_python_type_refs(base, symbols, text, out);
+                    emit_python_type_refs(base, locator, text, out);
                 }
             },
         // Type annotations (`x: T`, `-> T`) wrap their type in a `type` node.
@@ -166,7 +166,7 @@ pub(super) fn python_edges(
         // referenced type. The alias NAME in a `type X = …` is skipped (it's a definition,
         // not a reference). String forward refs (`-> "Api"`) carry no identifier → no edge.
         "type" if !python_is_type_alias_name(node) => {
-            emit_python_type_refs(node, symbols, text, out);
+            emit_python_type_refs(node, locator, text, out);
         },
         // A bare decorator (`@requires_auth`, `@pytest.fixture`) is an identifier/attribute, not a
         // `call` — applying it is a call-like dependency, so emit a NameOnly call edge. A
@@ -184,7 +184,7 @@ pub(super) fn python_edges(
                 // `pytest` receiver + dotted path — same context the call arm records — so the
                 // resolver doesn't fall back to a bare local `fixture` of the same name.
                 out.push(symbol_edge_with_context(
-                    symbols,
+                    locator,
                     node,
                     text,
                     name,
@@ -217,7 +217,7 @@ pub(super) fn python_edges(
 /// uniformly.
 fn emit_python_type_refs(
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     text: &str,
     out: &mut EdgeEmitter<'_>,
 ) {
@@ -229,14 +229,14 @@ fn emit_python_type_refs(
             rag_rat_base::stack::grow_stack(|| {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
-                    emit_python_type_refs(child, symbols, text, out);
+                    emit_python_type_refs(child, locator, text, out);
                 }
             });
         },
         "identifier" =>
             if let Some(name) = last_identifier_text(node, text) {
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     name,
                     EdgeKind::ReferencesType,
@@ -259,7 +259,7 @@ fn emit_python_type_refs(
                     .map(|object| node_text(object, text))
                     .or_else(|| identifiers.first_text().map(ToOwned::to_owned));
                 out.push(symbol_edge_with_context(
-                    symbols,
+                    locator,
                     node,
                     "",
                     name,

@@ -132,7 +132,7 @@ fn attribute_items(text: &str, node: Node<'_>) -> Vec<String> {
 }
 
 impl EdgeBackend for Rust {
-    fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>) {
+    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
         edges::rust_edges(visit, emit);
     }
 }

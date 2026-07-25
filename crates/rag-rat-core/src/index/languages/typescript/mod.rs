@@ -55,7 +55,7 @@ impl ParserBackend for TypeScript {
 }
 
 impl EdgeBackend for TypeScript {
-    fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>) {
+    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
         edges::typescript_edges(visit, emit);
     }
 }

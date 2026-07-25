@@ -121,7 +121,7 @@ fn assignment_is_const_scope(node: Node<'_>) -> bool {
 }
 
 impl EdgeBackend for Python {
-    fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>) {
+    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
         edges::python_edges(visit, emit);
     }
 }

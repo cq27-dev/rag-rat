@@ -7,7 +7,7 @@ use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(super) fn rust_edges(
-    EdgeVisit { text, node, symbols, path }: EdgeVisit<'_, '_>,
+    EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
     emit: &mut EdgeEmitter<'_>,
 ) {
     let out = emit;
@@ -79,7 +79,7 @@ pub(super) fn rust_edges(
         "call_expression" => {
             if let Some(name) = call_target_name(node, text) {
                 out.push(symbol_edge_with_context(
-                    symbols,
+                    locator,
                     node,
                     text,
                     name,
@@ -101,7 +101,7 @@ pub(super) fn rust_edges(
                 && receiver.chars().next().is_some_and(char::is_uppercase)
             {
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     receiver,
                     EdgeKind::ReferencesType,
@@ -123,7 +123,7 @@ pub(super) fn rust_edges(
                 .and_then(|f| dispatch::enum_variant_key(f, text))
             {
                 out.push(dispatch::dispatch_fact(
-                    symbols,
+                    locator,
                     node,
                     key,
                     EdgeKind::DispatchConstruct,
@@ -139,7 +139,7 @@ pub(super) fn rust_edges(
                 node.child_by_field_name("name").and_then(|n| dispatch::enum_variant_key(n, text))
             {
                 out.push(dispatch::dispatch_fact(
-                    symbols,
+                    locator,
                     node,
                     key,
                     EdgeKind::DispatchConstruct,
@@ -161,7 +161,7 @@ pub(super) fn rust_edges(
                 && let Some(key) = dispatch::enum_variant_key(node, text)
             {
                 out.push(dispatch::dispatch_fact(
-                    symbols,
+                    locator,
                     node,
                     key,
                     EdgeKind::DispatchConstruct,
@@ -170,11 +170,11 @@ pub(super) fn rust_edges(
                 ));
             }
         },
-        "match_arm" => dispatch::rust_dispatch_handle_facts(text, node, symbols, out),
+        "match_arm" => dispatch::rust_dispatch_handle_facts(text, node, locator, out),
         "macro_invocation" =>
             if let Some(name) = first_identifier_text(node, text) {
                 out.push(symbol_edge_with_context(
-                    symbols,
+                    locator,
                     node,
                     text,
                     name,
@@ -184,11 +184,11 @@ pub(super) fn rust_edges(
                     first_identifier_node(node).map(CalleeRange::of_node),
                 ));
             },
-        "impl_item" => rust_impl_edges(text, node, symbols, out),
+        "impl_item" => rust_impl_edges(text, node, locator, out),
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
             if let Some(name) = last_identifier_text(node, text) {
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     name,
                     EdgeKind::ReferencesType,
@@ -203,7 +203,7 @@ pub(super) fn rust_edges(
 pub(super) fn rust_impl_edges(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
     let node_text = node_text(node, text);
@@ -218,7 +218,7 @@ pub(super) fn rust_impl_edges(
         let trait_name = type_names.first().cloned().unwrap_or_default();
         let type_name = type_names.last().cloned().unwrap_or_default();
         out.push(EdgeCandidate {
-            from_symbol_id: containing_symbol(symbols, node.start_byte()).map(|symbol| symbol.id),
+            from_symbol_id: locator.find(node.start_byte()).map(|symbol| symbol.id),
             from_name: Some(type_name),
             to_name: trait_name,
             target_qualified_name: None,
@@ -234,7 +234,7 @@ pub(super) fn rust_impl_edges(
         });
     } else if let Some(type_name) = type_names.first() {
         out.push(symbol_edge(
-            symbols,
+            locator,
             node,
             type_name.clone(),
             EdgeKind::ReferencesType,

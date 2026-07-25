@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::*;
 
 /// Remove balanced `<...>` generic-argument regions from a call path — and the turbofish's leading
@@ -39,6 +41,91 @@ pub(crate) fn target_qualified_name(node: Node<'_>, text: &str) -> Option<String
     let value = strip_generics(&node_text(function, text));
     (value.contains("::") || value.contains('.')).then(|| value.replace('.', "::"))
 }
+
+/// Prepared source-owner lookup for edge extraction.
+///
+/// Construction sweeps symbol interval boundaries once and records the selected owner for each
+/// run. Lookups then binary-search those runs instead of scanning every symbol for every edge.
+pub(crate) struct SymbolLocator<'symbols> {
+    symbols: &'symbols [IndexedSymbol],
+    runs: Vec<(usize, Option<usize>)>,
+}
+
+impl<'symbols> SymbolLocator<'symbols> {
+    pub(crate) fn new(symbols: &'symbols [IndexedSymbol]) -> Self {
+        let mut events = Vec::with_capacity(symbols.len().saturating_mul(2));
+        for (index, symbol) in symbols.iter().enumerate() {
+            events.push((symbol.start_byte, true, index));
+            if let Some(after_end) = symbol.end_byte.checked_add(1) {
+                events.push((after_end, false, index));
+            }
+        }
+        // `false < true`, so an interval ending immediately before a new one starts is removed
+        // before the new interval is selected at that byte.
+        events.sort_unstable_by_key(|&(byte, add, index)| (byte, add, index));
+
+        let key = |index: usize| {
+            let symbol = &symbols[index];
+            (symbol.end_byte.saturating_sub(symbol.start_byte), index)
+        };
+        let is_special =
+            |index: usize| matches!(symbols[index].kind.as_str(), "const" | "property" | "static");
+        let mut active = BTreeSet::new();
+        let mut active_non_special = BTreeSet::new();
+        let mut runs = Vec::with_capacity(events.len());
+        let mut cursor = 0;
+        while cursor < events.len() {
+            let byte = events[cursor].0;
+            while cursor < events.len() && events[cursor].0 == byte {
+                let (_, add, index) = events[cursor];
+                if add {
+                    active.insert(key(index));
+                    if !is_special(index) {
+                        active_non_special.insert(key(index));
+                    }
+                } else {
+                    active.remove(&key(index));
+                    if !is_special(index) {
+                        active_non_special.remove(&key(index));
+                    }
+                }
+                cursor += 1;
+            }
+            let selected = active.first().map(|&(_, index)| index).and_then(|smallest| {
+                if is_special(smallest) {
+                    active_non_special.first().map(|&(_, index)| index).or(Some(smallest))
+                } else {
+                    Some(smallest)
+                }
+            });
+            if runs.last().is_none_or(|&(_, previous)| previous != selected) {
+                runs.push((byte, selected));
+            }
+        }
+        Self { symbols, runs }
+    }
+
+    pub(crate) fn find(&self, byte: usize) -> Option<&'symbols IndexedSymbol> {
+        let index = self.find_index_by(byte, || {});
+        index.map(|index| &self.symbols[index])
+    }
+
+    fn find_index_by(&self, byte: usize, mut probe: impl FnMut()) -> Option<usize> {
+        let mut low = 0;
+        let mut high = self.runs.len();
+        while low < high {
+            probe();
+            let middle = low + (high - low) / 2;
+            if self.runs[middle].0 <= byte {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low.checked_sub(1).and_then(|index| self.runs[index].1)
+    }
+}
+
 /// The smallest-span symbol whose byte range covers `byte` (a call/reference site's owner). When
 /// that smallest is a `const`/`property`/`static` — a value binding whose initializer is where the
 /// call actually lives, so the enclosing definition is the better owner — the smallest-span
@@ -49,7 +136,8 @@ pub(crate) fn target_qualified_name(node: Node<'_>, text: &str) -> Option<String
 /// sort-by-span ran once per edge candidate (O(E·S) plus an alloc+sort each). Tracking the two
 /// running minima gives byte-identical selection — a strict `<` update keeps the FIRST symbol of an
 /// equal-span tie, exactly as the stable sort did.
-pub(crate) fn containing_symbol(symbols: &[IndexedSymbol], byte: usize) -> Option<&IndexedSymbol> {
+#[cfg(test)]
+fn containing_symbol(symbols: &[IndexedSymbol], byte: usize) -> Option<&IndexedSymbol> {
     let span = |symbol: &IndexedSymbol| symbol.end_byte.saturating_sub(symbol.start_byte);
     let is_special =
         |symbol: &IndexedSymbol| matches!(symbol.kind.as_str(), "const" | "property" | "static");
@@ -621,6 +709,8 @@ mod containing_symbol_tests {
         let got = containing_symbol(symbols, byte).map(|symbol| symbol.id);
         let want = reference(symbols, byte).map(|symbol| symbol.id);
         assert_eq!(got, want, "byte={byte}");
+        let prepared = SymbolLocator::new(symbols).find(byte).map(|symbol| symbol.id);
+        assert_eq!(prepared, want, "prepared locator at byte={byte}");
     }
 
     #[test]
@@ -691,5 +781,18 @@ mod containing_symbol_tests {
         for byte in 0..=110 {
             assert_equiv(&symbols, byte);
         }
+    }
+
+    #[test]
+    fn prepared_lookup_is_logarithmic_in_symbol_count() {
+        let symbols = (0..4_096)
+            .map(|index| sym(index, "function", index as usize * 2, index as usize * 2))
+            .collect::<Vec<_>>();
+        let locator = SymbolLocator::new(&symbols);
+
+        let mut probes = 0;
+        let selected = locator.find_index_by(8_190, || probes += 1);
+        assert_eq!(selected.map(|index| symbols[index].id), Some(4_095));
+        assert!(probes <= 14, "{probes} probes for {} symbols", symbols.len());
     }
 }

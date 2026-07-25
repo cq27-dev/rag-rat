@@ -85,7 +85,7 @@ pub(super) trait ParserBackend: Sync {
 
 /// Grammar-specific edge recognition for one node visited by the shared depth-safe edge walk.
 pub(super) trait EdgeBackend: Sync {
-    fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>);
+    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>);
 }
 
 #[derive(Clone, Copy)]

@@ -3,7 +3,7 @@ use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(super) fn kotlin_edges(
-    EdgeVisit { text, node, symbols, path }: EdgeVisit<'_, '_>,
+    EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
     emit: &mut EdgeEmitter<'_>,
 ) {
     let out = emit;
@@ -28,7 +28,7 @@ pub(super) fn kotlin_edges(
                 .or_else(|| first_identifier_text(node, text))
             {
                 out.push(symbol_edge_with_context(
-                    symbols,
+                    locator,
                     node,
                     text,
                     name,
@@ -48,7 +48,7 @@ pub(super) fn kotlin_edges(
                 identifiers.first_text().filter(|_| identifiers.len() > 1).map(ToOwned::to_owned)
             {
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     receiver,
                     EdgeKind::ReferencesType,
@@ -68,7 +68,7 @@ pub(super) fn kotlin_edges(
                 // identifier (matching `identifiers.first()`).
                 let constructor_range = identifiers.first_node().map(CalleeRange::of_node);
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     constructor.clone(),
                     EdgeKind::ReferencesType,
@@ -76,7 +76,7 @@ pub(super) fn kotlin_edges(
                     constructor_range,
                 ));
                 out.push(symbol_edge_with_context(
-                    symbols,
+                    locator,
                     node,
                     text,
                     constructor,
@@ -90,7 +90,7 @@ pub(super) fn kotlin_edges(
         "user_type" | "type_identifier" =>
             if let Some(name) = last_identifier_text(node, text) {
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     name,
                     EdgeKind::ReferencesType,
@@ -101,7 +101,7 @@ pub(super) fn kotlin_edges(
         "delegation_specifier" | "supertype" | "super_type" => {
             if let Some(name) = last_identifier_text(node, text) {
                 out.push(symbol_edge(
-                    symbols,
+                    locator,
                     node,
                     name,
                     EdgeKind::Implements,

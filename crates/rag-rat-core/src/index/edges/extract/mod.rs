@@ -148,7 +148,8 @@ pub(crate) fn collect_edges(
     let Some(backend) = crate::index::languages::edge_backend(language) else {
         return;
     };
-    let context = EdgeExtractionContext { text, symbols, path };
+    let context =
+        EdgeExtractionContext { text, symbols, path, locator: SymbolLocator::new(symbols) };
     let mut emit = EdgeEmitter { out };
     let mut stack = vec![root];
     let mut cursor = root.walk();
@@ -166,25 +167,32 @@ pub(crate) fn collect_edges(
     }
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct EdgeExtractionContext<'source> {
     text: &'source str,
     symbols: &'source [IndexedSymbol],
     path: &'source Path,
+    locator: SymbolLocator<'source>,
 }
 
 impl<'source> EdgeExtractionContext<'source> {
-    fn visit<'tree>(&self, node: Node<'tree>) -> EdgeVisit<'tree, 'source> {
-        EdgeVisit { text: self.text, node, symbols: self.symbols, path: self.path }
+    fn visit<'tree>(&self, node: Node<'tree>) -> EdgeVisit<'tree, 'source, '_> {
+        EdgeVisit {
+            text: self.text,
+            node,
+            symbols: self.symbols,
+            path: self.path,
+            locator: &self.locator,
+        }
     }
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct EdgeVisit<'tree, 'source> {
+pub(crate) struct EdgeVisit<'tree, 'source, 'context> {
     pub(crate) text: &'source str,
     pub(crate) node: Node<'tree>,
     pub(crate) symbols: &'source [IndexedSymbol],
     pub(crate) path: &'source Path,
+    pub(crate) locator: &'context SymbolLocator<'source>,
 }
 
 pub(crate) struct EdgeEmitter<'out> {
@@ -301,7 +309,7 @@ pub(crate) fn inline_mod_scope(node: Node<'_>) -> Option<ImportScopeRange> {
     })
 }
 pub(crate) fn symbol_edge(
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     node: Node<'_>,
     to_name: String,
     edge_kind: EdgeKind,
@@ -309,7 +317,7 @@ pub(crate) fn symbol_edge(
     callee_span: Option<CalleeRange>,
 ) -> EdgeCandidate {
     symbol_edge_with_context(
-        symbols,
+        locator,
         node,
         "",
         to_name,
@@ -321,7 +329,7 @@ pub(crate) fn symbol_edge(
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn symbol_edge_with_context(
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     node: Node<'_>,
     text: &str,
     to_name: String,
@@ -335,7 +343,7 @@ pub(crate) fn symbol_edge_with_context(
     callee_span: Option<CalleeRange>,
 ) -> EdgeCandidate {
     let byte = node.start_byte();
-    let source = containing_symbol(symbols, byte);
+    let source = locator.find(byte);
     EdgeCandidate {
         from_symbol_id: source.map(|symbol| symbol.id),
         from_name: source.map(|symbol| symbol.qualified_name.clone()),

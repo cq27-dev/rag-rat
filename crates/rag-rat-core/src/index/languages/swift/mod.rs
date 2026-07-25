@@ -272,7 +272,7 @@ fn direct_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tr
 }
 
 impl EdgeBackend for Swift {
-    fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>) {
+    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
         edges::swift_edges(visit, emit);
     }
 }

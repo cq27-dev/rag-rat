@@ -632,14 +632,14 @@ pub(super) fn scoped_identifier_in_value_position(node: Node<'_>) -> bool {
 /// method). `to_name` is the variant key (construct) or the handler name (handle). No callee range,
 /// so the SCIP oracle skips these rows.
 pub(super) fn dispatch_fact(
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     node: Node<'_>,
     to_name: String,
     edge_kind: EdgeKind,
     context: EdgeContext,
     evidence: Option<String>,
 ) -> EdgeCandidate {
-    let source = containing_symbol(symbols, node.start_byte());
+    let source = locator.find(node.start_byte());
     EdgeCandidate {
         from_symbol_id: source.map(|symbol| symbol.id),
         from_name: source.map(|symbol| symbol.qualified_name.clone()),
@@ -665,7 +665,7 @@ pub(super) fn dispatch_fact(
 pub(super) fn rust_dispatch_handle_facts(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
     let Some(pattern) = node.child_by_field_name("pattern") else {
@@ -694,7 +694,7 @@ pub(super) fn rust_dispatch_handle_facts(
             // handler name + call context still come from the delegate call; from_symbol resolves
             // to the same dispatcher fn either way.
             out.push(dispatch_fact(
-                symbols,
+                locator,
                 *variant_node,
                 handler.clone(),
                 EdgeKind::DispatchHandle,

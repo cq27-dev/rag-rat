@@ -99,7 +99,7 @@ fn variable_declaration(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 impl EdgeBackend for Kotlin {
-    fn edges(&self, visit: EdgeVisit<'_, '_>, emit: &mut EdgeEmitter<'_>) {
+    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
         edges::kotlin_edges(visit, emit);
     }
 }

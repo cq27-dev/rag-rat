@@ -7,7 +7,7 @@ use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(super) fn swift_edges(
-    EdgeVisit { text, node, symbols, path }: EdgeVisit<'_, '_>,
+    EdgeVisit { text, node, symbols, path, locator }: EdgeVisit<'_, '_, '_>,
     emit: &mut EdgeEmitter<'_>,
 ) {
     let out = emit;
@@ -29,12 +29,12 @@ pub(super) fn swift_edges(
                 ));
             }
         },
-        "call_expression" => swift_call_edges(text, node, symbols, out),
-        "constructor_expression" => swift_constructor_edges(text, node, symbols, out),
-        "macro_invocation" => swift_macro_edges(text, node, symbols, out),
-        "operator_declaration" => swift_precedence_group_edges(text, node, symbols, out),
+        "call_expression" => swift_call_edges(text, node, locator, out),
+        "constructor_expression" => swift_constructor_edges(text, node, locator, out),
+        "macro_invocation" => swift_macro_edges(text, node, locator, out),
+        "operator_declaration" => swift_precedence_group_edges(text, node, locator, out),
         "precedence_group_attribute" =>
-            swift_precedence_group_relation_edges(text, node, symbols, out),
+            swift_precedence_group_relation_edges(text, node, locator, out),
         "postfix_expression"
         | "prefix_expression"
         | "multiplicative_expression"
@@ -45,10 +45,10 @@ pub(super) fn swift_edges(
         | "equality_expression"
         | "conjunction_expression"
         | "disjunction_expression"
-        | "bitwise_operation" => swift_operator_or_shorthand_case_edges(text, node, symbols, out),
-        "navigation_expression" => swift_qualified_case_edges(text, node, symbols, out),
+        | "bitwise_operation" => swift_operator_or_shorthand_case_edges(text, node, locator, out),
+        "navigation_expression" => swift_qualified_case_edges(text, node, locator, out),
         "attribute" if !swift_node_is_import_modifier(node) =>
-            swift_attribute_macro_edges(text, node, symbols, out),
+            swift_attribute_macro_edges(text, node, locator, out),
         "inheritance_specifier" => {
             let Some(type_path) = swift_inherited_type_name(node) else {
                 return;
@@ -67,7 +67,7 @@ pub(super) fn swift_edges(
                 EdgeKind::Implements
             };
             out.push(symbol_edge_with_context(
-                symbols,
+                locator,
                 node,
                 text,
                 name,
@@ -95,7 +95,7 @@ pub(super) fn swift_edges(
                 return;
             };
             out.push(symbol_edge_with_context(
-                symbols,
+                locator,
                 node,
                 text,
                 name,
@@ -115,7 +115,7 @@ pub(super) fn swift_edges(
         {
             let name = node_text(node, text);
             out.push(symbol_edge(
-                symbols,
+                locator,
                 node,
                 name,
                 EdgeKind::ReferencesType,
@@ -130,7 +130,7 @@ pub(super) fn swift_edges(
 fn swift_operator_or_shorthand_case_edges(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
     let Some(operation) =
@@ -143,7 +143,7 @@ fn swift_operator_or_shorthand_case_edges(
             return;
         };
         out.push(symbol_edge(
-            symbols,
+            locator,
             node,
             node_text(case_name, text),
             EdgeKind::CallsName,
@@ -161,7 +161,7 @@ fn swift_operator_or_shorthand_case_edges(
         return;
     }
     out.push(symbol_edge(
-        symbols,
+        locator,
         node,
         node_text(operation, text),
         EdgeKind::UsesOperator,
@@ -169,7 +169,7 @@ fn swift_operator_or_shorthand_case_edges(
         Some(CalleeRange::of_node(operation)),
     ));
     out.push(symbol_edge(
-        symbols,
+        locator,
         node,
         node_text(operation, text),
         EdgeKind::CallsName,
@@ -181,7 +181,7 @@ fn swift_operator_or_shorthand_case_edges(
 fn swift_qualified_case_edges(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
     if node.parent().is_some_and(|parent| {
@@ -199,7 +199,7 @@ fn swift_qualified_case_edges(
         return;
     };
     out.push(symbol_edge_with_context(
-        symbols,
+        locator,
         node,
         text,
         node_text(case_name, text),
@@ -213,7 +213,7 @@ fn swift_qualified_case_edges(
 fn swift_call_edges(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
     if swift_subscript_suffix(node, text).is_some() {
@@ -229,7 +229,7 @@ fn swift_call_edges(
             return;
         }
         identifiers.push("subscript".to_string());
-        emit_swift_call_edges(text, node, symbols, out, identifiers, None, false);
+        emit_swift_call_edges(text, node, locator, out, identifiers, None, false);
         return;
     }
     let Some(target) = swift_call_target(node).map(swift_callee_operand) else {
@@ -244,13 +244,13 @@ fn swift_call_edges(
         return;
     }
     let constructs = identifiers.last().is_some_and(|name| looks_like_type_name(name));
-    emit_swift_call_edges(text, node, symbols, out, identifiers, callee_range, constructs);
+    emit_swift_call_edges(text, node, locator, out, identifiers, callee_range, constructs);
 }
 
 fn swift_constructor_edges(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
     let Some(constructed_type) = node.child_by_field_name("constructed_type") else {
@@ -264,13 +264,13 @@ fn swift_constructor_edges(
     {
         return;
     }
-    emit_swift_call_edges(text, node, symbols, out, identifiers, callee_range, true);
+    emit_swift_call_edges(text, node, locator, out, identifiers, callee_range, true);
 }
 
 fn emit_swift_call_edges(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
     identifiers: Vec<String>,
     callee_range: Option<CalleeRange>,
@@ -280,7 +280,7 @@ fn emit_swift_call_edges(
         return;
     };
     out.push(symbol_edge_with_context(
-        symbols,
+        locator,
         node,
         text,
         name.clone(),
@@ -295,7 +295,7 @@ fn emit_swift_call_edges(
     ));
     if constructs {
         out.push(symbol_edge_with_context(
-            symbols,
+            locator,
             node,
             text,
             name,
@@ -310,7 +310,7 @@ fn emit_swift_call_edges(
 fn swift_macro_edges(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
     let Some(name_node) = syntax::identifier_nodes(node).first().copied() else {
@@ -322,7 +322,7 @@ fn swift_macro_edges(
         return;
     }
     out.push(symbol_edge(
-        symbols,
+        locator,
         node,
         node_text(name_node, text),
         EdgeKind::UsesMacro,
@@ -345,7 +345,7 @@ fn swift_has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
 fn swift_attribute_macro_edges(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
     let Some(attribute_name) = node.named_child(0) else {
@@ -361,7 +361,7 @@ fn swift_attribute_macro_edges(
         return;
     };
     out.push(symbol_edge_with_context(
-        symbols,
+        locator,
         node,
         text,
         name.clone(),
@@ -374,7 +374,7 @@ fn swift_attribute_macro_edges(
     // builders. Emit both semantic possibilities; language-policy resolution keeps only the one
     // whose declaration kind exists and suppresses both candidates when the attribute is external.
     out.push(symbol_edge_with_context(
-        symbols,
+        locator,
         node,
         text,
         name,
@@ -388,14 +388,14 @@ fn swift_attribute_macro_edges(
 fn swift_precedence_group_edges(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
     let Some(group) = syntax::identifier_nodes(node).last().copied() else {
         return;
     };
     out.push(symbol_edge(
-        symbols,
+        locator,
         node,
         node_text(group, text),
         EdgeKind::UsesPrecedenceGroup,
@@ -407,7 +407,7 @@ fn swift_precedence_group_edges(
 fn swift_precedence_group_relation_edges(
     text: &str,
     node: Node<'_>,
-    symbols: &[IndexedSymbol],
+    locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
     let identifiers = syntax::identifier_nodes(node);
@@ -421,7 +421,7 @@ fn swift_precedence_group_relation_edges(
     }
     for dependency in dependencies {
         let edge = symbol_edge(
-            symbols,
+            locator,
             node,
             node_text(*dependency, text),
             EdgeKind::UsesPrecedenceGroup,
