@@ -191,7 +191,7 @@ async fn a_fresh_peer_restores_the_accounts_content_after_the_account_log() {
 
     // And the moved bytes are usable: once the deferred refold settles, the peer accepts them —
     // acceptance the peer recomputes from the synced authority, never trusting the sender.
-    settle_pending_content_refolds(&dest, &ContentRefoldBudget::unbounded()).unwrap();
+    settle_pending_content_refolds(&dest, &ContentRefoldBudget::unbounded(), NOW).unwrap();
     let accepted: i64 = dest
         .query_row(
             "SELECT count(*) FROM content_entries WHERE author_account_id = ?1 AND accepted = 1",

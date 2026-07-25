@@ -38,6 +38,19 @@ pub struct LocalDevice {
 }
 
 impl LocalDevice {
+    /// The persisted ed25519 public key used to identify this store during device enrollment.
+    /// Exposes only public material; the signing secret remains oplog-internal.
+    pub fn ed25519_public_key(&self) -> [u8; 32] {
+        self.public.to_bytes()
+    }
+
+    /// The persisted X25519 public key to which this store's content-key wraps are sealed during
+    /// device enrollment. Exposes only public material; the decryption secret remains
+    /// oplog-internal.
+    pub fn x25519_public_key(&self) -> [u8; 32] {
+        self.x25519_public.to_bytes()
+    }
+
     /// The signing capability — the authoring seam signs entry bodies with this. `pub(super)`: the
     /// secret (and `DeviceSecret` itself) stay oplog-internal; the store's authoring path is the
     /// only caller. Cross-module callers author under a whole `&LocalDevice`, never the raw secret.

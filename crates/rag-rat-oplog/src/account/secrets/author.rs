@@ -41,9 +41,11 @@ use anyhow::Context;
 use rusqlite::Transaction;
 
 use super::super::bootstrap::{self, LocalAccountRef};
-use super::super::envelope::{AccountEntryHeader, VerifiedAccountEntry, sign_account_entry};
+use super::super::envelope::{
+    AccountEntryHeader, VerifiedAccountEntry, sign_account_entry, signed_entry_len,
+};
 use super::super::fold::{SECRETS_LOG, SUPPORTED_OP_VERSION};
-use super::super::keywrap::{self, ContentKey, WrapContext};
+use super::super::keywrap::{self, ContentKey, SealedKeyWrap, WrapContext};
 use super::super::storage::{self, CandidateInsert};
 use super::super::{AccountId, authoring, limits};
 use super::ops::{self, StreamKeyWrap, WrapEntry};
@@ -206,6 +208,35 @@ pub fn catch_up_stream_keys_for_device_in_tx(
     streams: &[StreamId],
     now_ms: i64,
 ) -> anyhow::Result<CatchUpReport> {
+    rewrap_live_stream_keys_for_device_in_tx(tx, target, streams, now_ms, ExistingCoverage::Credit)
+}
+
+/// Re-wrap every live content key to the key certified by a newly authored `DeviceAdd`, even when
+/// an older accepted wrap names the same fingerprint. Enrollment cannot credit fingerprint-only
+/// coverage: that ciphertext may have been sealed to a different X25519 key before the roster
+/// certificate existed.
+pub fn enroll_stream_keys_for_device_in_tx(
+    tx: &Transaction<'_>,
+    target: DeviceFingerprint,
+    streams: &[StreamId],
+    now_ms: i64,
+) -> anyhow::Result<CatchUpReport> {
+    rewrap_live_stream_keys_for_device_in_tx(tx, target, streams, now_ms, ExistingCoverage::Ignore)
+}
+
+#[derive(Clone, Copy)]
+enum ExistingCoverage {
+    Credit,
+    Ignore,
+}
+
+fn rewrap_live_stream_keys_for_device_in_tx(
+    tx: &Transaction<'_>,
+    target: DeviceFingerprint,
+    streams: &[StreamId],
+    now_ms: i64,
+    existing_coverage: ExistingCoverage,
+) -> anyhow::Result<CatchUpReport> {
     let LocalAccountRef { account_id, .. } = bootstrap::local_account_ref(tx)?
         .context("cannot catch up stream keys before the store's local account is minted")?;
     let device = local_device(tx, now_ms)?;
@@ -217,7 +248,14 @@ pub fn catch_up_stream_keys_for_device_in_tx(
     let target_public = storage::effective_roster_x25519_pubkey(tx, account_id, target)?.context(
         "stream-key catch-up target is not currently roster-effective in the local account",
     )?;
-    let targets = super::sealing::live_stream_key_targets_for_device(tx, target, streams)?;
+    let targets = match existing_coverage {
+        ExistingCoverage::Credit =>
+            super::sealing::live_stream_key_targets_for_device(tx, target, streams)?,
+        ExistingCoverage::Ignore => super::sealing::LiveKeyTargets {
+            required: super::sealing::live_stream_key_epochs(tx, account_id, streams)?,
+            already_covered: Vec::new(),
+        },
+    };
 
     let mut authored_wraps = Vec::with_capacity(targets.required.len());
     for live in &targets.required {
@@ -369,6 +407,39 @@ fn pack_wraps_into_ops(
 /// Sign, store, refold, and verify one batch of already-sealed wraps. The secrets chain is shared
 /// across streams, so the tail is read once and advanced in memory; one refold classifies the whole
 /// batch.
+/// The exact signed-envelope byte length of a one-recipient `StreamKeyWrap` entry at the maximum
+/// header width — what enrollment's mint preflight charges per live key target (#945). Measured
+/// from the real encoder + [`signed_entry_len`] (never a hand-computed sum): a wrap is a small
+/// fixed-size payload, so charging the §18a envelope maximum per entry would put an artificial
+/// enrollment ceiling on accounts with many streams or many retained live historical keys.
+pub(in crate::account) fn single_recipient_wrap_envelope_bytes() -> usize {
+    let wrap = StreamKeyWrap {
+        stream_id: StreamId::from_bytes([u8::MAX; 32]),
+        key_id: [u8::MAX; 32],
+        key_epoch: u64::MAX,
+        wraps: vec![WrapEntry {
+            recipient_fp: DeviceFingerprint::from_bytes([u8::MAX; 32]),
+            sealed: SealedKeyWrap { ephemeral_pubkey: [u8::MAX; 32], ciphertext: [u8::MAX; 48] },
+        }],
+    };
+    let payload = ops::encode(&wrap).expect("a single canonical recipient encodes");
+    let header = AccountEntryHeader {
+        account_id: AccountId::from_bytes([u8::MAX; 32]),
+        log_id: SECRETS_LOG,
+        device_fingerprint: DeviceFingerprint::from_bytes([u8::MAX; 32]),
+        seq: u64::MAX,
+        prev_hash: Some([u8::MAX; 32]),
+        parent_ref: Some([u8::MAX; 32]),
+        entry_type: ops::entry_type_of(&wrap),
+        op_version: SUPPORTED_OP_VERSION,
+        crypto_suite: 0,
+        auth_len: u64::MAX,
+        key_id: None,
+        authority_ref: Some([u8::MAX; 32]),
+    };
+    signed_entry_len(&header, &payload)
+}
+
 fn author_stream_key_wrap_batch_in_tx(
     tx: &Transaction<'_>,
     wraps: &[StreamKeyWrap],
@@ -1027,6 +1098,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, before, "accepted remote coverage is an idempotent no-op");
+    }
+
+    #[test]
+    fn enrollment_rewraps_coverage_sealed_before_the_device_certificate() {
+        use crate::device::DeviceSecret;
+
+        let conn = db();
+        let (account, stream) = account_with_owned_stream(&conn, "repo-x");
+        let key = ContentKey::from_seed(&[0x7b; 32]);
+        {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            author_stream_key_wrap_in_tx(&tx, stream, &key, 0, NOW).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let remote_owner = DeviceSecret::from_seed(&[0x7c; 32]);
+        let remote_owner_x = DeviceX25519Secret::from_seed(&[0x7d; 32]);
+        let remote_authority = author_control_op(&conn, account, &AccountOp::DeviceAdd {
+            device_fingerprint: remote_owner.public().fingerprint(),
+            ed25519_pubkey: remote_owner.public().to_bytes(),
+            x25519_pubkey: remote_owner_x.public().to_bytes(),
+            role: DeviceRole::Owner,
+            label: None,
+        });
+        let target_ed = DeviceSecret::from_seed(&[0x7e; 32]);
+        let target = target_ed.public().fingerprint();
+        let wrong_x = DeviceX25519Secret::from_seed(&[0x7f; 32]);
+        let wrong_ctx = WrapContext {
+            account_id: account.to_bytes(),
+            stream_id: stream.to_bytes(),
+            key_epoch: 0,
+            recipient_pub: wrong_x.public().to_bytes(),
+        };
+        let remote_wrap = StreamKeyWrap {
+            stream_id: stream,
+            key_id: key.key_id().to_bytes(),
+            key_epoch: 0,
+            wraps: vec![WrapEntry {
+                recipient_fp: target,
+                sealed: keywrap::seal_content_key(&key, &wrong_ctx, &wrong_x.public()).unwrap(),
+            }],
+        };
+        author_remote_stream_key_wrap(
+            &conn,
+            account,
+            &remote_owner,
+            remote_authority,
+            &remote_wrap,
+        );
+
+        let target_x = DeviceX25519Secret::from_seed(&[0x80; 32]);
+        assert_eq!(add_member_device_with_seed(&conn, account, &target_x, 0x7e), target);
+        let ordinary =
+            super::super::sealing::live_stream_key_targets_for_device(&conn, target, &[stream])
+                .unwrap();
+        assert!(ordinary.required.is_empty(), "fingerprint-only coverage looks complete");
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let report = enroll_stream_keys_for_device_in_tx(&tx, target, &[stream], NOW).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(report.authored.len(), 1, "enrollment always authors fresh coverage");
+        assert!(report.already_covered.is_empty());
+
+        let ctx = WrapContext {
+            account_id: account.to_bytes(),
+            stream_id: stream.to_bytes(),
+            key_epoch: 0,
+            recipient_pub: target_x.public().to_bytes(),
+        };
+        let decryptable = accepted_wraps_for_target(&conn, target)
+            .iter()
+            .flat_map(|wrap| &wrap.wraps)
+            .filter(|wrap| unwrap_content_key(&wrap.sealed, &target_x, &ctx).is_ok())
+            .count();
+        assert_eq!(decryptable, 1, "the certified X25519 key receives a fresh decryptable wrap");
     }
 
     #[test]

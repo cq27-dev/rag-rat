@@ -29,7 +29,6 @@ pub use author::{author_content_batch_in_tx, content_op_is_authorable, content_s
 pub(crate) use envelope::open_sealed_payload;
 pub use envelope::{
     ContentEntryHeader, SignedContentEntry, VerifiedContentEntry, decode_content_signed,
-    sign_content_entry, verify_content_signed,
 };
 // The C5a envelope-layer seal + sign (#608): the injected-nonce core (goldens) and the
 // OS-nonce production wrapper. The sealed author seam and projection tests consume these; no
@@ -39,6 +38,11 @@ pub use envelope::{
     reason = "sealed envelope authoring remains unwired from the live memory path (#608)"
 )]
 pub use envelope::{seal_and_sign_content_entry, sign_sealed_content_entry};
+// `sign_content_entry` / `verify_content_signed` stay in `envelope` at the crate root (they
+// take `pub(crate)` device-key types and must not reach the root glob); test consumers use
+// them through `content`.
+#[allow(unused_imports, reason = "test consumers use these signing seams through `content`")]
+pub use envelope::{sign_content_entry, verify_content_signed};
 // The V070 `content_projected_*` table-existence guard: shared crate-wide with the `/3`
 // projection's open-path upgrade re-fold (#688) so there is ONE guard, reused per the #683
 // doctrine.

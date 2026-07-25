@@ -65,7 +65,7 @@ impl DeviceRole {
         matches!(self, DeviceRole::Member | DeviceRole::Owner)
     }
 
-    pub(super) fn as_db_str(self) -> &'static str {
+    pub fn as_db_str(self) -> &'static str {
         match self {
             DeviceRole::ReadOnly => "read_only",
             DeviceRole::Member => "member",
@@ -73,7 +73,7 @@ impl DeviceRole {
         }
     }
 
-    pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
         match value {
             "read_only" => Ok(DeviceRole::ReadOnly),
             "member" => Ok(DeviceRole::Member),

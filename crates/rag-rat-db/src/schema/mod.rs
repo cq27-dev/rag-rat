@@ -8,7 +8,8 @@ pub(crate) use migrations::*;
 // Migration steps and table lists the engine's schema tests exercise directly:
 pub use migrations::{
     apply_account_authority_boundaries, apply_account_authority_projection,
-    apply_account_candidate_dag, apply_chunk_symbol_id, apply_clone_delta_maintenance,
+    apply_account_candidate_dag, apply_account_candidate_reservation_targets,
+    apply_account_candidate_reservations, apply_chunk_symbol_id, apply_clone_delta_maintenance,
     apply_clone_df_epoch, apply_clone_fingerprint_tables, apply_clone_graph_tables,
     apply_clone_postings_row_count, apply_content_candidate_dag, apply_content_digest_state,
     apply_content_projected_tables, apply_content_refold_queue_and_stats,
@@ -24,6 +25,7 @@ pub use migrations::{
     apply_papertrail_distill_substrate, apply_papertrail_mirror_resume_state,
     apply_papertrail_provider_neutral_schema, apply_repo_id_core_scoping,
     apply_repo_id_periphery_scoping, apply_repos_registry, apply_scip_moniker_anchors,
+    apply_sync_invites, apply_sync_invites_normalized_receipts,
     apply_sync_origin_and_edge_tombstone, apply_table_sync_tables,
 };
 pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_exists};
@@ -47,7 +49,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 88;
+pub const LATEST_SCHEMA_VERSION: u32 = 92;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -663,6 +665,37 @@ const MIGRATION_088_DESCRIPTION: &str =
      reading a maintained column replaces a full COUNT(*) scan of the postings table on every \
      delta pass. Additive; existing rows backfill from the current postings, and the count is \
      then maintained transactionally at build (complete_generation) and in each delta write-back";
+const MIGRATION_089_ID: &str = "089_sync_invites";
+const MIGRATION_089_CHECKSUM: &str = "sha256:rag-rat-sync-invites-bootstrap-replay-v89";
+const MIGRATION_089_DESCRIPTION: &str =
+    "Add the durable one-time enrollment invite store: a random nonce binds one account, granted \
+     device role, optional label, and expiry; successful redemption stores the exact request \
+     identity, signed DeviceAdd, and exact account-log bootstrap receipt in the same transaction \
+     as invite consumption and key catch-up, so delivery failures can replay the acknowledged \
+     enrollment idempotently and a fresh joiner can authorize its first closed sync";
+const MIGRATION_090_ID: &str = "090_account_candidate_reservations";
+const MIGRATION_090_CHECKSUM: &str = "sha256:rag-rat-account-candidate-reservations-v90";
+const MIGRATION_090_DESCRIPTION: &str =
+    "Add durable candidate-capacity reservations for outstanding enrollment invites (#949): a \
+     minted invite reserves the exact entries/bytes its mandatory DeviceAdd plus stream-key wraps \
+     will consume, and candidate admission charges active reservations against the same grow-only \
+     counters, so ordinary ingest or a second mint cannot strand an already-minted ticket. \
+     Redemption releases its reservation under the writer lock; expiry frees it";
+const MIGRATION_091_ID: &str = "091_account_candidate_reservation_targets";
+const MIGRATION_091_CHECKSUM: &str = "sha256:rag-rat-account-candidate-reservation-targets-v91";
+const MIGRATION_091_DESCRIPTION: &str =
+    "Track the live key-target count each outstanding invite reservation covers \
+     (account_candidate_reservations.reserved_targets, #949): any fold that grows the target set \
+     — local key mints or remotely synced StreamOwn/wrap entries — tops reservations up to the \
+     current mandatory redemption cost, so a minted ticket cannot be stranded by later growth. \
+     Backfilled from reserved_entries - 1, exact for every V090-era row";
+const MIGRATION_092_ID: &str = "092_sync_invites_normalized_receipts";
+const MIGRATION_092_CHECKSUM: &str = "sha256:rag-rat-sync-invites-normalized-receipts-v92";
+const MIGRATION_092_DESCRIPTION: &str =
+    "Drop sync_invites.receipt_bytes (#949): consumed invites keep only the joiner-specific \
+     DeviceAdd envelope; the account bootstrap is already durable in the grow-only candidate DAG, \
+     and receipt replay reconstructs the snapshot from it instead of storing one full copy per \
+     invite (quadratic growth across a fleet). Table rebuild preserving every row";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1387,6 +1420,30 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_088_CHECKSUM,
         description: MIGRATION_088_DESCRIPTION,
         apply: MigrationFn::Plain(apply_clone_postings_row_count),
+    },
+    Migration {
+        id: MIGRATION_089_ID,
+        checksum: MIGRATION_089_CHECKSUM,
+        description: MIGRATION_089_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_sync_invites),
+    },
+    Migration {
+        id: MIGRATION_090_ID,
+        checksum: MIGRATION_090_CHECKSUM,
+        description: MIGRATION_090_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_account_candidate_reservations),
+    },
+    Migration {
+        id: MIGRATION_091_ID,
+        checksum: MIGRATION_091_CHECKSUM,
+        description: MIGRATION_091_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_account_candidate_reservation_targets),
+    },
+    Migration {
+        id: MIGRATION_092_ID,
+        checksum: MIGRATION_092_CHECKSUM,
+        description: MIGRATION_092_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_sync_invites_normalized_receipts),
     },
 ];
 

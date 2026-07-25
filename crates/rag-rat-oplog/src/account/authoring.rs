@@ -17,14 +17,18 @@
 //! gate serializes racers, so a duplicate `StreamOwn` is never authored at all.
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::bootstrap::{self, LocalAccountRef};
-use super::envelope::{AccountEntryHeader, VerifiedAccountEntry, sign_account_entry};
+use super::envelope::{
+    AccountEntryHeader, VerifiedAccountEntry, sign_account_entry, signed_entry_len,
+};
 use super::id::AccountId;
+use super::limits::ACCOUNT_ENVELOPE_MAX_BYTES;
 use super::ops::{self, AccountOp};
 use super::storage::{self, CandidateInsert};
 use super::{AuthorityQuery, fold};
+use crate::device::{DeviceSecret, DeviceX25519Secret};
 use crate::identity::LocalDevice;
 use crate::local_device;
 use crate::op::DeviceFingerprint;
@@ -206,6 +210,125 @@ pub struct EnrollingDevice {
     pub label: Option<String>,
 }
 
+/// The exact mandatory candidate cost of redeeming an enrollment invite: one `DeviceAdd` plus one
+/// stream-key wrap per live key target across `streams`, measured from the real encoders at the
+/// maximum header width (the `DeviceAdd` at its actual role/label via
+/// [`device_add_envelope_bytes`], a one-recipient wrap via
+/// [`super::secrets::single_recipient_wrap_envelope_bytes`]). Mint persists this as the invite's
+/// candidate-capacity reservation; redemption releases the reservation and consumes exactly it.
+pub fn enrollment_authoring_requirements(
+    conn: &Connection,
+    account_id: AccountId,
+    streams: &[StreamId],
+    role: ops::DeviceRole,
+    label: Option<&str>,
+) -> anyhow::Result<(u64, u64)> {
+    let targets =
+        super::secrets::recoverable_live_stream_key_target_count(conn, account_id, streams)?;
+    let required_entries = 1u64.saturating_add(u64::try_from(targets)?);
+    let wrap_bytes = super::secrets::single_recipient_wrap_envelope_bytes();
+    let required_bytes = u64::try_from(
+        device_add_envelope_bytes(role, label)?.saturating_add(wrap_bytes.saturating_mul(targets)),
+    )?;
+    Ok((required_entries, required_bytes))
+}
+
+/// Refuse when the grow-only account candidate store cannot fit the mandatory entries redeeming an
+/// enrollment invite authors: the `DeviceAdd` and one stream-key wrap per live key target across
+/// `streams`. Latent pre-verify promotion is best-effort maintenance after enrollment commits and
+/// never consumes this reservation. Headroom is net of every outstanding invite's reservation at
+/// `now_ms`, so two invites cannot be minted against the same capacity. Read in the caller's
+/// snapshot; the mint transaction re-reads it under the writer lock.
+pub fn enrollment_authoring_fits(
+    conn: &Connection,
+    account_id: AccountId,
+    streams: &[StreamId],
+    role: ops::DeviceRole,
+    label: Option<&str>,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let (required_entries, required_bytes) =
+        enrollment_authoring_requirements(conn, account_id, streams, role, label)?;
+    let required_entries = i64::try_from(required_entries)?;
+    let required_bytes = i64::try_from(required_bytes)?;
+    let headroom = storage::candidate_capacity_headroom(conn, account_id, now_ms)?;
+    anyhow::ensure!(
+        headroom.account_entries_remaining >= required_entries
+            && headroom.global_entries_remaining >= required_entries
+            && headroom.account_bytes_remaining >= required_bytes
+            && headroom.global_bytes_remaining >= required_bytes,
+        "the account candidate store cannot fit this enrollment's DeviceAdd and stream-key wraps; \
+         an invite minted now would be unredeemable (candidate capacity is grow-only)",
+    );
+    Ok(())
+}
+
+/// The exact signed-envelope byte length of the `DeviceAdd` [`author_device_add_in_tx`] authors
+/// for `role`/`label`, at the maximum header width. Shared by [`validate_device_add_label`]
+/// (which signs the shape) and [`enrollment_authoring_fits`] (which charges it).
+fn device_add_envelope(
+    role: ops::DeviceRole,
+    label: Option<&str>,
+) -> (AccountEntryHeader, Vec<u8>) {
+    let author = DeviceSecret::from_seed(&[0x41; 32]);
+    let joiner = DeviceSecret::from_seed(&[0x42; 32]);
+    let joiner_x25519 = DeviceX25519Secret::from_seed(&[0x43; 32]);
+    let op = AccountOp::DeviceAdd {
+        device_fingerprint: joiner.public().fingerprint(),
+        ed25519_pubkey: joiner.public().to_bytes(),
+        x25519_pubkey: joiner_x25519.public().to_bytes(),
+        role,
+        label: label.map(str::to_owned),
+    };
+    let payload = ops::encode(&op).expect("a locally-built DeviceAdd encodes");
+    let header = AccountEntryHeader {
+        account_id: AccountId::from_bytes([u8::MAX; 32]),
+        log_id: 0,
+        device_fingerprint: author.public().fingerprint(),
+        seq: u64::MAX,
+        prev_hash: Some([u8::MAX; 32]),
+        parent_ref: Some([u8::MAX; 32]),
+        entry_type: ops::entry_type_of(&op),
+        op_version: 1,
+        crypto_suite: 0,
+        auth_len: u64::MAX,
+        key_id: None,
+        authority_ref: Some([u8::MAX; 32]),
+    };
+    (header, payload)
+}
+
+pub(in crate::account) fn device_add_envelope_bytes(
+    role: ops::DeviceRole,
+    label: Option<&str>,
+) -> anyhow::Result<usize> {
+    if label.is_some_and(|label| label.len() > ACCOUNT_ENVELOPE_MAX_BYTES) {
+        anyhow::bail!(
+            "device label exceeds the {ACCOUNT_ENVELOPE_MAX_BYTES}-byte account envelope limit"
+        );
+    }
+    let (header, payload) = device_add_envelope(role, label);
+    Ok(signed_entry_len(&header, &payload))
+}
+
+/// Validate that `label` can fit in every authorable `DeviceAdd` signed envelope.
+///
+/// This is the shared preflight for invite minting and actual authoring. It deliberately builds
+/// the largest possible header shape used by [`author_device_add_in_tx`] and routes the candidate
+/// through the real op encoder + account-envelope signer, so transport code never duplicates the
+/// account wire's size arithmetic.
+pub fn validate_device_add_label(label: Option<&str>) -> anyhow::Result<()> {
+    if label.is_some_and(|label| label.len() > ACCOUNT_ENVELOPE_MAX_BYTES) {
+        anyhow::bail!(
+            "device label exceeds the {ACCOUNT_ENVELOPE_MAX_BYTES}-byte account envelope limit"
+        );
+    }
+    let (header, payload) = device_add_envelope(ops::DeviceRole::Owner, label);
+    sign_account_entry(&DeviceSecret::from_seed(&[0x41; 32]), &header, &payload)
+        .context("device label cannot fit in an authorable DeviceAdd")?;
+    Ok(())
+}
+
 /// Author a `DeviceAdd` enrolling `joiner` onto the local account's roster at `role`, signed by the
 /// local owner device, and refold WITHIN the caller's transaction. Returns the authored entry hash
 /// (which, for `role == Owner`, IS the added device's owner-incarnation id). Neither opens nor
@@ -223,6 +346,34 @@ pub fn author_device_add_in_tx(
     role: ops::DeviceRole,
     now_ms: i64,
 ) -> anyhow::Result<EntryHash> {
+    author_device_add_with_promotion_in_tx(tx, joiner, role, now_ms, DeviceAddPromotion::Retry)
+}
+
+/// Enrollment-specific DeviceAdd authoring. Mandatory wraps and the durable receipt are committed
+/// before latent pre-verify work is retried, so opaque queue state cannot consume their capacity.
+pub fn author_enrollment_device_add_in_tx(
+    tx: &Transaction<'_>,
+    joiner: EnrollingDevice,
+    role: ops::DeviceRole,
+    now_ms: i64,
+) -> anyhow::Result<EntryHash> {
+    author_device_add_with_promotion_in_tx(tx, joiner, role, now_ms, DeviceAddPromotion::Defer)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DeviceAddPromotion {
+    Retry,
+    Defer,
+}
+
+fn author_device_add_with_promotion_in_tx(
+    tx: &Transaction<'_>,
+    joiner: EnrollingDevice,
+    role: ops::DeviceRole,
+    now_ms: i64,
+    promotion: DeviceAddPromotion,
+) -> anyhow::Result<EntryHash> {
+    validate_device_add_label(joiner.label.as_deref())?;
     let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
         "cannot enroll a device before the store's local account is minted (call local_account \
          first)",
@@ -253,6 +404,9 @@ pub fn author_device_add_in_tx(
         label: joiner.label,
     };
     let entry_hash = author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, now_ms)?;
+    if promotion == DeviceAddPromotion::Retry {
+        storage::promote_after_local_device_add_in_tx(tx, account_id, now_ms)?;
+    }
 
     // Verify the FACT, and the SPECIFIC fact — the joiner's effective roster row is THIS DeviceAdd
     // (`roster_ref == entry_hash`) at the REQUESTED role — never the authored entry's status. Bare
@@ -275,6 +429,18 @@ pub fn author_device_add_in_tx(
         ),
     }
     Ok(entry_hash)
+}
+
+/// Retry pre-verify rows unlocked by a committed enrollment in a separate maintenance transaction.
+pub fn retry_enrollment_pre_verify(
+    conn: &Connection,
+    account_id: AccountId,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    storage::promote_after_local_device_add_in_tx(&tx, account_id, now_ms)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// One `(account, log_id, device)` chain's tail: its highest-`seq` entry as `(seq, entry_hash)`, or
@@ -408,6 +574,72 @@ mod tests {
             1,
             "the check-fact-first gate authors no second StreamOwn on re-ensure",
         );
+    }
+
+    #[test]
+    fn locally_authored_device_add_promotes_rows_signed_by_the_joiner() {
+        let conn = db();
+        let account = bootstrap::local_account(&conn, NOW).expect("mint local account");
+        let joiner = DeviceSecret::from_seed(&[0x71; 32]);
+        let joiner_x = DeviceX25519Secret::from_seed(&[0x72; 32]);
+        let payload = ops::encode(&AccountOp::AccountGenesis {
+            ed25519_pubkey: joiner.public().to_bytes(),
+            x25519_pubkey: joiner_x.public().to_bytes(),
+            nonce16: [8; 16],
+            created_at_ms: NOW as u64,
+            label: None,
+        })
+        .unwrap();
+        let header = AccountEntryHeader {
+            account_id: account,
+            log_id: fold::CONTROL_LOG,
+            device_fingerprint: joiner.public().fingerprint(),
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: ops::entry_type::ACCOUNT_GENESIS,
+            op_version: fold::SUPPORTED_OP_VERSION + 1,
+            crypto_suite: 0,
+            auth_len: 0,
+            key_id: None,
+            authority_ref: None,
+        };
+        let parked = sign_account_entry(&joiner, &header, &payload).unwrap();
+        assert_eq!(
+            storage::account_ingest(&conn, &parked.signed_bytes, NOW).unwrap(),
+            storage::IngestOutcome::PreVerify,
+        );
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: joiner.public().to_bytes(),
+                x25519_pubkey: joiner_x.public().to_bytes(),
+                label: None,
+            },
+            ops::DeviceRole::ReadOnly,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let parked_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_pre_verify WHERE signed_hash = ?1",
+                [crate::cbor::sha256(&parked.signed_bytes).as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let candidate_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE entry_hash = ?1",
+                [parked.entry_hash.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parked_count, 0, "the newly resolvable queue row is drained");
+        assert_eq!(candidate_count, 1, "the joiner-signed row is promoted to the candidate DAG");
     }
 
     #[test]

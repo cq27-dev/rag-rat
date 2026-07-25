@@ -86,34 +86,42 @@ mod table_sync;
 // `prepare_content_authoring` / `author_prepared_content_batch_in_tx` / `SealPolicy` (C5, #608):
 // policy-aware `/3` authoring prepared before, then executed inside, a caller-owned transaction;
 // `author_content_batch` is the self-transacting convenience composition. The
-// envelope-layer seal
-// primitives (`sign_sealed_content_entry` / `seal_and_sign_content_entry`) take a `&DeviceSecret`,
-// so — like `sign_content_entry` — they stay account-crate-internal (never re-exported at the crate
-// root, or they would leak the `pub(crate)` `DeviceSecret` past its visibility).
+// envelope-layer seal primitives (`sign_sealed_content_entry` / `seal_and_sign_content_entry`)
+// take a `&DeviceSecret`, so — like `sign_content_entry` — they stay account-crate-internal. Keep
+// this crate-root API explicit: adding an account implementation seam must not silently make it a
+// public semver commitment.
 pub use account::{
-    AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
-    CapacityScope, CatchUpReport, ContentIngestOutcome, ContentKey, ContentKeyring,
-    ContentRefoldBudget, ContentSettleReport, DeviceCut, DeviceRole, EnrollingDevice,
-    GrantAuthority, GrantDeviceAuthority, GrantDeviceBoundary, GrantRole, IngestOutcome, KeyId,
-    LiveKeyEpoch, LiveKeyTargets, NodeAuthError, OwnerAuthority, OwnerChainAuthority,
-    PreparedContentAuthoring, RosterContentAuthority, RotationOutcome, SealPolicy,
-    SealingKeyOutcome, SelectedWrap, SnapshotAuthorOutcome, SyncAccountEntry, SyncContentEntry,
-    account_entries_for_sync, account_entry_ref, account_ingest, account_signed_entry_exists,
-    account_signed_hash, auth_len_freshness, author_content_batch, author_content_batch_in_tx,
-    author_device_add_in_tx, author_prepared_content_batch_in_tx, author_snapshot_in_tx,
-    backfill_authority_projection, catch_up_stream_keys_for_device_in_tx, content_entries_for_sync,
-    content_entry_ref, content_ingest, content_op_is_authorable, content_op_is_sealed_authorable,
+    AccountId, AuthoredDurability, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason,
+    AuthorityQuery, CapacityScope, CatchUpReport, ContentCapacityScope, ContentEntryHeader,
+    ContentIngestOutcome, ContentKey, ContentKeyring, ContentRefoldBudget, ContentSettleReport,
+    ContentStreamSettleFailure, DeviceCut, DeviceRole, ENROLLMENT_HELD_ENTRY_HASHES_MAX,
+    EnrollingDevice, EnrollmentBootstrap, EnrollmentBudget, GrantAuthority, GrantDeviceAuthority,
+    GrantDeviceBoundary, GrantRole, IngestOutcome, KeyId, LiveKeyEpoch, LiveKeyTargets,
+    NodeAuthError, OwnerAuthority, OwnerChainAuthority, PreparedContentAuthoring,
+    RosterContentAuthority, RotationOutcome, SealPolicy, SealingKeyOutcome, SelectedWrap,
+    SignedContentEntry, SnapshotAuthorOutcome, SyncAccountEntry, SyncContentEntry,
+    VerifiedContentEntry, account_entries_for_enrollment, account_entries_for_sync,
+    account_entry_ref, account_ingest, account_signed_entry_exists, account_signed_hash,
+    adopt_enrollment_bootstrap, adopt_local_account, auth_len_freshness, author_content_batch,
+    author_content_batch_in_tx, author_device_add_in_tx, author_enrollment_device_add_in_tx,
+    author_prepared_content_batch_in_tx, author_snapshot_in_tx, backfill_authority_projection,
+    catch_up_stream_keys_for_device_in_tx, content_entries_for_sync, content_entry_ref,
+    content_ingest, content_op_is_authorable, content_op_is_sealed_authorable,
     content_signed_entry_exists, content_signed_hash, content_stream_has_pending_refold,
     content_stream_has_sealed_ratchet, content_stream_is_empty, current_sealing_key,
-    decode_content_signed, ensure_owned_stream_v2_in_tx, ensure_stream_key_current_in_tx,
-    established_owned_stream_v2, grant_effective_for_device, historical_content_keyring,
-    live_stream_key_targets_for_device, local_account, mint_and_author_stream_key_wrap_in_tx,
-    owned_stream_v2_id, owner_control_authority, owner_secrets_authority,
-    prepare_content_authoring, read_local_account, roster_content_authority,
-    rotate_stream_key_in_tx, select_current_sealing_wrap,
+    decode_content_signed, enroll_stream_keys_for_device_in_tx, enrollment_authoring_fits,
+    enrollment_authoring_requirements, enrollment_budget, ensure_owned_stream_v2_in_tx,
+    ensure_stream_key_current_in_tx, established_owned_stream_v2, grant_effective_for_device,
+    held_account_entry_hashes, historical_content_keyring, live_stream_key_targets_for_device,
+    local_account, mint_and_author_stream_key_wrap_in_tx, owned_stream_v2_id,
+    owned_streams_for_account, owner_control_authority, owner_control_authority_in_snapshot,
+    owner_secrets_authority, prepare_content_authoring, prune_account_candidate_reservations_in_tx,
+    read_local_account, release_account_candidate_reservation_in_tx, retry_enrollment_pre_verify,
+    roster_content_authority, rotate_stream_key_in_tx, select_current_sealing_wrap,
     settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
     sign_local_node_binding, stream_key_rotation_needed, stream_owner_effective,
-    verify_node_binding,
+    upsert_account_candidate_reservation_in_tx, validate_device_add_label,
+    verify_enrollment_device_add, verify_node_binding,
 };
 // The `/3` content projection's store-global upgrade re-fold (#688): wired into the index
 // open/migrate seam by rag-rat-core, so a stale store is rebuilt (every stream, then the one

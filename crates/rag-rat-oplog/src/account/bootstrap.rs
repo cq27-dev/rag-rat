@@ -32,11 +32,14 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::AccountId;
-use super::envelope::{AccountEntryHeader, VerifiedAccountEntry, sign_account_entry};
+use super::envelope::{
+    self, AccountEntryHeader, SignedAccountEntry, VerifiedAccountEntry, sign_account_entry,
+};
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp};
 use super::storage::{self, CandidateInsert};
 use crate::local_device;
+use crate::op::DeviceFingerprint;
 
 /// Return this store's persisted local account, minting its self-authorizing genesis on the first
 /// call and returning the SAME account stably thereafter. `now_ms` stamps a freshly-minted genesis
@@ -65,6 +68,306 @@ pub fn local_account(conn: &Connection, now_ms: i64) -> anyhow::Result<AccountId
     // if we won, the incumbent's if we lost.
     read_local_account(conn)?
         .context("local account pointer missing immediately after mint (single-row insert lost?)")
+}
+
+/// Adopt an already-ingested, accepted account genesis as this store's local account. Enrollment
+/// uses this after cryptographically verifying and ingesting the inviter's bootstrap; unlike
+/// [`local_account`], it never mints a competing genesis.
+pub fn adopt_local_account(
+    conn: &Connection,
+    account_id: AccountId,
+    genesis_hash: [u8; 32],
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    if let Some(existing) = read_local_account(conn)? {
+        anyhow::ensure!(existing == account_id, "store already belongs to another local account");
+        return Ok(());
+    }
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    adopt_local_account_in_tx(&tx, account_id, genesis_hash, now_ms)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Atomically ingest a verified enrollment bootstrap, confirm the acknowledged device is
+/// effective, and adopt its genesis as this store's local account. No bootstrap row can become
+/// durable without the matching pointer, so a crash or rejected later entry cannot strand the
+/// one-time enrollment between identities.
+pub struct EnrollmentBootstrap<'a> {
+    pub account_entries: &'a [Vec<u8>],
+    pub account_id: AccountId,
+    pub genesis_hash: [u8; 32],
+    pub device_fingerprint: DeviceFingerprint,
+    pub device_add_hash: [u8; 32],
+    pub now_ms: i64,
+}
+
+/// The joiner-side admission budget this store can offer an enrollment redemption, clamped at
+/// zero (headroom goes negative past the grow-only caps). Sent in the enrollment request so the
+/// owner can measure its exact receipt against it BEFORE consuming the one-time nonce (#945).
+///
+/// Already-held candidates are NOT credited here — the request carries their hashes separately
+/// ([`held_account_entry_hashes`]), so the owner credits exactly the confirmed intersection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnrollmentBudget {
+    pub account_entries_remaining: u64,
+    pub account_bytes_remaining: u64,
+    pub global_entries_remaining: u64,
+    pub global_bytes_remaining: u64,
+}
+
+/// Complete candidate inventory bound for one enrollment request.
+pub const ENROLLMENT_HELD_ENTRY_HASHES_MAX: usize = storage::CANDIDATES_PER_ACCOUNT_MAX;
+
+pub fn enrollment_budget(
+    conn: &Connection,
+    account_id: AccountId,
+    now_ms: i64,
+) -> anyhow::Result<EnrollmentBudget> {
+    let headroom = storage::candidate_capacity_headroom(conn, account_id, now_ms)?;
+    let clamp = |value: i64| u64::try_from(value).unwrap_or(0);
+    Ok(EnrollmentBudget {
+        account_entries_remaining: clamp(headroom.account_entries_remaining),
+        account_bytes_remaining: clamp(headroom.account_bytes_remaining),
+        global_entries_remaining: clamp(headroom.global_entries_remaining),
+        global_bytes_remaining: clamp(headroom.global_bytes_remaining),
+    })
+}
+
+/// Durable candidate-capacity reservations for outstanding enrollment invites (#945). A minted
+/// invite reserves the exact entries/bytes its mandatory `DeviceAdd` plus stream-key wraps will
+/// consume, and [`storage::insert_candidate`] charges active reservations against the same
+/// grow-only counters — so ordinary ingest or another mint cannot consume headroom an outstanding
+/// ticket was measured against and strand it permanently. Redemption releases its own reservation
+/// under the writer lock; expiry frees it (`expires_at_ms` is the invite's own expiry).
+pub fn upsert_account_candidate_reservation_in_tx(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    reservation_id: [u8; 32],
+    reserved_entries: u64,
+    reserved_bytes: u64,
+    reserved_targets: u64,
+    expires_at_ms: i64,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT INTO account_candidate_reservations(
+             reservation_id, account_id, reserved_entries, reserved_bytes, reserved_targets,
+             expires_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(reservation_id) DO UPDATE SET
+             account_id = excluded.account_id,
+             reserved_entries = excluded.reserved_entries,
+             reserved_bytes = excluded.reserved_bytes,
+             reserved_targets = excluded.reserved_targets,
+             expires_at_ms = excluded.expires_at_ms",
+        params![
+            reservation_id.as_slice(),
+            account_id.to_bytes().as_slice(),
+            i64::try_from(reserved_entries)?,
+            i64::try_from(reserved_bytes)?,
+            i64::try_from(reserved_targets)?,
+            expires_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Release one invite's reservation. Called inside the redemption transaction immediately before
+/// the mandatory entries are authored, so the freed capacity is consumed by exactly the writes it
+/// was measured for; a rollback restores the reservation with everything else.
+pub fn release_account_candidate_reservation_in_tx(
+    tx: &Transaction<'_>,
+    reservation_id: [u8; 32],
+) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM account_candidate_reservations WHERE reservation_id = ?1", [
+        reservation_id.as_slice(),
+    ])?;
+    Ok(())
+}
+
+/// Delete expired reservations. Correctness never depends on this — the counters filter on
+/// `expires_at_ms` — it only keeps the table bounded.
+pub fn prune_account_candidate_reservations_in_tx(
+    conn: &Connection,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM account_candidate_reservations WHERE expires_at_ms <= ?1", [now_ms])?;
+    Ok(())
+}
+
+/// Every authenticated candidate hash this store holds for `account_id`, sorted for canonical
+/// enrollment encoding. Parked unauthenticated envelopes are normal-sync work, not bootstrap data.
+pub fn held_account_entry_hashes(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Vec<[u8; 32]>> {
+    let mut stmt = conn.prepare(
+        "SELECT entry_hash FROM account_entries WHERE account_id = ?1 ORDER BY entry_hash",
+    )?;
+    let hashes = stmt
+        .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        hashes.len() <= ENROLLMENT_HELD_ENTRY_HASHES_MAX,
+        "account held-proof inventory exceeds the enrollment wire bound"
+    );
+    hashes
+        .into_iter()
+        .map(|hash| {
+            <[u8; 32]>::try_from(hash.as_slice())
+                .map_err(|_| anyhow::anyhow!("stored entry_hash is not exactly 32 bytes"))
+        })
+        .collect()
+}
+
+/// One bootstrap entry staged for causal ingestion: its raw bytes plus the structural decode (the
+/// full signature verify still happens in `account_ingest_in_tx`). Undecodable entries sort last
+/// so they reach ingest — and their rejection rolls the adoption back — after every decodable
+/// entry had its chance.
+struct BootstrapEntry<'a> {
+    bytes: &'a [u8],
+    decoded: Option<SignedAccountEntry>,
+}
+
+impl BootstrapEntry<'_> {
+    /// The canonical deterministic pre-order the causal worklist scans: `(log_id, seq,
+    /// entry_hash, signed_bytes)` — the same key `account_entries_for_sync` emits, with
+    /// `signed_bytes` as the tie-break because two envelopes can share an `entry_hash` yet carry
+    /// different signatures.
+    fn causal_pre_order(&self, other: &Self) -> std::cmp::Ordering {
+        match (&self.decoded, &other.decoded) {
+            (Some(a), Some(b)) => (a.header.log_id, a.header.seq, a.entry_hash, &a.signed_bytes)
+                .cmp(&(b.header.log_id, b.header.seq, b.entry_hash, &b.signed_bytes)),
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, None) => self.bytes.cmp(other.bytes),
+        }
+    }
+}
+
+pub fn adopt_enrollment_bootstrap(
+    conn: &Connection,
+    bootstrap: EnrollmentBootstrap<'_>,
+) -> anyhow::Result<()> {
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Ingest in CAUSAL order — an entry only after the entry introducing its signer's key. The
+    // receipt's raw `(log_id, seq, entry_hash)` order puts EVERY promoted device's seq-0 control
+    // entry before the founder-chain DeviceAdd introducing its key, so raw-order ingestion parks
+    // them all simultaneously and can trip the pre-verify eviction budget — a deterministic
+    // adoption failure replayed for 24h against a committed enrollment (#945). The fold is
+    // order-free (I8), so reordering changes only transient parking, never the final accepted
+    // set; receipt bytes and their canonical-CBOR identity are untouched.
+    let mut pending: Vec<BootstrapEntry<'_>> = bootstrap
+        .account_entries
+        .iter()
+        .map(|bytes| BootstrapEntry { bytes, decoded: envelope::decode_account_signed(bytes).ok() })
+        .collect();
+    pending.sort_by(BootstrapEntry::causal_pre_order);
+    // Seed resolvability from what this store ALREADY holds (a prior sync session may have
+    // delivered some candidates), then drain the worklist: ingest every entry whose signer
+    // resolves, growing the map with the keys each ingested entry itself certifies — the exact
+    // `stored_device_pubkeys` + `add_self_pubkey` semantics ingest applies.
+    let mut resolved = storage::stored_device_pubkeys(&tx, bootstrap.account_id)?;
+    loop {
+        let mut progressed = false;
+        let mut still_pending = Vec::with_capacity(pending.len());
+        for entry in pending {
+            let ready = entry.decoded.as_ref().is_some_and(|signed| {
+                resolved.contains_key(&signed.header.device_fingerprint)
+                    || storage::self_certifies_signer(&signed.header, &signed.payload)
+            });
+            if ready {
+                let signed = entry.decoded.as_ref().expect("ready implies decoded");
+                let resolved_signer = resolved.get(&signed.header.device_fingerprint).copied();
+                storage::stage_enrollment_bootstrap_entry_in_tx(
+                    &tx,
+                    entry.bytes,
+                    resolved_signer,
+                    bootstrap.now_ms,
+                )?;
+                storage::add_self_pubkey(&mut resolved, &signed.header, &signed.payload);
+                progressed = true;
+            } else {
+                still_pending.push(entry);
+            }
+        }
+        pending = still_pending;
+        if !progressed {
+            break;
+        }
+    }
+    anyhow::ensure!(
+        pending.is_empty(),
+        "enrollment bootstrap contains an entry whose signer is not certified by the candidate \
+         snapshot"
+    );
+    // The one-time adoption fold contains ONLY receipt candidates and already-authenticated local
+    // candidates; the acknowledged DeviceAdd must win THAT fold before the local-account pointer
+    // commits. Pre-existing parked rows are retried only after the adoption is durable — a newly
+    // resolvable parked sibling can no longer roll the one-time bootstrap back, and its later
+    // promotion is ordinary best-effort queue work.
+    storage::finish_enrollment_bootstrap_in_tx(&tx, bootstrap.account_id, bootstrap.now_ms)?;
+    let enrolled: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM account_roster_history
+              WHERE account_id = ?1
+                AND device_fingerprint = ?2
+                AND roster_ref = ?3
+                AND closed_at IS NULL
+        )",
+        params![
+            bootstrap.account_id.to_bytes().as_slice(),
+            bootstrap.device_fingerprint.to_bytes().as_slice(),
+            bootstrap.device_add_hash.as_slice(),
+        ],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        enrolled,
+        "account bootstrap did not make the acknowledged DeviceAdd effective"
+    );
+    adopt_local_account_in_tx(&tx, bootstrap.account_id, bootstrap.genesis_hash, bootstrap.now_ms)?;
+    tx.commit()?;
+    // The caller retries parked rows the receipt's keys may now resolve in a SEPARATE
+    // best-effort maintenance pass (`retry_enrollment_pre_verify`): the enrollment and
+    // local-account pointer are durable at this point, so queue maintenance must never
+    // invalidate the completed enrollment or re-enter its one-time fold.
+    Ok(())
+}
+
+fn adopt_local_account_in_tx(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    genesis_hash: [u8; 32],
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    if let Some(existing) = read_local_account(tx)? {
+        anyhow::ensure!(existing == account_id, "store already belongs to another local account");
+        return Ok(());
+    }
+    let accepted: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM account_entries e
+               JOIN account_entry_status s ON s.entry_hash = e.entry_hash
+              WHERE e.entry_hash = ?1
+                AND e.account_id = ?2
+                AND e.log_id = 0
+                AND e.seq = 0
+                AND s.status = 'accepted'
+         )",
+        params![genesis_hash.as_slice(), account_id.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(accepted, "enrollment genesis is not accepted for the expected account");
+    tx.execute(
+        "INSERT INTO oplog_local_account(id, genesis_entry_hash, created_at_ms)
+         VALUES (0, ?1, ?2)",
+        params![genesis_hash.as_slice(), now_ms],
+    )?;
+    Ok(())
 }
 
 /// Mint the local account inside the caller's IMMEDIATE transaction, or adopt an incumbent and
@@ -240,12 +543,12 @@ fn read_pointer_hash(conn: &Connection) -> anyhow::Result<Option<[u8; 32]>> {
 /// path (including error/panic), so a shared connection is never stranded at FULL. Mirrors
 /// `query::memory::authoring::AuthoredDurability`, which the account layer cannot reach up into
 /// (the dependency is one-way).
-struct AuthoredDurability<'a> {
+pub struct AuthoredDurability<'a> {
     conn: &'a Connection,
 }
 
 impl<'a> AuthoredDurability<'a> {
-    fn begin(conn: &'a Connection) -> anyhow::Result<Self> {
+    pub fn begin(conn: &'a Connection) -> anyhow::Result<Self> {
         conn.execute_batch("PRAGMA synchronous = FULL;")?;
         Ok(Self { conn })
     }
@@ -359,6 +662,53 @@ mod tests {
             account_id,
             "the resolved account_id is the genesis commitment",
         );
+    }
+
+    #[test]
+    fn enrollment_inventory_returns_every_candidate_beyond_the_old_prefix() {
+        let conn = db();
+        let account = local_account(&conn, NOW).unwrap();
+        for ordinal in 1u64..=120 {
+            let mut hash = [0u8; 32];
+            hash[24..].copy_from_slice(&ordinal.to_be_bytes());
+            conn.execute(
+                "INSERT INTO account_entries(
+                     entry_hash, account_id, log_id, device_fingerprint, seq, prev_hash,
+                     parent_ref, authority_ref, entry_type, accepted, signed_bytes, received_at_ms)
+                 VALUES (?1, ?2, 3, ?3, ?4, NULL, NULL, NULL, 255, 0, X'00', ?5)",
+                params![
+                    hash.as_slice(),
+                    account.to_bytes().as_slice(),
+                    [9u8; 32].as_slice(),
+                    i64::try_from(ordinal).unwrap(),
+                    NOW,
+                ],
+            )
+            .unwrap();
+        }
+
+        let parked_entry_hash = [0xf0; 32];
+        let parked_signed_hash = [0xf1; 32];
+        conn.execute(
+            "INSERT INTO account_pre_verify(
+                 signed_hash, entry_hash, claimed_account_id, claimed_fingerprint, raw_bytes,
+                 received_at_ms)
+             VALUES (?1, ?2, ?3, ?4, X'00', ?5)",
+            params![
+                parked_signed_hash.as_slice(),
+                parked_entry_hash.as_slice(),
+                account.to_bytes().as_slice(),
+                [0xf2u8; 32].as_slice(),
+                NOW,
+            ],
+        )
+        .unwrap();
+
+        let hashes = held_account_entry_hashes(&conn, account).unwrap();
+        assert_eq!(hashes.len(), 121, "genesis and every authenticated candidate are advertised");
+        assert!(!hashes.contains(&parked_signed_hash));
+        assert!(!hashes.contains(&parked_entry_hash));
+        assert!(hashes.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]

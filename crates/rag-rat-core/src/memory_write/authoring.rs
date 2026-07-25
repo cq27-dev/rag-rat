@@ -356,8 +356,12 @@ impl ReconcileWork {
 /// Settling in-transaction bounds the cost to ONE fold per local write — work the write's own
 /// authoring performs anyway — and lets a mid-write enqueue self-heal. A fold failure propagates
 /// and rolls the write back, so the barrier stays fail-closed.
-fn settle_owner_stream_in_tx(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<()> {
-    rag_rat_oplog::settle_pending_content_refold_for_stream_in_tx(tx, stream)
+fn settle_owner_stream_in_tx(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    rag_rat_oplog::settle_pending_content_refold_for_stream_in_tx(tx, stream, now_ms)
         .context("settling the owner stream's pending content refold before reading completeness")
 }
 
@@ -457,7 +461,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Settle the owner stream's deferred refold debt HERE, inside the write's own transaction and
     // before the authoritative re-read, so completeness is read against a current projection.
-    settle_owner_stream_in_tx(&tx, stream)?;
+    settle_owner_stream_in_tx(&tx, stream, now_ms)?;
     anyhow::ensure!(
         stream_seal_policy(&tx, repo_id, stream)? == policy,
         "memory stream seal policy changed while preparing reconcile; retry"
@@ -606,7 +610,7 @@ pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow:
     rag_rat_db::meta::set_repo_meta(&tx, &repo_id, STREAM_SEAL_POLICY_META_KEY, "sealed")?;
     // Same barrier discipline as the reconcile path: settle inside this transaction so the sealed
     // re-authoring below reads completeness against a current accepted-`/3` projection.
-    settle_owner_stream_in_tx(&tx, stream)?;
+    settle_owner_stream_in_tx(&tx, stream, now_ms)?;
     let work = read_reconcile_work(&tx, &repo_id, stream, StreamSealPolicy::Sealed)?;
     work.warn_quarantined(&repo_id);
     let ops = build_reconcile_ops(

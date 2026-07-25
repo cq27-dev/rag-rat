@@ -21,15 +21,15 @@ mod storage;
 // points (`rotate_stream_key_in_tx` / `ensure_stream_key_current_in_tx` / `RotationOutcome`):
 // re-exported up through `account` and the crate root for the seal path (C5) to reach (`pub` here
 // so `account::mod` can re-export it — the private `mod secrets` keeps it crate-scoped regardless).
-pub use author::{
-    CatchUpReport, RotationOutcome, catch_up_stream_keys_for_device_in_tx,
-    ensure_stream_key_current_in_tx, mint_and_author_stream_key_wrap_in_tx,
-    rotate_stream_key_in_tx,
-};
 // The ingest-time structural validation twin (mirrors the control-plaintext arm) and the
 // refold pass wired into `refold_in_tx`.
+pub(in crate::account) use author::single_recipient_wrap_envelope_bytes;
+pub use author::{
+    CatchUpReport, RotationOutcome, catch_up_stream_keys_for_device_in_tx,
+    enroll_stream_keys_for_device_in_tx, ensure_stream_key_current_in_tx,
+    mint_and_author_stream_key_wrap_in_tx, rotate_stream_key_in_tx,
+};
 pub(in crate::account) use ops::validate_storable_secrets_payload;
-pub(in crate::account) use sealing::accepted_stream_key_wrap_exists_strict;
 // The C4.3b READ side: derive-on-read sealing-key selection + the key_id adoption cross-check.
 // `current_sealing_key` is what C5's seal path calls; `select_current_sealing_wrap` is also
 // the CLI "what key is current" surface. Nothing calls them in C4.3b (machinery ships one
@@ -38,5 +38,8 @@ pub use sealing::{
     ContentKeyring, LiveKeyEpoch, LiveKeyTargets, SealingKeyOutcome, SelectedWrap,
     current_sealing_key, historical_content_keyring, live_stream_key_targets_for_device,
     select_current_sealing_wrap, stream_key_rotation_needed,
+};
+pub(in crate::account) use sealing::{
+    accepted_stream_key_wrap_exists_strict, recoverable_live_stream_key_target_count,
 };
 pub(in crate::account) use storage::refold_secrets_log;

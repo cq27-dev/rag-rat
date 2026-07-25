@@ -2047,6 +2047,7 @@ mod tests {
         content_storage::settle_pending_content_refolds(
             &peer,
             &content_storage::ContentRefoldBudget::unbounded(),
+            NOW,
         )
         .expect("settle the refold");
 

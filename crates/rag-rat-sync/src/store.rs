@@ -64,6 +64,10 @@ impl<'a> OplogSyncStore<'a> {
     pub fn new(conn: &'a Connection, account_id: AccountId, now_fn: fn() -> i64) -> Self {
         Self { conn, account_id, now_fn }
     }
+
+    pub(crate) fn connection(&self) -> &'a Connection {
+        self.conn
+    }
 }
 
 impl SyncStore for OplogSyncStore<'_> {

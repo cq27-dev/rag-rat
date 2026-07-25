@@ -1266,12 +1266,10 @@ fn migration_087_adds_table_sync_tables() {
 
 /// V088 (#830) caches each clone generation's posting-row count on its generation row so the #598
 /// delta work budget reads one column instead of a full `COUNT(*)` scan of the postings table.
-/// Carries the absolute schema-tip pin now that V088 is newest. Verifies the column exists on a
-/// fresh ladder and that the applier backfills an existing generation from its actual postings.
+/// Verifies the column exists on a fresh ladder and that the applier backfills an existing
+/// generation from its actual postings.
 #[test]
 fn migration_088_caches_the_generation_posting_row_count() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 88, "move this pin with the next schema migration");
-
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     assert_eq!(
@@ -1326,4 +1324,190 @@ fn migration_088_caches_the_generation_posting_row_count() {
         )
         .unwrap();
     assert_eq!(after_reapply, 3, "a re-apply recomputes the same exact count");
+}
+
+/// V089 (#945) adds the durable one-time invite row redeemed by the enrollment ALPN.
+#[test]
+fn migration_089_adds_sync_invites() {
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_sync_invites(&bare).unwrap();
+    schema::apply_sync_invites(&bare).expect("replay is a no-op");
+    assert!(conn_table_exists(&bare, "sync_invites"));
+    assert!(
+        !conn_table_exists(&bare, "account_candidate_reservations"),
+        "V089 stays frozen; the reservation table is V090",
+    );
+    assert!(
+        bare.execute(
+            "INSERT INTO sync_invites(
+                 nonce, account_id, role, label, expires_at_ms, created_at_ms, used_at_ms
+             ) VALUES (zeroblob(32), zeroblob(32), 'administrator', NULL, 2, 1, NULL)",
+            [],
+        )
+        .is_err(),
+        "the store rejects roles outside the frozen three-level vocabulary",
+    );
+    assert!(
+        bare.execute(
+            "INSERT INTO sync_invites(
+                 nonce, account_id, role, label, expires_at_ms, created_at_ms, used_at_ms
+             ) VALUES (zeroblob(32), zeroblob(32), 'member', NULL, 2, 1, 2)",
+            [],
+        )
+        .is_err(),
+        "a consumed invite must persist its complete replay identity and receipt",
+    );
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    let recorded: i64 = conn
+        .query_row("SELECT COUNT(*) FROM schema_version WHERE id = '089_sync_invites'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V089");
+}
+
+/// V090 (#949) adds durable candidate-capacity reservations for outstanding enrollment invites.
+#[test]
+fn migration_090_adds_account_candidate_reservations() {
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_account_candidate_reservations(&bare).unwrap();
+    schema::apply_account_candidate_reservations(&bare).expect("replay is a no-op");
+    assert!(conn_table_exists(&bare, "account_candidate_reservations"));
+    assert!(
+        bare.execute(
+            "INSERT INTO account_candidate_reservations(
+                 reservation_id, account_id, reserved_entries, reserved_bytes, expires_at_ms
+             ) VALUES (zeroblob(32), zeroblob(32), -1, 0, 2)",
+            [],
+        )
+        .is_err(),
+        "a reservation cannot hold a negative entry count",
+    );
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '090_account_candidate_reservations'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V090");
+}
+
+/// V092 (#949) drops the duplicated per-invite receipt copy; replay reconstructs the bootstrap
+/// from the grow-only candidate DAG.
+#[test]
+fn migration_092_normalizes_invite_receipts() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 92, "move this pin with the next schema migration");
+
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_sync_invites(&bare).unwrap();
+    bare.execute(
+        "INSERT INTO sync_invites(
+             nonce, account_id, role, label, expires_at_ms, created_at_ms, used_at_ms,
+             used_transport_node, used_ed25519_pubkey, used_x25519_pubkey,
+             receipt_hash, receipt_signed, receipt_bytes
+         ) VALUES (zeroblob(32), zeroblob(32), 'member', NULL, 10, 1, 2,
+                   zeroblob(32), zeroblob(32), zeroblob(32),
+                   zeroblob(32), X'01', X'01020304')",
+        [],
+    )
+    .unwrap();
+    schema::apply_sync_invites_normalized_receipts(&bare).unwrap();
+    schema::apply_sync_invites_normalized_receipts(&bare).expect("replay is a no-op");
+    let (role, receipt, legacy): (String, Vec<u8>, Vec<u8>) = bare
+        .query_row(
+            "SELECT role, receipt_signed, receipt_bytes FROM sync_invites
+              WHERE nonce = zeroblob(32)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (role.as_str(), receipt.as_slice(), legacy.as_slice()),
+        ("member", &[1][..], &[1, 2, 3, 4][..]),
+        "a consumed invite keeps replaying through its window"
+    );
+
+    // Replaying V092 over a POST-V092 row (the `index --full` recovery path) preserves the
+    // normalized manifest rather than nulling it into the consumed-row CHECK.
+    bare.execute(
+        "INSERT INTO sync_invites(
+             nonce, account_id, role, label, expires_at_ms, created_at_ms, used_at_ms,
+             used_transport_node, used_ed25519_pubkey, used_x25519_pubkey,
+             receipt_hash, receipt_signed, receipt_entries, receipt_bytes
+         ) VALUES (X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', zeroblob(32), 'member', NULL, 10, 1, 2,
+                   zeroblob(32), zeroblob(32), zeroblob(32),
+                   zeroblob(32), X'01', X'02020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202', NULL)",
+        [],
+    )
+    .unwrap();
+    schema::apply_sync_invites_normalized_receipts(&bare).unwrap();
+    let manifest: Vec<u8> = bare
+        .query_row(
+            "SELECT receipt_entries FROM sync_invites
+              WHERE nonce = X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(manifest.len(), 64, "the re-applied migration preserves stored manifests");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, 92);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version
+              WHERE id = '092_sync_invites_normalized_receipts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V092");
+}
+
+/// V091 (#949) tracks the live key-target count each invite reservation covers, so fold-time
+/// growth — local or synced — can top reservations up to the current mandatory cost.
+#[test]
+fn migration_091_adds_account_candidate_reservation_targets() {
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_account_candidate_reservations(&bare).unwrap();
+    bare.execute(
+        "INSERT INTO account_candidate_reservations(
+             reservation_id, account_id, reserved_entries, reserved_bytes, expires_at_ms
+         ) VALUES (zeroblob(32), zeroblob(32), 4, 900, 10)",
+        [],
+    )
+    .unwrap();
+    schema::apply_account_candidate_reservation_targets(&bare).unwrap();
+    schema::apply_account_candidate_reservation_targets(&bare).expect("replay is a no-op");
+    let targets: i64 = bare
+        .query_row(
+            "SELECT reserved_targets FROM account_candidate_reservations
+              WHERE reservation_id = zeroblob(32)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(targets, 3, "the backfill recovers reserved_entries - 1 covered targets");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version
+              WHERE id = '091_account_candidate_reservation_targets'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V091");
 }

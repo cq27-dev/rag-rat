@@ -1374,6 +1374,10 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_086_ID => Some(86),
             MIGRATION_087_ID => Some(87),
             MIGRATION_088_ID => Some(88),
+            MIGRATION_089_ID => Some(89),
+            MIGRATION_090_ID => Some(90),
+            MIGRATION_091_ID => Some(91),
+            MIGRATION_092_ID => Some(92),
             _ => None,
         })
         .max()
@@ -1471,6 +1475,10 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_086_ID
             | MIGRATION_087_ID
             | MIGRATION_088_ID
+            | MIGRATION_089_ID
+            | MIGRATION_090_ID
+            | MIGRATION_091_ID
+            | MIGRATION_092_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1565,6 +1573,10 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_086_ID => migration.checksum != MIGRATION_086_CHECKSUM,
         MIGRATION_087_ID => migration.checksum != MIGRATION_087_CHECKSUM,
         MIGRATION_088_ID => migration.checksum != MIGRATION_088_CHECKSUM,
+        MIGRATION_089_ID => migration.checksum != MIGRATION_089_CHECKSUM,
+        MIGRATION_090_ID => migration.checksum != MIGRATION_090_CHECKSUM,
+        MIGRATION_091_ID => migration.checksum != MIGRATION_091_CHECKSUM,
+        MIGRATION_092_ID => migration.checksum != MIGRATION_092_CHECKSUM,
         _ => false,
     }
 }
@@ -6109,6 +6121,165 @@ pub fn apply_clone_postings_row_count(conn: &Connection) -> rusqlite::Result<()>
                  WHERE build_generation = clone_graph_generations.generation);",
     )?;
     Ok(())
+}
+
+/// V089 (#945): durable, single-use enrollment invites.
+pub fn apply_sync_invites(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_invites(
+             nonce         BLOB    NOT NULL PRIMARY KEY CHECK(length(nonce) = 32),
+             account_id    BLOB    NOT NULL CHECK(length(account_id) = 32),
+             role          TEXT    NOT NULL CHECK(role IN ('read_only', 'member', 'owner')),
+             label         TEXT,
+             expires_at_ms INTEGER NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             used_at_ms    INTEGER,
+             used_transport_node BLOB CHECK(
+                 used_transport_node IS NULL OR length(used_transport_node) = 32
+             ),
+             used_ed25519_pubkey BLOB CHECK(
+                 used_ed25519_pubkey IS NULL OR length(used_ed25519_pubkey) = 32
+             ),
+             used_x25519_pubkey BLOB CHECK(
+                 used_x25519_pubkey IS NULL OR length(used_x25519_pubkey) = 32
+             ),
+             receipt_hash BLOB CHECK(receipt_hash IS NULL OR length(receipt_hash) = 32),
+             receipt_signed BLOB,
+             receipt_bytes BLOB,
+             CHECK(
+                 (used_at_ms IS NULL
+                  AND used_transport_node IS NULL
+                  AND used_ed25519_pubkey IS NULL
+                  AND used_x25519_pubkey IS NULL
+                  AND receipt_hash IS NULL
+                  AND receipt_signed IS NULL
+                  AND receipt_bytes IS NULL)
+                 OR
+                 (used_at_ms IS NOT NULL
+                  AND used_transport_node IS NOT NULL
+                  AND used_ed25519_pubkey IS NOT NULL
+                  AND used_x25519_pubkey IS NOT NULL
+                  AND receipt_hash IS NOT NULL
+                  AND receipt_signed IS NOT NULL
+                  AND receipt_bytes IS NOT NULL)
+             )
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS sync_invites_account_expiry
+             ON sync_invites(account_id, expires_at_ms);",
+    )
+}
+
+/// V090 (#949): durable candidate-capacity reservations for outstanding enrollment invites.
+pub fn apply_account_candidate_reservations(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_candidate_reservations(
+             reservation_id BLOB    NOT NULL PRIMARY KEY CHECK(length(reservation_id) = 32),
+             account_id     BLOB    NOT NULL CHECK(length(account_id) = 32),
+             reserved_entries INTEGER NOT NULL CHECK(reserved_entries >= 0),
+             reserved_bytes   INTEGER NOT NULL CHECK(reserved_bytes >= 0),
+             expires_at_ms    INTEGER NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS account_candidate_reservations_account_expiry
+             ON account_candidate_reservations(account_id, expires_at_ms);",
+    )
+}
+
+/// V091 (#949): track the live key-target count each invite reservation covers, so any fold that
+/// grows the target set — local authoring or REMOTELY synced `StreamOwn`/wrap entries — can top
+/// the reservation up to the current mandatory redemption cost.
+///
+/// Additive + idempotent. The backfill is exact for every reservation written since V090: those
+/// rows hold `reserved_entries = 1 (DeviceAdd) + covered_targets`, so `reserved_entries - 1`
+/// recovers the covered target count.
+pub fn apply_account_candidate_reservation_targets(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(
+        conn,
+        "account_candidate_reservations",
+        "reserved_targets",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    conn.execute_batch(
+        "UPDATE account_candidate_reservations
+            SET reserved_targets = MAX(0, reserved_entries - 1);",
+    )?;
+    Ok(())
+}
+
+/// V092 (#949): stop duplicating every enrollment receipt in the invite row.
+///
+/// Each consumed invite used to store the complete signed account bootstrap (`receipt_bytes`),
+/// so a fleet enrolling within the replay window kept one full history copy PER invite —
+/// quadratic growth in a grow-only store. New redemptions persist only the joiner-specific
+/// `DeviceAdd` envelope plus the manifest of receipt entry hashes (`receipt_entries`, 32 bytes
+/// each in receipt order), and replay reconstructs the EXACT acknowledged receipt from the
+/// grow-only candidate DAG. The legacy `receipt_bytes` column is RETAINED (never written again)
+/// so invites consumed before this migration keep replaying through their 24h window; pruning
+/// drops both forms. Rebuilds the table, preserving every row.
+pub fn apply_sync_invites_normalized_receipts(conn: &Connection) -> rusqlite::Result<()> {
+    // A re-apply (the sanctioned `index --full` recovery) sees the V092 shape: preserve its
+    // `receipt_entries` manifests rather than nulling them into the consumed-row CHECK.
+    let already_normalized = column_exists(conn, "sync_invites", "receipt_entries")?;
+    let entries_expr = if already_normalized { "receipt_entries" } else { "NULL" };
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE sync_invites_v092(
+             nonce         BLOB    NOT NULL PRIMARY KEY CHECK(length(nonce) = 32),
+             account_id    BLOB    NOT NULL CHECK(length(account_id) = 32),
+             role          TEXT    NOT NULL CHECK(role IN ('read_only', 'member', 'owner')),
+             label         TEXT,
+             expires_at_ms INTEGER NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             used_at_ms    INTEGER,
+             used_transport_node BLOB CHECK(
+                 used_transport_node IS NULL OR length(used_transport_node) = 32
+             ),
+             used_ed25519_pubkey BLOB CHECK(
+                 used_ed25519_pubkey IS NULL OR length(used_ed25519_pubkey) = 32
+             ),
+             used_x25519_pubkey BLOB CHECK(
+                 used_x25519_pubkey IS NULL OR length(used_x25519_pubkey) = 32
+             ),
+             receipt_hash BLOB CHECK(receipt_hash IS NULL OR length(receipt_hash) = 32),
+             receipt_signed BLOB,
+             receipt_entries BLOB CHECK(
+                 receipt_entries IS NULL OR length(receipt_entries) % 32 = 0
+             ),
+             receipt_bytes BLOB,
+             CHECK(
+                 (used_at_ms IS NULL
+                  AND used_transport_node IS NULL
+                  AND used_ed25519_pubkey IS NULL
+                  AND used_x25519_pubkey IS NULL
+                  AND receipt_hash IS NULL
+                  AND receipt_signed IS NULL
+                  AND receipt_entries IS NULL
+                  AND receipt_bytes IS NULL)
+                 OR
+                 (used_at_ms IS NOT NULL
+                  AND used_transport_node IS NOT NULL
+                  AND used_ed25519_pubkey IS NOT NULL
+                  AND used_x25519_pubkey IS NOT NULL
+                  AND receipt_hash IS NOT NULL
+                  AND receipt_signed IS NOT NULL
+                  AND (receipt_entries IS NOT NULL OR receipt_bytes IS NOT NULL))
+              )
+         ) STRICT;",
+    )?;
+    tx.execute_batch(&format!(
+        "INSERT INTO sync_invites_v092(
+             nonce, account_id, role, label, expires_at_ms, created_at_ms, used_at_ms,
+             used_transport_node, used_ed25519_pubkey, used_x25519_pubkey,
+             receipt_hash, receipt_signed, receipt_entries, receipt_bytes)
+          SELECT nonce, account_id, role, label, expires_at_ms, created_at_ms, used_at_ms,
+             used_transport_node, used_ed25519_pubkey, used_x25519_pubkey,
+             receipt_hash, receipt_signed, {entries_expr}, receipt_bytes
+            FROM sync_invites;
+         DROP TABLE sync_invites;
+         ALTER TABLE sync_invites_v092 RENAME TO sync_invites;
+         CREATE INDEX IF NOT EXISTS sync_invites_account_expiry
+             ON sync_invites(account_id, expires_at_ms);"
+    ))?;
+    tx.commit()
 }
 
 #[cfg(test)]

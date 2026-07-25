@@ -667,6 +667,7 @@ pub(in crate::account) fn affected_streams_for_account(
 pub(super) fn refold_and_project_stream_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
+    now_ms: i64,
 ) -> anyhow::Result<()> {
     refold_content_stream(tx, stream_id)?;
     if content_projected_tables_exist(tx)? {
@@ -675,15 +676,20 @@ pub(super) fn refold_and_project_stream_in_tx(
     if pending_refold_table_exists(tx)? {
         clear_pending_content_refold(tx, stream_id)?;
     }
+    // Accepted suite-1 content pins its sealing key as a live enrollment catch-up target, so
+    // settling content can grow an outstanding invite's mandatory redemption cost without any
+    // account fold — refresh reservations here, at the content-acceptance choke point (#945).
+    super::super::storage::refresh_enrollment_reservations_for_stream_in_tx(tx, stream_id, now_ms)?;
     Ok(())
 }
 
 pub(in crate::account) fn finalize_affected_streams(
     tx: &Transaction<'_>,
     streams: &[StreamId],
+    now_ms: i64,
 ) -> anyhow::Result<()> {
     for &stream_id in streams {
-        refold_and_project_stream_in_tx(tx, stream_id)?;
+        refold_and_project_stream_in_tx(tx, stream_id, now_ms)?;
     }
     Ok(())
 }
@@ -1207,6 +1213,7 @@ fn settle_one_pending_refold(
     stream_id: StreamId,
     budget: &ContentRefoldBudget,
     consumed: ContentSettleConsumption,
+    now_ms: i64,
 ) -> PendingRefoldOutcome {
     #[cfg(test)]
     SETTLE_ADMISSION_PROBES.with(|c| c.set(c.get() + 1));
@@ -1237,7 +1244,7 @@ fn settle_one_pending_refold(
         return PendingRefoldOutcome::Deferred { oversize: false };
     };
 
-    if let Err(error) = refold_and_project_stream_in_tx(&tx, stream_id) {
+    if let Err(error) = refold_and_project_stream_in_tx(&tx, stream_id, now_ms) {
         return PendingRefoldOutcome::Failed { admitted: Some((work, oversize)), error };
     }
     match tx.commit() {
@@ -1452,13 +1459,15 @@ pub struct ContentSettleReport {
 pub fn settle_pending_content_refolds(
     conn: &Connection,
     budget: &ContentRefoldBudget,
+    now_ms: i64,
 ) -> anyhow::Result<ContentSettleReport> {
-    settle_pending_content_refolds_inner(conn, budget, || {})
+    settle_pending_content_refolds_inner(conn, budget, now_ms, || {})
 }
 
 fn settle_pending_content_refolds_inner(
     conn: &Connection,
     budget: &ContentRefoldBudget,
+    now_ms: i64,
     after_first_listing: impl FnOnce(),
 ) -> anyhow::Result<ContentSettleReport> {
     let batch = settle_candidate_batch_size(budget);
@@ -1507,7 +1516,7 @@ fn settle_pending_content_refolds_inner(
                 report.deferred_budget += 1;
                 continue;
             }
-            let outcome = settle_one_pending_refold(conn, stream_id, budget, consumed);
+            let outcome = settle_one_pending_refold(conn, stream_id, budget, consumed, now_ms);
             let (admitted, vanished, demote) =
                 record_settle_outcome(&mut report, &mut consumed, stream_id, outcome);
             if demote {
@@ -1546,7 +1555,7 @@ fn settle_pending_content_refolds_inner(
         && consumed.attempted_streams < budget.max_streams
         && let Some(stream_id) = oldest_oversize_pending_refold(conn, budget)?
     {
-        let outcome = settle_one_pending_refold(conn, stream_id, budget, consumed);
+        let outcome = settle_one_pending_refold(conn, stream_id, budget, consumed, now_ms);
         let (_, _, demote) = record_settle_outcome(&mut report, &mut consumed, stream_id, outcome);
         if demote {
             deferred_demotions.push(stream_id);
@@ -1577,11 +1586,12 @@ fn settle_pending_content_refolds_inner(
 pub fn settle_pending_content_refold_for_stream_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
+    now_ms: i64,
 ) -> anyhow::Result<()> {
     if !content_stream_has_pending_refold(tx, stream_id)? {
         return Ok(());
     }
-    refold_and_project_stream_in_tx(tx, stream_id)
+    refold_and_project_stream_in_tx(tx, stream_id, now_ms)
 }
 
 /// Narrow the branch-selected winners to a contiguous accepted prefix per coordinate.
@@ -2248,6 +2258,8 @@ fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
 mod tests {
     use rag_rat_db::schema;
 
+    const NOW: i64 = 1_700_000_000_000;
+
     use super::super::super::envelope::{AccountEntryHeader, sign_account_entry};
     use super::super::super::id::account_id_from_genesis_payload;
     use super::super::ContentEntryHeader;
@@ -2428,6 +2440,45 @@ mod tests {
     /// A device fingerprint distinct from any real local device — the pre-#652 default seed used
     /// for candidates that stand in for FOREIGN, remotely-signed rows in the capacity tests.
     const FOREIGN_FP: [u8; 32] = [2_u8; 32];
+
+    #[test]
+    fn enrollment_mint_ignores_non_fatal_content_promotions() {
+        let conn = db();
+        let account = super::super::super::bootstrap::local_account(&conn, 1).unwrap();
+        seed_content_candidates(
+            &conn,
+            account,
+            FOREIGN_FP,
+            0x945,
+            CANDIDATES_PER_AUTHOR_MAX as usize,
+            1,
+        );
+        conn.execute(
+            "INSERT INTO content_pre_verify(
+                 signed_hash, entry_hash, claimed_stream_id, claimed_author_account_id,
+                 claimed_fingerprint, roster_ref, raw_bytes, received_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, X'00', 1)",
+            params![
+                [0xd1u8; 32].as_slice(),
+                [0xd2u8; 32].as_slice(),
+                [0xd3u8; 32].as_slice(),
+                account.to_bytes().as_slice(),
+                [0xd4u8; 32].as_slice(),
+                [0xd5u8; 32].as_slice(),
+            ],
+        )
+        .unwrap();
+
+        super::super::super::authoring::enrollment_authoring_fits(
+            &conn,
+            account,
+            &[],
+            crate::account::DeviceRole::Member,
+            None,
+            1,
+        )
+        .expect("opaque parked content is not part of mandatory enrollment authoring");
+    }
 
     #[test]
     fn exact_roster_ref_verifies_and_full_u64_counters_persist() {
@@ -3561,7 +3612,7 @@ mod tests {
     ) {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
         let streams = affected_streams_for_account(&tx, account, previously_owned).unwrap();
-        finalize_affected_streams(&tx, &streams).unwrap();
+        finalize_affected_streams(&tx, &streams, NOW).unwrap();
         tx.commit().unwrap();
     }
 
@@ -3817,7 +3868,7 @@ mod tests {
         let owner = signed_roster(&DeviceSecret::from_seed(&[0xe2; 32])).0;
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         let streams = affected_streams_for_account(&tx, owner, &[]).unwrap();
-        finalize_affected_streams(&tx, &streams).unwrap();
+        finalize_affected_streams(&tx, &streams, NOW).unwrap();
         tx.commit().unwrap();
     }
 
@@ -4025,7 +4076,7 @@ mod tests {
     /// (drain the whole queue in one call). Tests written against that contract use this helper;
     /// the budgeted tests pass an explicit [`ContentRefoldBudget`] instead.
     fn settle_all(conn: &Connection) -> ContentSettleReport {
-        settle_pending_content_refolds(conn, &ContentRefoldBudget::unbounded()).unwrap()
+        settle_pending_content_refolds(conn, &ContentRefoldBudget::unbounded(), NOW).unwrap()
     }
 
     fn pending_refold_state(conn: &Connection) -> (i64, i64, i64) {
@@ -4573,7 +4624,7 @@ mod tests {
         }
         let one_stream = budget(1, u64::MAX, u64::MAX, false);
 
-        let first = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let first = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         assert_eq!(first.settled_streams, 1);
         assert_eq!(first.consumed_candidates, 1);
         assert_eq!(first.consumed_candidate_bytes, SYNTHETIC_ROW_BYTES);
@@ -4585,16 +4636,16 @@ mod tests {
         assert!(queue_contains(&conn, middle));
         assert!(queue_contains(&conn, newest));
 
-        let second = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let second = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         assert_eq!(second.settled_streams, 1);
         assert!(!second.queue_empty, "the resume continues where the budget stopped");
         assert!(!queue_contains(&conn, middle));
         assert!(queue_contains(&conn, newest));
 
-        let third = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let third = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         assert_eq!(third.settled_streams, 1);
         assert!(third.queue_empty);
-        let drained = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let drained = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         assert_eq!(drained.settled_streams, 0, "a drained queue is a no-op");
         assert!(drained.queue_empty);
     }
@@ -4611,7 +4662,8 @@ mod tests {
 
         // Candidate limit: `big` exactly fills it, so `small` no longer fits the remainder.
         let report =
-            settle_pending_content_refolds(&conn, &budget(u64::MAX, 3, u64::MAX, false)).unwrap();
+            settle_pending_content_refolds(&conn, &budget(u64::MAX, 3, u64::MAX, false), NOW)
+                .unwrap();
         assert_eq!(report.settled_streams, 1);
         assert_eq!(report.consumed_candidates, 3);
         assert_eq!(report.deferred_budget, 1);
@@ -4625,13 +4677,13 @@ mod tests {
         enqueue_refold(&conn, big, 1);
         enqueue_refold(&conn, small, 2);
         let byte_budget = budget(u64::MAX, u64::MAX, 2 * SYNTHETIC_ROW_BYTES, false);
-        let report = settle_pending_content_refolds(&conn, &byte_budget).unwrap();
+        let report = settle_pending_content_refolds(&conn, &byte_budget, NOW).unwrap();
         assert_eq!(report.settled_streams, 1);
         assert_eq!(report.consumed_candidate_bytes, 2 * SYNTHETIC_ROW_BYTES);
         assert_eq!(report.deferred_budget, 1);
         assert!(queue_contains(&conn, small));
         // The resume settles the remainder with a fresh budget.
-        let report = settle_pending_content_refolds(&conn, &byte_budget).unwrap();
+        let report = settle_pending_content_refolds(&conn, &byte_budget, NOW).unwrap();
         assert_eq!(report.settled_streams, 1);
         assert!(report.queue_empty);
     }
@@ -4657,7 +4709,8 @@ mod tests {
         )
         .unwrap();
         let report =
-            settle_pending_content_refolds(&conn, &budget(u64::MAX, 5, u64::MAX, false)).unwrap();
+            settle_pending_content_refolds(&conn, &budget(u64::MAX, 5, u64::MAX, false), NOW)
+                .unwrap();
         assert_eq!(report.settled_streams, 0);
         assert_eq!(
             report.deferred_oversize, 0,
@@ -4672,7 +4725,8 @@ mod tests {
         ])
         .unwrap();
         let report =
-            settle_pending_content_refolds(&conn, &budget(u64::MAX, 5, u64::MAX, false)).unwrap();
+            settle_pending_content_refolds(&conn, &budget(u64::MAX, 5, u64::MAX, false), NOW)
+                .unwrap();
         assert_eq!(report.settled_streams, 1);
         assert_eq!(report.consumed_candidates, 3);
         assert!(report.queue_empty);
@@ -4692,6 +4746,7 @@ mod tests {
         let report = settle_pending_content_refolds_inner(
             &conn,
             &budget(u64::MAX, 2, u64::MAX, false),
+            NOW,
             || seed_synthetic_candidates(&concurrent, stream, 2),
         )
         .unwrap();
@@ -4725,12 +4780,16 @@ mod tests {
         seed_synthetic_candidates(&conn, listed, 1);
         enqueue_refold(&conn, listed, 1);
 
-        let report =
-            settle_pending_content_refolds_inner(&conn, &ContentRefoldBudget::unbounded(), || {
+        let report = settle_pending_content_refolds_inner(
+            &conn,
+            &ContentRefoldBudget::unbounded(),
+            NOW,
+            || {
                 seed_synthetic_candidates(&concurrent, newly_enqueued, 1);
                 enqueue_refold(&concurrent, newly_enqueued, 2);
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert_eq!(report.settled_streams, 1);
         assert!(!report.queue_empty, "the final queue-empty probe sees the committed enqueue");
@@ -4752,6 +4811,7 @@ mod tests {
         let report = settle_pending_content_refolds_inner(
             &conn,
             &budget(1, 1, SYNTHETIC_ROW_BYTES, false),
+            NOW,
             || {
                 concurrent
                     .execute("DELETE FROM content_streams_pending_refold WHERE stream_id = ?1", [
@@ -4781,7 +4841,8 @@ mod tests {
         enqueue_refold(&conn, small, 2);
 
         let report =
-            settle_pending_content_refolds(&conn, &budget(u64::MAX, 2, u64::MAX, false)).unwrap();
+            settle_pending_content_refolds(&conn, &budget(u64::MAX, 2, u64::MAX, false), NOW)
+                .unwrap();
         assert_eq!(report.settled_streams, 1, "the smaller stream still settles");
         assert_eq!(report.consumed_candidates, 1);
         assert_eq!(report.deferred_budget, 0);
@@ -4796,7 +4857,8 @@ mod tests {
         // Normal mode NEVER starts it: repeated calls converge nothing further and never re-list
         // it.
         let stuck =
-            settle_pending_content_refolds(&conn, &budget(u64::MAX, 2, u64::MAX, false)).unwrap();
+            settle_pending_content_refolds(&conn, &budget(u64::MAX, 2, u64::MAX, false), NOW)
+                .unwrap();
         assert_eq!(stuck.settled_streams, 0);
         assert_eq!(stuck.deferred_oversize, 0);
         assert!(!stuck.queue_empty);
@@ -4820,7 +4882,7 @@ mod tests {
         // queue for this budget — so the oversize slot then fires for the OLDEST oversize stream,
         // an intentional exceedance visible in the charged counters. Exactly ONE oversize row is
         // admitted per call.
-        let first = settle_pending_content_refolds(&conn, &maintenance).unwrap();
+        let first = settle_pending_content_refolds(&conn, &maintenance, NOW).unwrap();
         assert_eq!(
             first.settled_streams, 2,
             "the eligible small stream settles, then the drained queue releases the oversize slot",
@@ -4838,7 +4900,7 @@ mod tests {
 
         // Call 2: the scheduled maintenance loop converges — the second big stream claims this
         // call's oversize slot.
-        let second = settle_pending_content_refolds(&conn, &maintenance).unwrap();
+        let second = settle_pending_content_refolds(&conn, &maintenance, NOW).unwrap();
         assert_eq!(second.settled_streams, 1);
         assert_eq!(second.consumed_candidates, 3);
         assert!(!queue_contains(&conn, other_big));
@@ -4904,9 +4966,12 @@ mod tests {
         )
         .unwrap();
 
-        let report =
-            settle_pending_content_refolds(&conn, &budget(1, 2, 2 * SYNTHETIC_ROW_BYTES, false))
-                .unwrap();
+        let report = settle_pending_content_refolds(
+            &conn,
+            &budget(1, 2, 2 * SYNTHETIC_ROW_BYTES, false),
+            NOW,
+        )
+        .unwrap();
 
         assert_eq!(report.settled_streams, 0);
         assert_eq!(report.failures.len(), 1, "the stream budget permits one attempt");
@@ -4927,7 +4992,7 @@ mod tests {
         enqueue_refold(&conn, oversize, 1);
 
         let zero_streams =
-            settle_pending_content_refolds(&conn, &budget(0, 2, u64::MAX, true)).unwrap();
+            settle_pending_content_refolds(&conn, &budget(0, 2, u64::MAX, true), NOW).unwrap();
         assert_eq!(zero_streams.settled_streams, 0);
         assert_eq!(zero_streams.consumed_candidates, 0);
         assert!(zero_streams.failures.is_empty());
@@ -4943,7 +5008,7 @@ mod tests {
         enqueue_refold(&conn, oversize, 2);
 
         let one_stream =
-            settle_pending_content_refolds(&conn, &budget(1, 2, u64::MAX, true)).unwrap();
+            settle_pending_content_refolds(&conn, &budget(1, 2, u64::MAX, true), NOW).unwrap();
         assert_eq!(one_stream.settled_streams, 1);
         assert_eq!(one_stream.consumed_candidates, 1);
         assert_eq!(
@@ -4975,7 +5040,7 @@ mod tests {
         let one_stream = budget(1, u64::MAX, u64::MAX, false);
         let mut settled_order = Vec::new();
         for expected in [older, tie_low, tie_mid, tie_high] {
-            let report = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+            let report = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
             assert_eq!(report.settled_streams, 1);
             assert!(!queue_contains(&conn, expected), "expected {expected:?} to settle next");
             settled_order.push(expected);
@@ -5026,7 +5091,7 @@ mod tests {
         let one_stream = budget(1, u64::MAX, u64::MAX, false);
 
         reset_settle_work_counters();
-        let first = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let first = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         let (listings, probes) = settle_work_counters();
         assert_eq!(first.settled_streams, 1);
         assert!(
@@ -5054,7 +5119,7 @@ mod tests {
         // A repeated call keeps the SAME per-call bound: draining stays linear in total, with no
         // per-call full scan.
         reset_settle_work_counters();
-        let second = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let second = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         let (listings, probes) = settle_work_counters();
         assert_eq!(second.settled_streams, 1);
         assert!(!second.queue_empty);
@@ -5092,7 +5157,7 @@ mod tests {
         // vanished rows, so discovery must page onward — without ever listing the rest of the
         // queue — to reach the first eligible stream.
         reset_settle_work_counters();
-        let report = settle_pending_content_refolds_inner(&conn, &one_stream, || {
+        let report = settle_pending_content_refolds_inner(&conn, &one_stream, NOW, || {
             for ordinal in 0..VANISHED {
                 concurrent
                     .execute("DELETE FROM content_streams_pending_refold WHERE stream_id = ?1", [
@@ -5144,7 +5209,7 @@ mod tests {
         let one_stream = budget(1, 2, u64::MAX, false);
 
         reset_settle_work_counters();
-        let report = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let report = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         let (listings, probes) = settle_work_counters();
 
         assert_eq!(report.settled_streams, 1, "the smaller later stream settles");
@@ -5184,7 +5249,7 @@ mod tests {
         let one_stream = budget(1, 2, 2 * SYNTHETIC_ROW_BYTES, false);
 
         reset_settle_work_counters();
-        let first = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let first = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         let (listings, probes) = settle_work_counters();
         assert_eq!(first.settled_streams, 1, "the small stream settles on the FIRST call");
         assert!(!queue_contains(&conn, small));
@@ -5197,7 +5262,7 @@ mod tests {
 
         // A follow-up call over the pure-oversize queue discovers nothing and probes nothing.
         reset_settle_work_counters();
-        let second = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let second = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         let (listings, probes) = settle_work_counters();
         assert_eq!(second.settled_streams, 0);
         assert!(!second.queue_empty);
@@ -5220,7 +5285,7 @@ mod tests {
         let maintenance = budget(1, 2, u64::MAX, true);
 
         reset_settle_work_counters();
-        let report = settle_pending_content_refolds(&conn, &maintenance).unwrap();
+        let report = settle_pending_content_refolds(&conn, &maintenance, NOW).unwrap();
         let (listings, probes) = settle_work_counters();
         assert_eq!(report.settled_streams, 1);
         assert_eq!(report.consumed_candidates, 3, "the intentional exceedance is charged");
@@ -5230,7 +5295,7 @@ mod tests {
         assert_eq!(listings, 2, "one filtered page plus the single targeted oversize query");
         assert_eq!(probes, 1, "only the admitted oversize row pays for a transaction");
 
-        let report = settle_pending_content_refolds(&conn, &maintenance).unwrap();
+        let report = settle_pending_content_refolds(&conn, &maintenance, NOW).unwrap();
         assert_eq!(report.settled_streams, 1);
         assert!(report.queue_empty);
     }
@@ -5253,7 +5318,7 @@ mod tests {
         // Two stream slots for four eligible rows: the budget runs out with eligible work queued.
         let maintenance = budget(2, 2, u64::MAX, true);
 
-        let report = settle_pending_content_refolds(&conn, &maintenance).unwrap();
+        let report = settle_pending_content_refolds(&conn, &maintenance, NOW).unwrap();
         assert_eq!(report.settled_streams, 2, "only the two budgeted eligible rows settle");
         assert!(
             queue_contains(&conn, oversize),
@@ -5286,7 +5351,7 @@ mod tests {
         .unwrap();
         let maintenance = budget(4, 5, u64::MAX, true);
 
-        let report = settle_pending_content_refolds(&conn, &maintenance).unwrap();
+        let report = settle_pending_content_refolds(&conn, &maintenance, NOW).unwrap();
         assert_eq!(report.failures.len(), 1, "the poisoned row is attempted and fails");
         assert!(
             !queue_contains(&conn, oversize),
@@ -5310,7 +5375,7 @@ mod tests {
         seed_synthetic_candidates(&conn, arrival, 1);
         enqueue_refold(&conn, arrival, 2);
 
-        let report = settle_pending_content_refolds(&conn, &maintenance).unwrap();
+        let report = settle_pending_content_refolds(&conn, &maintenance, NOW).unwrap();
         assert!(
             !queue_contains(&conn, oversize),
             "a steady trickle of eligible rows no longer starves oversize maintenance",
@@ -5328,7 +5393,8 @@ mod tests {
         seed_synthetic_candidates(&conn, oversize, 50);
         enqueue_refold(&conn, oversize, 1);
 
-        let report = settle_pending_content_refolds(&conn, &budget(4, 5, u64::MAX, false)).unwrap();
+        let report =
+            settle_pending_content_refolds(&conn, &budget(4, 5, u64::MAX, false), NOW).unwrap();
         assert_eq!(report.settled_streams, 0);
         assert_eq!(report.deferred_oversize, 0, "a listing-filtered row is never counted here");
         assert!(report.failures.is_empty());
@@ -5365,7 +5431,7 @@ mod tests {
         // Call 1: the poisoned stream is oldest, admitted first, and fails; its one stream slot is
         // spent so the healthy stream is deferred. The failed row is demoted behind the healthy
         // row.
-        let first = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let first = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         assert_eq!(first.settled_streams, 0, "the poisoned stream took the only stream slot");
         assert_eq!(first.failures.len(), 1);
         assert_eq!(first.failures[0].stream_id, StreamId::from_bytes(poisoned));
@@ -5379,7 +5445,7 @@ mod tests {
         // Call 2: because the poisoned row was demoted, the healthy stream is now oldest and
         // settles — without demotion the poisoned oldest row would head-of-line block it
         // forever.
-        let second = settle_pending_content_refolds(&conn, &one_stream).unwrap();
+        let second = settle_pending_content_refolds(&conn, &one_stream, NOW).unwrap();
         assert_eq!(second.settled_streams, 1, "the healthy stream settles once the poison demoted");
         assert!(!queue_contains(&conn, healthy));
         assert!(queue_contains(&conn, poisoned), "the poisoned stream is still queued for retry");
@@ -5429,7 +5495,7 @@ mod tests {
         );
 
         reset_settle_work_counters();
-        let report = settle_pending_content_refolds(&conn, &unbounded).unwrap();
+        let report = settle_pending_content_refolds(&conn, &unbounded, NOW).unwrap();
         let (listings, probes) = settle_work_counters();
 
         // Fairness: every healthy row settles despite the failing oldest row on page 1.

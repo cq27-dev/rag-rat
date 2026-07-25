@@ -20,7 +20,7 @@ use super::super::keywrap::{self, ContentKey, KeyId, WrapContext};
 use super::super::{AccountId, bootstrap, content, envelope, fold, storage};
 use super::ops::{self, DecodedSecretsOp, StreamKeyWrap};
 use super::security_event::{self, SyncSecurityEvent, SyncSecurityEventKind};
-use crate::identity::LocalDevice;
+use crate::identity::{LocalDevice, load_local_device};
 use crate::stream::StreamId;
 
 /// The current sealing selection for a stream — the winning `(epoch, key_id)` over the accepted
@@ -139,7 +139,59 @@ pub fn live_stream_key_targets_for_device(
     storage::effective_roster_x25519_pubkey(conn, account_id, target)?.context(
         "stream-key catch-up target is not currently roster-effective in the local account",
     )?;
+    let live = live_stream_key_epochs(conn, account_id, streams)?;
 
+    let mut required = Vec::new();
+    let mut already_covered = Vec::new();
+    for key in live {
+        let covered = list_accepted_stream_key_wraps(conn, account_id, key.stream_id)?
+            .iter()
+            .filter(|accepted| {
+                accepted.wrap.key_epoch == key.key_epoch
+                    && KeyId::from_bytes(accepted.wrap.key_id) == key.key_id
+            })
+            .flat_map(|accepted| &accepted.wrap.wraps)
+            .any(|wrap| wrap.recipient_fp == target);
+        if covered {
+            already_covered.push(key);
+        } else {
+            required.push(key);
+        }
+    }
+    Ok(LiveKeyTargets { required, already_covered })
+}
+
+/// Verify the local founder can recover every live exact key a new device needs, then return the
+/// catch-up workload. Enrollment minting calls this before issuing a ticket; counting alone would
+/// allow a permanently unusable invite when an accepted wrap omitted or cannot decrypt locally.
+pub(crate) fn recoverable_live_stream_key_target_count(
+    conn: &Connection,
+    account_id: AccountId,
+    streams: &[StreamId],
+) -> anyhow::Result<usize> {
+    let live = live_stream_key_epochs(conn, account_id, streams)?;
+    let device = load_local_device(conn)?
+        .context("cannot preflight enrollment key recovery without a local device")?;
+    for target in &live {
+        anyhow::ensure!(
+            recover_exact_historical_content_key(conn, account_id, *target, &device)?.is_some(),
+            "live content key is not recoverable for enrollment catch-up (stream {:?}, epoch {}, \
+             key {:?})",
+            target.stream_id,
+            target.key_epoch,
+            target.key_id,
+        );
+    }
+    Ok(live.len())
+}
+
+/// Every live exact key group in `streams` (see [`live_stream_key_targets_for_device`] for what
+/// "live" means). Each requested stream must currently be owned by `account_id`.
+pub(super) fn live_stream_key_epochs(
+    conn: &Connection,
+    account_id: AccountId,
+    streams: &[StreamId],
+) -> anyhow::Result<Vec<LiveKeyEpoch>> {
     let mut stmt = conn.prepare(
         "SELECT stream_id FROM account_stream_ownership
          WHERE account_id = ?1 ORDER BY stream_id",
@@ -203,25 +255,7 @@ pub fn live_stream_key_targets_for_device(
 
     live.sort_by_key(|key| (key.stream_id.to_bytes(), key.key_epoch, key.key_id.to_bytes()));
     live.dedup();
-
-    let mut required = Vec::new();
-    let mut already_covered = Vec::new();
-    for key in live {
-        let covered = list_accepted_stream_key_wraps(conn, account_id, key.stream_id)?
-            .iter()
-            .filter(|accepted| {
-                accepted.wrap.key_epoch == key.key_epoch
-                    && KeyId::from_bytes(accepted.wrap.key_id) == key.key_id
-            })
-            .flat_map(|accepted| &accepted.wrap.wraps)
-            .any(|wrap| wrap.recipient_fp == target);
-        if covered {
-            already_covered.push(key);
-        } else {
-            required.push(key);
-        }
-    }
-    Ok(LiveKeyTargets { required, already_covered })
+    Ok(live)
 }
 
 fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {

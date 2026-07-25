@@ -257,7 +257,10 @@ mod tests {
     fn alpn_identifiers_are_frozen() {
         assert_eq!(SYNC_ALPN, b"rag-rat/sync/2");
         assert_eq!(CONTENT_SYNC_ALPN, b"rag-rat/content/1");
+        assert_eq!(crate::enrollment::ENROLL_ALPN, b"rag-rat/enroll/1");
         assert_ne!(SYNC_ALPN, CONTENT_SYNC_ALPN);
+        assert_ne!(SYNC_ALPN, crate::enrollment::ENROLL_ALPN);
+        assert_ne!(CONTENT_SYNC_ALPN, crate::enrollment::ENROLL_ALPN);
     }
 
     #[test]

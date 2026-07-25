@@ -133,7 +133,7 @@ pub(crate) fn drain_synced_stream_for_repo(
     // the projection read, so the drain mirrors a CURRENT accepted set. A settle failure propagates
     // and rolls the drain back, so the barrier stays fail-closed (same discipline as the
     // reconcile).
-    rag_rat_oplog::settle_pending_content_refold_for_stream_in_tx(&tx, stream)?;
+    rag_rat_oplog::settle_pending_content_refold_for_stream_in_tx(&tx, stream, now_ms)?;
     let outcome = drain_synced_stream_in_tx(&tx, repo_id, stream, now_ms)?;
     // Stamp the watermark to the epoch AFTER the settle above (which may have advanced it), so the
     // next `content_drain_needed` short-circuits until the projection changes again. In the same

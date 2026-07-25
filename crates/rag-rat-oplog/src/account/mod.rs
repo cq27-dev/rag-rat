@@ -43,18 +43,28 @@ mod storage;
 // `established_owned_stream_v2` (derivation + effective-ownership fact — the reconcile's fast-path
 // probe). #664 wires all three into `query::memory`, so they are plain re-exports.
 pub use authoring::{
-    EnrollingDevice, author_device_add_in_tx, ensure_owned_stream_v2_in_tx,
-    established_owned_stream_v2, owned_stream_v2_id,
+    EnrollingDevice, author_device_add_in_tx, author_enrollment_device_add_in_tx,
+    enrollment_authoring_fits, enrollment_authoring_requirements, ensure_owned_stream_v2_in_tx,
+    established_owned_stream_v2, owned_stream_v2_id, retry_enrollment_pre_verify,
+    validate_device_add_label,
 };
-pub use bootstrap::{local_account, read_local_account};
+pub use bootstrap::{
+    AuthoredDurability, ENROLLMENT_HELD_ENTRY_HASHES_MAX, EnrollmentBootstrap, EnrollmentBudget,
+    adopt_enrollment_bootstrap, adopt_local_account, enrollment_budget, held_account_entry_hashes,
+    local_account, prune_account_candidate_reservations_in_tx, read_local_account,
+    release_account_candidate_reservation_in_tx, upsert_account_candidate_reservation_in_tx,
+};
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, ContentRefoldBudget,
     ContentSettleReport, ContentStreamSettleFailure, SignedContentEntry, VerifiedContentEntry,
     content_ingest, content_stream_has_pending_refold, decode_content_signed,
     settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
-    sign_content_entry, verify_content_signed,
 };
+// The envelope sign/verify primitives take `&DeviceSecret`/`&DevicePublic` (`pub(crate)`
+// types), so they stay off the crate-root glob — account-internal consumers reach them through
+// `content`.
+
 // The C5a sealed-authoring surface (#608): the envelope-layer seal
 // (`sign_sealed_content_entry` + its OS-nonce wrapper `seal_and_sign_content_entry`), the
 // policy-aware prepared authoring surface, sealed-op size predicate, and downgrade-ratchet
@@ -77,7 +87,7 @@ pub use content::{author_content_batch_in_tx, content_op_is_authorable, content_
 // re-fold (#688).
 pub(crate) use content::{content_projected_tables_exist, open_sealed_payload};
 #[allow(unused_imports, reason = "envelope tests consume these crate-internal signing seams")]
-pub use content::{seal_and_sign_content_entry, sign_sealed_content_entry};
+pub(in crate::account) use content::{seal_and_sign_content_entry, sign_sealed_content_entry};
 pub use fold::{
     AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, GrantAuthority,
     GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,
@@ -97,9 +107,10 @@ pub use ops::{DeviceCut, DeviceRole, GrantRole};
 pub use secrets::{
     CatchUpReport, ContentKeyring, LiveKeyEpoch, LiveKeyTargets, RotationOutcome,
     SealingKeyOutcome, SelectedWrap, catch_up_stream_keys_for_device_in_tx, current_sealing_key,
-    ensure_stream_key_current_in_tx, historical_content_keyring,
-    live_stream_key_targets_for_device, mint_and_author_stream_key_wrap_in_tx,
-    rotate_stream_key_in_tx, select_current_sealing_wrap, stream_key_rotation_needed,
+    enroll_stream_keys_for_device_in_tx, ensure_stream_key_current_in_tx,
+    historical_content_keyring, live_stream_key_targets_for_device,
+    mint_and_author_stream_key_wrap_in_tx, rotate_stream_key_in_tx, select_current_sealing_wrap,
+    stream_key_rotation_needed,
 };
 // The C6 snapshot-authoring seam (#609). No caller fires it yet, and that is deliberate rather
 // than an oversight: a snapshot is only worth minting once something reads one. #406 owns both
@@ -111,8 +122,10 @@ pub use secrets::{
 pub use snapshot::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub(crate) use storage::stream_owner_account;
 pub use storage::{
-    CapacityScope, IngestOutcome, SyncAccountEntry, account_entries_for_sync, account_entry_ref,
-    account_ingest, account_signed_entry_exists, account_signed_hash, auth_len_freshness,
-    backfill_authority_projection, grant_effective_for_device, owner_control_authority,
-    owner_secrets_authority, roster_content_authority, stream_owner_effective,
+    CapacityScope, IngestOutcome, SyncAccountEntry, account_entries_for_enrollment,
+    account_entries_for_sync, account_entry_ref, account_ingest, account_signed_entry_exists,
+    account_signed_hash, auth_len_freshness, backfill_authority_projection,
+    grant_effective_for_device, owned_streams_for_account, owner_control_authority,
+    owner_control_authority_in_snapshot, owner_secrets_authority, roster_content_authority,
+    stream_owner_effective, verify_enrollment_device_add,
 };
