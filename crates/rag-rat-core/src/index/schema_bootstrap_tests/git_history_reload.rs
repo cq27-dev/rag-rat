@@ -985,22 +985,108 @@ fn idle_discover_sweep_does_not_rewrite_indexed_at_ms() {
 }
 
 #[test]
-fn index_discover_reporting_flags_content_changes() {
+fn index_watch_reporting_flags_content_changes() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     let config = git_history_test_config(&root);
     IndexDatabase::rebuild(&config).unwrap();
 
     // No change → reports false, so the watch loop skips the reconcile / memory-validate tail.
-    let (_db, pass) = IndexDatabase::index_discover_reporting(&config).unwrap();
-    assert!(!pass.content_changed, "an unchanged discover sweep must report no content change");
+    let (_db, pass) = IndexDatabase::index_watch_reporting(&config).unwrap();
+    assert!(!pass.content_changed, "an unchanged changed-mode pass must report no content change");
 
     // A new file on disk → reports true.
     fs::write(root.join("docs/extra.md"), "# Extra\nbody text\n").unwrap();
-    let (_db, pass) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    let (_db, pass) = IndexDatabase::index_watch_reporting(&config).unwrap();
     assert!(
         pass.content_changed,
-        "a discover sweep that indexes a new file must report a content change"
+        "a changed-mode pass that indexes a new file must report a content change"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn watch_reporting_discovers_a_vanished_untracked_file() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let config = git_history_test_config(&root);
+    IndexDatabase::rebuild(&config).unwrap();
+
+    fs::write(root.join("docs/untracked.md"), "# Untracked\n").unwrap();
+    let (db, pass) = IndexDatabase::index_watch_reporting(&config).unwrap();
+    assert!(pass.content_changed);
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'docs/untracked.md'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    drop(db);
+
+    fs::remove_file(root.join("docs/untracked.md")).unwrap();
+    let (db, pass) = IndexDatabase::index_watch_reporting(&config).unwrap();
+    assert!(pass.content_changed, "the stale worktree-scoped row must force discovery");
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'docs/untracked.md'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn watch_reporting_discovers_ignore_rule_changes() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let config = git_history_test_config(&root);
+    IndexDatabase::rebuild(&config).unwrap();
+
+    fs::write(root.join(".gitignore"), ".rag-rat/\ndocs/search.md\n").unwrap();
+    let (db, pass) = IndexDatabase::index_watch_reporting(&config).unwrap();
+    assert!(pass.content_changed);
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'docs/search.md'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn watch_reporting_does_not_index_a_changed_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let config = git_history_test_config(&root);
+    IndexDatabase::rebuild(&config).unwrap();
+
+    symlink("guide.md", root.join("docs/link.md")).unwrap();
+    let (db, pass) = IndexDatabase::index_watch_reporting(&config).unwrap();
+    assert!(!pass.content_changed, "the authoritative walk must reject the symlink");
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'docs/link.md'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
     );
 
     let _ = fs::remove_dir_all(root);

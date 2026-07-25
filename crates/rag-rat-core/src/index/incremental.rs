@@ -81,8 +81,23 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        Self::index_incremental_with_progress(config, IndexMode::Changed, None, &mut progress)
-            .map(|(db, _)| db)
+        Self::index_incremental_with_progress(
+            config,
+            IndexMode::Changed,
+            None,
+            false,
+            &mut progress,
+        )
+        .map(|(db, _)| db)
+    }
+
+    /// Watcher-safe reporting entry point. A complete, clean Git scope with no worktree-scoped
+    /// rows uses the cheap `Changed` preparation; every ambiguous case retains authoritative
+    /// discovery semantics (non-Git roots, dirty paths, and stale untracked/modified rows).
+    pub(crate) fn index_watch_reporting(
+        config: &Config,
+    ) -> anyhow::Result<(Self, IncrementalPassReport)> {
+        Self::index_incremental_with_progress(config, IndexMode::Changed, None, true, &mut |_| {})
     }
 
     /// Reconcile exactly the supplied candidate `paths` (#659) — the edit-driven-reindex substrate.
@@ -105,8 +120,14 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        Self::index_incremental_with_progress(config, IndexMode::Paths, Some(paths), &mut progress)
-            .map(|(db, _)| db)
+        Self::index_incremental_with_progress(
+            config,
+            IndexMode::Paths,
+            Some(paths),
+            false,
+            &mut progress,
+        )
+        .map(|(db, _)| db)
     }
 
     pub fn index_discover(config: &Config) -> anyhow::Result<Self> {
@@ -117,23 +138,29 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        Self::index_incremental_with_progress(config, IndexMode::Discover, None, &mut progress)
-            .map(|(db, _)| db)
+        Self::index_incremental_with_progress(
+            config,
+            IndexMode::Discover,
+            None,
+            false,
+            &mut progress,
+        )
+        .map(|(db, _)| db)
     }
 
     /// Like [`Self::index_discover`], but also reports whether the pass changed index *content*
-    /// (a file was added / edited / removed). The watch loop uses this to skip the
-    /// reconcile / memory-validate tail on an idle no-change sweep (issue #63).
+    /// (a file was added / edited / removed).
     pub(crate) fn index_discover_reporting(
         config: &Config,
     ) -> anyhow::Result<(Self, IncrementalPassReport)> {
-        Self::index_incremental_with_progress(config, IndexMode::Discover, None, &mut |_| {})
+        Self::index_incremental_with_progress(config, IndexMode::Discover, None, false, &mut |_| {})
     }
 
     fn index_incremental_with_progress<F>(
         config: &Config,
         mode: IndexMode,
         explicit_paths: Option<&[PathBuf]>,
+        watch_safe_fast_path: bool,
         progress: &mut F,
     ) -> anyhow::Result<(Self, IncrementalPassReport)>
     where
@@ -288,12 +315,14 @@ impl IndexDatabase {
         // HEAD/target fingerprint, #459) to complete the scope; the named paths are a
         // subset discovery already covers. On a COMPLETE scope, `Paths` keeps its scoped
         // behavior.
-        let effective_mode =
-            if active_scope_incomplete && matches!(mode, IndexMode::Changed | IndexMode::Paths) {
-                IndexMode::Discover
-            } else {
-                mode
-            };
+        let effective_mode = if (active_scope_incomplete
+            && matches!(mode, IndexMode::Changed | IndexMode::Paths))
+            || (watch_safe_fast_path && !db.watch_changed_fast_path_is_safe(config))
+        {
+            IndexMode::Discover
+        } else {
+            mode
+        };
         progress(IndexProgress::Started {
             database: config.database.clone(),
             mode: effective_mode,
@@ -558,6 +587,30 @@ impl IndexDatabase {
         // via its full DB scan.
         let clone_delta_hint = (healed == 0).then_some(touched_base_paths);
         Ok((db, IncrementalPassReport { content_changed, clone_delta_hint }))
+    }
+
+    /// A git-status-only pass is authoritative for the watcher only when there is no current
+    /// filesystem ambiguity. Worktree-scoped rows include untracked and modified content; if Git
+    /// now reports a clean tree, discovery must reconcile rows whose untracked file vanished or
+    /// whose tracked file was restored. Any current dirt is also discovered so ignore changes and
+    /// symlink replacements retain the authoritative walk's semantics.
+    fn watch_changed_fast_path_is_safe(&self, config: &Config) -> bool {
+        let Ok(changes) = git_changed_paths(&config.root) else {
+            return false;
+        };
+        if !changes.changed.is_empty() || !changes.deleted.is_empty() {
+            return false;
+        }
+        self.storage
+            .connection()
+            .query_row(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM files WHERE worktree_id <> ''
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false)
     }
 
     /// Standalone full-corpus indexing into the CURRENT context — no generation staging, no

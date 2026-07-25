@@ -324,8 +324,8 @@ fn run_pass(
     // "nothing to index yet" and DEFERS silently — a later pass registers once real content
     // appears. A recorded root going empty still prunes (not first-time → not refused). The
     // one-shot `index` command instead surfaces the same error to the operator.
-    let discover = timings.stage("discover", || IndexDatabase::index_discover_reporting(config));
-    let (mut db, pass) = match discover {
+    let index = timings.stage("index", || IndexDatabase::index_watch_reporting(config));
+    let (mut db, pass) = match index {
         Ok(result) => result,
         Err(err) if err.downcast_ref::<crate::index::EmptyIndexRefused>().is_some() => {
             return Ok(());
