@@ -2,7 +2,7 @@
 use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
-pub(super) fn kotlin_edges(
+pub(in crate::index::languages) fn kotlin_edges(
     EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
     emit: &mut EdgeEmitter<'_>,
 ) {

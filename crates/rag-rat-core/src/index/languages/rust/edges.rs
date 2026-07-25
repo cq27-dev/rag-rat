@@ -6,7 +6,7 @@ use super::dispatch;
 use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
-pub(super) fn rust_edges(
+pub(in crate::index::languages) fn rust_edges(
     EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
     emit: &mut EdgeEmitter<'_>,
 ) {

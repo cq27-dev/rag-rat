@@ -6,7 +6,7 @@ use super::syntax;
 use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
-pub(super) fn swift_edges(
+pub(in crate::index::languages) fn swift_edges(
     EdgeVisit { text, node, symbols, path, locator }: EdgeVisit<'_, '_, '_>,
     emit: &mut EdgeEmitter<'_>,
 ) {

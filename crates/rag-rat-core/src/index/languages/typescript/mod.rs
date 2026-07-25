@@ -2,10 +2,11 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{EdgeBackend, EdgeEmitter, EdgeVisit, ParserBackend, SymbolMatch};
+use super::{ParserBackend, SymbolMatch};
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
+pub(super) use edges::typescript_edges;
 
 pub(super) static SUPPORT: TypeScript = TypeScript;
 
@@ -51,11 +52,5 @@ impl ParserBackend for TypeScript {
 
     fn is_plumbing_node(&self, node: Node<'_>) -> bool {
         node.kind().contains("comment") || node.kind() == "import_statement"
-    }
-}
-
-impl EdgeBackend for TypeScript {
-    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
-        edges::typescript_edges(visit, emit);
     }
 }

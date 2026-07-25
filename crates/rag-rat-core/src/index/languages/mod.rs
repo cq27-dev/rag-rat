@@ -84,9 +84,13 @@ pub(super) trait ParserBackend: Sync {
 }
 
 /// Grammar-specific edge recognition for one node visited by the shared depth-safe edge walk.
-pub(super) trait EdgeBackend: Sync {
-    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>);
-}
+///
+/// Extractors are registered functions rather than trait objects: they carry no state and the
+/// language implementations previously did nothing except forward these two arguments.
+pub(super) type EdgeExtractor = for<'tree, 'source, 'context, 'emit, 'out> fn(
+    EdgeVisit<'tree, 'source, 'context>,
+    &'emit mut EdgeEmitter<'out>,
+);
 
 #[derive(Clone, Copy)]
 pub(super) struct KindPreference {
@@ -196,15 +200,14 @@ pub(super) fn parser_backend(language: Language) -> &'static dyn ParserBackend {
     }
 }
 
-pub(super) fn edge_backend(language: Language) -> Option<&'static dyn EdgeBackend> {
+pub(super) fn edge_extractor(language: Language) -> Option<EdgeExtractor> {
     match language {
-        Language::Rust => Some(&rust::SUPPORT),
-        Language::TypeScript => Some(&typescript::SUPPORT),
-        Language::Kotlin => Some(&kotlin::SUPPORT),
-        Language::C => Some(&c_family::C_SUPPORT),
-        Language::Cpp => Some(&c_family::CPP_SUPPORT),
-        Language::Python => Some(&python::SUPPORT),
-        Language::Swift => Some(&swift::SUPPORT),
+        Language::Rust => Some(rust::rust_edges),
+        Language::TypeScript => Some(typescript::typescript_edges),
+        Language::Kotlin => Some(kotlin::kotlin_edges),
+        Language::C | Language::Cpp => Some(c_family::c_like_edges),
+        Language::Python => Some(python::python_edges),
+        Language::Swift => Some(swift::swift_edges),
         Language::Markdown => None,
     }
 }
@@ -266,7 +269,7 @@ mod tests {
 
     use rag_rat_base::language::Language;
 
-    use super::{edge_backend, parser_backend};
+    use super::{edge_extractor, parser_backend};
     use crate::index::parser::{self, ParserKind};
 
     #[test]
@@ -279,7 +282,7 @@ mod tests {
             let kind = parser_backend(language).parser_kind(path);
             assert_eq!(kind == ParserKind::Markdown, language == Language::Markdown);
             assert_eq!(parser::grammar_for(kind).is_some(), language != Language::Markdown);
-            assert_eq!(edge_backend(language).is_some(), language != Language::Markdown);
+            assert_eq!(edge_extractor(language).is_some(), language != Language::Markdown);
         }
     }
 }

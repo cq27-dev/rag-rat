@@ -2,7 +2,7 @@
 use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
-pub(super) fn typescript_edges(
+pub(in crate::index::languages) fn typescript_edges(
     EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
     emit: &mut EdgeEmitter<'_>,
 ) {

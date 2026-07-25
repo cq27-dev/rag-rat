@@ -2,10 +2,11 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{EdgeBackend, EdgeEmitter, EdgeVisit, ParserBackend, ResolverPolicy, SymbolMatch};
+use super::{ParserBackend, ResolverPolicy, SymbolMatch};
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
+pub(super) use edges::kotlin_edges;
 
 pub(super) static SUPPORT: Kotlin = Kotlin;
 
@@ -96,12 +97,6 @@ fn variable_declaration(node: Node<'_>) -> Option<Node<'_>> {
             }
         })
     })
-}
-
-impl EdgeBackend for Kotlin {
-    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
-        edges::kotlin_edges(visit, emit);
-    }
 }
 
 impl ResolverPolicy for Kotlin {

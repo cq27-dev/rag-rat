@@ -3,12 +3,13 @@ use std::path::Path;
 use tree_sitter::Node;
 
 use super::{
-    EdgeBackend, EdgeEmitter, EdgeVisit, ImportAliasRebind, ImportAliasRequest, KindPreference,
-    ParserBackend, ResolverPolicy, SymbolMatch,
+    ImportAliasRebind, ImportAliasRequest, KindPreference, ParserBackend, ResolverPolicy,
+    SymbolMatch,
 };
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
+pub(super) use edges::python_edges;
 
 pub(super) static SUPPORT: Python = Python;
 
@@ -118,12 +119,6 @@ fn assignment_is_const_scope(node: Node<'_>) -> bool {
         }
     }
     false
-}
-
-impl EdgeBackend for Python {
-    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
-        edges::python_edges(visit, emit);
-    }
 }
 
 impl ResolverPolicy for Python {

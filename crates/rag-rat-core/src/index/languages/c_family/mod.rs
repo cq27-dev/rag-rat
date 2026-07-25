@@ -2,10 +2,11 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{EdgeBackend, EdgeEmitter, EdgeVisit, ParserBackend, ResolverPolicy, SymbolMatch};
+use super::{ParserBackend, ResolverPolicy, SymbolMatch};
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
+pub(super) use edges::c_like_edges;
 
 pub(super) static C_SUPPORT: C = C;
 pub(super) static CPP_SUPPORT: Cpp = Cpp;
@@ -102,19 +103,6 @@ fn function_name(node: Node<'_>) -> Option<Node<'_>> {
     }
     parser::last_descendant_node(name_root, parser::NAME_KINDS)
 }
-
-macro_rules! impl_edges {
-    ($backend:ty) => {
-        impl EdgeBackend for $backend {
-            fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
-                edges::c_like_edges(visit, emit);
-            }
-        }
-    };
-}
-
-impl_edges!(C);
-impl_edges!(Cpp);
 
 macro_rules! impl_resolver_policy {
     ($backend:ty) => {

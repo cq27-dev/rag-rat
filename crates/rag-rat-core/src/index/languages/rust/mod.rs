@@ -2,11 +2,12 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{EdgeBackend, EdgeEmitter, EdgeVisit, ParserBackend, ResolverPolicy, SymbolMatch};
+use super::{ParserBackend, ResolverPolicy, SymbolMatch};
 use crate::index::parser::{self, ParsedSymbolFact, ParserKind};
 
 mod dispatch;
 mod edges;
+pub(super) use edges::rust_edges;
 
 pub(super) static SUPPORT: Rust = Rust;
 
@@ -129,12 +130,6 @@ fn attribute_items(text: &str, node: Node<'_>) -> Vec<String> {
     preceding.reverse();
     preceding.extend(attributes);
     preceding
-}
-
-impl EdgeBackend for Rust {
-    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
-        edges::rust_edges(visit, emit);
-    }
 }
 
 impl ResolverPolicy for Rust {

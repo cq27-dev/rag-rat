@@ -2,12 +2,11 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{
-    EdgeBackend, EdgeEmitter, EdgeVisit, KindPreference, ParserBackend, ResolverPolicy, SymbolMatch,
-};
+use super::{KindPreference, ParserBackend, ResolverPolicy, SymbolMatch};
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
+pub(super) use edges::swift_edges;
 pub(super) mod syntax;
 
 pub(super) static SUPPORT: Swift = Swift;
@@ -269,12 +268,6 @@ fn direct_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tr
         let index = u32::try_from(index).ok()?;
         node.child(index).filter(|child| child.kind() == kind)
     })
-}
-
-impl EdgeBackend for Swift {
-    fn edges(&self, visit: EdgeVisit<'_, '_, '_>, emit: &mut EdgeEmitter<'_>) {
-        edges::swift_edges(visit, emit);
-    }
 }
 
 impl ResolverPolicy for Swift {

@@ -26,7 +26,7 @@ pub(crate) fn edge_candidates(
     text: &str,
     symbols: &[IndexedSymbol],
 ) -> anyhow::Result<Vec<EdgeCandidate>> {
-    if crate::index::languages::edge_backend(language).is_none() {
+    if crate::index::languages::edge_extractor(language).is_none() {
         return Ok(Vec::new());
     }
     let mut candidates = contains_edges(symbols);
@@ -43,7 +43,7 @@ pub(crate) fn edge_candidates_from_root(
     root: Node<'_>,
     symbols: &[IndexedSymbol],
 ) -> Vec<EdgeCandidate> {
-    if crate::index::languages::edge_backend(language).is_none() {
+    if crate::index::languages::edge_extractor(language).is_none() {
         return Vec::new();
     }
     let mut candidates = contains_edges(symbols);
@@ -145,7 +145,7 @@ pub(crate) fn collect_edges(
     path: &Path,
     out: &mut Vec<EdgeCandidate>,
 ) {
-    let Some(backend) = crate::index::languages::edge_backend(language) else {
+    let Some(extract) = crate::index::languages::edge_extractor(language) else {
         return;
     };
     let context =
@@ -158,7 +158,7 @@ pub(crate) fn collect_edges(
         if node.is_error() || node.is_missing() {
             continue;
         }
-        backend.edges(context.visit(node), &mut emit);
+        extract(context.visit(node), &mut emit);
         named_children.clear();
         named_children.extend(node.named_children(&mut cursor));
         for &child in named_children.iter().rev() {
