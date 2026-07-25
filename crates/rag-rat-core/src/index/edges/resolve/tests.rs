@@ -219,24 +219,22 @@ fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
     let foreign_function = preferred_candidate(10, Language::Rust, "function");
     let swift_constructor = preferred_candidate(11, Language::Swift, "constructor");
 
-    let implements =
-        preferred_matches(EdgeKind::Implements.as_str(), Some(Language::Swift.as_str()), &[
-            &foreign_trait,
-            &protocol,
-        ]);
+    let implements = preferred_matches(EdgeKind::Implements, Some(Language::Swift.as_str()), &[
+        &foreign_trait,
+        &protocol,
+    ]);
     assert_eq!(implements.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![protocol.id]);
 
-    let inheritance =
-        preferred_matches(EdgeKind::Implements.as_str(), Some(Language::Swift.as_str()), &[
-            &foreign_trait,
-            &swift_class,
-        ]);
+    let inheritance = preferred_matches(EdgeKind::Implements, Some(Language::Swift.as_str()), &[
+        &foreign_trait,
+        &swift_class,
+    ]);
     assert_eq!(inheritance.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![
         swift_class.id
     ]);
 
     let protocol_reference =
-        preferred_matches(EdgeKind::ReferencesType.as_str(), Some(Language::Swift.as_str()), &[
+        preferred_matches(EdgeKind::ReferencesType, Some(Language::Swift.as_str()), &[
             &foreign_trait,
             &protocol,
         ]);
@@ -245,7 +243,7 @@ fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
     ]);
 
     for edge_kind in [EdgeKind::Constructs, EdgeKind::ReferencesType] {
-        let preferred = preferred_matches(edge_kind.as_str(), Some(Language::Swift.as_str()), &[
+        let preferred = preferred_matches(edge_kind, Some(Language::Swift.as_str()), &[
             &foreign_struct,
             &actor,
         ]);
@@ -256,15 +254,14 @@ fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
         );
     }
 
-    let macro_use =
-        preferred_matches(EdgeKind::UsesMacro.as_str(), Some(Language::Swift.as_str()), &[
-            &foreign_macro,
-            &swift_macro,
-        ]);
+    let macro_use = preferred_matches(EdgeKind::UsesMacro, Some(Language::Swift.as_str()), &[
+        &foreign_macro,
+        &swift_macro,
+    ]);
     assert_eq!(macro_use.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![swift_macro.id]);
 
     let enum_construction =
-        preferred_matches(EdgeKind::Constructs.as_str(), Some(Language::Swift.as_str()), &[
+        preferred_matches(EdgeKind::Constructs, Some(Language::Swift.as_str()), &[
             &foreign_struct,
             &swift_enum,
         ]);
@@ -272,14 +269,14 @@ fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
         swift_enum.id
     ]);
 
-    let call = preferred_matches(EdgeKind::CallsName.as_str(), Some(Language::Swift.as_str()), &[
+    let call = preferred_matches(EdgeKind::CallsName, Some(Language::Swift.as_str()), &[
         &foreign_function,
         &swift_method,
     ]);
     assert_eq!(call.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![swift_method.id]);
 
     let initializer_call =
-        preferred_matches(EdgeKind::CallsName.as_str(), Some(Language::Swift.as_str()), &[
+        preferred_matches(EdgeKind::CallsName, Some(Language::Swift.as_str()), &[
             &foreign_function,
             &swift_constructor,
         ]);
@@ -288,21 +285,19 @@ fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
     ]);
 
     assert!(
-        preferred_matches(EdgeKind::ReferencesType.as_str(), Some(Language::Swift.as_str()), &[
+        preferred_matches(EdgeKind::ReferencesType, Some(Language::Swift.as_str()), &[
             &foreign_struct
         ],)
         .is_empty(),
         "Swift type names without a Swift target must not prefer a foreign symbol"
     );
     assert!(
-        preferred_matches(EdgeKind::UsesMacro.as_str(), Some(Language::Swift.as_str()), &[
-            &foreign_macro
-        ],)
-        .is_empty(),
+        preferred_matches(EdgeKind::UsesMacro, Some(Language::Swift.as_str()), &[&foreign_macro],)
+            .is_empty(),
         "Swift macro names without a Swift target must not prefer a foreign macro"
     );
     assert!(
-        preferred_matches(EdgeKind::CallsName.as_str(), Some(Language::Swift.as_str()), &[
+        preferred_matches(EdgeKind::CallsName, Some(Language::Swift.as_str()), &[
             &foreign_function
         ],)
         .is_empty(),
@@ -318,18 +313,17 @@ fn generic_resolution_does_not_prefer_swift_only_symbol_kinds() {
     let rust_struct = preferred_candidate(4, Language::Rust, "struct");
 
     let implements =
-        preferred_matches(EdgeKind::Implements.as_str(), Some(Language::TypeScript.as_str()), &[
+        preferred_matches(EdgeKind::Implements, Some(Language::TypeScript.as_str()), &[
             &swift_protocol,
             &rust_trait,
         ]);
     assert_eq!(implements.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![rust_trait.id]);
 
     for edge_kind in [EdgeKind::Constructs, EdgeKind::ReferencesType] {
-        let preferred =
-            preferred_matches(edge_kind.as_str(), Some(Language::TypeScript.as_str()), &[
-                &swift_actor,
-                &rust_struct,
-            ]);
+        let preferred = preferred_matches(edge_kind, Some(Language::TypeScript.as_str()), &[
+            &swift_actor,
+            &rust_struct,
+        ]);
         assert_eq!(preferred.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![
             rust_struct.id
         ]);
@@ -669,7 +663,7 @@ fn swift_local_receivers_override_external_bare_name_suppression() {
             ResolveSymbolRequest {
                 name: "make",
                 target_qualified_name: Some(&qualified),
-                edge_kind: EdgeKind::CallsName.as_str(),
+                edge_kind: EdgeKind::CallsName,
                 evidence: Some("make()"),
                 receiver_hint: Some(receiver),
                 source_file_id: 1,

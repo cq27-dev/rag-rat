@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{ParserBackend, ResolverPolicy, SymbolMatch};
+use super::{ParserBackend, ResolutionPolicy, SymbolMatch, TypeBinding};
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -104,19 +104,5 @@ fn function_name(node: Node<'_>) -> Option<Node<'_>> {
     parser::last_descendant_node(name_root, parser::NAME_KINDS)
 }
 
-macro_rules! impl_resolver_policy {
-    ($backend:ty) => {
-        impl ResolverPolicy for $backend {
-            fn preferred_kinds(&self, _edge_kind: &str) -> Option<super::KindPreference> {
-                None
-            }
-
-            fn type_reference_requires_type_definition(&self) -> bool {
-                true
-            }
-        }
-    };
-}
-
-impl_resolver_policy!(C);
-impl_resolver_policy!(Cpp);
+pub(super) const RESOLVER_POLICY: ResolutionPolicy =
+    ResolutionPolicy { type_binding: TypeBinding::DefinitionsOnly, ..ResolutionPolicy::DEFAULT };

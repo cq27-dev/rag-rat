@@ -11,6 +11,7 @@ use std::path::Path;
 use rag_rat_base::language::Language;
 use tree_sitter::Node;
 
+use super::edges::EdgeKind;
 pub(super) use super::edges::extract::{EdgeEmitter, EdgeVisit};
 use super::parser::ParserKind;
 
@@ -98,60 +99,84 @@ pub(super) struct KindPreference {
     pub(super) same_language_only: bool,
 }
 
-/// Language-semantic resolution rules that cannot be derived from generic symbol kinds.
-pub(super) trait ResolverPolicy: Sync {
-    fn preferred_kinds(&self, edge_kind: &str) -> Option<KindPreference>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DeclarationIdentity {
+    CollapseEquivalent,
+    PreserveAmbiguity,
+}
 
-    fn collapse_same_named_declarations(&self) -> bool {
-        true
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ImportBinding {
+    Uses,
+    Aliases,
+}
 
-    fn import_edges_carry_aliases(&self) -> bool {
-        false
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TypeBinding {
+    AnySymbol,
+    DefinitionsOnly,
+}
 
-    fn rebind_import_alias(&self, _request: ImportAliasRequest<'_>) -> ImportAliasRebind {
-        ImportAliasRebind::default()
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReceiverFallback {
+    None,
+    Type,
+    TypeAndValue,
+}
 
-    fn reference_is_unresolvable(&self, _edge_kind: &str, _name: &str) -> bool {
-        false
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QualifiedRoot {
+    Neutral,
+    Local,
+    External,
+}
 
-    /// A target kind the BARE-NAME fallback may bind only when the reference itself carried no
-    /// qualifier and no receiver — i.e. only for the syntactic shape that is actual evidence for
-    /// that kind.
-    ///
-    /// The qualified/receiver-bearing shapes are unaffected: they resolve through the qualified
-    /// path (`Status.idle` → the `Status::idle` case) and only fall back to the bare name when
-    /// that path finds nothing — which is exactly where a wrong bind would be manufactured.
-    fn kind_requires_unqualified_reference(&self, _edge_kind: &str, _target_kind: &str) -> bool {
-        false
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReferenceDisposition {
+    Resolve,
+    Unresolvable,
+}
 
-    fn suppress_unresolved_reference(&self, _edge_kind: &str, _evidence: Option<&str>) -> bool {
-        false
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UnresolvedDisposition {
+    Keep,
+    Suppress,
+}
 
-    fn type_reference_requires_type_definition(&self) -> bool {
-        false
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReferenceShape {
+    Any,
+    UnqualifiedOnly,
+}
 
-    fn allow_type_receiver_fallback(&self) -> bool {
-        false
-    }
+/// One inspectable bundle of language-semantic resolution choices.
+#[derive(Clone, Copy)]
+pub(super) struct ResolutionPolicy {
+    pub(super) preferred_kinds: fn(EdgeKind) -> Option<KindPreference>,
+    pub(super) declaration_identity: DeclarationIdentity,
+    pub(super) import_binding: ImportBinding,
+    pub(super) rebind_import_alias: fn(ImportAliasRequest<'_>) -> ImportAliasRebind,
+    pub(super) reference_disposition: fn(EdgeKind, &str) -> ReferenceDisposition,
+    pub(super) target_shape: fn(EdgeKind, &str) -> ReferenceShape,
+    pub(super) unresolved_disposition: fn(EdgeKind, Option<&str>) -> UnresolvedDisposition,
+    pub(super) type_binding: TypeBinding,
+    pub(super) receiver_fallback: ReceiverFallback,
+    pub(super) qualified_root: fn(&str) -> QualifiedRoot,
+}
 
-    fn allow_value_receiver_fallback(&self) -> bool {
-        false
-    }
-
-    fn rejects_qualified_root(&self, _root: &str) -> bool {
-        false
-    }
-
-    fn is_local_qualified_root(&self, _root: &str) -> bool {
-        false
-    }
+impl ResolutionPolicy {
+    pub(super) const DEFAULT: Self = Self {
+        preferred_kinds: no_kind_preference,
+        declaration_identity: DeclarationIdentity::CollapseEquivalent,
+        import_binding: ImportBinding::Uses,
+        rebind_import_alias: no_alias_rebind,
+        reference_disposition: resolvable_reference,
+        target_shape: any_reference_shape,
+        unresolved_disposition: keep_unresolved,
+        type_binding: TypeBinding::AnySymbol,
+        receiver_fallback: ReceiverFallback::None,
+        qualified_root: neutral_qualified_root,
+    };
 }
 
 pub(super) struct ImportAliasRequest<'a> {
@@ -168,9 +193,33 @@ pub(super) struct ImportAliasRebind {
     pub(super) receiver_hint: Option<String>,
 }
 
+fn no_kind_preference(_edge_kind: EdgeKind) -> Option<KindPreference> {
+    None
+}
+
+fn no_alias_rebind(_request: ImportAliasRequest<'_>) -> ImportAliasRebind {
+    ImportAliasRebind::default()
+}
+
+fn resolvable_reference(_edge_kind: EdgeKind, _name: &str) -> ReferenceDisposition {
+    ReferenceDisposition::Resolve
+}
+
+fn any_reference_shape(_edge_kind: EdgeKind, _target_kind: &str) -> ReferenceShape {
+    ReferenceShape::Any
+}
+
+fn keep_unresolved(_edge_kind: EdgeKind, _evidence: Option<&str>) -> UnresolvedDisposition {
+    UnresolvedDisposition::Keep
+}
+
+fn neutral_qualified_root(_root: &str) -> QualifiedRoot {
+    QualifiedRoot::Neutral
+}
+
 pub(super) fn target_matches_policy(
     source_language: Option<&str>,
-    edge_kind: &str,
+    edge_kind: EdgeKind,
     target_language: &str,
     target_kind: &str,
 ) -> bool {
@@ -179,7 +228,7 @@ pub(super) fn target_matches_policy(
         return true;
     };
     let Some(preference) =
-        resolver_policy(source_language).and_then(|policy| policy.preferred_kinds(edge_kind))
+        resolver_policy(source_language).and_then(|policy| (policy.preferred_kinds)(edge_kind))
     else {
         return true;
     };
@@ -212,21 +261,20 @@ pub(super) fn edge_extractor(language: Language) -> Option<EdgeExtractor> {
     }
 }
 
-pub(super) fn resolver_policy(language: Language) -> Option<&'static dyn ResolverPolicy> {
+pub(super) fn resolver_policy(language: Language) -> Option<&'static ResolutionPolicy> {
     match language {
-        Language::Rust => Some(&rust::SUPPORT),
-        Language::Kotlin => Some(&kotlin::SUPPORT),
-        Language::C => Some(&c_family::C_SUPPORT),
-        Language::Cpp => Some(&c_family::CPP_SUPPORT),
-        Language::Python => Some(&python::SUPPORT),
-        Language::Swift => Some(&swift::SUPPORT),
+        Language::Rust => Some(&rust::RESOLVER_POLICY),
+        Language::Kotlin => Some(&kotlin::RESOLVER_POLICY),
+        Language::C | Language::Cpp => Some(&c_family::RESOLVER_POLICY),
+        Language::Python => Some(&python::RESOLVER_POLICY),
+        Language::Swift => Some(&swift::RESOLVER_POLICY),
         _ => None,
     }
 }
 
 pub(super) fn resolver_policy_for_name(
     language: Option<&str>,
-) -> Option<&'static dyn ResolverPolicy> {
+) -> Option<&'static ResolutionPolicy> {
     language.and_then(|name| name.parse::<Language>().ok()).and_then(resolver_policy)
 }
 
@@ -254,12 +302,12 @@ pub(crate) fn all_symbol_kinds() -> BTreeSet<&'static str> {
 
 pub(super) fn requires_same_language_target(
     source_language: Option<&str>,
-    edge_kind: &str,
+    edge_kind: EdgeKind,
 ) -> bool {
     source_language
         .and_then(|language| language.parse::<Language>().ok())
         .and_then(resolver_policy)
-        .and_then(|policy| policy.preferred_kinds(edge_kind))
+        .and_then(|policy| (policy.preferred_kinds)(edge_kind))
         .is_some_and(|preference| preference.same_language_only)
 }
 
@@ -269,7 +317,10 @@ mod tests {
 
     use rag_rat_base::language::Language;
 
-    use super::{edge_extractor, parser_backend};
+    use super::{
+        DeclarationIdentity, ImportBinding, ReceiverFallback, TypeBinding, edge_extractor,
+        parser_backend, resolver_policy,
+    };
     use crate::index::parser::{self, ParserKind};
 
     #[test]
@@ -283,6 +334,81 @@ mod tests {
             assert_eq!(kind == ParserKind::Markdown, language == Language::Markdown);
             assert_eq!(parser::grammar_for(kind).is_some(), language != Language::Markdown);
             assert_eq!(edge_extractor(language).is_some(), language != Language::Markdown);
+        }
+    }
+
+    #[test]
+    fn resolver_policies_are_complete_and_inspectable() {
+        let expected = [
+            (
+                Language::Rust,
+                Some((
+                    DeclarationIdentity::CollapseEquivalent,
+                    ImportBinding::Uses,
+                    TypeBinding::DefinitionsOnly,
+                    ReceiverFallback::Type,
+                )),
+            ),
+            (Language::TypeScript, None),
+            (
+                Language::Kotlin,
+                Some((
+                    DeclarationIdentity::CollapseEquivalent,
+                    ImportBinding::Uses,
+                    TypeBinding::AnySymbol,
+                    ReceiverFallback::TypeAndValue,
+                )),
+            ),
+            (
+                Language::C,
+                Some((
+                    DeclarationIdentity::CollapseEquivalent,
+                    ImportBinding::Uses,
+                    TypeBinding::DefinitionsOnly,
+                    ReceiverFallback::None,
+                )),
+            ),
+            (
+                Language::Cpp,
+                Some((
+                    DeclarationIdentity::CollapseEquivalent,
+                    ImportBinding::Uses,
+                    TypeBinding::DefinitionsOnly,
+                    ReceiverFallback::None,
+                )),
+            ),
+            (
+                Language::Python,
+                Some((
+                    DeclarationIdentity::CollapseEquivalent,
+                    ImportBinding::Aliases,
+                    TypeBinding::AnySymbol,
+                    ReceiverFallback::None,
+                )),
+            ),
+            (
+                Language::Swift,
+                Some((
+                    DeclarationIdentity::PreserveAmbiguity,
+                    ImportBinding::Uses,
+                    TypeBinding::AnySymbol,
+                    ReceiverFallback::None,
+                )),
+            ),
+            (Language::Markdown, None),
+        ];
+
+        assert_eq!(expected.len(), Language::all().len());
+        for (language, expected) in expected {
+            let actual = resolver_policy(language).map(|policy| {
+                (
+                    policy.declaration_identity,
+                    policy.import_binding,
+                    policy.type_binding,
+                    policy.receiver_fallback,
+                )
+            });
+            assert_eq!(actual, expected, "{language}");
         }
     }
 }

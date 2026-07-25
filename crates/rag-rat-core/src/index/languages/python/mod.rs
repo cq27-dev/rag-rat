@@ -3,9 +3,10 @@ use std::path::Path;
 use tree_sitter::Node;
 
 use super::{
-    ImportAliasRebind, ImportAliasRequest, KindPreference, ParserBackend, ResolverPolicy,
-    SymbolMatch,
+    ImportAliasRebind, ImportAliasRequest, ImportBinding, KindPreference, ParserBackend,
+    ResolutionPolicy, SymbolMatch,
 };
+use crate::index::edges::EdgeKind;
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -121,37 +122,36 @@ fn assignment_is_const_scope(node: Node<'_>) -> bool {
     false
 }
 
-impl ResolverPolicy for Python {
-    fn preferred_kinds(&self, edge_kind: &str) -> Option<KindPreference> {
-        (edge_kind == "implements").then_some(KindPreference {
-            symbol_kinds: &["class", "object"],
-            same_language_only: true,
-        })
-    }
+pub(super) const RESOLVER_POLICY: ResolutionPolicy = ResolutionPolicy {
+    preferred_kinds,
+    import_binding: ImportBinding::Aliases,
+    rebind_import_alias,
+    ..ResolutionPolicy::DEFAULT
+};
 
-    fn import_edges_carry_aliases(&self) -> bool {
-        true
-    }
+fn preferred_kinds(edge_kind: EdgeKind) -> Option<KindPreference> {
+    (edge_kind == EdgeKind::Implements)
+        .then_some(KindPreference { symbol_kinds: &["class", "object"], same_language_only: true })
+}
 
-    fn rebind_import_alias(&self, request: ImportAliasRequest<'_>) -> ImportAliasRebind {
-        match request.receiver_hint {
-            Some(receiver) => {
-                let Some(target) = (request.lookup)(receiver) else {
-                    return ImportAliasRebind::default();
-                };
-                ImportAliasRebind {
-                    name: None,
-                    target_qualified_name: request
-                        .target_qualified_name
-                        .map(|qualified| replace_qualified_root(qualified, &target)),
-                    receiver_hint: Some(target),
-                }
-            },
-            None => ImportAliasRebind {
-                name: (request.lookup)(short_name(request.to_name)),
-                ..ImportAliasRebind::default()
-            },
-        }
+fn rebind_import_alias(request: ImportAliasRequest<'_>) -> ImportAliasRebind {
+    match request.receiver_hint {
+        Some(receiver) => {
+            let Some(target) = (request.lookup)(receiver) else {
+                return ImportAliasRebind::default();
+            };
+            ImportAliasRebind {
+                name: None,
+                target_qualified_name: request
+                    .target_qualified_name
+                    .map(|qualified| replace_qualified_root(qualified, &target)),
+                receiver_hint: Some(target),
+            }
+        },
+        None => ImportAliasRebind {
+            name: (request.lookup)(short_name(request.to_name)),
+            ..ImportAliasRebind::default()
+        },
     }
 }
 

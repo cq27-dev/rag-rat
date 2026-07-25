@@ -70,6 +70,54 @@ impl EdgeKind {
             Self::DispatchHandle => "dispatch_handle",
         }
     }
+
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "imports" => Ok(Self::Imports),
+            "exports" => Ok(Self::Exports),
+            "calls_name" => Ok(Self::CallsName),
+            "constructs" => Ok(Self::Constructs),
+            "uses_operator" => Ok(Self::UsesOperator),
+            "uses_precedence_group" => Ok(Self::UsesPrecedenceGroup),
+            "uses_macro" => Ok(Self::UsesMacro),
+            "references_type" => Ok(Self::ReferencesType),
+            "implements" => Ok(Self::Implements),
+            "contains" => Ok(Self::Contains),
+            "dispatches" => Ok(Self::Dispatches),
+            "dispatch_construct" => Ok(Self::DispatchConstruct),
+            "dispatch_handle" => Ok(Self::DispatchHandle),
+            _ => anyhow::bail!("unknown edge kind `{value}`"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod edge_kind_tests {
+    use super::EdgeKind;
+
+    #[test]
+    fn persisted_tokens_round_trip() {
+        let kinds = [
+            EdgeKind::Imports,
+            EdgeKind::Exports,
+            EdgeKind::CallsName,
+            EdgeKind::Constructs,
+            EdgeKind::UsesOperator,
+            EdgeKind::UsesPrecedenceGroup,
+            EdgeKind::UsesMacro,
+            EdgeKind::ReferencesType,
+            EdgeKind::Implements,
+            EdgeKind::Contains,
+            EdgeKind::Dispatches,
+            EdgeKind::DispatchConstruct,
+            EdgeKind::DispatchHandle,
+        ];
+
+        for kind in kinds {
+            assert_eq!(EdgeKind::from_db_str(kind.as_str()).unwrap(), kind);
+        }
+        assert!(EdgeKind::from_db_str("unknown").is_err());
+    }
 }
 
 /// The `edges_data.hidden` value for a row (#734): 1 exactly when the row is not a public graph
@@ -551,7 +599,7 @@ impl<'a> SymbolIndex<'a> {
 pub(crate) struct ResolveSymbolRequest<'a> {
     name: &'a str,
     target_qualified_name: Option<&'a str>,
-    edge_kind: &'a str,
+    edge_kind: EdgeKind,
     evidence: Option<&'a str>,
     receiver_hint: Option<&'a str>,
     source_file_id: i64,

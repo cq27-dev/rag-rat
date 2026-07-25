@@ -45,7 +45,7 @@ fn import_alias_rebind(
         let target = import_scope.import_alias_target(request.file_id, name, request.ref_byte)?;
         (!index.file_defines(request.file_id, short_name(target))).then(|| target.to_string())
     };
-    policy.rebind_import_alias(crate::index::languages::ImportAliasRequest {
+    (policy.rebind_import_alias)(crate::index::languages::ImportAliasRequest {
         to_name: request.to_name,
         target_qualified_name: request.target_qualified_name,
         receiver_hint: request.receiver_hint,
@@ -313,7 +313,9 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             let evidence: Option<String> = row.get(3)?;
             let scope = import_scope_from_row(row.get(4)?, row.get(5)?, row.get(6)?);
             let carries_alias = crate::index::languages::resolver_policy_for_name(Some(&language))
-                .is_some_and(|policy| policy.import_edges_carry_aliases());
+                .is_some_and(|policy| {
+                    policy.import_binding == crate::index::languages::ImportBinding::Aliases
+                });
             if carries_alias {
                 // Alias carriers encode `evidence = alias`, `to_name = target`, and a lexical
                 // scope. Non-aliased imports have no scope and are ignored by this path.
@@ -371,12 +373,13 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         source_language,
     ) in rows
     {
+        let edge_kind = EdgeKind::from_db_str(&edge_kind)?;
         // #200: a `dispatch_construct` fact's `to_name` is a synthetic `Enum::Variant` key, NOT a
         // real call target — resolving it would bind a bogus `to_symbol_id` to any same-named
         // symbol, and synthesis reads only the fact's `from_symbol_id`. Leave it
         // unresolved. (`dispatch_handle` DOES resolve — synthesis reads its handler
         // `to_symbol_id`.)
-        if edge_kind == EdgeKind::DispatchConstruct.as_str() {
+        if edge_kind == EdgeKind::DispatchConstruct {
             let confidence_id = interner.get(conn, EdgeConfidence::NameOnly.as_str())?;
             let resolution_id = interner.get(conn, "unresolved")?;
             conn.prepare_cached(
@@ -389,7 +392,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 edge_id,
                 confidence_id,
                 resolution_id,
-                edge_hidden_flag(&edge_kind, "unresolved"),
+                edge_hidden_flag(edge_kind.as_str(), "unresolved"),
             ])?;
             continue;
         }
@@ -397,7 +400,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         let ref_byte = usize::try_from(source_start_byte).unwrap_or(0);
         // A language-owned import-alias policy may rewrite a reference to its imported target.
         // Imports edges retain their own target name.
-        let rebind = if edge_kind == EdgeKind::Imports.as_str() {
+        let rebind = if edge_kind == EdgeKind::Imports {
             Default::default()
         } else {
             import_alias_rebind(&import_scope, &index, ImportAliasResolveRequest {
@@ -417,7 +420,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             ResolveSymbolRequest {
                 name: resolve_name,
                 target_qualified_name: resolve_qualified,
-                edge_kind: &edge_kind,
+                edge_kind,
                 evidence: evidence.as_deref(),
                 receiver_hint: resolve_receiver,
                 source_file_id,
@@ -438,7 +441,8 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             let suppressed =
                 crate::index::languages::resolver_policy_for_name(Some(&source_language))
                     .is_some_and(|policy| {
-                        policy.suppress_unresolved_reference(&edge_kind, evidence.as_deref())
+                        (policy.unresolved_disposition)(edge_kind, evidence.as_deref())
+                            == crate::index::languages::UnresolvedDisposition::Suppress
                     });
             let confidence = if current_confidence == EdgeConfidence::Ambiguous.as_str() {
                 EdgeConfidence::Ambiguous
@@ -464,7 +468,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 edge_id,
                 confidence_id,
                 resolution_id,
-                edge_hidden_flag(&edge_kind, resolution),
+                edge_hidden_flag(edge_kind.as_str(), resolution),
             ])?;
             continue;
         };
@@ -489,7 +493,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             resolution_id,
             // A re-resolved candidate un-hides (a previously suppressed Swift macro candidate
             // whose target appears later); a resolved dispatch_handle FACT stays hidden.
-            edge_hidden_flag(&edge_kind, reason),
+            edge_hidden_flag(edge_kind.as_str(), reason),
         ])?;
     }
     // #200: now that the dispatch FACT rows are resolved (handlers bound to symbols), synthesize
@@ -563,7 +567,9 @@ pub(crate) fn resolve_and_insert_edges(
             let evidence = arena.get_opt(candidate.evidence).unwrap_or("");
             let source_language = file_language.get(file_id).map(String::as_str);
             let carries_alias = crate::index::languages::resolver_policy_for_name(source_language)
-                .is_some_and(|policy| policy.import_edges_carry_aliases());
+                .is_some_and(|policy| {
+                    policy.import_binding == crate::index::languages::ImportBinding::Aliases
+                });
             if carries_alias {
                 let target = arena.get(candidate.to_name).trim();
                 if !evidence.is_empty() && !target.is_empty() {
@@ -643,7 +649,7 @@ pub(crate) fn resolve_and_insert_edges(
                 ResolveSymbolRequest {
                     name: resolve_name,
                     target_qualified_name: resolve_qualified,
-                    edge_kind: candidate.edge_kind.as_str(),
+                    edge_kind: candidate.edge_kind,
                     evidence,
                     receiver_hint: resolve_receiver,
                     source_file_id: *file_id,
@@ -675,7 +681,8 @@ pub(crate) fn resolve_and_insert_edges(
                         file_language.get(file_id).map(String::as_str),
                     )
                     .is_some_and(|policy| {
-                        policy.suppress_unresolved_reference(candidate.edge_kind.as_str(), evidence)
+                        (policy.unresolved_disposition)(candidate.edge_kind, evidence)
+                            == crate::index::languages::UnresolvedDisposition::Suppress
                     });
                     let confidence = if candidate.confidence == EdgeConfidence::Ambiguous {
                         EdgeConfidence::Ambiguous
@@ -766,7 +773,7 @@ pub(crate) fn resolve_symbol<'a>(
     index: &SymbolIndex<'a>,
 ) -> Option<(&'a IndexedSymbol, EdgeConfidence, &'static str)> {
     let kind_matches = |symbol: &IndexedSymbol| {
-        (request.edge_kind != EdgeKind::UsesMacro.as_str() || symbol.kind == "macro")
+        (request.edge_kind != EdgeKind::UsesMacro || symbol.kind == "macro")
             && crate::index::languages::target_matches_policy(
                 request.source_language,
                 request.edge_kind,
@@ -785,14 +792,19 @@ pub(crate) fn resolve_symbol<'a>(
     // A language-owned local qualifier overrides an external bare-leaf import.
     if request.imported_external
         && !request.target_qualified_name.and_then(|path| path.split_once("::")).is_some_and(
-            |(root, _)| policy.is_some_and(|policy| policy.is_local_qualified_root(root)),
+            |(root, _)| {
+                policy.is_some_and(|policy| {
+                    (policy.qualified_root)(root) == crate::index::languages::QualifiedRoot::Local
+                })
+            },
         )
     {
         return None;
     }
-    if policy
-        .is_some_and(|policy| policy.reference_is_unresolvable(request.edge_kind, request.name))
-    {
+    if policy.is_some_and(|policy| {
+        (policy.reference_disposition)(request.edge_kind, request.name)
+            == crate::index::languages::ReferenceDisposition::Unresolvable
+    }) {
         return None;
     }
     if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
@@ -889,7 +901,8 @@ pub(crate) fn resolve_symbol<'a>(
     let bare_shape_ok = |symbol: &IndexedSymbol| {
         reference_is_bare
             || !policy.is_some_and(|policy| {
-                policy.kind_requires_unqualified_reference(request.edge_kind, &symbol.kind)
+                (policy.target_shape)(request.edge_kind, &symbol.kind)
+                    == crate::index::languages::ReferenceShape::UnqualifiedOnly
             })
     };
     let matches = index
@@ -903,8 +916,10 @@ pub(crate) fn resolve_symbol<'a>(
     let preferred = preferred_matches(request.edge_kind, request.source_language, &matches);
     // Language policy decides whether a type-position reference may bind a value declaration.
     if preferred.is_empty()
-        && request.edge_kind == EdgeKind::ReferencesType.as_str()
-        && policy.is_some_and(|policy| policy.type_reference_requires_type_definition())
+        && request.edge_kind == EdgeKind::ReferencesType
+        && policy.is_some_and(|policy| {
+            policy.type_binding == crate::index::languages::TypeBinding::DefinitionsOnly
+        })
     {
         return None;
     }
@@ -963,7 +978,10 @@ pub(crate) fn same_logical_symbol(symbols: &[&IndexedSymbol]) -> bool {
         .parse::<Language>()
         .ok()
         .and_then(crate::index::languages::resolver_policy)
-        .is_some_and(|policy| !policy.collapse_same_named_declarations())
+        .is_some_and(|policy| {
+            policy.declaration_identity
+                == crate::index::languages::DeclarationIdentity::PreserveAmbiguity
+        })
     {
         return false;
     }
@@ -975,14 +993,14 @@ pub(crate) fn same_logical_symbol(symbols: &[&IndexedSymbol]) -> bool {
     })
 }
 pub(crate) fn allow_unqualified_fallback(
-    edge_kind: &str,
+    edge_kind: EdgeKind,
     qualified: &str,
     name: &str,
     evidence: Option<&str>,
     receiver_hint: Option<&str>,
     source_language: Option<&str>,
 ) -> bool {
-    if edge_kind == EdgeKind::UsesMacro.as_str() {
+    if edge_kind == EdgeKind::UsesMacro {
         return false;
     }
     let target = short_name(name);
@@ -994,22 +1012,33 @@ pub(crate) fn allow_unqualified_fallback(
         .next()
         .unwrap_or_default();
     let policy = crate::index::languages::resolver_policy_for_name(source_language);
-    if policy.is_some_and(|policy| policy.is_local_qualified_root(qualifier)) {
+    if policy.is_some_and(|policy| {
+        (policy.qualified_root)(qualifier) == crate::index::languages::QualifiedRoot::Local
+    }) {
         return true;
     }
     if receiver_hint
         .is_some_and(|receiver| looks_like_type_name(receiver) && !is_common_member_name(target))
-        && policy.is_some_and(|policy| policy.allow_type_receiver_fallback())
+        && policy.is_some_and(|policy| {
+            matches!(
+                policy.receiver_fallback,
+                crate::index::languages::ReceiverFallback::Type
+                    | crate::index::languages::ReceiverFallback::TypeAndValue
+            )
+        })
     {
         return true;
     }
     if receiver_hint.is_some_and(|receiver| !matches!(receiver, "self" | "Self"))
         && evidence.is_some_and(|value| value.contains('.'))
     {
-        return policy.is_some_and(|policy| policy.allow_value_receiver_fallback())
-            && !is_common_member_name(target);
+        return policy.is_some_and(|policy| {
+            policy.receiver_fallback == crate::index::languages::ReceiverFallback::TypeAndValue
+        }) && !is_common_member_name(target);
     }
-    if policy.is_some_and(|policy| policy.rejects_qualified_root(qualifier)) {
+    if policy.is_some_and(|policy| {
+        (policy.qualified_root)(qualifier) == crate::index::languages::QualifiedRoot::External
+    }) {
         return false;
     }
     if looks_like_type_name(qualifier) && is_common_member_name(target) {
@@ -1039,7 +1068,7 @@ pub(crate) fn is_common_member_name(value: &str) -> bool {
     )
 }
 pub(crate) fn preferred_matches<'a>(
-    edge_kind: &str,
+    edge_kind: EdgeKind,
     source_language: Option<&str>,
     matches: &[&'a IndexedSymbol],
 ) -> Vec<&'a IndexedSymbol> {
@@ -1047,17 +1076,18 @@ pub(crate) fn preferred_matches<'a>(
         // `dispatch_handle` (#200) is a call to the handler the match arm delegates to — resolve it
         // with the SAME callable preference as a direct call, so a same-named type/const never wins
         // over the handler function/method.
-        "calls_name" | "dispatch_handle" => &["function", "method"],
-        "constructs" => &["struct", "class", "object"],
-        "uses_macro" => &["macro"],
-        "implements" => &["trait", "interface"],
-        "references_type" => &["struct", "enum", "trait", "type", "class", "interface", "object"],
+        EdgeKind::CallsName | EdgeKind::DispatchHandle => &["function", "method"],
+        EdgeKind::Constructs => &["struct", "class", "object"],
+        EdgeKind::UsesMacro => &["macro"],
+        EdgeKind::Implements => &["trait", "interface"],
+        EdgeKind::ReferencesType =>
+            &["struct", "enum", "trait", "type", "class", "interface", "object"],
         _ => &[],
     };
     let source_language = source_language.and_then(|name| name.parse::<Language>().ok());
     let language_preference = source_language
         .and_then(crate::index::languages::resolver_policy)
-        .and_then(|policy| policy.preferred_kinds(edge_kind));
+        .and_then(|policy| (policy.preferred_kinds)(edge_kind));
     let preferred_kinds = language_preference
         .as_ref()
         .map_or(generic_preferred_kinds, |preference| preference.symbol_kinds);

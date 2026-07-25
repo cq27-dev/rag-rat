@@ -2,7 +2,11 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{KindPreference, ParserBackend, ResolverPolicy, SymbolMatch};
+use super::{
+    DeclarationIdentity, KindPreference, ParserBackend, QualifiedRoot, ReferenceDisposition,
+    ReferenceShape, ResolutionPolicy, SymbolMatch, UnresolvedDisposition,
+};
+use crate::index::edges::EdgeKind;
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -270,53 +274,72 @@ fn direct_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tr
     })
 }
 
-impl ResolverPolicy for Swift {
-    fn preferred_kinds(&self, edge_kind: &str) -> Option<KindPreference> {
-        let symbol_kinds: &'static [&'static str] = match edge_kind {
-            "calls_name" => &["function", "method", "constructor", "enum_case"],
-            "constructs" => &["struct", "enum", "class", "object", "actor"],
-            "implements" => &["protocol", "class"],
-            "references_type" =>
-                &["struct", "enum", "type", "class", "object", "actor", "protocol"],
-            "uses_macro" => &["macro"],
-            "uses_operator" => &["operator"],
-            "uses_precedence_group" => &["precedence_group"],
-            _ => return None,
-        };
-        Some(KindPreference { symbol_kinds, same_language_only: true })
-    }
+pub(super) const RESOLVER_POLICY: ResolutionPolicy = ResolutionPolicy {
+    preferred_kinds,
+    declaration_identity: DeclarationIdentity::PreserveAmbiguity,
+    reference_disposition,
+    target_shape,
+    unresolved_disposition,
+    qualified_root,
+    ..ResolutionPolicy::DEFAULT
+};
 
-    fn collapse_same_named_declarations(&self) -> bool {
-        false
-    }
+fn preferred_kinds(edge_kind: EdgeKind) -> Option<KindPreference> {
+    let symbol_kinds: &'static [&'static str] = match edge_kind {
+        EdgeKind::CallsName => &["function", "method", "constructor", "enum_case"],
+        EdgeKind::Constructs => &["struct", "enum", "class", "object", "actor"],
+        EdgeKind::Implements => &["protocol", "class"],
+        EdgeKind::ReferencesType =>
+            &["struct", "enum", "type", "class", "object", "actor", "protocol"],
+        EdgeKind::UsesMacro => &["macro"],
+        EdgeKind::UsesOperator => &["operator"],
+        EdgeKind::UsesPrecedenceGroup => &["precedence_group"],
+        _ => return None,
+    };
+    Some(KindPreference { symbol_kinds, same_language_only: true })
+}
 
-    fn reference_is_unresolvable(&self, edge_kind: &str, name: &str) -> bool {
-        edge_kind == "imports" || (edge_kind == "calls_name" && operator_has_builtin_meaning(name))
+fn reference_disposition(edge_kind: EdgeKind, name: &str) -> ReferenceDisposition {
+    if edge_kind == EdgeKind::Imports
+        || (edge_kind == EdgeKind::CallsName && operator_has_builtin_meaning(name))
+    {
+        ReferenceDisposition::Unresolvable
+    } else {
+        ReferenceDisposition::Resolve
     }
+}
 
-    /// An enum case is reachable by BARE NAME only through Swift's shorthand `.idle` — the one
-    /// shape that is evidence of a case (the enum is inferred, so no qualifier exists to match
-    /// on).
-    ///
-    /// Everything else that lands on `calls_name` shares that AST shape without being a case: a
-    /// value-receiver method call (`client.idle()`) and a static member read (`Config.idle`) both
-    /// carry a receiver/qualifier. Those resolve through the qualified path when the member really
-    /// exists; when it does NOT, the bare-name fallback would otherwise bind them to an unrelated
-    /// `enum Status { case idle }` and report an ordinary property read or method call as a caller
-    /// of that case. Enum cases cannot be invoked through an arbitrary value receiver, so the bind
-    /// is never right — require the bare shape.
-    fn kind_requires_unqualified_reference(&self, edge_kind: &str, target_kind: &str) -> bool {
-        edge_kind == "calls_name" && target_kind == "enum_case"
+/// An enum case is reachable by BARE NAME only through Swift's shorthand `.idle` — the one
+/// shape that is evidence of a case (the enum is inferred, so no qualifier exists to match
+/// on).
+///
+/// Everything else that lands on `calls_name` shares that AST shape without being a case: a
+/// value-receiver method call (`client.idle()`) and a static member read (`Config.idle`) both
+/// carry a receiver/qualifier. Those resolve through the qualified path when the member really
+/// exists; when it does NOT, the bare-name fallback would otherwise bind them to an unrelated
+/// `enum Status { case idle }` and report an ordinary property read or method call as a caller
+/// of that case. Enum cases cannot be invoked through an arbitrary value receiver, so the bind
+/// is never right — require the bare shape.
+fn target_shape(edge_kind: EdgeKind, target_kind: &str) -> ReferenceShape {
+    if edge_kind == EdgeKind::CallsName && target_kind == "enum_case" {
+        ReferenceShape::UnqualifiedOnly
+    } else {
+        ReferenceShape::Any
     }
+}
 
-    fn suppress_unresolved_reference(&self, edge_kind: &str, evidence: Option<&str>) -> bool {
-        matches!(edge_kind, "uses_macro" | "references_type")
-            && evidence.is_some_and(|source| source.trim_start().starts_with('@'))
+fn unresolved_disposition(edge_kind: EdgeKind, evidence: Option<&str>) -> UnresolvedDisposition {
+    if matches!(edge_kind, EdgeKind::UsesMacro | EdgeKind::ReferencesType)
+        && evidence.is_some_and(|source| source.trim_start().starts_with('@'))
+    {
+        UnresolvedDisposition::Suppress
+    } else {
+        UnresolvedDisposition::Keep
     }
+}
 
-    fn is_local_qualified_root(&self, root: &str) -> bool {
-        is_local_qualified_root(root)
-    }
+fn qualified_root(root: &str) -> QualifiedRoot {
+    if is_local_qualified_root(root) { QualifiedRoot::Local } else { QualifiedRoot::Neutral }
 }
 
 fn operator_has_builtin_meaning(name: &str) -> bool {

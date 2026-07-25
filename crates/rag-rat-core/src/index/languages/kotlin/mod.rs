@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{ParserBackend, ResolverPolicy, SymbolMatch};
+use super::{ParserBackend, ReceiverFallback, ResolutionPolicy, SymbolMatch};
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -99,16 +99,7 @@ fn variable_declaration(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-impl ResolverPolicy for Kotlin {
-    fn preferred_kinds(&self, _edge_kind: &str) -> Option<super::KindPreference> {
-        None
-    }
-
-    fn allow_type_receiver_fallback(&self) -> bool {
-        true
-    }
-
-    fn allow_value_receiver_fallback(&self) -> bool {
-        true
-    }
-}
+pub(super) const RESOLVER_POLICY: ResolutionPolicy = ResolutionPolicy {
+    receiver_fallback: ReceiverFallback::TypeAndValue,
+    ..ResolutionPolicy::DEFAULT
+};

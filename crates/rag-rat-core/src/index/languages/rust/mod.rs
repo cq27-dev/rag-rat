@@ -2,7 +2,11 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{ParserBackend, ResolverPolicy, SymbolMatch};
+use super::{
+    ParserBackend, QualifiedRoot, ReceiverFallback, ReferenceDisposition, ResolutionPolicy,
+    SymbolMatch, TypeBinding,
+};
+use crate::index::edges::EdgeKind;
 use crate::index::parser::{self, ParsedSymbolFact, ParserKind};
 
 mod dispatch;
@@ -132,30 +136,29 @@ fn attribute_items(text: &str, node: Node<'_>) -> Vec<String> {
     preceding
 }
 
-impl ResolverPolicy for Rust {
-    fn preferred_kinds(&self, _edge_kind: &str) -> Option<super::KindPreference> {
-        None
-    }
+pub(super) const RESOLVER_POLICY: ResolutionPolicy = ResolutionPolicy {
+    reference_disposition,
+    type_binding: TypeBinding::DefinitionsOnly,
+    receiver_fallback: ReceiverFallback::Type,
+    qualified_root,
+    ..ResolutionPolicy::DEFAULT
+};
 
-    fn reference_is_unresolvable(&self, edge_kind: &str, name: &str) -> bool {
-        edge_kind == crate::index::edges::EdgeKind::ReferencesType.as_str()
-            && type_ref_is_unresolvable(name)
+fn reference_disposition(edge_kind: EdgeKind, name: &str) -> ReferenceDisposition {
+    if edge_kind == EdgeKind::ReferencesType && type_ref_is_unresolvable(name) {
+        ReferenceDisposition::Unresolvable
+    } else {
+        ReferenceDisposition::Resolve
     }
+}
 
-    fn type_reference_requires_type_definition(&self) -> bool {
-        true
-    }
-
-    fn allow_type_receiver_fallback(&self) -> bool {
-        true
-    }
-
-    fn rejects_qualified_root(&self, root: &str) -> bool {
-        is_external_root(root)
-    }
-
-    fn is_local_qualified_root(&self, root: &str) -> bool {
-        matches!(root, "crate" | "self" | "super")
+fn qualified_root(root: &str) -> QualifiedRoot {
+    if matches!(root, "crate" | "self" | "super") {
+        QualifiedRoot::Local
+    } else if is_external_root(root) {
+        QualifiedRoot::External
+    } else {
+        QualifiedRoot::Neutral
     }
 }
 
