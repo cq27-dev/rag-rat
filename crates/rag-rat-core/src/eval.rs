@@ -428,8 +428,11 @@ fn score_case_at_parent(
         return Ok(None);
     }
     let mut case_config = Config::load(&manifest)?;
-    case_config.database = std::env::temp_dir().join(format!("rag-rat-replay-{short}.sqlite"));
-    let _ = std::fs::remove_file(&case_config.database);
+    // The replay DB lives in a guarded scratch dir, so an indexing/scoring error removes it (and
+    // its WAL/SHM sidecars) instead of stranding a per-case sqlite in the system temp (#586). The
+    // guard outlives every handle below: it is declared first and drops last.
+    let scratch = rag_rat_base::test_scratch::ScratchDir::new(&format!("replay-{short}"));
+    case_config.database = scratch.join("replay.sqlite");
     IndexDatabase::rebuild(&case_config)?;
     let report = {
         let case_db = IndexDatabase::open_config(&case_config)?;
@@ -452,7 +455,6 @@ fn score_case_at_parent(
         // default `TOP_K` candidate width (the candidate-ceiling dial is HEAD-scored).
         evaluate_query(&case_config, &case_db, &query, SearchMode::Active, false, TOP_K)?
     };
-    let _ = std::fs::remove_file(&case_config.database);
     Ok(Some(report))
 }
 
