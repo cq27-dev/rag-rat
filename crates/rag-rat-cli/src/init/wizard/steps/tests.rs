@@ -1249,58 +1249,51 @@ fn integration_combines_version_check_and_hooks() {
     assert!(!state.draft.hooks.git);
 }
 
-/// Scrub the repository-routing git env for the duration of `f` (serialized): `git_paths` is
-/// env-aware BY DESIGN (#213 — bare-dir + hook contexts), so an ambient `GIT_DIR`/`GIT_WORK_TREE`
-/// would resolve the fixture to an unrelated repo and fail the test depending on the machine
-/// (#970). Process-global mutation is serialized by the lock; restoring is manual (a panicking
-/// body keeps the scrub, which only hides the ambient vars from later tests in the same process).
-fn without_routing_env<T>(f: impl FnOnce() -> T) -> T {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    const KEYS: [&str; 2] = ["GIT_DIR", "GIT_WORK_TREE"];
-    let _guard = LOCK.lock().unwrap();
-    let saved = KEYS.map(std::env::var_os);
-    // SAFETY: process-global env mutation, serialized by LOCK (nextest also isolates each test in
-    // its own process).
-    unsafe {
-        for key in KEYS {
-            std::env::remove_var(key);
-        }
-    }
-    let out = f();
-    // SAFETY: same as above.
-    unsafe {
-        for (key, value) in KEYS.into_iter().zip(saved) {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-    out
-}
-
 #[test]
 fn integration_blocks_unresolved_foreign_hook_conflicts() {
+    // `validate_hooks` resolves the repo through the env-aware `git_paths` (#213), so an ambient
+    // `GIT_DIR`/`GIT_WORK_TREE` (or a global `core.hooksPath`) would make this test
+    // machine-dependent (#970) — and seeding through the same env-aware path would write the
+    // fixture hook into an UNRELATED repo. Re-exec this test with a scrubbed environment instead
+    // of mutating the process-wide one.
+    if std::env::var_os("RAG_RAT_TEST_GIT_ENV_SCRUBBED").is_none() {
+        let home = rag_rat_base::test_scratch::ScratchDir::new("wizard-hooks-home");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "init::wizard::steps::tests::integration_blocks_unresolved_foreign_hook_conflicts",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("RAG_RAT_TEST_GIT_ENV_SCRUBBED", "1")
+            .env("HOME", home.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env_remove("GIT_CONFIG_SYSTEM")
+            .status()
+            .unwrap();
+        assert!(status.success(), "scrubbed re-exec failed");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     rag_rat_base::test_git::run(dir.path(), &["init", "-q"]);
-    without_routing_env(|| {
-        let gp = git_paths(dir.path()).unwrap();
-        std::fs::create_dir_all(&gp.hooks_dir).unwrap();
-        let hook = MANAGED_HOOKS[0];
-        std::fs::write(gp.hooks_dir.join(hook), "#!/bin/sh\necho custom\n").unwrap();
-        let scan = scan_repo(dir.path()).unwrap();
-        let mut draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
-        draft.hooks.git = true;
-        let mut state = WizardState::new(draft, scan);
+    let gp = git_paths(dir.path()).unwrap();
+    std::fs::create_dir_all(&gp.hooks_dir).unwrap();
+    let hook = MANAGED_HOOKS[0];
+    std::fs::write(gp.hooks_dir.join(hook), "#!/bin/sh\necho custom\n").unwrap();
+    let scan = scan_repo(dir.path()).unwrap();
+    let mut draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
+    draft.hooks.git = true;
+    let mut state = WizardState::new(draft, scan);
 
-        let unresolved = validate_hooks(&state);
-        state.hook_conflicts.insert(hook, hooks::HookConflict::Skip);
-        let resolved = validate_hooks(&state);
+    let unresolved = validate_hooks(&state);
+    state.hook_conflicts.insert(hook, hooks::HookConflict::Skip);
+    let resolved = validate_hooks(&state);
 
-        assert_eq!(unresolved.severity, Sev::Block);
-        assert!(unresolved.message.unwrap().contains(hook));
-        assert_eq!(resolved.severity, Sev::Ok);
-    });
+    assert_eq!(unresolved.severity, Sev::Block);
+    assert!(unresolved.message.unwrap().contains(hook));
+    assert_eq!(resolved.severity, Sev::Ok);
 }
 
 #[test]
