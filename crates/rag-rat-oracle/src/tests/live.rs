@@ -145,9 +145,9 @@ fn live_verdict_copies_the_batch_moniker_verbatim() {
 }
 
 #[test]
-fn live_sentinel_is_stable_then_a_batch_moniker_arrival_invalidates_refinements() {
+fn live_sentinel_is_stable_then_a_content_change_upgrades_to_the_batch_moniker() {
     let h = Harness::new();
-    let (_src, target, edge) = seed_corpus(&h);
+    let (src_file, target, edge) = seed_corpus(&h);
     let uri = root_uri(&h);
     let def = def_uri(&h, "defs.rs");
     let worklist = vec!["src.rs".to_string()];
@@ -159,15 +159,17 @@ fn live_sentinel_is_stable_then_a_batch_moniker_arrival_invalidates_refinements(
     let sentinel = scip_symbol_of(&h, edge);
     assert!(sentinel.starts_with("local ra-lsp-"));
 
-    // Pass 2, same content: the SAME sentinel → a same-value upsert, no refine churn.
+    // Pass 2, same content: the callee is COVERED (same tool_version + file_sha) and the
+    // covered-skip never re-resolves it — zero requests, the row untouched.
     let mut session = fake_session(&uri, Some((def.clone(), (0, 3), (0, 9))));
     let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
-    assert_eq!(scip_symbol_of(&h, edge), sentinel, "sentinel is content-stable");
-    assert!(!report.refinements_invalidated, "same-value upsert skips the invalidation");
+    assert_eq!(report.requests_used, 0, "a fully-covered file costs no requests");
+    assert_eq!(report.rows_written, 0);
+    assert_eq!(scip_symbol_of(&h, edge), sentinel, "sentinel is stable by construction");
+    assert!(!report.refinements_invalidated);
 
-    // A batch run then lands a moniker; the next live pass copies it — the scip_symbol CHANGES
-    // under an unchanged file_sha, so the scip-mode refinements that consulted the sentinel must
-    // be invalidated.
+    // A batch run then lands a moniker. Same content → the covered-skip still declines to
+    // re-resolve (the batch row carries the real evidence for the span meanwhile).
     h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", target);
     crate::store::write_logical_symbol_moniker(
         &h.conn,
@@ -178,9 +180,19 @@ fn live_sentinel_is_stable_then_a_batch_moniker_arrival_invalidates_refinements(
     )
     .unwrap();
     let mut session = fake_session(&uri, Some((def.clone(), (0, 3), (0, 9))));
+    live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+    assert_eq!(scip_symbol_of(&h, edge), sentinel, "unchanged content stays covered");
+
+    // A content change un-covers the callee (new file_sha), so the pass re-resolves it — now
+    // copying the batch moniker. No refine invalidation: the content change already re-keys
+    // every refinement that consulted the file.
+    let edited = "fn callXr() { target(); }\n";
+    std::fs::write(h.root().join("src.rs"), edited).unwrap();
+    h.set_file_sha(src_file, &sha256_hex(edited.as_bytes()));
+    let mut session = fake_session(&uri, Some((def.clone(), (0, 3), (0, 9))));
     let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
-    assert_eq!(scip_symbol_of(&h, edge), TARGET_MONIKER);
-    assert!(report.refinements_invalidated, "changed evidence under an unchanged file_sha");
+    assert_eq!(scip_symbol_of(&h, edge), TARGET_MONIKER, "content change re-resolves");
+    assert!(!report.refinements_invalidated, "the sha changed — refinements re-key anyway");
 }
 
 #[test]
@@ -286,6 +298,103 @@ fn live_pass_budget_defers_whole_files_to_the_next_pass() {
     assert_eq!(report.rows_written, 1);
     assert_eq!(report.unfinished_paths, vec!["b.rs".to_string()]);
     assert_eq!(report.status, "BudgetExhausted");
+}
+
+/// The budget binds WITHIN a file too: a file with more callees than the budget is truncated,
+/// rides the backlog, and the NEXT pass resumes at the unverdicted callees (the covered-skip
+/// continuation) instead of re-requesting from the top (#534 review).
+#[test]
+fn live_pass_budget_continuation_resumes_within_a_file() {
+    let h = Harness::new();
+    let defs = h.add_file("defs.rs", DEFS_SRC);
+    h.add_symbol(defs, "target", 0, 13);
+    // Three calls in one file: callees at 14, 24, 34.
+    let src = h.add_file("src.rs", "fn caller() { target(); target(); target(); }\n");
+    h.add_edge(src, "target", 14, 20, "NameOnly", None);
+    h.add_edge(src, "target", 24, 30, "NameOnly", None);
+    h.add_edge(src, "target", 34, 40, "NameOnly", None);
+    let uri = root_uri(&h);
+    let def = def_uri(&h, "defs.rs");
+
+    // Pass 1, budget 2: two callees resolve, the file rides with one deferred.
+    let mut session = fake_session(&uri, Some((def.clone(), (0, 3), (0, 9))));
+    let worklist = vec!["src.rs".to_string()];
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 2)).unwrap();
+    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.unfinished_paths, vec!["src.rs".to_string()]);
+
+    // Pass 2 (same session + version): the two covered callees are skipped, so the whole
+    // remaining budget goes to the ONE unverdicted callee — exactly one request.
+    let mut session = fake_session(&uri, Some((def.clone(), (0, 3), (0, 9))));
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 2)).unwrap();
+    assert_eq!(report.requests_used, 1, "covered callees don't spend the budget");
+    assert_eq!(report.rows_written, 1);
+    assert!(report.unfinished_paths.is_empty(), "the file drains this pass");
+    assert_eq!(report.status, "Completed");
+}
+
+/// A `rust-analyzer` upgrade between sessions must not strand prior verdicts: the first pass
+/// under the new `tool_version` migrates them (content-addressed, still `file_sha`-gated) and
+/// records the run that makes the new version current — otherwise the currency gate collapses
+/// live coverage to the few files the new session revisited (#534 review).
+#[test]
+fn live_pass_migrates_prior_verdicts_across_a_version_change() {
+    let h = Harness::new();
+    let (_src, _target, edge) = seed_corpus(&h);
+    let uri = root_uri(&h);
+    let def = def_uri(&h, "defs.rs");
+    let worklist = vec!["src.rs".to_string()];
+
+    // Pass 1 under version LIVE_VERSION.
+    let mut session = fake_session(&uri, Some((def.clone(), (0, 3), (0, 9))));
+    live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+    let sentinel = scip_symbol_of(&h, edge);
+    let version_of = |v: &str| {
+        h.conn
+            .query_row(
+                "SELECT COUNT(*) FROM edge_oracle WHERE tool = 'ra-lsp' AND tool_version = ?1",
+                params![v],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(version_of(LIVE_VERSION), 1);
+
+    // A NEW session probing a NEW rust-analyzer version; an EMPTY worklist (a quiet pass).
+    let client = client_with_server(move |msg: &Value| {
+        let id = msg.get("id").cloned();
+        match msg.get("method").and_then(Value::as_str) {
+            Some("initialize") => Some(vec![json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {"capabilities": {"positionEncoding": "utf-16"}}
+            })]),
+            _ if id.is_none() => Some(vec![]),
+            _ => Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": null})]),
+        }
+    });
+    let mut session = LiveOracleSession::from_client(client, "ra-test-2", &uri);
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &[], 100)).unwrap();
+
+    assert!(report.version_migrated);
+    assert!(report.refinements_invalidated, "the evidence changed hands");
+    assert_eq!(report.status, "VersionMigrated");
+    assert_eq!(version_of(LIVE_VERSION), 0, "old-version rows moved");
+    assert_eq!(version_of("ra-test-2"), 1, "rows now carried by the new version");
+    // The migrated verdict survives with its content + symbol intact.
+    let (kind, resolved, symbol) = h.verdict(edge).expect("migrated verdict persists");
+    assert_eq!(kind, "upgrade");
+    assert!(resolved.is_some());
+    assert_eq!(symbol, sentinel);
+    // And the new run row makes the new version the currency gate's latest.
+    let latest: String = h
+        .conn
+        .query_row(
+            "SELECT tool_version FROM oracle_runs WHERE tool = 'ra-lsp' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(latest, "ra-test-2");
 }
 
 #[test]

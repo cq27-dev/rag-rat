@@ -162,8 +162,12 @@ pub struct LivePassReport {
     /// Whether the scip-mode refine cache was invalidated (a row's `scip_symbol` changed under
     /// an unchanged `file_sha`).
     pub refinements_invalidated: bool,
-    /// Whether an `oracle_runs` row backs this pass (only when `rows_written > 0`).
+    /// Whether an `oracle_runs` row backs this pass (when `rows_written > 0` or a version
+    /// migration made the new `tool_version` current).
     pub run_recorded: bool,
+    /// Whether prior-version live verdicts were migrated to the session's `tool_version` (a
+    /// `rust-analyzer` upgrade detected at spawn).
+    pub version_migrated: bool,
     /// Worklist paths the request budget didn't reach — the caller's backlog into the next pass.
     #[serde(skip)]
     pub unfinished_paths: Vec<String>,
@@ -199,16 +203,36 @@ pub fn live_oracle_pass(
     }
     report.files_with_candidates = by_path.len() as u64;
 
-    // The indexed shas the definition-side drift gate compares against (the callsite side uses
-    // each candidate's own `file_sha`, which IS the indexed sha of the just-reindexed file).
-    let indexed_shas =
-        store::indexed_file_shas_in_scope(conn, input.commit_sha, input.worktree_id)?;
-
     let tx = conn.unchecked_transaction()?;
     let mut refinements_stale = false;
+    // Version transition: a respawn probing a NEW `rust-analyzer --version` must not strand the
+    // prior version's still-current verdicts — the first partial pass's run row would become the
+    // latest for the whole checkout and gate every prior-version verdict out of currency,
+    // collapsing live coverage to the handful of files this pass revisits. Migrate the rows
+    // (content-addressed, so `file_sha` still gates drift) and invalidate the scip refinements
+    // whose evidence just changed hands.
+    let mut version_migrated = false;
+    if let Some(old_version) =
+        store::latest_run_tool_version(conn, tool, input.commit_sha, input.worktree_id)?
+        && old_version != session.tool_version()
+    {
+        let moved = store::migrate_live_verdicts_to_version(
+            conn,
+            tool,
+            &old_version,
+            session.tool_version(),
+        )?;
+        if moved > 0 {
+            version_migrated = true;
+            refinements_stale = true;
+        }
+    }
     let mut aborted: Option<String> = None;
-    // Per-pass caches: definition-file disk bytes and symbol spans, keyed by repo-relative path.
+    // Per-pass caches: definition-file disk bytes / indexed sha / symbol spans, keyed by
+    // repo-relative path (the LSP returns a bounded set of def paths, so these stay small — the
+    // whole-checkout sha map is deliberately NOT loaded).
     let mut def_bytes: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+    let mut def_indexed_sha: HashMap<String, Option<String>> = HashMap::new();
     let mut def_spans: HashMap<String, Vec<store::SymbolSpan>> = HashMap::new();
     let logical_cache: std::cell::RefCell<HashMap<i64, Option<i64>>> =
         std::cell::RefCell::new(HashMap::new());
@@ -218,12 +242,9 @@ pub fn live_oracle_pass(
         let Some(callees) = by_path.get(path.as_str()) else {
             continue;
         };
-        // The request budget caps whole files (a file resolves fully or rides the next pass),
-        // except the FIRST candidate-bearing file, which always resolves even over budget so a
-        // huge file can never wedge the pass at zero progress.
-        if report.files_resolved > 0
-            && report.requests_used + callees.len() as u64 > input.max_requests
-        {
+        // Budget gate: nothing left → every candidate-bearing path from here rides the backlog.
+        let remaining = input.max_requests.saturating_sub(report.requests_used) as usize;
+        if remaining == 0 {
             report.unfinished_paths.extend(
                 input.worklist[position..]
                     .iter()
@@ -249,9 +270,32 @@ pub fn live_oracle_pass(
             continue;
         };
 
+        // Covered-skip continuation: a callee with a CURRENT live verdict (same tool_version +
+        // file_sha) is NEVER re-resolved for the same content — the budget only ever spends on
+        // unverdicted callees. A file a prior pass truncated therefore resumes exactly where it
+        // stopped, and a fully-covered file costs nothing (the first-file exemption this
+        // replaces let a huge generated file blow the budget). Re-resolution happens naturally
+        // on content change (a new `file_sha` un-covers the callee) — e.g. upgrading a sentinel
+        // to a batch moniker — or on a version migration, so a stale sentinel costs only
+        // cosmetics: the batch row carries the real evidence for any span both tools cover.
+        let covered = store::live_covered_callees_for_path(
+            conn,
+            tool,
+            session.tool_version(),
+            path,
+            &callees[0].file_sha,
+        )?;
+        let unverdicted: Vec<&store::EdgeJoinCandidate> =
+            callees.iter().copied().filter(|c| !covered.contains(&c.callee_start_byte)).collect();
+        if unverdicted.is_empty() {
+            continue;
+        }
+        let (to_resolve, deferred) = unverdicted.split_at(remaining.min(unverdicted.len()));
+        let deferred_count = deferred.len();
+
         let uri = format!("{}/{}", session.root_uri, encode_uri_path(path));
         let starts: Vec<usize> =
-            callees.iter().filter_map(|c| usize::try_from(c.callee_start_byte).ok()).collect();
+            to_resolve.iter().filter_map(|c| usize::try_from(c.callee_start_byte).ok()).collect();
         report.requests_used += starts.len() as u64;
         let resolved = match session.client.resolve_definitions(&uri, "rust", &text, &starts) {
             Ok(resolved) => resolved,
@@ -271,8 +315,13 @@ pub fn live_oracle_pass(
             },
         };
         report.files_resolved += 1;
+        if deferred_count > 0 {
+            // The budget cut this file short; it rides the backlog and resumes at the deferred
+            // callees (the covered-skip above makes that resume exact).
+            report.unfinished_paths.push(path.clone());
+        }
 
-        for (candidate, definition) in callees.iter().zip(resolved.iter()) {
+        for (candidate, definition) in to_resolve.iter().zip(resolved.iter()) {
             let Some((target_uri, target_range)) = definition else {
                 report.unresolved += 1;
                 continue;
@@ -294,11 +343,29 @@ pub fn live_oracle_pass(
                 report.skipped_drifted += 1;
                 continue;
             };
-            if indexed_shas.get(&def_path).map(String::as_str)
-                != Some(hex_sha256(&def_disk).as_str())
-            {
-                report.skipped_drifted += 1;
-                continue;
+            let indexed_sha = def_indexed_sha
+                .entry(def_path.clone())
+                .or_insert_with(|| {
+                    store::indexed_file_sha_for_path(
+                        conn,
+                        &def_path,
+                        input.commit_sha,
+                        input.worktree_id,
+                    )
+                    .unwrap_or(None)
+                })
+                .clone();
+            match indexed_sha {
+                // Not indexed in this checkout — nothing live can map to it.
+                None => {
+                    report.skipped_external += 1;
+                    continue;
+                },
+                Some(sha) if sha == hex_sha256(&def_disk) => {},
+                Some(_) => {
+                    report.skipped_drifted += 1;
+                    continue;
+                },
             }
             let index = LineIndex::new(&def_disk, session.client.encoding());
             let (Some(def_start), Some(def_end)) = (
@@ -378,10 +445,15 @@ pub fn live_oracle_pass(
         }
     }
 
-    if report.rows_written > 0 {
+    // A run row is recorded for a pass that WROTE verdicts OR migrated the tool version: the
+    // migration is what makes the new `tool_version` current for the currency gate, and without
+    // a backing run row the migrated rows stay invisible (the gate keys on the LATEST run).
+    report.version_migrated = version_migrated;
+    if report.rows_written > 0 || version_migrated {
         report.run_recorded = true;
         report.status = match &aborted {
             Some(err) => format!("Aborted: {err}"),
+            None if report.rows_written == 0 => "VersionMigrated".to_string(),
             None if report.unfinished_paths.is_empty() => "Completed".to_string(),
             None => "BudgetExhausted".to_string(),
         };
