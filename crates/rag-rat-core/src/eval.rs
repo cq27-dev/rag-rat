@@ -428,11 +428,8 @@ fn score_case_at_parent(
         return Ok(None);
     }
     let mut case_config = Config::load(&manifest)?;
-    // The replay DB lives in a guarded scratch dir, so an indexing/scoring error removes it (and
-    // its WAL/SHM sidecars) instead of stranding a per-case sqlite in the system temp (#586). The
-    // guard outlives every handle below: it is declared first and drops last.
-    let scratch = rag_rat_base::test_scratch::ScratchDir::new(&format!("replay-{short}"));
-    case_config.database = scratch.join("replay.sqlite");
+    let scratch = ReplayDbDir::create(short);
+    case_config.database = scratch.path.join("replay.sqlite");
     IndexDatabase::rebuild(&case_config)?;
     let report = {
         let case_db = IndexDatabase::open_config(&case_config)?;
@@ -538,6 +535,30 @@ impl Drop for ParentWorktree {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+    }
+}
+
+/// RAII throwaway directory for one replay case's index database. Removed on drop, so an indexing
+/// or scoring error never strands the per-case sqlite (and its WAL/SHM sidecars) in the system
+/// temp; a stale dir from a crashed run is cleared on creation. Deliberately NOT the test-scratch
+/// namespace: replay indexing is a production workload with no bounded duration, and the test
+/// helper's two-hour stale sweep is only sound for short-lived test fixtures.
+struct ReplayDbDir {
+    path: PathBuf,
+}
+
+impl ReplayDbDir {
+    fn create(dir_key: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("rag-rat-replay-db-{dir_key}"));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create replay scratch dir");
+        Self { path }
+    }
+}
+
+impl Drop for ReplayDbDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
