@@ -385,8 +385,8 @@ mod tests {
         assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
         assert_ne!(root, std::env::temp_dir());
 
-        let dir = scratch_dir("location-probe");
-        assert!(dir.starts_with(&root), "{dir:?} is not under the scratch root {root:?}");
+        let dir = ScratchDir::new("location-probe");
+        assert!(dir.path().starts_with(&root), "{dir:?} is not under the scratch root {root:?}");
     }
 
     /// The startup sweep must delete a stranded (aged) sibling while sparing a fresh one — the
@@ -394,13 +394,12 @@ mod tests {
     /// parallel test processes can't perturb the assertion. Bites if `sweep_stale` is neutered.
     #[test]
     fn sweep_removes_stale_dirs_but_spares_fresh_ones() {
-        // A private root for this test only (unique via `scratch_dir`), so no other worker's sweep
+        // A private root for this test only (unique via the guard), so no other worker's sweep
         // or dirs interfere with what we assert.
-        let test_root = scratch_dir("sweep-probe-root");
-        std::fs::create_dir_all(&test_root).unwrap();
+        let test_root = ScratchDir::new("sweep-probe-root");
 
-        let stale = test_root.join("stranded-by-kill");
-        let fresh = test_root.join("live-worker");
+        let stale = test_root.path().join("stranded-by-kill");
+        let fresh = test_root.path().join("live-worker");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::create_dir_all(&fresh).unwrap();
 
@@ -408,7 +407,7 @@ mod tests {
         let aged = SystemTime::now() - (SWEEP_MAX_AGE + Duration::from_secs(3600));
         set_file_mtime(&stale, FileTime::from_system_time(aged)).unwrap();
 
-        sweep_stale(&test_root);
+        sweep_stale(test_root.path());
 
         assert!(!stale.exists(), "sweep should have removed the stale (aged) dir {stale:?}");
         assert!(fresh.exists(), "sweep must NOT remove the fresh dir {fresh:?}");
@@ -424,18 +423,17 @@ mod tests {
     fn refuses_symlinked_namespace_and_spares_victim() {
         use std::os::unix::fs::symlink;
 
-        let parent = scratch_dir("symlink-attack-parent");
-        std::fs::create_dir_all(&parent).unwrap();
+        let parent = ScratchDir::new("symlink-attack-parent");
 
         // The victim: a directory (owned by us) containing an aged subdir a naive sweep would nuke.
-        let victim = parent.join("victim");
+        let victim = parent.path().join("victim");
         let victim_aged = victim.join("precious-aged-data");
         std::fs::create_dir_all(&victim_aged).unwrap();
         let aged = SystemTime::now() - (SWEEP_MAX_AGE + Duration::from_secs(3600));
         set_file_mtime(&victim_aged, FileTime::from_system_time(aged)).unwrap();
 
         // The attacker pre-creates the namespace path as a symlink to the victim.
-        let planted = parent.join("planted-namespace");
+        let planted = parent.path().join("planted-namespace");
         symlink(&victim, &planted).unwrap();
 
         // Drive the real startup sequence (create+verify, then sweep) against the planted path. The
@@ -472,8 +470,8 @@ mod tests {
             return;
         }
 
-        let parent = scratch_dir("foreign-owner-parent");
-        let namespace = parent.join("foreign-namespace");
+        let parent = ScratchDir::new("foreign-owner-parent");
+        let namespace = parent.path().join("foreign-namespace");
         std::fs::create_dir_all(&namespace).unwrap();
 
         // Hand the namespace to `nobody` (65534) so it is a real dir we no longer own.
@@ -542,9 +540,9 @@ mod tests {
     /// directly under the namespace root, named `<tag>-<pid>-<seq>`.
     #[test]
     fn accepts_normal_single_component_tag() {
-        let dir = scratch_dir("normal-tag");
-        assert_eq!(dir.parent(), Some(scratch_root().as_path()));
-        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let dir = ScratchDir::new("normal-tag");
+        assert_eq!(dir.path().parent(), Some(scratch_root().as_path()));
+        let name = dir.path().file_name().and_then(|n| n.to_str()).unwrap_or_default();
         assert!(name.starts_with("normal-tag-"), "unexpected scratch name {name:?}");
     }
 

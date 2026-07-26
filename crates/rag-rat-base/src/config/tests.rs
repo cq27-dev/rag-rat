@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use path_slash::PathExt;
 
@@ -17,7 +16,37 @@ use crate::language::Language;
 // double-quoted TOML string value without Windows `\U`/`\R` invalid-escape parse
 // errors.
 
-static CFG_TEMP: AtomicU64 = AtomicU64::new(0);
+/// One uniquely owned scratch directory, removed on drop — panics and early returns included.
+/// Wraps [`crate::test_scratch::ScratchDir`] and derefs to `PathBuf` so fixtures use it exactly
+/// like the bare temp path it replaces; the directory is created up front and fixtures nest
+/// repos and worktree destinations under it. Bind it for the whole test — a temporary drops the
+/// guard at the statement boundary and deletes the directory mid-test.
+#[derive(Debug)]
+struct ScratchRoot {
+    path: PathBuf,
+    _scratch: crate::test_scratch::ScratchDir,
+}
+
+impl std::ops::Deref for ScratchRoot {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for &ScratchRoot {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// A fresh scratch directory under the shared, self-healing test-scratch namespace (see
+/// [`crate::test_scratch`]), keyed by `tag`, the process id, and a process-wide counter.
+fn scratch(tag: &str) -> ScratchRoot {
+    let guard = crate::test_scratch::ScratchDir::new(tag);
+    ScratchRoot { path: guard.path().to_path_buf(), _scratch: guard }
+}
 
 #[test]
 fn config_load_resolves_main_and_linked_worktrees_to_one_database() {
@@ -26,8 +55,7 @@ fn config_load_resolves_main_and_linked_worktrees_to_one_database() {
     let git = |dir: &Path, args: &[&str]| {
         std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-cfgload-{}-{id}", std::process::id()));
+    let tmp = scratch("cfgload");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -62,8 +90,6 @@ fn config_load_resolves_main_and_linked_worktrees_to_one_database() {
         main.canonicalize().unwrap(),
         "a linked worktree's config root anchors to the main worktree",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -278,8 +304,7 @@ fn papertrail_rate_limit_reserve_is_parsed_and_validated() {
 
 #[test]
 fn repo_id_override_is_parsed_and_does_not_change_the_database_path() {
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-repoid-{}-{id}", std::process::id()));
+    let tmp = scratch("repoid");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     std::fs::write(
@@ -298,8 +323,6 @@ fn repo_id_override_is_parsed_and_does_not_change_the_database_path() {
     // Parse-only: the override must NOT influence path resolution — the explicit database stays
     // at the per-repo path beside `root`.
     assert_eq!(config.database, config.root.join(".rag-rat/index.sqlite"));
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// Seed a minimal COMMITTED git repo at `dir` — the identity-bearing fixture the global
@@ -324,8 +347,7 @@ fn git_commit_all(dir: &Path) {
 /// so this never touches a developer's real global store.
 #[test]
 fn config_load_without_a_database_key_resolves_to_the_global_database() {
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-globaldb-{}-{id}", std::process::id()));
+    let tmp = scratch("globaldb");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     std::fs::write(
@@ -342,8 +364,6 @@ fn config_load_without_a_database_key_resolves_to_the_global_database() {
         config.database, expected,
         "a keyless config defaults to the consolidated global database",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// The GOVERNING SEAM: in a linked worktree the MAIN config governs the WHOLE config, not a
@@ -356,8 +376,7 @@ fn config_load_in_a_linked_worktree_is_governed_wholesale_by_the_main_config() {
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-wholecfg-{}-{id}", std::process::id()));
+    let tmp = scratch("wholecfg");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -393,8 +412,6 @@ fn config_load_in_a_linked_worktree_is_governed_wholesale_by_the_main_config() {
     assert_eq!(from_linked.database, from_main.database);
     assert_eq!(from_linked.root, from_main.root);
     assert_eq!(from_linked.targets, from_main.targets);
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// Config-less-main fallback posture: main is resolvable but has NO `rag-rat.toml`, so the
@@ -406,8 +423,7 @@ fn config_load_falls_back_to_the_local_config_when_main_has_none() {
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-nomaincfg-{}-{id}", std::process::id()));
+    let tmp = scratch("nomaincfg");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -435,8 +451,6 @@ fn config_load_falls_back_to_the_local_config_when_main_has_none() {
         "the local key governs (resolved against the main top) until main gains a config",
     );
     assert!(cfg.database_key_pinned);
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// The DISCOVERY resolver matrix (Codex batch 9): local file wins wherever it exists (the
@@ -449,8 +463,7 @@ fn discover_config_path_resolves_the_governing_checkout() {
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-discover-{}-{id}", std::process::id()));
+    let tmp = scratch("discover");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -475,8 +488,6 @@ fn discover_config_path_resolves_the_governing_checkout() {
     let plain = tmp.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
     assert_eq!(config::discover_config_path(&plain), plain.join("rag-rat.toml"));
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// The ANCESTOR-WALK arm (non-worktree): a launch from a SUBDIRECTORY of a rag-rat repo
@@ -488,8 +499,7 @@ fn discover_config_path_resolves_the_governing_checkout() {
 /// starting dir.
 #[test]
 fn discover_config_path_walks_up_to_a_parent_repo_config() {
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-walkup-{}-{id}", std::process::id()));
+    let tmp = scratch("walkup");
     let repo = tmp.join("repo");
     let nested = repo.join("crates").join("cli").join("src");
     std::fs::create_dir_all(&nested).unwrap();
@@ -514,8 +524,6 @@ fn discover_config_path_walks_up_to_a_parent_repo_config() {
     let bare = tmp.join("bare").join("deep");
     std::fs::create_dir_all(&bare).unwrap();
     assert_eq!(config::discover_config_path(&bare), bare.join("rag-rat.toml"));
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// The ancestor walk STOPS at the enclosing git repo root: a nested checkout / submodule with
@@ -528,8 +536,7 @@ fn discover_config_path_does_not_cross_a_nested_repo_boundary() {
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-nested-{}-{id}", std::process::id()));
+    let tmp = scratch("nested");
     let parent = tmp.join("parent");
     let nested = parent.join("vendor").join("nested");
     std::fs::create_dir_all(&nested).unwrap();
@@ -548,8 +555,6 @@ fn discover_config_path_does_not_cross_a_nested_repo_boundary() {
         parent.join("rag-rat.toml").canonicalize().ok(),
         "the parent repo's rag-rat.toml must not leak across the nested boundary",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// A SUBDIRECTORY launch inside a LINKED worktree finds a BRANCH-LOCAL `rag-rat.toml` at the
@@ -562,8 +567,7 @@ fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdi
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-wtsub-{}-{id}", std::process::id()));
+    let tmp = scratch("wtsub");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -593,8 +597,6 @@ fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdi
         linked.join("rag-rat.toml").canonicalize().unwrap(),
         "a subdir launch must find the branch-local config, not jump to main",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// The linked-ness PRIMITIVE (Codex batch 8, findings 1+3): topology-derived — the discovered
@@ -607,8 +609,7 @@ fn linked_worktree_main_root_derives_linkedness_from_topology() {
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-linkpred-{}-{id}", std::process::id()));
+    let tmp = scratch("linkpred");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -636,8 +637,6 @@ fn linked_worktree_main_root_derives_linkedness_from_topology() {
     let plain = tmp.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
     assert_eq!(config::linked_worktree_main_root(&plain), None, "non-git has no designated main");
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// Validation ORDERING (Codex batch 8, finding 2): the governing config is chosen FIRST; hard
@@ -651,8 +650,7 @@ fn config_load_ignores_an_invalid_branch_config_when_main_governs() {
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-brokecfg-{}-{id}", std::process::id()));
+    let tmp = scratch("brokecfg");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -692,8 +690,6 @@ fn config_load_ignores_an_invalid_branch_config_when_main_governs() {
         Config::load(main.join("rag-rat.toml")).is_err(),
         "the governing config's validation is fatal as always",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// The seam's trigger is TOPOLOGY, not the root-anchoring proxy (Codex batch 8, finding 3): a
@@ -707,8 +703,7 @@ fn config_load_governs_from_main_even_when_a_branch_only_root_defeats_anchoring(
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-branchroot-{}-{id}", std::process::id()));
+    let tmp = scratch("branchroot");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -746,8 +741,6 @@ fn config_load_governs_from_main_even_when_a_branch_only_root_defeats_anchoring(
     );
     assert_eq!(cfg.watch.debounce_ms, 1111, "main's watch config governs too");
     assert_eq!(cfg.root, main_c, "root comes from MAIN's config when main governs");
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// The identity gate's SECOND entrance (Codex batch 8, finding 5a): an EXPLICIT pin at the
@@ -761,8 +754,7 @@ fn config_load_refuses_an_identity_less_pin_at_the_global_store() {
     let Some(global) = crate::data_dir::global_database_path() else {
         return; // no resolvable data dir on this platform — the gate cannot trigger
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-globpin-{}-{id}", std::process::id()));
+    let tmp = scratch("globpin");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     let config_path = tmp.join("rag-rat.toml");
@@ -798,8 +790,6 @@ fn config_load_refuses_an_identity_less_pin_at_the_global_store() {
     .unwrap();
     let cfg = Config::load(&config_path).expect("a repo_id pin lifts the refusal");
     assert_eq!(cfg.database, global);
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// The `database` decision is MAIN-WORKTREE-ANCHORED (Codex batch 7): a linked worktree's
@@ -813,8 +803,7 @@ fn config_load_anchors_the_database_key_to_the_main_worktree() {
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-dbanchor-{}-{id}", std::process::id()));
+    let tmp = scratch("dbanchor");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -868,8 +857,6 @@ fn config_load_anchors_the_database_key_to_the_main_worktree() {
         "a branch-local pin must not fork the repo onto its own database",
     );
     assert!(!from_linked.database_key_pinned, "main keyless ⇒ governing decision is keyless");
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// A7 legacy interplay: a keyless config in a repo that ALREADY has a `.rag-rat/index.sqlite`
@@ -878,8 +865,7 @@ fn config_load_anchors_the_database_key_to_the_main_worktree() {
 /// imports and renames it, after which resolution falls through to the global store.
 #[test]
 fn config_load_without_a_database_key_prefers_an_existing_legacy_index() {
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-legacydb-{}-{id}", std::process::id()));
+    let tmp = scratch("legacydb");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::create_dir_all(tmp.join(".rag-rat")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -918,8 +904,6 @@ fn config_load_without_a_database_key_prefers_an_existing_legacy_index() {
         crate::data_dir::global_database_path().expect("data dir resolves"),
         "a stray legacy file beside the .imported marker is ignored, not adopted",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// The IDENTITY GATE on the global default: a keyless config at a root with NO derivable repo
@@ -931,9 +915,7 @@ fn config_load_without_a_database_key_prefers_an_existing_legacy_index() {
 #[test]
 fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
     let keyless_config = |tag: &str| {
-        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-        let tmp =
-            std::env::temp_dir().join(format!("ragrat-noident-{tag}-{}-{id}", std::process::id()));
+        let tmp = scratch(&format!("noident-{tag}"));
         std::fs::create_dir_all(tmp.join("src")).unwrap();
         std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
         std::fs::write(
@@ -968,7 +950,7 @@ fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
     let unborn = keyless_config("unborn");
     let git = |args: &[&str]| {
         let out =
-            std::process::Command::new("git").arg("-C").arg(&unborn).args(args).output().unwrap();
+            std::process::Command::new("git").arg("-C").arg(&*unborn).args(args).output().unwrap();
         assert!(out.status.success());
     };
     git(&["init", "-q"]);
@@ -991,16 +973,11 @@ fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
         crate::data_dir::global_database_path().expect("data dir resolves"),
         "a pinned repo_id makes the root identity-bearing, so the global default applies",
     );
-
-    let _ = std::fs::remove_dir_all(&a);
-    let _ = std::fs::remove_dir_all(&b);
-    let _ = std::fs::remove_dir_all(&unborn);
 }
 
 #[test]
 fn repo_id_override_absent_is_none() {
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-repoid-none-{}-{id}", std::process::id()));
+    let tmp = scratch("repoid-none");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     std::fs::write(
@@ -1011,8 +988,6 @@ fn repo_id_override_absent_is_none() {
 
     let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
     assert_eq!(config.repo_id_override, None, "no [index] repo_id → None");
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -1028,8 +1003,7 @@ fn config_load_in_a_linked_worktree_uses_main_base_targets_not_the_branch() {
     let git = |dir: &Path, args: &[&str]| {
         std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-cfgbranch-{}-{id}", std::process::id()));
+    let tmp = scratch("cfgbranch");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -1081,8 +1055,6 @@ fn config_load_in_a_linked_worktree_uses_main_base_targets_not_the_branch() {
         !dirs.contains(&PathBuf::from("extra")),
         "the branch-only target must NOT be a base target (it can't tombstone main): {dirs:?}",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -1096,8 +1068,7 @@ fn config_load_in_a_linked_worktree_keeps_main_targets_when_the_branch_narrows_t
     let git = |dir: &Path, args: &[&str]| {
         std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-cfgnarrow-{}-{id}", std::process::id()));
+    let tmp = scratch("cfgnarrow");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::create_dir_all(main.join("extra")).unwrap();
@@ -1135,8 +1106,6 @@ fn config_load_in_a_linked_worktree_keeps_main_targets_when_the_branch_narrows_t
         dirs.contains(&PathBuf::from("extra")),
         "base keeps main's `extra` even though the branch dropped it: {dirs:?}",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -1148,9 +1117,7 @@ fn config_load_anchors_repo_id_override_to_main_when_the_branch_diverges() {
     let git = |dir: &Path, args: &[&str]| {
         std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp =
-        std::env::temp_dir().join(format!("ragrat-repoid-anchor-{}-{id}", std::process::id()));
+    let tmp = scratch("repoid-anchor");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -1190,8 +1157,6 @@ fn config_load_anchors_repo_id_override_to_main_when_the_branch_diverges() {
         Some("canonical-id"),
         "a linked worktree resolves MAIN's repo_id override, not its own branch-local pin",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -1204,9 +1169,7 @@ fn config_load_anchors_repo_id_override_to_main_when_main_omits_it() {
     let git = |dir: &Path, args: &[&str]| {
         std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp =
-        std::env::temp_dir().join(format!("ragrat-repoid-mainomit-{}-{id}", std::process::id()));
+    let tmp = scratch("repoid-mainomit");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -1239,8 +1202,6 @@ fn config_load_anchors_repo_id_override_to_main_when_main_omits_it() {
         from_linked.repo_id_override, None,
         "main omits the override, so the anchored identity derives — the branch pin is ignored",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// #427: a linked worktree's `[index] root` resolves to itself locally, but `Config::load`
@@ -1254,8 +1215,7 @@ fn load_records_the_pre_anchor_root_for_a_linked_worktree() {
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-reanchor-{}-{id}", std::process::id()));
+    let tmp = scratch("reanchor");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -1282,17 +1242,13 @@ fn load_records_the_pre_anchor_root_for_a_linked_worktree() {
         Some(linked_c.as_path()),
         "the pre-anchor (named) linked-worktree root is captured",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// The counterpart to the above: loading from a plain (non-worktree) repo redirects nothing,
 /// so the field stays `None`.
 #[test]
 fn load_leaves_reanchor_none_for_the_main_worktree() {
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp =
-        std::env::temp_dir().join(format!("ragrat-reanchor-none-{}-{id}", std::process::id()));
+    let tmp = scratch("reanchor-none");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     std::fs::write(
@@ -1307,16 +1263,13 @@ fn load_leaves_reanchor_none_for_the_main_worktree() {
         config.source_root_reanchored_from.is_none(),
         "no worktree redirection happened, so the field stays None",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
 fn cpp_target_renders_h_in_its_default_globs_but_c_keeps_h_too() {
     // The simple-binding glob render goes through `default_include_globs`, so a `cpp` binding
     // includes `**/*.h` (the header-resolution fix) while `c` keeps it as well.
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-prec-{}-{id}", std::process::id()));
+    let root = scratch("prec");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         root.join("rag-rat.toml"),
@@ -1332,7 +1285,6 @@ fn cpp_target_renders_h_in_its_default_globs_but_c_keeps_h_too() {
             < config.targets.iter().find(|t| t.language == Language::C).unwrap().index_precedence(),
         "cpp must outrank c for the shared .h header"
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1340,8 +1292,7 @@ fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
     let git = |dir: &Path, args: &[&str]| {
         std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-cfg-{}-{id}", std::process::id()));
+    let tmp = scratch("cfg");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     git(&main, &["init", "-q"]);
@@ -1386,8 +1337,6 @@ fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
         branch_only_c,
         "a branch-only root that's missing in main keeps the linked checkout's root",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -2109,8 +2058,7 @@ fn the_renamed_local_ai_table_is_rejected_with_a_migration_message() {
     // #317 renamed [local_ai] → [llm]. An old config's [local_ai] table must error LOUDLY:
     // serde would otherwise silently DROP it, reverting embedding settings to defaults on
     // upgrade. The error fires in Config::load before any directory resolution.
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-localai-{}-{id}", std::process::id()));
+    let tmp = scratch("localai");
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(
         tmp.join("rag-rat.toml"),
@@ -2130,8 +2078,7 @@ fn the_legacy_dream_table_is_rejected_with_a_migration_message() {
     // [dream] table must error LOUDLY: serde would otherwise silently DROP it, so an upgrade
     // from `[dream.model] enabled = true` would run the deterministic passes only (never the
     // model). Fires in Config::load before any directory resolution.
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-dream-{}-{id}", std::process::id()));
+    let tmp = scratch("dream");
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(
         tmp.join("rag-rat.toml"),
@@ -2887,9 +2834,7 @@ fn for_linked_worktree_overlay_falls_back_when_branch_config_is_missing_or_inval
     let git = |dir: &Path, args: &[&str]| {
         std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp =
-        std::env::temp_dir().join(format!("ragrat-overlay-fallback-{}-{id}", std::process::id()));
+    let tmp = scratch("overlay-fallback");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -2925,8 +2870,6 @@ fn for_linked_worktree_overlay_falls_back_when_branch_config_is_missing_or_inval
     let branch = base.for_linked_worktree_overlay(&linked);
     let dirs = branch.target_directories();
     assert!(dirs.contains(&PathBuf::from("extra")), "valid branch config swaps targets: {dirs:?}");
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -2934,8 +2877,7 @@ fn config_load_propagates_main_parse_error_from_linked_worktree() {
     let git = |dir: &Path, args: &[&str]| {
         std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("ragrat-main-broken-{}-{id}", std::process::id()));
+    let tmp = scratch("main-broken");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -2959,8 +2901,6 @@ fn config_load_propagates_main_parse_error_from_linked_worktree() {
         matches!(err, ConfigError::LocalAiTableRenamed),
         "linked checkout must inherit main's fatal parse error, got {err:?}",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -2968,9 +2908,7 @@ fn config_load_rejects_reserved_papertrail_table_from_governing_main() {
     let git = |dir: &Path, args: &[&str]| {
         std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
     };
-    let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
-    let tmp =
-        std::env::temp_dir().join(format!("ragrat-main-papertrail-{}-{id}", std::process::id()));
+    let tmp = scratch("main-papertrail");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -2994,8 +2932,6 @@ fn config_load_rejects_reserved_papertrail_table_from_governing_main() {
     .unwrap();
 
     Config::load(linked.join("rag-rat.toml")).unwrap();
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
