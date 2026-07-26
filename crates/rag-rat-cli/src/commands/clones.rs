@@ -212,15 +212,12 @@ pub(crate) fn clones_for(config: &Config, args: &ClonesForArgs) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
     use rag_rat_base::language::Language;
     use rag_rat_core::IndexDatabase;
 
     use crate::cli::ClonesArgs;
-
-    static N: AtomicU64 = AtomicU64::new(0);
 
     /// Fix E: a qualified name like `sym_utils.rs::load_user` (a file literally named `sym_*`)
     /// must route to `Ref`, not `Id`. The old `starts_with("sym_")` guard misrouted it to `Id`,
@@ -262,12 +259,7 @@ mod tests {
         // Plant two identical functions in separate files → struct_hash fast path produces a clone
         // class. Validates that the `clones` command handler wires find_clones and prints output
         // without panicking.
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-clones-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-clones");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let clone_body =
             "pub fn cloned_helper(x: i32, y: i32) -> i32 {\n    x + y + 42\n}\n".to_string();
@@ -282,7 +274,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
                 name: "rust".to_string(),
@@ -364,7 +356,5 @@ mod tests {
             );
         }
         assert!(syms.windows(2).all(|w| w[0] < w[1]), "clone_symbol_refs must be sorted+unique");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

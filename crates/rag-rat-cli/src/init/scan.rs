@@ -288,18 +288,11 @@ pub(crate) fn path_depth(path: &Path) -> usize {
 
 #[cfg(test)]
 mod header_assignment_tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
     use crate::init::run::default_plan;
 
-    fn temp_root(tag: &str) -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let id = N.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("ragrat-hdr-{tag}-{}-{id}", std::process::id()));
-        fs::remove_dir_all(&root).ok();
-        root
+    fn temp_root(tag: &str) -> rag_rat_base::test_scratch::ScratchDir {
+        rag_rat_base::test_scratch::ScratchDir::new(&format!("hdr-{tag}"))
     }
 
     #[test]
@@ -326,8 +319,6 @@ mod header_assignment_tests {
         let cpp = &plan.bindings[&Language::Cpp];
         assert!(cpp.contains(&PathBuf::from("include")), "cpp must bind the header dir: {cpp:?}");
         assert!(!plan.bindings.contains_key(&Language::C), "no C binding for a C++-only repo");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -341,8 +332,6 @@ mod header_assignment_tests {
         let scan = scan_repo(&root).unwrap();
         assert_eq!(scan.language_counts.get(&Language::C).copied().unwrap_or(0), 2, ".c + .h");
         assert_eq!(scan.language_counts.get(&Language::Cpp).copied().unwrap_or(0), 0, "no C++");
-
-        fs::remove_dir_all(&root).ok();
     }
 }
 
@@ -429,8 +418,7 @@ mod python_dir_tests {
 
     #[test]
     fn virtualenv_detected_by_content_not_name() {
-        let tmp = std::env::temp_dir().join(format!("rag-rat-venv-detect-{}", std::process::id()));
-        fs::remove_dir_all(&tmp).ok();
+        let tmp = rag_rat_base::test_scratch::ScratchDir::new("venv-detect");
         // A real venv (any name) has a `pyvenv.cfg` → detected.
         fs::create_dir_all(tmp.join("env")).unwrap();
         fs::write(tmp.join("env/pyvenv.cfg"), "home = /usr\n").unwrap();
@@ -442,7 +430,6 @@ mod python_dir_tests {
             !is_virtualenv_dir(&tmp.join("src/virtualenv")),
             "the virtualenv package dir has no pyvenv.cfg"
         );
-        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

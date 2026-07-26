@@ -42,18 +42,10 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir() -> std::path::PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("rag-rat-atomic-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir() -> rag_rat_base::test_scratch::ScratchDir {
+        rag_rat_base::test_scratch::ScratchDir::new("atomic")
     }
 
     #[test]
@@ -62,7 +54,6 @@ mod tests {
         let path = dir.join("settings.json");
         write_atomic(&path, b"hello\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello\n");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -72,7 +63,6 @@ mod tests {
         fs::write(&path, b"old contents").unwrap();
         write_atomic(&path, b"new contents").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new contents");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -87,7 +77,6 @@ mod tests {
             .filter(|name| name != "hook")
             .collect();
         assert!(leftovers.is_empty(), "unexpected temp files left behind: {leftovers:?}");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -96,6 +85,5 @@ mod tests {
         let path = dir.join("nested").join(".claude").join("settings.json");
         write_atomic(&path, b"{}").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
-        let _ = fs::remove_dir_all(&dir);
     }
 }

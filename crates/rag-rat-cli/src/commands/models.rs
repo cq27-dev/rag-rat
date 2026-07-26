@@ -332,22 +332,16 @@ fn warn_if_short_context(model_id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use rag_rat_base::config::Config;
 
-    static N: AtomicU64 = AtomicU64::new(0);
-
     /// Build a `Config` from a written rag-rat.toml with the given embedding-model selector and an
     /// optional connect `[remote]` block (a closed-port endpoint — never connected in these tests).
-    fn config_with_remote(model: &str, with_remote: bool) -> (PathBuf, Config) {
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-remote-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+    fn config_with_remote(
+        model: &str,
+        with_remote: bool,
+    ) -> (rag_rat_base::test_scratch::ScratchDir, Config) {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-remote");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
         let remote = if with_remote {
@@ -370,7 +364,7 @@ mod tests {
     #[test]
     fn remote_for_install_only_applies_the_remote_block_to_the_configured_model() {
         // Configured for the MiniLM transformer over a [remote] block.
-        let (root, config) = config_with_remote("sentence-transformers/all-MiniLM-L6-v2", true);
+        let (_root, config) = config_with_remote("sentence-transformers/all-MiniLM-L6-v2", true);
 
         // Installing the CONFIGURED model → uses the remote block.
         assert!(
@@ -389,16 +383,13 @@ mod tests {
         assert!(msg.contains("remote embedding is configured for"), "{msg}");
         assert!(msg.contains("sentence-transformers/all-MiniLM-L6-v2"), "names configured: {msg}");
         assert!(msg.contains("BAAI/bge-small-en-v1.5"), "names requested: {msg}");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn remote_for_install_returns_none_without_a_remote_block() {
         // No [remote] block → any install is local (None) regardless of the requested id.
-        let (root, config) = config_with_remote("sentence-transformers/all-MiniLM-L6-v2", false);
+        let (_root, config) = config_with_remote("sentence-transformers/all-MiniLM-L6-v2", false);
         assert!(super::remote_for_install(&config, "BAAI/bge-small-en-v1.5").unwrap().is_none());
         assert!(super::remote_for_install(&config, "embedding-hash").unwrap().is_none());
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

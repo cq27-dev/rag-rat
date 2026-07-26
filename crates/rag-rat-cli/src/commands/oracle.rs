@@ -431,7 +431,6 @@ fn join_tool_version_suffix(version: String, suffix: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -442,15 +441,8 @@ mod tests {
 
     use crate::cli::{OracleArgs, OracleCommand, OracleRunArgs, OracleToolArg};
 
-    static N: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_config() -> (PathBuf, Config) {
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-oracle-lock-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+    fn temp_config() -> (rag_rat_base::test_scratch::ScratchDir, Config) {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-oracle-lock");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n")
             .unwrap();
@@ -460,7 +452,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
                 name: "rust".to_string(),
@@ -626,8 +618,6 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(20)).expect("oracle run completes after unlock");
         assert!(ok, "oracle run should succeed once the lock is free");
         handle.join().unwrap();
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The lock is RELEASED after `oracle run` returns — a subsequent acquire succeeds immediately,
@@ -650,7 +640,5 @@ mod tests {
             FileLock::try_acquire(&write_lock_path(&config.database, &write_lock_repo_id(&config)))
                 .unwrap();
         assert!(lock.is_some(), "oracle run must release the write lock when it returns");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

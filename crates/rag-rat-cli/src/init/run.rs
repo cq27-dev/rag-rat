@@ -718,10 +718,7 @@ mod default_plan_tests {
         // endpoint) must PROPAGATE — the user asked for remote GPU embedding, so init must NOT
         // silently degrade to hash. (Contrast a LOCAL feature-missing install, which still falls
         // back.) `assume_yes=true` skips the prompt.
-        let n = std::sync::atomic::AtomicU64::new(0);
-        let id = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("ragrat-r4-{}-{id}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("r4");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
         // A closed port: bind then drop so the connect is refused at probe time.
@@ -754,7 +751,5 @@ mod default_plan_tests {
             .find(|m| m.model_id == rag_rat_base::embedding_models::HASH_MODEL_ID)
             .unwrap();
         assert!(!active.installed, "hash must NOT have been installed as a silent fallback");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

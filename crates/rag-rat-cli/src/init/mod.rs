@@ -325,8 +325,7 @@ mod tests {
 
     #[test]
     fn rendered_swift_binding_round_trips_with_default_glob() {
-        let root = std::env::temp_dir().join(format!("ragrat-render-swift-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("render-swift");
         std::fs::create_dir_all(root.join("Sources/App")).unwrap();
         std::fs::write(root.join("Sources/App/App.swift"), "struct App {}\n").unwrap();
         let plan = InitPlan {
@@ -346,7 +345,6 @@ mod tests {
         assert_eq!(config.targets[0].language, Language::Swift);
         assert_eq!(config.targets[0].directories, vec![PathBuf::from("Sources")]);
         assert_eq!(config.targets[0].include, vec!["**/*.swift"]);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -354,8 +352,7 @@ mod tests {
         // The generated config documents the full surface (commented), still parses via
         // Config::load, and the example [[target]] / [watch] / [version_check] tables stay
         // COMMENTED — only the active bindings + model take effect.
-        let root = std::env::temp_dir().join(format!("ragrat-render-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("render");
         std::fs::create_dir_all(root.join("include")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         let plan = InitPlan {
@@ -388,7 +385,6 @@ mod tests {
         assert!(config.watch.enabled);
         // Commented [log] falls back to its default (disabled).
         assert!(!config.log.enabled);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A7: the freshly rendered config has NO `database` key, so `Config::load` resolves it to the
@@ -396,9 +392,7 @@ mod tests {
     /// hand-written configs. Path resolution only; nothing is created at the global path.
     #[test]
     fn rendered_config_is_keyless_and_resolves_to_the_global_database() {
-        let root =
-            std::env::temp_dir().join(format!("ragrat-render-globaldb-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("render-globaldb");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
         // Identity-bearing root: the global default requires a derivable repo identity (a
@@ -410,8 +404,12 @@ mod tests {
             &["add", "-A"],
             &["commit", "-qm", "seed"],
         ] {
-            let out =
-                std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&*root)
+                .args(args)
+                .output()
+                .unwrap();
             assert!(out.status.success());
         }
         let plan = InitPlan {
@@ -431,13 +429,11 @@ mod tests {
                 .expect("a data dir resolves in the test environment"),
             "a fresh init's keyless config lands on the machine-global store",
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn config_load_ignores_active_init_cookbook_catalog() {
-        let root = std::env::temp_dir().join(format!("ragrat-init-catalog-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("init-catalog");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("rag-rat.toml"),
@@ -466,7 +462,6 @@ mod tests {
 
         assert_eq!(config.targets.len(), 1);
         assert_eq!(config.llm.embedding.backend.as_str(), "sentence-transformers/all-MiniLM-L6-v2");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

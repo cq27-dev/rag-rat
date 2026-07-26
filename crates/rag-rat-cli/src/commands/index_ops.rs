@@ -777,25 +777,17 @@ fn run_maintenance_pass(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
     use rag_rat_base::language::Language;
     use rag_rat_core::IndexDatabase;
-
-    static N: AtomicU64 = AtomicU64::new(0);
 
     /// #574: `doctor --vacuum` opens the store, reclaims dead space under the schema lock, and
     /// leaves the freelist empty. (Reclamation-under-load correctness is unit-tested in
     /// `db_file_health`; this pins the CLI wiring — dispatch → open_config → VACUUM → report.)
     #[test]
     fn doctor_vacuum_runs_and_leaves_no_freelist() {
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-vacuum-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-vacuum");
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("docs/a.md"), "# Title\nalpha token\n").unwrap();
         let config = Config {
@@ -804,7 +796,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
                 name: "markdown".to_string(),
@@ -834,7 +826,6 @@ mod tests {
             0,
             "a vacuum leaves no reclaimable freelist"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -846,12 +837,7 @@ mod tests {
         let git = |dir: &std::path::Path, args: &[&str]| {
             std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
         };
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-maint-overlay-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-maint-overlay");
         let main = root.join("main");
         std::fs::create_dir_all(main.join("src")).unwrap();
         std::fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
@@ -915,7 +901,6 @@ mod tests {
         );
 
         drop(db);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -930,12 +915,7 @@ mod tests {
         let git = |dir: &std::path::Path, args: &[&str]| {
             std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
         };
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-scope360-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-scope360");
         let main = root.join("main");
         std::fs::create_dir_all(main.join("src")).unwrap();
         std::fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
@@ -999,8 +979,6 @@ mod tests {
             "open_config must base-scope embedding counts (open does not): scoped={scoped} \
              unscoped={unscoped}"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// #573: the hook write path (`run_maintenance_pass`) checkpoints the shared global `-wal`, so a
@@ -1013,12 +991,7 @@ mod tests {
         let git = |dir: &std::path::Path, args: &[&str]| {
             std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
         };
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-maint-wal-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-maint-wal");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
@@ -1032,7 +1005,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
                 name: "rust".to_string(),
@@ -1073,7 +1046,6 @@ mod tests {
             serde_json::json!(false),
             "a fresh fixture's -wal is under the threshold, so the checkpoint is size-gated off"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1086,12 +1058,7 @@ mod tests {
         let git = |dir: &std::path::Path, args: &[&str]| {
             std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
         };
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-maint-backlog-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-maint-backlog");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
@@ -1105,7 +1072,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
                 name: "rust".to_string(),
@@ -1155,8 +1122,6 @@ mod tests {
         ] {
             assert!(backlog.get(key).is_none(), "`{key}` must be omitted from the cheap backlog");
         }
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1168,12 +1133,7 @@ mod tests {
         // #267: a single amend/merge/rebase fires several git hooks, each backgrounding
         // `rag-rat maintenance`. A concurrent trigger must coalesce — skip its pass and set the
         // rerun marker — rather than queue a redundant discover that widens the SQLITE_BUSY window.
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-maint-coalesce-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-maint-coalesce");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         let config = Config {
@@ -1182,7 +1142,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
                 name: "rust".to_string(),
@@ -1228,8 +1188,6 @@ mod tests {
         // change the coalesced trigger requested).
         super::maintenance(&config, &args).unwrap();
         assert!(!pending.exists(), "the runner clears the rerun marker after its pass");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The hook-driven maintenance tail shares the #472 quiet-window gate with the watcher: a
@@ -1237,12 +1195,7 @@ mod tests {
     /// rebuild; once the armed candidate has sat past the window, the next pass completes it.
     #[test]
     fn maintenance_defers_the_clone_graph_rebuild_inside_the_quiet_window() {
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-clone-quiet-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-clone-quiet");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("src/a.rs"),
@@ -1260,7 +1213,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
                 name: "rust".to_string(),
@@ -1320,21 +1273,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(complete, 1, "the quiet-elapsed hook pass builds the graph to completion");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
 #[cfg(test)]
 mod papertrail_hook_tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use rag_rat_base::config::{Config, ResolvedTarget, TargetKind, Tracker, TrackerConfig};
     use rag_rat_base::language::Language;
     use rag_rat_core::IndexDatabase;
-
-    static N: AtomicU64 = AtomicU64::new(0);
 
     fn config_with_unreachable_tracker(root: &std::path::Path) -> Config {
         Config {
@@ -1376,12 +1324,7 @@ mod papertrail_hook_tests {
 
     #[test]
     fn maintenance_triggers_papertrail_after_the_pass_and_a_broken_mirror_never_fails_the_hook() {
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-papertrail-hook-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-papertrail-hook");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         let config = config_with_unreachable_tracker(&root);
@@ -1415,18 +1358,11 @@ mod papertrail_hook_tests {
         assert!(
             !rag_rat_base::locks::papertrail_pending_path(&config.database, &lock_repo).exists()
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn maintenance_runs_device_sync_on_a_hook_trigger_without_failing_the_hook() {
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-device-sync-hook-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-device-sync-hook");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         let mut config = config_with_unreachable_tracker(&root);
@@ -1457,8 +1393,6 @@ mod papertrail_hook_tests {
             )
             .unwrap();
         assert_eq!(stamped, 0, "device sync stayed disabled (no account) — no watermark stamped");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A hook trigger that coalesces behind an in-flight maintenance run still fires its own
@@ -1469,12 +1403,7 @@ mod papertrail_hook_tests {
     fn coalesced_hook_trigger_still_fires_papertrail() {
         use rag_rat_base::locks::{FileLock, maintenance_lock_path, write_lock_repo_id};
 
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-papertrail-coalesced-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-papertrail-coalesced");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         let config = config_with_unreachable_tracker(&root);
@@ -1509,20 +1438,13 @@ mod papertrail_hook_tests {
         super::maintenance(&config, &args("post-commit")).unwrap();
         assert_eq!(mirror_attempts(), 1, "the hook's change signal must not be dropped");
         drop(held);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Papertrail auto-sync rides GIT-HOOK triggers only: a manual / foreground `maintenance`
     /// run must stay bounded by its index budget and never start a network mirror flight.
     #[test]
     fn manual_maintenance_never_triggers_papertrail() {
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-cli-papertrail-manual-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-papertrail-manual");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         let config = config_with_unreachable_tracker(&root);
@@ -1545,7 +1467,5 @@ mod papertrail_hook_tests {
             .query_row("SELECT COUNT(*) FROM papertrail_sync_cursor", [], |row| row.get(0))
             .unwrap();
         assert_eq!(cursor_rows, 0, "a non-hook trigger must not start a mirror flight");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

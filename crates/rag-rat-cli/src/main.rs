@@ -652,11 +652,8 @@ pub(crate) struct GitPaths {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{discover_target_config_optional, load_config_or_hint, progress_percent};
-
-    static TMP: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn progress_percent_is_capped() {
@@ -667,10 +664,8 @@ mod tests {
 
     #[test]
     fn missing_config_yields_friendly_init_hint() {
-        let n = TMP.fetch_add(1, Ordering::Relaxed);
-        let missing =
-            std::env::temp_dir().join(format!("rag-rat-no-config-{}-{n}.toml", std::process::id()));
-        let _ = std::fs::remove_file(&missing);
+        let scratch = rag_rat_base::test_scratch::ScratchDir::new("no-config");
+        let missing = scratch.join("missing.toml");
         let err = load_config_or_hint(Some(missing.to_str().unwrap())).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("rag-rat init"), "expected init hint, got: {message}");
@@ -678,9 +673,7 @@ mod tests {
 
     #[test]
     fn rm_target_config_discovery_honors_its_custom_database() {
-        let n = TMP.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir()
-            .join(format!("rag-rat-rm-target-config-{}-{n}", std::process::id()));
+        let root = rag_rat_base::test_scratch::ScratchDir::new("rm-target-config");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("rag-rat.toml"),
@@ -698,6 +691,5 @@ mod tests {
         // natively.
         let root = root.canonicalize().unwrap();
         assert_eq!(config.database, root.join("custom").join("index.sqlite"));
-        let _ = std::fs::remove_dir_all(root);
     }
 }

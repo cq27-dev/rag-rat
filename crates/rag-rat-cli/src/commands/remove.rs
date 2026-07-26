@@ -447,11 +447,7 @@ mod tests {
     /// config, so this test fails on a regression.
     #[test]
     fn cleanup_of_a_gone_tree_does_not_climb_into_a_parent_repos_config() {
-        let base = std::env::temp_dir().join(format!(
-            "ragrat-rm-guard-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let base = rag_rat_base::test_scratch::ScratchDir::new("rm-guard");
         let parent = base.join("parent");
         std::fs::create_dir_all(&parent).unwrap();
         let parent_config = parent.join("rag-rat.toml");
@@ -476,6 +472,5 @@ mod tests {
             result.warnings.iter().any(|warning| warning.contains("falling back")),
             "enumeration failure must be surfaced while cleanup falls back to the root"
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 }
