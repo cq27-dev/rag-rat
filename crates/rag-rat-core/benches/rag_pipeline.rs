@@ -30,27 +30,42 @@ fn resolver_built_config() -> (Config, rag_rat_base::test_scratch::ScratchDir) {
 }
 
 // Index cost: full rebuild of the subtree. Setup (clone + Config) is not measured; only `rebuild`.
+// The scratch guard is RETURNED, so its `remove_dir_all` drops in the (unmeasured) harness rather
+// than inside the instrumented function — an in-body drop would attribute the traversal to the
+// benchmark and, for the query benches, dominate the instruction count.
 #[library_benchmark]
 #[bench::cargo_resolver(setup = resolver_config)]
-fn index(setup: (Config, rag_rat_base::test_scratch::ScratchDir)) -> IndexDatabase {
-    IndexDatabase::rebuild(&setup.0).expect("rebuild corpus index")
+fn index(
+    setup: (Config, rag_rat_base::test_scratch::ScratchDir),
+) -> (IndexDatabase, rag_rat_base::test_scratch::ScratchDir) {
+    let db = IndexDatabase::rebuild(&setup.0).expect("rebuild corpus index");
+    (db, setup.1)
 }
 
 // Cold query: open a freshly-built index from disk (cold page cache) the way production `search`
 // does (open + active-checkout context, offline), then run one search — the open is INSIDE the
 // measured body, so this captures the realistic cold-open cost. Setup (rebuild) is not measured.
+// The guard rides back out for harness-side cleanup (see `index`).
 #[library_benchmark]
 #[bench::cargo_resolver(setup = resolver_built_config)]
-fn query_cold(setup: (Config, rag_rat_base::test_scratch::ScratchDir)) -> usize {
+fn query_cold(
+    setup: (Config, rag_rat_base::test_scratch::ScratchDir),
+) -> rag_rat_base::test_scratch::ScratchDir {
     let db = open_like_production(&setup.0);
-    db.search(QUERY, 10, false).expect("search").len()
+    std::hint::black_box(db.search(QUERY, 10, false).expect("search"));
+    setup.1
 }
 
-// Warm query: search against an already-open index (the build is in setup, not measured).
+// Warm query: search against an already-open index (the build is in setup, not measured). The
+// guard is returned unmeasured; the index handle itself drops in the measured body exactly as it
+// did when it was the sole parameter.
 #[library_benchmark]
 #[bench::cargo_resolver(setup = resolver_index)]
-fn query_warm(setup: (IndexDatabase, rag_rat_base::test_scratch::ScratchDir)) -> usize {
-    setup.0.search(QUERY, 10, false).expect("search").len()
+fn query_warm(
+    setup: (IndexDatabase, rag_rat_base::test_scratch::ScratchDir),
+) -> rag_rat_base::test_scratch::ScratchDir {
+    std::hint::black_box(setup.0.search(QUERY, 10, false).expect("search"));
+    setup.1
 }
 
 library_benchmark_group!(
