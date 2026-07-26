@@ -428,7 +428,7 @@ fn score_case_at_parent(
         return Ok(None);
     }
     let mut case_config = Config::load(&manifest)?;
-    let scratch = ReplayDbDir::create(short);
+    let scratch = ReplayDbDir::create(short)?;
     case_config.database = scratch.path.join("replay.sqlite");
     IndexDatabase::rebuild(&case_config)?;
     let report = {
@@ -548,11 +548,13 @@ struct ReplayDbDir {
 }
 
 impl ReplayDbDir {
-    fn create(dir_key: &str) -> Self {
+    /// Errors (a full/read-only temp filesystem) propagate: the replay loop reports and skips the
+    /// case rather than aborting the whole run.
+    fn create(dir_key: &str) -> anyhow::Result<Self> {
         let path = std::env::temp_dir().join(format!("rag-rat-replay-db-{dir_key}"));
         let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create replay scratch dir");
-        Self { path }
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { path })
     }
 }
 
