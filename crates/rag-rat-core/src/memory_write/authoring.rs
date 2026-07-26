@@ -1140,8 +1140,7 @@ mod tests {
     /// in-memory database ignores the `synchronous` setting and would not report the change.
     #[test]
     fn authored_durability_raises_full_then_restores_normal() {
-        let dir = std::env::temp_dir().join(format!("ragrat-authdur-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("authdur");
         let storage = rag_rat_db::storage::IndexConnection::open(&dir.join("index.db")).unwrap();
         let conn = storage.connection();
         let synchronous = |c: &Connection| -> i64 {
@@ -1162,8 +1161,6 @@ mod tests {
             1,
             "the authored-durability guard must restore synchronous=NORMAL (=1) on drop"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A `MemoryRow` with the given status, no payload, one tag — the fixture the ported op-split

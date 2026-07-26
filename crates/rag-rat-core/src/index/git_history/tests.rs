@@ -1,16 +1,12 @@
 use std::fs;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::apply::current_history_cursors_at_or_after_prepared;
 use super::read::read_history_excluding;
 use super::*;
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn temp_root(label: &str) -> PathBuf {
-    let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("ragrat-git-history-{label}-{}-{id}", std::process::id()))
+fn temp_root(label: &str) -> rag_rat_base::test_scratch::ScratchDir {
+    rag_rat_base::test_scratch::ScratchDir::new(&format!("git-history-{label}"))
 }
 
 fn run_git(root: &Path, args: &[&str]) {
@@ -37,8 +33,6 @@ fn insert_commit_row(conn: &Connection, repo_id: &str, hash: &str) {
 #[test]
 fn current_history_cursor_guard_rejects_empty_incomplete_or_wrong_scope() {
     let root = temp_root("cursor-guard");
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
     let conn = Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     let repo_id = "repo";
@@ -47,8 +41,11 @@ fn current_history_cursor_guard_rejects_empty_incomplete_or_wrong_scope() {
         params![repo_id],
     )
     .unwrap();
-    let repo =
-        GitRepo { worktree_root: root.clone(), head: "prepared-head".to_string(), shallow: false };
+    let repo = GitRepo {
+        worktree_root: root.to_path_buf(),
+        head: "prepared-head".to_string(),
+        shallow: false,
+    };
 
     assert!(
         current_history_cursors_at_or_after_prepared(&conn, repo_id, &root, &repo)
@@ -75,15 +72,11 @@ fn current_history_cursor_guard_rejects_empty_incomplete_or_wrong_scope() {
             .is_none(),
         "a cursor from another root cannot satisfy a stale prepared append"
     );
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn read_history_excluding_reports_invalid_hidden_head() {
     let root = temp_root("invalid-hidden-head");
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
     run_git(&root, &["init"]);
     run_git(&root, &["config", "user.name", "Rag Rat"]);
     run_git(&root, &["config", "user.email", "rag@example.com"]);
@@ -95,6 +88,4 @@ fn read_history_excluding_reports_invalid_hidden_head() {
     let err = read_history_excluding(&root, &root, &head, "not-a-git-object")
         .expect_err("invalid hidden head must be reported");
     assert!(!err.to_string().is_empty());
-
-    let _ = fs::remove_dir_all(root);
 }

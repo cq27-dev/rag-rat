@@ -2257,13 +2257,8 @@ mod tests {
     /// changed_path)`. The merge's first-parent diff touches `changed_path` (added on the merged
     /// branch), while a real merge carries NO per-file numstat — exactly the shape the history
     /// index stores no `git_file_changes` rows for.
-    fn build_merge_repo() -> (std::path::PathBuf, String, String) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("ragrat-distill-merge-{}-{id}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn build_merge_repo() -> (rag_rat_base::test_scratch::ScratchDir, String, String) {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("distill-merge");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let git = |args: &[&str]| {
             let status =
@@ -2356,8 +2351,6 @@ mod tests {
             0,
             "no repo handle → no fallback → no anchors from a merge with no git_file_changes rows"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2415,8 +2408,6 @@ mod tests {
             0,
             "no repo handle → best-effort empty diff snapshot"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2484,8 +2475,6 @@ mod tests {
             1,
             "a later repo-backed pass heals the missing diff rows"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2493,9 +2482,8 @@ mod tests {
         // At a shallow boundary the parent id is recorded but the object is absent; that is NOT a
         // root commit. Diffing against the empty tree would snapshot every repo file as added.
         let (root, merge_sha, path) = build_merge_repo();
-        let shallow =
-            std::env::temp_dir().join(format!("ragrat-distill-shallow-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&shallow);
+        // `git clone` into the guard's fresh, empty directory.
+        let shallow = rag_rat_base::test_scratch::ScratchDir::new("distill-shallow");
         let status = std::process::Command::new("git")
             .args([
                 "clone",
@@ -2530,20 +2518,12 @@ mod tests {
             0,
             "a missing parent skips the commit — never a full-tree 'everything added' patch"
         );
-
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(shallow);
     }
 
     /// Build a throwaway repo whose HEAD fix commit modifies `src/widget.rs` and adds a >1MiB
     /// `src/big.rs`, returning `(root, fix_sha)`.
-    fn build_big_blob_repo() -> (std::path::PathBuf, String) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("ragrat-distill-big-{}-{id}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn build_big_blob_repo() -> (rag_rat_base::test_scratch::ScratchDir, String) {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("distill-big");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let git = |args: &[&str]| {
             let status =
@@ -2591,8 +2571,6 @@ mod tests {
             vec!["src/widget.rs".to_string()],
             "the small patch renders; the >1MiB blob is skipped before any full diff"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Seed one outbound ref row the mirror sync would have mined from `source_text`'s item body.
@@ -2777,13 +2755,8 @@ mod tests {
 
     /// Build a throwaway repo whose HEAD fix commit DELETES `src/gone.rs` (added in the base
     /// commit), returning `(root, fix_sha, path)`.
-    fn build_delete_repo() -> (std::path::PathBuf, String, String) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("ragrat-distill-del-{}-{id}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn build_delete_repo() -> (rag_rat_base::test_scratch::ScratchDir, String, String) {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("distill-del");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let git = |args: &[&str]| {
             let status =
@@ -2833,8 +2806,6 @@ mod tests {
         );
         assert!(patch.contains("+++ /dev/null"), "a deleted file diffs TO /dev/null: {patch}");
         assert!(patch.contains("-fn gone() {}"), "the removed line renders: {patch}");
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

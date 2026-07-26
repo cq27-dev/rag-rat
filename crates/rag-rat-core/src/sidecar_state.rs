@@ -137,11 +137,11 @@ pub fn take_memory_nudge_slot(
 mod tests {
     use super::*;
 
-    fn temp_db(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("rr-sidecar-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn temp_db(tag: &str) -> (rag_rat_base::test_scratch::ScratchDir, PathBuf) {
+        let dir = rag_rat_base::test_scratch::ScratchDir::new(&format!("sidecar-{tag}"));
         std::fs::create_dir_all(dir.join(".rag-rat")).unwrap();
-        dir.join(".rag-rat").join("index.sqlite")
+        let db = dir.join(".rag-rat").join("index.sqlite");
+        (dir, db)
     }
 
     const TTL: i64 = 30 * 60 * 1000;
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn nudge_slot_throttles_to_the_window_but_forces_on_demand() {
-        let db = temp_db("nudge");
+        let (_scratch, db) = temp_db("nudge");
         // First ever show: nothing recorded → the window has "elapsed", so it shows and records.
         assert!(take_memory_nudge_slot(&db, REPO, 1_000, TTL, false), "first show");
         // Within the window, non-forced: throttled.
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn repos_sharing_one_db_throttle_independently() {
-        let db = temp_db("multi-repo");
+        let (_scratch, db) = temp_db("multi-repo");
         // repoA claims its slot and is then throttled inside the window.
         assert!(take_memory_nudge_slot(&db, "repoA", 1_000, TTL, false), "repoA first show");
         assert!(
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn nudge_and_version_cache_coexist_in_one_file() {
-        let db = temp_db("coexist");
+        let (_scratch, db) = temp_db("coexist");
         write_version_cache(&db, &CachedVersion {
             latest_version: "9.9.9".into(),
             checked_at_ms: 7,

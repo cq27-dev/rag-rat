@@ -5,7 +5,6 @@
 //! `compare_graph_to_scip` / gc behaviours. Models `eval::tests::eval_suite_runs_oracle_*`.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use ::protobuf::{EnumOrUnknown, Message};
 use ::scip::types::{Document, Index, Occurrence, PositionEncoding, SymbolRole};
@@ -14,15 +13,8 @@ use rag_rat_oracle::OracleTool;
 
 use super::*;
 
-static N: AtomicU64 = AtomicU64::new(0);
-
-fn temp_root() -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "rag-rat-q-oracle-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn temp_root() -> rag_rat_base::test_scratch::ScratchDir {
+    let root = rag_rat_base::test_scratch::ScratchDir::new("q-oracle");
     fs::create_dir_all(root.join("src")).unwrap();
     root
 }
@@ -34,7 +26,7 @@ fn rust_config(root: PathBuf) -> Config {
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
+        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
@@ -134,7 +126,7 @@ fn oracle_run_from_scip_surfaces_compiler_tier() {
     let root = temp_root();
     // Single line so byte offsets == char offsets (ASCII): `target` is the callee.
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let (edge_id, callee_start, callee_end, path) = call_edge(&db);
@@ -175,8 +167,6 @@ fn oracle_run_from_scip_surfaces_compiler_tier() {
     let compare = db.compare_graph_to_scip().unwrap();
     assert!(!compare.summary.no_oracle_data);
     assert_eq!(compare.summary.contradictions, 0);
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// `oracle_pre_spawn_snapshot` returns the active checkout's indexed `(path -> sha256)` map;
@@ -186,7 +176,7 @@ fn oracle_run_from_scip_surfaces_compiler_tier() {
 fn pre_spawn_snapshot_round_trips_through_run_oracle() {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let (_edge_id, cs, ce, path) = call_edge(&db);
@@ -223,8 +213,6 @@ fn pre_spawn_snapshot_round_trips_through_run_oracle() {
         .unwrap();
     assert_eq!(report.rows_written, 0, "a mid-subprocess reindex must skip the candidate");
     assert!(report.skipped_drifted >= 1);
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Staleness revert: after a current run surfaces `compiler`, drifting the source file (so its
@@ -234,7 +222,7 @@ fn pre_spawn_snapshot_round_trips_through_run_oracle() {
 fn drifted_file_reverts_to_heuristic_display() {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let (edge_id, cs, ce, path) = call_edge(&db);
@@ -259,8 +247,6 @@ fn drifted_file_reverts_to_heuristic_display() {
     let hop = callers.iter().find(|h| h.edge_id == edge_id).expect("call edge present");
     assert_ne!(hop.confidence, "compiler", "drifted file must revert to heuristic display");
     assert!(hop.resolution_reason.is_none());
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// `resolved-external`: a `.scip` resolving the callee to a packaged dependency symbol with no
@@ -273,7 +259,7 @@ fn external_resolution_surfaces_resolved_external_label() {
     // unresolved), so SCIP's external resolution is a clean `resolved-external`, not a
     // contradiction of an in-corpus claim.
     fs::write(root.join("src/lib.rs"), "fn caller() { external_fn(); }\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let (edge_id, cs, ce, path) = call_edge(&db);
@@ -294,8 +280,6 @@ fn external_resolution_surfaces_resolved_external_label() {
     assert_eq!(hop.resolved_external.as_deref(), Some("resolved-external(tokio)"));
     // External placement is not an in-corpus upgrade → confidence stays heuristic.
     assert_ne!(hop.confidence, "compiler");
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// `compare_graph_to_scip` reports a contradiction when the heuristic resolved an edge
@@ -304,7 +288,7 @@ fn external_resolution_surfaces_resolved_external_label() {
 fn compare_graph_to_scip_reports_contradiction() {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let (edge_id, cs, ce, path) = call_edge(&db);
@@ -335,8 +319,6 @@ fn compare_graph_to_scip_reports_contradiction() {
     assert_eq!(c.edge_id, edge_id);
     assert_eq!(c.heuristic_confidence, "exact");
     assert_eq!(c.resolved_external.as_deref(), Some("resolved-external(other)"));
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// #176: surfacing must NOT be hardcoded to rust-analyzer. A verdict written under another backend
@@ -347,7 +329,7 @@ fn compare_graph_to_scip_reports_contradiction() {
 fn compare_graph_to_scip_surfaces_non_rust_analyzer_tools() {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let (edge_id, cs, ce, path) = call_edge(&db);
@@ -379,8 +361,6 @@ fn compare_graph_to_scip_surfaces_non_rust_analyzer_tools() {
         "the report must name the contributing backend, got `{}`",
         compare.query.tool
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// #82 P0: when a run EXISTS but examined 0 in-scope verdicts, `compare_graph_to_scip` must WARN
@@ -391,7 +371,7 @@ fn compare_graph_to_scip_surfaces_non_rust_analyzer_tools() {
 fn compare_warns_when_run_exists_but_no_verdicts_in_scope() {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let (_edge_id, cs, ce, path) = call_edge(&db);
@@ -414,7 +394,6 @@ fn compare_warns_when_run_exists_but_no_verdicts_in_scope() {
         "run-but-empty must warn, not silently read as compiler-agrees: {:?}",
         compare.summary.warnings
     );
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// #82 finding 1: an IN-CORPUS contradiction (the compiler resolved the callee to a DIFFERENT
@@ -428,7 +407,7 @@ fn in_corpus_contradiction_is_not_labeled_resolved_external() {
     // the same callsite to the OTHER in-corpus def `other` → in-corpus Contradict.
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {} fn other() {}\n")
         .unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let (edge_id, cs, ce, path) = call_edge(&db);
@@ -471,8 +450,6 @@ fn in_corpus_contradiction_is_not_labeled_resolved_external() {
         c.resolved_external, None,
         "an in-corpus contradiction must not be labeled resolved-external"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// End-to-end #108 SCIP-aware ranking: an in-corpus Contradict RETARGETS importance to the
@@ -486,7 +463,7 @@ fn important_symbols_retargets_an_in_corpus_contradiction() {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {} fn other() {}\n")
         .unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
 
@@ -547,8 +524,6 @@ fn important_symbols_retargets_an_in_corpus_contradiction() {
         score_of(&after, &other_qn) > score_of(&before, &other_qn),
         "the retargeted callee gains rank it did not have heuristically: {after:?}"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// #82 finding 2: an `Upgrade` on a heuristic-unresolved edge must surface the SCIP-RESOLVED
@@ -560,7 +535,7 @@ fn important_symbols_retargets_an_in_corpus_contradiction() {
 fn upgrade_hydrates_target_from_compiler_resolution() {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let (edge_id, cs, ce, path) = call_edge(&db);
@@ -611,8 +586,6 @@ fn upgrade_hydrates_target_from_compiler_resolution() {
     assert_eq!(hop.to_symbol.as_deref(), Some(target_qualified.as_str()));
     assert_eq!(hop.target_qualified_name.as_deref(), Some(target_qualified.as_str()));
     assert!(hop.verified_target_symbol, "the compiler-resolved target is verified");
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// #82 finding 4: a compiler-`Upgrade`d low-confidence neighbor must appear within `limit` even
@@ -630,7 +603,7 @@ fn compiler_upgrade_survives_heuristic_limit() {
         "fn pull() {} fn a() { pull(); } fn b() { pull(); } fn c() { pull(); }\n",
     )
     .unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // Find the three call edges to `pull`. Make two of them Exact (high heuristic rank) and the
@@ -706,8 +679,6 @@ fn compiler_upgrade_survives_heuristic_limit() {
         "the compiler-upgraded neighbor must rank into the limit ahead of Exact neighbors"
     );
     assert_eq!(callers[0].confidence, "compiler");
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// gc prunes `oracle_runs` for dead checkout contexts: an oracle run recorded under a sibling
@@ -719,7 +690,7 @@ fn gc_prunes_oracle_runs_for_dead_contexts() {
     let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // Record a run for THIS (active) checkout + a run for a dead sibling context.
@@ -770,8 +741,6 @@ fn gc_prunes_oracle_runs_for_dead_contexts() {
         !remaining.iter().any(|c| c == "dead-commit"),
         "dead-context oracle_runs row must be pruned: {remaining:?}"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -847,11 +816,10 @@ fn oracle_run_without_tool_is_blocked_not_error() {
     }
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
     let outcome = db.run_oracle_with_tool(OracleTool::RustAnalyzer, &root.join("o.scip")).unwrap();
     assert!(matches!(outcome, rag_rat_oracle::OracleRunOutcome::Blocked { .. }));
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Run a git command in `root`, panicking on failure — used to make a real committed checkout
@@ -890,7 +858,7 @@ fn global_ranking(db: &IndexDatabase) -> Vec<rag_rat_query::pagerank::SymbolImpo
 /// ranking (an isolated changed symbol now correctly falls back to global; see
 /// `seed_resolving_only_to_isolated_symbols_is_labeled_global`). Returns the db; `touched.rs`
 /// is the changed file.
-fn checkout_with_dirty_indexed_symbol() -> (IndexDatabase, PathBuf) {
+fn checkout_with_dirty_indexed_symbol() -> (IndexDatabase, rag_rat_base::test_scratch::ScratchDir) {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
     fs::write(root.join("src/touched.rs"), "pub fn placeholder() {}\n").unwrap();
@@ -904,7 +872,7 @@ fn checkout_with_dirty_indexed_symbol() -> (IndexDatabase, PathBuf) {
         "pub fn placeholder() {} pub fn touched() { placeholder(); }\n",
     )
     .unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
     (db, root)
 }
@@ -916,7 +884,7 @@ fn checkout_with_dirty_indexed_symbol() -> (IndexDatabase, PathBuf) {
 fn explicit_seed_resolves_names_and_skips_misses() {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // A real name + a bogus one: the bogus is skipped (no_symbols += 1), the real one seeds.
@@ -966,8 +934,6 @@ fn explicit_seed_resolves_names_and_skips_misses() {
     assert_eq!(all_missing.mode, rag_rat_query::pagerank::ImportanceMode::Global);
     assert!(all_missing.reason.is_some(), "all-missing explicit seed reports why it's global");
     assert_eq!(all_missing.seed_source.unwrap().skipped.no_symbols, 2);
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// #142 review: a seed that RESOLVES to real symbols which are not endpoints of any resolved
@@ -981,7 +947,7 @@ fn seed_resolving_only_to_isolated_symbols_is_labeled_global() {
     // enters the PageRank graph.
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {} fn island() {}\n")
         .unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let result = db
@@ -1011,8 +977,6 @@ fn seed_resolving_only_to_isolated_symbols_is_labeled_global() {
         .unwrap();
     assert_eq!(connected.mode, rag_rat_query::pagerank::ImportanceMode::PersonalizedToChanges);
     assert_eq!(connected.seed_source.unwrap().effective_seed_count, 1);
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// #142 review: auto-seed-from-diff in a source root that is NOT a git worktree must not fail
@@ -1022,7 +986,7 @@ fn seed_resolving_only_to_isolated_symbols_is_labeled_global() {
 fn auto_seed_outside_a_git_worktree_falls_back_to_global() {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let result = db
@@ -1034,8 +998,6 @@ fn auto_seed_outside_a_git_worktree_falls_back_to_global() {
         .unwrap();
     assert_eq!(result.mode, rag_rat_query::pagerank::ImportanceMode::Global);
     assert!(!result.symbols.is_empty(), "the global ranking is still computed");
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// A name that matches MULTIPLE in-scope symbols seeds ALL of them — personalization is a
@@ -1053,7 +1015,7 @@ fn multi_match_name_seeds_all_in_scope_symbols() {
         "pub struct Thing;\nimpl Thing { pub fn a(&self) {} }\nimpl Thing { pub fn b(&self) {} }\n",
     )
     .unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // Sanity: the bare name really does match more than one symbol.
@@ -1077,7 +1039,6 @@ fn multi_match_name_seeds_all_in_scope_symbols() {
     assert_eq!(seed.kind, rag_rat_query::pagerank::SeedKind::Explicit);
     assert!(seed.symbol_seed_count >= 2, "all of the name's in-scope symbols are seeded: {seed:?}");
     assert_eq!(seed.skipped.no_symbols, 0, "a matched name is never counted as a miss");
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Auto-seed maps the git diff to symbols THROUGH the scoped `files` view: a dirty indexed file
@@ -1087,7 +1048,7 @@ fn auto_seed_from_diff_picks_changed_symbols() {
     if std::process::Command::new("git").arg("--version").output().is_err() {
         return;
     }
-    let (db, root) = checkout_with_dirty_indexed_symbol();
+    let (db, _root) = checkout_with_dirty_indexed_symbol();
     let result = db
         .important_symbols(ImportantSymbolsRequest {
             limit: 20,
@@ -1100,7 +1061,6 @@ fn auto_seed_from_diff_picks_changed_symbols() {
     assert_eq!(seed.kind, rag_rat_query::pagerank::SeedKind::GitDiff);
     assert!(seed.indexed_paths >= 1, "the dirty indexed file counted: {seed:?}");
     assert!(seed.symbol_seed_count >= 1, "the changed file's symbol seeded: {seed:?}");
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Diff with NO indexed symbols (a changed markdown file only) → global mode, a reason, and the
@@ -1117,7 +1077,7 @@ fn diff_without_symbols_falls_back_to_global_with_reason() {
     git(&root, &["commit", "-q", "-m", "init"]);
     // The only working-tree change is a markdown file — never indexed as a Rust symbol.
     fs::write(root.join("NOTES.md"), "# notes\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let result = db
@@ -1134,7 +1094,6 @@ fn diff_without_symbols_falls_back_to_global_with_reason() {
     assert!(seed.changed_paths >= 1, "the markdown change was considered: {seed:?}");
     assert_eq!(seed.symbol_seed_count, 0);
     assert!(!result.symbols.is_empty(), "global ranking still returns the spine");
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Deleted and generated changed paths are counted in `skipped`, not seeded.
@@ -1155,7 +1114,7 @@ fn deleted_and_generated_paths_counted_in_skipped() {
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
+        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![
             ResolvedTarget {
@@ -1204,7 +1163,6 @@ fn deleted_and_generated_paths_counted_in_skipped() {
     let seed = result.seed_source.expect("reports provenance");
     assert_eq!(seed.skipped.deleted, 1, "the removed file is counted deleted: {seed:?}");
     assert_eq!(seed.skipped.generated, 1, "the generated file is counted generated: {seed:?}");
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Acceptance invariant #1: with a non-empty diff carrying an indexed symbol, MCP defaults
@@ -1215,7 +1173,7 @@ fn mcp_auto_seeds_but_cli_stays_global_on_a_nonempty_diff() {
     if std::process::Command::new("git").arg("--version").output().is_err() {
         return;
     }
-    let (db, root) = checkout_with_dirty_indexed_symbol();
+    let (db, _root) = checkout_with_dirty_indexed_symbol();
 
     // MCP default: auto_seed_from_diff = true → personalized.
     let mcp = db
@@ -1245,7 +1203,6 @@ fn mcp_auto_seeds_but_cli_stays_global_on_a_nonempty_diff() {
         "CLI no-personalize ⇒ global, even with a non-empty diff"
     );
     assert!(cli.seed_source.is_none(), "CLI global carries no seed provenance");
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// #82 P2 regression: `find_callers` with NO oracle data must return the IDENTICAL membership
@@ -1266,7 +1223,7 @@ fn find_callers_without_oracle_matches_heuristic_order() {
     }
     src.push_str("fn target() {}\n");
     fs::write(root.join("src/lib.rs"), src).unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // No oracle run at all: enrichment early-returns false, so no re-sort fires.
@@ -1297,7 +1254,6 @@ fn find_callers_without_oracle_matches_heuristic_order() {
         ids(&heuristic),
         "with no oracle data, find_callers must match the plain heuristic membership + order"
     );
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// #82 P0 regression: on a REAL committed git checkout the active context is
@@ -1320,7 +1276,7 @@ fn oracle_surfaces_compiler_tier_on_a_real_git_checkout() {
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-q", "-m", "init"]);
 
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // Sanity: the active context carries BOTH a real commit_sha and a worktree_id, and the file
@@ -1356,6 +1312,4 @@ fn oracle_surfaces_compiler_tier_on_a_real_git_checkout() {
     let hop = callees.iter().find(|h| h.edge_id == edge_id).expect("call edge present");
     assert_eq!(hop.confidence, "compiler", "Compiler tier must surface on a real git checkout");
     assert_eq!(hop.resolution_reason.as_deref(), Some("scip:rust-analyzer@v-test"));
-
-    let _ = fs::remove_dir_all(&root);
 }

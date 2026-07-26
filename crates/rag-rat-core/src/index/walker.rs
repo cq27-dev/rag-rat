@@ -114,13 +114,8 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
-    fn tempdir() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let id = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ragrat-walk-{}-{id}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir() -> rag_rat_base::test_scratch::ScratchDir {
+        rag_rat_base::test_scratch::ScratchDir::new("walk")
     }
 
     fn cpp_target() -> ResolvedTarget {
@@ -154,8 +149,6 @@ mod tests {
         assert!(rel.contains(&"src/lib.cpp".to_string()), "{rel:?}");
         // ...but a plain `.c` file is NOT a C++ source.
         assert!(!rel.contains(&"legacy.c".to_string()), "cpp must not claim .c: {rel:?}");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -186,8 +179,6 @@ mod tests {
         assert!(!rel.contains(&"crates/app/skip.rs".to_string()), "nested gitignore: {rel:?}");
         assert!(!rel.contains(&"generated/out.rs".to_string()), "root gitignore: {rel:?}");
         assert!(!rel.iter().any(|p| p.starts_with("target/")), "floor dir: {rel:?}");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -213,7 +204,5 @@ mod tests {
             .map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
             .collect();
         assert_eq!(rel, vec!["present/lib.rs".to_string()], "present dir indexed, missing skipped");
-
-        fs::remove_dir_all(&root).ok();
     }
 }

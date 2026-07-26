@@ -647,13 +647,15 @@ mod tests {
         assert!(FileLock::try_acquire(&stale_lock_path).unwrap().is_some());
     }
 
-    fn temp_git_repo(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("ragrat-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+    fn temp_git_repo(tag: &str) -> rag_rat_base::test_scratch::ScratchDir {
+        let root = rag_rat_base::test_scratch::ScratchDir::new(tag);
         let git = |args: &[&str]| {
-            let out =
-                std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&*root)
+                .args(args)
+                .output()
+                .unwrap();
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         };
         git(&["init", "-q"]);

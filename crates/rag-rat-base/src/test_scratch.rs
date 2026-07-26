@@ -348,6 +348,16 @@ impl AsRef<Path> for ScratchDir {
     }
 }
 
+/// Path ergonomics for fixtures: `scratch.join(...)`, `scratch.canonicalize()`, and `&scratch`
+/// where a `&Path` is expected all work directly on the guarded directory.
+impl std::ops::Deref for ScratchDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.path()
+    }
+}
+
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);

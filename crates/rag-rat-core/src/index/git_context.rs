@@ -274,25 +274,26 @@ mod worktree_scope_tests {
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        // Shared, self-healing scratch root with a startup sweep, so a panicking/killed test can't
-        // strand this dir in the system temp (#726). See `rag_rat_base::test_scratch`.
-        rag_rat_base::test_scratch::scratch_dir(&format!("ragrat-wtscope-{tag}"))
+    /// An owned scratch dir (removed on drop) plus its canonical path, which is what the git
+    /// resolution under test reports. Worktree-add destinations are also guards: the fresh empty
+    /// dir satisfies `git worktree add`, and cleanup never depends on reaching the end of the test.
+    fn temp_dir(tag: &str) -> rag_rat_base::test_scratch::ScratchDir {
+        rag_rat_base::test_scratch::ScratchDir::new(&format!("ragrat-wtscope-{tag}"))
     }
 
-    fn init_repo(tag: &str) -> PathBuf {
+    fn init_repo(tag: &str) -> (rag_rat_base::test_scratch::ScratchDir, PathBuf) {
         let dir = temp_dir(tag);
-        std::fs::create_dir_all(&dir).unwrap();
         git(&dir, &["init", "-q"]);
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
         git(&dir, &["add", "."]);
         git(&dir, &["commit", "-q", "-m", "init"]);
-        dir.canonicalize().unwrap()
+        let canonical = dir.canonicalize().unwrap();
+        (dir, canonical)
     }
 
     #[test]
     fn none_is_the_base_scope() {
-        let main = init_repo("none");
+        let (_scratch, main) = init_repo("none");
         assert_eq!(resolve_worktree_scope(&main, None), resolve_git_context(&main));
     }
 
@@ -306,7 +307,7 @@ mod worktree_scope_tests {
     #[test]
     fn git_changed_paths_does_not_descend_into_ignored_directories() {
         use notify::Watcher as _;
-        let dir = init_repo("ignored-prune");
+        let (_scratch, dir) = init_repo("ignored-prune");
         std::fs::write(dir.join(".gitignore"), "vendor/\n").unwrap();
         git(&dir, &["add", ".gitignore"]);
         git(&dir, &["commit", "-q", "-m", "ignore vendor"]);
@@ -352,7 +353,7 @@ mod worktree_scope_tests {
     #[test]
     fn git_changed_paths_prunes_ignored_directories_outside_a_subdir_root() {
         use notify::Watcher as _;
-        let dir = init_repo("subdir-prune");
+        let (_scratch, dir) = init_repo("subdir-prune");
         std::fs::write(dir.join(".gitignore"), "vendor/\n").unwrap();
         std::fs::create_dir_all(dir.join("crates")).unwrap();
         std::fs::write(dir.join("crates/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -390,7 +391,7 @@ mod worktree_scope_tests {
 
     #[test]
     fn linked_worktree_selects_its_overlay_on_the_base_commit() {
-        let main = init_repo("linked-main");
+        let (_scratch, main) = init_repo("linked-main");
         let linked = temp_dir("linked-wt");
         git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
         // A commit on the branch so the linked HEAD diverges from the base.
@@ -409,15 +410,15 @@ mod worktree_scope_tests {
 
     #[test]
     fn main_worktree_path_falls_back_to_base() {
-        let main = init_repo("main-fallback");
+        let (_scratch, main) = init_repo("main-fallback");
         // Passing the MAIN checkout (git_dir == common_dir) is not a linked worktree → base scope.
         assert_eq!(resolve_worktree_scope(&main, Some(&main)), resolve_git_context(&main));
     }
 
     #[test]
     fn foreign_repo_worktree_falls_back_to_base() {
-        let main = init_repo("foreign-main");
-        let other = init_repo("foreign-other");
+        let (_scratch, main) = init_repo("foreign-main");
+        let (_scratch2, other) = init_repo("foreign-other");
         let other_linked = temp_dir("foreign-linked");
         git(&other, &["worktree", "add", "-q", other_linked.to_str().unwrap()]);
         // A genuine linked worktree, but of a DIFFERENT repo (common dir differs) → base scope,
@@ -427,7 +428,7 @@ mod worktree_scope_tests {
 
     #[test]
     fn unreadable_path_falls_back_to_base() {
-        let main = init_repo("unreadable");
+        let (_scratch, main) = init_repo("unreadable");
         // The macOS bogus cwd `/` and a nonexistent path both resolve to base — no panic, no wrong
         // repo (untrusted-input guard).
         assert_eq!(resolve_worktree_scope(&main, Some(Path::new("/"))), resolve_git_context(&main));

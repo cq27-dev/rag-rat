@@ -188,9 +188,7 @@ mod manifest_idempotence_tests {
     // write lock) once the manifest is current, or every read tool serializes on the SQLite writer.
     #[test]
     fn ensure_model_manifest_does_not_write_when_already_current() {
-        let dir = std::env::temp_dir().join(format!("ragrat-manifest-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("manifest");
         let db = dir.join("index.db");
 
         // First open establishes the manifest (a write); afterward the read-only check sees it.
@@ -230,7 +228,5 @@ mod manifest_idempotence_tests {
                 "a lingering legacy model must require a manifest write"
             );
         }
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

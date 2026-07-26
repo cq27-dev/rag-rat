@@ -659,13 +659,9 @@ fn resolve_refs(conn: &Connection, ids: &BTreeSet<i64>) -> anyhow::Result<HashMa
 mod tests {
     use super::CloneCheckInput;
 
-    fn fixture_db(tag: &str) -> crate::IndexDatabase {
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-of-text-{tag}-{}-{}",
-            std::process::id(),
-            rag_rat_base::time::now_ms()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+    fn fixture_db(tag: &str) -> (crate::IndexDatabase, rag_rat_base::test_scratch::ScratchDir) {
+        let scratch = rag_rat_base::test_scratch::ScratchDir::new(&format!("of-text-{tag}"));
+        let root = scratch.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("src/lib.rs"),
@@ -678,7 +674,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
@@ -698,12 +694,13 @@ mod tests {
             source_root_reanchored_from: None,
             allow_empty: false,
         };
-        crate::IndexDatabase::rebuild(&config).unwrap()
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        (db, scratch)
     }
 
     #[test]
     fn finds_exact_clone_of_new_text() {
-        let db = fixture_db("hit");
+        let (db, _scratch) = fixture_db("hit");
         let exact_text = "pub fn fetch_account(store: Db) -> i32 { let a = store.get(20); \
                           validate(a); a + 1 }\n";
         let hits = db
@@ -722,7 +719,7 @@ mod tests {
 
     #[test]
     fn batch_checks_multiple_files_and_tags_in_file() {
-        let db = fixture_db("batch");
+        let (db, _scratch) = fixture_db("batch");
         let inputs = vec![
             CloneCheckInput {
                 text: "pub fn a_clone(s: Db) -> i32 { let x = s.get(1); validate(x); x + 1 }\n"
@@ -745,7 +742,7 @@ mod tests {
 
     #[test]
     fn excludes_self_file_so_in_place_edits_dont_self_flag() {
-        let db = fixture_db("self");
+        let (db, _scratch) = fixture_db("self");
         // Re-write load_user IN its own file: it must NOT be reported as a clone of its indexed
         // self.
         let edited = "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n";
@@ -762,7 +759,7 @@ mod tests {
 
     #[test]
     fn no_op_on_unparseable_text() {
-        let db = fixture_db("noop");
+        let (db, _scratch) = fixture_db("noop");
         let none = db
             .clones_of_text(
                 "not real code !!!",
@@ -777,12 +774,7 @@ mod tests {
     #[test]
     fn clone_fingerprint_health_flags_stale_normalizer_version_for_reindex() {
         // Self-contained build (not `fixture_db`) so we keep the db path for the downgrade step.
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-of-text-health-{}-{}",
-            std::process::id(),
-            rag_rat_base::time::now_ms()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("of-text-health");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("src/lib.rs"),
@@ -796,7 +788,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: db_path.clone(),
             targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
@@ -847,12 +839,7 @@ mod tests {
     fn excludes_indexed_tests_from_corpus_and_skips_new_test_code() {
         // #292: a real function PLUS a structurally identical helper inside a `#[cfg(test)]` module
         // (so the helper is `is_test` though it shares the real fn's body).
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-of-text-exclude-{}-{}",
-            std::process::id(),
-            rag_rat_base::time::now_ms()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("of-text-exclude");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("src/scoring.rs"),
@@ -868,7 +855,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
@@ -929,13 +916,11 @@ mod tests {
     /// cross-language Python `load_user` (py/p.py, must never match a Rust check). Rebuilt AND
     /// precomputed, so a live postings-complete generation exists. Returns the db + its path (for
     /// the 2nd-connection mutations the eligibility / staleness tests need).
-    fn parity_fixture(tag: &str) -> (crate::IndexDatabase, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "rag-rat-of-text-parity-{tag}-{}-{}",
-            std::process::id(),
-            rag_rat_base::time::now_ms()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+    fn parity_fixture(
+        tag: &str,
+    ) -> (crate::IndexDatabase, rag_rat_base::test_scratch::ScratchDir, std::path::PathBuf) {
+        let scratch = rag_rat_base::test_scratch::ScratchDir::new(&format!("of-text-parity-{tag}"));
+        let root = scratch.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("py")).unwrap();
         std::fs::write(
@@ -971,7 +956,7 @@ mod tests {
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.clone(),
+            root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![
                 target("rust", rag_rat_base::language::Language::Rust, "src"),
@@ -990,7 +975,7 @@ mod tests {
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
         assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
         let db_path = root.join(".rag-rat/index.sqlite");
-        (db, db_path)
+        (db, scratch, db_path)
     }
 
     /// Run the SAME text through the postings fast path (`IndexedCorpus`) and the RAM fallback
@@ -1047,7 +1032,7 @@ mod tests {
     /// makes the fast path a pure optimization rather than a behavior change.
     #[test]
     fn fast_postings_path_equals_ram_fallback() {
-        let (db, _path) = parity_fixture("equiv");
+        let (db, _scratch, _path) = parity_fixture("equiv");
 
         // A clone of load_user written to a NEW file → matches load_user + load_order, never the
         // #[cfg(test)] helper or the cross-language python load_user.
@@ -1095,7 +1080,7 @@ mod tests {
     #[test]
     fn indexed_fast_path_drops_stale_postings() {
         use super::CloneCorpus; // the `near_candidate_bags` trait method
-        let (db, db_path) = parity_fixture("stale");
+        let (db, _scratch, db_path) = parity_fixture("stale");
         let conn = db.storage.connection();
         let generation = db.clone_check_indexed_generation().unwrap().unwrap();
         let corpus = super::IndexedCorpus::load(conn, generation).unwrap();
@@ -1127,7 +1112,7 @@ mod tests {
     #[test]
     fn clone_check_fast_path_eligibility_gate() {
         // Fresh + postings-complete + exactly current → eligible.
-        let (db, db_path) = parity_fixture("elig-fresh");
+        let (db, _scratch, db_path) = parity_fixture("elig-fresh");
         assert!(
             db.clone_check_indexed_generation().unwrap().is_some(),
             "a current postings-complete generation is fast-path eligible"
@@ -1145,7 +1130,7 @@ mod tests {
         );
 
         // A postings-less (pre-feature) live generation → NOT eligible (review R2).
-        let (db2, db_path2) = parity_fixture("elig-pw");
+        let (db2, _scratch2, db_path2) = parity_fixture("elig-pw");
         {
             let c = rusqlite::Connection::open(&db_path2).unwrap();
             c.execute("UPDATE clone_graph_generations SET postings_written = 0", []).unwrap();
@@ -1162,7 +1147,7 @@ mod tests {
     /// would find. Overlays fall back to RAM.
     #[test]
     fn clone_check_fast_path_disabled_under_worktree_overlay() {
-        let (mut db, _path) = parity_fixture("overlay-scope");
+        let (mut db, _scratch, _path) = parity_fixture("overlay-scope");
         assert!(
             db.clone_check_indexed_generation().unwrap().is_some(),
             "base scope (empty worktree id) is fast-path eligible"

@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn floor_dirs_ignored_without_any_gitignore() {
-        let tmp = tempdir();
+        let (_scratch, tmp) = tempdir();
         let m = compile(&tmp);
         assert!(m.is_ignored(&tmp.join("target"), true));
         assert!(m.is_ignored(&tmp.join("target/debug/foo.rs"), false));
@@ -452,12 +452,11 @@ mod tests {
         assert!(m.is_ignored(&tmp.join("node_modules/pkg/index.ts"), false));
         assert!(m.is_ignored(&tmp.join(".build/checkouts/Dep/Sources/Dep.swift"), false));
         assert!(!m.is_ignored(&tmp.join("src/lib.rs"), false));
-        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn python_venv_floor_dirs_ignored_but_generic_env_indexed() {
-        let tmp = tempdir();
+        let (_scratch, tmp) = tempdir();
         let m = compile(&tmp);
         // Dotted tooling trees can never be first-party import packages, so they're floored even
         // with no .gitignore (#181).
@@ -471,12 +470,11 @@ mod tests {
         assert!(!m.is_ignored(&tmp.join("src/virtualenv/__init__.py"), false));
         assert!(!m.is_ignored(&tmp.join("env/settings.py"), false));
         assert!(!m.is_ignored(&tmp.join(".env/config.py"), false));
-        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn root_gitignore_is_honored() {
-        let tmp = tempdir();
+        let (_scratch, tmp) = tempdir();
         write(&tmp.join(".gitignore"), "generated/\n*.bak\n");
         write(&tmp.join("src/lib.rs"), "fn a() {}\n");
         write(&tmp.join("generated/out.rs"), "fn b() {}\n");
@@ -486,12 +484,11 @@ mod tests {
         assert!(m.is_ignored(&tmp.join("generated/out.rs"), false), "file under gitignored dir");
         assert!(m.is_ignored(&tmp.join("src/old.bak"), false), "gitignored glob");
         assert!(!m.is_ignored(&tmp.join("src/lib.rs"), false), "non-ignored source");
-        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn nested_gitignore_scopes_to_its_subtree() {
-        let tmp = tempdir();
+        let (_scratch, tmp) = tempdir();
         // A nested gitignore ignores `vendor.rs` only under `sub/`, not at the root.
         write(&tmp.join("sub/.gitignore"), "vendor.rs\n");
         write(&tmp.join("sub/vendor.rs"), "x\n");
@@ -502,12 +499,11 @@ mod tests {
             !m.is_ignored(&tmp.join("vendor.rs"), false),
             "nested rule does NOT leak to the root",
         );
-        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn whitelist_negation_unignores() {
-        let tmp = tempdir();
+        let (_scratch, tmp) = tempdir();
         write(&tmp.join(".gitignore"), "build/\n!build/keep.rs\n");
         write(&tmp.join("build/keep.rs"), "x\n");
         write(&tmp.join("build/drop.rs"), "x\n");
@@ -518,7 +514,6 @@ mod tests {
             m.is_ignored(&tmp.join("build/keep.rs"), false),
             "floor dir beats gitignore negation"
         );
-        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -526,14 +521,13 @@ mod tests {
         // git can re-include a file under a directory ONLY if the directory itself is whitelisted.
         // `gen/` ignored + `!gen/` re-included + `gen/skip/` re-ignored: `gen/a.rs` is back,
         // `gen/skip/b.rs` is out.
-        let tmp = tempdir();
+        let (_scratch, tmp) = tempdir();
         write(&tmp.join(".gitignore"), "gen/\n!gen/\ngen/skip/\n");
         write(&tmp.join("gen/a.rs"), "x\n");
         write(&tmp.join("gen/skip/b.rs"), "x\n");
         let m = compile(&tmp);
         assert!(!m.is_ignored(&tmp.join("gen/a.rs"), false), "re-included dir's file un-ignored");
         assert!(m.is_ignored(&tmp.join("gen/skip/b.rs"), false), "re-ignored subdir still out");
-        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -541,7 +535,7 @@ mod tests {
         // FINDING 2: a nested `.gitignore` inside a directory ignored by an OUTER rule must NOT
         // re-include files. Git stops descending at the excluded `gen/`, so `gen/.gitignore`'s
         // `!keep.rs` is never consulted — `gen/keep.rs` stays ignored.
-        let tmp = tempdir();
+        let (_scratch, tmp) = tempdir();
         write(&tmp.join(".gitignore"), "gen/\n");
         write(&tmp.join("gen/.gitignore"), "!keep.rs\n");
         write(&tmp.join("gen/keep.rs"), "x\n");
@@ -552,7 +546,6 @@ mod tests {
             "nested negation under an ignored parent must NOT re-include",
         );
         assert!(m.is_ignored(&tmp.join("gen/drop.rs"), false), "sibling under ignored parent out");
-        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -560,14 +553,13 @@ mod tests {
         // Distinct from the nested case: a SINGLE gitignore with `gen/` + `!gen/keep.rs` does NOT
         // re-include either, because git can't reach inside an excluded directory even from the
         // same file. Both stay ignored. (This is the git-correct behavior.)
-        let tmp = tempdir();
+        let (_scratch, tmp) = tempdir();
         write(&tmp.join(".gitignore"), "gen/\n!gen/keep.rs\n");
         write(&tmp.join("gen/keep.rs"), "x\n");
         write(&tmp.join("gen/drop.rs"), "x\n");
         let m = compile(&tmp);
         assert!(m.is_ignored(&tmp.join("gen/keep.rs"), false), "no reinclude under excluded dir");
         assert!(m.is_ignored(&tmp.join("gen/drop.rs"), false), "sibling still ignored");
-        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -575,7 +567,8 @@ mod tests {
         // FINDING 1: the repo lives under a directory named like a floor entry (`build`). The floor
         // check must run on the path RELATIVE to the root, never on the absolute ancestors — so the
         // repo's own files are still indexed.
-        let outer = tempdir().join("build");
+        let (_scratch, outer_base) = tempdir();
+        let outer = outer_base.join("build");
         let root = outer.join("my-repo");
         write(&root.join("src/lib.rs"), "fn a() {}\n");
         write(&root.join("target/debug/built.rs"), "fn b() {}\n");
@@ -588,7 +581,6 @@ mod tests {
         assert!(m.is_ignored(&root.join("target/debug/built.rs"), false), "in-repo floor skipped");
         // A path outside the repo root is simply not governed (not ignored) by our rules.
         assert!(!m.is_ignored(&outer.join("sibling.rs"), false), "outside-root path not governed");
-        fs::remove_dir_all(outer.parent().unwrap()).ok();
     }
 
     #[test]
@@ -596,7 +588,7 @@ mod tests {
         // FINDING 3 (round 3): `config.root` is a subdirectory (`crates`) of a larger Git worktree.
         // The worktree-root `.gitignore` rules Git would apply to paths under that subdirectory
         // must be honored — files Git ignores must not be indexed.
-        let wt = tempdir();
+        let (_scratch, wt) = tempdir();
         git_init(&wt);
         // Worktree-root .gitignore ignores every `*.gen.rs` and the `vendored/` dir, repo-wide.
         write(&wt.join(".gitignore"), "*.gen.rs\nvendored/\n");
@@ -617,7 +609,6 @@ mod tests {
             m.is_ignored(&sub.join("vendored/dep.rs"), false),
             "worktree-root dir rule applies under the subdir config.root (finding 3)",
         );
-        fs::remove_dir_all(&wt).ok();
     }
 
     #[test]
@@ -626,7 +617,7 @@ mod tests {
         // not be scanned for nested `.gitignore`s. We assert by behavior: a nested `.gitignore` in
         // the sibling is never compiled, so it has no effect on classification — and, conversely, a
         // nested `.gitignore` INSIDE the target tree IS picked up.
-        let root = tempdir();
+        let (_scratch, root) = tempdir();
         // Target tree: `src`. Sibling tree: `huge` (not a target).
         write(&root.join("src/.gitignore"), "skip.rs\n");
         write(&root.join("src/skip.rs"), "x\n");
@@ -646,12 +637,11 @@ mod tests {
             !m.is_ignored(&root.join("huge/marker.rs"), false),
             "sibling outside target trees is not scanned for nested gitignores (scoping)",
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn target_ancestor_gitignore_governs_nested_target_without_scanning_siblings() {
-        let root = tempdir();
+        let (_scratch, root) = tempdir();
         write(&root.join("src/.gitignore"), "generated/\n");
         write(&root.join("src/generated/lib.rs"), "x\n");
         write(&root.join("src/sibling/.gitignore"), "marker.rs\n");
@@ -666,18 +656,15 @@ mod tests {
             !m.is_ignored(&root.join("src/sibling/marker.rs"), false),
             "target ancestor compilation must not recursively scan unindexed siblings",
         );
-        fs::remove_dir_all(&root).ok();
     }
 
-    fn tempdir() -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let id = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ragrat-ignore-{}-{id}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+    fn tempdir() -> (rag_rat_base::test_scratch::ScratchDir, std::path::PathBuf) {
+        let guard = rag_rat_base::test_scratch::ScratchDir::new("ignore");
         // Canonicalize so the absolute paths we build match what worktree-root resolution returns
-        // (macOS /tmp is a symlink to /private/tmp; git reports the canonical form).
-        dir.canonicalize().unwrap_or(dir)
+        // (macOS /tmp is a symlink to /private/tmp; git reports the canonical form). The guard
+        // still removes the directory: the canonical form is the same inode.
+        let root = guard.path().canonicalize().unwrap_or_else(|_| guard.path().to_path_buf());
+        (guard, root)
     }
 
     // base_under_worktree must return the worktree root in `root`'s OWN representation even when a
@@ -688,7 +675,7 @@ mod tests {
     #[test]
     fn base_under_worktree_handles_symlinked_root_segment() {
         use std::os::unix::fs::symlink;
-        let wt = tempdir(); // canonical worktree root
+        let (_scratch, wt) = tempdir(); // canonical worktree root
         fs::create_dir_all(wt.join("a/b")).unwrap();
         // `<wt>/link` (1 component) resolves to `<wt>/a/b` (2 components) — counts differ.
         let link = wt.join("link");
@@ -701,6 +688,5 @@ mod tests {
             link.strip_prefix(base.unwrap()).is_ok(),
             "base must stay a textual prefix of root"
         );
-        let _ = fs::remove_dir_all(&wt);
     }
 }

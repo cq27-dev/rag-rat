@@ -923,9 +923,7 @@ fn doctor_attention_count_counts_active_gone_and_stale_bindings() {
 /// a bare read-only open and fails open to 0 on a missing DB — it must never block a tool call.
 #[test]
 fn memory_attention_count_reads_file_db_and_fails_open() {
-    let dir = std::env::temp_dir().join(format!("ragrat-attn-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("attn");
     let db_path = dir.join("index.sqlite");
 
     // Missing DB → 0 (fail-open).
@@ -955,6 +953,4 @@ fn memory_attention_count_reads_file_db_and_fails_open() {
             .unwrap();
     }
     assert_eq!(crate::memory_attention_count(&db_path), 1, "counts the gone binding from disk");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -182,15 +182,7 @@ fn find_clones_rejects_nan_and_non_finite_min_similarity() {
     // bail!() runs in the same function before the DB is touched.
     // Instead, test the validation logic directly via the public API by setting up a
     // temporary empty database and calling find_clones with the bad values.
-    let root = std::env::temp_dir().join(format!(
-        "rag-rat-nan-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    ));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = rag_rat_base::test_scratch::ScratchDir::new("rag-rat-nan-test");
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
     let config = rag_rat_base::config::Config {
@@ -199,7 +191,7 @@ fn find_clones_rejects_nan_and_non_finite_min_similarity() {
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
+        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![rag_rat_base::config::ResolvedTarget {
             name: "rust".to_string(),
@@ -280,8 +272,6 @@ fn find_clones_rejects_nan_and_non_finite_min_similarity() {
         })
         .is_ok()
     );
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ── Fix B: allocation-free two-pointer overlap ────────────────────────────────────────────
@@ -757,15 +747,7 @@ fn refine_metrics_sampled_at_value_cap() {
 fn recall_candidates_identical_blob_vs_postings_grouping() {
     use std::collections::HashMap;
 
-    let root = std::env::temp_dir().join(format!(
-        "rag-rat-recall-parity-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    ));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = rag_rat_base::test_scratch::ScratchDir::new("rag-rat-recall-parity");
     std::fs::create_dir_all(root.join("src")).unwrap();
     // Two renamed-clone groups + one unrelated function, across files.
     std::fs::write(
@@ -788,7 +770,7 @@ fn recall_candidates_identical_blob_vs_postings_grouping() {
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
+        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![rag_rat_base::config::ResolvedTarget {
             name: "rust".to_string(),
@@ -892,8 +874,6 @@ fn recall_candidates_identical_blob_vs_postings_grouping() {
         !has(lu, ct) && !has(lu, ta) && !has(lo, ct) && !has(lo, ta),
         "the two clone GROUPS do not cross-pair"
     );
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// #235 item 12: a focused unit test for `load_source_discriminators`, the production

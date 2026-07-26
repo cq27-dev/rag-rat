@@ -2287,10 +2287,7 @@ mod tests {
     /// the pinned BUSY posture.
     #[test]
     fn wal_sidecars_travel_with_the_imported_archive() {
-        let dir =
-            std::env::temp_dir().join(format!("ragrat-sidecars-{}-{:p}", std::process::id(), &()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("sidecars");
         let source = dir.join("index.sqlite");
         let imported = imported_marker(&source);
         // Simulate the post-rename state with LEFTOVER sidecars (incl. an un-checkpointed wal).
@@ -2311,7 +2308,6 @@ mod tests {
                 "the {suffix} sidecar travelled with the archive"
             );
         }
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The pinned-`database` refusal is PATH-AWARE: a pin at the default legacy path needs only

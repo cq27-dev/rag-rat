@@ -852,8 +852,7 @@ mod tests {
 
     #[test]
     fn local_crate_roots_scans_workspace_manifests() {
-        let dir = std::env::temp_dir().join(format!("rr-crate-roots-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("rr-crate-roots");
         std::fs::create_dir_all(dir.join("crates/foo-bar/src")).unwrap();
         std::fs::write(
             dir.join("Cargo.toml"),
@@ -866,7 +865,6 @@ mod tests {
             .unwrap();
         std::fs::write(dir.join("crates/foo-bar/src/lib.rs"), "").unwrap();
         let roots = scan_packages(&dir).0;
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(roots.contains("cargo"), "top package; got {roots:?}");
         assert!(roots.contains("foo_bar"), "hyphen→underscore normalized; got {roots:?}");
     }
@@ -876,8 +874,7 @@ mod tests {
     /// treated as local. A LIBRARY member (autodiscovered `src/lib.rs` or explicit `[lib]`) does.
     #[test]
     fn local_crate_roots_skips_bin_only_packages() {
-        let dir = std::env::temp_dir().join(format!("rr-bin-only-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("rr-bin-only");
         std::fs::create_dir_all(dir.join("tool/src")).unwrap();
         std::fs::write(dir.join("tool/Cargo.toml"), "[package]\nname=\"clap\"\n").unwrap();
         std::fs::write(dir.join("tool/src/main.rs"), "fn main() {}").unwrap();
@@ -892,7 +889,6 @@ mod tests {
         )
         .unwrap();
         let roots = scan_packages(&dir).0;
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             !roots.contains("clap"),
             "a bin-only package name is not a local root; got {roots:?}"
@@ -911,8 +907,7 @@ mod tests {
     /// this index, so localizing its alias would let a same-named in-corpus symbol wrongly bind.
     #[test]
     fn local_crate_roots_excludes_out_of_corpus_path_deps() {
-        let base = std::env::temp_dir().join(format!("rr-corpus-scope-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = rag_rat_base::test_scratch::ScratchDir::new("rr-corpus-scope");
         let root = base.join("indexed");
         std::fs::create_dir_all(base.join("sibling/src")).unwrap();
         std::fs::write(base.join("sibling/src/lib.rs"), "").unwrap();
@@ -926,7 +921,6 @@ mod tests {
         )
         .unwrap();
         let roots = scan_packages(&root).0;
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !roots.contains("outside_alias"),
             "a path dep outside the indexed root is NOT a local root; got {roots:?}"
@@ -946,8 +940,7 @@ mod tests {
     /// source).
     #[test]
     fn scan_packages_keeps_path_dep_aliases_package_local() {
-        let root = std::env::temp_dir().join(format!("rr-scan-pkg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("rr-scan-pkg");
         std::fs::create_dir_all(root.join("shared/src")).unwrap();
         std::fs::write(root.join("shared/Cargo.toml"), "[package]\nname=\"shared\"\n").unwrap();
         std::fs::write(root.join("shared/src/lib.rs"), "").unwrap();
@@ -962,7 +955,6 @@ mod tests {
         std::fs::write(root.join("b/Cargo.toml"), "[package]\nname=\"b\"\n").unwrap();
         std::fs::write(root.join("b/src/lib.rs"), "").unwrap();
         let (global, packages) = scan_packages(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             global.contains("a_only"),
             "the global union includes every alias key; got {global:?}"
@@ -987,8 +979,7 @@ mod tests {
     /// resolution it was dropped as external.
     #[test]
     fn scan_packages_resolves_inherited_workspace_path_dep() {
-        let root = std::env::temp_dir().join(format!("rr-ws-inherit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rag_rat_base::test_scratch::ScratchDir::new("rr-ws-inherit");
         // Workspace root declares the path dep in [workspace.dependencies]; path is relative to the
         // workspace root dir.
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1012,7 +1003,6 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("member/src/lib.rs"), "").unwrap();
         let (global, packages) = scan_packages(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             global.contains("local"),
             "the inherited workspace path-dep alias is in the global union; got {global:?}"

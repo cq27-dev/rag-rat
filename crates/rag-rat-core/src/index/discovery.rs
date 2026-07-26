@@ -248,8 +248,6 @@ pub(crate) fn target_for_path(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use rag_rat_base::language::Language;
 
     use super::*;
@@ -258,10 +256,7 @@ mod tests {
     fn h_resolves_to_cpp_when_both_c_and_cpp_bindings_cover_it() {
         // Both bindings claim `.h`; the `cpp` upgrade must win it (the deliberate intent), while a
         // `.c` stays C and a `.cpp` stays C++.
-        static N: AtomicU64 = AtomicU64::new(0);
-        let id = N.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("ragrat-disc-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = rag_rat_base::test_scratch::ScratchDir::new("disc");
         std::fs::write(
             root.join("rag-rat.toml"),
             "[index]\nroot = \".\"\n[target_bindings]\nc = [\".\"]\ncpp = [\".\"]\n",
@@ -277,7 +272,5 @@ mod tests {
         );
         // A non-code file resolves to nothing.
         assert_eq!(target_for_path(&config, Path::new("README")), None);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

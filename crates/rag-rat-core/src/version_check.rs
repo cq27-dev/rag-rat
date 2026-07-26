@@ -215,8 +215,7 @@ mod tests {
 
     #[test]
     fn cached_status_enabled_reflects_the_cache() {
-        let dir = std::env::temp_dir().join(format!("rr-vcheck-status-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("rr-vcheck-status");
         std::fs::create_dir_all(dir.join(".rag-rat")).unwrap();
         let database = dir.join(".rag-rat").join("index.sqlite");
 
@@ -235,7 +234,6 @@ mod tests {
         assert_eq!(s.latest_version.as_deref(), Some("99.0.0"));
         assert!(s.update_available, "99.0.0 is newer than the running {}", current_version());
         assert_eq!(s.update_command, "cargo install rag-rat --force");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -265,8 +263,7 @@ mod tests {
 
     #[test]
     fn cache_round_trips_through_disk() {
-        let dir = std::env::temp_dir().join(format!("rr-vcheck-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("rr-vcheck");
         std::fs::create_dir_all(dir.join(".rag-rat")).unwrap();
         let database = dir.join(".rag-rat").join("index.sqlite");
         assert_eq!(read_cache(&database), None, "absent cache reads None");
@@ -282,6 +279,5 @@ mod tests {
             crate::sidecar_state::state_path(&database),
             dir.join(".rag-rat").join("mcp-state.json")
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
