@@ -112,7 +112,7 @@ fn rebuild_fts_repopulates_contentless_chunk_fts_from_the_store() {
         "rebuild_fts repopulates contentless chunk_fts from chunk_text"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -912,7 +912,7 @@ fn full_rebuild_applies_per_package_import_scope() {
         "a `Display` use'd from external std must not bind to the local `Display` struct"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ─── Phase C1: orientation composer ──────────────────────────────────────────
@@ -1034,5 +1034,5 @@ fn orientation_composes_read_only() {
     );
     assert_eq!(o2.total_files, o1.total_files, "second call: total_files changed");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

@@ -48,7 +48,7 @@ fn dir_memory_binds_to_a_directory() {
     assert_eq!(binding.binding_id, "src");
     assert_eq!(binding.anchor_status, "current");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn dir_memory_validation_current_and_gone() {
     assert_eq!(report.current, 2, "expected 2 current dir bindings");
     assert_eq!(report.gone, 1, "expected 1 gone dir binding");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -241,7 +241,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
     assert_eq!(path_only.len(), 1, "expected 1 path-kind summary, got: {path_only:?}");
     assert_eq!(path_only[0].binding_kind, "path");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ─── Fix 1: label/depth contract ─────────────────────────────────────────────
@@ -291,7 +291,7 @@ fn dir_tree_label_depth_flat_siblings() {
     assert_eq!(b.label, "b", "src/b label");
 
     assert_eq!(tree.truncated, 0);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -368,7 +368,7 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
         tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
     );
     assert_eq!(tree.truncated, 0);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ─── Fix 1 + memory-only inclusion ───────────────────────────────────────────
@@ -409,7 +409,7 @@ fn dir_tree_memory_only_dir_appears_without_min_files() {
     assert_eq!(node_a.depth, 1, "src/a depth");
     assert_eq!(node_a.label, "a", "src/a label");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ─── Fix 2: generated exclusion ──────────────────────────────────────────────
@@ -470,7 +470,7 @@ fn dir_tree_excludes_generated_files_from_count() {
     });
     assert_eq!(real_node.file_count, 3, "src/real file_count must be 3 (non-generated only)");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ─── Fix 3: real multi-context scoping ───────────────────────────────────────
@@ -525,7 +525,7 @@ fn dir_tree_scope_excludes_other_worktree_files() {
         node_a.file_count
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ─── Fix 3: max_nodes cap ────────────────────────────────────────────────────
@@ -577,7 +577,7 @@ fn dir_tree_truncates_at_max_nodes() {
     assert!(tree.nodes.len() <= 3, "nodes.len()={} must be <= max_nodes=3", tree.nodes.len());
     assert!(tree.truncated > 0, "truncated must be >0 when nodes were dropped");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ─── original integration test (extended) ────────────────────────────────────
@@ -668,7 +668,7 @@ fn dir_tree_builds_annotated_layout() {
     let node_a2 = tree2.nodes.iter().find(|n| n.path == "src/a").unwrap();
     assert_eq!(node_a2.file_count, 3, "file_count changed after scope reinstall");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ─── Bug fix: children of collapsed node must use leaf labels ─────────────────
@@ -764,7 +764,7 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
     );
 
     assert_eq!(tree.truncated, 0);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// V022 bootstrap (fresh-applies-all): a brand-new index applies every migration through V022 and

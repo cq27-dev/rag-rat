@@ -34,5 +34,5 @@ fn index_status_surfaces_watch_placement_failures() {
     assert!(db.record_watch_placement_failures(5).unwrap(), "a higher count is a change");
     assert_eq!(db.status(&config.database).unwrap().watch_placement_failures, 5);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

@@ -760,7 +760,7 @@ fn impact_report_surfaces_and_gates_coupling_section() {
         capped.completeness_and_caveats.truncated_sections
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Codex #566 finding 2: a co-changed file that is dirty-since-index must count toward
@@ -815,5 +815,5 @@ fn dirty_co_changed_file_counts_toward_stale_files() {
         report.completeness_and_caveats.stale_files
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

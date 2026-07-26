@@ -19,7 +19,7 @@ use super::*;
 /// A git fixture repo with the named source files under `src/`, plus its source `Config` (absolute
 /// DB path, like production). A REAL git checkout so `adopt_repo_from_config` registers a portable
 /// repo id.
-fn generation_fixture(files: &[(&str, &str)]) -> (PathBuf, Config) {
+fn generation_fixture(files: &[(&str, &str)]) -> (ScratchRoot, Config) {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -257,7 +257,7 @@ fn a_reader_sees_the_complete_old_generation_until_the_rebuild_flips() {
     );
 
     drop(db);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// STEP 2 (bounded writer holds): while a full rebuild is PAUSED between committed waves — holding
@@ -313,7 +313,7 @@ fn a_paused_rebuild_does_not_block_a_write_to_another_repo() {
     resume_tx.send(()).unwrap();
     handle.join().unwrap();
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// The poison-sibling harness survives a full rebuild of the PRIMARY repo: the generation-staged
@@ -330,7 +330,7 @@ fn the_poison_sibling_survives_a_full_rebuild_of_the_primary_repo() {
     let db = IndexDatabase::rebuild(&config).unwrap();
     crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
     drop(db);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// This repo's `parser_failures` count for a path, from a fresh connection.
@@ -404,7 +404,7 @@ fn dead_generation_sweep_keeps_a_live_paths_parser_failure() {
         "a path removed from the tree loses its stale record in the rebuild tail"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 #2: the pointer flip is the TERMINAL write of a rebuild. A failure anywhere in the tail
@@ -481,7 +481,7 @@ fn a_tail_failure_leaves_the_old_generation_live_and_a_retry_flips() {
         "the successful retry publishes the staged clear"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 #3: dead-generation reclamation needs NO git context, so it runs even on the "no live
@@ -539,7 +539,7 @@ fn non_git_indexes_sweep_dead_generations_despite_the_context_prune_refusal() {
     );
     crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
     drop(db);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 #4: a carried-forward overlay's edges are re-resolved against the freshly staged base inside
@@ -616,7 +616,7 @@ fn carried_overlay_edges_re_resolve_onto_the_new_base_generation() {
 
     drop(db);
     let _ = fs::remove_dir_all(&linked);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 (parser_failures.rs): a previously-indexed path that freshly fails PREPARATION (invalid
@@ -645,7 +645,7 @@ fn a_fresh_prepare_failure_for_a_previously_indexed_path_survives_the_tail_sweep
         "a fresh PREPARE failure for a previously-indexed path survives the tail orphan sweep"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 (rebuild.rs FTS race): during a FIRST index (no `chunk_text_dict` yet — chunk text only
@@ -706,7 +706,7 @@ fn a_concurrent_fts_refresh_during_first_index_does_not_lose_staged_rows() {
         .unwrap();
     assert!(!missing_fts, "every published chunk has a BM25 row after the first index");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 (incremental.rs interleaved writers) — the PROOF's regression test: a memory written
@@ -798,7 +798,7 @@ fn a_memory_written_mid_rebuild_survives_the_flip_intact() {
     crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
 
     drop(db);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 (incremental.rs / repo_brief): `summary_counts.graph_edges` is an EXACTNESS counter — it
@@ -847,7 +847,7 @@ fn repo_brief_edge_count_is_generation_scoped() {
     );
 
     drop(db);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Install the keyed pause barrier for `config`'s database and spawn a full rebuild on a thread,
@@ -946,7 +946,7 @@ fn gc_serializes_on_the_flock_while_a_rebuild_is_mid_flight() {
     );
     assert_eq!(reader_scoped_file_count(&db_path, &root), 2);
     drop(db);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 (file_rows.rs, generation-bounded deletes): a LOCKLESS heal replacing a path mid-rebuild
@@ -1009,7 +1009,7 @@ fn a_lockless_heal_mid_rebuild_does_not_remove_the_staged_row() {
     );
     assert_eq!(reader_scoped_file_count(&db_path, &root), 2);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 (lifecycle.rs, bare-open scope view): the bare `IndexDatabase::open` (the MCP
@@ -1077,7 +1077,7 @@ fn a_bare_open_reader_is_generation_scoped() {
     );
     drop(bare);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 batch 4 (schema-apply race): every path that can APPLY schema serializes on the GLOBAL
@@ -1111,7 +1111,7 @@ fn concurrent_create_or_migrate_applies_the_schema_exactly_once() {
         "exactly one schema_version row per migration"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 batch 6 #1 (git history rides the flip): a tail failure must leave the WHOLE git-history
@@ -1210,7 +1210,7 @@ fn a_tail_failure_leaves_git_meta_and_history_cursors_on_the_old_state() {
     assert_eq!(git_commit_meta(&db_path, &repo_id).as_deref(), Some(h2.as_str()));
     assert!(history_current(&db_path, &root), "cursors advanced with the successful flip");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 batch 5 (abandoned staging): failed rebuilds leave committed-but-never-flipped generations
@@ -1270,7 +1270,7 @@ fn gc_reclaims_abandoned_staged_generations_from_failed_rebuilds() {
     assert!(live_generation(&db_path, &repo_id) > live);
     assert_eq!(reader_scoped_file_count(&db_path, &root), 2);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// P2 batch 5 (source_root joins cursors-last): a rebuild from a NEW checkout root that fails
@@ -1324,12 +1324,12 @@ fn a_tail_failure_leaves_source_root_on_the_old_checkout() {
     );
 
     let _ = fs::remove_dir_all(&root2);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// A git fixture that is also a Cargo crate (`[package] name = crate_name` + `src/lib.rs`), so
 /// `refresh_packages` records a real `packages` row + `repo_meta.local_crate_roots`.
-fn cargo_generation_fixture(crate_name: &str) -> (PathBuf, Config) {
+fn cargo_generation_fixture(crate_name: &str) -> (ScratchRoot, Config) {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -1395,7 +1395,7 @@ fn a_tail_failure_leaves_package_roots_on_the_old_state() {
         "the retry publishes the new crate root together with the flip"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Batch 6 #3 (overlay package roots carried across a base HEAD advance): a full rebuild that
@@ -1456,7 +1456,7 @@ fn a_head_advancing_rebuild_carries_overlay_package_roots_onto_the_new_base_comm
     );
 
     let _ = fs::remove_dir_all(&linked);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Batch 6 (count-scoping class, the adversary's repro): during a DEAD-GENERATION window (two
@@ -1510,7 +1510,7 @@ fn graph_traversal_summary_counts_match_the_live_rows_during_a_dead_generation_w
     );
 
     drop(db);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Batch 7 P2 (incremental.rs, standalone finalize): the public `index_targets()` entry shares
@@ -1580,7 +1580,7 @@ fn standalone_index_targets_publishes_staged_parser_failures_immediately() {
     assert_eq!(logical_fine, 1, "the standalone finalize folds logical symbols (batch 7 twin)");
 
     drop(db);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Batch 7 P2 (rebuild.rs, overlay package carry vs a fresh refresh): an overlay that ALREADY
@@ -1650,7 +1650,7 @@ fn a_rebuild_after_an_overlay_already_refreshed_at_the_new_head_does_not_collide
     assert!(rows > 0, "the overlay package map survived the carry");
 
     let _ = fs::remove_dir_all(&linked);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Batch 7 (the re-key's second collision shape): overlay rows at TWO different STALE commits
@@ -1717,7 +1717,7 @@ fn a_rebuild_dedupes_multi_stale_overlay_package_rows_before_the_re_key() {
     );
 
     let _ = fs::remove_dir_all(&linked);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Batch 6 (concurrency HIGH): `rag-rat init`'s `setup_index` reaches the rebuild through
@@ -1782,5 +1782,5 @@ fn a_lockless_init_rebuild_serializes_a_concurrent_flock_gc() {
         2,
         "the init-path rebuild published a non-empty generation despite the racing collector"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

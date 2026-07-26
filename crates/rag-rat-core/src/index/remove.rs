@@ -425,7 +425,7 @@ mod tests {
             "an exact recorded config root remains a valid destructive target"
         );
         drop(storage);
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The one REAL fixture repo (neither the `__unassigned__` placeholder nor the poison sibling).
@@ -935,7 +935,7 @@ mod tests {
             "the newly re-added repo must survive the stale removal attempt"
         );
         drop(storage);
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The removal tombstone gates re-registration: once a repo is marked removed, the indexing

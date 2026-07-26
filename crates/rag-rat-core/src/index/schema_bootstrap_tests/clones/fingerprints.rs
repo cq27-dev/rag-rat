@@ -84,7 +84,7 @@ fn indexing_writes_baseline_fingerprints_for_functions() {
         conn.query_row("SELECT count(*) FROM symbol_fingerprints", [], |r| r.get(0)).unwrap();
     assert_eq!(after_fps, 0, "fingerprints (and their token_bag BLOBs) cascade on symbol delete");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// T4 (#231): `refresh_clone_token_df` recomputed from the token-bag BLOBs equals the postings-era
@@ -147,7 +147,7 @@ fn clone_token_df_recomputed_from_blobs_matches_postings_era() {
         "the two renamed clones share at least one token (df == 2)"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -179,7 +179,7 @@ fn candidate_components_group_renamed_clones_and_exclude_unrelated() {
     assert_eq!(components.len(), 1, "exactly one clone component: {components:?}");
     assert_eq!(components[0].len(), 2, "the component is the two renamed clones: {components:?}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Adversarial containment (design rev-4 §8): a small function A whose entire token bag is
@@ -243,7 +243,7 @@ fn candidate_components_reject_small_function_contained_in_large_one() {
         "a small function contained in a large one is NOT a whole-symbol clone: {components:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// df is a selectivity hint only (design rev-4 §2, §8): emptying `clone_token_df` must NOT change
@@ -278,7 +278,7 @@ fn candidate_components_unchanged_when_clone_token_df_is_empty() {
         "df is selectivity-only: emptying clone_token_df must not change components"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// The `files.generated = 0` predicate is a READ-SIDE filter: generated files are still
@@ -342,7 +342,7 @@ fn candidate_components_exclude_generated_files_via_read_filter() {
         "generated b.rs must be excluded from clone components by the read filter: {after:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #232 #6: a PATH-heuristic-generated file under a SOURCE target (`src/generated/*.rs`,
@@ -418,7 +418,7 @@ fn generated_files_are_not_fingerprinted_at_index_time() {
         "generated file must NOT be fingerprinted after a single-file heal"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #232 multi-language integration: a Rust + TS + Python repo with WITHIN-language planted clones
@@ -556,7 +556,7 @@ fn multi_language_clone_integration_finds_within_language_no_cross() {
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Max-denominator overlap gate regression: two structurally different functions whose
@@ -622,7 +622,7 @@ fn candidate_components_reject_partial_overlap_below_max_denominator_theta() {
          containment): min_len={min_len} max_len={max_len} threshold={threshold} {comps:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// normalizer_version filter: after a NORM_VERSION bump the old rows are stale and the read
@@ -657,5 +657,5 @@ fn candidate_read_ignores_stale_normalizer_version_rows() {
         "stale-version fingerprints must be ignored by the read"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

@@ -1756,7 +1756,7 @@ fn a_writer_whose_identity_upgrades_mid_run_extends_its_lock_to_the_resolved_id(
 
 /// A real git repo (two empty commits) for the upgrade-proof tests — its HEAD is a commit a genuine
 /// deepened clone would reach.
-fn real_git_repo(tag: &str) -> PathBuf {
+fn real_git_repo(tag: &str) -> ScratchRoot {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
@@ -2450,7 +2450,7 @@ fn unshallow_upgrades_a_shallow_clone_index_from_local_to_portable_in_place() {
         )
         .expect("the memory binding still resolves after the in-place upgrade");
     assert_eq!(resolved_name, symbol_name, "the memory resolves to the same symbol post-upgrade");
-    let _ = fs::remove_dir_all(base);
+    let _ = fs::remove_dir_all(&base);
 }
 
 // --- Read-path repo resolution without registering (#413 round-4 findings #1 + #2) ---
@@ -2533,7 +2533,7 @@ fn resolve_config_repo_id_returns_none_for_a_rejected_pin() {
         None,
         "a reserved-id pin does not resolve on the read path — it surfaces via the read-write open",
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #413 round-5: a NEW, unregistered `[index] repo_id` pin resolves to `None` on the read path —
@@ -2569,7 +2569,7 @@ fn resolve_config_repo_id_returns_none_for_a_new_unregistered_pin() {
         "a new unregistered pin declines on the read path — it does not bind the old (repo-a) \
          scope",
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #413 round-5, the shallow-upgrade sibling case: a repo registered under a `local:` id whose
@@ -2614,7 +2614,7 @@ fn resolve_config_repo_id_returns_none_for_a_newly_portable_local_incumbent() {
         None,
         "a newly-portable identity declines on the read path — upgrade happens on the write path",
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Test-local probe: is `repo_id` a registered real repo? (mirrors the private
@@ -2643,7 +2643,7 @@ fn open_config_surfaces_a_reserved_repo_id_pin() {
     let err = IndexDatabase::open_config(&config)
         .expect_err("a reserved-id pin is a rejection, never a silent placeholder fallback");
     assert!(err.to_string().contains("reserved"), "error names the rejection: {err}");
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// A cut shallow clone (its root commit unreachable, so a derived id would be depth-dependent) does
@@ -2684,7 +2684,7 @@ fn open_config_adopts_a_shallow_clone_under_a_local_only_id() {
         1,
         "LocalOnly repo row"
     );
-    let _ = fs::remove_dir_all(base);
+    let _ = fs::remove_dir_all(&base);
 }
 
 /// A NON-git root (no identity to derive at all) is the EXPECTED-absence class: `open_config`
@@ -2704,7 +2704,7 @@ fn open_config_falls_back_to_the_sole_repo_on_a_non_git_root() {
         db.active_repo_id, LEGACY_REPO_ID,
         "the un-adopted single-repo DB scopes to the placeholder"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// The STRUCTURAL BACKSTOP for the identity gate's second entrance (Codex batch 8, finding 5): an
@@ -2749,7 +2749,7 @@ fn an_identity_less_open_refuses_to_sole_pick_on_a_multi_repo_db() {
     assert_eq!(repos, 2, "both siblings still registered, nothing adopted");
     let roots: i64 = conn.query_row("SELECT COUNT(*) FROM repo_roots", [], |r| r.get(0)).unwrap();
     assert_eq!(roots, 0, "no root was recorded for the refused open");
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // --- V041: repo_id scoping on the GitHub papertrail tables (memory-sync phase A4) ---

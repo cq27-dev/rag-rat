@@ -13,7 +13,8 @@ use super::*;
 /// A shared DB holding repo A (really indexed) plus repo B (seeded rows at repo A's SAME commit).
 struct TwoRepoFixture {
     db: IndexDatabase,
-    root_a: PathBuf,
+    root_a: ScratchRoot,
+    _shared_root: ScratchRoot,
     repo_a_id: String,
     /// The commit both repos' rows sit at — proves the isolation is by `repo_id`, not commit sha.
     shared_commit: String,
@@ -47,7 +48,8 @@ fn two_repo_fixture() -> TwoRepoFixture {
     run_git(&root_a, &["add", "."]);
     run_git(&root_a, &["commit", "-q", "-m", "init"]);
 
-    let shared_db = unique_temp_root().join("shared.sqlite");
+    let shared_root = unique_temp_root();
+    let shared_db = shared_root.join("shared.sqlite");
     let mut config_a = source_config(root_a.clone(), Language::Rust);
     config_a.database = shared_db;
     let db = IndexDatabase::rebuild(&config_a).unwrap();
@@ -77,7 +79,7 @@ fn two_repo_fixture() -> TwoRepoFixture {
         .unwrap();
     }
 
-    TwoRepoFixture { db, root_a, repo_a_id, shared_commit }
+    TwoRepoFixture { db, root_a, _shared_root: shared_root, repo_a_id, shared_commit }
 }
 
 /// Paths visible through the per-connection scope VIEW (`temp.files`) at the active scope.
@@ -118,7 +120,7 @@ fn scope_view_isolates_repos_sharing_a_commit() {
         "repo B's view must NOT leak repo A's file: {view_b:?}"
     );
 
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// `garbage_collect` is repo-sliced: sweeping repo A prunes ONLY repo A's dead-context rows and
@@ -212,7 +214,7 @@ fn gc_of_one_repo_leaves_the_other_intact() {
         "gc reports repo A's chunk slice, not the whole-store union",
     );
 
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// The all-zeros id: the lexicographically SMALLEST 40-hex string, so a real commit-hash repo id
@@ -286,7 +288,7 @@ fn graph_refresh_of_one_repo_leaves_the_other_repos_edges() {
         repo_b_before,
         "repo A's graph refresh must not wipe repo B's edges"
     );
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// #413 finding #4: the config-bearing incremental path (`index --changed`/`--discover`) must
@@ -338,7 +340,7 @@ fn incremental_adopts_the_config_repo_over_a_smaller_sibling() {
         .query_row("SELECT COUNT(*) FROM main.files WHERE repo_id = ?1", [&repo_id], |r| r.get(0))
         .unwrap();
     assert!(under_config > 0, "rows are stamped under the config's repo");
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #413 round-4 finding #1: the read-only MCP open (`try_open_config_read_only`) must scope to the
@@ -389,7 +391,7 @@ fn read_only_open_binds_the_config_repo_over_a_smaller_sibling() {
         !ro.symbols("ro_sibling_anchor", Some(Language::Rust), 10).unwrap().is_empty(),
         "the read-only connection answers queries scoped to the config repo",
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// All `repo_meta` rows as a sorted `(repo_id, key, value)` list — the snapshot the full-ladder
@@ -456,7 +458,7 @@ fn full_ladder_replay_on_a_two_repo_db_is_idempotent() {
         .query_row("SELECT COUNT(*) FROM main.files WHERE repo_id = ?1", [REPO_B], |r| r.get(0))
         .unwrap();
     assert_eq!(repo_b_files, 2, "repo B's rows are intact after the replay");
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// #413 finding #5 (now V042): `oracle_runs.repo_id` scopes the prune to the ACTIVE repo, so GC for
@@ -491,7 +493,7 @@ fn gc_skips_the_global_oracle_prune_on_a_multi_repo_db() {
         })
         .unwrap();
     assert_eq!(surviving, 1, "repo A's repo-scoped oracle prune spares repo B's run");
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// The complement: the ACTIVE repo's OWN dead-context run IS pruned. The dead run is stamped the
@@ -530,7 +532,7 @@ fn gc_prunes_a_dead_oracle_run_on_a_single_repo_db() {
         })
         .unwrap();
     assert_eq!(surviving, 0, "single-repo gc prunes the dead-context oracle run as before");
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// `LogicalSymbolKey::stable_id` folds the OWNING repo into the content hash: two repos with
@@ -603,7 +605,7 @@ fn repo_brief_edges_are_scoped_to_the_active_repo() {
         summary.graph_edges < u64::try_from(global_edges).unwrap(),
         "and is strictly below the global union (repo B's edge is excluded)",
     );
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// #413 round-5: an INSTALLED-but-EMPTY scope context (`""`, the sibling-safe "match nothing" scope
@@ -638,7 +640,7 @@ fn active_repo_id_honors_an_installed_empty_scope() {
         None,
         "installed-empty scope yields empty direct-scoped reads, never a sibling's rows",
     );
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// #413 round-5: `query::orientation` threads the config's `[index] repo_id` override into its
@@ -697,7 +699,7 @@ fn orientation_pins_the_fork_repo_over_a_shared_root_sibling() {
         "",
         "no pin at a fork-owned root → the owner mirror declines rather than bind the sibling",
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // --- Cross-repo FTS / papertrail leak matrix (spec §9, memory-sync phase A4) ---
@@ -840,7 +842,7 @@ fn lexical_and_hybrid_search_never_surface_the_other_repo() {
         "repo A must still see its own chunk: {own:?}"
     );
 
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// Git-history queries are repo-scoped: repo B's commit (commit_fts MATCH) and its path history are
@@ -868,7 +870,7 @@ fn git_history_queries_never_surface_the_other_repo() {
     let status = crate::index::git_history::status(conn, &fx.root_a).unwrap();
     assert_eq!(status.commit_count, 1, "status counts only repo A's git_commits, not repo B's");
 
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// Papertrail queries are repo-scoped: repo B's issue (papertrail_fts MATCH) and its
@@ -892,7 +894,7 @@ fn papertrail_queries_never_surface_the_other_repo() {
     let own_refs = rag_rat_papertrail::refs_for_path(conn, "src/a_only.rs", 10).unwrap();
     assert!(!own_refs.is_empty(), "repo A must still see its own papertrail ref");
 
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 // ================================================================================================
@@ -1120,7 +1122,7 @@ fn clone_precompute_leaves_sibling_repo_generation_untouched() {
         .unwrap();
     assert!(repo_a_complete >= 1, "repo A published its own fresh Complete generation");
 
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// A5 finding 2: `refresh_clone_token_df` reads `symbol_fingerprints` scoped to the active repo
@@ -1180,7 +1182,7 @@ fn clone_token_df_recompute_excludes_a_sibling_repos_fingerprints() {
         "a sibling repo's fingerprint token leaked into the active repo's clone_token_df",
     );
 
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// A5 finding: `memory_by_id` is the guard for `memory_get` / `update_memory` / `mark_obsolete` /
@@ -1733,7 +1735,7 @@ fn reconcile_status_ignores_a_sibling_repos_attempt() {
         fx.db.llm_status().unwrap().last_reconcile.expect("repo A has a reconcile attempt");
     assert_eq!(status.status, "Ok", "the status must be repo A's, not repo B's newer attempt");
     assert_eq!(status.started_at_ms, 100);
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// A5 finding: the raw memory-summary readers (`repo_brief::memory_counts` /
@@ -1811,7 +1813,7 @@ fn memory_summary_readers_exclude_a_sibling_repos_memory() {
         "orientation leaked a sibling repo's active memory title",
     );
 
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// A7 (batch 2): the open-time model-manifest heal must never mutate a SIBLING repo's
@@ -1862,7 +1864,7 @@ fn incremental_open_heal_leaves_a_sibling_repos_model_meta_alone() {
         "the open-time manifest heal mutated a sibling repo's repo_meta (pre-adoption sole pick)",
     );
 
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// A7 (batch 3, same class as the incremental finding — the CALLEE now enforces it): a
@@ -1951,7 +1953,7 @@ fn incremental_open_resets_source_root_from_the_config_before_heals() {
          sibling root would refresh the target's graph from the wrong checkout",
     );
 
-    let _ = fs::remove_dir_all(fx.root_a);
+    let _ = fs::remove_dir_all(&fx.root_a);
 }
 
 /// #275: `current_callee_monikers` — the clone-refine collapse's `edge_oracle` read — must scope
@@ -2172,5 +2174,5 @@ fn qualified_name_resolution_is_repo_scoped_in_a_consolidated_db() {
         "symbol_lookup must surface the active repo's symbol and never the sibling's: {ids:?}",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

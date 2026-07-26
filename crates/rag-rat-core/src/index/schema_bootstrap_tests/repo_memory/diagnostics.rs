@@ -84,7 +84,7 @@ fn anchor_health_counts_tallies_persisted_statuses() {
     assert_eq!(health.gone, 0, "expected no gone bindings, got {health:?}");
     assert_eq!(health.stale, 0, "expected no stale bindings, got {health:?}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
         entry.candidates
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// A memory stranded under the `'__unassigned__'` placeholder on an ADOPTED DB — the V042
@@ -284,7 +284,7 @@ fn memory_doctor_dedupes_cfg_split_candidates() {
         entry.candidates.iter().filter(|c| c.ends_with("cfg_helper")).collect();
     assert_eq!(cfg_candidates.len(), 1, "cfg twins collapse to one suggestion: {cfg_candidates:?}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -319,7 +319,7 @@ fn symbol_path_selector_is_exact_not_substring() {
         .expect("one hit");
     assert_eq!(hit.name, "spawn_blocking");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn select_symbol_for_bind_collapses_cfg_split_group() {
         .expect("one member returned");
     assert_eq!(hit.logical_symbol_id, Some(logical_id));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -476,7 +476,7 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
     assert!(!god_modules.candidates[0].split_hints.is_empty());
     assert!(god_modules.candidates[0].next_tools.iter().any(|tool| tool.tool == "impact_surface"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -553,5 +553,5 @@ fn repo_clusters_groups_cotouched_files() {
     assert!(sync_cluster.representative_paths.contains(&"src/sync/msg.rs".to_string()));
     assert!(sync_cluster.metrics.co_touch_edges >= 2);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

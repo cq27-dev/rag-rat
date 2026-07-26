@@ -242,8 +242,8 @@ fn a_files_write_without_the_fold_function_fails_closed() {
 // ---- real IndexDatabase seams (rebuild / gc / poison / migration re-stamp) ----
 
 /// Build a tiny committed git repo and return its config (the base for the real-DB seam tests).
-fn digest_repo_config(tag: &str) -> (PathBuf, Config) {
-    let root = unique_temp_root().join(tag);
+fn digest_repo_config(tag: &str) -> (ScratchRoot, Config) {
+    let root = ScratchRoot::new(tag);
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();

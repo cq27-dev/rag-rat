@@ -88,7 +88,7 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
     assert_eq!(res.completeness.normalizer_version, NORM_VERSION);
     assert!(!res.completeness.truncated);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// `clones_for_symbol` integration test: two rename-clone functions (a.rs / b.rs) form one
@@ -152,7 +152,7 @@ fn clones_for_symbol_returns_the_class_by_ref_and_by_path_line() {
 
     // Post-condition: the clone rebuild/precompute must not touch a sibling repo (round-6 harness).
     crate::index::poison_sibling::assert_sibling_intact(db2.storage.connection());
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Fix 1 (#215): `min_similarity` is honored ALL the way through candidate generation, not merely
@@ -214,7 +214,7 @@ fn find_clones_min_similarity_below_theta_widens_and_is_reported() {
     );
     assert_eq!(default.completeness.min_similarity, 0.7, "default completeness θ is 0.7");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// `min_similarity` is a similarity ratio θ = overlap/max_len and must lie in [0.5, 1.0]. Values
@@ -276,7 +276,7 @@ fn find_clones_rejects_out_of_range_min_similarity() {
     db.find_clones(FindClonesOptions { min_similarity: Some(0.5), min_copies: None, limit: None })
         .expect("min_similarity = 0.5 is the inclusive lower bound and must be accepted");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Fix 2 (#215): `completeness.truncated` reflects whole CLASSES dropped by `limit`, not only
@@ -330,7 +330,7 @@ fn find_clones_truncated_reflects_class_limit() {
         "dropping a whole class via the limit must set completeness.truncated"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Plan 4 coherence-splits over-merged components; the A~B~C chain becomes coherent sub-classes.
@@ -398,7 +398,7 @@ fn coherence_split_applied_in_find_clones() {
             })
             .unwrap();
         let sim = res.classes.first().map(|c| c.similarity_min).unwrap_or(0.0);
-        let _ = fs::remove_dir_all(r);
+        let _ = fs::remove_dir_all(&r);
         sim
     };
     let ab = edge_sim(("a", a), ("b", b));
@@ -471,7 +471,7 @@ fn coherence_split_applied_in_find_clones() {
     );
     assert!(c_class.refined, "the {{B,C}} sub-class is refined");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #256 (R5c): the full clone path is DETERMINISTic on a synthetic transitive chain. The
@@ -513,7 +513,7 @@ fn clone_split_full_path_is_deterministic() {
         // clones_for_symbol on the chained subject B (which is in BOTH {A,B} and {B,C}).
         let by_b = db.clones_for_symbol(CloneSymbolSelector::Ref("src/b.rs::fb".into())).unwrap();
         let b_key = by_b.class.as_ref().map(|cl| cl.class_key.clone());
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(&root);
         (keys, b_key)
     };
 
@@ -565,7 +565,7 @@ fn clones_for_chained_symbol_serves_tight_neighborhood() {
         "the served class must be internally coherent (≥ θ): got {}",
         b_class.cohesion_min_pairwise
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #256 (R7) recall pin: a 7-copy structurally-identical clone family (the `collect_rows`-style
@@ -624,7 +624,7 @@ fn find_clones_recall_pin_seven_copy_clone_still_found() {
     );
     assert!(seven.roi > 0.0, "a genuine clone keeps a positive ROI");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Plan 4a: four renamed clones (same structure, different names) form ONE class that the refine
@@ -662,7 +662,7 @@ fn find_clones_refines_a_clean_class() {
         c.roi
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Plan 4a: `clones_for_symbol` always refines the subject's class (when refine inputs are
@@ -686,5 +686,5 @@ fn clones_for_symbol_returns_refined_class() {
         class.members.iter().map(|m| &m.r#ref).collect::<Vec<_>>()
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

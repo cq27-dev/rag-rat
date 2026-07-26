@@ -83,7 +83,7 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
     assert_eq!(impact.completeness_and_caveats.memory_status.active, 1);
     assert_eq!(impact.completeness_and_caveats.memory_status.stale, 0);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn compact_repo_memory_view_projects_primary_binding_then_full_mode_round_trips(
     assert_eq!(full.direct[0].body, full_body);
     assert_eq!(full.direct[0].bindings[0].binding_kind, "logical_symbol");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn compact_repo_memory_view_separates_the_stale_lane() {
     assert_eq!(after.stale[0].memory_id, created.memory.memory_id);
     assert_eq!(after.stale[0].anchor_status.as_deref(), Some("stale"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -338,7 +338,7 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
     assert_eq!(anchored.len(), 1, "memory did not re-anchor to moved symbol");
     assert_ne!(anchored[0].bindings[0].anchor_status, "gone");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -430,7 +430,7 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
         db.memory_for_symbol(&symbol, 10, rag_rat_base::config::MemorySurface::Full).unwrap();
     assert_eq!(gone[0].bindings[0].anchor_status, "gone");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #491: one qualified name, two logical twins (a `struct` and its `impl` block). The impl's
@@ -529,7 +529,7 @@ fn relocation_lands_on_the_kind_matching_twin_not_plan_order() {
          happens to return first"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #492: the path probe took the newest `files` row with no `kind != 'deleted'` filter, and a
@@ -592,7 +592,7 @@ fn a_deleted_at_head_file_makes_a_bare_path_binding_gone() {
     assert_eq!(status(&db), "gone", "the deleted marker must not shadow the file's absence");
     assert_eq!(report.gone, 1);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #492: a path that is absent at THIS context's HEAD but alive in another indexed scope (a
@@ -713,7 +713,7 @@ fn a_path_alive_only_in_another_scope_validates_pending_not_gone() {
     assert_eq!(report.pending, 0);
     assert_eq!(report.gone, 1);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -846,7 +846,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
     assert_eq!(call_path[0].memory_id, call_path_memory.memory.memory_id);
     assert_eq!(call_path[0].call_paths[0].path_summary, "caller_edge -> target_edge");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -907,7 +907,7 @@ fn memory_search_defers_the_body_under_the_summary_surface() {
          yet)"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1037,7 +1037,7 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
     db.memory_validate().unwrap();
     assert_eq!(call_path_status(&db), "gone", "deleting the call site makes the path gone");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1133,5 +1133,5 @@ fn impact_surface_surfaces_call_path_memory_when_path_crossed() {
         compact.call_path_crossed.iter().map(|m| &m.title).collect::<Vec<_>>()
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

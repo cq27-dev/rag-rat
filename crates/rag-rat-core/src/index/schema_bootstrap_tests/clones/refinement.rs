@@ -39,7 +39,7 @@ fn refinement_key_is_content_addressed_and_distinct_from_read_key() {
         "the content-addressed refinement key must differ from the location-derived read key"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Plan 4a: the refinement cache is read-through — the first `find_clones` populates a
@@ -78,7 +78,7 @@ fn refine_cache_is_read_through() {
     assert!(r2.classes[0].refined, "run 2 still refined (served from cache)");
     assert_eq!(count_rows(&db), after_run1, "run 2 is a cache hit — the row count must not grow");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Fix A (#215 Plan 4a codex2): the warm path (cache hit) must NOT re-parse any source file.
@@ -118,7 +118,7 @@ fn find_clones_warm_cache_serves_refined_without_reparse() {
         "warm-path lcs_ratio must match the cold-path value"
     );
 
-    fs::remove_dir_all(root).unwrap_or(());
+    fs::remove_dir_all(&root).unwrap_or(());
 }
 
 /// Fix B (#215 Plan 4a codex2): the member-count sampling dimension must be reported consistently
@@ -155,7 +155,7 @@ fn find_clones_warm_cache_metrics_sampled_consistent() {
          ({sampled_warm}) paths"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Plan 4a: only the top-N (by provisional ROI) classes are refined, where N == the caller's limit.
@@ -235,8 +235,8 @@ fn unrefined_class_outside_top_n_keeps_plan2_shape() {
         "limit=1 refines only the top-1 class — the out-of-budget class is never refined"
     );
 
-    let _ = fs::remove_dir_all(root);
-    let _ = fs::remove_dir_all(root2);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&root2);
 }
 
 /// Fix 2 (Codex P2 #215 Plan 4a): find_clones with limit=Some(N) must never return an unrefined
@@ -322,8 +322,8 @@ fn find_clones_limited_result_contains_only_refined_classes() {
         );
     }
 
-    let _ = fs::remove_dir_all(root);
-    let _ = fs::remove_dir_all(root2);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&root2);
 }
 
 /// I2 (#215 Plan 4a adversary): find_clones with a huge limit must clamp effective returned classes
@@ -414,7 +414,7 @@ fn find_clones_huge_limit_clamps_to_refine_budget() {
         "a limit above the budget that drops classes must set refine_budget_clamped"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Plan 4b Task 5b: `load_refine_members` caps the re-parse to `MEMBER_VALUE_CAP` (50, previously
@@ -487,7 +487,7 @@ fn load_refine_members_returns_up_to_value_cap() {
     // live handle (`os error 32`), whereas Unix unlinks it lazily. Dropping `db` first makes the
     // strict teardown pass on both.
     drop(db);
-    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(&root).unwrap();
 }
 
 /// Plan 4b Task 5b: every `RefineMember` returned by `load_refine_members` must carry
@@ -555,7 +555,7 @@ fn refine_member_carries_spans_len_eq_seq() {
     // live handle (`os error 32`), whereas Unix unlinks it lazily. Dropping `db` first makes the
     // strict teardown pass on both.
     drop(db);
-    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(&root).unwrap();
 }
 
 /// Plan 4b Task 5b: the faithfulness pin still drops drifted members. A member whose on-disk
@@ -604,7 +604,7 @@ fn faithfulness_pin_still_drops_drifted_member() {
         "a drifted member (struct_hash mismatch) must cause load_refine_members to return Ok(None)"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #259 (Adversary C) — END-TO-END through the real `find_clones` driver: a refine-FAILED class (a
@@ -705,5 +705,5 @@ fn refine_failed_class_member_count_dampened_end_to_end() {
         raw_roi
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

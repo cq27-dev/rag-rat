@@ -69,7 +69,7 @@ fn build_class_surfaces_medoid_symbol_id() {
     // live handle (`os error 32`), whereas Unix unlinks it lazily. Dropping `db` first makes the
     // strict teardown pass on both.
     drop(db);
-    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(&root).unwrap();
 }
 
 /// Worktree-overlay scope: `find_clones` returns the BRANCH-ONLY clone class under the overlay
@@ -194,7 +194,7 @@ fn find_clones_falls_back_to_unrefined_when_source_unavailable() {
     assert!(c.refine_mode.is_none(), "no refine_mode on an un-refined class");
 
     // a/ and b/ are already gone; only `.rag-rat/` remains under root.
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Fix 1 + Fix 2 (#215): a clone class with more than MAX_MEMBERS members exercises two paths that
@@ -285,7 +285,7 @@ fn find_clones_caps_large_class_and_pins_late_subject() {
         pinned.members.iter().map(|m| &m.r#ref).collect::<Vec<_>>()
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Fix 5 (#215): the clone surface stays empty (and errors NOT) when no fingerprint rows survive —
@@ -324,7 +324,7 @@ fn find_clones_returns_no_class_when_fingerprints_vanish() {
         .unwrap();
     assert!(after.classes.is_empty(), "no fingerprints ⇒ no clone classes (no error): {after:?}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Fix 4 (#215): the `Ref` and `PathLine` resolution arms now LEFT JOIN symbol_fingerprints and
@@ -365,7 +365,7 @@ fn clones_for_symbol_prefers_fingerprinted_row_on_resolution() {
         "Ref and PathLine must resolve to the same fingerprinted class"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ── Fix 1 regression guard (PathLine tightest-span PRIMARY) ──────────────────────────────────
@@ -438,7 +438,7 @@ fn pathline_tightest_span_wins_over_fingerprinted_enclosing() {
         .unwrap();
     if lu_fp_count == 0 {
         // load_user not fingerprinted — can't run this test; skip gracefully.
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(&root);
         return;
     }
 
@@ -600,7 +600,7 @@ fn pathline_tightest_span_wins_over_fingerprinted_enclosing() {
          (span=19)"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ── Fix 2: Ref ambiguity rejection ───────────────────────────────────────────────────────────
@@ -646,7 +646,7 @@ fn clones_for_symbol_ref_single_fingerprinted_resolves_unfingerprinted_falls_bac
     assert!(!tiny_res.symbol_fingerprinted, "tiny is below MIN_TOKENS");
     assert!(tiny_res.class.is_none());
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Fix 2 (#215): injecting TWO distinct fingerprinted `symbols` rows that share the SAME
@@ -715,7 +715,7 @@ fn clones_for_symbol_ref_ambiguous_fingerprinted_returns_err() {
 
     let Some((nk, nv, tl, sh)) = fp else {
         // If there's no fingerprint yet the ambiguity path can't be reached; skip gracefully.
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(&root);
         return;
     };
 
@@ -740,7 +740,7 @@ fn clones_for_symbol_ref_ambiguous_fingerprinted_returns_err() {
         .unwrap();
     if dup_fp_count == 0 {
         // fp INSERT was silently ignored (shouldn't happen) — skip the test.
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(&root);
         return;
     }
 
@@ -755,7 +755,7 @@ fn clones_for_symbol_ref_ambiguous_fingerprinted_returns_err() {
         "error message must name the ambiguous ref, got: {msg}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ── Fix 3: stale_members in completeness ────────────────────────────────────────────────────
@@ -813,7 +813,7 @@ fn find_clones_stale_members_zero_on_clean_index_and_nonzero_after_disk_edit() {
         stale.completeness.stale_members
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Faithfulness pin (#215 Plan 4a Task 2): `load_refine_members` re-parses each member's scoped
@@ -899,7 +899,7 @@ fn load_refine_members_reparse_is_faithful_to_persisted_struct_hash() {
          refine_member_order_is_reindex_stable"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Empty input is a valid (empty) refine set — not a failure.
@@ -915,7 +915,7 @@ fn load_refine_members_empty_input_returns_empty() {
         db.load_refine_members(&[], false).unwrap().expect("empty input is a valid empty set");
     assert!(members.is_empty(), "empty member_ids → empty members");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Missing source: a member whose source file is deleted from disk (but whose fingerprint row is
@@ -950,7 +950,7 @@ fn load_refine_members_returns_none_when_source_missing() {
         "a member with a deleted source file must yield Ok(None) for the whole class"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Overlay fallback (#215 Plan 4a Task 2): under a LINKED-WORKTREE OVERLAY scope, `source_root` is
@@ -1135,5 +1135,5 @@ fn scip_moniker_collapse_lifts_a_same_symbol_callee_class() {
     };
     assert_eq!(modes, vec!["baseline".to_string(), "scip".to_string()]);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

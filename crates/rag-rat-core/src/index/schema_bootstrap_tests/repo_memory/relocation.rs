@@ -99,7 +99,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
     // Post-condition: memory validation/relocation (which rewrites bindings) must not rebind onto,
     // or delete, a SIBLING repo's rows (round-6 harness; guards the P2 #2 relocation scoping).
     crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -194,7 +194,7 @@ fn memory_relocation_is_durable_across_a_second_reindex() {
     );
     assert!(!binding.contains("a.rs"), "binding_id must not still reference a.rs: {binding}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -301,7 +301,7 @@ fn relocation_persists_refreshed_symbol_and_logical_ids() {
         "persisted symbol_id must resolve to a live symbol row"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -346,7 +346,7 @@ fn full_rebuild_leaves_no_orphan_symbol_rows_for_a_path() {
         "repeated full rebuilds must not accumulate orphan symbol rows for the same path"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -415,7 +415,7 @@ fn memory_stays_gone_when_moved_symbol_body_changed() {
     assert_eq!(report.gone, 1, "changed body must not trigger relocate, expected gone: {report:?}");
     assert_eq!(report.relocated, 0, "must not relocate when body changed: {report:?}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -530,7 +530,7 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
         "must not relocate when two identical bodies exist: {report:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -653,7 +653,7 @@ fn memory_logical_binding_relocates_across_files() {
         "logical binding path should be b.rs after relocation, got: {path}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -787,7 +787,7 @@ fn memory_chunk_binding_relocates_by_hash() {
         "binding path must reference target.rs: {binding_path:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -945,5 +945,5 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
         "binding must be current or relocated after validate: {post_rebind_report:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

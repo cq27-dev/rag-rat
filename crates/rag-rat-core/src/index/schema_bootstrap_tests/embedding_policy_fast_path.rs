@@ -52,7 +52,7 @@ fn rebuild_stamps_the_policy_version_current() {
         Some(ai::DEFAULT_MAX_EMBEDDING_CHARS.to_string().as_str()),
         "the stamp records the DEFAULT cap the column was derived at"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn rebuild_carrying_overlay_rows_does_not_certify() {
         Some(ai::EMBEDDING_POLICY_VERSION),
         "a rebuild that carried un-reparsed overlay rows must not certify the version current"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -105,7 +105,7 @@ fn fast_path_refused_at_non_default_cap() {
         "default-cap fast path reads the poisoned column; a non-default cap recomputes from \
          source: {fast:?} vs {recomputed:?}"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn self_heal_skipped_at_non_default_cap() {
         Some("pre-upgrade"),
         "a non-default-cap reconcile must not certify the DEFAULT-cap column"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn reconcile_plan_classifies_at_the_requested_cap() {
         "cap=1000: the same chunk is now SkipTooLarge: {:?}",
         small_plan.embeddings.skipped_by_policy
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -230,7 +230,7 @@ fn incremental_edit_keeps_the_certified_column_fresh() {
         Some(ai::EMBEDDING_POLICY_VERSION),
         "incremental indexing must not invalidate the stamp"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Shared setup for the embed-path policy-source tests (#725): a rebuild whose fn chunk classifies
@@ -283,7 +283,7 @@ fn reconcile_embed_path_reads_the_stamped_policy_column() {
         0,
         "a certified-stamp embed path must not re-classify any candidate FromText"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -312,7 +312,7 @@ fn stale_stamp_reconcile_heals_then_takes_the_fast_path() {
         "the stale-stamp reconcile heals and re-certifies"
     );
     assert!(report.embeddings_written >= 1, "the healed Embed chunk still embeds: {report:?}");
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -338,7 +338,7 @@ fn reconcile_plan_classifies_from_the_stamped_column_like_the_embed_path() {
          the embed path: {:?}",
         plan.embeddings
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -377,7 +377,7 @@ fn self_heal_refreshes_stale_priorities_under_an_unchanged_policy() {
         Some(ai::EMBEDDING_POLICY_VERSION),
         "the heal re-certifies after writing BOTH columns"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -409,7 +409,7 @@ fn reconcile_embed_path_recomputes_at_a_non_default_cap() {
         "the uncertified embed path must re-derive policy FromText (the fallback the fast path \
          avoids)"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -437,5 +437,5 @@ fn absent_stamp_takes_the_recompute_path() {
         0,
         "an absent stamp forces a recompute that ignores the poisoned column: {summary:?}"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

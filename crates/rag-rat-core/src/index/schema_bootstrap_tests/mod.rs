@@ -162,13 +162,40 @@ fn hot_module_text(revision: usize) -> String {
     text
 }
 
-fn unique_temp_root() -> PathBuf {
-    // Shared, self-healing scratch root with a startup sweep, so a panicking/killed test can't
-    // strand this dir in the system temp (#726). See `rag_rat_base::test_scratch`.
-    rag_rat_base::test_scratch::scratch_dir("rag-rat-schema-test")
+pub(crate) struct ScratchRoot {
+    path: PathBuf,
+    _scratch: rag_rat_base::test_scratch::ScratchDir,
 }
 
-fn fixture_temp_root(fixture: &str) -> PathBuf {
+impl ScratchRoot {
+    fn new(tag: &str) -> Self {
+        let scratch = rag_rat_base::test_scratch::ScratchDir::new(tag);
+        let path = scratch.path().to_path_buf();
+        // Preserve the old helper's allocated-but-absent path contract for worktree destinations.
+        let _ = fs::remove_dir_all(&path);
+        Self { path, _scratch: scratch }
+    }
+}
+
+impl std::ops::Deref for ScratchRoot {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for &ScratchRoot {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn unique_temp_root() -> ScratchRoot {
+    ScratchRoot::new("rag-rat-schema-test")
+}
+
+fn fixture_temp_root(fixture: &str) -> ScratchRoot {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     let fixture_root =
@@ -191,7 +218,7 @@ fn copy_fixture_dir(from: &Path, to: &Path) {
     }
 }
 
-fn markdown_config(text: &str) -> (PathBuf, Config) {
+fn markdown_config(text: &str) -> (ScratchRoot, Config) {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     let docs = root.join("docs");
@@ -340,7 +367,7 @@ fn overlay_row_count(db: &IndexDatabase) -> i64 {
 /// poison-sibling harness self-tests against. A REAL git root (not a bare temp dir) so
 /// `adopt_repo_from_config` registers a portable repo id (a non-git root is `Absent` and stays
 /// under the placeholder, which would leave `real_repos == 0` and defeat the opt-out self-check).
-pub(crate) fn poison_test_config(tag: &str) -> (PathBuf, Config) {
+pub(crate) fn poison_test_config(tag: &str) -> (ScratchRoot, Config) {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -756,7 +783,7 @@ impl papertrail::PapertrailClient for PartiallyFailingGitHubClient {
 }
 
 /// A git fixture with one committed source file, configured like production (absolute DB path).
-fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
+fn git_fixture_for_overlay_tests() -> (ScratchRoot, Config) {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();

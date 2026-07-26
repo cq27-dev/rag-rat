@@ -103,7 +103,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
         schema::LATEST_SCHEMA_VERSION
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -134,7 +134,7 @@ fn symbols_store_true_source_line_spans() {
     assert_eq!(line_span("alpha"), (2, 2));
     assert_eq!(line_span("beta"), (4, 6));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn rebuild_reports_file_preparation_progress() {
         "missing indexing progress event: {events:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn open_refuses_a_legacy_schema_without_version_table() {
     let err = IndexDatabase::open(&database).unwrap_err().to_string();
     assert!(err.contains("rebuild"), "{err}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn forward_migration_does_not_rerun_already_applied_migrations() {
         schema::SchemaState::Compatible
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -273,7 +273,7 @@ fn forward_migration_reprovisions_missing_baseline_tables() {
     drop(conn);
     assert_eq!(edge_strings_exists, 1, "baseline did not reprovision name_strings before replay");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -305,7 +305,7 @@ fn open_auto_migrates_a_forward_older_schema_to_latest() {
     assert_eq!(after.state, schema::SchemaState::Compatible);
     assert_eq!(after.current_version, after.latest_version);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -381,7 +381,7 @@ fn migrate_adds_edge_name_columns_before_indexing_them() {
     assert_eq!(table_count(&db, "idx_edges_from_name"), 1);
     assert_eq!(table_count(&db, "idx_edges_to_name"), 1);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -425,7 +425,7 @@ fn migrate_preserves_the_papertrail_cache() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].item_key, "42");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -460,7 +460,7 @@ fn full_rebuild_preserves_the_papertrail_cache() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].item_key, "42");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -483,7 +483,7 @@ fn full_rebuild_preserves_installed_model_manifest() {
     assert!(after.embedding.installed);
     assert_eq!(after.embedding.state, "Ready");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -612,7 +612,7 @@ fn full_rebuild_preserves_other_worktree_contexts() {
         1
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -672,7 +672,7 @@ fn compatible_open_refuses_dirty_and_newer_schema() {
         assert!(err.contains("do not hot-upgrade"), "{err}");
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #498: the forward-migrate REPLAY path (an existing versioned ledger — every open-time
@@ -982,7 +982,7 @@ fn concurrent_forward_migrate_applies_the_pending_step_exactly_once() {
         "exactly one schema_version row per migration and no stranded dirty marker"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1025,5 +1025,5 @@ fn discover_mode_indexes_new_files_and_removes_deleted_files() {
     );
     assert_eq!(db.symbols("new_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

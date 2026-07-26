@@ -48,7 +48,7 @@ fn index_paths_reconciles_only_the_supplied_path() {
         "a new file that was NOT supplied is not indexed — only the supplied path is touched",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn index_paths_is_a_noop_for_ignored_out_of_target_and_unchanged_paths() {
     );
     assert!(symbol_present(&db, "alpha_v1"), "the unchanged target file is intact");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn index_paths_tombstones_a_supplied_path_that_no_longer_exists() {
     assert_eq!(db.indexed_file_count().unwrap(), 1, "the deleted supplied path is tombstoned");
     assert!(symbol_present(&db, "alpha_v1"), "the un-supplied file is untouched by the tombstone");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -553,7 +553,7 @@ fn index_paths_completes_the_base_scope_after_a_commit_advances_head() {
     );
     assert!(symbol_present(&db, "alpha_v2"), "the committed edit is indexed at the new HEAD");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -589,7 +589,7 @@ fn index_paths_keeps_a_clean_committed_file_in_the_committed_scope() {
         "the clean file stays committed-scoped",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -662,7 +662,7 @@ fn index_paths_does_not_churn_an_unchanged_files_row() {
         "an unchanged supplied file keeps its row id — no remove+reinsert churn",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -699,7 +699,7 @@ fn index_paths_normalizes_internal_parent_dir_components() {
         "the out-of-target `outside.rs` (via `src/../`) is not indexed",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -723,7 +723,7 @@ fn index_paths_does_not_tombstone_a_never_indexed_missing_path() {
         "a never-indexed missing path gets no tombstone row",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -762,7 +762,7 @@ fn index_paths_signals_a_package_refresh_for_a_supplied_cargo_toml() {
             .unwrap();
     assert!(deleted_signal, "a supplied but DELETED Cargo.toml still signals a package refresh");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -783,7 +783,7 @@ fn index_paths_defers_on_a_first_time_empty_repo() {
          {result:?}",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -809,7 +809,7 @@ fn index_paths_defers_instead_of_rebuilding_an_uninitialized_non_empty_repo() {
     );
     assert!(!config.database.exists(), "deferring must not build any index");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -873,7 +873,7 @@ fn index_paths_skips_a_supplied_symlink_to_an_in_repo_file() {
         "a supplied symlink is skipped — no duplicate index row under the symlink path",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -904,7 +904,7 @@ fn index_paths_skips_a_path_through_a_symlinked_ancestor_dir() {
         "a path crossing a symlinked ANCESTOR dir is skipped — no row under the symlink spelling",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1052,7 +1052,7 @@ fn index_paths_tombstones_a_deleted_indexed_file_under_a_now_ignored_dir() {
     );
     assert!(symbol_present(&db, "alpha_v1"), "the un-supplied file is untouched");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1103,7 +1103,7 @@ fn index_paths_reindexes_on_stored_target_identity_drift_with_unchanged_bytes() 
         "a stored target-identity drift is reindexed, not sha-skipped",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1178,7 +1178,7 @@ fn overlay_target_drift_scan_is_gated_on_the_config_fingerprint() {
         "a divergent branch config (C→C++) → the drift scan runs",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1210,7 +1210,7 @@ fn index_paths_tombstones_a_regular_file_replaced_by_a_symlink() {
     );
     assert!(symbol_present(&db, "beta_v1"), "the un-supplied file is untouched");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

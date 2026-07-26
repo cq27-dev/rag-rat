@@ -825,7 +825,7 @@ fn rebuild_restores_durable_wal_after_bulk_build() {
     // The index is intact and queryable after the bulk build.
     assert!(!db.symbols("alpha", Some(Language::Rust), 10).unwrap().is_empty());
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

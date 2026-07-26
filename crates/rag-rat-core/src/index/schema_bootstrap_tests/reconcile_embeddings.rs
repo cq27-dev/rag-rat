@@ -16,7 +16,7 @@ fn indexing_skips_symlink_loops() {
 
     assert_eq!(db.symbols("loop_safe_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn dirty_git_files_are_indexed_as_worktree_overlay() {
     assert_eq!(overlay_hits.len(), 1);
     assert!(overlay_hits[0].summary.contains("overlay token"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn rebuild_populates_revision_metadata_and_fresh_fts_state() {
     assert_eq!(indexed_revision_count(&db), 1);
     assert_eq!(chunk_source_revision_count(&db), 1);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[cfg(not(feature = "fastembed"))]
@@ -135,7 +135,7 @@ fn fastembed_missing_feature_reports_rebuild_command() {
     );
     assert_eq!(status.fastembed.next.as_deref(), Some("cargo install rag-rat"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     let stale_embedding_hits = db.search("alpha", 10, false).unwrap();
     assert_eq!(stale_embedding_hits.len(), 1);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -271,7 +271,7 @@ fn reconcile_confirms_a_provisional_model_against_a_config_change() {
         "a reconcile-confirmed model is not switched by a config change"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -299,7 +299,7 @@ fn an_incremental_pass_heals_a_missing_active_model_atomically() {
         "the incremental pass healed the active model and committed it"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[cfg(feature = "fastembed")]
@@ -340,7 +340,7 @@ fn cached_fastembed_model_recovers_ready_state() {
         "recovery stamps the recovered model's version (R3b)",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[cfg(feature = "fastembed")]
@@ -371,7 +371,7 @@ fn compatible_migrate_recovers_cached_fastembed_model() {
     assert_eq!(status.fastembed.status, "Ready");
     assert!(status.fastembed.active);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -393,7 +393,7 @@ fn reconcile_without_limit_processes_all_chunks() {
     let second = db.reconcile(None, Some(2)).unwrap();
     assert_eq!(second.processed_chunks, 0);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -416,7 +416,7 @@ fn force_reconcile_processes_each_chunk_once_and_terminates() {
     assert_eq!(report.embeddings_written, 2, "force re-embedded chunks: {report:?}");
     assert_eq!(report.processed_chunks, 2, "force re-processed chunks: {report:?}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -463,7 +463,7 @@ fn force_reconcile_progress_is_honest_and_terminates_without_limit() {
         }
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -487,7 +487,7 @@ fn status_counts_only_active_context_chunks() {
     assert_eq!(scoped.total_chunks, 0, "status ignored active context scope");
     assert_eq!(scoped.current, 0);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -508,7 +508,7 @@ fn watch_maintenance_pass_indexes_new_files() {
     let hits = db.symbols("newly_added_symbol", Some(Language::Rust), 10).unwrap();
     assert!(!hits.is_empty(), "watcher pass did not index the new file");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -535,7 +535,7 @@ fn watch_maintenance_pass_defers_a_first_time_empty_config() {
     let hits = db.symbols("appeared", Some(Language::Rust), 10).unwrap();
     assert!(!hits.is_empty(), "a pass after content appears must register + index it");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -592,7 +592,7 @@ fn discover_deletion_is_worktree_scoped() {
     // Post-condition: a worktree-scoped discover-deletion must not delete a sibling repo's rows
     // (round-6 harness) — the same "delete only my scope" invariant, widened to the repo axis.
     crate::index::poison_sibling::assert_sibling_intact(conn);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -640,7 +640,7 @@ fn gc_prunes_dead_context_rows_and_keeps_live_ones() {
         "live chunks were pruned",
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -658,7 +658,7 @@ fn gc_refuses_to_prune_with_no_live_context() {
 
     // Post-condition: the refused prune must leave the poison sibling untouched (round-6 harness).
     crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -695,7 +695,7 @@ int main(void)
     let report = db.reconcile(None, Some(8)).unwrap();
     assert!(report.embeddings_written > 0, "report: {report:?}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -713,7 +713,7 @@ fn reconcile_policy_skips_tiny_chunks_before_embedding() {
     assert_eq!(report.skipped_by_policy.get("SkipTooSmall"), Some(&1));
     assert_eq!(db.current_embedding_count(HASH_MODEL_ID).unwrap(), 0);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -796,7 +796,7 @@ fn policy_skip_summary_recomputes_exactly_for_a_non_default_char_cap() {
         small_cap_run.skipped_by_policy
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -845,7 +845,7 @@ fn policy_skip_summary_buckets_ineligible_chunks_across_categories() {
     // Rust is a supported embedding language.
     assert_eq!(skipped.get("SkipLanguageUnsupported"), None, "summary: {skipped:?}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -877,7 +877,7 @@ fn reconcile_plan_reports_policy_skips_for_fastembed_model() {
     assert_eq!(plan.embeddings.missing, 0);
     assert_eq!(plan.embeddings.skipped_by_policy.get("SkipTooSmall"), Some(&1));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[cfg(not(feature = "fastembed"))]
@@ -900,7 +900,7 @@ fn blocked_fastembed_reconcile_still_reports_policy_skips() {
     assert_eq!(report.status, "Blocked");
     assert_eq!(report.skipped_by_policy.get("SkipTooSmall"), Some(&1));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -936,7 +936,7 @@ fn search_explain_reports_weighted_score_components() {
     assert!(components.papertrail <= 0.02);
     assert!(db.search("runtime shutdown", 10, false).unwrap()[0].score_components.is_none());
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -958,7 +958,7 @@ fn search_explain_labels_missing_vector_runtime() {
         Some("vector search unavailable: no current embedding model")
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1065,7 +1065,7 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
     let cached = db.git_blame_chunk(chunk_id).unwrap().unwrap();
     assert_eq!(cached.source_text_hash, blame.source_text_hash);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1084,7 +1084,7 @@ fn git_history_reload_is_skipped_when_head_is_unchanged() {
     // Real history is left intact (the 2 real commits are untouched by the skip).
     assert_eq!(db.status(&config.database).unwrap().git_history.commit_count, 2);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1215,7 +1215,7 @@ fn skip_summary_shared_parse_matches_per_chunk_text() {
          {span:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1280,7 +1280,7 @@ fn skip_summary_fast_path_reads_certified_column_and_falls_back_when_stale() {
          {fast:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1352,7 +1352,7 @@ fn reconcile_self_heals_stale_policy_column_and_restamps() {
         "after self-heal the summary reads the certified column (fast path): {after:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1399,7 +1399,7 @@ fn self_heal_does_not_certify_a_repo_with_another_live_scope() {
         "self-heal must NOT certify a repo whose active scope is not its whole live set"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1487,7 +1487,7 @@ fn reconcile_heals_an_op_log_ghost_in_an_idle_repo() {
         "the reconcile pass authored the idle-repo ghost into the signed log"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1523,7 +1523,7 @@ fn candidate_count_stream_is_unordered_and_sorts_only_under_a_limit() {
         "a LIMITed walk keeps the need-first order — it decides which rows are counted:\n{limited}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1578,7 +1578,7 @@ fn count_paths_fetch_text_only_for_rows_that_reach_a_text_gate() {
         "a metadata-fresh chunk still fetches text for the input-hash clause"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #821 digest parity: `sync_fts` computes ONE `main.files` digest and stamps BOTH freshness
@@ -1608,5 +1608,5 @@ fn sync_fts_threaded_digest_matches_the_recomputing_form_byte_for_byte() {
         "the value-threaded stamp is byte-identical to a recompute over the same table state"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

@@ -50,7 +50,7 @@ fn clones_for_symbol_reports_eligibility() {
     let class = clone.class.expect("load_user is in a clone class");
     assert_eq!(class.member_count, 2, "the clone class has both rename-clones");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #274 item 3a: `clones_for_symbol` reports a RICHER eligibility reason than the bare
@@ -239,5 +239,5 @@ fn clones_for_symbol_distinguishes_ineligibility_reasons() {
     }
     assert_eq!(crate::index::CloneIneligibilityReason::from_db_str("bogus"), None);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

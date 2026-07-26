@@ -31,7 +31,7 @@ fn orientation_composes_through_read_only_connection() {
     assert!(!o.tree.nodes.is_empty(), "tree.nodes empty through read-only conn");
     assert_eq!(o.total_files, 6, "total_files mismatch through read-only conn");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #87: a full rebuild must be authoritative for the whole checkout. A stale overlay row shadows
@@ -71,7 +71,7 @@ fn full_rebuild_survives_stale_overlay_rows() {
     assert_eq!(rows.len(), 1, "exactly one row per path after an authoritative rebuild: {rows:?}");
     assert_eq!(rows[0], (commit, String::new()), "the clean tree indexes at the commit scope");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #59: a FOREIGN file row — a path the real tree never produces — leaked into the index at the
@@ -117,7 +117,7 @@ fn full_rebuild_clears_foreign_leaked_rows_at_the_active_scope() {
         .unwrap();
     assert_eq!(leaked, 0, "the authoritative full rebuild clears foreign rows at the active scope");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #1 / #106: in a REAL git checkout the active context is `(commit_sha=HEAD, worktree_id=<root
@@ -228,7 +228,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
          symbol"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #87 (self-heal half): an incremental pass drops a stale overlay row whose path is clean.
@@ -293,7 +293,7 @@ fn incremental_pass_heals_stale_overlay_rows() {
         "re-stamp is in place — the row id (and ids hanging off it) survive"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #459 review: if the watcher indexes a dirty file and that file is then committed, a changed-mode
@@ -358,7 +358,7 @@ fn changed_pass_after_dirty_commit_restamps_unchanged_files() {
         .unwrap();
     assert_eq!(overlays, 0, "the stale dirty overlay row is healed after the commit");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// The dirty-commit fallback must still discover/restamp the clean tree when another target file
@@ -422,7 +422,7 @@ fn changed_pass_after_dirty_commit_restamps_with_another_dirty_target() {
          overlay"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Phase 3: the LOCAL structural-load enrichment (`scoped weighted fan-in`) rides along on BOTH the
@@ -512,7 +512,7 @@ pub fn caller_three() -> i32 { load_bearing_hub() }
         assert_eq!(importance.label, "local structural load", "search hit labeled correctly");
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Phase 3 regression: a CALLEE neighbor whose call was written with a `::` path carries a
@@ -592,7 +592,7 @@ pub fn qualified_caller_two() -> i32 { crate::helper::deep_helper() }
     assert_eq!(importance.signal, "scoped weighted fan-in");
     assert!(importance.score > 0.0, "two callers give the callee positive fan-in");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -635,7 +635,7 @@ fn read_only_open_serves_current_index_and_declines_when_heal_is_owed() {
         "a stale graph index owes a heal write → the read-only path must decline"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -709,7 +709,7 @@ fn impact_report_flags_a_section_truncated_at_limit() {
         full.completeness_and_caveats.truncated_sections
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -748,7 +748,7 @@ fn symbol_lookup_heals_stale_line_numbers_after_an_edit() {
         after.candidates[0].start_byte
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -798,7 +798,7 @@ fn symbol_lookup_heals_a_just_added_symbol_without_waiting_for_the_watcher() {
         "a genuine miss must stay empty"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -828,7 +828,7 @@ fn impact_completeness_flags_dirty_result_files() {
         dirty.completeness_and_caveats
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -867,7 +867,7 @@ fn symbol_lookup_does_not_resurrect_a_deleted_symbol_after_heal() {
         after.candidates
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -898,7 +898,7 @@ fn symbol_lookup_by_id_keeps_pre_heal_candidate_flagged_stale() {
     assert!(!res.candidates.is_empty(), "symbol_id selector keeps the pre-heal candidate");
     assert!(!res.stale_files.is_empty(), "and flags the file stale: {:?}", res.stale_files);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -938,7 +938,7 @@ fn impact_completeness_flags_a_dirty_callee_definition_file() {
         dirty.completeness_and_caveats
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

@@ -50,7 +50,7 @@ fn stale_generated_flags_are_rederived_on_open() {
         after.candidates.iter().map(|c| &c.path).collect::<Vec<_>>()
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn search_and_read_chunk_attach_bounded_graph_evidence() {
     );
     assert!(full_graph.notes.iter().any(|note| note.contains("tree-sitter/syntactic")));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -199,7 +199,7 @@ fn graph_exact_mode_requires_verified_symbol_identity() {
     );
     assert!(exact_callees.iter().all(|edge| edge.verified_target_symbol));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -230,7 +230,7 @@ pub struct Database;
         "impl Database should still be available after the struct: {hits:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -295,7 +295,7 @@ impl B {
         .collect();
     assert_eq!(reindexed_ids, logical_ids, "logical ids must be stable across reindex");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -418,7 +418,7 @@ pub fn caller() {
         "a handle in the ref slot is not ambiguous: {by_ref_handle:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -459,7 +459,7 @@ fn indexes_real_world_rust_graph_patterns() {
         "serve callers: {callers:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -502,7 +502,7 @@ export const callRun = () => run();
         "callRun callees: {callees:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -721,7 +721,7 @@ struct Runner: Worker<Service> {
         assert_eq!(&source[start as usize..end as usize], callee);
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -753,7 +753,7 @@ int runtime_open(Runtime *runtime) {
 
     assert_edge(&db, "runtime_open", "helper", "calls_name", "Syntactic");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -817,7 +817,7 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
         "DEVICE_API hits: {hits:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -848,7 +848,7 @@ void Runtime::open() {
 
     assert_edge(&db, "open", "helper", "calls_name", "Syntactic");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -883,7 +883,7 @@ fn indexes_real_world_typescript_graph_patterns() {
         "Shell callees: {callees:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -936,7 +936,7 @@ fn execute_one() {
     assert_eq!(edge.4, "unresolved");
     assert!(edge.5.as_deref().is_some_and(|value| value.contains("format!")));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1008,7 +1008,7 @@ fn execute_one() {
     assert_eq!(edge.3, "unresolved");
     assert!(edge.4.as_deref().is_some_and(|value| value.contains("format!")));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1065,7 +1065,7 @@ pub fn caller() {
     assert_eq!(edge.3, "NameOnly");
     assert_eq!(edge.4, "unresolved");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1124,7 +1124,7 @@ fn rust_entry() {
     assert_eq!(edge.4, "unresolved");
     assert!(edge.5.as_deref().is_some_and(|value| value.contains("json!")));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1169,7 +1169,7 @@ pub fn second() {
         "spawn_blocking callers: {callers:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1266,7 +1266,7 @@ pub fn related_spawn_with_text() {
         "qualified caller lookup leaked related names or chain evidence: {qualified_callers:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1316,7 +1316,7 @@ pub fn caller() {{
         "impact: {impact:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1378,7 +1378,7 @@ pub fn caller() {
         "type references should not appear as direct impact: {impact:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1432,7 +1432,7 @@ pub fn hub() {
         "an uncapped result must NOT carry a sentinel: {full:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1465,7 +1465,7 @@ fn impact_surface_flat_signals_truncation_from_a_capped_textual_fallback() {
     let real_items = impact.iter().filter(|item| item.category != "completeness").count();
     assert_eq!(real_items, limit as usize, "exactly `limit` real items, plus the sentinel");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1529,7 +1529,7 @@ fn impact_surface_collapses_file_matches_to_one_row_per_file() {
         .count();
     assert_eq!(store_rows, 1, "a file with four symbols collapses to one fallback row");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1608,7 +1608,7 @@ where
         "path-local task_spawn docs should outrank unrelated phrase docs: {hits:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1636,7 +1636,7 @@ fn broken( {
     assert!(symbols.iter().any(|symbol| symbol.name == "caller"), "caller symbols: {symbols:?}");
     assert_edge(&db, "caller", "helper", "calls_name", "Syntactic");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1692,7 +1692,7 @@ pub struct JoinSet;
     assert_eq!(edge.4, "unresolved");
     assert_eq!(edge.5.as_deref(), Some("joinset"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1781,7 +1781,7 @@ where
         "unresolved-enabled callees: {with_unresolved:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1841,7 +1841,7 @@ pub fn caller(input: Result<String, String>) -> String {
         "common-method-enabled callees: {expanded:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1883,7 +1883,7 @@ fun helper() {}
         "impact: {impact:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1915,7 +1915,7 @@ fn indexes_real_world_kotlin_graph_patterns() {
         "cleaned callers: {callers:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1981,7 +1981,7 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
         "unrelated builder calls should not resolve to WatchProposalBuilder.build: {callers:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -2048,5 +2048,5 @@ fn papertrail_sync_caches_rationale_without_query_time_crawling() {
         matches!(item.evidence_kind, "historical_tracker" | "literal_tracker_ref")
     }));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

@@ -35,7 +35,7 @@ fn configless_discovery_keeps_self_contained_github_refs_from_files_and_commits(
         }));
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
         .unwrap();
     assert_eq!(gitlab_cached, 0, "manual GitHub sync must not dispatch the same-key GitLab ref");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn rationale_lookup_keeps_self_contained_github_refs_without_a_binding() {
         evidence.iter().any(|item| item.project == "cq27-dev/rag-rat" && item.item_key == "42")
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn production_discovery_persists_refs_for_every_configured_tracker() {
             && reference.item_key == "PROJ-42"
     }));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -277,7 +277,7 @@ fn papertrail_for_commit_prefers_commit_sourced_tracker_refs() {
         "structured commit refs should suppress noisy fallback evidence: {papertrail:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -310,7 +310,7 @@ fn papertrail_for_symbol_dedupes_duplicate_file_refs() {
         "duplicate #42 refs in one file should collapse to one item evidence row: {papertrail:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -346,7 +346,7 @@ fn papertrail_sync_keeps_the_synced_item_and_retries_a_404_ref() {
     assert_eq!(second.skipped_refs, 1);
     assert_eq!(second.failed_refs, 1);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -366,7 +366,7 @@ fn search_recovers_when_fts_is_marked_dirty() {
     assert!(!fresh.fts_dirty);
     assert!(fresh.fts_fresh);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -381,7 +381,7 @@ fn read_chunk_relocates_small_line_drift_to_current_text() {
     assert_eq!(chunk.end_line, 3);
     assert_eq!(chunk.text, "# Title\nalpha token\n");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn read_chunk_large_drift_reindexes_and_reports_stale_chunk() {
     assert_eq!(hits.len(), 1);
     assert!(db.search("alpha", 10, false).unwrap().is_empty());
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -412,7 +412,7 @@ fn search_retries_after_healing_stale_hit() {
     assert_eq!(beta_hits.len(), 1);
     assert!(beta_hits[0].summary.contains("beta"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -427,7 +427,7 @@ fn search_heals_relocated_hits_before_returning_line_spans() {
     assert_eq!(hits[0].end_line, 3);
     assert!(hits[0].summary.contains("alpha"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -441,7 +441,7 @@ fn read_chunk_deleted_source_reports_gone() {
     assert!(err.contains("Gone"), "{err}");
     assert!(db.search("alpha", 10, false).unwrap().is_empty());
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -462,7 +462,7 @@ fn search_returns_needs_reindex_when_heal_cap_is_exceeded() {
     let err = db.search("common", 20, false).unwrap_err().to_string();
     assert!(err.contains("needs_reindex"), "{err}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -489,7 +489,7 @@ fn search_drops_deleted_file_instead_of_erroring() {
     assert!(hits.iter().all(|hit| !hit.path.ends_with("drop.md")), "{hits:?}");
     assert!(hits.iter().any(|hit| hit.path.ends_with("keep.md")), "{hits:?}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -510,7 +510,7 @@ fn heal_index_limit_does_not_warn_when_only_fresh_files_are_skipped() {
     assert_eq!(report.skipped_files, 2);
     assert_eq!(report.message, None);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -531,7 +531,7 @@ fn search_recovers_when_fts_revision_is_stale() {
     assert_eq!(fresh.fts_source_revision.as_deref(), Some(fresh.content_revision.as_str()));
     assert!(fresh.fts_fresh);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -573,7 +573,7 @@ fn parser_failures_report_paths() {
     assert_eq!(status.parser_failures, 1);
     assert_eq!(status.parser_failure_paths[0].path, "src/broken.rs");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 // --- V060: provider-neutral papertrail schema ---
@@ -1072,7 +1072,7 @@ fn papertrail_sync_retries_a_failed_ref_instead_of_caching_a_partial_item() {
     assert_eq!(third.skipped_refs, 1);
     assert_eq!(third.synced_items, 0);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1103,7 +1103,7 @@ fn papertrail_sync_rolls_back_the_item_when_a_comment_store_fails() {
     assert_eq!(retried.status.change_requests, 1);
     assert_eq!(retried.status.comments, 4);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

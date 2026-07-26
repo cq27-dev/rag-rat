@@ -19,7 +19,7 @@ use super::*;
 
 /// Index the corpus. SwiftPM puts first-party code under `Sources/` and its test targets under
 /// `Tests/`; both are bound so the fixture exercises test detection as well as source extraction.
-fn corpus() -> (PathBuf, IndexDatabase) {
+fn corpus() -> (ScratchRoot, IndexDatabase) {
     let root = fixture_temp_root("swift-corpus");
     let config = source_config_dirs(root.clone(), Language::Swift, &["Sources", "Tests"]);
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -119,7 +119,7 @@ fn swift_corpus_extracts_declarations_and_containment() {
         ("function".into(), "Store::load".into()),
     ]);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Test-target symbols are marked `is_test` and production symbols in the same index are not — the
@@ -149,7 +149,7 @@ fn swift_corpus_marks_test_target_symbols_and_leaves_production_alone() {
     assert!(!is_test_symbol(&db, "Renderer"));
     assert!(!is_test_symbol(&db, "mapped"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// What the baseline resolves, and — the load-bearing half — what it refuses to.
@@ -196,7 +196,7 @@ fn swift_corpus_pins_the_resolution_baseline_for_the_oracle() {
         "an overloaded call cannot be resolved by name: {fetches:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// The call on the right of a binary operator reaches the graph at all.
@@ -216,7 +216,7 @@ fn swift_corpus_keeps_calls_on_the_right_of_an_operator() {
     // The method call at the end of a `+` chain, through a receiver.
     assert_eq!(call_states(&db, "described", "describe").len(), 1);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// UTF-16 ↔ byte position conversion over real non-ASCII source — the semantic-readiness check for
@@ -268,7 +268,7 @@ fn swift_corpus_converts_utf16_positions_over_non_ascii_source() {
         }
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Coverage floors. Deliberately floors, not exact counts: they catch a broken parse or a collapsed
@@ -300,7 +300,7 @@ fn swift_corpus_meets_its_coverage_floors() {
     );
     assert_eq!(symbolless, 0, "every indexed Swift file must parse into symbols");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// The corpus is a REAL package, so it must actually build — the SourceKit-LSP oracle (#637)
@@ -349,5 +349,5 @@ fn swift_corpus_builds_with_swiftpm() {
         String::from_utf8_lossy(&build.stderr)
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

@@ -31,7 +31,7 @@ fn with_global_store(allow_migrate: bool, body: impl FnOnce(&Path)) {
     let saved_allow = std::env::var_os("RAG_RAT_ALLOW_MIGRATE");
     // SAFETY: env access is serialized by ENV_LOCK for the duration of this call.
     unsafe {
-        std::env::set_var("RAG_RAT_DATA_DIR", &data_dir);
+        std::env::set_var("RAG_RAT_DATA_DIR", data_dir.as_os_str());
         if allow_migrate {
             std::env::set_var("RAG_RAT_ALLOW_MIGRATE", "1");
         } else {

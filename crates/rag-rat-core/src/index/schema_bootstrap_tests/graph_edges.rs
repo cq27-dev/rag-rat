@@ -64,7 +64,7 @@ fn driver() {
     let contains = callee_byte_range(&db, "Obj", "method", "contains");
     assert_eq!(contains, None, "contains edges must have a NULL callee range");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn imports_edge_has_null_callee_byte_range() {
     let import = callee_byte_range(&db, "src/lib.rs", "worker", "imports");
     assert_eq!(import, None, "imports edges must have a NULL callee range");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -116,7 +116,7 @@ int runtime_open(Runtime *runtime) {
     let (start, end) = (start as usize, end as usize);
     assert_eq!(&source[start..end], "helper", "C callee range must span exactly `helper`");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -198,7 +198,7 @@ pub fn exported_fn() {}
         "comment-only UniFFI mentions must not create FFI surface rows: {surface:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -226,7 +226,7 @@ fn find_callers_sees_calls_in_let_bindings() {
     assert!(has("via_let"), "missing `let x = target()` caller; got {names:?}");
     assert!(has("via_let_else"), "missing `let-else` caller; got {names:?}");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// #827: an incremental content-changed pass narrows the edge re-resolve to the changed files plus
@@ -299,5 +299,5 @@ fn scoped_incremental_pass_preserves_find_callers_both_directions() {
         caller_names(&db, "b_helper"),
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

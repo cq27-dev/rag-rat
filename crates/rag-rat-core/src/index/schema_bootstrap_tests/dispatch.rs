@@ -81,7 +81,7 @@ pub fn upsert_journal_embedding(_id: i64) {}
         "an arm side-effect call must not become a dispatch target: {log_callers:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -138,7 +138,7 @@ pub fn upsert(_id: i64) {}
     // visibility predicate the view enforces.
     crate::index::edges::assert_hidden_agrees_with_visibility(conn);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -205,7 +205,7 @@ pub fn run_stop() {}
         "a guard/predicate call must not become a dispatch handler"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -270,7 +270,7 @@ pub fn banana_handler() {}
         "Self::Variant must not cross-link distinct enums: apple={apple:?} banana={banana:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -321,7 +321,7 @@ pub fn deliver() {}
     // External/aliased head (`Status` has no local enum definition) is admitted.
     assert!(dispatch_from("deliver", "emit"), "external enum-head dispatch missing");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -381,7 +381,7 @@ fn embed_text(_text: String) -> Result<i32, ()> { Ok(0) }
         "a wrapper constructor must not be a dispatch handler"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -459,7 +459,7 @@ fn run_setup() -> Result<Resp, ()> { Ok(Resp::Blank) }
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -536,7 +536,7 @@ fn start_span() {}
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -638,7 +638,7 @@ fn finish_response() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -723,7 +723,7 @@ fn finish_b() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -837,7 +837,7 @@ fn start_span() -> u8 { 0 }
         "const-generic call must resolve to the callee name"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -920,7 +920,7 @@ fn e() -> E { E::Ready(0) }
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1007,7 +1007,7 @@ fn finish_c() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1122,7 +1122,7 @@ fn build_deref() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1194,7 +1194,7 @@ fn handler_c() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1287,7 +1287,7 @@ fn finish_fp() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1351,7 +1351,7 @@ fn make_worker() -> W { W }
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1401,7 +1401,7 @@ pub fn run() {}
         "a nested-payload variant must not be treated as the handled variant: {senders:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1455,7 +1455,7 @@ pub mod b {
         );
     }
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1518,5 +1518,5 @@ fn symbol_search_excludes_generated_bindings_unless_opted_in() {
     assert_eq!(id_hits.candidates.len(), 1, "explicit id must resolve the generated symbol");
     assert!(id_hits.candidates[0].path.contains("/generated/"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

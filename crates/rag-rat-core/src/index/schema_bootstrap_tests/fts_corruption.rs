@@ -278,8 +278,12 @@ fn commit_fts_heals_even_while_chunk_staging_exists() {
     fs::write(root.join("src/lib.rs"), "pub fn staged_commit_witness() {}\n").unwrap();
     // commit_fts indexes git history — the corruption probe needs a non-empty mirror.
     let git = |args: &[&str]| {
-        let out =
-            std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root.as_os_str())
+            .args(args)
+            .output()
+            .unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
     git(&["init", "-q"]);

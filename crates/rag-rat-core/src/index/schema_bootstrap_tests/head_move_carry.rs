@@ -10,7 +10,7 @@ use super::*;
 
 /// A repo with two committed rust files, returning `(root, config)`. `keep.rs` stays unchanged
 /// across every HEAD move in these tests; `edit.rs` is the file the moves modify.
-fn head_move_repo(tag: &str) -> (PathBuf, Config) {
+fn head_move_repo(tag: &str) -> (ScratchRoot, Config) {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -112,7 +112,7 @@ fn scope_row_modified_at_ms_reads_the_scoped_disk_mtime() {
         "a different path is a different scope key"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn a_head_move_carries_unchanged_rows_and_rederives_only_the_diff() {
 
     // A carried pass must never touch a sibling repo's rows (round-6 harness).
     crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn a_branch_switch_back_carries_everything_with_no_rederive() {
     let keep_rows = committed_rows(&db, "src/keep.rs");
     assert_eq!(keep_rows.len(), 1);
     assert_eq!(keep_rows[0].1, main_head);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -266,7 +266,7 @@ fn carry_requires_matching_language_and_kind() {
         .query_row("SELECT language FROM files WHERE path = 'src/new.rs'", [], |row| row.get(0))
         .unwrap();
     assert_eq!(language, "rust");
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -311,7 +311,7 @@ fn dirty_paths_keep_their_overlay_and_are_not_carried() {
     let committed = committed_rows(&db, "src/keep.rs");
     assert_eq!(committed.len(), 1, "no duplicate committed row is derived for a dirty path");
     assert_eq!(committed[0].1, old_head, "the shadowed committed row is left in place");
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -359,7 +359,7 @@ fn a_pull_after_a_branch_round_trip_still_carries_despite_stale_higher_id_rows()
         Some(keep_id),
         "the genuinely changed file is re-derived"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -387,7 +387,7 @@ fn discovery_status_surfaces_a_pending_carry_instead_of_reporting_clean() {
     let status = db.discovery_status(&config).unwrap();
     assert_eq!(status.carryable_files, 0, "the applied carry clears the pending count");
     assert_eq!(status.warning, None, "a carried-and-derived scope is clean");
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -429,7 +429,7 @@ fn an_untracked_recreation_of_old_content_is_not_carried_into_the_committed_scop
         new_head,
         "the genuinely committed unchanged file is still carried"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -471,7 +471,7 @@ fn a_dirty_revert_to_old_content_is_not_carried_into_the_committed_scope() {
         hex_sha256(&old_bytes),
         "the reverted bytes are served from this worktree's overlay"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -527,7 +527,7 @@ fn a_carried_callers_edge_reresolves_to_the_rederived_callee() {
         Some(fresh_target),
         "the carried caller's edge re-resolves to the re-derived callee symbol"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -570,5 +570,5 @@ fn a_carry_only_pass_still_refreshes_package_roots() {
         package_rows.iter().any(|(_, sha)| sha == &new_head),
         "package roots follow the carried scope to the new HEAD {new_head}: {package_rows:?}"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

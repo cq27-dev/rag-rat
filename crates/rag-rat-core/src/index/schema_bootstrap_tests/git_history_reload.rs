@@ -33,7 +33,7 @@ fn git_history_appends_after_a_new_commit() {
     assert_eq!(db.commit_search("gamma", 10).unwrap().len(), 1, "new commit is indexed");
     assert_eq!(db.commit_search("beta", 10).unwrap().len(), 1, "old commit FTS rows remain live");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn git_history_append_rebuilds_desynced_commit_fts() {
         "fast-forward append rebuilds commit_fts and repairs pre-existing desync"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn git_history_falls_back_when_append_rows_are_already_present() {
     assert_eq!(sentinel_commit_count(&db), 0, "a torn append state must force full replacement");
     assert_eq!(db.commit_search("torn", 10).unwrap().len(), 1, "commit FTS is rebuilt");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -150,9 +150,9 @@ fn git_history_append_plan_falls_back_for_non_git_or_other_root() {
     let other_head = git_output(&other, &["rev-parse", "HEAD"]);
     assert_eq!(status.indexed_head.as_deref(), Some(other_head.as_str()));
 
-    let _ = fs::remove_dir_all(root);
-    let _ = fs::remove_dir_all(non_git);
-    let _ = fs::remove_dir_all(other);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&non_git);
+    let _ = fs::remove_dir_all(&other);
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn git_history_prepare_plan_fails_closed_on_incomplete_or_shallow_cursors() {
             "corrupt cursor metadata must fail closed to a full reload plan"
         );
         drop(db);
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
@@ -312,7 +312,7 @@ fn incomplete_git_history_cursor_forces_full_reload_before_fast_forward_append()
         "a complete full reload restores the append-safe cursor marker"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -345,7 +345,7 @@ fn stale_prepared_append_is_noop_after_another_pass_catches_up() {
     assert_eq!(status.indexed_head.as_deref(), Some(new_head.as_str()));
     assert_eq!(sentinel_commit_count(&db), 1, "stale prepared append must not rewrite rows");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -383,7 +383,7 @@ fn stale_prepared_append_clears_when_root_loses_git_dir() {
     assert!(!status.available, "status reports the lost git repository");
     assert_eq!(status.commit_count, 0, "the stale git-history rows were cleared");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -429,7 +429,7 @@ fn stale_prepared_append_is_noop_when_db_cursor_is_ahead() {
     assert_eq!(db.commit_search("middle", 10).unwrap().len(), 1);
     assert_eq!(db.commit_search("newer", 10).unwrap().len(), 1);
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -485,7 +485,7 @@ fn git_history_append_records_new_head_for_out_of_scope_fast_forward_commit() {
         "empty append still rebuilds commit_fts and repairs pre-existing desync"
     );
 
-    let _ = fs::remove_dir_all(worktree);
+    let _ = fs::remove_dir_all(&worktree);
 }
 
 #[test]
@@ -512,7 +512,7 @@ fn git_history_append_reports_commit_fts_prepare_errors() {
     .expect_err("missing commit_fts must surface an append failure");
     assert!(err.to_string().contains("commit_fts"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -525,7 +525,7 @@ fn repo_generation_file_count_reports_sql_errors() {
     let err = db.repo_generation_file_count(true).expect_err("missing files table must error");
     assert!(err.to_string().contains("files"));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -586,7 +586,7 @@ fn repo_generation_file_count_ignores_foreign_worktree_overlays() {
         "active tombstones shadow committed rows and should not inflate the expected scope count"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -631,7 +631,7 @@ fn discovered_empty_active_commit_does_not_promote_changed_mode() {
         "after an empty active scope is discover-checked, changed-mode must not promote forever"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -686,7 +686,7 @@ fn changed_mode_discovers_when_target_fingerprint_is_stale() {
     );
     assert!(db.active_base_scope_discovered(&expanded_config.targets).unwrap());
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -707,7 +707,7 @@ fn base_scope_marker_is_absent_without_commit_or_worktree_scope() {
         "an unscoped connection has no stable marker to write"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -730,7 +730,7 @@ fn watch_shutdown_marker_clear_is_idempotent() {
         "a second clear remains write-free"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -764,7 +764,7 @@ fn git_history_appends_after_a_merge_commit() {
         "topic commit must be searchable after merge append"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -799,7 +799,7 @@ fn git_history_appends_after_a_squash_commit() {
     assert_eq!(sentinel_commit_count(&db), 1, "a squash append must not wipe old rows");
     assert_eq!(db.commit_search("theta", 10).unwrap().len(), 1, "squash commit is indexed");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -824,7 +824,7 @@ fn git_history_reloads_after_a_history_rewrite() {
     assert_eq!(db.commit_search("delta", 10).unwrap().len(), 1, "rewritten subject is indexed");
     assert_eq!(db.commit_search("beta", 10).unwrap().len(), 0, "old subject is gone after rewrite");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -847,7 +847,7 @@ fn git_history_reloads_after_a_non_fast_forward_branch_switch() {
     assert_eq!(db.commit_search("branch", 10).unwrap().len(), 1, "new branch history is indexed");
     assert_eq!(db.commit_search("beta", 10).unwrap().len(), 0, "old branch history is gone");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -895,7 +895,7 @@ fn git_history_reloads_after_squashing_indexed_commits() {
         "old commit FTS row is gone"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -936,8 +936,8 @@ fn git_history_reload_is_not_skipped_on_a_shallow_clone() {
     let db = IndexDatabase::index_changed(&config).unwrap();
     assert_eq!(sentinel_commit_count(&db), 0, "a shallow clone must never skip the reload");
 
-    let _ = fs::remove_dir_all(origin);
-    let _ = fs::remove_dir_all(shallow);
+    let _ = fs::remove_dir_all(&origin);
+    let _ = fs::remove_dir_all(&shallow);
 }
 
 #[test]
@@ -981,7 +981,7 @@ fn idle_discover_sweep_does_not_rewrite_indexed_at_ms() {
         "a sweep that indexes a new file must update indexed_at_ms"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1003,7 +1003,7 @@ fn index_discover_reporting_flags_content_changes() {
         "a discover sweep that indexes a new file must report a content change"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1037,7 +1037,7 @@ fn discover_relanguages_h_when_binding_changes_c_to_cpp() {
         .unwrap();
     assert_eq!(lang, "cpp", "the .h must be reindexed as C++ after the binding change");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1085,7 +1085,7 @@ fn changed_mode_ignores_gitignored_target_files_under_root_target() {
     assert_eq!(before, after, "ignored target/ writes must not index new files");
     assert_eq!(target_rows, 0, "target/ artifacts must not enter the index");
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1135,5 +1135,5 @@ fn caller() {
         "helper callers: {callers:?}"
     );
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
 }

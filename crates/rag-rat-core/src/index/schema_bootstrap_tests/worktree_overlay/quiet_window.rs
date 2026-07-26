@@ -2,7 +2,7 @@ use super::*;
 
 /// One committed base repo + one linked worktree, the shared #822/#825 shape: `(main, linked,
 /// config, db)` with `src/a.rs` committed on both sides and every overlay basis unrecorded.
-fn quiet_window_fixture() -> (PathBuf, PathBuf, Config, IndexDatabase) {
+fn quiet_window_fixture() -> (ScratchRoot, ScratchRoot, Config, IndexDatabase) {
     let main = unique_temp_root();
     let _ = fs::remove_dir_all(&main);
     fs::create_dir_all(main.join("src")).unwrap();
