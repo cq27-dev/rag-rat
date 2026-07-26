@@ -308,11 +308,13 @@ fn live_pass_aborts_best_effort_when_the_server_dies_mid_pass() {
     });
     let mut session = LiveOracleSession::from_client(client, LIVE_VERSION, &uri);
     let worklist = vec!["src.rs".to_string()];
-
     // Never an `Err` — the maintenance pass must survive a dead server (#535 hardens further).
     let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
     assert!(report.status.starts_with("Aborted:"), "{}", report.status);
     assert_eq!(report.rows_written, 0);
+    // The failed file is REQUEUED (not dropped): the watcher rides it into the next pass with a
+    // freshly spawned session.
+    assert_eq!(report.unfinished_paths, vec!["src.rs".to_string()]);
     assert_eq!(live_run_count(&h.conn), 0);
 }

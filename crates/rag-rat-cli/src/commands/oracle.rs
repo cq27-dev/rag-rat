@@ -232,6 +232,17 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
             profile.tool
         )
     })?;
+    // A live-only tool (`ra-lsp`) is driven by the watcher, never by a whole-checkout report:
+    // the `--scip` branch bypasses `produce_scip_with_tool`'s batch-capability gate, so reject
+    // here or a corpus declaring it would persist batch-shaped runs under the live identity and
+    // hide genuine session verdicts from the currency gate (#534 review).
+    anyhow::ensure!(
+        tool.batch_capable(),
+        "corpus `{}` names live-only oracle tool `{}` — it has no whole-checkout `.scip` to \
+         report over (live verdicts come from the watcher under `[oracle.live]`)",
+        profile.corpus_id,
+        profile.tool
+    );
 
     // Fail closed if the active checkout's target bindings don't match the corpus profile (Codex on
     // #175). The report stamps this profile's `corpus_profile_hash`, asserting "these numbers are

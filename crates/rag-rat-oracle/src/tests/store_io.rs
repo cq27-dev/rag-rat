@@ -502,3 +502,43 @@ fn current_callee_monikers_drops_verdicts_without_a_live_edge() {
         "a verdict with no live edge is dropped; the live-edge-backed one is returned"
     );
 }
+
+/// `edge_join_candidates_for_paths` (the live oracle's worklist read, #534) scopes candidates to
+/// the named paths AND survives a worklist larger than one `IN`-list chunk — an accumulated
+/// watcher backlog must never fail the prepare with a bound-variable overflow and wedge the
+/// backlog.
+#[test]
+fn edge_join_candidates_for_paths_scopes_and_chunks() {
+    let h = Harness::new();
+    let a = h.add_file("a.rs", "fn a() { t(); }\n");
+    let edge_a = h.add_edge(a, "t", 9, 10, "NameOnly", None);
+    let b = h.add_file("b.rs", "fn b() { t(); }\n");
+    h.add_edge(b, "t", 9, 10, "NameOnly", None);
+    // c.rs exists but is NOT in the worklist.
+    let c = h.add_file("c.rs", "fn c() { t(); }\n");
+    h.add_edge(c, "t", 9, 10, "NameOnly", None);
+
+    // Scoped: only the named paths come back.
+    let candidates = store::edge_join_candidates_for_paths(&h.conn, COMMIT, WORKTREE, &[
+        "a.rs".to_string(),
+        "b.rs".to_string(),
+    ])
+    .unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].edge_id, edge_a);
+    assert!(candidates.iter().all(|c| c.source_path != "c.rs"));
+
+    // Chunked: > 500 paths (499 fillers + the real one) crosses one chunk boundary and still
+    // resolves — the query is issued in bounded `IN` lists.
+    let mut big: Vec<String> = (0..600).map(|i| format!("src/filler-{i}.rs")).collect();
+    big.push("a.rs".to_string());
+    let candidates =
+        store::edge_join_candidates_for_paths(&h.conn, COMMIT, WORKTREE, &big).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].edge_id, edge_a);
+
+    // Empty worklist → no query, no candidates.
+    assert!(
+        store::edge_join_candidates_for_paths(&h.conn, COMMIT, WORKTREE, &[]).unwrap().is_empty()
+    );
+}

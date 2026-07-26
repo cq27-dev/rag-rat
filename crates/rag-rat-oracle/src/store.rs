@@ -333,9 +333,26 @@ pub(crate) fn edge_join_candidates(
 
 /// [`edge_join_candidates`] restricted to a set of source paths — the live oracle's per-pass
 /// worklist (#534): only the files the maintenance pass just reindexed. Same scope + ordering
-/// discipline as the whole-checkout variant. `paths` is caller-capped (the pass budget), so the
-/// `IN` list stays bounded.
+/// discipline as the whole-checkout variant. Paths are queried in bounded chunks (one `IN` list
+/// per chunk), so an accumulated backlog larger than SQLite's bound-variable limit can't fail
+/// the prepare and wedge the backlog forever.
 pub(crate) fn edge_join_candidates_for_paths(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+    paths: &[String],
+) -> anyhow::Result<Vec<EdgeJoinCandidate>> {
+    const PATH_CHUNK: usize = 500;
+    let mut out = Vec::new();
+    for chunk in paths.chunks(PATH_CHUNK) {
+        out.extend(edge_join_candidates_in_paths(conn, commit_sha, worktree_id, chunk)?);
+    }
+    // Chunks concatenate in worklist order; the per-chunk ORDER BY keeps candidates grouped by
+    // path, which is all the live pass's per-file grouping requires.
+    Ok(out)
+}
+
+fn edge_join_candidates_in_paths(
     conn: &Connection,
     commit_sha: &str,
     worktree_id: &str,

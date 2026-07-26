@@ -249,17 +249,24 @@ pub fn live_oracle_pass(
             continue;
         };
 
-        let uri = format!("{}/{}", session.root_uri, path);
+        let uri = format!("{}/{}", session.root_uri, encode_uri_path(path));
         let starts: Vec<usize> =
             callees.iter().filter_map(|c| usize::try_from(c.callee_start_byte).ok()).collect();
         report.requests_used += starts.len() as u64;
         let resolved = match session.client.resolve_definitions(&uri, "rust", &text, &starts) {
             Ok(resolved) => resolved,
             Err(err) => {
-                // A dead/wedged server: keep what earlier files produced, abort the rest, and
-                // let the watcher drop the session (a later pass respawns). Never fail the
-                // maintenance pass over it (#535 hardens this further).
+                // A dead/wedged server: keep what earlier files produced, REQUEUE this file and
+                // every candidate-bearing path after it (the watcher rides them into the next
+                // pass and replaces the session), and never fail the maintenance pass over it
+                // (#535 hardens this further).
                 aborted = Some(err.to_string());
+                report.unfinished_paths.extend(
+                    input.worklist[position..]
+                        .iter()
+                        .filter(|p| by_path.contains_key(p.as_str()))
+                        .cloned(),
+                );
                 break 'files;
             },
         };
@@ -378,6 +385,12 @@ pub fn live_oracle_pass(
             None if report.unfinished_paths.is_empty() => "Completed".to_string(),
             None => "BudgetExhausted".to_string(),
         };
+        if refinements_stale {
+            rag_rat_clones::refine::cache::invalidate_scip_refinements(conn)?;
+            report.refinements_invalidated = true;
+        }
+        // Serialize AFTER every report field is final (the invalidation flag above rides the
+        // same stats_json the status surface reads).
         store::record_oracle_run_at(
             conn,
             tool,
@@ -388,10 +401,6 @@ pub fn live_oracle_pass(
             &report.status,
             &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
         )?;
-        if refinements_stale {
-            rag_rat_clones::refine::cache::invalidate_scip_refinements(conn)?;
-            report.refinements_invalidated = true;
-        }
     } else {
         report.status = match &aborted {
             Some(err) => format!("Aborted: {err}"),
@@ -400,7 +409,9 @@ pub fn live_oracle_pass(
         };
     }
     tx.commit()?;
-    session.touch(input.started_at_ms);
+    // Stamp usage at COMPLETION, not the pass's start: a pass longer than the idle window must
+    // not read as idle on the next pass (that would force a needless respawn + warm-up).
+    session.touch(rag_rat_base::time::now_ms());
     Ok(report)
 }
 
@@ -479,6 +490,21 @@ mod tests {
             Some("src/a file.rs".to_string())
         );
         assert_eq!(path_from_uri(root, "file:///elsewhere/src/lib.rs"), None);
+    }
+
+    #[test]
+    fn document_uri_encodes_the_relative_path() {
+        // A repo path carrying URI-reserved bytes (`#`, `%`, spaces, non-ASCII) must be encoded
+        // BEFORE joining the root URI, or the server parses `b.rs` as a fragment and the opened
+        // document never associates with the indexed file (#534 review).
+        assert_eq!(encode_uri_path("src/a b#c%.rs"), "src/a%20b%23c%25.rs");
+        let root = root_uri_for(Path::new("/repo"));
+        let uri = format!("{}/{}", root, encode_uri_path("src/доки/a b.rs"));
+        assert_eq!(
+            path_from_uri(&root, &uri),
+            Some("src/доки/a b.rs".to_string()),
+            "encode → open → decode round-trips the reserved-byte path"
+        );
     }
 
     #[test]

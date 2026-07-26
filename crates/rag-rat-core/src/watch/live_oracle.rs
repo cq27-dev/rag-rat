@@ -86,6 +86,19 @@ impl LiveOracleTail {
         match db.run_live_oracle_pass(session, &worklist, live_cfg.max_requests_per_pass, now) {
             Ok(report) => {
                 self.backlog = report.unfinished_paths.clone();
+                // An aborted pass means the server died or wedged mid-resolution: drop the
+                // session so the next pass respawns a clean one instead of reusing a broken
+                // transport (the aborted files are already requeued in `unfinished_paths`).
+                if report.status.starts_with("Aborted:")
+                    && let Some(session) = self.session.take()
+                {
+                    tracing::warn!(
+                        target: "rag_rat_core::watch",
+                        status = %report.status,
+                        "live oracle: server aborted; session dropped, respawn on next pass"
+                    );
+                    session.shutdown();
+                }
                 if report.rows_written > 0 || !report.unfinished_paths.is_empty() {
                     tracing::info!(
                         target: "rag_rat_core::watch",
