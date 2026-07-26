@@ -397,6 +397,107 @@ fn live_pass_migrates_prior_verdicts_across_a_version_change() {
     assert_eq!(latest, "ra-test-2");
 }
 
+/// Two edges sharing ONE callee token (`calls_name` + `references_type`) must not starve each
+/// other: coverage is keyed by the FULL content key, so a budget split between them resumes the
+/// deferred edge instead of treating the shared start byte as covered (#534 review).
+#[test]
+fn live_pass_continuation_keys_coverage_by_the_full_edge_identity() {
+    let h = Harness::new();
+    let defs = h.add_file("defs.rs", DEFS_SRC);
+    h.add_symbol(defs, "target", 0, 13);
+    let src = h.add_file("src.rs", CALLER_SRC);
+    // Two edge kinds on the SAME token (14..20).
+    let call = h.add_edge(src, "target", 14, 20, "NameOnly", None);
+    let refty = h.add_edge_with_kind(src, "target", 14, 20, "references_type", "NameOnly", None);
+    let uri = root_uri(&h);
+    let def = def_uri(&h, "defs.rs");
+
+    // Pass 1, budget 1: ONE of the two edges resolves; the other is deferred.
+    let mut session = fake_session(&uri, Some((def.clone(), (0, 3), (0, 9))));
+    let worklist = vec!["src.rs".to_string()];
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 1)).unwrap();
+    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.unfinished_paths, vec!["src.rs".to_string()]);
+
+    // Pass 2: the deferred edge must NOT read as covered by the shared start byte — it resolves
+    // (one more request) and both verdicts persist.
+    let mut session = fake_session(&uri, Some((def.clone(), (0, 3), (0, 9))));
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 1)).unwrap();
+    assert_eq!(report.requests_used, 1);
+    assert_eq!(report.rows_written, 1);
+    assert!(report.unfinished_paths.is_empty());
+    assert!(h.verdict(call).is_some() || h.verdict(refty).is_some());
+    let both = h
+        .conn
+        .query_row("SELECT COUNT(*) FROM edge_oracle WHERE tool = 'ra-lsp'", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(both, 2, "both token-sharing edges have verdicts");
+}
+
+/// The version migration is SCOPED to the active checkout (#534 review): a sibling worktree's
+/// `ra-lsp` rows must not be relabeled — only the migrating checkout's currency advances.
+#[test]
+fn live_version_migration_leaves_a_sibling_checkouts_rows_alone() {
+    let h = Harness::new();
+    let (_src, _target, edge) = seed_corpus(&h);
+    // A sibling checkout with its own file + edge + ra-lsp verdict under the OLD version.
+    let sib_file = h.add_file_in_scope("sibling.rs", OTHER_COMMIT, OTHER_WORKTREE);
+    let sib_edge = h.add_edge(sib_file, "t", 9, 10, "NameOnly", None);
+    let sib_key = h.edge_content_key(sib_edge);
+    crate::store::write_edge_oracle(
+        &h.conn,
+        OracleTool::RaLsp,
+        "old-v",
+        &crate::store::EdgeOracleRow {
+            source_path: &sib_key.source_path,
+            source_start_byte: sib_key.source_start_byte,
+            source_end_byte: sib_key.source_end_byte,
+            callee_start_byte: sib_key.callee_start_byte,
+            callee_end_byte: sib_key.callee_end_byte,
+            edge_kind: &sib_key.edge_kind,
+            file_sha: "sib-sha",
+            resolved_symbol_id: None,
+            scip_symbol: "local ra-lsp-sib",
+            kind: OracleResolutionKind::Upgrade,
+        },
+    )
+    .unwrap();
+    // The active checkout's ra-lsp verdict under the OLD version (from a prior pass).
+    let uri = root_uri(&h);
+    let def = def_uri(&h, "defs.rs");
+    let worklist = vec!["src.rs".to_string()];
+    let mut session = fake_session(&uri, Some((def.clone(), (0, 3), (0, 9))));
+    live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+    // Relabel the active checkout's row to the old version too (both start at old-v).
+    h.conn
+        .execute("UPDATE edge_oracle SET tool_version = 'old-v' WHERE tool = 'ra-lsp'", [])
+        .unwrap();
+
+    let moved = crate::store::migrate_live_verdicts_to_version(
+        &h.conn,
+        OracleTool::RaLsp,
+        "old-v",
+        "new-v",
+        COMMIT,
+        WORKTREE,
+    )
+    .unwrap();
+
+    assert_eq!(moved, 1, "only the active checkout's row moves");
+    let sibling_version: String = h
+        .conn
+        .query_row(
+            "SELECT tool_version FROM edge_oracle WHERE source_path = 'sibling.rs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sibling_version, "old-v", "the sibling checkout's row keeps its version");
+    let _ = edge;
+}
+
 #[test]
 fn live_pass_aborts_best_effort_when_the_server_dies_mid_pass() {
     let h = Harness::new();

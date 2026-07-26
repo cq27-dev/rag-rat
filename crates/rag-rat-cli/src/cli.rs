@@ -684,6 +684,10 @@ pub(crate) enum OracleToolArg {
     ScipTypescript,
     #[value(name = "scip-java")]
     ScipJava,
+    /// The live watcher oracle (#534). Selectable for `oracle status`; `oracle run --tool
+    /// ra-lsp` degrades to the documented `Blocked` hint (live tools never produce a `.scip`).
+    #[value(name = "ra-lsp")]
+    RaLsp,
 }
 
 impl OracleToolArg {
@@ -694,6 +698,7 @@ impl OracleToolArg {
             OracleToolArg::ScipPython => rag_rat_oracle::OracleTool::ScipPython,
             OracleToolArg::ScipTypescript => rag_rat_oracle::OracleTool::ScipTypescript,
             OracleToolArg::ScipJava => rag_rat_oracle::OracleTool::ScipJava,
+            OracleToolArg::RaLsp => rag_rat_oracle::OracleTool::RaLsp,
         }
     }
 }
@@ -1131,6 +1136,20 @@ mod tests {
             cli.command,
             Command::Oracle(OracleArgs { command: OracleCommand::Status(_) })
         ));
+    }
+
+    #[test]
+    fn oracle_status_accepts_the_live_tool_selector() {
+        // `oracle status --tool ra-lsp` must parse (#534): the status selector includes the
+        // live backend; `oracle run --tool ra-lsp` is gated to Blocked downstream instead.
+        let cli = Cli::try_parse_from(["rag-rat", "oracle", "status", "--tool", "ra-lsp"])
+            .expect("parse");
+        match cli.command {
+            Command::Oracle(OracleArgs { command: OracleCommand::Status(args) }) => {
+                assert_eq!(args.tool, Some(OracleToolArg::RaLsp));
+            },
+            other => panic!("expected oracle status, got {other:?}"),
+        }
     }
 
     #[test]

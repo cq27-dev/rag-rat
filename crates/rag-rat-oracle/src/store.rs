@@ -355,27 +355,36 @@ pub(crate) fn indexed_file_sha_for_path(
     .map_err(Into::into)
 }
 
-/// The callee start bytes of a file already covered by a CURRENT live verdict for
+/// The full content keys of a file's edges already covered by a CURRENT live verdict for
 /// `(tool, tool_version)` — current meaning the row's `file_sha` matches the file's indexed
 /// content NOW (the content-addressed currency the live pass keys on, #534). The budget
 /// continuation mechanism: a file a prior pass truncated resumes where it stopped, because
-/// already-verdicted callees are re-resolved LAST (and skipped entirely while the budget is
-/// exhausted).
-pub(crate) fn live_covered_callees_for_path(
+/// already-verdicted callees are skipped by the live pass. The key is the FULL edge identity
+/// (source span + callee span + edge kind), never the callee start alone: two edges can share
+/// one token (`calls_name` + `references_type`), and a start-byte key would let the first
+/// written row mark BOTH covered and starve the other forever.
+pub(crate) fn live_covered_edges_for_path(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
     source_path: &str,
     file_sha: &str,
-) -> anyhow::Result<std::collections::HashSet<i64>> {
+) -> anyhow::Result<std::collections::HashSet<(i64, i64, i64, i64, String)>> {
     let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT callee_start_byte FROM edge_oracle
+        "SELECT source_start_byte, source_end_byte, callee_start_byte, callee_end_byte, edge_kind
+         FROM edge_oracle
          WHERE tool = ?1 AND tool_version = ?2 AND source_path = ?3 AND file_sha = ?4{repo_clause}"
     ))?;
-    let rows = stmt
-        .query_map(params![tool.as_db_str(), tool_version, source_path, file_sha], |row| {
-            row.get::<_, i64>(0)
+    let rows =
+        stmt.query_map(params![tool.as_db_str(), tool_version, source_path, file_sha], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
         })?;
     let mut out = std::collections::HashSet::new();
     for row in rows {
@@ -391,15 +400,25 @@ pub(crate) fn live_covered_callees_for_path(
 /// coverage to the handful of files the new session revisited. The rows are content-addressed
 /// (`file_sha` still gates drift), so moving them under the new version preserves coverage; a
 /// row the new version already wrote (same content key) is dropped first to keep the PK.
+///
+/// SCOPE (load-bearing): restricted to rows whose LIVE EDGE belongs to the active
+/// `(commit_sha, worktree_id)` checkout — the SAME content join [`clear_edge_oracle_for_tool`]
+/// uses. `edge_oracle` rows carry no commit/worktree columns (their scope is the live-edge
+/// join), so a repo-wide UPDATE would relabel a SIBLING worktree's rows too while only THIS
+/// checkout gets the new-version run row — and the sibling's currency gate, still selecting the
+/// old version, would then hide all of its own verdicts.
 pub(crate) fn migrate_live_verdicts_to_version(
     conn: &Connection,
     tool: OracleTool,
     from_version: &str,
     to_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
 ) -> anyhow::Result<u64> {
     let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
-    // Drop old-version rows whose content key the new version already covers (PK is
-    // (repo_id?, tool, tool_version, source_path, spans…, edge_kind)).
+    let scope = active_checkout_file_predicate("?4", "?5");
+    // Drop old-version rows whose content key the new version already covers in THIS checkout
+    // (PK is (repo_id?, tool, tool_version, source_path, spans…, edge_kind)).
     conn.execute(
         &format!(
             "DELETE FROM edge_oracle
@@ -409,16 +428,42 @@ pub(crate) fn migrate_live_verdicts_to_version(
                     SELECT source_path, source_start_byte, source_end_byte,
                            callee_start_byte, callee_end_byte, edge_kind
                     FROM edge_oracle
-                    WHERE tool = ?1 AND tool_version = ?3{repo_clause})"
+                    WHERE tool = ?1 AND tool_version = ?3{repo_clause})
+               AND EXISTS (
+                    SELECT 1
+                    FROM edges_data
+                    JOIN files ON files.id = edges_data.source_file_id
+                    JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
+                    WHERE files.path = edge_oracle.source_path
+                      AND edges_data.source_start_byte = edge_oracle.source_start_byte
+                      AND edges_data.source_end_byte = edge_oracle.source_end_byte
+                      AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
+                      AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
+                      AND ek.value = edge_oracle.edge_kind
+                      AND edges_data.hidden = 0
+                      AND {scope})"
         ),
-        params![tool.as_db_str(), from_version, to_version],
+        params![tool.as_db_str(), from_version, to_version, commit_sha, worktree_id],
     )?;
     let moved = conn.execute(
         &format!(
             "UPDATE edge_oracle SET tool_version = ?3
-             WHERE tool = ?1 AND tool_version = ?2{repo_clause}"
+             WHERE tool = ?1 AND tool_version = ?2{repo_clause}
+               AND EXISTS (
+                    SELECT 1
+                    FROM edges_data
+                    JOIN files ON files.id = edges_data.source_file_id
+                    JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
+                    WHERE files.path = edge_oracle.source_path
+                      AND edges_data.source_start_byte = edge_oracle.source_start_byte
+                      AND edges_data.source_end_byte = edge_oracle.source_end_byte
+                      AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
+                      AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
+                      AND ek.value = edge_oracle.edge_kind
+                      AND edges_data.hidden = 0
+                      AND {scope})"
         ),
-        params![tool.as_db_str(), from_version, to_version],
+        params![tool.as_db_str(), from_version, to_version, commit_sha, worktree_id],
     )?;
     Ok(moved as u64)
 }

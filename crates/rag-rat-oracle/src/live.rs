@@ -209,21 +209,27 @@ pub fn live_oracle_pass(
     // prior version's still-current verdicts — the first partial pass's run row would become the
     // latest for the whole checkout and gate every prior-version verdict out of currency,
     // collapsing live coverage to the handful of files this pass revisits. Migrate the rows
-    // (content-addressed, so `file_sha` still gates drift) and invalidate the scip refinements
-    // whose evidence just changed hands.
+    // (content-addressed, so `file_sha` still gates drift; SCOPED to this checkout so a sibling
+    // worktree's rows and currency stay untouched) and invalidate the scip refinements whose
+    // evidence just changed hands. The transition run is recorded whenever the version moved —
+    // even with zero rows moved — because the session's binary IS the new version and the
+    // currency gate must start selecting it (a sibling's migration may already have moved the
+    // shared rows).
     let mut version_migrated = false;
     if let Some(old_version) =
         store::latest_run_tool_version(conn, tool, input.commit_sha, input.worktree_id)?
         && old_version != session.tool_version()
     {
+        version_migrated = true;
         let moved = store::migrate_live_verdicts_to_version(
             conn,
             tool,
             &old_version,
             session.tool_version(),
+            input.commit_sha,
+            input.worktree_id,
         )?;
         if moved > 0 {
-            version_migrated = true;
             refinements_stale = true;
         }
     }
@@ -270,23 +276,34 @@ pub fn live_oracle_pass(
             continue;
         };
 
-        // Covered-skip continuation: a callee with a CURRENT live verdict (same tool_version +
-        // file_sha) is NEVER re-resolved for the same content — the budget only ever spends on
-        // unverdicted callees. A file a prior pass truncated therefore resumes exactly where it
-        // stopped, and a fully-covered file costs nothing (the first-file exemption this
-        // replaces let a huge generated file blow the budget). Re-resolution happens naturally
-        // on content change (a new `file_sha` un-covers the callee) — e.g. upgrading a sentinel
-        // to a batch moniker — or on a version migration, so a stale sentinel costs only
-        // cosmetics: the batch row carries the real evidence for any span both tools cover.
-        let covered = store::live_covered_callees_for_path(
+        // Covered-skip continuation: an edge with a CURRENT live verdict (same tool_version +
+        // file_sha, FULL content key — two edges may share a callee token, and a start-byte key
+        // would let one written row starve the other) is NEVER re-resolved for the same
+        // content — the budget only ever spends on unverdicted edges. A file a prior pass
+        // truncated therefore resumes exactly where it stopped, and a fully-covered file costs
+        // nothing (the first-file exemption this replaces let a huge generated file blow the
+        // budget). Re-resolution happens naturally on content change (a new `file_sha`
+        // un-covers the edge) — e.g. upgrading a sentinel to a batch moniker — or on a version
+        // migration, so a stale sentinel costs only cosmetics: the batch row carries the real
+        // evidence for any span both tools cover.
+        let covered = store::live_covered_edges_for_path(
             conn,
             tool,
             session.tool_version(),
             path,
             &callees[0].file_sha,
         )?;
+        let is_covered = |c: &store::EdgeJoinCandidate| {
+            covered.contains(&(
+                c.source_start_byte,
+                c.source_end_byte,
+                c.callee_start_byte,
+                c.callee_end_byte,
+                c.edge_kind.clone(),
+            ))
+        };
         let unverdicted: Vec<&store::EdgeJoinCandidate> =
-            callees.iter().copied().filter(|c| !covered.contains(&c.callee_start_byte)).collect();
+            callees.iter().copied().filter(|c| !is_covered(c)).collect();
         if unverdicted.is_empty() {
             continue;
         }
@@ -314,12 +331,21 @@ pub fn live_oracle_pass(
                 break 'files;
             },
         };
-        report.files_resolved += 1;
-        if deferred_count > 0 {
+        // Fully sent only when nothing was budget-deferred: `files_resolved` documents "every
+        // callee of this file was sent", so a truncated file must not inflate it (the field
+        // rides `oracle_runs.stats_json` into status consumers).
+        if deferred_count == 0 {
+            report.files_resolved += 1;
+        } else {
             // The budget cut this file short; it rides the backlog and resumes at the deferred
             // callees (the covered-skip above makes that resume exact).
             report.unfinished_paths.push(path.clone());
         }
+        // Definition bytes are cached ONLY within this file's batch: a def file edited between
+        // two source files' LSP requests would otherwise be hashed + position-converted from a
+        // stale snapshot, defeating the definition-side drift gate. (The indexed sha + symbol
+        // spans stay cached: the write lock pins the index for the whole pass.)
+        def_bytes.clear();
 
         for (candidate, definition) in to_resolve.iter().zip(resolved.iter()) {
             let Some((target_uri, target_range)) = definition else {
@@ -501,11 +527,18 @@ fn live_local_sentinel(source_path: &str, candidate: &store::EdgeJoinCandidate) 
 }
 
 /// The `file://` URI of a checkout root — the base every document URI hangs off. Encodes any
-/// non-URI-path byte as %XX (spaces, non-ASCII); `/` is preserved.
+/// non-URI-path byte as %XX (spaces, non-ASCII); `/` is preserved. A Windows drive prefix
+/// (`C:`) keeps its colon UNENCODED — `file:///C:/repo`, not `file:///C%3A/repo` — because
+/// that is the canonical form rust-analyzer returns for definition URIs, and `path_from_uri`'s
+/// literal prefix match must agree with it (#534 review).
 fn root_uri_for(checkout_root: &Path) -> String {
     let lossy = checkout_root.to_string_lossy().replace('\\', "/");
     let with_lead = if lossy.starts_with('/') { lossy } else { format!("/{lossy}") };
-    format!("file://{}", encode_uri_path(&with_lead))
+    let bytes = with_lead.as_bytes();
+    // Drive prefix: `/C:/…` after the leading-slash normalization.
+    let drive_len =
+        if bytes.len() >= 4 && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' { 3 } else { 0 };
+    format!("file://{}{}", &with_lead[..drive_len], encode_uri_path(&with_lead[drive_len..]))
 }
 
 /// Percent-encode a URI path: keep the RFC 3986 unreserved set plus `/`; %XX-encode the rest.
@@ -552,6 +585,18 @@ mod tests {
     fn root_uri_encodes_spaces_and_preserves_slashes() {
         assert_eq!(root_uri_for(Path::new("/tmp/my repo")), "file:///tmp/my%20repo");
         assert_eq!(root_uri_for(Path::new("/plain/path")), "file:///plain/path");
+    }
+
+    #[test]
+    fn root_uri_keeps_a_windows_drive_colon_verbatim() {
+        // rust-analyzer returns `file:///C:/repo/…` canonically; encoding the drive colon
+        // (`file:///C%3A/repo`) would break `path_from_uri`'s prefix match and class every
+        // in-repo definition as external (#534 review).
+        let root = root_uri_for(Path::new(r"C:\repo"));
+        assert_eq!(root, "file:///C:/repo");
+        assert_eq!(path_from_uri(&root, "file:///C:/repo/src/lib.rs"), Some("src/lib.rs".into()));
+        // A drive root with a space still encodes the non-drive part.
+        assert_eq!(root_uri_for(Path::new(r"D:\my repo")), "file:///D:/my%20repo");
     }
 
     #[test]
