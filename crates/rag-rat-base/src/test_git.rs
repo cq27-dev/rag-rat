@@ -123,6 +123,17 @@ mod tests {
             .args(["commit", "-q", "-m", "seed"])
             .env("GIT_CONFIG_GLOBAL", root.join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            // The repro pins the hostile GLOBAL file, but ambient command-scope config
+            // (`GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG`) outranks it and could
+            // silence — or mis-trigger — the hook; routing vars get the same scrub so the repro
+            // always measures exactly the pinned file.
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
             .output()
             .unwrap();
         assert!(!out.status.success(), "the hostile global hook must fire without isolation");
