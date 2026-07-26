@@ -21,6 +21,45 @@ use crate::IndexDatabase;
 use crate::index::ai::ReconcileOptions;
 use crate::index::ignore_rules::IgnoreMatcher;
 
+#[derive(Debug)]
+struct ScratchRoot {
+    path: PathBuf,
+    _scratch: rag_rat_base::test_scratch::ScratchDir,
+}
+
+impl ScratchRoot {
+    fn new(tag: impl AsRef<str>) -> Self {
+        let scratch = rag_rat_base::test_scratch::ScratchDir::new(tag.as_ref());
+        let path = scratch.path().to_path_buf();
+        // Watch fixtures historically allocate an absent path, including Git worktree targets.
+        let _ = std::fs::remove_dir_all(&path);
+        Self { path, _scratch: scratch }
+    }
+
+    fn canonicalize(mut self) -> std::io::Result<Self> {
+        self.path = self.path.canonicalize()?;
+        Ok(self)
+    }
+}
+
+impl std::ops::Deref for ScratchRoot {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for &ScratchRoot {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn scratch_root(tag: impl AsRef<str>) -> ScratchRoot {
+    ScratchRoot::new(tag)
+}
+
 fn mutation_event(path: PathBuf) -> Event {
     Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path)
 }
@@ -722,8 +761,7 @@ fn maintenance_pass_or_skip_runs_when_lock_is_available() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir()
-        .join(format!("ragrat-watch-maintenance-skip-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-maintenance-skip-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn maintenance_target() {}\n").unwrap();
@@ -737,7 +775,7 @@ fn maintenance_pass_or_skip_runs_when_lock_is_available() {
     let db = IndexDatabase::open_config(&config).unwrap();
     assert!(db.status(&config.database).unwrap().file_count_by_language.values().sum::<u64>() > 0);
 
-    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -745,8 +783,7 @@ fn startup_catchup_retries_existing_base_embedding_backlog() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir()
-        .join(format!("ragrat-watch-startup-backlog-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-startup-backlog-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
@@ -784,7 +821,7 @@ fn startup_catchup_retries_existing_base_embedding_backlog() {
         "startup retry wrote hash embeddings"
     );
 
-    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// #817 end-to-end: a maintenance pass whose only change is a dirty LINKED worktree skips the
@@ -804,10 +841,9 @@ fn overlay_only_pass_skips_base_tail_but_still_validates_memories() {
     use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let main =
-        std::env::temp_dir().join(format!("ragrat-watch-overlay-only-{}-{id}", std::process::id()));
-    let linked = std::env::temp_dir()
-        .join(format!("ragrat-watch-overlay-only-linked-{}-{id}", std::process::id()));
+    let main = scratch_root(format!("ragrat-watch-overlay-only-{}-{id}", std::process::id()));
+    let linked =
+        scratch_root(format!("ragrat-watch-overlay-only-linked-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&main);
     let _ = std::fs::remove_dir_all(&linked);
     std::fs::create_dir_all(main.join("src")).unwrap();
@@ -895,8 +931,7 @@ fn startup_catchup_skips_ephemeral_backlog_scan_without_query_endpoint() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir()
-        .join(format!("ragrat-watch-ephemeral-backlog-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-ephemeral-backlog-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
@@ -934,7 +969,7 @@ fn startup_catchup_skips_ephemeral_backlog_scan_without_query_endpoint() {
         "startup must not scan chunks before the ephemeral light endpoint is known usable"
     );
 
-    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -942,8 +977,7 @@ fn startup_catchup_reconciles_shutdown_discovered_content() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir()
-        .join(format!("ragrat-watch-shutdown-reconcile-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-shutdown-reconcile-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
@@ -1006,7 +1040,7 @@ fn startup_catchup_reconciles_shutdown_discovered_content() {
     );
     assert_eq!(db.pending_embedding_jobs().unwrap(), 0, "startup catch-up embedded the backlog");
 
-    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1014,8 +1048,7 @@ fn startup_catchup_keeps_shutdown_marker_when_reconcile_is_blocked() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir()
-        .join(format!("ragrat-watch-shutdown-blocked-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-shutdown-blocked-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
@@ -1047,7 +1080,7 @@ fn startup_catchup_keeps_shutdown_marker_when_reconcile_is_blocked() {
         "not-ready models report no pending jobs, so marker clearing must key off status"
     );
 
-    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1060,8 +1093,7 @@ fn wal_checkpoint_runs_at_every_pass_terminal_gated_by_size_alone() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir()
-        .join(format!("ragrat-watch-wal-checkpoint-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-wal-checkpoint-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/a.rs"), "pub fn wal_probe() -> i32 { 1 }\n").unwrap();
@@ -1094,8 +1126,7 @@ fn initial_watch_state_places_base_gitignore_and_fleet_surfaces() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir()
-        .join(format!("ragrat-watch-initial-state-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-initial-state-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src/kept")).unwrap();
     std::fs::create_dir_all(root.join("bin")).unwrap();
@@ -1127,7 +1158,8 @@ fn initial_watch_state_places_base_gitignore_and_fleet_surfaces() {
         watcher
             .watched
             .iter()
-            .any(|(path, mode)| path == &root && *mode == RecursiveMode::NonRecursive),
+            .any(|(path, mode)| path.as_path() == root.as_path()
+                && *mode == RecursiveMode::NonRecursive),
         "the config root is watched for root .gitignore edits",
     );
     assert!(
@@ -1146,8 +1178,7 @@ fn event_maintenance_helpers_place_dirs_recompile_and_refresh_linked_state() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root =
-        std::env::temp_dir().join(format!("ragrat-watch-maint-helper-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-maint-helper-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src/fresh")).unwrap();
     let root = root.canonicalize().unwrap();
@@ -1212,8 +1243,7 @@ fn event_maintenance_helper_requests_pass_for_relevant_and_registry_events() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir()
-        .join(format!("ragrat-watch-maint-branches-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-maint-branches-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
@@ -1266,10 +1296,8 @@ fn initial_watch_state_places_worktree_registry() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let main =
-        std::env::temp_dir().join(format!("ragrat-watch-registry-{}-{id}", std::process::id()));
-    let linked = std::env::temp_dir()
-        .join(format!("ragrat-watch-registry-linked-{}-{id}", std::process::id()));
+    let main = scratch_root(format!("ragrat-watch-registry-{}-{id}", std::process::id()));
+    let linked = scratch_root(format!("ragrat-watch-registry-linked-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&main);
     let _ = std::fs::remove_dir_all(&linked);
     std::fs::create_dir_all(main.join("src")).unwrap();
@@ -1345,8 +1373,7 @@ fn missing_config_root_bootstrap_dirs_use_existing_ancestor_chain() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let checkout =
-        std::env::temp_dir().join(format!("ragrat-bootstrap-chain-{}-{id}", std::process::id()));
+    let checkout = scratch_root(format!("ragrat-bootstrap-chain-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&checkout);
     std::fs::create_dir_all(checkout.join("packages")).unwrap();
     let checkout = checkout.canonicalize().unwrap();
@@ -1631,7 +1658,7 @@ fn linked_worktree_events_honor_its_ignore_rules() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let worktree = std::env::temp_dir().join(format!("ragrat-wt-ign-{}-{id}", std::process::id()));
+    let worktree = scratch_root(format!("ragrat-wt-ign-{}-{id}", std::process::id()));
     std::fs::create_dir_all(worktree.join("src")).unwrap();
     std::fs::create_dir_all(worktree.join("ignored_dir")).unwrap();
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
@@ -1685,8 +1712,7 @@ fn linked_worktree_watch_placement_uses_configured_pruned_targets() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let worktree =
-        std::env::temp_dir().join(format!("ragrat-wt-place-{}-{id}", std::process::id()));
+    let worktree = scratch_root(format!("ragrat-wt-place-{}-{id}", std::process::id()));
     std::fs::create_dir_all(worktree.join("src/kept")).unwrap();
     std::fs::create_dir_all(worktree.join("src/ignored_dir")).unwrap();
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
@@ -1700,7 +1726,7 @@ fn linked_worktree_watch_placement_uses_configured_pruned_targets() {
     ]);
     let state = &worktrees.states[0];
 
-    assert_eq!(state.config.root, worktree);
+    assert_eq!(state.config.root.as_path(), worktree.as_path());
     assert!(
         watcher.watched.iter().any(|(path, mode)| path == &state.config.root.join("src")
             && *mode == RecursiveMode::NonRecursive),
@@ -1734,7 +1760,7 @@ fn linked_worktree_watch_set_sync_rebuilds_existing_root_state() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let worktree = std::env::temp_dir().join(format!("ragrat-wt-sync-{}-{id}", std::process::id()));
+    let worktree = scratch_root(format!("ragrat-wt-sync-{}-{id}", std::process::id()));
     std::fs::create_dir_all(worktree.join("src")).unwrap();
     std::fs::create_dir_all(worktree.join("extra")).unwrap();
     let worktree = worktree.canonicalize().unwrap();
@@ -1762,7 +1788,7 @@ fn linked_worktree_watch_set_handles_created_dirs_and_recompile() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let worktree = std::env::temp_dir().join(format!("ragrat-wt-set-{}-{id}", std::process::id()));
+    let worktree = scratch_root(format!("ragrat-wt-set-{}-{id}", std::process::id()));
     std::fs::create_dir_all(worktree.join("src")).unwrap();
     let worktree = worktree.canonicalize().unwrap();
     std::fs::write(worktree.join(".gitignore"), "").unwrap();
@@ -1801,8 +1827,7 @@ fn linked_worktree_watch_set_handles_created_target_ancestors() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let worktree =
-        std::env::temp_dir().join(format!("ragrat-wt-ancestor-{}-{id}", std::process::id()));
+    let worktree = scratch_root(format!("ragrat-wt-ancestor-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&worktree).unwrap();
     let worktree = worktree.canonicalize().unwrap();
     std::fs::write(worktree.join(".gitignore"), "").unwrap();
@@ -1849,8 +1874,7 @@ fn linked_worktree_target_ancestor_gitignore_is_compiled() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let worktree =
-        std::env::temp_dir().join(format!("ragrat-wt-ancestor-ignore-{}-{id}", std::process::id()));
+    let worktree = scratch_root(format!("ragrat-wt-ancestor-ignore-{}-{id}", std::process::id()));
     std::fs::create_dir_all(worktree.join("src/generated")).unwrap();
     std::fs::create_dir_all(worktree.join("src/sibling")).unwrap();
     let worktree = worktree.canonicalize().unwrap();
@@ -1883,10 +1907,9 @@ fn linked_subdir_root_watch_placement_keeps_checkout_root_when_config_root_missi
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let repo = std::env::temp_dir()
-        .join(format!("ragrat-wt-missing-root-main-{}-{id}", std::process::id()));
-    let checkout = std::env::temp_dir()
-        .join(format!("ragrat-wt-missing-root-linked-{}-{id}", std::process::id()));
+    let repo = scratch_root(format!("ragrat-wt-missing-root-main-{}-{id}", std::process::id()));
+    let checkout =
+        scratch_root(format!("ragrat-wt-missing-root-linked-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&checkout);
     std::fs::create_dir_all(repo.join("packages/crate/src")).unwrap();
@@ -1916,10 +1939,8 @@ fn linked_subdir_root_watch_placement_keeps_checkout_root_when_config_root_missi
     assert_eq!(worktrees.states[0].config.root, linked_root);
     assert!(!linked_root.exists(), "the linked branch has not created the configured root yet");
     assert!(
-        watcher
-            .watched
-            .iter()
-            .any(|(path, mode)| path == &checkout && *mode == RecursiveMode::NonRecursive),
+        watcher.watched.iter().any(|(path, mode)| path.as_path() == checkout.as_path()
+            && *mode == RecursiveMode::NonRecursive),
         "a missing linked subdir-root needs a non-recursive checkout-root bootstrap watch",
     );
     assert!(
@@ -1941,8 +1962,7 @@ fn watch_created_dirs_reinstalls_watches_for_recreated_config_root() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir()
-        .join(format!("ragrat-watch-recreated-root-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-recreated-root-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join(".gitignore"), "").unwrap();
@@ -1969,7 +1989,8 @@ fn watch_created_dirs_reinstalls_watches_for_recreated_config_root() {
         watcher
             .watched
             .iter()
-            .any(|(path, mode)| path == &root && *mode == RecursiveMode::NonRecursive),
+            .any(|(path, mode)| path.as_path() == root.as_path()
+                && *mode == RecursiveMode::NonRecursive),
         "the recreated config root itself should stay watched non-recursively",
     );
     assert!(
@@ -1988,8 +2009,8 @@ fn watch_created_dirs_bootstraps_missing_linked_subdir_root_ancestors() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let checkout = std::env::temp_dir()
-        .join(format!("ragrat-watch-linked-ancestor-{}-{id}", std::process::id()));
+    let checkout =
+        scratch_root(format!("ragrat-watch-linked-ancestor-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&checkout);
     std::fs::create_dir_all(checkout.join("packages")).unwrap();
     std::fs::create_dir_all(checkout.join("vendor")).unwrap();
@@ -2051,8 +2072,7 @@ fn linked_created_target_dir_requests_maintenance_when_directory_event_is_not_re
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let worktree =
-        std::env::temp_dir().join(format!("ragrat-wt-create-pass-{}-{id}", std::process::id()));
+    let worktree = scratch_root(format!("ragrat-wt-create-pass-{}-{id}", std::process::id()));
     std::fs::create_dir_all(worktree.join("src")).unwrap();
     let worktree = worktree.canonicalize().unwrap();
     std::fs::write(worktree.join(".gitignore"), "").unwrap();
@@ -2092,10 +2112,8 @@ fn linked_created_dir_watch_signal_does_not_short_circuit_state_updates() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let first =
-        std::env::temp_dir().join(format!("ragrat-wt-create-all-a-{}-{id}", std::process::id()));
-    let second =
-        std::env::temp_dir().join(format!("ragrat-wt-create-all-b-{}-{id}", std::process::id()));
+    let first = scratch_root(format!("ragrat-wt-create-all-a-{}-{id}", std::process::id()));
+    let second = scratch_root(format!("ragrat-wt-create-all-b-{}-{id}", std::process::id()));
     for root in [&first, &second] {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join(".gitignore"), "").unwrap();
@@ -2143,8 +2161,7 @@ fn watch_created_dirs_skips_dirs_ignored_before_or_after_recompile() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir()
-        .join(format!("ragrat-watch-created-ignore-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-created-ignore-{}-{id}", std::process::id()));
     std::fs::create_dir_all(root.join("src/already_ignored")).unwrap();
     std::fs::create_dir_all(root.join("src/newly_ignored")).unwrap();
     let root = root.canonicalize().unwrap();
@@ -2202,7 +2219,7 @@ fn event_touches_worktree_rebases_subdir_rooted_config() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let repo = std::env::temp_dir().join(format!("ragrat-wt-subdir-{}-{id}", std::process::id()));
+    let repo = scratch_root(format!("ragrat-wt-subdir-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(repo.join("crate/src")).unwrap();
     std::fs::write(repo.join("crate/src/a.rs"), "fn a() {}\n").unwrap();
@@ -2244,8 +2261,7 @@ fn event_touches_worktree_rebases_subdir_rooted_config() {
         allow_empty: false,
     };
     // A linked checkout mirrors the layout: `<checkout>/crate/src/a.rs`.
-    let checkout =
-        std::env::temp_dir().join(format!("ragrat-wt-subdir-co-{}-{id}", std::process::id()));
+    let checkout = scratch_root(format!("ragrat-wt-subdir-co-{}-{id}", std::process::id()));
     let mut watcher = RecordingWatcher::default();
     let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
         checkout.clone(),
@@ -2264,7 +2280,7 @@ fn event_is_relevant_skips_gitignored_paths_consistently_with_walker() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-watchev-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watchev-{}-{id}", std::process::id()));
     std::fs::create_dir_all(root.join("crates")).unwrap();
     std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
 
@@ -2330,7 +2346,7 @@ fn gitignore_edit_is_relevant_and_recompile_reflects_new_rules() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-watchgi-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watchgi-{}-{id}", std::process::id()));
     std::fs::create_dir_all(root.join("crates")).unwrap();
     // Initially nothing is gitignored.
     std::fs::write(root.join(".gitignore"), "").unwrap();
@@ -2399,7 +2415,7 @@ fn worktree_root_gitignore_edit_recompiles_for_subdir_config_root() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let wt = std::env::temp_dir().join(format!("ragrat-wtgi-{}-{id}", std::process::id()));
+    let wt = scratch_root(format!("ragrat-wtgi-{}-{id}", std::process::id()));
     std::fs::create_dir_all(wt.join("crates")).unwrap();
     let wt = wt.canonicalize().unwrap();
     let ok = std::process::Command::new("git")
@@ -3009,7 +3025,7 @@ fn worktree_watch_targets_excludes_the_main_checkout_for_a_subdir_config_root() 
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let main = std::env::temp_dir().join(format!("ragrat-wwt-{}-{id}", std::process::id()));
+    let main = scratch_root(format!("ragrat-wwt-{}-{id}", std::process::id()));
     std::fs::create_dir_all(main.join("crate/src")).unwrap();
     let git = |dir: &Path, args: &[&str]| {
         std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap()
@@ -3050,7 +3066,7 @@ fn worktree_watch_targets_excludes_the_main_checkout_for_a_subdir_config_root() 
     };
 
     let (roots, _registry) = worktree_watch_targets(&config);
-    let main_id = crate::index::worktree_id_of(&main.canonicalize().unwrap());
+    let main_id = crate::index::worktree_id_of(&std::fs::canonicalize(&main).unwrap());
     assert!(
         !roots.iter().any(|r| crate::index::worktree_id_of(r) == main_id),
         "the main checkout must NOT be watched as a linked worktree: {roots:?}",
@@ -3067,7 +3083,7 @@ fn gitignore_watch_dirs_includes_worktree_root_for_subdir_config_root() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let wt = std::env::temp_dir().join(format!("ragrat-wdirs-{}-{id}", std::process::id()));
+    let wt = scratch_root(format!("ragrat-wdirs-{}-{id}", std::process::id()));
     std::fs::create_dir_all(wt.join("crates/app")).unwrap();
     let wt = wt.canonicalize().unwrap();
     let ok = std::process::Command::new("git")
@@ -3081,7 +3097,11 @@ fn gitignore_watch_dirs_includes_worktree_root_for_subdir_config_root() {
     let sub = wt.join("crates/app");
     let dirs = gitignore_watch_dirs(&sub);
     // The chain from the worktree root down to config.root, inclusive.
-    assert_eq!(dirs.first(), Some(&wt), "worktree root is watched (finding 1)");
+    assert_eq!(
+        dirs.first().map(PathBuf::as_path),
+        Some(wt.as_path()),
+        "worktree root is watched (finding 1)"
+    );
     assert!(dirs.contains(&wt.join("crates")), "intermediate ancestor watched");
     assert_eq!(dirs.last(), Some(&sub), "config.root itself is watched");
 
@@ -3095,7 +3115,7 @@ fn gitignore_watch_dirs_non_git_tree_is_just_root() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-wdirs-ng-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-wdirs-ng-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
     // Best-effort: only meaningful when /tmp isn't itself inside a git worktree. If it is,
@@ -3117,7 +3137,7 @@ fn root_gitignore_edit_is_delivered_to_a_real_watcher() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let wt = std::env::temp_dir().join(format!("ragrat-deliv-{}-{id}", std::process::id()));
+    let wt = scratch_root(format!("ragrat-deliv-{}-{id}", std::process::id()));
     std::fs::create_dir_all(wt.join("crates")).unwrap();
     let wt = wt.canonicalize().unwrap();
     let ok = std::process::Command::new("git")
@@ -3175,7 +3195,7 @@ fn watcher_main_routes_gitignore_mutations_through_central_helpers() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-watch-loop-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-watch-loop-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     let git = |dir: &Path, args: &[&str]| {
@@ -3271,7 +3291,7 @@ fn gitignored_subdir_under_a_target_is_not_watched() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-331ign-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-331ign-{}-{id}", std::process::id()));
     std::fs::create_dir_all(root.join("ignored_dir/nested")).unwrap();
     std::fs::create_dir_all(root.join("kept_dir/nested")).unwrap();
     let root = root.canonicalize().unwrap();
@@ -3317,7 +3337,7 @@ fn newly_created_non_ignored_dir_gets_watched() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-331new-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-331new-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
     std::fs::write(root.join(".gitignore"), "ignored_dir/\n").unwrap();
@@ -3371,7 +3391,7 @@ fn a_bare_directory_create_is_not_relevant_so_placement_must_be_unconditional() 
     use notify::event::CreateKind;
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-332rel-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-332rel-{}-{id}", std::process::id()));
     std::fs::create_dir_all(root.join("src")).unwrap();
     let root = root.canonicalize().unwrap();
     let config = Config {
@@ -3427,7 +3447,7 @@ fn a_directory_moved_into_a_target_is_watched() {
     use notify::event::{ModifyKind, RenameMode};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-332mv-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-332mv-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
     std::fs::write(root.join(".gitignore"), "").unwrap();
@@ -3473,7 +3493,7 @@ fn relaxing_an_ignore_rule_re_places_watches_on_the_unignored_subtree() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-332re-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-332re-{}-{id}", std::process::id()));
     std::fs::create_dir_all(root.join("formerly_ignored")).unwrap();
     let root = root.canonicalize().unwrap();
     std::fs::write(root.join(".gitignore"), "formerly_ignored/\n").unwrap();
@@ -3516,12 +3536,12 @@ fn a_symlink_to_a_directory_is_not_followed_into_watches() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-332sym-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-332sym-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
     std::fs::write(root.join(".gitignore"), "").unwrap();
     // A real directory OUTSIDE the target, with a file in it — the symlink's target.
-    let outside = std::env::temp_dir().join(format!("ragrat-332symtgt-{}-{id}", id));
+    let outside = scratch_root(format!("ragrat-332symtgt-{}-{id}", id));
     std::fs::create_dir_all(&outside).unwrap();
     let outside = outside.canonicalize().unwrap();
     std::fs::write(outside.join("f.rs"), "// f\n").unwrap();
@@ -3574,7 +3594,7 @@ fn a_non_target_top_level_dir_is_not_watched() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-332nt-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-332nt-{}-{id}", std::process::id()));
     std::fs::create_dir_all(root.join("src")).unwrap();
     let root = root.canonicalize().unwrap();
     std::fs::write(root.join(".gitignore"), "").unwrap();
@@ -3653,7 +3673,7 @@ fn a_moved_in_dir_with_a_nested_gitignore_prunes_against_it() {
     use notify::event::{ModifyKind, RenameMode};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("ragrat-332nest-{}-{id}", std::process::id()));
+    let root = scratch_root(format!("ragrat-332nest-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
     std::fs::write(root.join(".gitignore"), "").unwrap();
