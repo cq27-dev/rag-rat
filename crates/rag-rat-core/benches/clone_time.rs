@@ -19,9 +19,8 @@
 
 mod shared;
 
-use std::path::PathBuf;
+use std::hint;
 use std::time::Duration;
-use std::{fs, hint};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rag_rat_core::index::{CloneSymbolSelector, FindClonesOptions};
@@ -36,29 +35,13 @@ fn default_opts() -> FindClonesOptions {
     FindClonesOptions { min_similarity: None, min_copies: None, limit: None }
 }
 
-/// Best-effort removal of a bench DB's on-disk files (`.sqlite` + `-wal`/`-shm`) when dropped, so a
-/// long run doesn't leak a corpus-sized DB per build — the same discipline as `index_time`'s
-/// `TempIndexDb` (#251). Declared so it drops AFTER the `IndexDatabase` handle it pairs with (the
-/// handle closes the connection first, then the files are unlinked).
-struct DbFiles(PathBuf);
-
-impl Drop for DbFiles {
-    fn drop(&mut self) {
-        let db = self.0.display().to_string();
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = fs::remove_file(format!("{db}{suffix}"));
-        }
-    }
-}
-
 fn clone_queries(c: &mut Criterion) {
     // Clone the corpus once, before timing.
     let _ = corpus_dir();
 
     // One shared index for the cache-free / warm benches and to resolve a real subject. Declared
-    // before `db` so `db` (the open handle) drops first and `DbFiles` unlinks afterwards.
-    let config = built_config(SUBDIR);
-    let _shared_cleanup = DbFiles(config.database.clone());
+    // before `db` so `db` (the open handle) drops first and the guard removes the DB afterwards.
+    let (config, _shared_scratch) = built_config(SUBDIR);
     let db = open_like_production(&config);
 
     let components = db.candidate_clone_components().expect("candidate components");
@@ -107,11 +90,10 @@ fn clone_queries(c: &mut Criterion) {
     cold.bench_function("find_clones_cold", |b| {
         b.iter_batched_ref(
             || {
-                let config = built_config(SUBDIR);
-                let cleanup = DbFiles(config.database.clone());
+                let (config, scratch) = built_config(SUBDIR);
                 let db = open_like_production(&config);
-                // (db, cleanup): db drops first (closes the connection), then cleanup unlinks.
-                (db, cleanup)
+                // (db, scratch): db drops first (closes the connection), then the guard unlinks.
+                (db, scratch)
             },
             |(db, _cleanup)| {
                 hint::black_box(db.find_clones(default_opts()).expect("find_clones"));

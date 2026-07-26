@@ -285,8 +285,6 @@ fn git_remote_url(root: &Path, remote: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
@@ -409,19 +407,13 @@ mod tests {
         assert_eq!(parse_git_remote_url("git@github.com:"), None);
     }
 
-    static REMOTE_TEMP: AtomicU64 = AtomicU64::new(0);
-
     fn git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
-    fn temp_git_repo() -> PathBuf {
-        let id = REMOTE_TEMP.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("ragrat-trackers-{}-{id}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+    fn temp_git_repo() -> rag_rat_base::test_scratch::ScratchDir {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("trackers");
         git(&root, &["init", "-q"]);
         root
     }
@@ -432,7 +424,6 @@ mod tests {
         git(&root, &["remote", "add", "origin", "git@github.com:owner/repo.git"]);
         let trackers = resolve_trackers(&[], &root);
         assert_eq!(trackers, vec![github("owner/repo").unwrap()]);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -441,7 +432,6 @@ mod tests {
         assert_eq!(resolve_trackers(&[], &root), Vec::new(), "no remote at all");
         git(&root, &["remote", "add", "origin", "git@codeberg.org:owner/repo.git"]);
         assert_eq!(resolve_trackers(&[], &root), Vec::new(), "unknown host");
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -511,7 +501,6 @@ mod tests {
             (Tracker::Bitbucket, "PROJ/repo", Some("https://bitbucket.example.com"))
         );
         assert_eq!((trackers[2].provider, trackers[2].project.as_str()), (Tracker::Jira, "PROJ"));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn tagged(tags: &[&str]) -> ResolvedTracker {

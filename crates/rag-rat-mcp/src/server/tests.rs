@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
@@ -12,14 +11,8 @@ use serde_json::{Value, json};
 use super::*;
 use crate::blocking::{self, ToolTimeoutPolicy};
 
-static N: AtomicU64 = AtomicU64::new(0);
-
-fn config_over_temp_repo() -> (PathBuf, Config) {
-    let root = std::env::temp_dir().join(format!(
-        "rag-rat-server-test-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
+fn config_over_temp_repo() -> (rag_rat_base::test_scratch::ScratchDir, Config) {
+    let root = rag_rat_base::test_scratch::ScratchDir::new("server-test");
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn open_database() {}\n").unwrap();
     let config = Config {
@@ -28,7 +21,7 @@ fn config_over_temp_repo() -> (PathBuf, Config) {
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
+        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
@@ -52,7 +45,7 @@ fn config_over_temp_repo() -> (PathBuf, Config) {
     (root, config)
 }
 
-fn service_over_temp_repo() -> (PathBuf, RagRatService) {
+fn service_over_temp_repo() -> (rag_rat_base::test_scratch::ScratchDir, RagRatService) {
     let (root, config) = config_over_temp_repo();
     (root, RagRatService::new(config, OutputFormat::Toon))
 }
@@ -81,7 +74,7 @@ fn timeout_and_worker_env_ignore_blank_zero_and_invalid_values() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn call_async_dispatches_through_blocking_chokepoint() {
-    let (root, svc) = service_over_temp_repo();
+    let (_root, svc) = service_over_temp_repo();
     let result = svc.call_async("index_status".to_string(), json!({})).await.unwrap();
 
     assert!(!result.content.is_empty(), "async tool dispatch returned no content");
@@ -94,14 +87,12 @@ async fn call_async_dispatches_through_blocking_chokepoint() {
         "unknown-tool error should preserve the dispatcher message, got: {}",
         err.message
     );
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn call_async_counts_queued_blocking_work_as_inflight() {
-    let (root, mut svc) = service_over_temp_repo();
+    let (_root, mut svc) = service_over_temp_repo();
     svc.tool_workers = test_tool_workers(1);
     let held_worker = Arc::clone(&svc.tool_workers).acquire_owned().await.unwrap();
     let inflight = svc.inflight();
@@ -121,8 +112,6 @@ async fn call_async_counts_queued_blocking_work_as_inflight() {
     drop(held_worker);
     pending.await.unwrap().unwrap();
     assert_eq!(inflight.count(), 0, "in-flight guard must drop after the worker exits");
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -280,7 +269,7 @@ async fn blocking_tool_work_reports_panics_as_mcp_errors() {
 /// the fleet — except a `memory_create`/`memory_update` forces it (and resets the window).
 #[test]
 fn stale_memory_nudge_throttles_forces_and_suppresses_json() {
-    let (root, config) = config_over_temp_repo();
+    let (_root, config) = config_over_temp_repo();
     // A memory bound to an unindexed/absent path resolves `gone` → drift the nudge reports.
     let toon = RagRatService::new(config.clone(), OutputFormat::Toon);
     toon.call(
@@ -320,8 +309,6 @@ fn stale_memory_nudge_throttles_forces_and_suppresses_json() {
     // Immediately after — within the window — a plain read tool is THROTTLED (nudge
     // suppressed).
     assert!(toon.stale_memory_nudge("semantic_search").is_none(), "throttled inside the window",);
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// #752 end-to-end: in TOON (LLM-facing) mode a repo memory riding a DRIVE-BY result
@@ -337,7 +324,7 @@ fn drive_by_memories_dedup_in_toon_but_json_mode_is_untrimmed() {
         serde_json::from_str(&text_of(&svc.call(tool, args).unwrap())).unwrap()
     }
 
-    let (root, config) = config_over_temp_repo(); // indexes `open_database`
+    let (_root, config) = config_over_temp_repo(); // indexes `open_database`
     let lookup_args = json!({"symbol": "open_database", "allow_ambiguous": true});
     const ELIDED: &str = "already surfaced this session";
 
@@ -384,8 +371,6 @@ fn drive_by_memories_dedup_in_toon_but_json_mode_is_untrimmed() {
         assert_eq!(m["memory_id"].as_str(), Some(mem_id.as_str()));
         assert!(m["elided"].is_null(), "JSON mode never stubs a drive-by memory");
     }
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

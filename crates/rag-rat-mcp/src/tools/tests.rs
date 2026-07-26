@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
 use rag_rat_base::language::Language;
@@ -8,8 +7,6 @@ use rag_rat_core::IndexDatabase;
 use serde_json::json;
 
 use super::*;
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn degraded_coverage_escalates_low_completeness_risk() {
@@ -358,7 +355,7 @@ fn enum_like_tool_args_reject_unknown_values_during_decoding() {
 
 #[test]
 fn index_status_surfaces_version_when_cached_and_enabled() {
-    let (root, config) = mixed_config();
+    let (_root, config) = mixed_config();
     IndexDatabase::rebuild(&config).unwrap();
     // Seed a clearly-newer cached crates.io result into the combined sidecar store (the network
     // refresh that normally writes this is out of band).
@@ -376,13 +373,11 @@ fn index_status_surfaces_version_when_cached_and_enabled() {
     assert_eq!(version["latest_version"], "99.0.0");
     assert_eq!(version["update_available"], true);
     assert_eq!(version["update_command"], "cargo install rag-rat --force");
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn mcp_tool_calls_preserve_compatibility_shapes() {
-    let (root, config) = mixed_config();
+    let (_root, config) = mixed_config();
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
 
@@ -424,13 +419,11 @@ fn mcp_tool_calls_preserve_compatibility_shapes() {
 
     let llm = call_tool(&config.database, "llm_status", json!({})).unwrap();
     assert_eq!(llm["embedding"]["state"], "MissingModel");
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn mcp_edge_tools_add_traverse_and_remove() {
-    let (root, config) = mixed_config();
+    let (_root, config) = mixed_config();
     IndexDatabase::rebuild(&config).unwrap();
 
     let create = |title: &str| -> String {
@@ -485,8 +478,6 @@ fn mcp_edge_tools_add_traverse_and_remove() {
         call_tool_for_config(&config, "memory_edge_remove", json!({"edge_key": key})).unwrap(),
         json!(true)
     );
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -498,7 +489,7 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
         "#[cfg(unix)]\npub fn cfg_helper() {}\n#[cfg(windows)]\npub fn cfg_helper() {}\n",
     )
     .unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
 
@@ -579,8 +570,6 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
         call_tool(&config.database, "memory_mark_obsolete", json!({"memory_id": memory_id}))
             .unwrap();
     assert_eq!(obsolete["status"], "obsolete");
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -593,7 +582,7 @@ fn mcp_dream_surfaces_a_finding_and_review_applies_a_verdict() {
     let root = unique_temp_root();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
 
@@ -660,8 +649,6 @@ fn mcp_dream_surfaces_a_finding_and_review_applies_a_verdict() {
     )
     .unwrap();
     assert_eq!(reset["status"], "open");
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -672,7 +659,7 @@ fn mcp_dream_defaults_when_arguments_are_omitted() {
     let root = unique_temp_root();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
 
@@ -681,8 +668,6 @@ fn mcp_dream_defaults_when_arguments_are_omitted() {
         report["findings"].is_array(),
         "a bare `dream` call (omitted arguments) returns a worklist: {report}"
     );
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -709,8 +694,6 @@ fn mcp_read_chunk_and_heal_index_do_not_return_stale_text() {
     assert!(stale.as_array().unwrap().is_empty());
     let fresh = call_tool_for_config(&config, "semantic_search", json!({"query": "beta"})).unwrap();
     assert_eq!(fresh.as_array().unwrap().len(), 1);
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -728,7 +711,7 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
         "pub fn shared() {}\npub fn caller_two() {\n    shared();\n}\n",
     )
     .unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
 
@@ -880,8 +863,6 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
     )
     .unwrap();
     assert!(papertrail["current_source"]["symbol"].as_str().unwrap().contains("shared"));
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -897,7 +878,7 @@ fn find_callers_zero_callers_is_not_low_completeness() {
         "pub fn orphan() {}\npub fn callee() {}\npub fn caller() {\n    callee();\n}\n",
     )
     .unwrap();
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     IndexDatabase::rebuild(&config).unwrap();
 
     let orphan = call_tool(&config.database, "find_callers", json!({"symbol": "orphan"})).unwrap();
@@ -916,8 +897,6 @@ fn find_callers_zero_callers_is_not_low_completeness() {
     assert_eq!(callee["summary"]["returned_count"], 1);
     assert_eq!(callee["summary"]["completeness_risk"], "low");
     assert!(callee["summary"]["completeness_note"].is_null());
-
-    let _ = fs::remove_dir_all(root);
 }
 
 fn assert_schema_requires(tools: &[Value], name: &str, field: &str) {
@@ -1023,7 +1002,7 @@ fn mcp_rewrites_ranking_hint_when_auto_run_enabled() {
     // must say compiler ranking refreshes in the background — not tell the agent to run `oracle
     // run` by hand. The core query is config-unaware, so call_tool_for_config applies the
     // rewrite.
-    let (root, mut config) = mixed_config();
+    let (_root, mut config) = mixed_config();
     IndexDatabase::rebuild(&config).unwrap();
 
     config.oracle.auto_run = true;
@@ -1041,8 +1020,6 @@ fn mcp_rewrites_ranking_hint_when_auto_run_enabled() {
         manual["ranking_hint"].as_str(),
         Some(rag_rat_query::pagerank::RANKING_HINT_RUN_ORACLE),
     );
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 fn tool_schema<'a>(tools: &'a [Value], name: &str) -> &'a Value {
@@ -1053,19 +1030,19 @@ fn tool_schema<'a>(tools: &'a [Value], name: &str) -> &'a Value {
         .expect("tool schema")
 }
 
-fn mixed_config() -> (PathBuf, Config) {
+fn mixed_config() -> (rag_rat_base::test_scratch::ScratchDir, Config) {
     let root = unique_temp_root();
     fs::create_dir_all(root.join("docs")).unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("docs/search.md"), "# Title\nalpha token\n").unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn alpha_symbol() {}\n").unwrap();
-    (root.clone(), Config {
+    let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
+        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![
             ResolvedTarget {
@@ -1094,20 +1071,21 @@ fn mixed_config() -> (PathBuf, Config) {
         log: Default::default(),
         source_root_reanchored_from: None,
         allow_empty: false,
-    })
+    };
+    (root, config)
 }
 
-fn markdown_config(text: &str) -> (PathBuf, Config) {
+fn markdown_config(text: &str) -> (rag_rat_base::test_scratch::ScratchDir, Config) {
     let root = unique_temp_root();
     fs::create_dir_all(root.join("docs")).unwrap();
     fs::write(root.join("docs/search.md"), text).unwrap();
-    (root.clone(), Config {
+    let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
+        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
             name: "markdown".to_string(),
@@ -1126,7 +1104,8 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
         log: Default::default(),
         source_root_reanchored_from: None,
         allow_empty: false,
-    })
+    };
+    (root, config)
 }
 
 fn rust_config(root: PathBuf) -> Config {
@@ -1136,7 +1115,7 @@ fn rust_config(root: PathBuf) -> Config {
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
+        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
@@ -1158,9 +1137,8 @@ fn rust_config(root: PathBuf) -> Config {
     }
 }
 
-fn unique_temp_root() -> PathBuf {
-    let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("rag-rat-mcp-test-{}-{id}", std::process::id()))
+fn unique_temp_root() -> rag_rat_base::test_scratch::ScratchDir {
+    rag_rat_base::test_scratch::ScratchDir::new("mcp-test")
 }
 
 fn git(root: &Path, args: &[&str]) {
@@ -1198,7 +1176,6 @@ fn worktree_arg_prefers_request_then_falls_back_to_cwd() {
 #[test]
 fn worktree_param_routes_query_to_branch_overlay() {
     let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
     git(&root, &["init", "-q", "-b", "main"]);
@@ -1206,11 +1183,10 @@ fn worktree_param_routes_query_to_branch_overlay() {
     git(&root, &["config", "user.name", "t"]);
     git(&root, &["add", "."]);
     git(&root, &["commit", "-q", "-m", "base"]);
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let mut db = IndexDatabase::rebuild(&config).unwrap();
 
     let linked = unique_temp_root();
-    let _ = fs::remove_dir_all(&linked);
     git(&root, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
     fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
     git(&linked, &["add", "."]);
@@ -1245,9 +1221,6 @@ fn worktree_param_routes_query_to_branch_overlay() {
         0,
         "the overlay shadows the base symbol in the worktree scope"
     );
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&linked);
 }
 
 #[test]
@@ -1257,7 +1230,6 @@ fn compare_graph_to_text_stays_base_scoped_under_a_worktree_param() {
     // overlay while its TEXT side stayed main — mismatched. It must stay BASE-scoped even with a
     // `worktree` arg, so a `worktree`-passed call matches the base call exactly.
     let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
     // Base: `caller` calls `target`.
     fs::write(root.join("src/a.rs"), "pub fn target() {}\npub fn caller() {\n    target();\n}\n")
@@ -1267,13 +1239,12 @@ fn compare_graph_to_text_stays_base_scoped_under_a_worktree_param() {
     git(&root, &["config", "user.name", "t"]);
     git(&root, &["add", "."]);
     git(&root, &["commit", "-q", "-m", "base"]);
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let mut db = IndexDatabase::rebuild(&config).unwrap();
 
     // Branch: `caller` no longer calls `target` (the callsite is gone on the branch). An
     // overlay-scoped compare would see 0 graph edges; the base sees 1.
     let linked = unique_temp_root();
-    let _ = fs::remove_dir_all(&linked);
     git(&root, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
     fs::write(linked.join("src/a.rs"), "pub fn target() {}\npub fn caller() {\n}\n").unwrap();
     git(&linked, &["add", "."]);
@@ -1310,9 +1281,6 @@ fn compare_graph_to_text_stays_base_scoped_under_a_worktree_param() {
         base["summary"]["graph_edges"].as_u64().unwrap() >= 1,
         "the base call sees the committed callsite edge: {base:?}",
     );
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&linked);
 }
 
 #[test]
@@ -1324,7 +1292,6 @@ fn heal_index_from_a_linked_worktree_does_not_corrupt_the_overlay() {
     // makes the heal paths refuse to write under a linked overlay scope, so the overlay
     // survives a `heal_index` invoked from the worktree cwd.
     let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
     git(&root, &["init", "-q", "-b", "main"]);
@@ -1332,11 +1299,10 @@ fn heal_index_from_a_linked_worktree_does_not_corrupt_the_overlay() {
     git(&root, &["config", "user.name", "t"]);
     git(&root, &["add", "."]);
     git(&root, &["commit", "-q", "-m", "base"]);
-    let config = rust_config(root.clone());
+    let config = rust_config(root.to_path_buf());
     let mut db = IndexDatabase::rebuild(&config).unwrap();
 
     let linked = unique_temp_root();
-    let _ = fs::remove_dir_all(&linked);
     git(&root, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
     // Branch modifies one file AND adds a branch-only file (the file absent from main is the strong
     // corruption vector: a worktree-scoped heal can't read it from `source_root`, so it
@@ -1376,9 +1342,6 @@ fn heal_index_from_a_linked_worktree_does_not_corrupt_the_overlay() {
         candidate_count(&only) > 0,
         "heal_index must NOT tombstone the branch-only overlay file",
     );
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&linked);
 }
 
 #[test]
@@ -1406,8 +1369,6 @@ fn read_tool_lazy_write_retries_read_write_not_readonly_error() {
         !rag_rat_db::storage::is_readonly_violation(&err),
         "the lazy write must be retried read-write, never surfaced as SQLITE_READONLY: {err:?}"
     );
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

@@ -473,11 +473,9 @@ mod tests {
         // `--infer-tsconfig` writing one into the tree — the read-only-on-source contract.
         let manifest = ToolManifest::for_tool(OracleTool::ScipTypescript);
         assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_some());
-        let dir = std::env::temp_dir().join("rag_rat_ts_prereq_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("ts-prereq");
         std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
         assert!(manifest.prerequisite_blocked(&dir).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -504,9 +502,7 @@ mod tests {
         // `pom.xml` Kotlin project would fail rather than index (Codex on #193).
         let manifest = ToolManifest::for_tool(OracleTool::ScipJava);
         assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_some());
-        let dir = std::env::temp_dir().join("rag_rat_java_prereq_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("java-prereq");
         assert!(manifest.prerequisite_blocked(&dir).is_some(), "empty dir has no build → Blocked");
         std::fs::write(dir.join("pom.xml"), "").unwrap();
         assert!(
@@ -526,6 +522,5 @@ mod tests {
             manifest.prerequisite_blocked(&dir).is_none(),
             "a gradlew wrapper is a scip-java Gradle sentinel → satisfied"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

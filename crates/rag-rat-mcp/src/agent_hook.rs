@@ -407,13 +407,8 @@ mod listener_tests {
     /// mirrors `mcp_hot_upgrade.rs`'s `TestEnv::setup`, minus targets (the listener never
     /// indexes). The DB is created at `config.database` *after* `Config::load` so root
     /// canonicalization can't desync the two paths.
-    fn test_config() -> Config {
-        let root = std::env::temp_dir().join(format!(
-            "ragrat-hooksock-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+    fn test_config() -> (rag_rat_base::test_scratch::ScratchDir, Config) {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("hooksock");
         let config_path = root.join("rag-rat.toml");
         std::fs::write(&config_path, "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.db\"\n")
             .unwrap();
@@ -461,7 +456,7 @@ mod listener_tests {
             .unwrap();
         // No rebuild_fts here: external-content FTS5 rebuilds corrupt when out of sync with
         // direct seeding, and the symbol lane needs no FTS rows.
-        config
+        (root, config)
     }
 
     async fn request(socket: &std::path::Path, body: serde_json::Value) -> serde_json::Value {
@@ -476,7 +471,7 @@ mod listener_tests {
 
     #[tokio::test]
     async fn listener_serves_context_then_dedupes_per_session() {
-        let config = test_config();
+        let (_scratch, config) = test_config();
         let _listener = spawn_listener(config.clone());
         let socket = socket_path_for(&config);
         // Election + bind are async; poll for the socket.
@@ -510,7 +505,7 @@ mod listener_tests {
     /// `frobnicate`, which has a caller), and dedups per session like grep-augment does.
     #[tokio::test]
     async fn listener_serves_read_augment_and_dedupes_per_session() {
-        let config = test_config();
+        let (_scratch, config) = test_config();
         let _listener = spawn_listener(config.clone());
         let socket = socket_path_for(&config);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -548,7 +543,7 @@ mod listener_tests {
     async fn second_listener_takes_over_when_winner_dies() {
         use super::listener::{ListenerHooks, spawn_listener_with_hooks};
 
-        let config = test_config();
+        let (_scratch, config) = test_config();
         let winner_hooks = ListenerHooks::default();
         let winner = spawn_listener_with_hooks(config.clone(), winner_hooks.clone());
         // Wait for the winner to have bound the socket instead of polling socket.exists().

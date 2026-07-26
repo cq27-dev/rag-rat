@@ -263,7 +263,6 @@ impl<P: FlightPayload> MarkerGuard<'_, P> {
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
@@ -298,22 +297,16 @@ mod tests {
 
     /// A fresh flight coordinator over a unique temp key (unique across threads AND processes — the
     /// coverage runner shares one process, so pid+millis alone collides).
-    fn flight<P: FlightPayload>() -> (SingleFlight<P>, PathBuf) {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "rag-rat-single-flight-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn flight<P: FlightPayload>() -> (crate::test_scratch::ScratchDir, SingleFlight<P>) {
+        let dir = crate::test_scratch::ScratchDir::new("single-flight");
         let sf =
             SingleFlight::new(dir.join("flight.lock"), dir.join("marker"), dir.join("marker.lock"));
-        (sf, dir)
+        (dir, sf)
     }
 
     #[test]
     fn a_lone_trigger_runs_once() {
-        let (sf, dir) = flight::<Ids>();
+        let (_dir, sf) = flight::<Ids>();
         let passes = RefCell::new(Vec::new());
         let outcome = sf
             .run(Ids::of([1]), |p| {
@@ -323,7 +316,6 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, FlightOutcome::Ran(Some(()))));
         assert_eq!(*passes.borrow(), vec![Ids::of([1])]);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -332,7 +324,7 @@ mod tests {
         // the union — never a lost payload. Simulated inline: the first pass queues a
         // second payload (as a concurrent trigger's `merge` would), and the drain must
         // rerun with it.
-        let (sf, dir) = flight::<Ids>();
+        let (_dir, sf) = flight::<Ids>();
         let passes = RefCell::new(Vec::new());
         let first = Cell::new(true);
         let outcome = sf
@@ -346,14 +338,13 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, FlightOutcome::Ran(Some(()))));
         assert_eq!(*passes.borrow(), vec![Ids::of([1]), Ids::of([2, 3])]);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_trigger_coalesces_when_a_runner_holds_the_flight_lock() {
         // Holding the flight lock stands in for an in-flight runner: a fresh trigger must merge
         // into the marker and return Coalesced, not run.
-        let (sf, dir) = flight::<Ids>();
+        let (dir, sf) = flight::<Ids>();
         let _held = FileLock::acquire_blocking(sf.flight_lock_path()).unwrap();
         let outcome = sf
             .run(Ids::of([7]), |_| -> anyhow::Result<Step<()>> {
@@ -366,14 +357,13 @@ mod tests {
             std::fs::read(dir.join("marker")).map(|b| Ids::decode(&b)).unwrap(),
             Ids::of([7])
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_stale_marker_is_drained_not_wedged() {
         // A marker left by a killed runner must be absorbed by the next runner's first pass, never
         // strand it. Written directly, as a crashed process would leave it.
-        let (sf, dir) = flight::<Ids>();
+        let (dir, sf) = flight::<Ids>();
         std::fs::write(dir.join("marker"), Ids::of([4]).encode()).unwrap();
         let passes = RefCell::new(Vec::new());
         sf.run(Ids::of([5]), |p| {
@@ -383,12 +373,11 @@ mod tests {
         .unwrap();
         assert_eq!(*passes.borrow(), vec![Ids::of([4, 5])], "the stale marker is folded in, once");
         assert!(!dir.join("marker").exists(), "and the marker is drained, not left wedged");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn stop_requeue_leaves_the_marker_set() {
-        let (sf, dir) = flight::<Ids>();
+        let (dir, sf) = flight::<Ids>();
         let outcome = sf
             .run(Ids::of([9]), |_| -> anyhow::Result<Step<()>> { Ok(Step::StopRequeue) })
             .unwrap();
@@ -398,12 +387,11 @@ mod tests {
             Ids::of([9]),
             "the payload is left for a future runner",
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn stop_carry_hands_the_payload_back_and_clears_the_marker() {
-        let (sf, dir) = flight::<Ids>();
+        let (dir, sf) = flight::<Ids>();
         // A payload also queued mid-marker must be absorbed into the carried value.
         sf.queue(Ids::of([2])).unwrap();
         let outcome =
@@ -414,14 +402,13 @@ mod tests {
                 panic!("expected Stopped(Some), got {:?}", matches!(other, FlightOutcome::Ran(_))),
         }
         assert!(!dir.join("marker").exists(), "the marker is consumed into the carried payload");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn the_unit_payload_reruns_on_a_bare_marker() {
         // The maintenance (#267) case: `()` carries nothing; the marker's mere existence is the
         // rerun signal.
-        let (sf, dir) = flight::<()>();
+        let (_dir, sf) = flight::<()>();
         let count = Cell::new(0u32);
         let first = Cell::new(true);
         sf.run((), |()| {
@@ -433,6 +420,5 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count.get(), 2, "a bare marker set mid-pass earns exactly one rerun");
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

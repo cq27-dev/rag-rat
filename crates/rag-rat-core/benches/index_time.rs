@@ -28,15 +28,7 @@ const SUBDIR: &str = ".";
 /// box (#251).
 struct TempIndexDb {
     config: Config,
-}
-
-impl Drop for TempIndexDb {
-    fn drop(&mut self) {
-        let db = self.config.database.display().to_string();
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{db}{suffix}"));
-        }
-    }
+    _scratch: rag_rat_base::test_scratch::ScratchDir,
 }
 
 fn full_index(c: &mut Criterion) {
@@ -45,7 +37,7 @@ fn full_index(c: &mut Criterion) {
 
     // Build one index up front to report the real scale being measured (and to size throughput).
     // This is the headline number a user cares about: how big a repo are we actually indexing?
-    let probe = bench_config(SUBDIR);
+    let (probe, _scratch) = bench_config(SUBDIR);
     let db = IndexDatabase::rebuild(&probe).expect("probe rebuild");
     let status = db.status(&probe.database).expect("index status");
     let files: u64 = status.file_count_by_language.values().sum();
@@ -68,7 +60,10 @@ fn full_index(c: &mut Criterion) {
         // on disk rather than leaking one per iteration (#251). The deletion is outside the
         // measured section.
         b.iter_batched_ref(
-            || TempIndexDb { config: bench_config(SUBDIR) },
+            || {
+                let (config, scratch) = bench_config(SUBDIR);
+                TempIndexDb { config, _scratch: scratch }
+            },
             |bench_db| {
                 let db = IndexDatabase::rebuild(&bench_db.config).expect("rebuild corpus index");
                 std::hint::black_box(db);

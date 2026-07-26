@@ -642,17 +642,11 @@ fn socket_path_with_runtime_base(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
-    static LOCK_TEMP: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir() -> PathBuf {
-        let id = LOCK_TEMP.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ragrat-lock-{}-{id}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir() -> crate::test_scratch::ScratchDir {
+        crate::test_scratch::ScratchDir::new("lock")
     }
 
     #[test]
@@ -673,8 +667,6 @@ mod tests {
         drop(first);
         let reacquired = FileLock::try_acquire(&path).unwrap();
         assert!(reacquired.is_some(), "should acquire after the holder drops");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// #409: flock ownership belongs to the open-file-description, not the fd. A child forked
@@ -726,8 +718,6 @@ mod tests {
             reacquired.is_some(),
             "drop must release the flock immediately despite the fork-inherited fd (#409)"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -780,8 +770,6 @@ mod tests {
         .join()
         .unwrap();
         assert!(reacquired, "the lock is free after the outermost guard drops");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -842,12 +830,10 @@ mod tests {
         // `/tmp`->`/private/tmp` aliasing on Linux with an explicit symlink so the raw and
         // canonical forms diverge.
         let real = temp_dir();
-        let link = real.parent().unwrap().join(format!(
-            "ragrat-lock-link-{}-{}",
-            std::process::id(),
-            LOCK_TEMP.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_file(&link);
+        // The symlink lives inside its own guard, so a failing assert can't strand it in the
+        // shared temp root.
+        let link_parent = temp_dir();
+        let link = link_parent.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         // A DB whose `.rag-rat/` parent does NOT exist yet, reached through the symlink.
@@ -862,9 +848,6 @@ mod tests {
         // The aliased path and the real path resolve to ONE lock file (the alias is collapsed).
         let via_real = write_lock_path(&real.join(".rag-rat").join("index.sqlite"), "abcd12345678");
         assert_eq!(after, via_real, "aliased and canonical paths share one lock file");
-
-        let _ = fs::remove_file(&link);
-        let _ = fs::remove_dir_all(&real);
     }
 
     #[test]
@@ -930,8 +913,6 @@ mod tests {
         .join()
         .unwrap();
         assert!(reacquired, "the lock is free after the outermost session guard drops");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -973,21 +954,22 @@ mod tests {
     }
 
     /// Build a base dir long enough that `<base>/sockets/<hash>.sock` exceeds
-    /// `MAX_SOCKET_PATH_LEN`.
-    fn long_base_dir() -> PathBuf {
-        let mut base = temp_dir();
+    /// `MAX_SOCKET_PATH_LEN`, returned with the guard that removes it on drop.
+    fn long_base_dir() -> (crate::test_scratch::ScratchDir, PathBuf) {
+        let guard = temp_dir();
+        let mut base = guard.path().to_path_buf();
         // Each push appends ~28 bytes; 12 × 28 = 336, well over the 100-byte budget.
         for _ in 0..12 {
             base.push("very-long-directory-segment");
         }
-        base
+        (guard, base)
     }
 
     #[test]
     fn hook_socket_path_falls_back_when_base_path_is_too_long() {
         // When the preferred path is over budget and XDG_RUNTIME_DIR is a short /tmp path, the
         // XDG candidate fits within budget and is returned.
-        let long_base = long_base_dir();
+        let (_long_guard, long_base) = long_base_dir();
         let root = temp_dir();
         // Use a known-short runtime_base so the test is independent of the runner environment.
         let short_runtime_base = std::env::temp_dir(); // e.g. /tmp — always short
@@ -1005,8 +987,8 @@ mod tests {
     fn hook_socket_path_falls_back_to_temp_when_xdg_also_too_long() {
         // When both the preferred path and the XDG candidate are over budget, the function falls
         // through to the OS temp dir (best-effort; callers fail open).
-        let long_base = long_base_dir();
-        let long_runtime_base = long_base_dir();
+        let (_long_guard, long_base) = long_base_dir();
+        let (_long_rt_guard, long_runtime_base) = long_base_dir();
         let root = temp_dir();
         let socket = socket_path_with_runtime_base(&long_base, &root, &long_runtime_base);
         // Must not be under either long base.

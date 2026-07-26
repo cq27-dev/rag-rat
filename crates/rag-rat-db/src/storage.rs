@@ -306,8 +306,7 @@ mod tests {
 
     #[test]
     fn open_read_only_reads_but_rejects_writes() {
-        let dir = std::env::temp_dir().join(format!("ragrat-ro-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("ro");
         let db = dir.join("index.db");
         {
             let rw = IndexConnection::open(&db).unwrap();
@@ -319,17 +318,11 @@ mod tests {
         assert_eq!(n, 0);
         let err = ro.connection().execute("INSERT INTO index_meta(key, value) VALUES('x','y')", []);
         assert!(err.is_err(), "read-only connection must reject writes");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn setup_pins_the_write_path_pragmas() {
-        let dir = std::env::temp_dir().join(format!(
-            "ragrat-setup-pragmas-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("setup-pragmas");
         let db = dir.join("index.db");
         let rw = IndexConnection::open(&db).unwrap();
         let pragma = |name: &str| -> i64 {
@@ -349,8 +342,6 @@ mod tests {
             rw.connection().query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
         assert_eq!(mode, "wal");
         assert_eq!(pragma("synchronous"), 1, "synchronous must stay NORMAL");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Grow the `-wal` past the fold threshold with zeroblob pages (cheap to generate).
@@ -371,12 +362,7 @@ mod tests {
 
     #[test]
     fn dropping_a_write_connection_folds_an_oversized_wal() {
-        let dir = std::env::temp_dir().join(format!(
-            "ragrat-drop-fold-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("drop-fold");
         let db = dir.join("index.db");
         let rw = IndexConnection::open(&db).unwrap();
         // A second live connection defeats SQLite's last-connection-close checkpoint — the drop
@@ -392,17 +378,11 @@ mod tests {
             "dropping the write connection must fold the oversized WAL (#818)"
         );
         drop(holder);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn dropping_the_nowait_connection_never_folds() {
-        let dir = std::env::temp_dir().join(format!(
-            "ragrat-drop-nowait-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("drop-nowait");
         let db = dir.join("index.db");
         let holder = IndexConnection::open(&db).unwrap();
         grow_wal_past_threshold(&db);
@@ -417,23 +397,18 @@ mod tests {
             "the nowait event-loop connection must leave WAL folding to the pass worker"
         );
         drop(holder);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn open_read_only_fails_cleanly_when_database_missing() {
-        let missing = std::env::temp_dir().join("ragrat-ro-missing/never-created.db");
+        let scratch = rag_rat_base::test_scratch::ScratchDir::new("ro-missing");
+        let missing = scratch.join("never-created.db");
         assert!(IndexConnection::open_read_only(&missing).is_err());
     }
 
     #[test]
     fn open_read_only_blocking_does_not_persist_wal_mode_or_create_sidecars() {
-        let dir = std::env::temp_dir().join(format!(
-            "ragrat-ro-journal-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("ro-journal");
         let db = dir.join("index.db");
         {
             let conn = Connection::open(&db).unwrap();
@@ -453,12 +428,11 @@ mod tests {
         assert_eq!(mode, "delete", "journal mode must remain DELETE after the RO open");
         assert!(!db.with_extension("db-wal").exists(), "RO planning must not create a WAL file");
         assert!(!db.with_extension("db-shm").exists(), "RO planning must not create a SHM file");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn is_readonly_violation_flags_only_sqlite_readonly_errors() {
-        let dir = std::env::temp_dir().join(format!("ragrat-roviol-{}", std::process::id()));
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("roviol");
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("index.db");
         {
@@ -481,8 +455,6 @@ mod tests {
         let syntax_err: anyhow::Error =
             ro.connection().execute("THIS IS NOT SQL", []).unwrap_err().into();
         assert!(!is_readonly_violation(&syntax_err), "a non-readonly error must not be flagged");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn sqlite_failure(result_code: i32) -> anyhow::Error {

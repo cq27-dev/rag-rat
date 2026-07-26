@@ -736,8 +736,8 @@ mod tests {
         use rusqlite::OpenFlags;
 
         // Build a writable in-memory DB and apply the schema.
-        let rw_path =
-            std::env::temp_dir().join(format!("ragrat-refine-ro-probe-{}.db", std::process::id()));
+        let scratch = rag_rat_base::test_scratch::ScratchDir::new("refine-ro-probe");
+        let rw_path = scratch.join("probe.db");
         {
             let rw = rusqlite::Connection::open(&rw_path).unwrap();
             rag_rat_db::schema::apply(&rw, &rag_rat_db::MigrationHooks::noop()).unwrap();
@@ -759,8 +759,6 @@ mod tests {
             rag_rat_db::storage::is_readonly_violation(&anyhow_err),
             "the DELETE probe on a RO connection must produce SQLITE_READONLY: {anyhow_err}"
         );
-
-        let _ = std::fs::remove_file(&rw_path);
     }
 
     // ── Plan 4b Task 7: full content cache round-trip + version invalidation

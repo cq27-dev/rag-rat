@@ -5,7 +5,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::{env, fs};
 
 use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
@@ -43,34 +42,27 @@ pub fn corpus_dir() -> PathBuf {
     dir
 }
 
-static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-pub fn temp_db_path() -> PathBuf {
-    let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = env::temp_dir().join(format!("rag-rat-bench-{}-{n}.sqlite", std::process::id()));
-    // Pids recycle (containers, long-lived hosts), and bench DBs are never cleaned up — a name
-    // collision would REBUILD INTO the stale DB, leaving a multi-generation index whose query cost
-    // silently differs from a fresh one (measured swings of ±25% on query_warm). Delete any
-    // leftover (plus WAL/SHM siblings) so every bench run indexes into a truly fresh database.
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = fs::remove_file(path.with_file_name(format!(
-            "{}{suffix}",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        )));
-    }
-    path
+/// A guarded scratch dir (removed when the bench's value drops) holding the bench database.
+/// Every call is a fresh dir, so every bench run indexes into a truly fresh database — a stale
+/// DB would silently change measured query cost (the old pid+counter name reuse, ±25% on
+/// query_warm).
+fn temp_db() -> rag_rat_base::test_scratch::ScratchDir {
+    rag_rat_base::test_scratch::ScratchDir::new("bench")
 }
 
-/// A Config indexing `subdir` of the corpus into a fresh temp DB.
-pub fn bench_config(subdir: &str) -> Config {
-    Config {
+/// A Config indexing `subdir` of the corpus into a fresh temp DB, plus the guard that removes
+/// it on drop. The guard is the LAST tuple field: tuple fields drop in declaration order, so the
+/// Config — and any handle built from it — drops before the directory is removed.
+pub fn bench_config(subdir: &str) -> (Config, rag_rat_base::test_scratch::ScratchDir) {
+    let scratch = temp_db();
+    let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
         root: corpus_dir(),
-        database: temp_db_path(),
+        database: scratch.join("bench.sqlite"),
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
             language: Language::Rust,
@@ -88,22 +80,25 @@ pub fn bench_config(subdir: &str) -> Config {
         log: Default::default(),
         source_root_reanchored_from: None,
         allow_empty: false,
-    }
+    };
+    (config, scratch)
 }
 
-/// Build a fresh index of `subdir` and return the open handle.
-pub fn built_index(subdir: &str) -> IndexDatabase {
-    IndexDatabase::rebuild(&bench_config(subdir)).expect("rebuild corpus index")
+/// Build a fresh index of `subdir` and return the open handle (the guard drops after it).
+pub fn built_index(subdir: &str) -> (IndexDatabase, rag_rat_base::test_scratch::ScratchDir) {
+    let (config, scratch) = bench_config(subdir);
+    let db = IndexDatabase::rebuild(&config).expect("rebuild corpus index");
+    (db, scratch)
 }
 
 /// Build a fresh index of `subdir` and return its `Config`, so a cold-open bench can reopen the DB
 /// the way production `open_config` does — see [`open_like_production`]. (Returns the Config, not
 /// just the path, because the realistic reopen needs `config.root` to resolve the active-checkout
 /// git context.)
-pub fn built_config(subdir: &str) -> Config {
-    let config = bench_config(subdir);
+pub fn built_config(subdir: &str) -> (Config, rag_rat_base::test_scratch::ScratchDir) {
+    let (config, scratch) = bench_config(subdir);
     IndexDatabase::rebuild(&config).expect("rebuild corpus index");
-    config
+    (config, scratch)
 }
 
 /// Open an already-built index from disk the way the production `search` path does

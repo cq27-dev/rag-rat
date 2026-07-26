@@ -19,21 +19,21 @@ use shared::{bench_config, built_config, built_index, open_like_production};
 const SUBDIR: &str = "src/cargo/core/resolver";
 const QUERY: &str = "resolve dependency version conflict";
 
-fn resolver_config() -> rag_rat_base::config::Config {
+fn resolver_config() -> (Config, rag_rat_base::test_scratch::ScratchDir) {
     bench_config(SUBDIR)
 }
-fn resolver_index() -> IndexDatabase {
+fn resolver_index() -> (IndexDatabase, rag_rat_base::test_scratch::ScratchDir) {
     built_index(SUBDIR)
 }
-fn resolver_built_config() -> Config {
+fn resolver_built_config() -> (Config, rag_rat_base::test_scratch::ScratchDir) {
     built_config(SUBDIR)
 }
 
 // Index cost: full rebuild of the subtree. Setup (clone + Config) is not measured; only `rebuild`.
 #[library_benchmark]
 #[bench::cargo_resolver(setup = resolver_config)]
-fn index(config: rag_rat_base::config::Config) -> IndexDatabase {
-    IndexDatabase::rebuild(&config).expect("rebuild corpus index")
+fn index(setup: (Config, rag_rat_base::test_scratch::ScratchDir)) -> IndexDatabase {
+    IndexDatabase::rebuild(&setup.0).expect("rebuild corpus index")
 }
 
 // Cold query: open a freshly-built index from disk (cold page cache) the way production `search`
@@ -41,16 +41,16 @@ fn index(config: rag_rat_base::config::Config) -> IndexDatabase {
 // measured body, so this captures the realistic cold-open cost. Setup (rebuild) is not measured.
 #[library_benchmark]
 #[bench::cargo_resolver(setup = resolver_built_config)]
-fn query_cold(config: Config) -> usize {
-    let db = open_like_production(&config);
+fn query_cold(setup: (Config, rag_rat_base::test_scratch::ScratchDir)) -> usize {
+    let db = open_like_production(&setup.0);
     db.search(QUERY, 10, false).expect("search").len()
 }
 
 // Warm query: search against an already-open index (the build is in setup, not measured).
 #[library_benchmark]
 #[bench::cargo_resolver(setup = resolver_index)]
-fn query_warm(db: IndexDatabase) -> usize {
-    db.search(QUERY, 10, false).expect("search").len()
+fn query_warm(setup: (IndexDatabase, rag_rat_base::test_scratch::ScratchDir)) -> usize {
+    setup.0.search(QUERY, 10, false).expect("search").len()
 }
 
 library_benchmark_group!(

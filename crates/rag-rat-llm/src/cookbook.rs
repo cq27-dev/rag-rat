@@ -1221,11 +1221,9 @@ extern "C" fn handle_terminating_signal(signo: libc::c_int) {
 mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-
-    static N: AtomicU64 = AtomicU64::new(0);
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cookbook").join(name)
@@ -1346,9 +1344,11 @@ mod tests {
         assert!(err.to_string().contains("cancelled before start"), "{err:#}");
     }
 
-    fn tmp(name: &str) -> PathBuf {
-        let id = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("ragrat-cookbook-{}-{id}-{name}", std::process::id()))
+    /// A scratch dir (removed on drop) plus the path a fixture script writes inside it.
+    fn tmp(name: &str) -> (rag_rat_base::test_scratch::ScratchDir, PathBuf) {
+        let scratch = rag_rat_base::test_scratch::ScratchDir::new("cookbook");
+        let path = scratch.join(name);
+        (scratch, path)
     }
 
     #[test]
@@ -1438,7 +1438,7 @@ mod tests {
         // only a process-GROUP kill reaches it. If `Drop` killed just `child.id()` (the old bug),
         // the grandchild would survive (the leaked paid box). We provision, read the grandchild's
         // pid, drop the box, and assert the grandchild is GONE.
-        let pidfile = tmp("grandchild-pid");
+        let (_scratch, pidfile) = tmp("grandchild-pid");
         let _ = std::fs::remove_file(&pidfile);
         let cmd = stub_command("stub_grandchild.sh", &[
             ("STUB_ENDPOINT", "http://127.0.0.1:1"),
@@ -1484,7 +1484,7 @@ mod tests {
         // the instant the leader's `waitpid` succeeded → it skipped the SIGKILL backstop and `Drop`
         // returned with the grandchild (the paid box) still alive — a leak. The fix polls the whole
         // GROUP (`killpg(pgid, 0)`), so `Drop` must NOT return until the grandchild is gone too.
-        let pidfile = tmp("lingering-grandchild-pid");
+        let (_scratch, pidfile) = tmp("lingering-grandchild-pid");
         let _ = std::fs::remove_file(&pidfile);
         let cmd = stub_command("stub_grandchild_lingers.sh", &[
             ("STUB_ENDPOINT", "http://127.0.0.1:1"),
@@ -1876,7 +1876,7 @@ mod tests {
         // group probe / NO killpg → the grandchild (the paid box) is orphaned. This case
         // FAILS before the Part-1 fix and PASSES after it: the fix always probes the GROUP
         // and runs the full SIGTERM→grace→SIGKILL teardown.
-        let pidfile = tmp("wrapper-early-gc-pid");
+        let (_scratch, pidfile) = tmp("wrapper-early-gc-pid");
         let _ = std::fs::remove_file(&pidfile);
         let cmd = stub_command("stub_wrapper_exits_early.sh", &[
             ("STUB_ENDPOINT", "http://127.0.0.1:1"),
@@ -1904,7 +1904,7 @@ mod tests {
         // `waitpid` — it polls the GROUP and (for a long-enough hang) SIGKILLs at the grace
         // deadline. `stub_grandchild`'s grandchild ignores TERM and sleeps long, so only
         // the group SIGKILL backstop reaps it.
-        let pidfile = tmp("hung-gc-pid");
+        let (_scratch, pidfile) = tmp("hung-gc-pid");
         let _ = std::fs::remove_file(&pidfile);
         let cmd = stub_command("stub_grandchild.sh", &[
             ("STUB_ENDPOINT", "http://127.0.0.1:1"),
@@ -1932,7 +1932,7 @@ mod tests {
         // up. The timeout path must run the full `teardown_group` (R1: grace, not a hard
         // SIGKILL-only) and reap the group — NOT return the timeout error while leaking the
         // grandchild.
-        let pidfile = tmp("timeout-live-gc-pid");
+        let (_scratch, pidfile) = tmp("timeout-live-gc-pid");
         let _ = std::fs::remove_file(&pidfile);
         // The box is never returned (it never serves), so the grandchild's pidfile is our handle on
         // the group. Run provisioning on a thread so we can read the pidfile while it blocks on the
@@ -2005,8 +2005,8 @@ mod tests {
         }
 
         let exe = std::env::current_exe().expect("test binary path");
-        let gc_pidfile = tmp("case6-grandchild-pid");
-        let ready_file = tmp("case6-ready");
+        let (_scratch, gc_pidfile) = tmp("case6-grandchild-pid");
+        let (_scratch2, ready_file) = tmp("case6-ready");
         let _ = std::fs::remove_file(&gc_pidfile);
         let _ = std::fs::remove_file(&ready_file);
 
