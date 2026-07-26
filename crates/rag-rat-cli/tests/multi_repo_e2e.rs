@@ -367,13 +367,7 @@ fn identical_content_fixtures_get_distinct_repo_ids() {
     let repo_b = keyless_repo("c0-b", &files);
 
     let root_commit = |root: &Path| -> String {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["rev-list", "--max-parents=0", "HEAD"])
-            .output()
-            .unwrap();
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
+        rag_rat_base::test_git::output(root, &["rev-list", "--max-parents=0", "HEAD"])
     };
     assert_ne!(
         root_commit(&repo_a),

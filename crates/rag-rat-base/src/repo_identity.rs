@@ -360,7 +360,6 @@ fn empty_repo_error(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -376,14 +375,11 @@ mod tests {
     }
 
     fn git(root: &Path, args: &[&str]) {
-        let out = Command::new("git").args(args).current_dir(root).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(root, args);
     }
 
     fn git_out(root: &Path, args: &[&str]) -> String {
-        let out = Command::new("git").args(args).current_dir(root).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
+        crate::test_git::output(root, args)
     }
 
     fn init_repo(root: &Path) {

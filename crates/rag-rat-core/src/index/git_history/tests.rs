@@ -1,5 +1,4 @@
 use std::fs;
-use std::process::Command;
 
 use super::apply::current_history_cursors_at_or_after_prepared;
 use super::read::read_history_excluding;
@@ -10,14 +9,11 @@ fn temp_root(label: &str) -> rag_rat_base::test_scratch::ScratchDir {
 }
 
 fn run_git(root: &Path, args: &[&str]) {
-    let status = Command::new("git").current_dir(root).args(args).status().unwrap();
-    assert!(status.success(), "git {args:?} failed");
+    rag_rat_base::test_git::run(root, args);
 }
 
 fn git_output(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git").current_dir(root).args(args).output().unwrap();
-    assert!(output.status.success(), "git {args:?} failed");
-    String::from_utf8(output.stdout).unwrap().trim().to_string()
+    rag_rat_base::test_git::output(root, args)
 }
 
 fn insert_commit_row(conn: &Connection, repo_id: &str, hash: &str) {

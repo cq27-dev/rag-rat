@@ -65,6 +65,11 @@ fn init_yes_writes_a_config_that_config_load_accepts() {
         .env("RAG_RAT_DATA_DIR", &data_dir)
         .env("HOME", &*root)
         .env("XDG_CACHE_HOME", &cache)
+        // The production subprocess honors the ambient git config (it must — hook install is a
+        // real user-facing path), so the harness isolates it to keep the test machine-independent
+        // (#970): a hostile ambient `core.hooksPath` must not reach the fixture's hook install.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .expect("run rag-rat init --yes");
 
@@ -146,6 +151,8 @@ fn init_in_a_new_repo_leaves_an_existing_repos_heal_owed_meta() {
             .env("RAG_RAT_DATA_DIR", &data_dir)
             .env("HOME", &*base)
             .env("XDG_CACHE_HOME", &cache)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .output()
             .unwrap()
     };
@@ -243,14 +250,13 @@ fn init_refuses_to_run_in_a_linked_worktree() {
     git_init(&root);
 
     let linked = common::unique_dir("init-yes-linked");
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&*root)
-        .args(["worktree", "add", "--detach", "-q"])
-        .arg(&*linked)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "worktree add: {}", String::from_utf8_lossy(&out.stderr));
+    rag_rat_base::test_git::run(&root, &[
+        "worktree",
+        "add",
+        "--detach",
+        "-q",
+        linked.to_str().unwrap(),
+    ]);
 
     let output = Command::new(env!("CARGO_BIN_EXE_rag-rat"))
         .args(["init", "-y"])

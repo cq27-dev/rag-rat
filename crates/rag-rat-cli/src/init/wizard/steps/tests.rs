@@ -1252,12 +1252,7 @@ fn integration_combines_version_check_and_hooks() {
 #[test]
 fn integration_blocks_unresolved_foreign_hook_conflicts() {
     let dir = tempfile::tempdir().unwrap();
-    let status = std::process::Command::new("git")
-        .arg("init")
-        .arg(dir.path())
-        .status()
-        .expect("git init should run");
-    assert!(status.success());
+    rag_rat_base::test_git::run(dir.path(), &["init", "-q"]);
     let gp = git_paths(dir.path()).unwrap();
     std::fs::create_dir_all(&gp.hooks_dir).unwrap();
     let hook = MANAGED_HOOKS[0];

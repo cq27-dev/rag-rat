@@ -1142,16 +1142,7 @@ fn unique_temp_root() -> rag_rat_base::test_scratch::ScratchDir {
 }
 
 fn git(root: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@e")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@e")
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    rag_rat_base::test_git::run(root, args);
 }
 
 fn candidate_count(value: &Value) -> usize {

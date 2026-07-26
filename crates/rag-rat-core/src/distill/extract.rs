@@ -2261,9 +2261,7 @@ mod tests {
         let root = rag_rat_base::test_scratch::ScratchDir::new("distill-merge");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let git = |args: &[&str]| {
-            let status =
-                std::process::Command::new("git").current_dir(&root).args(args).status().unwrap();
-            assert!(status.success(), "git {args:?} failed");
+            rag_rat_base::test_git::run(&root, args);
         };
         git(&["init", "-q"]);
         git(&["config", "user.name", "Rag Rat"]);
@@ -2278,12 +2276,7 @@ mod tests {
         git(&["checkout", "-q", "-"]);
         // `--no-ff` forces a real merge commit (a fast-forward would carry no merge node).
         git(&["merge", "--no-ff", "-q", "-m", "Merge feature", "feature"]);
-        let out = std::process::Command::new("git")
-            .current_dir(&root)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        let merge_sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let merge_sha = rag_rat_base::test_git::output(&root, &["rev-parse", "HEAD"]);
         (root, merge_sha, "src/widget.rs".to_string())
     }
 
@@ -2484,18 +2477,14 @@ mod tests {
         let (root, merge_sha, path) = build_merge_repo();
         // `git clone` into the guard's fresh, empty directory.
         let shallow = rag_rat_base::test_scratch::ScratchDir::new("distill-shallow");
-        let status = std::process::Command::new("git")
-            .args([
-                "clone",
-                "-q",
-                "--depth",
-                "1",
-                &format!("file://{}", root.display()),
-                shallow.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success(), "shallow clone failed");
+        rag_rat_base::test_git::run(&root, &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", root.display()),
+            shallow.to_str().unwrap(),
+        ]);
 
         let conn = scoped_conn("repoA");
         seed_item(
@@ -2526,9 +2515,7 @@ mod tests {
         let root = rag_rat_base::test_scratch::ScratchDir::new("distill-big");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let git = |args: &[&str]| {
-            let status =
-                std::process::Command::new("git").current_dir(&root).args(args).status().unwrap();
-            assert!(status.success(), "git {args:?} failed");
+            rag_rat_base::test_git::run(&root, args);
         };
         git(&["init", "-q"]);
         git(&["config", "user.name", "Rag Rat"]);
@@ -2540,12 +2527,7 @@ mod tests {
         std::fs::write(root.join("src/big.rs"), "x".repeat(1_200_000)).unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "fix: widget and a giant file"]);
-        let out = std::process::Command::new("git")
-            .current_dir(&root)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        let fix_sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let fix_sha = rag_rat_base::test_git::output(&root, &["rev-parse", "HEAD"]);
         (root, fix_sha)
     }
 
@@ -2759,9 +2741,7 @@ mod tests {
         let root = rag_rat_base::test_scratch::ScratchDir::new("distill-del");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let git = |args: &[&str]| {
-            let status =
-                std::process::Command::new("git").current_dir(&root).args(args).status().unwrap();
-            assert!(status.success(), "git {args:?} failed");
+            rag_rat_base::test_git::run(&root, args);
         };
         git(&["init", "-q"]);
         git(&["config", "user.name", "Rag Rat"]);
@@ -2772,12 +2752,7 @@ mod tests {
         std::fs::remove_file(root.join("src/gone.rs")).unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "fix: remove gone"]);
-        let out = std::process::Command::new("git")
-            .current_dir(&root)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        let fix_sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let fix_sha = rag_rat_base::test_git::output(&root, &["rev-parse", "HEAD"]);
         (root, fix_sha, "src/gone.rs".to_string())
     }
 

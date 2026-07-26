@@ -80,11 +80,7 @@ fn index_warns_when_a_clone_joins_an_indexed_repo() {
 
     // Clone B (same root commit → same portable identity) pointed at the SAME database.
     let b = tmp.join("B");
-    let cloned = Command::new("git")
-        .args(["clone", "-q", a.to_str().unwrap(), b.to_str().unwrap()])
-        .status()
-        .unwrap();
-    assert!(cloned.success(), "git clone A B failed");
+    rag_rat_base::test_git::run(&a, &["clone", "-q", a.to_str().unwrap(), b.to_str().unwrap()]);
     std::fs::write(b.join("rag-rat.toml"), shared_config(&shared)).unwrap();
 
     let out = run_index(&b.join("rag-rat.toml"), &b);
@@ -116,18 +112,15 @@ fn index_warns_when_root_names_a_linked_worktree() {
 
     // A linked worktree with a local config whose root="." resolves to the worktree.
     let wt = tmp.join("wt");
-    let added = Command::new("git")
-        .args([
-            "-C",
-            main.to_str().unwrap(),
-            "worktree",
-            "add",
-            "--detach",
-            "-q",
-            wt.to_str().unwrap(),
-        ])
-        .status()
-        .unwrap();
+    let added = rag_rat_base::test_git::command(&main, &[
+        "worktree",
+        "add",
+        "--detach",
+        "-q",
+        wt.to_str().unwrap(),
+    ])
+    .status()
+    .unwrap();
     assert!(added.success(), "git worktree add failed");
     std::fs::create_dir_all(wt.join("src")).unwrap();
     std::fs::write(wt.join("rag-rat.toml"), shared_config(&shared)).unwrap();
@@ -202,7 +195,7 @@ fn full_rebuild_prunes_an_existing_placeholder_index_instead_of_refusing() {
 
     // Give the root a git identity the DB has NOT adopted, then delete all target files.
     let git = |args: &[&str]| {
-        Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+        rag_rat_base::test_git::run(repo, args);
     };
     git(&["init", "-q"]);
     git(&["config", "user.email", "t@example.com"]);
@@ -256,7 +249,7 @@ fn index_discover_refuses_a_first_time_empty_repo_against_an_existing_db() {
     std::fs::create_dir_all(b.join("src")).unwrap();
     std::fs::write(b.join("src/b.rs"), "fn b() {}\n").unwrap();
     let git_b = |args: &[&str]| {
-        Command::new("git").arg("-C").arg(&b).args(args).output().unwrap();
+        rag_rat_base::test_git::run(&b, args);
     };
     git_b(&["init", "-q"]);
     git_b(&["config", "user.email", "t@example.com"]);
@@ -418,7 +411,7 @@ fn git_available() -> bool {
 
 fn git_init_commit(dir: &Path) {
     let git = |args: &[&str]| {
-        Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        rag_rat_base::test_git::run(dir, args);
     };
     git(&["init", "-q"]);
     git(&["config", "user.email", "t@example.com"]);

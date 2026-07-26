@@ -826,18 +826,7 @@ fn oracle_run_without_tool_is_blocked_not_error() {
 /// so `resolve_git_context` returns a non-empty `commit_sha` AND `worktree_id` (the active
 /// context every other e2e test misses by running in a non-git temp dir).
 fn git(root: &std::path::Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?} failed");
+    rag_rat_base::test_git::run(root, args);
 }
 
 /// Global (un-seeded) ranking — the common assertion shape: no explicit seed, no auto-diff.

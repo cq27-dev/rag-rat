@@ -431,13 +431,7 @@ mod tests {
     /// Initialize a real (empty) Git repo at `dir` so worktree-root resolution returns `dir`. Used
     /// by the ancestor-chain test; the others don't need git (base falls back to `root`).
     fn git_init(dir: &Path) {
-        let ok = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "git init failed (git must be on PATH for this test)");
+        rag_rat_base::test_git::run(dir, &["init", "-q"]);
     }
 
     #[test]

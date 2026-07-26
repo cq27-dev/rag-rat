@@ -1770,13 +1770,7 @@ fn real_git_repo(tag: &str) -> ScratchRoot {
 
 /// The full HEAD commit hash — a commit reachable from HEAD, used as a recorded shallow boundary.
 fn head_commit_hash(root: &Path) -> String {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git rev-parse HEAD failed");
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
+    rag_rat_base::test_git::output(root, &["rev-parse", "HEAD"])
 }
 
 /// PROOF gates the RE-POINT, not the registration (A7): a DB first indexed from a cut shallow clone

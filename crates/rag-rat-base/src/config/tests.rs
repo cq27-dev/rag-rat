@@ -53,7 +53,7 @@ fn config_load_resolves_main_and_linked_worktrees_to_one_database() {
     // The actual guarantee (review item 1): Config::load from the main worktree and from a
     // linked worktree of the same repo produce the *same* database path — not two DBs.
     let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("cfgload");
     let main = tmp.join("main");
@@ -330,8 +330,7 @@ fn repo_id_override_is_parsed_and_does_not_change_the_database_path() {
 /// identity).
 fn git_commit_all(dir: &Path) {
     let git = |args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     git(&["init", "-q"]);
     git(&["config", "user.email", "t@e"]);
@@ -373,8 +372,7 @@ fn config_load_without_a_database_key_resolves_to_the_global_database() {
 #[test]
 fn config_load_in_a_linked_worktree_is_governed_wholesale_by_the_main_config() {
     let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("wholecfg");
     let main = tmp.join("main");
@@ -420,8 +418,7 @@ fn config_load_in_a_linked_worktree_is_governed_wholesale_by_the_main_config() {
 #[test]
 fn config_load_falls_back_to_the_local_config_when_main_has_none() {
     let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("nomaincfg");
     let main = tmp.join("main");
@@ -460,8 +457,7 @@ fn config_load_falls_back_to_the_local_config_when_main_has_none() {
 #[test]
 fn discover_config_path_resolves_the_governing_checkout() {
     let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("discover");
     let main = tmp.join("main");
@@ -533,8 +529,7 @@ fn discover_config_path_walks_up_to_a_parent_repo_config() {
 #[test]
 fn discover_config_path_does_not_cross_a_nested_repo_boundary() {
     let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("nested");
     let parent = tmp.join("parent");
@@ -564,8 +559,7 @@ fn discover_config_path_does_not_cross_a_nested_repo_boundary() {
 #[test]
 fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdir() {
     let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("wtsub");
     let main = tmp.join("main");
@@ -606,8 +600,7 @@ fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdi
 #[test]
 fn linked_worktree_main_root_derives_linkedness_from_topology() {
     let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("linkpred");
     let main = tmp.join("main");
@@ -647,8 +640,7 @@ fn linked_worktree_main_root_derives_linkedness_from_topology() {
 #[test]
 fn config_load_ignores_an_invalid_branch_config_when_main_governs() {
     let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("brokecfg");
     let main = tmp.join("main");
@@ -700,8 +692,7 @@ fn config_load_ignores_an_invalid_branch_config_when_main_governs() {
 #[test]
 fn config_load_governs_from_main_even_when_a_branch_only_root_defeats_anchoring() {
     let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("branchroot");
     let main = tmp.join("main");
@@ -800,8 +791,7 @@ fn config_load_refuses_an_identity_less_pin_at_the_global_store() {
 #[test]
 fn config_load_anchors_the_database_key_to_the_main_worktree() {
     let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("dbanchor");
     let main = tmp.join("main");
@@ -949,9 +939,7 @@ fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
     // existing single-repo adoption flow), instead of stranding in the global store.
     let unborn = keyless_config("unborn");
     let git = |args: &[&str]| {
-        let out =
-            std::process::Command::new("git").arg("-C").arg(&*unborn).args(args).output().unwrap();
-        assert!(out.status.success());
+        crate::test_git::run(&unborn, args);
     };
     git(&["init", "-q"]);
     let config = Config::load(unborn.join("rag-rat.toml")).unwrap();
@@ -1001,7 +989,7 @@ fn config_load_in_a_linked_worktree_uses_main_base_targets_not_the_branch() {
     // any main file outside it. The branch's extra target is served via the overlay, not the
     // base config.
     let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("cfgbranch");
     let main = tmp.join("main");
@@ -1066,7 +1054,7 @@ fn config_load_in_a_linked_worktree_keeps_main_targets_when_the_branch_narrows_t
     // base scope — hiding committed files from main queries. The stored base targets
     // must be MAIN's.
     let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("cfgnarrow");
     let main = tmp.join("main");
@@ -1115,7 +1103,7 @@ fn config_load_anchors_repo_id_override_to_main_when_the_branch_diverges() {
     // a DIFFERENT id must still resolve MAIN's — otherwise identity splits by which checkout
     // launched. This mirrors the root/database/targets anchoring above.
     let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("repoid-anchor");
     let main = tmp.join("main");
@@ -1167,7 +1155,7 @@ fn config_load_anchors_repo_id_override_to_main_when_main_omits_it() {
     // NOT honored for the shared identity (honoring it would make identity depend on
     // which worktree launched).
     let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("repoid-mainomit");
     let main = tmp.join("main");
@@ -1212,8 +1200,7 @@ fn config_load_anchors_repo_id_override_to_main_when_main_omits_it() {
 #[test]
 fn load_records_the_pre_anchor_root_for_a_linked_worktree() {
     let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("reanchor");
     let main = tmp.join("main");
@@ -1290,7 +1277,7 @@ fn cpp_target_renders_h_in_its_default_globs_but_c_keeps_h_too() {
 #[test]
 fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
     let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("cfg");
     let main = tmp.join("main");
@@ -2832,7 +2819,7 @@ fn log_dir_defaults_to_db_sibling_and_custom_is_config_relative() {
 #[test]
 fn for_linked_worktree_overlay_falls_back_when_branch_config_is_missing_or_invalid() {
     let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("overlay-fallback");
     let main = tmp.join("main");
@@ -2875,7 +2862,7 @@ fn for_linked_worktree_overlay_falls_back_when_branch_config_is_missing_or_inval
 #[test]
 fn config_load_propagates_main_parse_error_from_linked_worktree() {
     let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("main-broken");
     let main = tmp.join("main");
@@ -2906,7 +2893,7 @@ fn config_load_propagates_main_parse_error_from_linked_worktree() {
 #[test]
 fn config_load_rejects_reserved_papertrail_table_from_governing_main() {
     let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        crate::test_git::run(dir, args);
     };
     let tmp = scratch("main-papertrail");
     let main = tmp.join("main");

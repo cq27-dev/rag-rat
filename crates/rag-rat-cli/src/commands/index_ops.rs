@@ -835,7 +835,7 @@ mod tests {
         // worktree's branch overlay. Without it, a commit/checkout/merge in a linked worktree
         // indexes the base `config.root` but leaves the worktree overlay stale.
         let git = |dir: &std::path::Path, args: &[&str]| {
-            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+            rag_rat_base::test_git::run(dir, args);
         };
         let root = rag_rat_base::test_scratch::ScratchDir::new("cli-maint-overlay");
         let main = root.join("main");
@@ -913,7 +913,7 @@ mod tests {
         // embedder needed — with zero embeddings every chunk is `missing`, so `missing`
         // tracks the scoped chunk count.)
         let git = |dir: &std::path::Path, args: &[&str]| {
-            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+            rag_rat_base::test_git::run(dir, args);
         };
         let root = rag_rat_base::test_scratch::ScratchDir::new("cli-scope360");
         let main = root.join("main");
@@ -989,7 +989,7 @@ mod tests {
     #[test]
     fn maintenance_pass_owns_the_wal_checkpoint() {
         let git = |dir: &std::path::Path, args: &[&str]| {
-            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+            rag_rat_base::test_git::run(dir, args);
         };
         let root = rag_rat_base::test_scratch::ScratchDir::new("cli-maint-wal");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1056,7 +1056,7 @@ mod tests {
         // and the approximate ones (skipped, the retryable/waiting split) + expensive per-chunk
         // breakdowns are ABSENT — those need `reconcile --plan`.
         let git = |dir: &std::path::Path, args: &[&str]| {
-            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+            rag_rat_base::test_git::run(dir, args);
         };
         let root = rag_rat_base::test_scratch::ScratchDir::new("cli-maint-backlog");
         std::fs::create_dir_all(root.join("src")).unwrap();

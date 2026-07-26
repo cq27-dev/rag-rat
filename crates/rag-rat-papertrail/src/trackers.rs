@@ -408,8 +408,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        rag_rat_base::test_git::run(dir, args);
     }
 
     fn temp_git_repo() -> rag_rat_base::test_scratch::ScratchDir {

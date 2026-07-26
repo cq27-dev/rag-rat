@@ -848,9 +848,7 @@ fn overlay_only_pass_skips_base_tail_but_still_validates_memories() {
     let _ = std::fs::remove_dir_all(&linked);
     std::fs::create_dir_all(main.join("src")).unwrap();
     let git = |dir: &Path, args: &[&str]| {
-        let status =
-            std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap();
-        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        rag_rat_base::test_git::run(dir, args);
     };
     git(&main, &["init", "-q"]);
     git(&main, &["config", "user.email", "t@e"]);
@@ -1302,9 +1300,7 @@ fn initial_watch_state_places_worktree_registry() {
     let _ = std::fs::remove_dir_all(&linked);
     std::fs::create_dir_all(main.join("src")).unwrap();
     let git = |dir: &Path, args: &[&str]| {
-        let status =
-            std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap();
-        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        rag_rat_base::test_git::run(dir, args);
     };
     git(&main, &["init", "-q"]);
     git(&main, &["config", "user.email", "t@e"]);
@@ -1903,7 +1899,6 @@ fn linked_worktree_target_ancestor_gitignore_is_compiled() {
 
 #[test]
 fn linked_subdir_root_watch_placement_keeps_checkout_root_when_config_root_missing() {
-    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
@@ -1921,8 +1916,7 @@ fn linked_subdir_root_watch_placement_keeps_checkout_root_when_config_root_missi
         vec!["add", "."],
         vec!["commit", "-q", "-m", "base"],
     ] {
-        let output = Command::new("git").args(&args).current_dir(&repo).output().unwrap();
-        assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        rag_rat_base::test_git::run(&repo, &args);
     }
     std::fs::create_dir_all(checkout.join("packages")).unwrap();
     let checkout = checkout.canonicalize().unwrap();
@@ -2215,7 +2209,6 @@ fn event_touches_worktree_rebases_subdir_rooted_config() {
     // edit arrives as `<checkout>/crate/src/a.rs`. Stripping only the checkout root leaves
     // `crate/src/a.rs`, which `target_for_path` (config-root-relative, expecting `src/a.rs`)
     // rejects — so the subdir prefix must be stripped too.
-    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
@@ -2230,7 +2223,7 @@ fn event_touches_worktree_rebases_subdir_rooted_config() {
         vec!["add", "."],
         vec!["commit", "-q", "-m", "base"],
     ] {
-        Command::new("git").args(&args).current_dir(&repo).output().unwrap();
+        rag_rat_base::test_git::run(&repo, &args);
     }
     // `config.root` is the `crate` SUBDIR of the repo.
     let config_root = repo.join("crate").canonicalize().unwrap();
@@ -2418,13 +2411,7 @@ fn worktree_root_gitignore_edit_recompiles_for_subdir_config_root() {
     let wt = scratch_root(format!("ragrat-wtgi-{}-{id}", std::process::id()));
     std::fs::create_dir_all(wt.join("crates")).unwrap();
     let wt = wt.canonicalize().unwrap();
-    let ok = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&wt)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    assert!(ok, "git init failed (git must be on PATH)");
+    rag_rat_base::test_git::run(&wt, &["init", "-q"]);
     std::fs::write(wt.join(".gitignore"), "").unwrap();
 
     let sub = wt.join("crates"); // config.root is the subdirectory.
@@ -3027,9 +3014,8 @@ fn worktree_watch_targets_excludes_the_main_checkout_for_a_subdir_config_root() 
     let id = N.fetch_add(1, Ordering::Relaxed);
     let main = scratch_root(format!("ragrat-wwt-{}-{id}", std::process::id()));
     std::fs::create_dir_all(main.join("crate/src")).unwrap();
-    let git = |dir: &Path, args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap()
-    };
+    let git =
+        |dir: &Path, args: &[&str]| rag_rat_base::test_git::command(dir, args).status().unwrap();
     git(&main, &["init", "-q"]);
     git(&main, &["config", "user.email", "t@e"]);
     git(&main, &["config", "user.name", "t"]);
@@ -3086,13 +3072,7 @@ fn gitignore_watch_dirs_includes_worktree_root_for_subdir_config_root() {
     let wt = scratch_root(format!("ragrat-wdirs-{}-{id}", std::process::id()));
     std::fs::create_dir_all(wt.join("crates/app")).unwrap();
     let wt = wt.canonicalize().unwrap();
-    let ok = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&wt)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    assert!(ok, "git init failed (git must be on PATH)");
+    rag_rat_base::test_git::run(&wt, &["init", "-q"]);
 
     let sub = wt.join("crates/app");
     let dirs = gitignore_watch_dirs(&sub);
@@ -3140,13 +3120,7 @@ fn root_gitignore_edit_is_delivered_to_a_real_watcher() {
     let wt = scratch_root(format!("ragrat-deliv-{}-{id}", std::process::id()));
     std::fs::create_dir_all(wt.join("crates")).unwrap();
     let wt = wt.canonicalize().unwrap();
-    let ok = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&wt)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    assert!(ok, "git init failed (git must be on PATH)");
+    rag_rat_base::test_git::run(&wt, &["init", "-q"]);
     std::fs::write(wt.join(".gitignore"), "").unwrap();
 
     let sub = wt.join("crates"); // config.root is the subdirectory.
@@ -3199,9 +3173,7 @@ fn watcher_main_routes_gitignore_mutations_through_central_helpers() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     let git = |dir: &Path, args: &[&str]| {
-        let status =
-            std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap();
-        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        rag_rat_base::test_git::run(dir, args);
     };
     git(&root, &["init", "-q"]);
     git(&root, &["config", "user.email", "t@e"]);

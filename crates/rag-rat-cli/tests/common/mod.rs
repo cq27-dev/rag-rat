@@ -15,7 +15,6 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 2021-01-01T00:00:00Z — a fixed, wall-clock-independent anchor for fixture commit dates.
@@ -88,8 +87,7 @@ pub fn toml_path(path: &Path) -> String {
 /// deterministic, unique date (a plain `git(dir, &["commit", ...])` would commit on the wall clock
 /// and could collide on `repo_id`).
 pub fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    rag_rat_base::test_git::run(dir, args);
 }
 
 /// `git commit` with `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` pinned to a fixed base epoch plus a
@@ -98,10 +96,7 @@ pub fn git(dir: &Path, args: &[&str]) {
 /// are the commit flags/message, e.g. `&["-q", "-m", "seed"]`.
 pub fn git_commit(dir: &Path, args: &[&str]) {
     let date = format!("@{} +0000", FIXTURE_EPOCH_BASE + next_seq());
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .arg("commit")
+    let out = rag_rat_base::test_git::command(dir, &["commit"])
         .args(args)
         .env("GIT_AUTHOR_DATE", &date)
         .env("GIT_COMMITTER_DATE", &date)

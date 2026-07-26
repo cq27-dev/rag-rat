@@ -583,24 +583,11 @@ fn first_chunk_id(db: &IndexDatabase) -> i64 {
 /// defeats the HEAD-move carry (#502) sha match and corrupts the committed index db. `GIT_CONFIG_*`
 /// overrides global config without touching the user's config.
 fn git_command(root: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.args(args)
-        .current_dir(root)
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "core.autocrlf")
-        .env("GIT_CONFIG_VALUE_0", "false");
-    cmd
+    rag_rat_base::test_git::command(root, args)
 }
 
 fn run_git(root: &Path, args: &[&str]) {
-    let output = git_command(root, args).output().unwrap();
-    assert!(
-        output.status.success(),
-        "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    rag_rat_base::test_git::run(root, args);
 }
 
 fn run_git_with_env(root: &Path, args: &[&str], env: &[(&str, &str)]) {
@@ -609,9 +596,7 @@ fn run_git_with_env(root: &Path, args: &[&str], env: &[(&str, &str)]) {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> String {
-    let output = git_command(root, args).output().unwrap();
-    assert!(output.status.success(), "git {:?} failed", args);
-    String::from_utf8(output.stdout).unwrap().trim().to_string()
+    rag_rat_base::test_git::output(root, args)
 }
 
 struct MockGitHubClient;

@@ -404,13 +404,7 @@ mod tests {
             &["add", "-A"],
             &["commit", "-qm", "seed"],
         ] {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&*root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(out.status.success());
+            rag_rat_base::test_git::run(&root, args);
         }
         let plan = InitPlan {
             root_value: ".".to_string(),

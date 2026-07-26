@@ -650,13 +650,7 @@ mod tests {
     fn temp_git_repo(tag: &str) -> rag_rat_base::test_scratch::ScratchDir {
         let root = rag_rat_base::test_scratch::ScratchDir::new(tag);
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&*root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            rag_rat_base::test_git::run(&root, args);
         };
         git(&["init", "-q"]);
         git(&[

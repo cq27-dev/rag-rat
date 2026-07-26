@@ -257,21 +257,11 @@ pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) 
 
 #[cfg(test)]
 mod worktree_scope_tests {
-    use std::process::Command;
 
     use super::*;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@e")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@e")
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        rag_rat_base::test_git::run(dir, args);
     }
 
     /// An owned scratch dir (removed on drop) plus its canonical path, which is what the git
