@@ -14,6 +14,7 @@ fn persisted_enums_round_trip_through_db_strings() {
         (OracleTool::ScipPython, "scip-python"),
         (OracleTool::ScipTypescript, "scip-typescript"),
         (OracleTool::ScipJava, "scip-java"),
+        (OracleTool::RaLsp, "ra-lsp"),
     ] {
         assert_eq!(tool.as_db_str(), token);
         assert_eq!(OracleTool::from_db_str(tool.as_db_str()), Some(tool));

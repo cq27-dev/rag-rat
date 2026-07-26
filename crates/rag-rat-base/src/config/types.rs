@@ -196,6 +196,8 @@ impl MemorySurface {
 /// minimum-interval floor) — see `oracle::auto_run_decision`. SCIP production takes
 /// minutes while edits arrive in seconds, so edge-collapsing alone would thrash; both gates are
 /// required. Fail-open and detached: it never blocks a request and dies with the server process.
+/// The nested `[oracle.live]` table ([`OracleLiveConfig`]) is the separate live-LSP freshness
+/// path — standalone, and NOT implied by `auto_run` (#534).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OracleConfig {
     /// Run the oracle in the background on the MCP server (default false — opt in explicitly).
@@ -206,6 +208,8 @@ pub struct OracleConfig {
     pub auto_run_quiet_period_secs: u64,
     /// And at most once this often, regardless of churn. The minimum-interval floor.
     pub auto_run_min_interval_secs: u64,
+    /// The live LSP oracle (`[oracle.live]`) — per-pass resolution for just-changed files (#534).
+    pub live: OracleLiveConfig,
 }
 
 impl Default for OracleConfig {
@@ -214,7 +218,39 @@ impl Default for OracleConfig {
             auto_run: false,
             auto_run_quiet_period_secs: 900,
             auto_run_min_interval_secs: 21_600,
+            live: OracleLiveConfig::default(),
         }
+    }
+}
+
+/// Live LSP oracle (`[oracle.live]`, #74 slice 2 / #534). Opt-in; default OFF. When `enabled`,
+/// the resident watcher's maintenance pass resolves the callees of JUST-CHANGED Rust files
+/// through a resident `rust-analyzer` language server, writing `edge_oracle` verdicts under the
+/// distinct `ra-lsp` tool id — a freshness patch for files being edited, while the batch pass
+/// (`auto_run` / `oracle run`) stays the canonical whole-checkout writer.
+///
+/// Standalone: it does NOT imply or require `[oracle] auto_run`. Without a batch baseline the
+/// live pass is moniker-blind (it synthesizes `local ra-lsp-<n>` sentinel monikers), so it
+/// upgrades edge confidence tiers but contributes nothing to clone-collapse (#275) or
+/// moniker-anchored memory relocation until a batch run completes — `oracle status` surfaces
+/// that state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleLiveConfig {
+    /// Resolve changed files through the resident LSP client on maintenance passes (default
+    /// false — opt in explicitly).
+    pub enabled: bool,
+    /// Shut the resident language server down after this long without a live pass (default
+    /// 900s). Bounds an idle server's resident memory; the next eligible pass respawns lazily.
+    pub idle_shutdown_secs: u64,
+    /// Cap on LSP requests a single pass may issue (default 200) — the budget that keeps a
+    /// big change set from monopolizing the maintenance pass. Unfinished files ride the next
+    /// pass via the watcher's backlog.
+    pub max_requests_per_pass: u64,
+}
+
+impl Default for OracleLiveConfig {
+    fn default() -> Self {
+        Self { enabled: false, idle_shutdown_secs: 900, max_requests_per_pass: 200 }
     }
 }
 

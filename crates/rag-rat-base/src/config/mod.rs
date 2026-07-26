@@ -191,9 +191,9 @@ pub use types::{
     Config, DEFAULT_QUERY_ENDPOINT, DEFAULT_SYNC_RELAY, DistillLlmConfig, DreamLlmConfig,
     EmbeddingBackend, EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat,
     LogLevel, MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig,
-    PapertrailConfig, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget,
-    SearchConfig, SyncConfig, TargetKind, Tracker, TrackerAuth, TrackerConfig, VersionCheckConfig,
-    WatchConfig,
+    OracleLiveConfig, PapertrailConfig, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig,
+    ResolvedTarget, SearchConfig, SyncConfig, TargetKind, Tracker, TrackerAuth, TrackerConfig,
+    VersionCheckConfig, WatchConfig,
 };
 
 #[cfg(test)]

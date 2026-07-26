@@ -363,6 +363,123 @@ fn compare_graph_to_scip_surfaces_non_rust_analyzer_tools() {
     );
 }
 
+/// #534 batch-wins-on-overlap: a clean Rust edge can carry BOTH the batch `rust-analyzer` and
+/// the live `ra-lsp` tool's current verdicts (live covers the same edges at pass cadence). The
+/// batch pass is canonical, so the hop must surface the BATCH verdict — never displaced by the
+/// live one, regardless of `OracleTool::ALL` declaration order. Here the batch Confirms
+/// (compiler tier) while the live Contradicts (would NOT promote): if the merge order let the
+/// live row win, the edge would silently drop out of the compiler tier.
+#[test]
+fn batch_verdict_wins_over_live_for_the_same_edge() {
+    let root = temp_root();
+    fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+    let config = rust_config(root.to_path_buf());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let (edge_id, cs, ce, path) = call_edge(&db);
+    // Force the heuristic edge in-corpus-resolved so the live external resolution below is a
+    // Contradict (not a resolved-external label).
+    let target_sym: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE edges SET confidence = 'Exact', resolution = 'exact', to_symbol_id = ?2 WHERE \
+             id = ?1",
+            params![edge_id, target_sym],
+        )
+        .unwrap();
+
+    // Batch (canonical): resolve in-corpus → Confirm → compiler tier.
+    let symbol = "scip-rust crate held-mini `target`().";
+    let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((29, 35)));
+    db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-batch", &scip).unwrap();
+
+    // Live (`ra-lsp`): a DIFFERENT verdict on the SAME edge — an external placement, which
+    // against the in-corpus heuristic classifies as a Contradict. (Written through the batch
+    // consumption path under the ra-lsp tool id: the read-side merge can't tell the difference,
+    // which is exactly what makes this a valid precedence fixture.)
+    let live_symbol = "scip-rust cargo other 1.0 `target`().";
+    let live_scip = scip_with(&path, cs, ce, live_symbol, None, None);
+    db.run_oracle_from_scip(OracleTool::RaLsp, "v-live", &live_scip).unwrap();
+
+    // The batch verdict must survive the merge: still compiler, still the batch's reason.
+    let callers = db
+        .find_callers_with_options("target", 50, &rag_rat_query::graph::GraphTraversalOptions {
+            include_unresolved: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let hop = callers.iter().find(|h| h.edge_id == edge_id).expect("call edge present");
+    assert_eq!(
+        hop.confidence, "compiler",
+        "the batch verdict must win over the live one for the same edge"
+    );
+    assert_eq!(hop.resolution_reason.as_deref(), Some("scip:rust-analyzer@v-batch"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #534: when BOTH the batch and the live tool contradict the same edge, `compare_graph_to_scip`
+/// reports the edge ONCE, carrying the batch (canonical) tool's evidence — never two rows for
+/// one edge, and never the live tool's version of the disagreement.
+#[test]
+fn compare_graph_to_scip_dedupes_cross_tool_contradictions_batch_first() {
+    let root = temp_root();
+    fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+    let config = rust_config(root.to_path_buf());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let (edge_id, cs, ce, path) = call_edge(&db);
+    let target_sym: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE edges SET confidence = 'Exact', resolution = 'exact', to_symbol_id = ?2 WHERE \
+             id = ?1",
+            params![edge_id, target_sym],
+        )
+        .unwrap();
+
+    // Both tools contradict the same in-corpus edge, with DIFFERENT external targets.
+    let batch_symbol = "scip-rust cargo batchdep 1.0 `target`().";
+    db.run_oracle_from_scip(
+        OracleTool::RustAnalyzer,
+        "v-batch",
+        &scip_with(&path, cs, ce, batch_symbol, None, None),
+    )
+    .unwrap();
+    let live_symbol = "scip-rust cargo livedep 1.0 `target`().";
+    db.run_oracle_from_scip(
+        OracleTool::RaLsp,
+        "v-live",
+        &scip_with(&path, cs, ce, live_symbol, None, None),
+    )
+    .unwrap();
+
+    let compare = db.compare_graph_to_scip().unwrap();
+    assert_eq!(
+        compare.summary.contradictions, 1,
+        "one edge, one contradiction row (deduped): {compare:?}"
+    );
+    let c = &compare.contradictions[0];
+    assert_eq!(c.edge_id, edge_id);
+    assert_eq!(
+        c.resolved_external.as_deref(),
+        Some("resolved-external(batchdep)"),
+        "the batch tool's evidence wins the dedupe"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// #82 P0: when a run EXISTS but examined 0 in-scope verdicts, `compare_graph_to_scip` must WARN
 /// — that is "run-but-empty" (the silent symptom of the scope bug), not "compiler agrees". Here
 /// a run writes a verdict, then the callsite file drifts so the current-content gate

@@ -89,6 +89,40 @@ impl IndexDatabase {
         )
     }
 
+    /// Run the live oracle's per-pass resolution (#534) over `worklist` (repo-relative Rust
+    /// paths the maintenance pass just reindexed, plus any backlog): resolve their callees
+    /// through the resident LSP `session` and write `ra-lsp` verdicts + a backing run row in one
+    /// transaction. The batch pass stays the canonical writer — live rows are a per-pass
+    /// freshness patch, and there is NO authoritative clear. Best-effort for LSP-side failures
+    /// (a dead server aborts the remaining worklist into `unfinished_paths`, never fails);
+    /// `Err` is DB-only.
+    pub fn run_live_oracle_pass(
+        &self,
+        session: &mut rag_rat_oracle::LiveOracleSession,
+        worklist: &[String],
+        max_requests: u64,
+        started_at_ms: i64,
+    ) -> anyhow::Result<rag_rat_oracle::LivePassReport> {
+        let Some(root) = self.storage.source_root() else {
+            anyhow::bail!(
+                "index has no source_root metadata; rebuild required for the live oracle pass"
+            );
+        };
+        let root = root.to_path_buf();
+        rag_rat_oracle::live_oracle_pass(
+            self.storage.connection(),
+            session,
+            &rag_rat_oracle::LivePassInput {
+                commit_sha: &self.active_commit_sha,
+                worktree_id: &self.active_worktree_id,
+                checkout_root: &root,
+                worklist,
+                max_requests,
+                started_at_ms,
+            },
+        )
+    }
+
     /// Heuristic-vs-oracle eval metrics (precision/recall/recovery) for a tool/version, diffing the
     /// persisted `edge_oracle` rows against the `edges` heuristic. [`RecallCalls`] is the
     /// `(covered_calls, oracle_only_calls)` pair reported by the most recent [`run_oracle`] — both

@@ -809,7 +809,7 @@ fn startup_catchup_retries_existing_base_embedding_backlog() {
     );
     drop(db);
 
-    startup_catchup_pass(&config, None).unwrap();
+    startup_catchup_pass(&config, None, None).unwrap();
     let db = IndexDatabase::open_config(&config).unwrap();
     assert_eq!(
         db.pending_embedding_jobs().unwrap(),
@@ -962,7 +962,7 @@ fn startup_catchup_skips_ephemeral_backlog_scan_without_query_endpoint() {
     drop(db);
 
     crate::index::ai::reset_estimated_reconcile_job_calls();
-    startup_catchup_pass(&config, None).unwrap();
+    startup_catchup_pass(&config, None, None).unwrap();
     assert_eq!(
         crate::index::ai::estimated_reconcile_job_calls(),
         0,

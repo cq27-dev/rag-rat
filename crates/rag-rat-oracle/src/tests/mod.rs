@@ -15,6 +15,7 @@ use crate::test_support::*;
 mod edge_view;
 mod join_tests;
 mod library_usage;
+mod live;
 mod monikers;
 mod persisted_enums;
 mod pre_spawn;

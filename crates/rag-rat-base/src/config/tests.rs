@@ -6,9 +6,10 @@ use path_slash::PathExt;
 use super::{
     self as config, Config, ConfigError, DEFAULT_SYNC_RELAY, DistillLlmConfig,
     EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel, MemoryConfig, MemorySurface,
-    OracleConfig, RawConfig, RawMemory, RawOracle, RawSearch, RawSync, RawTarget, RawVersionCheck,
-    RawWatch, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget,
-    SearchConfig, SyncConfig, TargetKind, TrackerAuth, VersionCheckConfig, WatchConfig,
+    OracleConfig, OracleLiveConfig, RawConfig, RawMemory, RawOracle, RawSearch, RawSync, RawTarget,
+    RawVersionCheck, RawWatch, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig,
+    ResolvedTarget, SearchConfig, SyncConfig, TargetKind, TrackerAuth, VersionCheckConfig,
+    WatchConfig,
 };
 use crate::language::Language;
 
@@ -2759,6 +2760,9 @@ fn oracle_defaults_off_and_parses_overrides() {
     assert!(!default.auto_run, "background oracle is OFF by default");
     assert_eq!(default.auto_run_quiet_period_secs, 900);
     assert_eq!(default.auto_run_min_interval_secs, 21_600);
+    assert!(!default.live.enabled, "live oracle is OFF by default (#534)");
+    assert_eq!(default.live.idle_shutdown_secs, 900);
+    assert_eq!(default.live.max_requests_per_pass, 200);
 
     let raw: RawConfig = toml::from_str(
         r#"
@@ -2769,6 +2773,11 @@ fn oracle_defaults_off_and_parses_overrides() {
             auto_run = true
             auto_run_quiet_period_secs = 60
             auto_run_min_interval_secs = 3600
+
+            [oracle.live]
+            enabled = true
+            idle_shutdown_secs = 120
+            max_requests_per_pass = 50
             "#,
     )
     .unwrap();
@@ -2777,7 +2786,27 @@ fn oracle_defaults_off_and_parses_overrides() {
         auto_run: true,
         auto_run_quiet_period_secs: 60,
         auto_run_min_interval_secs: 3600,
+        live: OracleLiveConfig {
+            enabled: true,
+            idle_shutdown_secs: 120,
+            max_requests_per_pass: 50,
+        },
     });
+
+    // `[oracle.live]` stands alone: it neither implies nor requires `[oracle] auto_run` (#534).
+    let raw: RawConfig = toml::from_str(
+        r#"
+            [index]
+            root = "."
+
+            [oracle.live]
+            enabled = true
+            "#,
+    )
+    .unwrap();
+    let oracle: OracleConfig = raw.oracle.into();
+    assert!(oracle.live.enabled);
+    assert!(!oracle.auto_run, "live must not imply the batch auto-run");
 }
 
 #[test]

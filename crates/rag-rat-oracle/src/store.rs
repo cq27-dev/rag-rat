@@ -331,6 +331,149 @@ pub(crate) fn edge_join_candidates(
     Ok(out)
 }
 
+/// [`edge_join_candidates`] restricted to a set of source paths — the live oracle's per-pass
+/// worklist (#534): only the files the maintenance pass just reindexed. Same scope + ordering
+/// discipline as the whole-checkout variant. `paths` is caller-capped (the pass budget), so the
+/// `IN` list stays bounded.
+pub(crate) fn edge_join_candidates_for_paths(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+    paths: &[String],
+) -> anyhow::Result<Vec<EdgeJoinCandidate>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Numbered params, NOT anonymous `?`: the scope predicate binds ?1/?2 (and an anonymous
+    // parameter would take slot 1, colliding with them), so the path list numbers from ?3.
+    let marks = (3..3 + paths.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "
+        SELECT edges.id,
+               files.path,
+               files.sha256,
+               edges.source_start_byte,
+               edges.source_end_byte,
+               edges.callee_start_byte,
+               edges.callee_end_byte,
+               edges.confidence,
+               edges.edge_kind,
+               edges.to_symbol_id
+        FROM edges
+        JOIN files ON files.id = edges.source_file_id
+        WHERE edges.callee_start_byte IS NOT NULL
+          AND edges.callee_end_byte IS NOT NULL
+          AND files.path IN ({marks})
+          AND {scope}
+        ORDER BY files.path, edges.callee_start_byte
+        ",
+        scope = active_checkout_file_predicate("?1", "?2"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    // ?1/?2 are the checkout scope; the path list binds from ?3.
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&commit_sha, &worktree_id];
+    for path in paths {
+        params.push(path);
+    }
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok(EdgeJoinCandidate {
+            edge_id: row.get(0)?,
+            source_path: row.get(1)?,
+            file_sha: row.get(2)?,
+            source_start_byte: row.get(3)?,
+            source_end_byte: row.get(4)?,
+            callee_start_byte: row.get(5)?,
+            callee_end_byte: row.get(6)?,
+            confidence: row.get(7)?,
+            edge_kind: row.get(8)?,
+            to_symbol_id: row.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The batch tool's persisted moniker for the logical symbol `symbol_id` belongs to — the string
+/// the LIVE writer copies verbatim into its `edge_oracle.scip_symbol` (#534). Interchangeability
+/// is literal string equality: the batch moniker is byte-identical to what the batch pass's own
+/// verdicts carry (for rust-analyzer `stabilize_moniker_version` is the identity), so
+/// clone-collapse + moniker-anchored memory relocation treat live and batch rows as one evidence
+/// set, and `current_callee_monikers`' cross-tool conflict-drop never fires on a co-covered
+/// span. `None` when the batch pass has no moniker for the symbol (never run, or the def maps
+/// outside its definitions) — the caller then falls back to a SCIP-local sentinel. Live only
+/// READS this table; only the batch pass writes it.
+pub(crate) fn batch_moniker_for_symbol(
+    conn: &Connection,
+    symbol_id: i64,
+    batch_tool: OracleTool,
+) -> anyhow::Result<Option<String>> {
+    use rusqlite::OptionalExtension as _;
+    // The qualifier is the `m` alias this query uses, so the repo clause names the alias, not the
+    // table.
+    let repo_clause = oracle_repo_scope_clause(conn, "m")?;
+    conn.query_row(
+        &format!(
+            "
+            SELECT m.moniker
+            FROM logical_symbol_monikers m
+            JOIN logical_symbol_members mem
+              ON mem.logical_symbol_id = m.logical_symbol_id
+            WHERE mem.symbol_id = ?1 AND m.tool = ?2{repo_clause}
+            LIMIT 1
+            "
+        ),
+        params![symbol_id, batch_tool.as_db_str()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The persisted `(file_sha, scip_symbol)` of the `edge_oracle` row at `row`'s content key for
+/// `(tool, tool_version)`, if any. The live writer reads this before its upsert (#534): an
+/// existing row whose `scip_symbol` CHANGES while its `file_sha` stays constant means the
+/// oracle evidence a scip-mode clone refinement consulted moved under an unchanged refinement
+/// key, so the refine cache must be invalidated (mirroring the batch run's hook). A same-value
+/// upsert (or a `file_sha` change, which already re-keys everything downstream) skips it.
+pub(crate) fn existing_verdict_scip_symbol(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    row: &EdgeOracleRow<'_>,
+) -> anyhow::Result<Option<(String, String)>> {
+    use rusqlite::OptionalExtension as _;
+    let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
+    conn.query_row(
+        &format!(
+            "
+            SELECT file_sha, scip_symbol
+            FROM edge_oracle
+            WHERE tool = ?1 AND tool_version = ?2
+              AND source_path = ?3
+              AND source_start_byte = ?4 AND source_end_byte = ?5
+              AND callee_start_byte = ?6 AND callee_end_byte = ?7
+              AND edge_kind = ?8{repo_clause}
+            "
+        ),
+        params![
+            tool.as_db_str(),
+            tool_version,
+            row.source_path,
+            row.source_start_byte,
+            row.source_end_byte,
+            row.callee_start_byte,
+            row.callee_end_byte,
+            row.edge_kind,
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// All symbols defined in a file (by path, scoped to commit/worktree), with their byte spans, so a
 /// SCIP definition range can be mapped to the enclosing symbol by overlap.
 pub(crate) fn symbol_spans_for_path(

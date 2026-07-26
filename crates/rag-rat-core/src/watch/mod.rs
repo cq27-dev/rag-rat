@@ -21,6 +21,7 @@
 //!   never postponed by an in-flight maintenance pass.
 
 mod event_loop;
+mod live_oracle;
 mod overlay;
 mod papertrail;
 mod pass;

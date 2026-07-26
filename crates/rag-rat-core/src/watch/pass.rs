@@ -6,6 +6,7 @@ use notify::Event;
 use rag_rat_base::config::Config;
 use rag_rat_base::locks::{self};
 
+use super::live_oracle::LiveOracleTail;
 use super::overlay::{OverlayScope, ReconcileBudget, refresh_worktree_overlays};
 use super::placement::WatchPlacementCounters;
 use crate::index::IndexDatabase;
@@ -269,22 +270,25 @@ pub(crate) fn spawn_pass_worker(
 /// The hook/CLI entry point — it has no resident watcher, so there are no watch-placement counters
 /// to persist (`None`); a running watcher records its own via [`maintenance_pass_scoped`].
 pub fn maintenance_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
-    maintenance_pass_scoped(config, run_gc, &OverlayScope::All, None)
+    maintenance_pass_scoped(config, run_gc, &OverlayScope::All, None, None)
 }
 
 /// [`maintenance_pass`] with an explicit overlay scope — the watcher's event-driven passes name
 /// the checkouts events came from instead of sweeping the whole worktree fleet (#577). The resident
 /// watcher passes `Some(counters)` so this pass persists its watch-placement failure high-water
-/// mark; the hook/CLI wrapper above passes `None`.
+/// mark; the hook/CLI wrapper above passes `None`. Only the resident watcher passes
+/// `Some(live_oracle)` (#534): the live tail owns a resident language server, and a one-shot
+/// hook/CLI pass must not spawn one (minutes of warm-up for a process about to exit).
 pub(crate) fn maintenance_pass_scoped(
     config: &Config,
     run_gc: bool,
     overlay_scope: &OverlayScope,
     watch_counters: Option<&WatchPlacementCounters>,
+    live_oracle: Option<&mut LiveOracleTail>,
 ) -> anyhow::Result<()> {
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
-    run_pass(config, run_gc, false, overlay_scope, watch_counters)
+    run_pass(config, run_gc, false, overlay_scope, watch_counters, live_oracle)
 }
 
 /// Run one maintenance pass only if the write lock is free within `SKIP_TIMEOUT`; returns whether
@@ -294,7 +298,7 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
     let lock_repo = locks::write_lock_repo_id(config);
     match locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SKIP_TIMEOUT)? {
         Some(_lock) => {
-            run_pass(config, run_gc, false, &OverlayScope::All, None)?;
+            run_pass(config, run_gc, false, &OverlayScope::All, None, None)?;
             Ok(true)
         },
         None => Ok(false),
@@ -304,10 +308,11 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
 pub(crate) fn startup_catchup_pass(
     config: &Config,
     watch_counters: Option<&WatchPlacementCounters>,
+    live_oracle: Option<&mut LiveOracleTail>,
 ) -> anyhow::Result<()> {
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
-    run_pass(config, STARTUP_CATCHUP_RUN_GC, true, &OverlayScope::All, watch_counters)
+    run_pass(config, STARTUP_CATCHUP_RUN_GC, true, &OverlayScope::All, watch_counters, live_oracle)
 }
 
 fn run_pass(
@@ -316,6 +321,7 @@ fn run_pass(
     retry_base_embedding_backlog: bool,
     overlay_scope: &OverlayScope,
     watch_counters: Option<&WatchPlacementCounters>,
+    live_oracle: Option<&mut LiveOracleTail>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut timings = PassTimings::new(started);
@@ -401,6 +407,15 @@ fn run_pass(
     let clone_graph_due = db
         .clone_graph_rebuild_due(CLONE_GRAPH_QUIET_MS, base_tail_forced || base_embedding_backlog)
         .unwrap_or(false);
+    // Live oracle (#74 slice 2 / #534): resolve this pass's changed Rust files through the
+    // resident LSP client, writing `ra-lsp` verdicts as a per-pass freshness patch (the batch
+    // pass stays canonical). Runs BEFORE the tail decision on purpose: on a quiet pass the work
+    // side is a cheap no-op (no changed set, empty backlog), but the idle-shutdown sweep inside
+    // must still fire so a gone-quiet server releases the resident language server. Only the
+    // resident watcher passes the state in — hook/CLI passes skip the stage entirely.
+    if let Some(live) = live_oracle {
+        timings.stage("live_oracle", || live.on_pass(&db, config, clone_delta_hint.as_ref()));
+    }
     // Idle backstop (issue #63, facet 2): when the sweep changed nothing, skip everything past
     // discovery — an idle server should do no work. `run_gc` (every GC_EVERY_PASSES) still forces
     // a full tail, so the cases that DON'T flip content_changed are still caught within that

@@ -116,6 +116,32 @@ impl LspClient {
         resolved
     }
 
+    /// [`resolve_callees`] without the per-callee `textDocument/moniker` fan-out — the slice-2
+    /// write path's shape (#534). Live verdicts NEVER persist an LSP moniker (it is not
+    /// interchangeable with the batch SCIP moniker string, so persisting one would trip the
+    /// cross-tool conflict-drop), so the request would be pure waste against the pass's request
+    /// budget. Returns `(target_uri, target_range)` per callee, aligned with `callee_starts`.
+    pub(crate) fn resolve_definitions(
+        &mut self,
+        uri: &str,
+        language_id: &str,
+        text: &str,
+        callee_starts: &[usize],
+    ) -> io::Result<Vec<Option<(String, LspRange)>>> {
+        self.did_open(uri, language_id, text)?;
+        let resolved = (|| {
+            let index = LineIndex::new(text.as_bytes(), self.encoding());
+            let mut out = Vec::with_capacity(callee_starts.len());
+            for &start in callee_starts {
+                let position = index.position_at_byte(start);
+                out.push(self.definition_at(uri, position)?);
+            }
+            Ok(out)
+        })();
+        let _ = self.did_close(uri);
+        resolved
+    }
+
     /// The resolution loop over an ALREADY-OPEN document (the interior of [`resolve_callees`],
     /// split out so the enclosing `didOpen`/`didClose` always pair even when a request errors).
     fn resolve_open_callees(
@@ -417,6 +443,34 @@ mod tests {
                 start: LspPosition { line: 2, character: 3 },
                 end: LspPosition { line: 2, character: 9 },
             }))
+        );
+    }
+
+    #[test]
+    fn resolve_definitions_skips_the_moniker_fan_out() {
+        // The slice-2 write path never persists an LSP moniker, so the definitions-only variant
+        // must not spend a moniker request per callee — assert none leaves the client.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut client = client_with_server(responder(
+            "utf-16",
+            Some(("file:///defs.rs", (5, 3), (5, 9))),
+            Some("cargo std foo"),
+            Arc::clone(&captured),
+        ));
+        client.initialize("file:///repo").unwrap();
+        let src = "fn caller() { foo(); }\n";
+        let foo = src.find("foo").unwrap();
+        let out = client.resolve_definitions("file:///src.rs", "rust", src, &[foo]).unwrap();
+        assert_eq!(out, vec![Some(("file:///defs.rs".to_string(), LspRange {
+            start: LspPosition { line: 5, character: 3 },
+            end: LspPosition { line: 5, character: 9 },
+        },))]);
+        let requests = captured.lock().unwrap();
+        assert!(
+            !requests
+                .iter()
+                .any(|m| m.get("method").and_then(Value::as_str) == Some("textDocument/moniker")),
+            "no moniker request may be issued: {requests:?}"
         );
     }
 

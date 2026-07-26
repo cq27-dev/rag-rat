@@ -170,10 +170,29 @@ fn oracle_status(db: &IndexDatabase, args: &OracleStatusArgs) -> anyhow::Result<
             Some(version) => Some(db.oracle_status(tool, &version)?),
             None => None,
         };
+        // The live oracle without a batch baseline is moniker-blind (#534): it upgrades edge
+        // tiers under `local ra-lsp-<n>` sentinels, but clone-collapse (#275) and
+        // moniker-anchored memory relocation get nothing until a batch run completes. Surface
+        // that honestly when live verdicts exist but the batch counterpart has never run.
+        let note = if status.is_some()
+            && let Some(source) = tool.batch_moniker_source()
+            && db.latest_oracle_run_version(source)?.is_none()
+        {
+            Some(format!(
+                "live-only: no {} batch run in this checkout — edge tiers upgrade, but \
+                 clone-collapse + moniker anchoring are blind until `oracle run --tool {}` \
+                 completes",
+                source.as_db_str(),
+                source.as_db_str()
+            ))
+        } else {
+            None
+        };
         entries.push(serde_json::json!({
             "tool": tool.as_db_str(),
             "tool_available": availability,
             "verdicts": status,
+            "note": note,
         }));
     }
     print_output(&entries)

@@ -279,6 +279,11 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
         let configured_languages: std::collections::HashSet<&str> =
             config.targets.iter().map(|target| target.language.as_str()).collect();
         for &tool in OracleTool::ALL {
+            // Live-only backends (`ra-lsp`) are driven by the watcher, never by the batch
+            // auto-run loop (#534).
+            if !tool.batch_capable() {
+                continue;
+            }
             // Skip a backend whose language this checkout doesn't index — never auto-run it here
             // (the status registry stays broad; only background runs are gated).
             let manifest = rag_rat_oracle::ToolManifest::for_tool(tool);

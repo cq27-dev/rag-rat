@@ -6,9 +6,9 @@ use serde::Deserialize;
 use super::{
     ConfigError, DEFAULT_QUERY_ENDPOINT, DistillLlmConfig, DreamLlmConfig, EmbeddingBackend,
     EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,
-    MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, PapertrailConfig,
-    RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig, SyncConfig, Tracker,
-    TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig,
+    MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, OracleLiveConfig,
+    PapertrailConfig, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig,
+    SyncConfig, Tracker, TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig,
 };
 use crate::embedding_models::Backend;
 
@@ -305,6 +305,8 @@ pub(crate) struct RawOracle {
     auto_run: Option<bool>,
     auto_run_quiet_period_secs: Option<u64>,
     auto_run_min_interval_secs: Option<u64>,
+    #[serde(default)]
+    live: RawOracleLive,
 }
 
 impl From<RawOracle> for OracleConfig {
@@ -318,6 +320,27 @@ impl From<RawOracle> for OracleConfig {
             auto_run_min_interval_secs: raw
                 .auto_run_min_interval_secs
                 .unwrap_or(default.auto_run_min_interval_secs),
+            live: raw.live.into(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+pub(crate) struct RawOracleLive {
+    enabled: Option<bool>,
+    idle_shutdown_secs: Option<u64>,
+    max_requests_per_pass: Option<u64>,
+}
+
+impl From<RawOracleLive> for OracleLiveConfig {
+    fn from(raw: RawOracleLive) -> Self {
+        let default = OracleLiveConfig::default();
+        Self {
+            enabled: raw.enabled.unwrap_or(default.enabled),
+            idle_shutdown_secs: raw.idle_shutdown_secs.unwrap_or(default.idle_shutdown_secs),
+            max_requests_per_pass: raw
+                .max_requests_per_pass
+                .unwrap_or(default.max_requests_per_pass),
         }
     }
 }

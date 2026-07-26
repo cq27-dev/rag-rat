@@ -22,6 +22,7 @@ mod auto_run;
 mod corpus;
 mod join;
 mod library_usage;
+mod live;
 pub(crate) mod lsp;
 mod manifest;
 mod report;
@@ -45,6 +46,7 @@ pub use library_usage::{
     LibraryUsageCallSite, LibraryUsageEntry, LibraryUsageOptions, LibraryUsageReport,
     LibraryUsageStatus, check_library_usage,
 };
+pub use live::{LiveOracleSession, LivePassInput, LivePassReport, live_oracle_pass};
 // LSP position conversion (line/char <-> byte under an encoding) — consumed by the engine's
 // corpus fixtures; the rest of `lsp` stays private.
 pub use lsp::position::{LineIndex, LspEncoding, LspPosition};
@@ -304,6 +306,20 @@ pub fn produce_scip_with_tool(
     scip_output: &Path,
 ) -> anyhow::Result<ScipProduction> {
     let manifest = ToolManifest::for_tool(tool);
+    // A live-only tool (`ra-lsp`) has no `scip_command` — it writes verdicts from the watcher's
+    // maintenance pass, not a whole-checkout index. Block with that explanation rather than
+    // probing/spawning anything (#534).
+    if !tool.batch_capable() {
+        return Ok(ScipProduction::Blocked {
+            tool: tool.as_db_str().to_string(),
+            program: manifest.program.to_string(),
+            hint: format!(
+                "{} is a live oracle backend: it runs from the watcher under `[oracle.live] \
+                 enabled`, not via `oracle run` — there is no `.scip` to produce.",
+                tool.as_db_str()
+            ),
+        });
+    }
     let version = match manifest.probe() {
         ToolAvailability::Available { version, .. } => version,
         ToolAvailability::Blocked { tool, program, hint } => {
@@ -700,17 +716,29 @@ pub enum OracleTool {
     /// scip-typescript; unlike scip-python/typescript it embeds no project version in local
     /// monikers (always `.` placeholders), so monikers are already commit-stable.
     ScipJava,
+    /// The LIVE rust-analyzer LSP client (#74 / #534) — a resident server resolving callees in
+    /// just-changed files at watcher cadence, writing the same `edge_oracle` shape the batch pass
+    /// writes. Deliberately a DISTINCT tool id from [`Self::RustAnalyzer`]: the
+    /// `(tool, tool_version)` axis of the `edge_oracle`/`oracle_runs` keys exists so writers of
+    /// different authority + cadence coexist, and reusing the batch id would make
+    /// `auto_run_decision` see the index as always-fresh (live run rows land every pass), silently
+    /// stopping the whole-checkout batch pass. Never batch-capable — see
+    /// [`Self::batch_capable`].
+    RaLsp,
 }
 
 impl OracleTool {
     /// Every known oracle tool, for "report on all tools" surfaces (`oracle status` with no
-    /// `--tool`). Later language backends extend this alongside the enum.
+    /// `--tool`). Later language backends extend this alongside the enum. Includes the LIVE tools
+    /// (`RaLsp`) — read surfaces merge across every writer with a run; batch-only DRIVERS must
+    /// filter through [`Self::batch_capable`].
     pub const ALL: &[OracleTool] = &[
         Self::RustAnalyzer,
         Self::ScipClang,
         Self::ScipPython,
         Self::ScipTypescript,
         Self::ScipJava,
+        Self::RaLsp,
     ];
 
     pub fn as_db_str(self) -> &'static str {
@@ -719,6 +747,26 @@ impl OracleTool {
 
     pub fn from_db_str(value: &str) -> Option<Self> {
         value.parse().ok()
+    }
+
+    /// Whether this tool produces/consumes whole-checkout `.scip` indexes — the batch paths:
+    /// `oracle run`, the background auto-run loop, the init-wizard tool listing, and
+    /// [`produce_scip_with_tool`]. `false` ONLY for the live LSP tools (`RaLsp`), which write
+    /// per-pass verdicts from the watcher and have no `scip_command`; every batch driver must skip
+    /// them rather than try to invoke them as indexers.
+    pub fn batch_capable(self) -> bool {
+        !matches!(self, Self::RaLsp)
+    }
+
+    /// The batch tool whose `logical_symbol_monikers` rows a LIVE tool copies into its own
+    /// `edge_oracle.scip_symbol` values, so live verdicts are byte-identical to what the batch
+    /// pass would write (clone-collapse + memory anchoring treat them as one evidence set, #534).
+    /// `None` for a batch tool (it mints monikers itself).
+    pub fn batch_moniker_source(self) -> Option<OracleTool> {
+        match self {
+            Self::RaLsp => Some(Self::RustAnalyzer),
+            _ => None,
+        }
     }
 
     /// Whether this backend's non-zero EXIT CODE reflects source DIAGNOSTICS rather than indexing
@@ -734,7 +782,6 @@ impl OracleTool {
     pub(crate) fn exit_code_reflects_diagnostics(self) -> bool {
         matches!(self, Self::ScipPython)
     }
-
     /// The position encoding to assume for SCIP documents this tool emits **without** an explicit
     /// `position_encoding` (the protobuf default `Unspecified`). scip-typescript reports ranges in
     /// UTF-16 code units (TypeScript's internal string offsets) but never sets the field, so
@@ -749,7 +796,9 @@ impl OracleTool {
             // UTF-16 count). Reading them as the UTF-32 fallback mis-converts past astral chars.
             Self::ScipTypescript | Self::ScipJava =>
                 PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
-            Self::RustAnalyzer | Self::ScipClang | Self::ScipPython =>
+            // RaLsp never parses a `.scip` (the live client negotiates its own LSP encoding);
+            // the arm exists only for exhaustiveness.
+            Self::RustAnalyzer | Self::ScipClang | Self::ScipPython | Self::RaLsp =>
                 PositionEncoding::UnspecifiedPositionEncoding,
         }
     }

@@ -81,6 +81,18 @@ It needs a SCIP tool (e.g. `rust-analyzer`) on `PATH`, runs only inside the MCP 
 the `.scip` outside the index write lock so the file watcher is never starved. See
 [`config.md`](config.md) for all knobs.
 
+### Live freshness (`[oracle.live]`)
+
+The batch pass covers the whole checkout on a slow cadence; the **live** oracle (#534) patches the
+gap for files being edited right now. With `[oracle.live] enabled`, the watcher's maintenance pass
+resolves the callees of just-changed Rust files through a resident `rust-analyzer` language server
+and writes the same verdict shape under the `ra-lsp` tool id — so a dirty file's edges reach the
+`Compiler` tier within a pass instead of the next batch run. Batch stays canonical: where both
+tools cover an edge, the batch verdict wins. `[oracle.live]` stands alone (it does not imply
+`auto_run`), but it is *moniker-blind* without a batch baseline — run `oracle run` occasionally so
+clone-collapse and moniker-anchored memories see the live edges too. See
+[`config/oracle.md`](config/oracle.md).
+
 ## Resolution-quality CI (the corpus runner)
 
 `tools/oracle-corpora.toml` declares real-repo corpora (a small per-PR tier + a heavy

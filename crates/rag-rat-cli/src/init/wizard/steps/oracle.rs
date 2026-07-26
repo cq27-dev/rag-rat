@@ -55,6 +55,12 @@ pub(super) fn render_oracle(f: &mut Frame, area: Rect, state: &WizardState) {
         _ => {},
     }
     for tool in OracleTool::ALL {
+        // The wizard lists BATCH (`.scip`-producing) tools only — a live backend (`ra-lsp`) is a
+        // watcher feature toggled via `[oracle.live]`, not a tool the user installs separately
+        // (#534).
+        if !tool.batch_capable() {
+            continue;
+        }
         let m = ToolManifest::for_tool(*tool);
         let relevant = m.languages.iter().any(|l| detected.contains(l));
         let style = if relevant { theme::accent() } else { theme::muted() };
@@ -108,6 +114,7 @@ fn tools_for_scan(state: &WizardState) -> Vec<OracleTool> {
     OracleTool::ALL
         .iter()
         .copied()
+        .filter(|t| t.batch_capable())
         .filter(|&t| ToolManifest::for_tool(t).languages.iter().any(|l| detected.contains(l)))
         .collect()
 }

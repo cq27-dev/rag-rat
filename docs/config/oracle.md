@@ -23,3 +23,28 @@ the brief join/write serializes), and is **fail-open** — any error, or a missi
 silent no-op, and the thread dies with the server process. While auto-fresh is on, `important-symbols`
 reports `heuristic ranking — compiler ranking refreshes in the background` instead of nudging you to
 run the oracle by hand.
+
+## Live LSP oracle (`[oracle.live]`)
+
+The **live** oracle is the per-pass freshness path (#534): the resident watcher's maintenance pass
+resolves the callees of **just-changed Rust files** through a resident `rust-analyzer` language
+server and writes the same `edge_oracle` verdicts the batch pass writes, under a distinct `ra-lsp`
+tool id. The batch pass (`auto_run` / `oracle run`) stays the canonical whole-checkout writer —
+live rows are a freshness patch for files being edited, and where both tools cover the same edge
+the batch verdict wins.
+
+```toml
+[oracle.live]
+enabled = false               # off by default — opt in explicitly
+idle_shutdown_secs = 900      # shut the language server down after 15 min idle
+max_requests_per_pass = 200   # cap on LSP requests per maintenance pass; the rest rides the next pass
+```
+
+**Standalone:** `[oracle.live]` does NOT imply or require `[oracle] auto_run`. Without a batch
+baseline the live pass is *moniker-blind* — it upgrades edge confidence tiers under `local
+ra-lsp-<n>` sentinel monikers, but clone-collapse (`find_clones` scip refine mode) and
+moniker-anchored memory relocation get nothing until a batch `oracle run` completes (`oracle
+status` says so when that's the case). Each completed batch run auto-upgrades subsequent live
+passes to the real monikers. Live runs only from the resident watcher (never one-shot hook/CLI
+maintenance passes, which would pay a language-server warm-up per invocation), and needs
+`rust-analyzer` on `PATH`; a missing tool degrades quietly like a missing embedding model.

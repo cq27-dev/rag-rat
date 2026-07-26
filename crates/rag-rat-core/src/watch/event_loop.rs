@@ -11,6 +11,7 @@ use rag_rat_base::config::Config;
 use rag_rat_base::locks::{self, FileLock};
 use rag_rat_papertrail::AutosyncRequest;
 
+use super::live_oracle::LiveOracleTail;
 use super::overlay::OverlayScope;
 use super::papertrail::{self, PapertrailClock, PapertrailScheduler};
 use super::pass::{
@@ -197,22 +198,29 @@ fn watcher_main(
         }
     }
 
-    // Maintenance passes run on the worker thread (#506); see `spawn_pass_worker` for why.
+    // Maintenance passes run on the worker thread (#506); see `spawn_pass_worker` for why. The
+    // live oracle's resident session + backlog (#534) lives here too — owned by the pass-worker
+    // closure, so it survives across passes but dies with the watcher.
     let (pass_tx, pass_rx) = std::sync::mpsc::channel();
     let Some(pass_worker) = spawn_pass_worker(pass_rx, tx, {
         let config = config.clone();
         // This watcher's counters, shared with the event-loop thread that records into them; the
         // pass reads them to persist the placement-failure high-water mark for `index_status`.
         let watch_counters = Arc::clone(&watch_counters);
+        let mut live_oracle = LiveOracleTail::new();
         move |request| {
             let _ = match request {
-                PassRequest::StartupCatchup =>
-                    startup_catchup_pass(&config, Some(watch_counters.as_ref())),
+                PassRequest::StartupCatchup => startup_catchup_pass(
+                    &config,
+                    Some(watch_counters.as_ref()),
+                    Some(&mut live_oracle),
+                ),
                 PassRequest::Maintenance { run_gc, overlay_scope } => maintenance_pass_scoped(
                     &config,
                     *run_gc,
                     overlay_scope,
                     Some(watch_counters.as_ref()),
+                    Some(&mut live_oracle),
                 ),
             };
         }

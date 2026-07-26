@@ -86,11 +86,15 @@ impl IndexDatabase {
         }
         // Merge verdicts from EVERY oracle backend that has a run in this checkout, not just
         // rust-analyzer (#176): a mixed-language repo has rust-analyzer/scip-clang/scip-python
-        // runs, and a Python (or C) edge's `compiler` tier lives under that tool's verdicts. An
-        // edge belongs to one language, so the per-tool verdict sets are disjoint — merging can't
-        // collide.
+        // runs, and a Python (or C) edge's `compiler` tier lives under that tool's verdicts.
+        // BATCH tools merge FIRST and WIN ties: batch verdict sets are disjoint across languages,
+        // but a LIVE tool (`ra-lsp`, #534) covers the SAME Rust edges its batch counterpart does,
+        // so overlap is real. The batch pass is the canonical writer (whole-checkout,
+        // authoritative clear, moniker-minting); a live verdict for the same edge is a freshness
+        // patch that must not displace it. Batch-first order + first-writer-wins per edge_id
+        // gives exactly that, deterministically (never relying on ALL's declaration order).
         let conn = self.storage.connection();
-        let runs = rag_rat_oracle::latest_runs_in_scope(
+        let mut runs = rag_rat_oracle::latest_runs_in_scope(
             conn,
             &self.active_commit_sha,
             &self.active_worktree_id,
@@ -99,17 +103,21 @@ impl IndexDatabase {
             // No oracle run for this checkout — nothing to surface, all hops stay heuristic.
             return Ok(false);
         }
+        // Stable sort: batch tools (`batch_capable`) first, preserving their ALL order.
+        runs.sort_by_key(|(tool, _)| !tool.batch_capable());
         let edge_ids = hops.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
         let mut verdicts = std::collections::HashMap::new();
         for (tool, tool_version) in &runs {
-            verdicts.extend(rag_rat_oracle::current_oracle_verdicts_for_edges(
+            for (edge_id, verdict) in rag_rat_oracle::current_oracle_verdicts_for_edges(
                 conn,
                 *tool,
                 tool_version,
                 &self.active_commit_sha,
                 &self.active_worktree_id,
                 &edge_ids,
-            )?);
+            )? {
+                verdicts.entry(edge_id).or_insert(verdict);
+            }
         }
         if verdicts.is_empty() {
             return Ok(false);
@@ -473,15 +481,21 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         // Compare against EVERY backend with a run in this checkout, not just rust-analyzer (#176):
         // a mixed-language repo's contradictions span tools (a C edge under scip-clang, a Python
-        // edge under scip-python). Verdict sets are disjoint by edge language, so aggregating is a
-        // plain concatenation.
-        let runs = rag_rat_oracle::latest_runs_in_scope(
+        // edge under scip-python). Batch tools report FIRST and win per-edge ties (#534): batch
+        // verdict sets are disjoint across languages, but a live tool (`ra-lsp`) overlaps its
+        // batch counterpart on the same Rust edges — without the dedupe one edge would appear
+        // once per tool, and the batch (canonical) verdict is the one to show.
+        let mut runs = rag_rat_oracle::latest_runs_in_scope(
             conn,
             &self.active_commit_sha,
             &self.active_worktree_id,
         )?;
+        // Stable sort: batch tools (`batch_capable`) first, preserving their ALL order.
+        runs.sort_by_key(|(tool, _)| !tool.batch_capable());
         let mut summary = rag_rat_query::graph::CompareGraphScipSummary::default();
         let mut contradictions = Vec::new();
+        // Edge ids already reported as contradicted (batch-first dedupe, #534).
+        let mut contradicted_edge_ids = std::collections::HashSet::new();
         if runs.is_empty() {
             summary.no_oracle_data = true;
             summary.warnings.push(
@@ -511,6 +525,11 @@ impl IndexDatabase {
             summary.verdicts_examined += u64::try_from(comparisons.len()).unwrap_or(u64::MAX);
             for comparison in comparisons {
                 if comparison.kind != rag_rat_oracle::OracleResolutionKind::Contradict {
+                    continue;
+                }
+                // One row per edge: the batch tool's contradiction (merged first) stands over a
+                // live duplicate — same batch-wins-on-overlap precedence as the tier surfacing.
+                if !contradicted_edge_ids.insert(comparison.edge_id) {
                     continue;
                 }
                 contradictions.push(rag_rat_query::graph::GraphScipContradiction {

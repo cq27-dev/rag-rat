@@ -87,8 +87,26 @@ pub(crate) fn classify_edge(input: &JoinInput<'_>) -> Option<EdgeVerdict> {
 /// heuristic already resolved (Exact/Syntactic), upgrade otherwise (unresolved / NameOnly /
 /// Ambiguous).
 fn classify_resolved(input: &JoinInput<'_>, oracle_symbol_id: i64) -> OracleResolutionKind {
-    if heuristic_resolved_in_corpus(input) {
-        if heuristic_agrees_with_oracle(input, oracle_symbol_id) {
+    classify_in_corpus(
+        input.confidence,
+        input.heuristic_symbol_id,
+        oracle_symbol_id,
+        input.logical_symbol_of,
+    )
+}
+
+/// The in-corpus classification over plain values — shared with the LIVE oracle's write path
+/// (#534), which resolves a callee to an in-corpus symbol via the LSP definition rather than a
+/// SCIP occurrence but must apply the IDENTICAL confirm/contradict/upgrade taxonomy so live and
+/// batch verdicts are interchangeable downstream.
+pub(crate) fn classify_in_corpus(
+    confidence: &str,
+    heuristic_symbol_id: Option<i64>,
+    oracle_symbol_id: i64,
+    logical_symbol_of: &dyn Fn(i64) -> Option<i64>,
+) -> OracleResolutionKind {
+    if heuristic_resolved_in_corpus(confidence, heuristic_symbol_id) {
+        if heuristic_agrees_with_oracle(heuristic_symbol_id, oracle_symbol_id, logical_symbol_of) {
             OracleResolutionKind::Confirm
         } else {
             OracleResolutionKind::Contradict
@@ -108,17 +126,18 @@ fn classify_resolved(input: &JoinInput<'_>, oracle_symbol_id: i64) -> OracleReso
 /// confirm/contradict split was ~even because *which* concrete row the resolver returned first was
 /// order-dependent, not correctness-dependent). Concrete-equality stays the fast path; the logical
 /// lookup only runs when the ids differ.
-fn heuristic_agrees_with_oracle(input: &JoinInput<'_>, oracle_symbol_id: i64) -> bool {
-    let Some(heuristic_symbol_id) = input.heuristic_symbol_id else {
+fn heuristic_agrees_with_oracle(
+    heuristic_symbol_id: Option<i64>,
+    oracle_symbol_id: i64,
+    logical_symbol_of: &dyn Fn(i64) -> Option<i64>,
+) -> bool {
+    let Some(heuristic_symbol_id) = heuristic_symbol_id else {
         return false;
     };
     if heuristic_symbol_id == oracle_symbol_id {
         return true;
     }
-    match (
-        (input.logical_symbol_of)(heuristic_symbol_id),
-        (input.logical_symbol_of)(oracle_symbol_id),
-    ) {
+    match (logical_symbol_of(heuristic_symbol_id), logical_symbol_of(oracle_symbol_id)) {
         (Some(heuristic_logical), Some(oracle_logical)) => heuristic_logical == oracle_logical,
         _ => false,
     }
@@ -134,7 +153,7 @@ fn heuristic_agrees_with_oracle(input: &JoinInput<'_>, oracle_symbol_id: i64) ->
 /// heuristic did NOT resolve in-corpus (unresolved / `NameOnly` / `Ambiguous`): there is no
 /// in-corpus claim to contradict, just an external placement the heuristic missed.
 fn classify_external(input: &JoinInput<'_>) -> OracleResolutionKind {
-    if heuristic_resolved_in_corpus(input) {
+    if heuristic_resolved_in_corpus(input.confidence, input.heuristic_symbol_id) {
         OracleResolutionKind::Contradict
     } else {
         OracleResolutionKind::ResolvedExternal
@@ -144,8 +163,8 @@ fn classify_external(input: &JoinInput<'_>) -> OracleResolutionKind {
 /// Whether the heuristic already resolved this edge to an in-corpus symbol: an `Exact`/`Syntactic`
 /// confidence carrying a concrete `to_symbol_id`. This is the precondition for a confirm/contradict
 /// verdict (there is a heuristic claim to agree or disagree with).
-fn heuristic_resolved_in_corpus(input: &JoinInput<'_>) -> bool {
-    matches!(input.confidence, "Exact" | "Syntactic") && input.heuristic_symbol_id.is_some()
+fn heuristic_resolved_in_corpus(confidence: &str, heuristic_symbol_id: Option<i64>) -> bool {
+    matches!(confidence, "Exact" | "Syntactic") && heuristic_symbol_id.is_some()
 }
 
 /// The occurrence whose byte range contains the callee token. Prefers a reference occurrence (the

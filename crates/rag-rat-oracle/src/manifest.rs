@@ -98,6 +98,17 @@ impl ToolManifest {
                                project's Gradle build (Maven Kotlin is unsupported), so the build \
                                must succeed; or pass a pre-built index with `--scip <path>`.",
             },
+            // The live rust-analyzer LSP client (#534): same binary as the batch Rust backend,
+            // driven as a resident language server by the watcher (`[oracle.live]`), never as a
+            // `.scip` producer — `batch_capable` gates it out of every batch driver.
+            OracleTool::RaLsp => ToolManifest {
+                tool,
+                program: "rust-analyzer",
+                languages: &["rust"],
+                install_hint: "rust-analyzer not found on PATH. Install it (e.g. `rustup \
+                               component add rust-analyzer`) so the live oracle (`[oracle.live] \
+                               enabled`) can spawn it as a language server.",
+            },
         }
     }
 
@@ -147,6 +158,9 @@ impl ToolManifest {
                     .arg("--help")
                     .output()
                     .is_ok_and(|output| output.status.success()),
+            // The live client drives rust-analyzer as an LSP server (no `scip` subcommand needed);
+            // a successful `--version` (already detected by `probe`) is the capability signal.
+            OracleTool::RaLsp => true,
         }
     }
 
@@ -204,6 +218,8 @@ impl ToolManifest {
                     root.display()
                 )
             }),
+            // The live client has no checkout prerequisite beyond the binary itself.
+            OracleTool::RaLsp => None,
         }
     }
 
@@ -287,6 +303,13 @@ impl ToolManifest {
                     .arg(output);
                 cmd
             },
+            // Unreachable: every batch driver gates live-only tools out BEFORE building a command
+            // (`produce_scip_with_tool` returns `Blocked`, the auto-run loop and the wizard filter
+            // on `batch_capable`). A live tool has no whole-checkout index invocation.
+            OracleTool::RaLsp => unreachable!(
+                "ra-lsp is a live oracle backend with no scip_command — the caller must gate on \
+                 OracleTool::batch_capable()"
+            ),
         }
     }
 }
