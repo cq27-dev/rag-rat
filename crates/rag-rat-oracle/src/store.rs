@@ -355,6 +355,11 @@ pub(crate) fn indexed_file_sha_for_path(
     .map_err(Into::into)
 }
 
+/// An `edge_oracle` row's full content key: `(source_start_byte, source_end_byte,
+/// callee_start_byte, callee_end_byte, edge_kind)` — the identity the live pass's covered-skip
+/// tracks (never the callee start alone; two edges can share one token).
+pub(crate) type LiveEdgeKey = (i64, i64, i64, i64, String);
+
 /// The full content keys of a file's edges already covered by a CURRENT live verdict for
 /// `(tool, tool_version)` — current meaning the row's `file_sha` matches the file's indexed
 /// content NOW (the content-addressed currency the live pass keys on, #534). The budget
@@ -369,7 +374,7 @@ pub(crate) fn live_covered_edges_for_path(
     tool_version: &str,
     source_path: &str,
     file_sha: &str,
-) -> anyhow::Result<std::collections::HashSet<(i64, i64, i64, i64, String)>> {
+) -> anyhow::Result<std::collections::HashSet<LiveEdgeKey>> {
     let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
     let mut stmt = conn.prepare(&format!(
         "SELECT source_start_byte, source_end_byte, callee_start_byte, callee_end_byte, edge_kind
