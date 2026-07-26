@@ -2,18 +2,53 @@ use super::build::{build_sub_block_index, resolve_symbol_anchors};
 use super::storage::open_building_generation;
 use super::*;
 
+pub(in super::super) struct CloneFixture {
+    config: rag_rat_base::config::Config,
+    scratch: rag_rat_base::test_scratch::ScratchDir,
+}
+
+impl CloneFixture {
+    pub(in super::super) fn retain_for(self, db: crate::IndexDatabase) -> CloneDatabase {
+        CloneDatabase { db, _scratch: self.scratch }
+    }
+}
+
+impl std::ops::Deref for CloneFixture {
+    type Target = rag_rat_base::config::Config;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+impl std::ops::DerefMut for CloneFixture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.config
+    }
+}
+
+pub(in super::super) struct CloneDatabase {
+    // Fields drop in declaration order: close SQLite before removing its directory on Windows.
+    db: crate::IndexDatabase,
+    _scratch: rag_rat_base::test_scratch::ScratchDir,
+}
+
+impl std::ops::Deref for CloneDatabase {
+    type Target = crate::IndexDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        &self.db
+    }
+}
+
 /// The config for a fixed two-file fixture with two renamed-clone groups
 /// (load_user/load_order and compute_totals/tally_amounts). Identical file CONTENT across tags
 /// → identical content-key edges, so two builds are directly comparable. Split out so a
 /// test can `rebuild` the SAME config twice (identical content) to exercise the
 /// full-rebuild df refresh.
-pub(in super::super) fn clone_fixture_config(tag: &str) -> rag_rat_base::config::Config {
-    let root = std::env::temp_dir().join(format!(
-        "rag-rat-precompute-{tag}-{}-{}",
-        std::process::id(),
-        now_ms()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
+pub(in super::super) fn clone_fixture_config(tag: &str) -> CloneFixture {
+    let scratch = rag_rat_base::test_scratch::ScratchDir::new(&format!("precompute-{tag}"));
+    let root = scratch.path().to_path_buf();
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
         root.join("src/a.rs"),
@@ -29,7 +64,7 @@ pub(in super::super) fn clone_fixture_config(tag: &str) -> rag_rat_base::config:
          } t + 1 }\n",
     )
     .unwrap();
-    rag_rat_base::config::Config {
+    let config = rag_rat_base::config::Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
@@ -54,12 +89,15 @@ pub(in super::super) fn clone_fixture_config(tag: &str) -> rag_rat_base::config:
         log: Default::default(),
         source_root_reanchored_from: None,
         allow_empty: false,
-    }
+    };
+    CloneFixture { config, scratch }
 }
 
 /// A fixed two-file fixture (see [`clone_fixture_config`]), rebuilt fresh.
-fn build_clone_fixture(tag: &str) -> crate::IndexDatabase {
-    crate::IndexDatabase::rebuild(&clone_fixture_config(tag)).unwrap()
+fn build_clone_fixture(tag: &str) -> CloneDatabase {
+    let fixture = clone_fixture_config(tag);
+    let db = crate::IndexDatabase::rebuild(&fixture).unwrap();
+    fixture.retain_for(db)
 }
 
 /// The content-key set of the live-or-only generation's edges, sorted — the build-stable

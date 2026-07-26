@@ -4,45 +4,16 @@
 //! memory-relocation tests, so it is NOT `#[cfg(test)]` — the gate does not propagate cross-crate.
 //! Not part of the semver-stable API surface.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use ::protobuf::{EnumOrUnknown, Message};
 use ::scip::types::{Document, Index, Occurrence, PositionEncoding};
+use rag_rat_base::test_scratch::ScratchDir;
 use rag_rat_db::schema;
 use rusqlite::{Connection, params};
 
 use crate::store::{self, EdgeOracleRow};
 use crate::{OracleResolutionKind, OracleTool};
-
-/// A unique temp directory under the system temp root (no external crate; matches the repo's
-/// `std::env::temp_dir` + atomic-counter convention). Cleaned up on `Drop`.
-struct TempRoot {
-    path: PathBuf,
-}
-
-impl TempRoot {
-    fn new() -> Self {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "rag-rat-oracle-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        TempRoot { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempRoot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 pub const TOOL: OracleTool = OracleTool::RustAnalyzer;
 pub const VERSION: &str = "test";
@@ -67,7 +38,8 @@ pub struct EdgeContentKey {
 /// A test corpus written to a temp checkout + an index DB seeded to match.
 pub struct Harness {
     pub conn: Connection,
-    root: TempRoot,
+    // Fields drop in declaration order: close SQLite before removing its directory on Windows.
+    root: ScratchDir,
 }
 
 impl Default for Harness {
@@ -85,7 +57,7 @@ impl Harness {
         // Fresh in-memory scratch DB: the documented-sound `MigrationHooks::noop()` case — every
         // hook-using migration runs over empty tables, so the harness stays engine-free.
         schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
-        let root = TempRoot::new();
+        let root = ScratchDir::new("oracle");
         Harness { conn, root }
     }
 

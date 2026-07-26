@@ -1781,7 +1781,7 @@ mod tests {
 
         // Two byte-identical fixtures, taken through the SAME rebuild + precompute + edit +
         // reindex, so only the delta's changed-set derivation differs between them.
-        let prepare = |tag: &str| -> (rag_rat_base::config::Config, crate::IndexDatabase) {
+        let prepare = |tag: &str| {
             let config = clone_fixture_config(tag);
             let db = crate::IndexDatabase::rebuild(&config).unwrap();
             assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
@@ -1802,15 +1802,15 @@ mod tests {
             )
             .unwrap();
             let db = reindex(&config);
-            (config, db)
+            config.retain_for(db)
         };
 
-        let (_scan_config, scan_db) = prepare("delta-hint-scan");
+        let scan_db = prepare("delta-hint-scan");
         let scan_report =
             scan_db.apply_clone_graph_delta_hinted(64, CloneDeltaHint::FullScan).unwrap();
         let scan_edges = edge_keys(&scan_db);
 
-        let (_hint_config, hint_db) = prepare("delta-hint-paths");
+        let hint_db = prepare("delta-hint-paths");
         // The hint the reconcile would supply: the reindexed/new paths PLUS an unchanged base file.
         let touched: BTreeSet<String> =
             ["src/a.rs", "src/b.rs", "src/c.rs"].iter().map(|s| s.to_string()).collect();

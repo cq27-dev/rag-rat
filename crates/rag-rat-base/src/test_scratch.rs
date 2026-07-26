@@ -22,8 +22,8 @@
 //!   2. the FIRST scratch request in each process sweeps sibling scratch dirs older than
 //!      [`SWEEP_MAX_AGE`] out of that root — self-healing after a `kill -9`, no external cron.
 //!
-//! `Drop`-based cleanup stays the fast path; the age-bounded sweep is only the backstop for the
-//! cases where `Drop` never runs.
+//! [`ScratchDir`]'s `Drop` cleanup is the fast path; the age-bounded sweep is only the backstop for
+//! the cases where `Drop` never runs.
 //!
 //! # Security: the namespace is per-user and its identity is verified before any sweep
 //!
@@ -318,6 +318,42 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// One uniquely owned scratch directory, removed on drop.
+///
+/// Names retain [`scratch_dir`]'s tag + PID + atomic-sequence scheme, so parallel tests never share
+/// a directory. The guard is deliberately not cloneable: exactly one owner removes each path.
+/// Keep it alive until every file, database connection, watcher, and child process using the path
+/// has dropped; this is required for cleanup on Windows.
+#[derive(Debug)]
+pub struct ScratchDir {
+    path: PathBuf,
+}
+
+impl ScratchDir {
+    pub fn new(tag: &str) -> Self {
+        let path = scratch_dir(tag);
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|error| panic!("failed to create scratch directory {path:?}: {error}"));
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for ScratchDir {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -510,6 +546,46 @@ mod tests {
         assert_eq!(dir.parent(), Some(scratch_root().as_path()));
         let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
         assert!(name.starts_with("normal-tag-"), "unexpected scratch name {name:?}");
+    }
+
+    #[test]
+    fn scratch_guard_removes_its_directory_on_drop() {
+        let path = {
+            let scratch = ScratchDir::new("drop-probe");
+            let path = scratch.path().to_path_buf();
+            std::fs::write(path.join("payload"), "test").unwrap();
+            path
+        };
+        assert!(!path.exists(), "scratch guard left its directory behind: {path:?}");
+    }
+
+    #[test]
+    fn scratch_guard_removes_its_directory_during_unwind() {
+        let scratch = ScratchDir::new("unwind-probe");
+        let path = scratch.path().to_path_buf();
+        let result = std::panic::catch_unwind(move || {
+            let _scratch = scratch;
+            panic!("fixture failure");
+        });
+        assert!(result.is_err());
+        assert!(!path.exists(), "unwinding left the scratch directory behind: {path:?}");
+    }
+
+    #[test]
+    fn parallel_scratch_guards_get_distinct_directories() {
+        let workers = (0..32)
+            .map(|_| std::thread::spawn(|| ScratchDir::new("parallel-probe")))
+            .collect::<Vec<_>>();
+        let scratch = workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>();
+        let paths = scratch
+            .iter()
+            .map(|dir| dir.path().to_path_buf())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(paths.len(), scratch.len());
+        assert!(paths.iter().all(|path| path.is_dir()));
+
+        drop(scratch);
+        assert!(paths.iter().all(|path| !path.exists()));
     }
 
     /// The exact #732-review attack: a `..` tag aims the join+delete at a victim OUTSIDE the

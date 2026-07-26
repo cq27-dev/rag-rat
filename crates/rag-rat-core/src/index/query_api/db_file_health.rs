@@ -330,22 +330,32 @@ fn freelist_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
 
-    static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+    struct TestDatabase {
+        // Fields drop in declaration order: close SQLite before removing its directory on Windows.
+        db: crate::IndexDatabase,
+        _scratch: rag_rat_base::test_scratch::ScratchDir,
+    }
+
+    impl std::ops::Deref for TestDatabase {
+        type Target = crate::IndexDatabase;
+
+        fn deref(&self) -> &Self::Target {
+            &self.db
+        }
+    }
 
     /// Minimal single-file fixture: file-health tests need a real WAL-mode database with a
     /// registered repo, not any particular indexed content.
-    fn fixture_config(tag: &str) -> rag_rat_base::config::Config {
-        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir()
-            .join(format!("rag-rat-file-health-{tag}-{}-{seq}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn fixture_config(
+        tag: &str,
+    ) -> (rag_rat_base::config::Config, rag_rat_base::test_scratch::ScratchDir) {
+        let scratch = rag_rat_base::test_scratch::ScratchDir::new(&format!("file-health-{tag}"));
+        let root = scratch.path().to_path_buf();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn health_probe() -> i32 { 1 }\n").unwrap();
-        rag_rat_base::config::Config {
+        let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             sync: Default::default(),
@@ -370,11 +380,14 @@ mod tests {
             log: Default::default(),
             source_root_reanchored_from: None,
             allow_empty: false,
-        }
+        };
+        (config, scratch)
     }
 
-    fn build_fixture(tag: &str) -> crate::IndexDatabase {
-        crate::IndexDatabase::rebuild(&fixture_config(tag)).unwrap()
+    fn build_fixture(tag: &str) -> TestDatabase {
+        let (config, scratch) = fixture_config(tag);
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        TestDatabase { db, _scratch: scratch }
     }
 
     /// Guarantee at least one un-checkpointed WAL frame (the rebuild may have autocheckpointed).
