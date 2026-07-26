@@ -1266,11 +1266,18 @@ fn integration_blocks_unresolved_foreign_hook_conflicts() {
             ])
             .env("RAG_RAT_TEST_GIT_ENV_SCRUBBED", "1")
             .env("HOME", home.path())
+            // `/dev/null` config files (not merely removing the overrides, which would restore
+            // the machine's real system/global config), and no inline-config vectors: any of
+            // `GIT_CONFIG`/`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` could still smuggle a
+            // `core.hooksPath` into the child's `git_paths` resolution.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_CONFIG_GLOBAL")
-            .env_remove("GIT_CONFIG_SYSTEM")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
             .status()
             .unwrap();
         assert!(status.success(), "scrubbed re-exec failed");
