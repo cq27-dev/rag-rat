@@ -246,24 +246,10 @@ mod tests {
     // Run a git command in `root`, panicking on failure — models
     // `query_api::oracle_surfacing_tests::git`, private to that module and not reachable here.
     fn git(root: &std::path::Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            // Isolate from the ambient environment (#581): no user/system gitconfig leaks in
-            // (a hostile global `core.hooksPath` fails every commit here), and HOME is pinned
-            // to the temp root so nothing resolves to the developer's/CI runner's real home.
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("HOME", root)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?} failed");
+        // The shared seam keeps the #581 isolation (no ambient gitconfig, pinned HOME and
+        // identity) and adds repository-routing isolation (an exported `GIT_DIR`/`GIT_WORK_TREE`
+        // can never re-point a fixture at an external repo).
+        rag_rat_base::test_git::run(root, args);
     }
 
     /// A clone sharing a checkout's portable (root-commit-derived) identity, pointed at the SAME

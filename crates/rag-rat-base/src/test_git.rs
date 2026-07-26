@@ -33,6 +33,20 @@ pub fn command(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(dir)
         .args(args)
+        // Repository-routing variables are removed outright: an exported `GIT_DIR` /
+        // `GIT_WORK_TREE` / `GIT_INDEX_FILE` (a worktree shell, an IDE, a hook context) beats
+        // `current_dir` and would operate the fixture on an UNRELATED repository (#219's exact
+        // hijack shape), and `GIT_CONFIG` / `GIT_CONFIG_PARAMETERS` are inline-config vectors
+        // that could smuggle a hostile `hooksPath` past the `/dev/null` files below.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_PARAMETERS")
         .env("GIT_AUTHOR_NAME", "rag-rat-test")
         .env("GIT_AUTHOR_EMAIL", "rag-rat-test@example.invalid")
         .env("GIT_COMMITTER_NAME", "rag-rat-test")

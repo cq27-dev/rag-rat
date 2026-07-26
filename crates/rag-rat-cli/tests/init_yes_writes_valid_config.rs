@@ -70,6 +70,11 @@ fn init_yes_writes_a_config_that_config_load_accepts() {
         // (#970): a hostile ambient `core.hooksPath` must not reach the fixture's hook install.
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        // Routing vars are scrubbed too: production discovery honors GIT_DIR/GIT_WORK_TREE
+        // (#213 bare-dir/hook contexts), which would re-point the fixture at an unrelated repo.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .expect("run rag-rat init --yes");
 
@@ -153,6 +158,9 @@ fn init_in_a_new_repo_leaves_an_existing_repos_heal_owed_meta() {
             .env("XDG_CACHE_HOME", &cache)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap()
     };

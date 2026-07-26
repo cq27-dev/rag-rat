@@ -397,15 +397,7 @@ mod tests {
     use super::*;
 
     fn git(root: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?} failed");
+        rag_rat_base::test_git::run(root, args);
     }
 
     #[test]
