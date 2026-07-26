@@ -16,7 +16,7 @@ use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
 use rag_rat_query::symbol::SymbolSelector;
 use serde::Deserialize;
 
-use crate::cli::DumpVerifyPacksArgs;
+use crate::cli::{DumpMemoryInputHashesArgs, DumpVerifyPacksArgs};
 use crate::open_index;
 
 /// The regeneration spec: the eval memories to insert, plus which of them to dump packs for.
@@ -142,5 +142,37 @@ pub(crate) fn dump_verify_packs(config: &Config, args: &DumpVerifyPacksArgs) -> 
 
     std::fs::write(&args.out, serde_json::to_string_pretty(&packs)?)?;
     eprintln!("wrote {} packs (root {}) to {}", packs.len(), args.root_label, args.out.display());
+    Ok(())
+}
+
+/// Recompute the exact production verifier-input hash for existing memories. Unlike
+/// [`dump_verify_packs`], this is read-only and operates on the configured live index; it exists so
+/// offline fixture exporters cannot mistake a merely non-null stored hash for a fresh verdict.
+pub(crate) fn dump_memory_input_hashes(
+    config: &Config,
+    args: &DumpMemoryInputHashesArgs,
+) -> anyhow::Result<()> {
+    let memory_ids: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&args.memory_ids)?)?;
+    let storage = rag_rat_db::storage::IndexConnection::open_read_only_blocking(&args.db)?;
+    rag_rat_core::index::install_worktree_scope_view(
+        storage.connection(),
+        &args.repo_id,
+        &config.root,
+        &config.root,
+    )?;
+    let scope = Some(args.repo_id.clone());
+    let mut hashes = BTreeMap::new();
+    for memory_id in memory_ids {
+        let hash = rag_rat_query::memory::evidence::checked_inputs_hash(
+            storage.connection(),
+            &memory_id,
+            &scope,
+        )
+        .map_err(|error| anyhow::anyhow!("hashing verifier inputs for `{memory_id}`: {error}"))?;
+        hashes.insert(memory_id, hash);
+    }
+    std::fs::write(&args.out, serde_json::to_string_pretty(&hashes)?)?;
+    eprintln!("wrote {} verifier-input hashes to {}", hashes.len(), args.out.display());
     Ok(())
 }

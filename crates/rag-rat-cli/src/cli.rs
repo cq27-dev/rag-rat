@@ -132,6 +132,11 @@ pub(crate) enum Command {
     #[command(hide = true)]
     DumpVerifyPacks(DumpVerifyPacksArgs),
 
+    /// Recompute production verifier-input hashes for existing memories. Eval fixture helper.
+    #[cfg(feature = "eval")]
+    #[command(hide = true)]
+    DumpMemoryInputHashes(DumpMemoryInputHashesArgs),
+
     /// SCIP-oracle pass: compiler-grade edge resolution from a language indexer.
     Oracle(OracleArgs),
 
@@ -507,6 +512,23 @@ pub(crate) struct DumpVerifyPacksArgs {
     #[arg(long)]
     pub root_label: String,
     /// Output JSON path: `{ "<eval_id>|<root_label>": "<pack text>" }`.
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
+#[cfg(feature = "eval")]
+#[derive(Debug, Args)]
+pub(crate) struct DumpMemoryInputHashesArgs {
+    /// Existing index database whose memories should be resolved.
+    #[arg(long)]
+    pub db: PathBuf,
+    /// Repository scope containing the memories.
+    #[arg(long)]
+    pub repo_id: String,
+    /// Input JSON array of existing memory ids.
+    #[arg(long)]
+    pub memory_ids: PathBuf,
+    /// Output JSON object mapping each memory id to its current production input hash.
     #[arg(long)]
     pub out: PathBuf,
 }

@@ -1,0 +1,1027 @@
+{
+ "cases": {
+  "reviewed_00": {
+   "current_bound_paths": [
+    "crates/rag-rat-sync/src/auth.rs"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_01": {
+   "current_bound_paths": [
+    "crates/rag-rat-oplog/src/account/content/storage.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "773",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-oplog/src/account/content/storage.rs",
+     "thread_title": "fix(oplog): condemn beyond-cut content on a withheld watermark (I11 parity with the account fold)",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "780",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-oplog/src/account/content/storage.rs",
+     "thread_title": "test(oplog): tripwires for AEAD nonce freshness, sealing-selection convergence, and pre-verify per-origin isolation",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "885",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-oplog/src/account/content/storage.rs",
+     "thread_title": "feat(sync): extend the transport to /3 content \u2014 the memories themselves (#406)",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": [
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "73aac22d473c55a2836511a4434dd875adbe4d4c52a3740b71ee7d42be5fe4ae",
+      "content_hash": "3757464aba74841fc197948bd30ea132a512ce3ab911ec5a803d89723b425041",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Invariant",
+     "memory_id": "mem_19f7c2526d5_19a8b784fd07",
+     "shared_binding": "crates/rag-rat-oplog/src/account/content/storage.rs",
+     "summary": null,
+     "title": "Refold\u2192reproject coupling (#683/#698): shared refold_and_project_stream_in_tx seam; remote path queues future atomic acceptance+projection"
+    },
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "eb14c08cc9e1d5bdc93c0ca9c536d77d23ce07b5bce530b60e6e05fc7afedc2d",
+      "content_hash": "d5b3d1e4cb1e30d1ba8b3df2306362ad136d958cb5c308a83ad052112d33a02f",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Invariant",
+     "memory_id": "mem_19f85f6005c_6f9995125332",
+     "shared_binding": "crates/rag-rat-oplog/src/account/content/storage.rs",
+     "summary": null,
+     "title": "Oversize settle maintenance gates on \"eligible work DRAINED\", never on \"discovery listed nothing\" \u2014 the latter starves forever"
+    }
+   ]
+  },
+  "reviewed_02": {
+   "current_bound_paths": [
+    "crates/rag-rat-papertrail/src/lib.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "808",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-papertrail/src/lib.rs",
+     "thread_title": "distill: records_for_symbol \u2014 facet-gated symbol\u2192record read for the drive-by lane",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": []
+  },
+  "reviewed_03": {
+   "current_bound_paths": [
+    "crates/rag-rat-core/src/index/ai/reconcile/model_lifecycle.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "371",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/ai/reconcile/model_lifecycle.rs",
+     "thread_title": "Split index/ai/reconcile.rs god-module (2.5k lines / 84 fns, mixed concerns)",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": []
+  },
+  "reviewed_04": {
+   "current_bound_paths": [
+    "crates/rag-rat-core/src/index/ai/reconcile/embed_loop.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "572",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/ai/reconcile/embed_loop.rs",
+     "thread_title": "perf(reconcile): classify skip-summary low-signal from one shared parse per file",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "630",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/ai/reconcile/embed_loop.rs",
+     "thread_title": "refactor: tiered god-module sweep (watch, config, mcp, embed_loop)",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "371",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/ai/reconcile/embed_loop.rs",
+     "thread_title": "Split index/ai/reconcile.rs god-module (2.5k lines / 84 fns, mixed concerns)",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": []
+  },
+  "reviewed_05": {
+   "current_bound_paths": [
+    "crates/rag-rat-cli/src/commands/index_ops.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "496",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-cli/src/commands/index_ops.rs",
+     "thread_title": "feat(memory): pending anchor status for in-flight worktree branches",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "575",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-cli/src/commands/index_ops.rs",
+     "thread_title": "perf(reconcile): serve the skip-summary from a version-stamped column",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "631",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-cli/src/commands/index_ops.rs",
+     "thread_title": "feat(papertrail): add tracker config and provider ref grammar",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": [
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "6db0af620475b46d6f70f5e51b3bd47e87c4f8b296358be27a755e709ae8dc79",
+      "content_hash": "b69e161f482087e480d256f6fcffcd85dd34468d13f295dcb02824637cd6aa1b",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "PlatformQuirk",
+     "memory_id": "mem_19f88dc34a8_a4bc9a257800",
+     "shared_binding": "crates/rag-rat-cli/src/commands/index_ops.rs",
+     "summary": null,
+     "title": "index --watch exits on SIGINT via DEFAULT disposition only \u2014 launchers that inherit SIG_IGN (shell `&` in non-interactive scripts) make it un-Ctrl-C-able"
+    }
+   ]
+  },
+  "reviewed_06": {
+   "current_bound_paths": [],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_07": {
+   "current_bound_paths": [
+    "crates/rag-rat-core/src/index/ai/policy.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "572",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/ai/policy.rs",
+     "thread_title": "perf(reconcile): classify skip-summary low-signal from one shared parse per file",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "575",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/ai/policy.rs",
+     "thread_title": "perf(reconcile): serve the skip-summary from a version-stamped column",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "516",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/ai/policy.rs",
+     "thread_title": "perf(index): embedding policy re-parses every chunk \u2014 classify low-signal from the shared file parse",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": [
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "6276a8ef415519366cc38057b12a650bf5e3b9e1f6b16c4db1499ebed198d249",
+      "content_hash": "438adf7dd0e19c7d14ba851824ee3744c6a8553a611e124ea153f904b6d05022",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Decision",
+     "memory_id": "mem_19f7133eb05_12965327c378",
+     "shared_binding": "crates/rag-rat-core/src/index/ai/policy.rs",
+     "summary": null,
+     "title": "#725: embed path reads the certified stamped policy column (job_policy) \u2014 FromText re-parse is the fallback, not the default"
+    }
+   ]
+  },
+  "reviewed_08": {
+   "current_bound_paths": [],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_09": {
+   "current_bound_paths": [
+    "crates/rag-rat-core/src/index/edges/resolve/mod.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "192",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/edges/resolve/mod.rs",
+     "thread_title": "fix(resolve): stop asserting high confidence on guessed Rust type references",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "206",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/edges/resolve/mod.rs",
+     "thread_title": "feat(graph): synthesize message-dispatch (actor-channel / enum) edges (#200)",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "1",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/edges/resolve/mod.rs",
+     "thread_title": "M1: Keep SQLite/rusqlite storage facade and default config",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": []
+  },
+  "reviewed_10": {
+   "current_bound_paths": [
+    "crates/rag-rat-db/src/content_digest.rs"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_11": {
+   "current_bound_paths": [],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_12": {
+   "current_bound_paths": [
+    "tools/oracle-toolchain/package.json"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_13": {
+   "current_bound_paths": [
+    "crates/rag-rat-oplog/src/account/fold.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "737",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-oplog/src/account/fold.rs",
+     "thread_title": "feat(oplog): wire secrets-chain cut registers into the account fold (C4.2a)",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "774",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-oplog/src/account/fold.rs",
+     "thread_title": "test(oplog): behavioral coverage for last-owner protection and no-cascade",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "813",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-oplog/src/account/fold.rs",
+     "thread_title": "feat(oplog): annex log and the snapshot coverage-manifest wire (#609)",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": [
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "db3601a5ed38071b550fb9a6661195c8dce24fbae81ed8c02de86e2aacf0750d",
+      "content_hash": "baa9531e1e0d5126cd760bd489292e99c8007e69a9d8f8a8ee63cfb156fa1d05",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Invariant",
+     "memory_id": "mem_19f755d18e0_347e5099b1f4",
+     "shared_binding": "crates/rag-rat-oplog/src/account/fold.rs",
+     "summary": null,
+     "title": "C4.2a: secrets-chain cut registers fold via log-generic machinery (atomic per-op, whole-depth staging, intrinsic-LastOwner prefilter)"
+    },
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "74d5e9bcaf9ca1b5644691fd7082339236a38d8a3f37e11db3c6b84cf6745985",
+      "content_hash": "af0f6966ecb6fca2e05d01acaa7626b5273f7c7b4d8f28a11c72cce2ee52b442",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Risk",
+     "memory_id": "mem_19f76df2f5e_8c4dc6284156",
+     "shared_binding": "crates/rag-rat-oplog/src/account/fold.rs",
+     "summary": null,
+     "title": "Intrinsic last-owner prefilter is skipped at stratum 0: sole-founder self-remove equivocation folds contested, not Live"
+    },
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "e141bc148f678be1749d05d4efb945fc7525daa7e1a38bf16485a8ac85be83a2",
+      "content_hash": "578b2ddd9518eac945b82d23377c626752a8a573396c0fc901c88306b17eb466",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "TestExpectation",
+     "memory_id": "mem_19f77246ae7_80f708fe55ce",
+     "shared_binding": "crates/rag-rat-oplog/src/account/fold.rs",
+     "summary": null,
+     "title": "Both LastOwner paths (intrinsic prefilter + I2 sim) are reachable in a Live fold only via a DEMOTED-but-still-live owner"
+    }
+   ]
+  },
+  "reviewed_14": {
+   "current_bound_paths": [
+    "crates/rag-rat-core/src/index/edges/extract/mod.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "519",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/edges/extract/mod.rs",
+     "thread_title": "perf(edges): contains_edges is O(S\u00b2), containing_symbol allocates + sorts per edge",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "520",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/edges/extract/mod.rs",
+     "thread_title": "refactor(parser): iterative single-cursor tree walks; depth-safe traversal",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "543",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/edges/extract/mod.rs",
+     "thread_title": "perf(parser): depth-safe the recursive name-finding helpers (subtree-depth stack overflow)",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": []
+  },
+  "reviewed_15": {
+   "current_bound_paths": [],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_16": {
+   "current_bound_paths": [
+    "crates/rag-rat-sync/src/session.rs"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_17": {
+   "current_bound_paths": [
+    "crates/rag-rat-oplog/src/table_sync/apply.rs"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_18": {
+   "current_bound_paths": [
+    "release-plz.toml"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_19": {
+   "current_bound_paths": [
+    "dist-workspace.toml"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_20": {
+   "current_bound_paths": [
+    "cookbook/recipes/modal.mts"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_21": {
+   "current_bound_paths": [],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_22": {
+   "current_bound_paths": [
+    "crates/rag-rat-papertrail/src/mirror.rs"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_23": {
+   "current_bound_paths": [
+    "crates/rag-rat-oplog/src/account/keywrap.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "780",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-oplog/src/account/keywrap.rs",
+     "thread_title": "test(oplog): tripwires for AEAD nonce freshness, sealing-selection convergence, and pre-verify per-origin isolation",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": []
+  },
+  "reviewed_24": {
+   "current_bound_paths": [
+    "crates/rag-rat-core/src/index/util.rs"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_25": {
+   "current_bound_paths": [
+    "crates/rag-rat-oplog/src/account"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_26": {
+   "current_bound_paths": [
+    "crates/rag-rat-core/src/memory_write/authoring.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "891",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/memory_write/authoring.rs",
+     "thread_title": "feat(memory): sync-origin provenance + edge tombstones, the projection foundation (#691)",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "680",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/memory_write/authoring.rs",
+     "thread_title": "Oversized pre-existing memory body wedges all writes for a repo",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "683",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/memory_write/authoring.rs",
+     "thread_title": "Refresh the accepted-/3 memory projection when an account refold changes acceptance",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": [
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "a7cf39193f024f7a71661173923a803ed319599b1ce50b13bfb538412d5cb188",
+      "content_hash": "999f7f980bc3ff0e8248846c6da9cf19782bacd538f68e8a3b080c22ddc7c090",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Invariant",
+     "memory_id": "mem_19f796e67c2_898471e7dbea",
+     "shared_binding": "crates/rag-rat-core/src/memory_write/authoring.rs",
+     "summary": null,
+     "title": "#680 P2: whole-op write-boundary guard lives at author_in_owner_stream \u2014 the one seam all live memory mutations funnel through"
+    },
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "5fd13e5d1cd17c5175dfc0e9ba93a638c0dc813f9cbe1d765ce3e6c3b16c97be",
+      "content_hash": "f32e3370920bb75331805ac155843a68ce1de5cc72797be719787e0944c0e7ea",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Invariant",
+     "memory_id": "mem_19f7f789868_b6b6febd9f01",
+     "shared_binding": "crates/rag-rat-core/src/memory_write/authoring.rs",
+     "summary": null,
+     "title": "#763 core catch-up owns durability/scope; future pairing calls it only after enrollment"
+    },
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "ffed32941c1d9c9830720e634c3126cef17615fbd0c206eb6c8789d8fc8da154",
+      "content_hash": "1948ca0627cc828b9c7756aae12f5f41ce55b4267ba59cc3695d93487f7adb26",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Invariant",
+     "memory_id": "mem_19f85f6484a_ee0e681d5998",
+     "shared_binding": "crates/rag-rat-core/src/memory_write/authoring.rs",
+     "summary": null,
+     "title": "The pending-fold barrier settles the owner stream INSIDE the write's transaction \u2014 never as an unbudgeted autocommit pre-drain"
+    }
+   ]
+  },
+  "reviewed_27": {
+   "current_bound_paths": [
+    "deny.toml"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_28": {
+   "current_bound_paths": [
+    "crates/rag-rat-core/src/index/papertrail_autosync.rs"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_29": {
+   "current_bound_paths": [
+    "crates/rag-rat-oplog/src/account/storage.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "842",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-oplog/src/account/storage.rs",
+     "thread_title": "feat(oplog): read-time verification of a snapshot's coverage claim (#609)",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "846",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-oplog/src/account/storage.rs",
+     "thread_title": "feat(oplog): snapshot usability and coverage-dominance selection (#609)",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "861",
+     "item_kind": "change_request",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-oplog/src/account/storage.rs",
+     "thread_title": "test(oplog): pin the total tombstone set a snapshot binds (#609)",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": [
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "d190d976a6fef19d901a9ac28767fc0c2419984059be083906b3ca021bda4654",
+      "content_hash": "d9689b26916bfacd771feaae6c0a002ac09d21c3da799dd48d9b5e02a49a0ddf",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Decision",
+     "memory_id": "mem_19f756a8073_a5875921fb9c",
+     "shared_binding": "crates/rag-rat-oplog/src/account/storage.rs",
+     "summary": null,
+     "title": "Frozen convergence rule: a non-evaluable log-1 (secrets) entry is SLOT-ELIGIBLE but never accepted"
+    },
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "49e34377e7260cc15aec507274c69dc9f77e17bbfc0e6876e3518468d982f5e9",
+      "content_hash": "53f6fa3312336a2a2f111e36919fc303771079308de6c4f5b78a6f6d1808f595",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Risk",
+     "memory_id": "mem_19f756ad8de_cc4edaea9959",
+     "shared_binding": "crates/rag-rat-oplog/src/account/storage.rs",
+     "summary": null,
+     "title": "Account-side branch selection has NO watermark pins; a log-1/secrets acceptance loop needs a pin-aware analog"
+    },
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "a190a96882daed397d51a8d0d2b1a97baab22da539245dd9ec45a02e7979512b",
+      "content_hash": "28f2a366acbd4340b7dedd79e52908b151b7a77944a32a23f02ff855f026818d",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Risk",
+     "memory_id": "mem_19f75cc7180_be3b8d356394",
+     "shared_binding": "crates/rag-rat-oplog/src/account/storage.rs",
+     "summary": null,
+     "title": "C4.3a wrap recipient set must be roster-EFFECTIVE; stored_device_pubkeys is fold-independent and includes removed devices"
+    }
+   ]
+  },
+  "reviewed_30": {
+   "current_bound_paths": [
+    "crates/rag-rat-core/src/index/query_api/global_status.rs"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_31": {
+   "current_bound_paths": [],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_32": {
+   "current_bound_paths": [
+    "crates/rag-rat-core/src/index/rebuild.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "231",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/rebuild.rs",
+     "thread_title": "perf(clones): investigate BLOB-packing the token bag (vs per-token symbol_token_postings rows)",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "79",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/rebuild.rs",
+     "thread_title": "Normalize repeated edge strings into an interned ids table (on-disk) \u2014 11.2M kernel edges repeat names relentlessly",
+     "tracker": "github",
+     "unreviewed": true
+    },
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "87",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-core/src/index/rebuild.rs",
+     "thread_title": "index --full fails with UNIQUE(files.path, commit_sha, worktree_id) when stale worktree-overlay rows linger after the tree goes clean",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": [
+    {
+     "freshness": {
+      "checked_against_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+      "checked_at_ms": 1785029427785,
+      "checked_inputs_hash": "a48d23c8ee0fede5eecd57b47b947bc587cc942ec0fe1aaf21958d781ad05fd1",
+      "content_hash": "e2b9b92f708abace6e55b3f74070d89f68ff949accbdb72429e8d0d3dea4241a",
+      "prompt_version": "verify-pack-v3",
+      "verdict": "current"
+     },
+     "kind": "Decision",
+     "memory_id": "mem_19f2ab8bbf5_9804ab7e8a0d",
+     "shared_binding": "crates/rag-rat-core/src/index/rebuild.rs",
+     "summary": "GIT ROWS RIDE THE FLIP: `orientation::recent_commit_subjects` now reads `git_commits/git_file_changes` DIRECTLY, NOT via deferred cursors; `apply_prepared_git_history_deferring_cursors` and `finalize_full_rebuild_fts` move INSIDE terminal txn; `a_tail_failure_leaves_git_meta_and_history_cursors_on_the_old_state` asserts h2_row==0 and H2 subject absent. FLOCK BY CONSTRUCTION: `rebuild_with_progress` acquires `WriteLock::acquire_blocking(&config.database, &write_lock_repo_id(config))` at top; `spawn_paused_rebuild` manual acquire REMOVED; `gc/maintenance` now safe under `generation != live`. PACKAGES + BASE-EDGE: `index_targets_with_progress` returns `(usize, FullRebuildGraph)` and drops tail; `finalize_base_edges` runs INSIDE terminal txn; `refresh_clone_token_df` runs AFTER `carry_forward_live_overlays`; `carry_forward_overlay_packages` re-keys overlay packages to new base HEAD. COUNT-SCOPING: `traversal_summary`, `unique_symbol_name`, `count_callers`, `count_edges_for_symbol` now JOIN files view; `graph_traversal_summary_counts_match_the_live_rows_during_a_dead_generation_window` asserts summary == rows == 1.",
+     "title": "A6 batch 6 test probe"
+    }
+   ]
+  },
+  "reviewed_33": {
+   "current_bound_paths": [
+    ".github/workflows/release-android.yml"
+   ],
+   "papertrail": [],
+   "verified_memories": []
+  },
+  "reviewed_34": {
+   "current_bound_paths": [
+    "crates/rag-rat-dream/src/findings.rs"
+   ],
+   "papertrail": [
+    {
+     "decision_chosen": null,
+     "distilled_at_ms": 1784979288831,
+     "item_key": "769",
+     "item_kind": "issue",
+     "outcome_summary": null,
+     "project": "cq27-dev/rag-rat",
+     "rejected_alternatives": [],
+     "root_cause": null,
+     "root_issue": null,
+     "selected_anchor": false,
+     "shared_anchor": "crates/rag-rat-dream/src/findings.rs",
+     "thread_title": "Generalize the chat client into rag-rat-llm and add guided decoding",
+     "tracker": "github",
+     "unreviewed": true
+    }
+   ],
+   "verified_memories": []
+  },
+  "reviewed_35": {
+   "current_bound_paths": [],
+   "papertrail": [],
+   "verified_memories": []
+  }
+ },
+ "context_index_commit": "f9ae8f7f00a5109cb71a9e71b6fbe371f47ebf91",
+ "context_repo_id": "6f7d51904146ba48b450292ee1c2da2eedc8f9e8",
+ "limits": {
+  "papertrail": 3,
+  "rendered_context_bytes": 6000,
+  "verified_memories": 3
+ },
+ "selection_version": "intent-context-v1",
+ "source_pack_commit": "c5303848",
+ "verdict_prompt_version": "verify-pack-v3"
+}

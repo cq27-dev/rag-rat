@@ -240,7 +240,7 @@ def _tool_read(path: str, start: int, end: int, root: str = "/repo") -> str:
     lines = p.read_text(errors="replace").splitlines()
     end = min(end, start + 99, len(lines))
     seg = lines[max(0, start - 1):end]
-    return "\n".join(f"{i}: {l}" for i, l in enumerate(seg, start))
+    return "\n".join(f"{i}: {line}" for i, line in enumerate(seg, start))
 
 
 def _parse_call(text: str):
@@ -579,6 +579,71 @@ def reviewed_verify_replay():
         print(f"{model}: ok gen={result['gen_s']}s")
     RESULTS.mkdir(exist_ok=True)
     (RESULTS / "reviewed-verify-results.json").write_text(json.dumps(out, indent=1))
+
+
+@app.local_entrypoint()
+def reviewed_verify_intent_context():
+    """Run the #957 source-only control plus verified-memory/papertrail context ablations."""
+    from intent_context import ARMS, load_context_fixture, render_reviewed_prompt
+
+    cases = json.loads((DATA_DIR / "corpus" / "reviewed-verify-replay.json").read_text())
+    packs = json.loads((DATA_DIR / "corpus" / "reviewed-verify-packs.json").read_text())
+    fixture = load_context_fixture(
+        DATA_DIR / "corpus" / "reviewed-verify-intent-context.json",
+        {case["id"] for case in cases},
+    )
+    keyed_prompts = [
+        (
+            arm,
+            case,
+            render_reviewed_prompt(
+                VERIFY_PACK_PROMPT,
+                case,
+                packs[f"{case['id']}|/repo"],
+                fixture["cases"][case["id"]],
+                arm,
+            ),
+        )
+        for arm in ARMS
+        for case in cases
+    ]
+
+    configured = _configured_dream_model()
+    model, chat_kwargs, system_prefix = V2_MODELS[0]
+    if model != configured:
+        raise SystemExit(
+            f"intent-context replay mismatch: configured model is {configured!r}, "
+            f"V2_MODELS[0] is {model!r}"
+        )
+    result = run_model.remote(
+        model,
+        chat_kwargs,
+        system_prefix,
+        [prompt for _, _, prompt in keyed_prompts],
+        450,
+        max_model_len=16384,
+    )
+    if "error" in result:
+        raise SystemExit(f"{model}: intent-context replay failed: {result['error'][:200]}")
+
+    by_arm = {arm: [] for arm in ARMS}
+    for (arm, case, _), answer in zip(keyed_prompts, result["outputs"]):
+        by_arm[arm].append(
+            {
+                "model": model,
+                "arm": arm,
+                "item": case["id"],
+                "expected": case["expected_verdict"],
+                "expected_direction": case["expected_direction"],
+                "answer": answer,
+            }
+        )
+    RESULTS.mkdir(exist_ok=True)
+    for arm, rows in by_arm.items():
+        path = RESULTS / f"reviewed-verify-intent-{arm}-results.json"
+        path.write_text(json.dumps(rows, indent=1))
+        print(f"{arm}: wrote {len(rows)} results to {path.name}")
+    print(f"{model}: ok gen={result['gen_s']}s ({len(keyed_prompts)} prompts)")
 
 
 @app.local_entrypoint()

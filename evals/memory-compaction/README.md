@@ -81,6 +81,48 @@ MoE activation size is not the deployment memory floor: Coder-Next activates 3B 
 token but its 80B FP8 checkpoint still requires an H200-class box in this harness. Keep model
 selection tied to the reviewed replay rather than general coding benchmarks.
 
+### Intent-context ablation (#957)
+
+`reviewed_verify_intent_context` keeps three epistemic layers separate while replaying the same 36
+reviewed cases and the same source packs:
+
+1. **NOTE** is the historical claim being classified.
+2. **INTENT CONTEXT** is bounded, non-citable interpretation help from freshness-stamped `current`
+   neighboring memories and distilled-papertrail records linked through current bound paths.
+3. **EVIDENCE PACK** remains the only proof of current checkout state and the only admissible source
+   of `EVIDENCE:` lines.
+
+The entrypoint runs four temperature-zero arms in one model load: `source-only`, `verified-memory`,
+`papertrail`, and `combined`. Intent rows use `INTENT MEMORY` / `INTENT PAPERTRAIL` labels rather
+than identifier-table or `path:line:` syntax, and the offline production guard still receives only
+the frozen source pack. `harness/test_intent_context.py` pins both boundaries.
+
+The context fixture records provenance explicitly. The source packs are frozen at `c5303848`; the
+available dogfood context snapshot is `f9ae8f7f` and its neighboring-memory verdicts use
+`verify-pack-v3`. Only rows stamped `current` against that exact indexed commit, with matching note
+content hashes, non-null checked-input hashes, and no binding recreated after the verdict check are
+eligible. The exporter also recomputes each candidate's input hash through the shipped Rust
+resolver and requires an exact match with the stored stamp; an unchanged HEAD alone is not treated
+as freshness because an index may contain uncommitted source changes. This makes the arm an offline
+historical experiment, not evidence that the two snapshots are identical. Re-exporting records the
+new context commit/version rather than silently changing that claim.
+
+The Qwen3-4B temperature-zero ablation (Modal run `ap-TrGVrolU345ouPggx1c3eX`) rejected the
+proposal for production use:
+
+| arm | accepted false positives | true positives | discarded |
+|---|---:|---:|---:|
+| source-only | 1 / 33 | 3 / 3 | 17 / 36 |
+| verified-memory | 1 / 33 | 3 / 3 | 17 / 36 |
+| papertrail | 1 / 33 | 3 / 3 | 17 / 36 |
+| combined | 1 / 33 | 3 / 3 | 17 / 36 |
+
+The aggregate counts hide a per-case regression: every intent arm repaired the source-only false
+positive on `reviewed_26` but introduced a new false positive on `reviewed_29`. Context therefore
+failed the no-new-false-positive acceptance condition and provided no net precision, recall, or
+discard-rate improvement. Keep verification source-only; any future intent-aware attempt needs a
+different decision boundary rather than adding interpretive text to this prompt.
+
 The two **`unverifiable`** synthetics (`syn_0,syn_2`) are **not** in this manifest: they are decided
 deterministically in **pass 0** (`verify.rs` `unverifiable_findings`) and never reach the model, and
 the shipped 2-way prompt never emits `unverifiable`. They live in `PASS0_UNVERIFIABLE` in the
@@ -100,10 +142,15 @@ evals/memory-compaction/
                           REGENERATE with harness/regen-verify-packs.py after any render_pack change
     reviewed-verify-replay.json  36 manually reviewed production findings (33 current, 3 diverged)
     reviewed-verify-packs.json   frozen evidence packs for that reviewed production batch
+    reviewed-verify-intent-context.json  deterministic non-citable context for the #957 ablations
   harness/
     eval_app.py          Modal app: candidates, judge, HHEM, the v2 variants, verify + drift
     regen-verify-packs.py  rebuilds verify-packs.json against the current + doctored trees (#695)
     export-reviewed-verify-replay.py  one-time freezer for the #954 reviewed production batch
+    export-reviewed-intent-context.py  read-only context freezer with snapshot/freshness provenance
+    intent_context.py   pure bounded context/prompt renderer
+    test_intent_context.py  fixture and non-citable-boundary regressions
+    compare-reviewed-intent.py  per-arm production-guard scoreboard and changed-case report
     score.py             folds judge verdicts + HHEM + format checks into the round-1 scoreboard
     score_v2.py          scores the v2 variants; carries the offline ref-leakage metric
     make-drift-tree.py   regenerates the doctored crates/ copy the manifest's two cases need
@@ -139,6 +186,14 @@ modal run harness/eval_app.py::drift_test
 modal run harness/eval_app.py::verify_pack_test   # evidence-pack method (the live design)
 modal run harness/eval_app.py::reviewed_verify_replay
 python3 harness/score-reviewed-verify.py           # precision/recall on 33 current + 3 diverged
+cargo build -p rag-rat --features eval
+python3 harness/export-reviewed-intent-context.py --db ~/.local/share/rag-rat/rag-rat.sqlite
+modal run harness/eval_app.py::reviewed_verify_intent_context
+python3 harness/score-reviewed-verify.py --results results/reviewed-verify-intent-source-only-results.json
+python3 harness/score-reviewed-verify.py --results results/reviewed-verify-intent-verified-memory-results.json
+python3 harness/score-reviewed-verify.py --results results/reviewed-verify-intent-papertrail-results.json
+python3 harness/score-reviewed-verify.py --results results/reviewed-verify-intent-combined-results.json
+python3 harness/compare-reviewed-intent.py
 modal run harness/eval_app.py::reviewed_verify_candidates
 python3 harness/score-reviewed-verify.py --results results/reviewed-verify-candidate-results.json
 python3 harness/make-drift-tree.py                # needed for the agentic comparison arm

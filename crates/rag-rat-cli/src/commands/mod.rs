@@ -27,7 +27,7 @@ pub(crate) use config_info::{dump_config, version_check};
 pub(crate) use consolidate::consolidate;
 pub(crate) use distill::distill;
 #[cfg(feature = "eval")]
-pub(crate) use dump_verify_packs::dump_verify_packs;
+pub(crate) use dump_verify_packs::{dump_memory_input_hashes, dump_verify_packs};
 pub(crate) use format::{output_format, set_output_format};
 pub(crate) use hooks::{hooks, papertrail};
 pub(crate) use index_ops::{doctor, doctor_global_store, index, maintenance, reconcile};

@@ -159,6 +159,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::BenchmarkEmbedding(args) => benchmark_embedding(&config, &args)?,
         #[cfg(feature = "eval")]
         Cmd::DumpVerifyPacks(args) => dump_verify_packs(&config, &args)?,
+        #[cfg(feature = "eval")]
+        Cmd::DumpMemoryInputHashes(args) => dump_memory_input_hashes(&config, &args)?,
         Cmd::Oracle(args) => oracle(&config, &args)?,
         Cmd::Consolidate => {
             let config_path = cli
