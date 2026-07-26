@@ -659,7 +659,9 @@ fn resolve_refs(conn: &Connection, ids: &BTreeSet<i64>) -> anyhow::Result<HashMa
 mod tests {
     use super::CloneCheckInput;
 
-    fn fixture_db(tag: &str) -> (crate::IndexDatabase, rag_rat_base::test_scratch::ScratchDir) {
+    // The guard is FIRST: pattern bindings drop right-to-left, so `let (_scratch, db)` closes the
+    // database before the directory is removed (required for cleanup on Windows).
+    fn fixture_db(tag: &str) -> (rag_rat_base::test_scratch::ScratchDir, crate::IndexDatabase) {
         let scratch = rag_rat_base::test_scratch::ScratchDir::new(&format!("of-text-{tag}"));
         let root = scratch.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -695,12 +697,12 @@ mod tests {
             allow_empty: false,
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        (db, scratch)
+        (scratch, db)
     }
 
     #[test]
     fn finds_exact_clone_of_new_text() {
-        let (db, _scratch) = fixture_db("hit");
+        let (_scratch, db) = fixture_db("hit");
         let exact_text = "pub fn fetch_account(store: Db) -> i32 { let a = store.get(20); \
                           validate(a); a + 1 }\n";
         let hits = db
@@ -719,7 +721,7 @@ mod tests {
 
     #[test]
     fn batch_checks_multiple_files_and_tags_in_file() {
-        let (db, _scratch) = fixture_db("batch");
+        let (_scratch, db) = fixture_db("batch");
         let inputs = vec![
             CloneCheckInput {
                 text: "pub fn a_clone(s: Db) -> i32 { let x = s.get(1); validate(x); x + 1 }\n"
@@ -742,7 +744,7 @@ mod tests {
 
     #[test]
     fn excludes_self_file_so_in_place_edits_dont_self_flag() {
-        let (db, _scratch) = fixture_db("self");
+        let (_scratch, db) = fixture_db("self");
         // Re-write load_user IN its own file: it must NOT be reported as a clone of its indexed
         // self.
         let edited = "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n";
@@ -759,7 +761,7 @@ mod tests {
 
     #[test]
     fn no_op_on_unparseable_text() {
-        let (db, _scratch) = fixture_db("noop");
+        let (_scratch, db) = fixture_db("noop");
         let none = db
             .clones_of_text(
                 "not real code !!!",
@@ -918,7 +920,7 @@ mod tests {
     /// the 2nd-connection mutations the eligibility / staleness tests need).
     fn parity_fixture(
         tag: &str,
-    ) -> (crate::IndexDatabase, rag_rat_base::test_scratch::ScratchDir, std::path::PathBuf) {
+    ) -> (rag_rat_base::test_scratch::ScratchDir, crate::IndexDatabase, std::path::PathBuf) {
         let scratch = rag_rat_base::test_scratch::ScratchDir::new(&format!("of-text-parity-{tag}"));
         let root = scratch.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -975,7 +977,7 @@ mod tests {
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
         assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
         let db_path = root.join(".rag-rat/index.sqlite");
-        (db, scratch, db_path)
+        (scratch, db, db_path)
     }
 
     /// Run the SAME text through the postings fast path (`IndexedCorpus`) and the RAM fallback
@@ -1032,7 +1034,7 @@ mod tests {
     /// makes the fast path a pure optimization rather than a behavior change.
     #[test]
     fn fast_postings_path_equals_ram_fallback() {
-        let (db, _scratch, _path) = parity_fixture("equiv");
+        let (_scratch, db, _path) = parity_fixture("equiv");
 
         // A clone of load_user written to a NEW file → matches load_user + load_order, never the
         // #[cfg(test)] helper or the cross-language python load_user.
@@ -1080,7 +1082,7 @@ mod tests {
     #[test]
     fn indexed_fast_path_drops_stale_postings() {
         use super::CloneCorpus; // the `near_candidate_bags` trait method
-        let (db, _scratch, db_path) = parity_fixture("stale");
+        let (_scratch, db, db_path) = parity_fixture("stale");
         let conn = db.storage.connection();
         let generation = db.clone_check_indexed_generation().unwrap().unwrap();
         let corpus = super::IndexedCorpus::load(conn, generation).unwrap();
@@ -1112,7 +1114,7 @@ mod tests {
     #[test]
     fn clone_check_fast_path_eligibility_gate() {
         // Fresh + postings-complete + exactly current → eligible.
-        let (db, _scratch, db_path) = parity_fixture("elig-fresh");
+        let (_scratch, db, db_path) = parity_fixture("elig-fresh");
         assert!(
             db.clone_check_indexed_generation().unwrap().is_some(),
             "a current postings-complete generation is fast-path eligible"
@@ -1130,7 +1132,7 @@ mod tests {
         );
 
         // A postings-less (pre-feature) live generation → NOT eligible (review R2).
-        let (db2, _scratch2, db_path2) = parity_fixture("elig-pw");
+        let (_scratch2, db2, db_path2) = parity_fixture("elig-pw");
         {
             let c = rusqlite::Connection::open(&db_path2).unwrap();
             c.execute("UPDATE clone_graph_generations SET postings_written = 0", []).unwrap();
@@ -1147,7 +1149,7 @@ mod tests {
     /// would find. Overlays fall back to RAM.
     #[test]
     fn clone_check_fast_path_disabled_under_worktree_overlay() {
-        let (mut db, _scratch, _path) = parity_fixture("overlay-scope");
+        let (_scratch, mut db, _path) = parity_fixture("overlay-scope");
         assert!(
             db.clone_check_indexed_generation().unwrap().is_some(),
             "base scope (empty worktree id) is fast-path eligible"

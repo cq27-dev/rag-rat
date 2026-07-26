@@ -858,7 +858,7 @@ fn global_ranking(db: &IndexDatabase) -> Vec<rag_rat_query::pagerank::SymbolImpo
 /// ranking (an isolated changed symbol now correctly falls back to global; see
 /// `seed_resolving_only_to_isolated_symbols_is_labeled_global`). Returns the db; `touched.rs`
 /// is the changed file.
-fn checkout_with_dirty_indexed_symbol() -> (IndexDatabase, rag_rat_base::test_scratch::ScratchDir) {
+fn checkout_with_dirty_indexed_symbol() -> (rag_rat_base::test_scratch::ScratchDir, IndexDatabase) {
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
     fs::write(root.join("src/touched.rs"), "pub fn placeholder() {}\n").unwrap();
@@ -874,7 +874,7 @@ fn checkout_with_dirty_indexed_symbol() -> (IndexDatabase, rag_rat_base::test_sc
     .unwrap();
     let config = rust_config(root.to_path_buf());
     let db = IndexDatabase::rebuild(&config).unwrap();
-    (db, root)
+    (root, db)
 }
 
 /// Name/path/id seed resolution: a valid name resolves to a personalized ranking; a missing
@@ -1048,7 +1048,7 @@ fn auto_seed_from_diff_picks_changed_symbols() {
     if std::process::Command::new("git").arg("--version").output().is_err() {
         return;
     }
-    let (db, _root) = checkout_with_dirty_indexed_symbol();
+    let (_root, db) = checkout_with_dirty_indexed_symbol();
     let result = db
         .important_symbols(ImportantSymbolsRequest {
             limit: 20,
@@ -1173,7 +1173,7 @@ fn mcp_auto_seeds_but_cli_stays_global_on_a_nonempty_diff() {
     if std::process::Command::new("git").arg("--version").output().is_err() {
         return;
     }
-    let (db, _root) = checkout_with_dirty_indexed_symbol();
+    let (_root, db) = checkout_with_dirty_indexed_symbol();
 
     // MCP default: auto_seed_from_diff = true → personalized.
     let mcp = db
