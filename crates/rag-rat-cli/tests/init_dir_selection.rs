@@ -9,16 +9,11 @@
 //! shells out to `claude`/`codex` (the real `init` install flow does all of those).
 
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
+mod common;
 
-fn unique_temp_root() -> PathBuf {
-    let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("rag-rat-init-dirsel-{}-{id}", std::process::id()))
-}
+use common::unique_dir;
 
 fn write(root: &std::path::Path, rel: &str, contents: &str) {
     let path = root.join(rel);
@@ -38,7 +33,7 @@ fn init_dry_run(root: &std::path::Path) -> std::process::Output {
 
 #[test]
 fn gitignored_root_venv_does_not_drop_the_root_entrypoint() {
-    let root = unique_temp_root();
+    let root = unique_dir("init-dirsel");
     fs::create_dir_all(&root).unwrap();
     // A Django-style layout: a root `manage.py`, a real package, and a GITIGNORED virtualenv.
     write(&root, "manage.py", "def main():\n    pass\n");
@@ -57,13 +52,11 @@ fn gitignored_root_venv_does_not_drop_the_root_entrypoint() {
         "expected `.` + package binding, got:\n{rendered}"
     );
     assert!(!root.join("rag-rat.toml").exists(), "dry-run must not write a config");
-
-    fs::remove_dir_all(&root).ok();
 }
 
 #[test]
 fn non_gitignored_env_only_repo_fails_instead_of_empty_config() {
-    let root = unique_temp_root();
+    let root = unique_dir("init-dirsel");
     fs::create_dir_all(&root).unwrap();
     // The only Python lives under a NON-gitignored, unfloored `env/` virtualenv — there is no safe
     // binding, so init must fail rather than emit an empty `[target_bindings]`.
@@ -71,13 +64,11 @@ fn non_gitignored_env_only_repo_fails_instead_of_empty_config() {
 
     let output = init_dry_run(&root);
     assert!(!output.status.success(), "init should fail with no indexable source: {output:?}");
-
-    fs::remove_dir_all(&root).ok();
 }
 
 #[test]
 fn first_party_virtualenv_package_is_bindable() {
-    let root = unique_temp_root();
+    let root = unique_dir("init-dirsel");
     fs::create_dir_all(&root).unwrap();
     // The `virtualenv` PyPI package's own layout: `src/virtualenv/` is FIRST-PARTY source (no
     // `pyvenv.cfg`). It must not be treated as a dependency tree — Python stays bound.
@@ -92,13 +83,11 @@ fn first_party_virtualenv_package_is_bindable() {
         rendered.contains("python = [\"src\"]"),
         "the virtualenv package must remain a Python binding, got:\n{rendered}"
     );
-
-    fs::remove_dir_all(&root).ok();
 }
 
 #[test]
 fn nested_real_venv_does_not_promote_its_ancestor() {
-    let root = unique_temp_root();
+    let root = unique_dir("init-dirsel");
     fs::create_dir_all(&root).unwrap();
     // A real venv (has `pyvenv.cfg`) nested under `tools/`, plus a genuine package. The venv's
     // files must not count, so `tools` is never promoted and `.` is blocked; only `myapp`
@@ -117,6 +106,4 @@ fn nested_real_venv_does_not_promote_its_ancestor() {
         rendered.contains("python = [\"myapp\"]"),
         "only the real package should bind (not `.` or `tools`), got:\n{rendered}"
     );
-
-    fs::remove_dir_all(&root).ok();
 }

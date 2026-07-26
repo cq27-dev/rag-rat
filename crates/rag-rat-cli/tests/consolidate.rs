@@ -9,12 +9,12 @@
 //! never touches a developer's real `~/.local/share/rag-rat`.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 
 mod common;
 
-use common::{git, git_commit, unique_dir};
+use common::{ScratchRoot, git, git_commit, unique_dir};
 
 /// A git fixture repo with one rust file and an EXPLICIT `database` key — the pre-flip `init`
 /// shape — so the initial index builds the LEGACY per-repo `.rag-rat/index.sqlite`.
@@ -26,7 +26,7 @@ use common::{git, git_commit, unique_dir};
 /// environment-flaky. The seeded heal-owed witness (a legacy model id set directly in the DB) still
 /// mismatches this `none` config, so the "consolidate must not heal a sibling's meta" assertion is
 /// unchanged — just deterministic offline.
-fn fixture_repo() -> PathBuf {
+fn fixture_repo() -> ScratchRoot {
     let root = unique_dir("repo");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn consolidate_anchor() {}\n").unwrap();
@@ -128,10 +128,6 @@ fn consolidate_refuses_a_pinned_config_then_completes_after_key_removal() {
     assert!(out.status.success(), "re-run failed: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already_global"), "re-run is a no-op via the latch: {stdout}");
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&model_cache);
 }
 
 /// A CUSTOM pinned `database` path gets the path-aware remedy: the refusal prints the literal move
@@ -201,10 +197,6 @@ fn consolidate_custom_pin_remedy_moves_then_imports() {
     assert!(global.exists(), "the global store now exists");
     assert!(!default_legacy.exists(), "the moved file was renamed to the marker");
     assert!(root.join(".rag-rat/index.sqlite.imported").exists(), "marker in place");
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&model_cache);
 }
 
 /// Consolidating a SECOND repo into a one-repo global DB must not heal/mutate the FIRST repo's
@@ -277,11 +269,6 @@ fn consolidating_a_second_repo_leaves_the_first_repos_heal_owed_meta() {
         Some("fastembed-all-minilm-l6-v2"),
         "consolidating repo 2 healed (cleared) repo 1's model meta through the sibling witness",
     );
-
-    let _ = fs::remove_dir_all(&repo1);
-    let _ = fs::remove_dir_all(&repo2);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&model_cache);
 }
 
 /// Guard ordering: a config still PINNED at a missing/renamed path must be REFUSED with the
@@ -317,10 +304,6 @@ fn consolidate_refuses_a_pin_at_a_missing_path_and_accepts_a_pin_at_global() {
     assert!(out.status.success(), "a pin at the global target is already_global");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already_global"), "pin-at-global reports already_global: {stdout}");
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&model_cache);
 }
 
 /// The legacy-side lock drain covers the source DB's OWN registered ids, not just the current
@@ -369,8 +352,8 @@ fn consolidate_drains_a_pre_deepen_writers_legacy_lock() {
     let binary = env!("CARGO_BIN_EXE_rag-rat");
     let mut child = Command::new(binary)
         .current_dir(&root)
-        .env("RAG_RAT_DATA_DIR", &data_dir)
-        .env("RAG_RAT_MODEL_CACHE", &model_cache)
+        .env("RAG_RAT_DATA_DIR", &*data_dir)
+        .env("RAG_RAT_MODEL_CACHE", &*model_cache)
         .env("RAG_RAT_NO_WATCH", "1")
         .arg("consolidate")
         .spawn()
@@ -389,10 +372,6 @@ fn consolidate_drains_a_pre_deepen_writers_legacy_lock() {
         root.join(".rag-rat/index.sqlite.imported").exists(),
         "the import + rename completed after the drain"
     );
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&model_cache);
 }
 
 /// OLD-VINTAGE sources (Codex batch 6): a legacy DB this binary never opened keeps its model meta
@@ -453,10 +432,6 @@ fn consolidate_migrates_an_old_vintage_source_so_model_meta_arrives() {
         Some("vintage-model"),
         "an old-vintage source's model meta must arrive with the import (ladder-relocated)",
     );
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&model_cache);
 }
 
 /// Batch-7 finding 3: a config explicitly PINNED AT the global path can coexist with a lingering,
@@ -507,10 +482,6 @@ fn consolidate_imports_a_lingering_legacy_under_a_pin_at_global() {
     assert!(out.status.success(), "re-run failed: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already_global"), "the marker latches the re-run: {stdout}");
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&model_cache);
 }
 
 /// The worktree dimension of consolidate (batch-7 directive): run FROM a LINKED worktree whose
@@ -569,11 +540,6 @@ fn consolidate_from_a_linked_worktree_uses_the_main_config_and_legacy() {
     let out = run(&root, &data_dir, &model_cache, &["consolidate"]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("already_global"));
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&linked);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&model_cache);
 }
 
 /// Consolidation opens its target through the schema-only path, so it must explicitly run the
@@ -664,8 +630,4 @@ fn consolidate_rebuilds_stale_content_projection_before_reconcile() {
         )
         .unwrap();
     assert_eq!(stamp, "3", "consolidate upgraded the store-global projector stamp");
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&model_cache);
 }

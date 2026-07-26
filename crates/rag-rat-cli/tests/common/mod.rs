@@ -30,12 +30,48 @@ fn next_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// One uniquely owned scratch directory, removed on drop — panics and early returns included.
+///
+/// Wraps [`rag_rat_base::test_scratch::ScratchDir`] (tag + PID + process-wide sequence naming, the
+/// #726 stale sweep as backstop) and derefs to `PathBuf`, so call sites use it exactly like the
+/// bare path this replaces. The path itself is left ABSENT (any stale dir removed, nothing
+/// created): fixtures create it — or, for `git worktree add` destinations, keep it absent —
+/// exactly as before. The guard is deliberately not cloneable: exactly one owner removes each
+/// path. Bind it for the whole test (never `unique_dir(..).join(..)` in one expression, which
+/// drops the guard at the statement boundary), and declare it before any DB connection, watcher,
+/// or child process using the path so those drop first (required for cleanup on Windows).
+#[derive(Debug)]
+pub struct ScratchRoot {
+    path: PathBuf,
+    _scratch: rag_rat_base::test_scratch::ScratchDir,
+}
+
+impl std::ops::Deref for ScratchRoot {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for &ScratchRoot {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// A throwaway scratch dir under the shared, self-healing test-scratch root
-/// (see [`rag_rat_base::test_scratch`]), keyed by `tag`, the process id, and a unique counter. Any
-/// stale dir at the path is removed first, and the shared helper sweeps dirs stranded by a
-/// killed/panicking run so they can't accumulate in the system temp (#726).
-pub fn unique_dir(tag: &str) -> PathBuf {
-    rag_rat_base::test_scratch::scratch_dir(tag)
+/// (see [`rag_rat_base::test_scratch`]), keyed by `tag`, the process id, and a unique counter,
+/// returned as its owning [`ScratchRoot`] guard. The path is ABSENT on return (any stale dir at
+/// the path is removed first); the guard removes whatever the test leaves there on drop, and the
+/// shared helper sweeps dirs stranded by a killed run so they can't accumulate in the system
+/// temp (#586, #726).
+pub fn unique_dir(tag: &str) -> ScratchRoot {
+    let scratch = rag_rat_base::test_scratch::ScratchDir::new(tag);
+    let path = scratch.path().to_path_buf();
+    // Fixtures historically allocate an absent path, including Git worktree destinations.
+    let _ = std::fs::remove_dir_all(&path);
+    ScratchRoot { path, _scratch: scratch }
 }
 
 /// A filesystem path formatted for embedding inside a double-quoted TOML string value. On Windows a

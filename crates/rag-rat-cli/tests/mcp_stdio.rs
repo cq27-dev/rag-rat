@@ -1,17 +1,17 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rag_rat_base::config::Config;
 use serde_json::{Value, json};
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+mod common;
+
+use common::unique_dir;
 
 #[test]
 fn mcp_stdio_smoke_lists_and_calls_core_tools() {
-    let root = unique_temp_root();
+    let root = unique_dir("mcp-stdio");
     fs::create_dir_all(root.join("docs")).unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("docs/search.md"), "# Search\n\nSemantic recall uses sqlite.\n").unwrap();
@@ -116,7 +116,6 @@ fn mcp_stdio_smoke_lists_and_calls_core_tools() {
     assert!(papertrail["evidence"].is_array());
 
     stop(child);
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// A `rag-rat mcp` launched OUTSIDE any rag-rat repo (no `rag-rat.toml` at or above cwd) must NOT
@@ -126,7 +125,7 @@ fn mcp_stdio_smoke_lists_and_calls_core_tools() {
 /// dormant notice as a NON-error result, and the process stays alive across calls.
 #[test]
 fn mcp_stdio_serves_dormant_without_a_config() {
-    let root = unique_temp_root();
+    let root = unique_dir("mcp-stdio");
     // A bare directory — deliberately NO rag-rat.toml here or (temp roots have none) above it.
     fs::create_dir_all(&root).unwrap();
 
@@ -222,7 +221,6 @@ fn mcp_stdio_serves_dormant_without_a_config() {
     assert_eq!(recv(&mut reader)["id"], 5, "the dormant server stays alive across calls");
 
     stop(child);
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// The dormant tool result honors `--json` mode: its text block must be directly parseable as JSON
@@ -230,7 +228,7 @@ fn mcp_stdio_serves_dormant_without_a_config() {
 /// MCP client would otherwise fail ONLY in dormant mode.
 #[test]
 fn mcp_stdio_dormant_result_is_valid_json_in_json_mode() {
-    let root = unique_temp_root();
+    let root = unique_dir("mcp-stdio");
     fs::create_dir_all(&root).unwrap();
 
     let binary = env!("CARGO_BIN_EXE_rag-rat");
@@ -272,7 +270,6 @@ fn mcp_stdio_dormant_result_is_valid_json_in_json_mode() {
     assert_eq!(parsed["status"], "no_index", "dormant JSON payload carries the no-index status");
 
     stop(child);
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// Self-healing (#603): a server that started DORMANT activates its tools as soon as the directory
@@ -286,7 +283,7 @@ fn mcp_stdio_dormant_result_is_valid_json_in_json_mode() {
 /// (#603). Activation requires a restart; the smoke test covers the launched-with-config path.
 #[test]
 fn mcp_stdio_dormant_server_stays_dormant_until_restart() {
-    let root = unique_temp_root();
+    let root = unique_dir("mcp-stdio");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn healed_symbol_marker() {}\n").unwrap();
 
@@ -349,7 +346,6 @@ fn mcp_stdio_dormant_server_stays_dormant_until_restart() {
     );
 
     stop(child);
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// Regression guard: every tool advertised by `tools/list` (built from `TOOL_NAMES`) must be
@@ -361,7 +357,7 @@ fn mcp_stdio_dormant_server_stays_dormant_until_restart() {
 /// an argument/validation error — only an unroutable one yields "tool not found".
 #[test]
 fn mcp_stdio_every_advertised_tool_is_routable() {
-    let root = unique_temp_root();
+    let root = unique_dir("mcp-stdio");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn open_database() {}\n").unwrap();
     fs::write(
@@ -430,7 +426,6 @@ fn mcp_stdio_every_advertised_tool_is_routable() {
         }
     }
     stop(child);
-    fs::remove_dir_all(root).unwrap();
 
     assert!(
         unroutable.is_empty(),
@@ -443,7 +438,7 @@ fn mcp_stdio_json_flag_emits_json_not_toon() {
     // `rag-rat mcp --json` is the MCP-side escape hatch: MCP has no per-call flag, so the output
     // format is chosen once at launch. With it, tool results are JSON (parseable directly), not the
     // default TOON (which `serde_json::from_str` would reject).
-    let root = unique_temp_root();
+    let root = unique_dir("mcp-stdio");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn open_database() {}\n").unwrap();
     fs::write(
@@ -499,7 +494,6 @@ fn mcp_stdio_json_flag_emits_json_not_toon() {
     assert!(parsed.is_array() || parsed.is_object(), "expected a JSON array/object, got: {text}");
 
     stop(child);
-    fs::remove_dir_all(root).unwrap();
 }
 
 fn send(stdin: &mut impl Write, value: Value) {
@@ -527,14 +521,9 @@ fn stop(mut child: Child) {
     let _ = child.wait();
 }
 
-fn unique_temp_root() -> PathBuf {
-    let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("rag-rat-mcp-stdio-test-{}-{id}", std::process::id()))
-}
-
 #[test]
 fn mcp_stdio_find_clones_returns_class_for_planted_pair() {
-    let root = unique_temp_root();
+    let root = unique_dir("mcp-stdio");
     fs::create_dir_all(root.join("src")).unwrap();
     // Two identical functions → struct_hash fast path produces a clone pair.
     let clone_body = "pub fn cloned_helper(x: i32, y: i32) -> i32 {\n    x + y + 42\n}\n";
@@ -598,7 +587,6 @@ fn mcp_stdio_find_clones_returns_class_for_planted_pair() {
     );
 
     stop(child);
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// End-to-end (#215 Plan 4b Task 8): a Type-2 clone pair — two functions whose ONLY difference is
@@ -610,7 +598,7 @@ fn mcp_stdio_find_clones_returns_class_for_planted_pair() {
 /// candidate pair that refines to a `value_param` variation point. Uses `--json` for plain JSON.
 #[test]
 fn mcp_stdio_find_clones_returns_refined_payload_for_type2_clone() {
-    let root = unique_temp_root();
+    let root = unique_dir("mcp-stdio");
     fs::create_dir_all(root.join("src")).unwrap();
     // Two functions differing ONLY in the literal KIND (int 10 vs float 2.5). Baseline
     // normalization buckets literals by kind (`LIT_INTEGER_LITERAL` vs `LIT_FLOAT_LITERAL`), so the
@@ -712,7 +700,6 @@ fn mcp_stdio_find_clones_returns_refined_payload_for_type2_clone() {
     );
 
     stop(child);
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// CLI surface (#215 Plan 4b Task 8): `rag-rat clones --explain <CLASS_KEY>` prints the refined
@@ -721,7 +708,7 @@ fn mcp_stdio_find_clones_returns_refined_payload_for_type2_clone() {
 /// `--explain <key>` and assert the human output names a metavar (`m0`) and the value_param role.
 #[test]
 fn cli_clones_explain_prints_template_and_metavar_for_type2_clone() {
-    let root = unique_temp_root();
+    let root = unique_dir("mcp-stdio");
     fs::create_dir_all(root.join("src")).unwrap();
     // Same Type-2 fixture as the MCP refined-payload test: bodies identical except a differing
     // literal KIND (int 10 vs float 2.5), which is what forces a value_param variation point.
@@ -827,6 +814,4 @@ fn cli_clones_explain_prints_template_and_metavar_for_type2_clone() {
         "explain output must zip per-member values with member identity (identity=value | \
          identity=value):\n{out}"
     );
-
-    fs::remove_dir_all(root).unwrap();
 }

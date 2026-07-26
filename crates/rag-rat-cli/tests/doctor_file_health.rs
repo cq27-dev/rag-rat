@@ -5,20 +5,16 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rag_rat_base::config::Config;
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+mod common;
 
-/// Build a throwaway index over one Rust file and return (root, config path).
-fn build_index() -> (PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!(
-        "rag-rat-cli-doctor-health-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&root);
+use common::{ScratchRoot, unique_dir};
+
+/// Build a throwaway index over one Rust file and return (scratch guard, config path).
+fn build_index() -> (ScratchRoot, PathBuf) {
+    let root = unique_dir("doctor-health");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn doctor_probe() {}\n").unwrap();
     fs::write(
@@ -35,7 +31,7 @@ fn build_index() -> (PathBuf, PathBuf) {
 
 #[test]
 fn doctor_reports_database_file_health() {
-    let (root, config_path) = build_index();
+    let (_root, config_path) = build_index();
 
     let out = Command::new(env!("CARGO_BIN_EXE_rag-rat"))
         .arg("--config")
@@ -56,6 +52,4 @@ fn doctor_reports_database_file_health() {
     assert_eq!(health["wal_oversized"], serde_json::Value::Bool(false));
     assert_eq!(health["freelist_excessive"], serde_json::Value::Bool(false));
     assert!(health["note"].is_null(), "no advisory on a healthy file: {health}");
-
-    let _ = fs::remove_dir_all(&root);
 }

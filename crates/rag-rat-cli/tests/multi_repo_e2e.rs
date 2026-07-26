@@ -45,7 +45,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use common::{git, git_commit, unique_dir};
+use common::{ScratchRoot, git, git_commit, unique_dir};
 use rag_rat_base::config::Config;
 use rag_rat_base::language::Language;
 use rag_rat_core::IndexDatabase;
@@ -66,13 +66,13 @@ fn chunky_fn(name: &str) -> String {
 /// global store) plus the given `src/<name>` files. `.rag-rat/`, `rag-rat-lib.toml`, and
 /// `target/` are gitignored so the working tree stays clean (untracked helper files must not flip
 /// the indexer's dirty accounting).
-fn keyless_repo(tag: &str, files: &[(&str, String)]) -> PathBuf {
+fn keyless_repo(tag: &str, files: &[(&str, String)]) -> ScratchRoot {
     build_repo(tag, files, "[index]\nroot = \".\"\n\n[target_bindings]\nrust = [\"src\"]\n")
 }
 
 /// A committed git repo whose `rag-rat.toml` PINS the legacy per-repo `.rag-rat/index.sqlite` — the
 /// pre-flip shape `consolidate` imports from.
-fn legacy_pinned_repo(tag: &str, files: &[(&str, String)]) -> PathBuf {
+fn legacy_pinned_repo(tag: &str, files: &[(&str, String)]) -> ScratchRoot {
     build_repo(
         tag,
         files,
@@ -81,7 +81,7 @@ fn legacy_pinned_repo(tag: &str, files: &[(&str, String)]) -> PathBuf {
     )
 }
 
-fn build_repo(tag: &str, files: &[(&str, String)], config: &str) -> PathBuf {
+fn build_repo(tag: &str, files: &[(&str, String)], config: &str) -> ScratchRoot {
     let root = unique_dir(tag);
     std::fs::create_dir_all(root.join("src")).unwrap();
     for (name, body) in files {
@@ -352,12 +352,6 @@ fn ref_memory(title: &str, gone_path: &str, bind_path: &str) -> RepoMemoryCreate
     }
 }
 
-fn cleanup(dirs: &[&Path]) {
-    for d in dirs {
-        let _ = std::fs::remove_dir_all(d);
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // Case 0: the fixture-identity guarantee the whole matrix rests on — two BYTE-IDENTICAL repos
 // still register as two DISTINCT repo_ids in one global DB (the #435 helper closes #434).
@@ -394,8 +388,6 @@ fn identical_content_fixtures_get_distinct_repo_ids() {
         2,
         "two identical-content repos register as TWO distinct repo_ids in one global DB"
     );
-
-    cleanup(&[&repo_a, &repo_b, &data_dir, &cache]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -489,8 +481,6 @@ fn search_symbol_and_impact_are_repo_scoped() {
     );
     let b_impact = open_scoped(&repo_b, &data_dir).impact_surface("alpha_target", 30).unwrap();
     assert!(b_impact.is_empty(), "impact for A's symbol, scoped to B, sees nothing: {b_impact:?}");
-
-    cleanup(&[&repo_a, &repo_b, &data_dir, &cache]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -606,8 +596,6 @@ fn memories_are_isolated_across_repos() {
         b_doc.iter().all(|e| e.anchor_status != "gone"),
         "doctor B never touches or flags A's gone anchor: {b_doc:?}"
     );
-
-    cleanup(&[&repo_a, &repo_b, &data_dir, &cache]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -680,8 +668,6 @@ fn clones_are_repo_scoped() {
         !b_recall.contains("dup_a1.rs") && !b_recall.contains("clone_alpha"),
         "B's clone listing never contains A's members:\n{b_recall}"
     );
-
-    cleanup(&[&repo_a, &repo_b, &data_dir, &cache]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -746,8 +732,6 @@ fn gc_of_one_repo_leaves_the_other_intact_and_reports_per_repo() {
     // Repo B is byte-identical — parents AND children (row-count parity across every scoped table).
     let b_after = repo_snapshot(&data_dir, &b_id);
     assert_eq!(b_before, b_after, "gc of A left every one of B's scoped tables untouched");
-
-    cleanup(&[&repo_a, &repo_b, &data_dir, &cache]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -839,8 +823,6 @@ fn consolidate_lands_a_third_legacy_repos_memories_fts_searchable() {
             .is_empty(),
         "repo B cannot see C's imported memory"
     );
-
-    cleanup(&[&repo_a, &repo_b, &repo_c, &data_dir, &cache]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -876,8 +858,8 @@ fn concurrent_index_of_a_and_write_on_b_are_lock_disjoint() {
     // With B's lock held, run a full rebuild of A as a subprocess. A takes A's OWN flock.
     let mut child = Command::new(env!("CARGO_BIN_EXE_rag-rat"))
         .current_dir(&repo_a)
-        .env("RAG_RAT_DATA_DIR", &data_dir)
-        .env("RAG_RAT_MODEL_CACHE", &cache)
+        .env("RAG_RAT_DATA_DIR", &*data_dir)
+        .env("RAG_RAT_MODEL_CACHE", &*cache)
         .env("RAG_RAT_NO_WATCH", "1")
         .env("RAG_RAT_HOOK_DISABLE", "1")
         .args(["index", "--full"])
@@ -926,8 +908,6 @@ fn concurrent_index_of_a_and_write_on_b_are_lock_disjoint() {
         .unwrap();
     assert_eq!(b_mems, 6, "all of B's concurrent memory writes completed");
     assert_eq!(live_file_count(&data_dir, &a_id), 8, "A's rebuild republished all its files");
-
-    cleanup(&[&repo_a, &repo_b, &data_dir, &cache]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1048,8 +1028,6 @@ fn linked_worktree_resolves_through_main_config() {
         init_err.to_lowercase().contains("linked") || init_err.contains("main"),
         "init's refusal points at the main worktree: {init_err}"
     );
-
-    cleanup(&[&main, &linked, &data_dir, &cache]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1155,8 +1133,6 @@ fn dream_worklist_is_repo_scoped_end_to_end() {
         a_ids.iter().all(|id| !b_ids.contains(id)),
         "no dream finding id is shared across repos"
     );
-
-    cleanup(&[&repo_a, &repo_b, &data_dir, &cache]);
 }
 
 #[test]
@@ -1194,6 +1170,4 @@ fn dream_ephemeral_zero_work_guard_skips_cli_provisioning() {
         stderr.contains("skipping the ephemeral `[llm.dream.remote]` GPU box"),
         "expected the CLI zero-work guard note, got stderr:\n{stderr}"
     );
-
-    cleanup(&[&repo, &data_dir, &cache]);
 }

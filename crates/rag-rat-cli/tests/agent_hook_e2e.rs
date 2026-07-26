@@ -9,9 +9,14 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::Child,
-    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
+
+mod common;
+
+#[cfg(unix)]
+use common::ScratchRoot;
+use common::unique_dir;
 
 fn run_hook(stdin_body: &str, cwd: &std::path::Path) -> (String, std::process::ExitStatus) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rag-rat"))
@@ -40,10 +45,10 @@ fn run_hook(stdin_body: &str, cwd: &std::path::Path) -> (String, std::process::E
 
 #[test]
 fn no_rag_rat_toml_means_silent_exit_zero() {
-    let dir = std::env::temp_dir().join(format!("ragrat-hook-noindex-{}", std::process::id()));
+    let dir = unique_dir("hook-noindex");
     std::fs::create_dir_all(&dir).unwrap();
     let input = serde_json::json!({
-        "session_id": "s1", "cwd": dir, "hook_event_name": "PreToolUse",
+        "session_id": "s1", "cwd": dir.as_path(), "hook_event_name": "PreToolUse",
         "tool_name": "Grep", "tool_input": {"pattern": "anything"}
     });
     let (stdout, status) = run_hook(&input.to_string(), &dir);
@@ -53,7 +58,7 @@ fn no_rag_rat_toml_means_silent_exit_zero() {
 
 #[test]
 fn garbage_stdin_means_silent_exit_zero() {
-    let dir = std::env::temp_dir().join(format!("ragrat-hook-garbage-{}", std::process::id()));
+    let dir = unique_dir("hook-garbage");
     std::fs::create_dir_all(&dir).unwrap();
     let (stdout, status) = run_hook("this is not json", &dir);
     assert!(status.success());
@@ -62,10 +67,10 @@ fn garbage_stdin_means_silent_exit_zero() {
 
 #[test]
 fn non_search_tool_means_silent_exit_zero() {
-    let dir = std::env::temp_dir().join(format!("ragrat-hook-read-{}", std::process::id()));
+    let dir = unique_dir("hook-read");
     std::fs::create_dir_all(&dir).unwrap();
     let input = serde_json::json!({
-        "session_id": "s1", "cwd": dir, "hook_event_name": "PreToolUse",
+        "session_id": "s1", "cwd": dir.as_path(), "hook_event_name": "PreToolUse",
         "tool_name": "Read", "tool_input": {"path": "/x"}
     });
     let (stdout, status) = run_hook(&input.to_string(), &dir);
@@ -78,8 +83,7 @@ fn non_search_tool_means_silent_exit_zero() {
 /// `database.exists()` hints).
 #[test]
 fn posttooluse_without_an_index_is_silent_and_non_creating() {
-    let dir = std::env::temp_dir().join(format!("ragrat-hook-post-noindex-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = unique_dir("hook-post-noindex");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("rag-rat.toml"),
@@ -88,14 +92,13 @@ fn posttooluse_without_an_index_is_silent_and_non_creating() {
     )
     .unwrap();
     let input = serde_json::json!({
-        "session_id": "s1", "cwd": dir, "hook_event_name": "PostToolUse",
+        "session_id": "s1", "cwd": dir.as_path(), "hook_event_name": "PostToolUse",
         "tool_name": "Write", "tool_input": {"file_path": dir.join("src/new.rs")}
     });
     let (stdout, status) = run_hook(&input.to_string(), &dir);
     assert!(status.success(), "PostToolUse must exit 0 even with no index");
     assert!(stdout.is_empty(), "PostToolUse prints nothing, got: {stdout}");
     assert!(!dir.join(".rag-rat/index.sqlite").is_file(), "the hook must not create the index");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Full path: a live `rag-rat mcp` elects the hook listener, the `agent-hook` client reaches it
@@ -153,16 +156,11 @@ fn socket_path_serves_dedupes_and_falls_back() {
         fallback_context.contains("frobnicate_xyz") && fallback_context.contains("src/lib.rs"),
         "fallback must compose from SQLite directly, got: {fallback_context}"
     );
-
-    repo.cleanup();
 }
 
 #[cfg(unix)]
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(unix)]
 struct TestRepo {
-    root: PathBuf,
+    root: ScratchRoot,
     config_path: PathBuf,
     config: rag_rat_base::config::Config,
 }
@@ -173,9 +171,7 @@ impl TestRepo {
     /// `IndexDatabase::rebuild` (the same path `mcp_stdio`/`mcp_hot_upgrade` use to populate a real
     /// index). Unique per run so parallel tests never collide on the socket election lock.
     fn indexed_with_symbol() -> Self {
-        let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("ragrat-hook-e2e-{}-{id}", std::process::id()));
+        let root = unique_dir("hook-e2e");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn frobnicate_xyz() {}\n").unwrap();
         let config_path = root.join("rag-rat.toml");
@@ -243,16 +239,12 @@ impl TestRepo {
     /// cwd = repo root (so `find_config` walks up to our `rag-rat.toml`).
     fn run_hook_session(&self, session_id: &str) -> String {
         let input = serde_json::json!({
-            "session_id": session_id, "cwd": self.root, "hook_event_name": "PreToolUse",
+            "session_id": session_id, "cwd": self.root.as_path(), "hook_event_name": "PreToolUse",
             "tool_name": "Grep", "tool_input": {"pattern": "frobnicate_xyz"}
         });
         let (stdout, status) = run_hook(&input.to_string(), &self.root);
         assert!(status.success(), "agent-hook must exit zero on every path");
         stdout
-    }
-
-    fn cleanup(&self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -341,7 +333,7 @@ fn edit_reindex_reconciles_the_edited_file() {
     let status = Command::new(env!("CARGO_BIN_EXE_rag-rat"))
         .arg("edit-reindex")
         .arg("--cwd")
-        .arg(&repo.root)
+        .arg(&*repo.root)
         .arg("--paths")
         .arg(repo.root.join("src/lib.rs"))
         .current_dir(&repo.root)
@@ -355,7 +347,6 @@ fn edit_reindex_reconciles_the_edited_file() {
         "the edit's new symbol is indexed"
     );
     assert!(!symbol_indexed(&repo.config, "frobnicate_xyz"), "the replaced symbol is gone");
-    repo.cleanup();
 }
 
 /// #661 end-to-end: a PostToolUse edit hook returns immediately (exit 0, silent) and backgrounds a
@@ -367,7 +358,7 @@ fn posttooluse_backgrounds_a_scoped_reindex() {
     let repo = TestRepo::indexed_with_symbol();
     fs::write(repo.root.join("src/lib.rs"), "pub fn added_via_hook_tuv() {}\n").unwrap();
     let input = serde_json::json!({
-        "session_id": "s-post", "cwd": repo.root, "hook_event_name": "PostToolUse",
+        "session_id": "s-post", "cwd": repo.root.as_path(), "hook_event_name": "PostToolUse",
         "tool_name": "Edit", "tool_input": {"file_path": repo.root.join("src/lib.rs")}
     });
     let (stdout, status) = run_hook(&input.to_string(), &repo.root);
@@ -375,7 +366,6 @@ fn posttooluse_backgrounds_a_scoped_reindex() {
     assert!(stdout.is_empty(), "PostToolUse prints nothing, got: {stdout}");
     // The reindex runs in a detached child; poll until the edit lands.
     wait_for_symbol(&repo.config, "added_via_hook_tuv", Duration::from_secs(30));
-    repo.cleanup();
 }
 
 #[cfg(unix)]
@@ -410,8 +400,7 @@ fn wait_until_gone(path: &Path, timeout: Duration) {
 /// session-start digest must become an actionable version-skew notice instead of going silent.
 #[test]
 fn session_start_warns_when_the_index_schema_is_newer() {
-    let dir = std::env::temp_dir().join(format!("ragrat-hook-newer-schema-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = unique_dir("hook-newer-schema");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn skew_probe() {}\n").unwrap();
     std::fs::write(
@@ -433,7 +422,7 @@ fn session_start_warns_when_the_index_schema_is_newer() {
     drop(conn);
 
     let input = serde_json::json!({
-        "session_id": "s-skew", "cwd": dir, "hook_event_name": "SessionStart",
+        "session_id": "s-skew", "cwd": dir.as_path(), "hook_event_name": "SessionStart",
         "source": "startup"
     });
     let (stdout, status) = run_hook(&input.to_string(), &dir);
@@ -442,6 +431,4 @@ fn session_start_warns_when_the_index_schema_is_newer() {
         stdout.contains("newer rag-rat") && stdout.contains("upgrade rag-rat"),
         "expected an actionable version-skew notice, got: {stdout:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

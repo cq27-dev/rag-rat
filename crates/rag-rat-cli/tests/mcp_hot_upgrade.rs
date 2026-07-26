@@ -13,13 +13,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rag_rat_base::config::Config;
 use serde_json::{Value, json};
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+mod common;
+
+use common::{ScratchRoot, unique_dir};
 
 /// SIGUSR1: drain at a boundary, hand off, `exec` the new binary in place, and resume serving the
 /// same session — the next tool call succeeds with no intervening `initialize`.
@@ -54,7 +55,6 @@ fn sigusr1_hot_upgrade_resumes_session_in_place() {
     assert_eq!(reply["v"], 1, "hook socket re-binds and speaks the protocol after hot-upgrade");
 
     session.stop();
-    env.cleanup();
 }
 
 /// When the configured upgrade binary can't be `exec`'d, the process tears down and exits non-zero
@@ -71,19 +71,17 @@ fn sigusr1_exec_failure_exits_nonzero() {
     session.send_sigusr1();
     let status = session.wait_for_exit(Duration::from_secs(20));
     assert!(!status.success(), "exec failure must exit non-zero, got {status:?}");
-
-    env.cleanup();
 }
 
 struct TestEnv {
-    root: PathBuf,
+    root: ScratchRoot,
     config_path: PathBuf,
     config: Config,
 }
 
 impl TestEnv {
     fn setup() -> Self {
-        let root = unique_temp_root();
+        let root = unique_dir("hot-upgrade");
         fs::create_dir_all(root.join("docs")).unwrap();
         fs::write(root.join("docs/search.md"), "# Search\n\nSemantic recall uses sqlite.\n")
             .unwrap();
@@ -140,10 +138,6 @@ impl TestEnv {
         let stdin = child.stdin.take().unwrap();
         let reader = BufReader::new(child.stdout.take().unwrap());
         Session { child, stdin, reader, next_id: 1 }
-    }
-
-    fn cleanup(&self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -270,9 +264,4 @@ fn wait_for(path: &Path, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("expected {} within {timeout:?}", path.display());
-}
-
-fn unique_temp_root() -> PathBuf {
-    let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("rag-rat-hot-upgrade-{}-{id}", std::process::id()))
 }

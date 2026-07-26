@@ -84,8 +84,6 @@ fn worktree_overlay_ignores_inherited_git_dir_env() {
         "an inherited worktree GIT_DIR hijacked resolution and pruned the overlay (reinf.rs \
          missing)"
     );
-
-    let _ = fs::remove_dir_all(&base);
 }
 
 /// The DISCOVERY side of the governing seam (Codex batch 9): a linked worktree with no
@@ -154,6 +152,4 @@ fn default_config_discovery_reaches_the_main_worktree_from_a_linked_checkout() {
         "a read command from the linked checkout works too: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-
-    let _ = fs::remove_dir_all(&base);
 }

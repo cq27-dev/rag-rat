@@ -6,25 +6,17 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rag_rat_base::config::Config;
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+mod common;
 
-fn unique_temp_root() -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "rag-rat-cli-output-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&root);
-    root
-}
+use common::{ScratchRoot, unique_dir};
 
-/// Build a throwaway index over one Rust file and return the config path the CLI should use.
-fn build_index() -> (PathBuf, PathBuf) {
-    let root = unique_temp_root();
+/// Build a throwaway index over one Rust file and return the scratch guard + the config path the
+/// CLI should use.
+fn build_index() -> (ScratchRoot, PathBuf) {
+    let root = unique_dir("cli-output");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn open_database() {}\npub fn close_database() {}\n")
         .unwrap();
@@ -56,7 +48,7 @@ fn run(config_path: &PathBuf, json: bool, args: &[&str]) -> String {
 
 #[test]
 fn cli_defaults_to_toon_and_json_flag_flips_to_json() {
-    let (root, config_path) = build_index();
+    let (_root, config_path) = build_index();
 
     // Default: TOON. The hit list renders as a TOON object — and is NOT parseable as JSON (TOON's
     // bare-key / tabular form is not a JSON document), which is the strongest single signal that
@@ -72,8 +64,6 @@ fn cli_defaults_to_toon_and_json_flag_flips_to_json() {
     let parsed: serde_json::Value = serde_json::from_str(&json)
         .unwrap_or_else(|err| panic!("--json output is not valid JSON ({err}):\n{json}"));
     assert!(parsed.is_object() || parsed.is_array(), "unexpected JSON shape:\n{json}");
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Every read command that prints structured output through `print_output` must honor the global
@@ -81,7 +71,7 @@ fn cli_defaults_to_toon_and_json_flag_flips_to_json() {
 /// per-handler output branches (`doctor`/`brief`/`clusters`) the format flag threads through.
 #[test]
 fn read_commands_honor_global_format() {
-    let (root, config_path) = build_index();
+    let (_root, config_path) = build_index();
     for args in [&["doctor"][..], &["brief"][..], &["clusters"][..]] {
         let toon = run(&config_path, false, args);
         assert!(
@@ -92,17 +82,15 @@ fn read_commands_honor_global_format() {
         serde_json::from_str::<serde_json::Value>(&json)
             .unwrap_or_else(|err| panic!("`{args:?} --json` is not valid JSON ({err}):\n{json}"));
     }
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// `memory list` println'd human text and ignored `--json` before this change; under `--json` it
 /// must emit the structured list (here an empty index → a JSON array).
 #[test]
 fn memory_list_json_flag_emits_json() {
-    let (root, config_path) = build_index();
+    let (_root, config_path) = build_index();
     let json = run(&config_path, true, &["memory", "list"]);
     let parsed: serde_json::Value = serde_json::from_str(&json)
         .unwrap_or_else(|err| panic!("`memory list --json` is not valid JSON ({err}):\n{json}"));
     assert!(parsed.is_array(), "expected a JSON array of memory summaries, got:\n{json}");
-    let _ = fs::remove_dir_all(&root);
 }

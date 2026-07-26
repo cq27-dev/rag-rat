@@ -9,14 +9,13 @@
 //! an online run resolves from cache) so the test never leaks into the developer's model cache and
 //! never depends on a specific model being present.
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use rag_rat_base::config::Config;
 
 mod common;
 
-fn unique_temp_root() -> PathBuf {
+fn unique_temp_root() -> common::ScratchRoot {
     common::unique_dir("init-yes")
 }
 
@@ -64,7 +63,7 @@ fn init_yes_writes_a_config_that_config_load_accepts() {
         .env("RAG_RAT_NO_WATCH", "1")
         .env("RAG_RAT_MODEL_CACHE", &cache)
         .env("RAG_RAT_DATA_DIR", &data_dir)
-        .env("HOME", &root)
+        .env("HOME", &*root)
         .env("XDG_CACHE_HOME", &cache)
         .output()
         .expect("run rag-rat init --yes");
@@ -114,8 +113,6 @@ fn init_yes_writes_a_config_that_config_load_accepts() {
         "the SwiftPM source tree must bind a Swift target with default globs, got: {:?}",
         config.targets
     );
-
-    std::fs::remove_dir_all(&root).ok();
 }
 
 /// `init` in a NEW repo must not heal/mutate an EXISTING repo's meta in the shared global DB
@@ -147,7 +144,7 @@ fn init_in_a_new_repo_leaves_an_existing_repos_heal_owed_meta() {
             .env("RAG_RAT_NO_WATCH", "1")
             .env("RAG_RAT_MODEL_CACHE", &cache)
             .env("RAG_RAT_DATA_DIR", &data_dir)
-            .env("HOME", &base)
+            .env("HOME", &*base)
             .env("XDG_CACHE_HOME", &cache)
             .output()
             .unwrap()
@@ -201,8 +198,6 @@ fn init_in_a_new_repo_leaves_an_existing_repos_heal_owed_meta() {
         Some("fastembed-all-minilm-l6-v2"),
         "init of a new repo healed (cleared) the existing repo's model meta",
     );
-
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Init from a SUBDIRECTORY of the normal MAIN worktree proceeds (Codex batch 8, finding 1): the
@@ -222,7 +217,7 @@ fn init_proceeds_from_a_subdirectory_of_the_main_worktree() {
         .env("RAG_RAT_HOOK_DISABLE", "1")
         .env("RAG_RAT_NO_WATCH", "1")
         .env("RAG_RAT_DATA_DIR", root.join("data"))
-        .env("HOME", &root)
+        .env("HOME", &*root)
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -234,8 +229,6 @@ fn init_proceeds_from_a_subdirectory_of_the_main_worktree() {
         !stderr.contains("linked git worktree"),
         "no linked-worktree refusal from a main subdir: {stderr}"
     );
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Init REFUSES to run in a LINKED git worktree (batch-7 worktree audit): the governing seam in
@@ -249,13 +242,12 @@ fn init_refuses_to_run_in_a_linked_worktree() {
     std::fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
     git_init(&root);
 
-    let linked =
-        root.parent().unwrap().join(format!("{}-wt", root.file_name().unwrap().to_string_lossy()));
+    let linked = common::unique_dir("init-yes-linked");
     let out = std::process::Command::new("git")
         .arg("-C")
-        .arg(&root)
+        .arg(&*root)
         .args(["worktree", "add", "--detach", "-q"])
-        .arg(&linked)
+        .arg(&*linked)
         .output()
         .unwrap();
     assert!(out.status.success(), "worktree add: {}", String::from_utf8_lossy(&out.stderr));
@@ -274,7 +266,4 @@ fn init_refuses_to_run_in_a_linked_worktree() {
         "the refusal names the main worktree path: {stderr}"
     );
     assert!(!linked.join("rag-rat.toml").exists(), "no branch-local config was written");
-
-    let _ = std::fs::remove_dir_all(&linked);
-    let _ = std::fs::remove_dir_all(&root);
 }
