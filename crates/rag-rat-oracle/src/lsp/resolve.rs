@@ -168,11 +168,17 @@ impl LspClient {
 }
 
 /// Parse a `textDocument/definition` result: `Location`, `Location[]`, `LocationLink`,
-/// `LocationLink[]`, or `null`. Returns the FIRST target's `(uri, range)`.
+/// `LocationLink[]`, or `null`. A multi-target response is authoritative only when every entry
+/// names the same target; choosing the first distinct target would turn unordered alternatives
+/// into a false Confirm/Upgrade/Contradict verdict.
 fn parse_definition(value: &Value) -> Option<(String, LspRange)> {
     match value {
         Value::Null => None,
-        Value::Array(items) => items.first().and_then(parse_one_location),
+        Value::Array(items) => {
+            let mut parsed = items.iter().map(parse_one_location);
+            let first = parsed.next()??;
+            parsed.all(|target| target.as_ref() == Some(&first)).then_some(first)
+        },
         object => parse_one_location(object),
     }
 }
@@ -444,6 +450,25 @@ mod tests {
                 end: LspPosition { line: 2, character: 9 },
             }))
         );
+    }
+
+    #[test]
+    fn parse_definition_rejects_distinct_multi_target_responses() {
+        let range = |line| {
+            json!({"start": {"line": line, "character": 0},
+                   "end": {"line": line, "character": 1}})
+        };
+        let ambiguous = json!([
+            {"uri": "file:///a.rs", "range": range(0)},
+            {"uri": "file:///b.rs", "range": range(1)}
+        ]);
+        assert_eq!(parse_definition(&ambiguous), None);
+
+        let duplicate = json!([
+            {"uri": "file:///a.rs", "range": range(0)},
+            {"uri": "file:///a.rs", "range": range(0)}
+        ]);
+        assert!(parse_definition(&duplicate).is_some(), "duplicate targets are unambiguous");
     }
 
     #[test]

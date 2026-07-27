@@ -409,20 +409,22 @@ pub(crate) fn live_covered_edges_for_path(
     Ok(out)
 }
 
-/// Migrate every `edge_oracle` row of `tool` from one `tool_version` to another, returning the
-/// moved row count. The live oracle's version-transition path (#534): a respawn probing a NEW
-/// `rust-analyzer --version` would otherwise make the first partial pass's run row the latest
-/// for the whole checkout and gate every prior-version verdict out of currency — collapsing live
-/// coverage to the handful of files the new session revisited. The rows are content-addressed
-/// (`file_sha` still gates drift), so moving them under the new version preserves coverage; a
-/// row the new version already wrote (same content key) is dropped first to keep the PK.
+/// Copy every current-checkout `edge_oracle` row of `tool` from one `tool_version` to another,
+/// returning the inserted row count. The live oracle's version-transition path (#534): a respawn
+/// probing a NEW `rust-analyzer --version` would otherwise make the first partial pass's run row
+/// the latest for the whole checkout and gate every prior-version verdict out of currency —
+/// collapsing live coverage to the handful of files the new session revisited. The rows are
+/// content-addressed (`file_sha` still gates drift), so copying them under the new version
+/// preserves coverage; a row the new version already wrote (same content key) wins via `INSERT OR
+/// IGNORE`.
 ///
-/// SCOPE (load-bearing): restricted to rows whose LIVE EDGE belongs to the active
+/// SCOPE (load-bearing): the copied set is restricted to rows whose LIVE EDGE belongs to the active
 /// `(commit_sha, worktree_id)` checkout — the SAME content join [`clear_edge_oracle_for_tool`]
 /// uses. `edge_oracle` rows carry no commit/worktree columns (their scope is the live-edge
 /// join), so a repo-wide UPDATE would relabel a SIBLING worktree's rows too while only THIS
-/// checkout gets the new-version run row — and the sibling's currency gate, still selecting the
-/// old version, would then hide all of its own verdicts.
+/// checkout gets the new-version run row. The old row MUST remain: identical-content sibling
+/// checkouts share one `edge_oracle` row, so destructively relabeling it would hide that verdict
+/// from every sibling whose currency still selects the old version.
 pub(crate) fn migrate_live_verdicts_to_version(
     conn: &Connection,
     tool: OracleTool,
@@ -436,8 +438,7 @@ pub(crate) fn migrate_live_verdicts_to_version(
     // The active-checkout, current-CONTENT live-edge predicate: the row's `file_sha` must equal
     // the checkout's CURRENT `files.sha256`, so a sibling worktree's row (same path + spans, but
     // its own content sha) is NOT treated as this checkout's — without the sha correlation a
-    // repo-wide relabel would move the sibling's row while only this checkout records the
-    // new-version run, hiding the sibling's verdicts behind its still-old currency gate.
+    // a sibling worktree's row while only this checkout records the new-version run.
     let active_current = format!(
         "EXISTS (
              SELECT 1
@@ -454,27 +455,21 @@ pub(crate) fn migrate_live_verdicts_to_version(
                AND edges_data.hidden = 0
                AND {scope})"
     );
-    // Drop old-version rows whose content key the new version already occupies (the PK is
-    // (repo_id?, tool, tool_version, source_path, spans…, edge_kind) — file_sha is NOT in it, so
-    // the UPDATE below would otherwise hit a PK collision), restricted to rows current in THIS
-    // checkout.
-    conn.execute(
-        &format!(
-            "DELETE FROM edge_oracle
-             WHERE tool = ?1 AND tool_version = ?2{repo_clause}
-               AND (source_path, source_start_byte, source_end_byte,
-                    callee_start_byte, callee_end_byte, edge_kind) IN (
-                    SELECT source_path, source_start_byte, source_end_byte,
-                           callee_start_byte, callee_end_byte, edge_kind
-                    FROM edge_oracle
-                    WHERE tool = ?1 AND tool_version = ?3{repo_clause})
-               AND {active_current}"
-        ),
-        params![tool.as_db_str(), from_version, to_version, commit_sha, worktree_id],
-    )?;
+    let (repo_col, repo_value) =
+        if oracle_repo_scope(conn)?.is_some() { ("repo_id, ", "repo_id, ") } else { ("", "") };
+    // COPY, never relabel: two checkouts with identical bytes + spans intentionally share the old
+    // row. Keeping it lets a sibling's old-version currency continue surfacing the verdict while
+    // this checkout switches to the copied new-version row.
     let moved = conn.execute(
         &format!(
-            "UPDATE edge_oracle SET tool_version = ?3
+            "INSERT OR IGNORE INTO edge_oracle(
+                 {repo_col}source_path, source_start_byte, source_end_byte,
+                 callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version,
+                 resolved_symbol_id, scip_symbol, kind, computed_at)
+             SELECT {repo_value}source_path, source_start_byte, source_end_byte,
+                    callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, ?3,
+                    resolved_symbol_id, scip_symbol, kind, computed_at
+             FROM edge_oracle
              WHERE tool = ?1 AND tool_version = ?2{repo_clause}
                AND {active_current}"
         ),

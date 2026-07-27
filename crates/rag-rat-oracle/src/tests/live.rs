@@ -334,7 +334,7 @@ fn live_pass_budget_continuation_resumes_within_a_file() {
 }
 
 /// A `rust-analyzer` upgrade between sessions must not strand prior verdicts: the first pass
-/// under the new `tool_version` migrates them (content-addressed, still `file_sha`-gated) and
+/// under the new `tool_version` copies them (content-addressed, still `file_sha`-gated) and
 /// records the run that makes the new version current — otherwise the currency gate collapses
 /// live coverage to the few files the new session revisited (#534 review).
 #[test]
@@ -378,8 +378,8 @@ fn live_pass_migrates_prior_verdicts_across_a_version_change() {
     assert!(report.version_migrated);
     assert!(report.refinements_invalidated, "the evidence changed hands");
     assert_eq!(report.status, "VersionMigrated");
-    assert_eq!(version_of(LIVE_VERSION), 0, "old-version rows moved");
-    assert_eq!(version_of("ra-test-2"), 1, "rows now carried by the new version");
+    assert_eq!(version_of(LIVE_VERSION), 1, "old-version rows remain for sibling currency");
+    assert_eq!(version_of("ra-test-2"), 1, "rows are copied under the new version");
     // The migrated verdict survives with its content + symbol intact.
     let (kind, resolved, symbol) = h.verdict(edge).expect("migrated verdict persists");
     assert_eq!(kind, "upgrade");
@@ -496,6 +496,63 @@ fn live_version_migration_leaves_a_sibling_checkouts_rows_alone() {
         .unwrap();
     assert_eq!(sibling_version, "old-v", "the sibling checkout's row keeps its version");
     let _ = edge;
+}
+
+/// Identical-content sibling checkouts SHARE the same content-keyed verdict row. A version
+/// transition must copy that row, not relabel it: the active checkout selects the new version while
+/// the sibling's still-old currency needs the old row to remain visible.
+#[test]
+fn live_version_migration_preserves_a_shared_old_version_row() {
+    let h = Harness::new();
+    let (_src, _target, edge) = seed_corpus(&h);
+    let key = h.edge_content_key(edge);
+    let active_sha = h.file_sha("src.rs");
+    crate::store::write_edge_oracle(
+        &h.conn,
+        OracleTool::RaLsp,
+        "old-v",
+        &crate::store::EdgeOracleRow {
+            source_path: &key.source_path,
+            source_start_byte: key.source_start_byte,
+            source_end_byte: key.source_end_byte,
+            callee_start_byte: key.callee_start_byte,
+            callee_end_byte: key.callee_end_byte,
+            edge_kind: &key.edge_kind,
+            file_sha: &active_sha,
+            resolved_symbol_id: None,
+            scip_symbol: "local ra-lsp-shared",
+            kind: OracleResolutionKind::Upgrade,
+        },
+    )
+    .unwrap();
+
+    // Model another checkout with the SAME path, bytes, and edge spans: both scopes join to the
+    // one old-version edge_oracle row.
+    let sibling_file = h.add_file_in_scope("src.rs", OTHER_COMMIT, OTHER_WORKTREE);
+    h.set_file_sha(sibling_file, &active_sha);
+    h.add_edge(sibling_file, "target", 14, 20, "NameOnly", None);
+
+    let copied = crate::store::migrate_live_verdicts_to_version(
+        &h.conn,
+        OracleTool::RaLsp,
+        "old-v",
+        "new-v",
+        COMMIT,
+        WORKTREE,
+    )
+    .unwrap();
+    assert_eq!(copied, 1);
+
+    let mut versions = h
+        .conn
+        .prepare("SELECT tool_version FROM edge_oracle WHERE tool = 'ra-lsp' ORDER BY tool_version")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    versions.dedup();
+    assert_eq!(versions, ["new-v", "old-v"], "both checkout currencies retain coverage");
 }
 
 #[test]

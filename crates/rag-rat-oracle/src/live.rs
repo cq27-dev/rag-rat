@@ -214,7 +214,8 @@ pub fn live_oracle_pass(
     // evidence just changed hands. The transition run is recorded whenever the version moved —
     // even with zero rows moved — because the session's binary IS the new version and the
     // currency gate must start selecting it (a sibling's migration may already have moved the
-    // shared rows).
+    // shared rows). Migration COPIES rather than relabels: identical-content siblings share the
+    // old row and still need it under their old-version currency.
     let mut version_migrated = false;
     if let Some(old_version) =
         store::latest_run_tool_version(conn, tool, input.commit_sha, input.worktree_id)?
@@ -583,10 +584,11 @@ fn encode_uri_path(path: &str) -> String {
 /// The repo-relative path of a `file://` document URI under `root_uri`, percent-decoded; `None`
 /// when the URI points outside the checkout (an external dependency — nothing live can write).
 fn path_from_uri(root_uri: &str, uri: &str) -> Option<String> {
-    // The separator between root and document is OPTIONAL here because the root itself may end
-    // in `/` (a filesystem-root `/` or a drive root `C:\`) — strip it only when present.
     let rest = uri.strip_prefix(root_uri)?;
-    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    // Require a path boundary after a non-root checkout URI. A lexical prefix such as
+    // `file:///work/repo` must not accept `file:///work/repository/x.rs` as `sitory/x.rs`.
+    // Slash-terminated roots (`file:///`, `file:///C:/`) already supply that boundary.
+    let rest = if root_uri.ends_with('/') { rest } else { rest.strip_prefix('/')? };
     let mut bytes = Vec::with_capacity(rest.len());
     let raw = rest.as_bytes();
     let mut i = 0;
@@ -672,6 +674,7 @@ mod tests {
             Some("src/a file.rs".to_string())
         );
         assert_eq!(path_from_uri(root, "file:///elsewhere/src/lib.rs"), None);
+        assert_eq!(path_from_uri(root, "file:///tmp/my%20repository/src/lib.rs"), None);
     }
 
     #[test]
