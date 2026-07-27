@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rag_rat_base::time::now_ms;
 use rag_rat_oracle::{
-    self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls,
+    self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls, ToolManifest,
 };
 
 use super::*;
@@ -262,10 +262,15 @@ impl IndexDatabase {
         self.run_oracle(tool, tool_version, scip_bytes, OracleShaSnapshots::default())
     }
 
-    /// Probe whether an oracle tool is installed, for `oracle status`. A `Blocked` probe is
-    /// informational (the tool isn't installed), never an error.
+    /// Probe whether an oracle tool is installed, for `oracle status`. Config-backed opens probe
+    /// from the checkout root so rustup directory overrides select the same rust-analyzer as the
+    /// watcher. A `Blocked` probe is informational (the tool isn't installed), never an error.
     pub fn probe_oracle_tool(&self, tool: OracleTool) -> rag_rat_oracle::ToolAvailability {
-        rag_rat_oracle::probe_oracle_tool(tool)
+        let manifest = ToolManifest::for_tool(tool);
+        match &self.config {
+            Some(config) => manifest.probe_in(&config.root),
+            None => manifest.probe(),
+        }
     }
 
     /// The `tool_version` of the most recent oracle run for `tool` in this checkout, or `None` when
