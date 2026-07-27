@@ -39,6 +39,7 @@
 //! the checkout has no batch-interchangeable SCIP symbol string, so it is skipped, not written).
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::Path;
 
 use rag_rat_base::hash::hex_sha256;
@@ -392,18 +393,17 @@ pub fn live_oracle_pass(
                 report.skipped_drifted += 1;
                 continue;
             };
-            let indexed_sha = def_indexed_sha
-                .entry(def_path.clone())
-                .or_insert_with(|| {
-                    store::indexed_file_sha_for_path(
+            let indexed_sha = match def_indexed_sha.entry(def_path.clone()) {
+                Entry::Occupied(entry) => entry.get().clone(),
+                Entry::Vacant(entry) => entry
+                    .insert(store::indexed_file_sha_for_path(
                         conn,
                         &def_path,
                         input.commit_sha,
                         input.worktree_id,
-                    )
-                    .unwrap_or(None)
-                })
-                .clone();
+                    )?)
+                    .clone(),
+            };
             match indexed_sha {
                 // Not indexed in this checkout — nothing live can map to it.
                 None => {
@@ -424,10 +424,15 @@ pub fn live_oracle_pass(
                 report.skipped_drifted += 1;
                 continue;
             };
-            let spans = def_spans.entry(def_path.clone()).or_insert_with(|| {
-                store::symbol_spans_for_path(conn, &def_path, input.commit_sha, input.worktree_id)
-                    .unwrap_or_default()
-            });
+            let spans = match def_spans.entry(def_path.clone()) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(store::symbol_spans_for_path(
+                    conn,
+                    &def_path,
+                    input.commit_sha,
+                    input.worktree_id,
+                )?),
+            };
             let Some(symbol_id) = join::map_definition_to_symbol(spans, def_start, def_end) else {
                 // The def is in an indexed file but under no indexed symbol (macro-generated
                 // code, a symbol kind without a row): nothing trustworthy to write.
@@ -566,6 +571,16 @@ fn live_local_sentinel(source_path: &str, candidate: &store::EdgeJoinCandidate) 
 /// path (`\\server\share`) becomes an authority URI (`file://server/share/…`, no extra slash).
 fn root_uri_for(checkout_root: &Path) -> String {
     let lossy = checkout_root.to_string_lossy().replace('\\', "/");
+    // `Path::canonicalize` on Windows returns verbatim paths. Normalize those BEFORE the UNC
+    // branch: `\\?\C:\repo` becomes `//?/C:/repo` after separator replacement and would otherwise
+    // be mistaken for an authority named `?`; verbatim UNC uses the `\\?\UNC\server\share` form.
+    let lossy = if let Some(unc) = lossy.strip_prefix("//?/UNC/") {
+        format!("//{unc}")
+    } else if let Some(drive) = lossy.strip_prefix("//?/") {
+        drive.to_string()
+    } else {
+        lossy
+    };
     // UNC: `//server/share/…` → `file://server/share/…` (the server is the URI authority, not a
     // path segment). Encode each segment but keep the `/` separators.
     if let Some(unc) = lossy.strip_prefix("//") {
@@ -639,6 +654,16 @@ mod tests {
         assert_eq!(path_from_uri(&root, "file:///C:/repo/src/lib.rs"), Some("src/lib.rs".into()));
         // A drive root with a space still encodes the non-drive part.
         assert_eq!(root_uri_for(Path::new(r"D:\my repo")), "file:///D:/my%20repo");
+    }
+
+    #[test]
+    fn root_uri_strips_windows_verbatim_prefixes() {
+        // Canonical Windows paths carry `\\?\`; rust-analyzer emits ordinary canonical file URLs.
+        assert_eq!(root_uri_for(Path::new(r"\\?\C:\repo")), "file:///C:/repo");
+        assert_eq!(
+            root_uri_for(Path::new(r"\\?\UNC\server\share\repo")),
+            "file://server/share/repo"
+        );
     }
 
     #[test]

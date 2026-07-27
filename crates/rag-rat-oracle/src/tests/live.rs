@@ -242,6 +242,28 @@ fn live_pass_skips_a_drifted_callsite_and_records_no_run() {
 }
 
 #[test]
+fn live_pass_propagates_definition_metadata_query_failures() {
+    // SQLite's dynamic typing models a malformed symbol metadata row. The cache fill must return
+    // the DB error, not reinterpret it as "no symbols" and record a deceptively successful run.
+    let h = Harness::new();
+    let (_src, _target, _edge) = seed_corpus(&h);
+    h.conn
+        .execute(
+            "UPDATE symbols SET start_byte = 'bad' WHERE file_id =
+                 (SELECT id FROM files WHERE path = 'defs.rs')",
+            [],
+        )
+        .unwrap();
+    let uri = root_uri(&h);
+    let def = def_uri(&h, "defs.rs");
+    let mut session = fake_session(&uri, Some((def, (0, 3), (0, 9))));
+    let worklist = vec!["src.rs".to_string()];
+
+    assert!(live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).is_err());
+    assert_eq!(live_run_count(&h.conn), 0);
+}
+
+#[test]
 fn live_pass_skips_an_external_definition_without_a_row() {
     let h = Harness::new();
     let (_src, _target, _edge) = seed_corpus(&h);
