@@ -312,7 +312,13 @@ pub fn live_oracle_pass(
         let (to_resolve, deferred) = unverdicted.split_at(remaining.min(unverdicted.len()));
         let deferred_count = deferred.len();
 
-        let uri = format!("{}/{}", session.root_uri, encode_uri_path(path));
+        // Join on exactly one separator: a root URI already ending in `/` (a filesystem-root `/`
+        // or a drive root `C:\`) would otherwise produce `file:////…` / `file:///C://…`, which
+        // rust-analyzer's canonical single-slash form then fails to prefix-match (#534 review).
+        // `strip_suffix` drops at most ONE slash — `trim_end_matches('/')` would eat `file:///`
+        // down to `file:`.
+        let root = session.root_uri.strip_suffix('/').unwrap_or(&session.root_uri);
+        let uri = format!("{root}/{}", encode_uri_path(path));
         let starts: Vec<usize> =
             to_resolve.iter().filter_map(|c| usize::try_from(c.callee_start_byte).ok()).collect();
         report.requests_used += starts.len() as u64;
@@ -577,7 +583,10 @@ fn encode_uri_path(path: &str) -> String {
 /// The repo-relative path of a `file://` document URI under `root_uri`, percent-decoded; `None`
 /// when the URI points outside the checkout (an external dependency — nothing live can write).
 fn path_from_uri(root_uri: &str, uri: &str) -> Option<String> {
-    let rest = uri.strip_prefix(root_uri)?.strip_prefix('/')?;
+    // The separator between root and document is OPTIONAL here because the root itself may end
+    // in `/` (a filesystem-root `/` or a drive root `C:\`) — strip it only when present.
+    let rest = uri.strip_prefix(root_uri)?;
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
     let mut bytes = Vec::with_capacity(rest.len());
     let raw = rest.as_bytes();
     let mut i = 0;
@@ -627,6 +636,32 @@ mod tests {
             path_from_uri(&root, "file://server/share/repo/src/a.rs"),
             Some("src/a.rs".into())
         );
+    }
+
+    #[test]
+    fn document_join_uses_one_separator_at_a_slash_terminated_root() {
+        // A checkout AT the filesystem root (`/`) or a drive root (`C:\`) yields a root URI
+        // ending in `/`; joining a document must not double the separator or the server's
+        // canonical URI won't prefix-match (#534 review).
+        let root = root_uri_for(Path::new("/"));
+        assert_eq!(root, "file:///");
+        let doc = format!(
+            "{}/{}",
+            root.strip_suffix('/').unwrap_or(&root),
+            encode_uri_path("src/lib.rs")
+        );
+        assert_eq!(doc, "file:///src/lib.rs");
+        assert_eq!(path_from_uri(&root, &doc), Some("src/lib.rs".into()));
+
+        let drive = root_uri_for(Path::new(r"C:\"));
+        assert_eq!(drive, "file:///C:/");
+        let doc = format!(
+            "{}/{}",
+            drive.strip_suffix('/').unwrap_or(&drive),
+            encode_uri_path("src/lib.rs")
+        );
+        assert_eq!(doc, "file:///C:/src/lib.rs");
+        assert_eq!(path_from_uri(&drive, &doc), Some("src/lib.rs".into()));
     }
 
     #[test]
