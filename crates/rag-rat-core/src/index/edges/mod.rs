@@ -223,6 +223,7 @@ pub(crate) struct EdgeCandidate {
     pub(in crate::index) target_qualified_name: Option<String>,
     pub(in crate::index) evidence: Option<String>,
     pub(in crate::index) receiver_hint: Option<String>,
+    pub(in crate::index) receiver_type_hint: Option<String>,
     pub(in crate::index) source_span: EdgeSpan,
     /// Byte range of the callee identifier token; see [`CalleeRange`]. `None` for non-symbol
     /// edges.
@@ -370,6 +371,7 @@ struct CompactEdge {
     target_qualified_name: OptSym,
     evidence: OptSym,
     receiver_hint: OptSym,
+    receiver_type_hint: OptSym,
     source_span: CompactSpan,
     /// Callee identifier byte range; `u32::MAX` in `callee_start_byte` is the `None` sentinel.
     callee_start_byte: u32,
@@ -508,6 +510,7 @@ impl FullRebuildGraph {
                 .intern_opt(candidate.target_qualified_name.as_deref()),
             evidence: self.arena.intern_opt(candidate.evidence.as_deref()),
             receiver_hint: self.arena.intern_opt(candidate.receiver_hint.as_deref()),
+            receiver_type_hint: self.arena.intern_opt(candidate.receiver_type_hint.as_deref()),
             source_span: CompactSpan::from_span(candidate.source_span),
             callee_start_byte,
             callee_end_byte,
@@ -537,6 +540,7 @@ pub(crate) struct EdgeSpan {
 pub(crate) struct EdgeContext {
     pub(in crate::index) target_qualified_name: Option<String>,
     pub(in crate::index) receiver_hint: Option<String>,
+    pub(in crate::index) receiver_type_hint: Option<String>,
 }
 
 impl IndexedSymbol {
@@ -550,39 +554,59 @@ impl IndexedSymbol {
     }
 }
 
+pub(crate) fn degeneric_path(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    let mut depth = 0;
+    for ch in path.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            _ if depth == 0 => result.push(ch),
+            _ => {},
+        }
+    }
+    result
+}
+
 /// Name-keyed indexes over the symbol set, built once per resolve pass. Edge resolution used to
 /// scan the entire `Vec<IndexedSymbol>` (several times) per edge — O(edges × symbols), the single
 /// biggest cost in a full rebuild. These maps make each lookup ~O(1). Bucket order mirrors the
 /// input `symbols` order, so first-match semantics are preserved exactly.
 pub(crate) struct SymbolIndex<'a> {
     /// Exact `qualified_name` match.
-    by_qualified: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    pub(crate) by_qualified: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
     /// Exact `scope_path` match (semantic scope, e.g. `Workspace::new`). Tried before bare-name
     /// fallback: it aligns with an edge's source-derived `target_qualified_name`, so the strong
     /// qualified path fires for methods/nested items instead of collapsing to bare-name
     /// collisions.
-    by_scope_path: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    pub(crate) by_scope_path: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    /// Scope path with generics stripped, e.g. `SymbolIndex::build` matching
+    /// `SymbolIndex<'a>::build`.
+    pub(crate) by_degeneric_scope_path: HashMap<String, Vec<&'a IndexedSymbol>>,
     /// Short-name fallback (`symbol.name`).
-    by_name: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    pub(crate) by_name: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
     /// Candidates for the `qualified_name.ends_with("::{q}")` suffix match, keyed by the last
     /// `::`-segment of the qualified name (a name ending in `::{q}` necessarily shares `q`'s
     /// tail).
-    by_qn_tail: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    pub(crate) by_qn_tail: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
 }
 
 impl<'a> SymbolIndex<'a> {
-    fn build(symbols: &'a [IndexedSymbol]) -> Self {
+    pub(crate) fn build(symbols: &'a [IndexedSymbol]) -> Self {
         let mut by_qualified: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_scope_path: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
+        let mut by_degeneric_scope_path: HashMap<String, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_qn_tail: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         for symbol in symbols {
             by_qualified.entry(symbol.qualified_name.as_str()).or_default().push(symbol);
             by_scope_path.entry(symbol.scope_path.as_str()).or_default().push(symbol);
+            let degeneric = degeneric_path(&symbol.scope_path);
+            by_degeneric_scope_path.entry(degeneric).or_default().push(symbol);
             by_name.entry(symbol.name.as_str()).or_default().push(symbol);
             by_qn_tail.entry(qn_tail(&symbol.qualified_name)).or_default().push(symbol);
         }
-        Self { by_qualified, by_scope_path, by_name, by_qn_tail }
+        Self { by_qualified, by_scope_path, by_degeneric_scope_path, by_name, by_qn_tail }
     }
 
     /// Whether `file_id` itself defines a symbol named `name`. Import-alias rebinding defers when
@@ -602,6 +626,7 @@ pub(crate) struct ResolveSymbolRequest<'a> {
     edge_kind: EdgeKind,
     evidence: Option<&'a str>,
     receiver_hint: Option<&'a str>,
+    receiver_type_hint: Option<&'a str>,
     source_file_id: i64,
     source_language: Option<&'a str>,
     /// `name` is brought into this file by a `use` from an EXTERNAL dependency crate (#61 Project

@@ -104,6 +104,7 @@ pub(in crate::index::languages) fn python_edges(
                             .first_text()
                             .filter(|_| identifiers.len() > 1)
                             .map(ToOwned::to_owned),
+                        ..Default::default()
                     },
                     identifiers.last_node().map(CalleeRange::of_node),
                 ));
@@ -196,6 +197,7 @@ pub(in crate::index::languages) fn python_edges(
                             .first_text()
                             .filter(|_| identifiers.len() > 1)
                             .map(ToOwned::to_owned),
+                        ..Default::default()
                     },
                     identifiers.last_node().map(final_segment_node).map(CalleeRange::of_node),
                 ));
@@ -268,6 +270,7 @@ fn emit_python_type_refs(
                     EdgeContext {
                         receiver_hint: receiver,
                         target_qualified_name: identifiers.qualified_name(),
+                        ..Default::default()
                     },
                     identifiers.last_node().map(final_segment_node).map(CalleeRange::of_node),
                 ));

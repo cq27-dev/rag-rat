@@ -23,9 +23,9 @@ pub use migrations::{
     apply_oplog_device_x25519, apply_oplog_local_account, apply_oplog_storage,
     apply_oplog_stream_scoping, apply_oracle_tables, apply_papertrail_binding_health,
     apply_papertrail_distill_substrate, apply_papertrail_mirror_resume_state,
-    apply_papertrail_provider_neutral_schema, apply_repo_id_core_scoping,
-    apply_repo_id_periphery_scoping, apply_repos_registry, apply_scip_moniker_anchors,
-    apply_sync_invites, apply_sync_invites_normalized_receipts,
+    apply_papertrail_provider_neutral_schema, apply_receiver_type_hint_interning,
+    apply_repo_id_core_scoping, apply_repo_id_periphery_scoping, apply_repos_registry,
+    apply_scip_moniker_anchors, apply_sync_invites, apply_sync_invites_normalized_receipts,
     apply_sync_origin_and_edge_tombstone, apply_table_sync_projection_state,
     apply_table_sync_tables,
 };
@@ -50,7 +50,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 93;
+pub const LATEST_SCHEMA_VERSION: u32 = 94;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -707,6 +707,10 @@ const MIGRATION_093_DESCRIPTION: &str =
      stored entry cannot be replayed at all; and sync_published_rows.projector_version, since the \
      anti-echo hash covers the hashing binary's column set and is meaningless without that set's \
      identity";
+const MIGRATION_094_ID: &str = "094_receiver_type_hint_interning";
+const MIGRATION_094_CHECKSUM: &str = "sha256:rag-rat-receiver-type-hint-interning-v94";
+const MIGRATION_094_DESCRIPTION: &str =
+    "Add edges_data.receiver_type_hint_id for conservative Rust receiver-type resolution";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1461,6 +1465,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_093_CHECKSUM,
         description: MIGRATION_093_DESCRIPTION,
         apply: MigrationFn::Plain(apply_table_sync_projection_state),
+    },
+    Migration {
+        id: MIGRATION_094_ID,
+        checksum: MIGRATION_094_CHECKSUM,
+        description: MIGRATION_094_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_receiver_type_hint_interning),
     },
 ];
 

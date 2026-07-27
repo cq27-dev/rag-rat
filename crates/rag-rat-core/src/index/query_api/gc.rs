@@ -233,6 +233,8 @@ impl IndexDatabase {
                     WHERE target_qualified_name_id IS NOT NULL
                 UNION SELECT receiver_hint_id FROM main.edges_data
                     WHERE receiver_hint_id IS NOT NULL
+                UNION SELECT receiver_type_hint_id FROM main.edges_data
+                    WHERE receiver_type_hint_id IS NOT NULL
                 UNION SELECT resolution_id FROM main.edges_data
                 UNION SELECT edge_kind_id FROM main.edges_data
                 UNION SELECT confidence_id FROM main.edges_data

@@ -338,11 +338,12 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
     // rewritten; empty for the base/incremental/full-rebuild path.
     let mut stmt = conn.prepare(&format!(
         "SELECT d.id, d.source_file_id, tn.value, tqn.value, ek.value, conf.value, d.evidence, \
-         rh.value, d.source_start_byte, files.language FROM edges_data d JOIN files ON files.id = \
-         d.source_file_id LEFT JOIN name_strings tn ON tn.id = d.to_name_id LEFT JOIN \
+         rh.value, rth.value, d.source_start_byte, files.language FROM edges_data d JOIN files ON \
+         files.id = d.source_file_id LEFT JOIN name_strings tn ON tn.id = d.to_name_id LEFT JOIN \
          name_strings tqn ON tqn.id = d.target_qualified_name_id LEFT JOIN name_strings ek ON \
          ek.id = d.edge_kind_id LEFT JOIN name_strings conf ON conf.id = d.confidence_id LEFT \
-         JOIN name_strings rh ON rh.id = d.receiver_hint_id WHERE 1 = 1{} ORDER BY d.id",
+         JOIN name_strings rh ON rh.id = d.receiver_hint_id LEFT JOIN name_strings rth ON rth.id \
+         = d.receiver_type_hint_id WHERE 1 = 1{} ORDER BY d.id",
         write.files_write_predicate(),
     ))?;
     let rows = stmt.query_map([], |row| {
@@ -355,8 +356,9 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             row.get::<_, String>(5)?,
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
-            row.get::<_, i64>(8)?,
-            row.get::<_, String>(9)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, String>(10)?,
         ))
     })?;
     let rows = rows.collect::<Result<Vec<_>, _>>()?;
@@ -369,6 +371,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         current_confidence,
         evidence,
         receiver_hint,
+        receiver_type_hint,
         source_start_byte,
         source_language,
     ) in rows
@@ -423,6 +426,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 edge_kind,
                 evidence: evidence.as_deref(),
                 receiver_hint: resolve_receiver,
+                receiver_type_hint: receiver_type_hint.as_deref(),
                 source_file_id,
                 source_language: Some(source_language.as_str()),
                 imported_external: import_scope.is_external_import(
@@ -618,6 +622,7 @@ pub(crate) fn resolve_and_insert_edges(
         let target_qualified_name = arena.get_opt(candidate.target_qualified_name);
         let evidence = arena.get_opt(candidate.evidence);
         let receiver_hint = arena.get_opt(candidate.receiver_hint);
+        let receiver_type_hint = arena.get_opt(candidate.receiver_type_hint);
         // The reference's byte position drives the module-aware covering test (#61) — same input
         // the DB driver reads from `source_start_byte`.
         let ref_byte = candidate.source_span.start_byte as usize;
@@ -652,6 +657,7 @@ pub(crate) fn resolve_and_insert_edges(
                     edge_kind: candidate.edge_kind,
                     evidence,
                     receiver_hint: resolve_receiver,
+                    receiver_type_hint,
                     source_file_id: *file_id,
                     source_language: file_language.get(file_id).map(String::as_str),
                     imported_external: import_scope.is_external_import(
@@ -710,6 +716,7 @@ pub(crate) fn resolve_and_insert_edges(
         let to_name_id = interner.get(conn, to_name)?;
         let target_qualified_name_id = interner.get_opt(conn, target_qualified_name)?;
         let receiver_hint_id = interner.get_opt(conn, receiver_hint)?;
+        let receiver_type_hint_id = interner.get_opt(conn, receiver_type_hint)?;
         let edge_kind_id = interner.get(conn, candidate.edge_kind.as_str())?;
         let confidence_id = interner.get(conn, confidence.as_str())?;
         let resolution_id = interner.get(conn, reason)?;
@@ -717,7 +724,7 @@ pub(crate) fn resolve_and_insert_edges(
             "
             INSERT INTO edges_data(
                 source_file_id, from_symbol_id, from_name_id, to_name_id,
-                target_qualified_name_id, evidence, receiver_hint_id,
+                target_qualified_name_id, evidence, receiver_hint_id, receiver_type_hint_id,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 callee_start_byte, callee_end_byte,
                 import_scope_start_byte, import_scope_end_byte, import_mod_id,
@@ -725,7 +732,7 @@ pub(crate) fn resolve_and_insert_edges(
                 to_symbol_id, target_start_line, target_end_line, resolution_id, hidden
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23)
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24)
             ",
         )?
         .execute(params![
@@ -736,6 +743,7 @@ pub(crate) fn resolve_and_insert_edges(
             target_qualified_name_id,
             evidence,
             receiver_hint_id,
+            receiver_type_hint_id,
             i64::from(candidate.source_span.start_line),
             i64::from(candidate.source_span.end_line),
             i64::from(candidate.source_span.start_byte),
@@ -807,6 +815,74 @@ pub(crate) fn resolve_symbol<'a>(
     }) {
         return None;
     }
+    if let Some(type_hint) = request.receiver_type_hint.filter(|value| !value.is_empty()) {
+        let target = format!("{type_hint}::{}", request.name);
+        let target_degeneric = degeneric_path(&target);
+
+        let scope_exact = index
+            .by_scope_path
+            .get(target.as_str())
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|symbol| kind_matches(symbol))
+            .collect::<Vec<_>>();
+        match scope_exact.as_slice() {
+            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "receiver_type")),
+            [_, ..] if same_logical_symbol(&scope_exact) =>
+                return Some((scope_exact[0], EdgeConfidence::Syntactic, "receiver_type")),
+            _ => {},
+        }
+
+        let scope_degeneric = index
+            .by_degeneric_scope_path
+            .get(&target_degeneric)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|symbol| kind_matches(symbol))
+            .collect::<Vec<_>>();
+        match scope_degeneric.as_slice() {
+            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "scope_degeneric")),
+            [_, ..] if same_logical_symbol(&scope_degeneric) =>
+                return Some((scope_degeneric[0], EdgeConfidence::Syntactic, "scope_degeneric")),
+            _ => {},
+        }
+
+        let scope_suffix = format!("::{target}");
+        let scope_degeneric_suffix = format!("::{target_degeneric}");
+        let receiver_suffix_matches = index
+            .by_name
+            .get(short_name(request.name))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|symbol| {
+                kind_matches(symbol)
+                    && (symbol.scope_path.ends_with(&scope_suffix)
+                        || degeneric_path(&symbol.scope_path).ends_with(&scope_degeneric_suffix))
+            })
+            .collect::<Vec<_>>();
+        match receiver_suffix_matches.as_slice() {
+            [symbol] => {
+                let reason = if symbol.scope_path.ends_with(&scope_suffix) {
+                    "receiver_type"
+                } else {
+                    "scope_degeneric"
+                };
+                return Some((*symbol, EdgeConfidence::Syntactic, reason));
+            },
+            [_, ..] if same_logical_symbol(&receiver_suffix_matches) => {
+                let reason = if receiver_suffix_matches[0].scope_path.ends_with(&scope_suffix) {
+                    "receiver_type"
+                } else {
+                    "scope_degeneric"
+                };
+                return Some((receiver_suffix_matches[0], EdgeConfidence::Syntactic, reason));
+            },
+            _ => {},
+        }
+    }
     if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
         // Semantic SCOPE-PATH match first (#61). An edge's `target_qualified_name` is a source-code
         // path (`Workspace::new`), which aligns with a symbol's `scope_path`
@@ -833,6 +909,21 @@ pub(crate) fn resolve_symbol<'a>(
             [symbol] => return Some((*symbol, EdgeConfidence::Exact, "scope_exact")),
             [_, ..] if same_logical_symbol(&scope_exact) =>
                 return Some((scope_exact[0], EdgeConfidence::Syntactic, "logical_variant")),
+            _ => {},
+        }
+        let qualified_degeneric = degeneric_path(qualified);
+        let scope_degeneric = index
+            .by_degeneric_scope_path
+            .get(&qualified_degeneric)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|symbol| kind_matches(symbol))
+            .collect::<Vec<_>>();
+        match scope_degeneric.as_slice() {
+            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "scope_degeneric")),
+            [_, ..] if same_logical_symbol(&scope_degeneric) =>
+                return Some((scope_degeneric[0], EdgeConfidence::Syntactic, "scope_degeneric")),
             _ => {},
         }
         let scope_suffix = format!("::{qualified}");
@@ -897,7 +988,8 @@ pub(crate) fn resolve_symbol<'a>(
     // manufacture a dependency the source never expressed — `client.idle()` becoming a "caller" of
     // `enum Status { case idle }`. Let the language policy exclude those kinds from this fallback.
     let reference_is_bare = request.target_qualified_name.is_none_or(str::is_empty)
-        && request.receiver_hint.is_none_or(str::is_empty);
+        && request.receiver_hint.is_none_or(str::is_empty)
+        && request.receiver_type_hint.is_none_or(str::is_empty);
     let bare_shape_ok = |symbol: &IndexedSymbol| {
         reference_is_bare
             || !policy.is_some_and(|policy| {

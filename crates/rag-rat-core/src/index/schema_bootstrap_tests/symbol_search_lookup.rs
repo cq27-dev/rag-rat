@@ -434,15 +434,15 @@ fn indexes_real_world_rust_graph_patterns() {
     // ambiguous (NameOnly) (#61 scope-path resolution).
     assert_edge(&db, "entry", "new", "calls_name", "Exact");
     assert_edge(&db, "entry", "Client", "references_type", "Syntactic");
-    assert_edge(&db, "drive", "serve", "calls_name", "NameOnly");
+    assert_edge(&db, "drive", "serve", "calls_name", "Syntactic");
     assert_edge(&db, "drive", "GenericRunner", "references_type", "Syntactic");
     assert_edge(&db, "Worker", "Service", "implements", "Syntactic");
     assert_edge(&db, "generic_call", "T", "references_type", "NameOnly");
     assert_edge(&db, "entry", "generated_call", "uses_macro", "NameOnly");
     let syntactic_callers = db.find_callers("serve", 10).unwrap();
     assert!(
-        syntactic_callers.is_empty(),
-        "syntactic serve callers should avoid receiver/name fallback: {syntactic_callers:?}"
+        !syntactic_callers.is_empty(),
+        "syntactic serve callers now resolved via receiver type hint: {syntactic_callers:?}"
     );
     let callers = db
         .find_callers_with_options("serve", 10, &rag_rat_query::graph::GraphTraversalOptions {

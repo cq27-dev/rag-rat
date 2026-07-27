@@ -1475,10 +1475,8 @@ fn migration_092_normalizes_invite_receipts() {
 /// one-way stream id hashes away, and the column set each anti-echo hash covers.
 #[test]
 fn migration_093_adds_table_sync_projection_state() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 93, "move this pin with the next schema migration");
-
     // Absence is asserted against the PRE-V093 DDL in isolation, never against the full ladder
-    // (which now ends at V093 and would make the check vacuous).
+    // (which runs past V093 and would make the check vacuous).
     let bare = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply_table_sync_tables(&bare).unwrap();
     assert!(
@@ -1541,6 +1539,29 @@ fn migration_093_adds_table_sync_projection_state() {
         )
         .unwrap();
     assert_eq!(recorded, 1, "the forward migration records V093");
+}
+
+/// V094 (#976) adds receiver_type_hint_id to edges_data and updates the edges view.
+#[test]
+fn migration_094_receiver_type_hint_interning() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 94, "move this pin with the next schema migration");
+
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&bare, &crate::index::migration_hooks()).unwrap();
+    schema::apply_receiver_type_hint_interning(&bare).unwrap();
+    schema::apply_receiver_type_hint_interning(&bare).expect("replay is a no-op");
+    assert!(schema::column_exists(&bare, "edges_data", "receiver_type_hint_id").unwrap());
+
+    assert_eq!(schema::status(&bare).unwrap().current_version, 94);
+    let recorded: i64 = bare
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version
+              WHERE id = '094_receiver_type_hint_interning'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V094");
 }
 
 /// V091 (#949) tracks the live key-target count each invite reservation covers, so fold-time

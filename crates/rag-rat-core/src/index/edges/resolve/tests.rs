@@ -469,6 +469,7 @@ fn full_rebuild_uses_language_of_symbol_less_swift_files() {
         target_qualified_name: None,
         evidence: Some("parse()".to_string()),
         receiver_hint: None,
+        receiver_type_hint: None,
         source_span: EdgeSpan { start_line: 1, end_line: 1, start_byte: 0, end_byte: 7 },
         callee_span: None,
         import_scope: None,
@@ -666,6 +667,7 @@ fn swift_local_receivers_override_external_bare_name_suppression() {
                 edge_kind: EdgeKind::CallsName,
                 evidence: Some("make()"),
                 receiver_hint: Some(receiver),
+                receiver_type_hint: None,
                 source_file_id: 1,
                 source_language: Some(Language::Swift.as_str()),
                 imported_external: true,
@@ -1913,4 +1915,65 @@ fn scoped_resolve_repoints_staged_inedge_onto_moved_target() {
     let (to, _, resolution) = edge_state(&conn, edge);
     assert_eq!(to, Some(new_target), "the staged in-edge re-points onto the target's NEW id");
     assert_eq!(resolution, "qualified_suffix");
+}
+
+fn add_edge_full(
+    conn: &Connection,
+    source_file_id: i64,
+    to_name: &str,
+    target_qualified_name: Option<&str>,
+    receiver_hint: Option<&str>,
+    receiver_type_hint: Option<&str>,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, target_qualified_name, receiver_hint, \
+         receiver_type_hint, edge_kind, confidence, resolution) VALUES (?1, ?2, ?3, ?4, ?5, \
+         'calls_name', 'NameOnly', 'unresolved')",
+        params![source_file_id, to_name, target_qualified_name, receiver_hint, receiver_type_hint],
+    )
+    .unwrap();
+    conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
+}
+
+#[test]
+fn test_receiver_type_resolution() {
+    let conn = seeded_conn();
+    let file = add_file(&conn, "worker.rs", NEW);
+    let target_sym = add_symbol_scope(&conn, file, "run", "crate::Worker::run", "Worker::run");
+
+    let edge_id = add_edge_full(&conn, file, "run", None, Some("worker"), Some("Worker"));
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    stage_edge_rewrite_files(&conn, &[file]);
+    resolve_changed_edges(&conn).unwrap();
+
+    let (to, confidence, resolution) = edge_state(&conn, edge_id);
+    assert_eq!(to, Some(target_sym));
+    assert_eq!(confidence, "Syntactic");
+    assert_eq!(resolution, "receiver_type");
+}
+
+#[test]
+fn test_scope_degeneric_resolution() {
+    let conn = seeded_conn();
+    let file = add_file(&conn, "index.rs", NEW);
+    let target_sym = add_symbol_scope(
+        &conn,
+        file,
+        "build",
+        "crate::SymbolIndex<'a>::build",
+        "SymbolIndex<'a>::build",
+    );
+
+    let edge_id =
+        add_edge_full(&conn, file, "build", Some("SymbolIndex::build"), Some("SymbolIndex"), None);
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    stage_edge_rewrite_files(&conn, &[file]);
+    resolve_changed_edges(&conn).unwrap();
+
+    let (to, confidence, resolution) = edge_state(&conn, edge_id);
+    assert_eq!(to, Some(target_sym));
+    assert_eq!(confidence, "Syntactic");
+    assert_eq!(resolution, "scope_degeneric");
 }

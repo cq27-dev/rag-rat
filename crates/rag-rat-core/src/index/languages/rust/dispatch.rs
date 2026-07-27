@@ -647,6 +647,7 @@ pub(super) fn dispatch_fact(
         target_qualified_name: context.target_qualified_name,
         evidence,
         receiver_hint: context.receiver_hint,
+        receiver_type_hint: context.receiver_type_hint,
         source_span: span_for_node(node),
         callee_span: None,
         import_scope: None,
@@ -687,6 +688,7 @@ pub(super) fn rust_dispatch_handle_facts(
         let context = EdgeContext {
             target_qualified_name: target_qualified_name(*call, text),
             receiver_hint: scoped_receiver_name(*call, text),
+            ..Default::default()
         };
         for (key, variant_node) in &keys {
             // Anchor each fact at its OWN variant-pattern node (not the shared delegate call), so

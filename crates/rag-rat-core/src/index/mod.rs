@@ -345,7 +345,9 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // re-extract so the corrected `dispatch_handle` set reaches deployed indexes.
 // 11: #208 review round 11 — effect-only fallback records the direct call (no shadowing
 // misresolve); method calls on scoped receivers (`worker.run()`) are recorded again; re-extract.
-const GRAPH_INDEX_VERSION: &str = "11";
+// 12: #567 — conservative Rust receiver-type extraction + resolution (`receiver_type_hint_id` and
+// `scope_degeneric`).
+const GRAPH_INDEX_VERSION: &str = "12";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
 // on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —

@@ -588,6 +588,7 @@ fn swift_recovered_precedence_relations(
                 target_qualified_name: None,
                 evidence: Some(evidence.clone()),
                 receiver_hint: None,
+                receiver_type_hint: None,
                 source_span,
                 callee_span: Some(CalleeRange { start_byte, end_byte: start_byte + name_len }),
                 import_scope: None,
@@ -715,6 +716,7 @@ fn swift_edge_context(identifiers: &[String]) -> EdgeContext {
             .then(|| syntax::canonical_name(identifiers))
             .flatten(),
         receiver_hint: identifiers.first().filter(|_| identifiers.len() > 1).cloned(),
+        ..Default::default()
     }
 }
 

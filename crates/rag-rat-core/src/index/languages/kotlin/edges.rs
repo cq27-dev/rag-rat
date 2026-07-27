@@ -40,6 +40,7 @@ pub(in crate::index::languages) fn kotlin_edges(
                             .first_text()
                             .filter(|_| identifiers.len() > 1)
                             .map(ToOwned::to_owned),
+                        ..Default::default()
                     },
                     identifiers.last_node().map(CalleeRange::of_node),
                 ));
