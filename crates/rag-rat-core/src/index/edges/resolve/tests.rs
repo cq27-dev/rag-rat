@@ -1954,6 +1954,27 @@ fn test_receiver_type_resolution() {
 }
 
 #[test]
+fn test_receiver_type_resolution_declines_ambiguous_owners() {
+    let conn = seeded_conn();
+    let source = add_file(&conn, "caller.rs", NEW);
+    let first = add_file(&conn, "first.rs", NEW);
+    let second = add_file(&conn, "second.rs", NEW);
+    add_symbol_scope(&conn, first, "run", "first::Worker::run", "Worker::run");
+    add_symbol_scope(&conn, second, "run", "second::Worker::run", "Worker::run");
+
+    let edge_id = add_edge_full(&conn, source, "run", None, Some("worker"), Some("Worker"));
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    stage_edge_rewrite_files(&conn, &[source]);
+    resolve_changed_edges(&conn).unwrap();
+
+    let (to, confidence, resolution) = edge_state(&conn, edge_id);
+    assert_eq!(to, None, "two distinct Worker::run owners remain unresolved");
+    assert_eq!(confidence, "NameOnly");
+    assert_eq!(resolution, "unresolved");
+}
+
+#[test]
 fn test_scope_degeneric_resolution() {
     let conn = seeded_conn();
     let file = add_file(&conn, "index.rs", NEW);

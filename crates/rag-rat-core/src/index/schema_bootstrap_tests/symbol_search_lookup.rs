@@ -439,9 +439,28 @@ fn indexes_real_world_rust_graph_patterns() {
     assert_edge(&db, "Worker", "Service", "implements", "Syntactic");
     assert_edge(&db, "generic_call", "T", "references_type", "NameOnly");
     assert_edge(&db, "entry", "generated_call", "uses_macro", "NameOnly");
+    let (receiver_hint, receiver_type_hint, resolution): (Option<String>, Option<String>, String) =
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT e.receiver_hint, e.receiver_type_hint, e.resolution
+                 FROM edges e
+                 WHERE COALESCE(e.from_name, '') LIKE '%drive%'
+                   AND e.to_name = 'serve' AND e.edge_kind = 'calls_name'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(receiver_hint.as_deref(), Some("worker"));
+    assert_eq!(receiver_type_hint.as_deref(), Some("Worker"));
+    assert_eq!(resolution, "receiver_type");
     let syntactic_callers = db.find_callers("serve", 10).unwrap();
     assert!(
-        !syntactic_callers.is_empty(),
+        syntactic_callers.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("drive"))
+                && edge.confidence == "syntactic"
+                && edge.verified_target_symbol
+        }),
         "syntactic serve callers now resolved via receiver type hint: {syntactic_callers:?}"
     );
     let callers = db

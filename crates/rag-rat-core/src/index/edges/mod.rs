@@ -574,25 +574,25 @@ pub(crate) fn degeneric_path(path: &str) -> String {
 /// input `symbols` order, so first-match semantics are preserved exactly.
 pub(crate) struct SymbolIndex<'a> {
     /// Exact `qualified_name` match.
-    pub(crate) by_qualified: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    by_qualified: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
     /// Exact `scope_path` match (semantic scope, e.g. `Workspace::new`). Tried before bare-name
     /// fallback: it aligns with an edge's source-derived `target_qualified_name`, so the strong
     /// qualified path fires for methods/nested items instead of collapsing to bare-name
     /// collisions.
-    pub(crate) by_scope_path: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    by_scope_path: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
     /// Scope path with generics stripped, e.g. `SymbolIndex::build` matching
     /// `SymbolIndex<'a>::build`.
-    pub(crate) by_degeneric_scope_path: HashMap<String, Vec<&'a IndexedSymbol>>,
+    by_degeneric_scope_path: HashMap<String, Vec<&'a IndexedSymbol>>,
     /// Short-name fallback (`symbol.name`).
-    pub(crate) by_name: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    by_name: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
     /// Candidates for the `qualified_name.ends_with("::{q}")` suffix match, keyed by the last
     /// `::`-segment of the qualified name (a name ending in `::{q}` necessarily shares `q`'s
     /// tail).
-    pub(crate) by_qn_tail: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    by_qn_tail: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
 }
 
 impl<'a> SymbolIndex<'a> {
-    pub(crate) fn build(symbols: &'a [IndexedSymbol]) -> Self {
+    fn build(symbols: &'a [IndexedSymbol]) -> Self {
         let mut by_qualified: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_scope_path: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_degeneric_scope_path: HashMap<String, Vec<&IndexedSymbol>> = HashMap::new();

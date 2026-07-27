@@ -1047,8 +1047,8 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                 id, source_file_id, from_symbol_id, to_symbol_id, from_name_id, to_name_id,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 target_start_line, target_end_line, target_qualified_name_id, evidence,
-                receiver_hint_id, receiver_type_hint_id, resolution_id, callee_start_byte, \
-         callee_end_byte,
+                receiver_hint_id, receiver_type_hint_id, resolution_id,
+                callee_start_byte, callee_end_byte,
                 import_scope_start_byte, import_scope_end_byte, import_mod_id,
                 edge_kind_id, confidence_id, hidden
             )
@@ -1101,8 +1101,8 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                     (SELECT id FROM name_strings WHERE value = NEW.target_qualified_name),
                 evidence = NEW.evidence,
                 receiver_hint_id = (SELECT id FROM name_strings WHERE value = NEW.receiver_hint),
-                receiver_type_hint_id = (SELECT id FROM name_strings WHERE value = \
-         NEW.receiver_type_hint),
+                receiver_type_hint_id =
+                    (SELECT id FROM name_strings WHERE value = NEW.receiver_type_hint),
                 resolution_id = (SELECT id FROM name_strings WHERE value = NEW.resolution),
                 callee_start_byte = NEW.callee_start_byte,
                 callee_end_byte = NEW.callee_end_byte,

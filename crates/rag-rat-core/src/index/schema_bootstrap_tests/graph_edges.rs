@@ -301,3 +301,61 @@ fn scoped_incremental_pass_preserves_find_callers_both_directions() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn incremental_pass_refreshes_receiver_type_and_target() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let alpha_source = "struct Alpha;\nstruct Beta;\nimpl Alpha { fn run(&self) {} }\nimpl Beta { \
+                        fn run(&self) {} }\nfn call(receiver: Alpha) { receiver.run(); }\n";
+    fs::write(root.join("src/lib.rs"), alpha_source).unwrap();
+    init_git_repo(&root);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "seed"]);
+    let config = source_config(root.clone(), Language::Rust);
+
+    let edge_state = |db: &IndexDatabase| -> (String, String, String, String) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT e.receiver_type_hint, e.confidence, e.resolution, s.scope_path
+                 FROM edges e
+                 JOIN files f ON f.id = e.source_file_id
+                 JOIN symbols s ON s.id = e.to_symbol_id
+                 WHERE COALESCE(e.from_name, '') LIKE '%call%' AND e.to_name = 'run'
+                   AND e.edge_kind = 'calls_name'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    };
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(
+        edge_state(&db),
+        (
+            "Alpha".to_string(),
+            "Syntactic".to_string(),
+            "receiver_type".to_string(),
+            "Alpha::run".to_string(),
+        )
+    );
+    drop(db);
+
+    let beta_source =
+        format!("// changed\n{}", alpha_source.replace("receiver: Alpha", "receiver: Beta"));
+    fs::write(root.join("src/lib.rs"), beta_source).unwrap();
+    let db = IndexDatabase::index_paths(&config, &[root.join("src/lib.rs")]).unwrap();
+    assert_eq!(
+        edge_state(&db),
+        (
+            "Beta".to_string(),
+            "Syntactic".to_string(),
+            "receiver_type".to_string(),
+            "Beta::run".to_string(),
+        )
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

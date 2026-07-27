@@ -250,12 +250,16 @@ pub(super) fn rust_impl_edges(
 
 pub(crate) fn infer_rust_receiver_type_hint(node: Node<'_>, text: &str) -> Option<String> {
     let function = node.child_by_field_name("function")?;
-    if function.kind() != "field_expression" {
-        return None;
-    }
-    let value_node = function.child_by_field_name("value")?;
-    let raw_recv = node_text(value_node, text);
-    let recv = clean_receiver_expr(&raw_recv)?;
+    let receiver = match function.kind() {
+        "field_expression" => {
+            let value_node = function.child_by_field_name("value")?;
+            let raw_receiver = node_text(value_node, text);
+            clean_receiver_expr(&raw_receiver)?.to_string()
+        },
+        "scoped_identifier" => scoped_receiver_name(node, text)?,
+        _ => return None,
+    };
+    let recv = receiver.as_str();
 
     if recv == "self" || recv == "Self" {
         return infer_self_type_hint(node, text);
@@ -303,11 +307,11 @@ fn is_simple_identifier(s: &str) -> bool {
 fn infer_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
     let mut current = node.parent();
     while let Some(ancestor) = current {
-        if ancestor.kind() == "impl_item" {
-            if let Some(type_node) = ancestor.child_by_field_name("type") {
-                let type_text = node_text(type_node, text);
-                return clean_rust_type_name(&type_text, &[]);
-            }
+        if ancestor.kind() == "impl_item"
+            && let Some(type_node) = ancestor.child_by_field_name("type")
+        {
+            let type_text = node_text(type_node, text);
+            return clean_rust_type_name(&type_text, &[]);
         }
         current = ancestor.parent();
     }
@@ -317,6 +321,9 @@ fn infer_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
 fn clean_rust_type_name(raw: &str, fn_generics: &[&str]) -> Option<String> {
     let s = raw.trim();
     let cleaned = clean_receiver_expr(s).unwrap_or(s);
+    if cleaned.starts_with('<') || cleaned.contains(" as ") {
+        return None;
+    }
     let without_generics = degeneric_path(cleaned);
     let type_str = without_generics.trim();
     if type_str.is_empty() {
@@ -359,75 +366,163 @@ fn clean_rust_type_name(raw: &str, fn_generics: &[&str]) -> Option<String> {
 fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Option<String> {
     let call_start = call_node.start_byte();
     let mut current = call_node.parent();
-    let mut scope_node = None;
+    let mut function_node = None;
     while let Some(ancestor) = current {
-        if matches!(ancestor.kind(), "function_item" | "closure_expression") {
-            scope_node = Some(ancestor);
+        if ancestor.kind() == "closure_expression" {
+            return None;
+        }
+        if ancestor.kind() == "function_item" {
+            function_node = Some(ancestor);
             break;
         }
         current = ancestor.parent();
     }
-    let scope_node = scope_node?;
+    let function_node = function_node?;
 
     let mut fn_generics = Vec::new();
-    if scope_node.kind() == "function_item" {
-        if let Some(type_params) = scope_node.child_by_field_name("type_parameters") {
-            let mut cursor = type_params.walk();
-            for child in type_params.named_children(&mut cursor) {
-                if child.kind() == "type_parameter" || child.kind() == "constrained_type_parameter"
-                {
-                    if let Some(name) = child_name_text(child, text) {
-                        fn_generics.push(name);
-                    }
-                }
+    if let Some(type_params) = function_node.child_by_field_name("type_parameters") {
+        let mut cursor = type_params.walk();
+        for child in type_params.named_children(&mut cursor) {
+            if (child.kind() == "type_parameter" || child.kind() == "constrained_type_parameter")
+                && let Some(name) = child_name_text(child, text)
+            {
+                fn_generics.push(name);
             }
         }
     }
+    let fn_generic_refs = fn_generics.iter().map(String::as_str).collect::<Vec<_>>();
 
-    let mut candidate_type: Option<String> = None;
-    let mut binding_start_byte: usize = 0;
-
-    if scope_node.kind() == "function_item" {
-        if let Some(params_node) = scope_node.child_by_field_name("parameters") {
-            let mut cursor = params_node.walk();
-            for param in params_node.named_children(&mut cursor) {
-                if param.kind() == "parameter" {
-                    let pattern = param.child_by_field_name("pattern").or_else(|| param.child(0));
-                    if let Some(pattern_node) = pattern {
-                        if match_simple_pattern(pattern_node, text, recv) {
-                            if let Some(type_node) = param.child_by_field_name("type") {
-                                let type_text = node_text(type_node, text);
-                                let fn_gen_refs =
-                                    fn_generics.iter().map(|s| s.as_str()).collect::<Vec<_>>();
-                                if let Some(ct) = clean_rust_type_name(&type_text, &fn_gen_refs) {
-                                    candidate_type = Some(ct);
-                                    binding_start_byte = param.start_byte();
-                                }
-                            }
-                        }
+    let mut child_on_path = call_node;
+    let mut ancestor = call_node.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "block" {
+            match visible_let_binding(
+                node,
+                child_on_path.start_byte(),
+                recv,
+                text,
+                &fn_generic_refs,
+            ) {
+                VisibleBinding::Typed(type_name, binding_start) => {
+                    if is_reassigned(function_node, binding_start, call_start, recv, text) {
+                        return None;
                     }
-                }
+                    return canonical_receiver_type(type_name, call_node, text);
+                },
+                VisibleBinding::Shadowed => return None,
+                VisibleBinding::Missing => {},
             }
+        }
+        if node == function_node {
+            break;
+        }
+        child_on_path = node;
+        ancestor = node.parent();
+    }
+
+    if let Some(params_node) = function_node.child_by_field_name("parameters") {
+        let mut cursor = params_node.walk();
+        for param in params_node.named_children(&mut cursor) {
+            if param.kind() != "parameter" {
+                continue;
+            }
+            let Some(pattern) = param.child_by_field_name("pattern").or_else(|| param.child(0))
+            else {
+                continue;
+            };
+            if !pattern_binds_name(pattern, text, recv) {
+                continue;
+            }
+            if !match_simple_pattern(pattern, text, recv) {
+                return None;
+            }
+            let type_name = param.child_by_field_name("type").and_then(|type_node| {
+                clean_rust_type_name(&node_text(type_node, text), &fn_generic_refs)
+            })?;
+            if is_reassigned(function_node, param.start_byte(), call_start, recv, text) {
+                return None;
+            }
+            return canonical_receiver_type(type_name, call_node, text);
         }
     }
 
-    find_let_bindings(
-        scope_node,
-        call_start,
-        recv,
-        text,
-        &fn_generics,
-        &mut candidate_type,
-        &mut binding_start_byte,
-    );
+    None
+}
 
-    let candidate_type = candidate_type?;
+fn canonical_receiver_type(type_name: String, call_node: Node<'_>, text: &str) -> Option<String> {
+    if type_name == "Self" { infer_self_type_hint(call_node, text) } else { Some(type_name) }
+}
 
-    if is_reassigned(scope_node, binding_start_byte, call_start, recv, text) {
+#[derive(Debug, PartialEq, Eq)]
+enum VisibleBinding {
+    Typed(String, usize),
+    Shadowed,
+    Missing,
+}
+
+fn visible_let_binding(
+    block: Node<'_>,
+    before_byte: usize,
+    recv: &str,
+    text: &str,
+    fn_generics: &[&str],
+) -> VisibleBinding {
+    let mut cursor = block.walk();
+    let children = block
+        .named_children(&mut cursor)
+        .filter(|child| child.end_byte() <= before_byte)
+        .collect::<Vec<_>>();
+    for child in children.into_iter().rev() {
+        if child.kind() != "let_declaration" {
+            continue;
+        }
+        let Some(pattern) = child.child_by_field_name("pattern") else {
+            continue;
+        };
+        if !pattern_binds_name(pattern, text, recv) {
+            continue;
+        }
+        if !match_simple_pattern(pattern, text, recv) {
+            return VisibleBinding::Shadowed;
+        }
+        let type_name = if let Some(type_node) = child.child_by_field_name("type") {
+            clean_rust_type_name(&node_text(type_node, text), fn_generics)
+        } else {
+            constructor_owner(child.child_by_field_name("value"), text, fn_generics)
+        };
+        return type_name
+            .map(|type_name| VisibleBinding::Typed(type_name, child.start_byte()))
+            .unwrap_or(VisibleBinding::Shadowed);
+    }
+    VisibleBinding::Missing
+}
+
+fn constructor_owner(value: Option<Node<'_>>, text: &str, fn_generics: &[&str]) -> Option<String> {
+    let value = value?;
+    if value.kind() != "call_expression" {
         return None;
     }
+    let function = value.child_by_field_name("function")?;
+    if function.kind() != "scoped_identifier" {
+        return None;
+    }
+    let function_text = node_text(function, text);
+    let (type_part, method_part) = function_text.rsplit_once("::")?;
+    let method_name = method_part.trim();
+    if !matches!(method_name, "new" | "default" | "from") && !method_name.starts_with("with_") {
+        return None;
+    }
+    clean_rust_type_name(type_part, fn_generics)
+}
 
-    Some(candidate_type)
+fn pattern_binds_name(pattern: Node<'_>, text: &str, recv: &str) -> bool {
+    rag_rat_base::stack::grow_stack(|| {
+        if pattern.kind() == "identifier" && node_text(pattern, text).trim() == recv {
+            return true;
+        }
+        let mut cursor = pattern.walk();
+        pattern.named_children(&mut cursor).any(|child| pattern_binds_name(child, text, recv))
+    })
 }
 
 fn match_simple_pattern(pattern_node: Node<'_>, text: &str, recv: &str) -> bool {
@@ -435,86 +530,6 @@ fn match_simple_pattern(pattern_node: Node<'_>, text: &str, recv: &str) -> bool 
     let cleaned = p_text.trim();
     let name = cleaned.strip_prefix("mut ").unwrap_or(cleaned).trim();
     name == recv && is_simple_identifier(name)
-}
-
-fn find_let_bindings(
-    node: Node<'_>,
-    call_start: usize,
-    recv: &str,
-    text: &str,
-    fn_generics: &[String],
-    candidate_type: &mut Option<String>,
-    binding_start_byte: &mut usize,
-) {
-    if node.start_byte() >= call_start {
-        return;
-    }
-    if node.kind() == "let_declaration" {
-        if let Some(pattern_node) = node.child_by_field_name("pattern") {
-            if match_simple_pattern(pattern_node, text, recv) {
-                let fn_gen_refs = fn_generics.iter().map(|s| s.as_str()).collect::<Vec<_>>();
-                if let Some(type_node) = node.child_by_field_name("type") {
-                    let type_text = node_text(type_node, text);
-                    if let Some(ct) = clean_rust_type_name(&type_text, &fn_gen_refs) {
-                        *candidate_type = Some(ct);
-                        *binding_start_byte = node.start_byte();
-                    } else {
-                        *candidate_type = None;
-                        *binding_start_byte = node.start_byte();
-                    }
-                } else if let Some(val_node) = node.child_by_field_name("value") {
-                    if val_node.kind() == "call_expression" {
-                        if let Some(fn_node) = val_node.child_by_field_name("function") {
-                            if fn_node.kind() == "scoped_identifier" {
-                                let fn_text = node_text(fn_node, text);
-                                if let Some((type_part, method_part)) = fn_text.rsplit_once("::") {
-                                    let method_name = method_part.trim();
-                                    if method_name == "new"
-                                        || method_name == "default"
-                                        || method_name == "from"
-                                        || method_name.starts_with("with_")
-                                    {
-                                        if let Some(ct) =
-                                            clean_rust_type_name(type_part, &fn_gen_refs)
-                                        {
-                                            *candidate_type = Some(ct);
-                                            *binding_start_byte = node.start_byte();
-                                        } else {
-                                            *candidate_type = None;
-                                            *binding_start_byte = node.start_byte();
-                                        }
-                                    } else {
-                                        *candidate_type = None;
-                                        *binding_start_byte = node.start_byte();
-                                    }
-                                }
-                            } else {
-                                *candidate_type = None;
-                                *binding_start_byte = node.start_byte();
-                            }
-                        }
-                    } else {
-                        *candidate_type = None;
-                        *binding_start_byte = node.start_byte();
-                    }
-                }
-            }
-        }
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() < call_start {
-            find_let_bindings(
-                child,
-                call_start,
-                recv,
-                text,
-                fn_generics,
-                candidate_type,
-                binding_start_byte,
-            );
-        }
-    }
 }
 
 fn is_reassigned(
@@ -537,11 +552,14 @@ fn check_assignment(
     text: &str,
     found: &mut bool,
 ) {
-    if *found || node.start_byte() >= call_start {
-        return;
-    }
-    if node.start_byte() > binding_start && node.kind() == "assignment_expression" {
-        if let Some(left) = node.child_by_field_name("left") {
+    rag_rat_base::stack::grow_stack(|| {
+        if *found || node.start_byte() >= call_start {
+            return;
+        }
+        if node.start_byte() > binding_start
+            && node.kind() == "assignment_expression"
+            && let Some(left) = node.child_by_field_name("left")
+        {
             let left_text = node_text(left, text);
             let cleaned = left_text.trim();
             let name = cleaned.strip_prefix('*').unwrap_or(cleaned).trim();
@@ -550,13 +568,13 @@ fn check_assignment(
                 return;
             }
         }
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() < call_start {
-            check_assignment(child, binding_start, call_start, recv, text, found);
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.start_byte() < call_start {
+                check_assignment(child, binding_start, call_start, recv, text, found);
+            }
         }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -593,6 +611,19 @@ mod receiver_type_hint_tests {
             impl Worker {
                 fn run(&self) {
                     self.execute();
+                }
+            }
+        "#;
+        let hints = extract_call_hints(code);
+        assert_eq!(hints, vec![Some("Worker".to_string())]);
+    }
+
+    #[test]
+    fn test_associated_self_in_impl() {
+        let code = r#"
+            impl Worker {
+                fn run() {
+                    Self::execute();
                 }
             }
         "#;
@@ -647,5 +678,70 @@ mod receiver_type_hint_tests {
         "#;
         let hints = extract_call_hints(code);
         assert_eq!(hints, vec![None, None, None]);
+    }
+
+    #[test]
+    fn test_closed_inner_scope_does_not_shadow_parameter() {
+        let code = r#"
+            fn test(worker: &Alpha) {
+                {
+                    let worker: Beta;
+                }
+                worker.run();
+            }
+        "#;
+        let hints = extract_call_hints(code);
+        assert_eq!(hints, vec![Some("Alpha".to_string())]);
+    }
+
+    #[test]
+    fn test_unknown_same_scope_shadow_declined() {
+        let code = r#"
+            fn test(worker: &Alpha) {
+                let worker = unknown;
+                worker.run();
+            }
+        "#;
+        let hints = extract_call_hints(code);
+        assert_eq!(hints, vec![None]);
+    }
+
+    #[test]
+    fn test_destructuring_shadow_declined() {
+        let code = r#"
+            fn test(worker: &Alpha) {
+                let (worker, _rest): (Beta, u8) = pair;
+                worker.run();
+            }
+        "#;
+        let hints = extract_call_hints(code);
+        assert_eq!(hints, vec![None]);
+    }
+
+    #[test]
+    fn test_closure_receiver_declined() {
+        let code = r#"
+            fn test(worker: &Worker) {
+                let _closure = || worker.run();
+            }
+        "#;
+        let hints = extract_call_hints(code);
+        assert_eq!(hints, vec![None]);
+    }
+
+    #[test]
+    fn test_generic_and_trait_object_receivers_declined() {
+        let generic = r#"
+            fn test<T>(worker: T) {
+                worker.run();
+            }
+        "#;
+        let trait_object = r#"
+            fn test(worker: &dyn Service) {
+                worker.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(generic), vec![None]);
+        assert_eq!(extract_call_hints(trait_object), vec![None]);
     }
 }
