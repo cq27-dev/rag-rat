@@ -551,6 +551,7 @@ fn identical_content_in_two_repos_yields_distinct_logical_symbols() {
         path: "src/lib.rs".to_string(),
         name: "parse".to_string(),
         qualified_name: "lib::parse".to_string(),
+        scope_path: "parse".to_string(),
         kind: "function".to_string(),
         signature: Some("fn parse()".to_string()),
     };

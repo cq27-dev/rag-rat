@@ -12,6 +12,7 @@ pub(super) struct LogicalSymbolKey {
     pub(super) path: String,
     pub(super) name: String,
     pub(super) qualified_name: String,
+    pub(super) scope_path: String,
     pub(super) kind: String,
     // Signature is part of the identity so that two distinct same-named symbols in one file (e.g.
     // `new` on two different impls — same `qualified_name`, different signatures) do NOT collapse
@@ -26,6 +27,7 @@ impl LogicalSymbolKey {
             path: row.path.clone(),
             name: row.name.clone(),
             qualified_name: row.qualified_name.clone(),
+            scope_path: row.scope_path.clone(),
             kind: row.kind.clone(),
             signature: row.signature.clone(),
         }
@@ -46,12 +48,13 @@ impl LogicalSymbolKey {
     /// primary-key error on rebuild rather than silent merging.
     pub(super) fn stable_id(&self, repo_id: &str) -> i64 {
         let canonical = format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
             repo_id,
             self.language,
             self.path,
             self.name,
             self.qualified_name,
+            self.scope_path,
             self.kind,
             self.signature.as_deref().unwrap_or(""),
         );
@@ -95,18 +98,28 @@ pub(crate) fn realign_logical_symbol_ids(conn: &rusqlite::Connection) -> rusqlit
         path: String,
         name: String,
         qualified_name: Option<String>,
+        scope_path: Option<String>,
         kind: String,
         signature: Option<String>,
     }
-    let mut stmt = conn.prepare(
+    let has_scope_path = conn.prepare("SELECT scope_path FROM symbols LIMIT 0").is_ok();
+    let scope_path_subquery = if has_scope_path {
+        "(SELECT COALESCE(s.scope_path, '') FROM logical_symbol_members m \
+           JOIN symbols s ON s.id = m.symbol_id \
+          WHERE m.logical_symbol_id = ls.id LIMIT 1)"
+    } else {
+        "''"
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT ls.id, ls.repo_id, ls.language, ls.path, ls.logical_name,
                 (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
                 ls.kind,
                 (SELECT s.signature FROM logical_symbol_members m
                    JOIN symbols s ON s.id = m.symbol_id
-                  WHERE m.logical_symbol_id = ls.id LIMIT 1)
+                  WHERE m.logical_symbol_id = ls.id LIMIT 1),
+                {scope_path_subquery}
          FROM logical_symbols ls",
-    )?;
+    ))?;
     let rows = stmt
         .query_map([], |r| {
             Ok(Row {
@@ -118,6 +131,7 @@ pub(crate) fn realign_logical_symbol_ids(conn: &rusqlite::Connection) -> rusqlit
                 qualified_name: r.get(5)?,
                 kind: r.get(6)?,
                 signature: r.get(7)?,
+                scope_path: r.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -134,6 +148,7 @@ pub(crate) fn realign_logical_symbol_ids(conn: &rusqlite::Connection) -> rusqlit
             path: row.path,
             name: row.name,
             qualified_name,
+            scope_path: row.scope_path.unwrap_or_default(),
             kind: row.kind,
             signature: row.signature,
         };
@@ -383,6 +398,7 @@ pub(super) struct LogicalKeyDriftRow {
     path: String,
     name: String,
     qualified_name: Option<String>,
+    scope_path: Option<String>,
     kind: String,
     pub(super) signature: Option<String>,
 }
@@ -396,6 +412,7 @@ impl LogicalKeyDriftRow {
             path: self.path.clone(),
             name: self.name.clone(),
             qualified_name: self.qualified_name.clone(),
+            scope_path: self.scope_path.clone(),
             kind: self.kind.clone(),
             signature: self.signature.clone(),
         }
@@ -410,6 +427,7 @@ struct DriftKey {
     path: String,
     name: String,
     qualified_name: Option<String>,
+    scope_path: Option<String>,
     kind: String,
     signature: Option<String>,
 }
@@ -497,7 +515,7 @@ impl LogicalGroupingUpkeep {
     }
 }
 
-/// The six logical-key columns of one symbol row in the scope being rewritten — exactly the
+/// The seven logical-key columns of one symbol row in the scope being rewritten — exactly the
 /// identity [`IndexDatabase::rebuild_logical_symbols`] groups by. `Ord` so the multiset
 /// comparison is a `BTreeMap` walk; `Option` fields compare `None`-first, and `None` never
 /// equals `Some` (an absent qualified name or signature is no wildcard).
@@ -507,6 +525,7 @@ pub(super) struct ReplacedSymbolKey {
     path: String,
     name: String,
     qualified_name: Option<String>,
+    scope_path: Option<String>,
     kind: String,
     signature: Option<String>,
 }
@@ -528,6 +547,7 @@ struct LogicalKeyDriftCandidate {
     id: i64,
     kind: String,
     qualified_name: Option<String>,
+    scope_path: Option<String>,
     signature: Option<String>,
 }
 
@@ -620,6 +640,7 @@ pub(super) struct LogicalSymbolMemberRow {
     pub(super) language: String,
     pub(super) name: String,
     pub(super) qualified_name: String,
+    pub(super) scope_path: String,
     pub(super) kind: String,
     pub(super) signature: Option<String>,
     pub(super) start_line: i64,
@@ -764,14 +785,15 @@ impl IndexDatabase {
         let mut stmt = conn.prepare(&format!(
             "
             SELECT symbols.id, main.files.path, symbols.language, symbols.name,
-                   qn.value, symbols.kind, symbols.signature, symbols.start_line,
-                   symbols.end_line, symbols.file_id
+                   qn.value, COALESCE(symbols.scope_path, ''), symbols.kind, symbols.signature,
+                   symbols.start_line, symbols.end_line, symbols.file_id
             FROM main.symbols AS symbols
             JOIN main.files ON main.files.id = symbols.file_id
             LEFT JOIN main.name_strings qn ON qn.id = symbols.qualified_name_id
             WHERE main.files.repo_id = ?1 AND main.files.generation = ?2{extra_where}
             ORDER BY symbols.language, main.files.path, symbols.name, qn.value,
-                     symbols.kind, symbols.signature, symbols.start_byte, symbols.end_byte
+                     COALESCE(symbols.scope_path, ''), symbols.kind, symbols.signature,
+                     symbols.start_byte, symbols.end_byte
             "
         ))?;
         let mut rows = stmt.query(params![self.active_repo_id, self.active_generation])?;
@@ -783,11 +805,12 @@ impl IndexDatabase {
                 language: row.get(2)?,
                 name: row.get(3)?,
                 qualified_name: row.get(4)?,
-                kind: row.get(5)?,
-                signature: row.get(6)?,
-                start_line: row.get(7)?,
-                end_line: row.get(8)?,
-                file_id: row.get(9)?,
+                scope_path: row.get(5)?,
+                kind: row.get(6)?,
+                signature: row.get(7)?,
+                start_line: row.get(8)?,
+                end_line: row.get(9)?,
+                file_id: row.get(10)?,
             };
             // Compare the member's key fields against the current group WITHOUT allocating a key
             // per row (only per group, on a boundary).
@@ -796,6 +819,7 @@ impl IndexDatabase {
                     && key.path == member.path
                     && key.name == member.name
                     && key.qualified_name == member.qualified_name
+                    && key.scope_path == member.scope_path
                     && key.kind == member.kind
                     && key.signature == member.signature
             });
@@ -894,8 +918,8 @@ impl IndexDatabase {
         // narrowed to the one scope row being replaced.
         let mut stmt = conn.prepare_cached(
             "
-            SELECT s.language, f.path, s.name, qn.value, s.kind, s.signature,
-                   m.logical_symbol_id
+            SELECT s.language, f.path, s.name, qn.value, COALESCE(s.scope_path, ''), s.kind,
+                   s.signature, m.logical_symbol_id
             FROM main.symbols s
             JOIN main.files f ON f.id = s.file_id
             LEFT JOIN main.name_strings qn ON qn.id = s.qualified_name_id
@@ -918,10 +942,11 @@ impl IndexDatabase {
                 path: row.get(1)?,
                 name: row.get(2)?,
                 qualified_name: row.get(3)?,
-                kind: row.get(4)?,
-                signature: row.get(5)?,
+                scope_path: row.get(4)?,
+                kind: row.get(5)?,
+                signature: row.get(6)?,
             };
-            let Some(logical_symbol_id) = row.get::<_, Option<i64>>(6)? else {
+            let Some(logical_symbol_id) = row.get::<_, Option<i64>>(7)? else {
                 return Ok(None); // ungrouped symbol — the grouping cannot vouch for this file
             };
             match claims.entry(key) {
@@ -964,8 +989,8 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         let mut stmt = conn.prepare_cached(
             "
-            SELECT s.language, f.path, s.name, qn.value, s.kind, s.signature,
-                   s.id, s.start_line, s.end_line
+            SELECT s.language, f.path, s.name, qn.value, COALESCE(s.scope_path, ''), s.kind,
+                   s.signature, s.id, s.start_line, s.end_line
             FROM main.symbols s
             JOIN main.files f ON f.id = s.file_id
             LEFT JOIN main.name_strings qn ON qn.id = s.qualified_name_id
@@ -987,13 +1012,14 @@ impl IndexDatabase {
                 path: row.get(1)?,
                 name: row.get(2)?,
                 qualified_name: row.get(3)?,
-                kind: row.get(4)?,
-                signature: row.get(5)?,
+                scope_path: row.get(4)?,
+                kind: row.get(5)?,
+                signature: row.get(6)?,
             };
             inserted.entry(key).or_default().push(ReplacementSymbolSpan {
-                symbol_id: row.get(6)?,
-                start_line: row.get(7)?,
-                end_line: row.get(8)?,
+                symbol_id: row.get(7)?,
+                start_line: row.get(8)?,
+                end_line: row.get(9)?,
             });
         }
         // Every inserted key must exist in the replaced set with the SAME member count, and the
@@ -1136,6 +1162,9 @@ impl IndexDatabase {
             "
             SELECT ls.id, ls.path, ls.logical_name,
                    (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
+                   (SELECT COALESCE(s.scope_path, '') FROM logical_symbol_members m
+                      JOIN symbols s ON s.id = m.symbol_id
+                     WHERE m.logical_symbol_id = ls.id LIMIT 1),
                    ls.kind,
                    {UNANIMOUS_MEMBER_SIGNATURE_SQL}
             FROM main.logical_symbols ls
@@ -1151,8 +1180,9 @@ impl IndexDatabase {
                     path: row.get(1)?,
                     name: row.get(2)?,
                     qualified_name: row.get(3)?,
-                    kind: row.get(4)?,
-                    signature: row.get(5)?,
+                    scope_path: row.get(4)?,
+                    kind: row.get(5)?,
+                    signature: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1216,6 +1246,9 @@ impl IndexDatabase {
                         "
                         SELECT ls.path, ls.logical_name,
                                (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
+                               (SELECT COALESCE(s.scope_path, '') FROM logical_symbol_members m
+                                  JOIN symbols s ON s.id = m.symbol_id
+                                 WHERE m.logical_symbol_id = ls.id LIMIT 1),
                                ls.kind,
                                {UNANIMOUS_MEMBER_SIGNATURE_SQL}
                         FROM main.logical_symbols ls
@@ -1228,8 +1261,9 @@ impl IndexDatabase {
                             path: row.get(0)?,
                             name: row.get(1)?,
                             qualified_name: row.get(2)?,
-                            kind: row.get(3)?,
-                            signature: row.get(4)?,
+                            scope_path: row.get(3)?,
+                            kind: row.get(4)?,
+                            signature: row.get(5)?,
                         })
                     },
                 )
@@ -1411,6 +1445,9 @@ impl IndexDatabase {
             "
             SELECT ls.id, ls.kind,
                    (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
+                   (SELECT COALESCE(s.scope_path, '') FROM logical_symbol_members m
+                      JOIN symbols s ON s.id = m.symbol_id
+                     WHERE m.logical_symbol_id = ls.id LIMIT 1),
                    {UNANIMOUS_MEMBER_SIGNATURE_SQL}
             FROM main.logical_symbols ls
             WHERE ls.repo_id = ?1 AND ls.path = ?2 AND ls.logical_name = ?3
@@ -1422,7 +1459,8 @@ impl IndexDatabase {
                     id: row.get(0)?,
                     kind: row.get(1)?,
                     qualified_name: row.get(2)?,
-                    signature: row.get(3)?,
+                    scope_path: row.get(3)?,
+                    signature: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1430,6 +1468,7 @@ impl IndexDatabase {
             .into_iter()
             .filter(|candidate| {
                 drift_evidence_agrees(&old.qualified_name, &candidate.qualified_name)
+                    || drift_evidence_agrees(&old.scope_path, &candidate.scope_path)
                     || drift_evidence_agrees(&old.signature, &candidate.signature)
             })
             .collect())

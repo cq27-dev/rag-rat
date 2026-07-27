@@ -367,7 +367,8 @@ const GENERATED_FLAGS_VERSION_KEY: &str = "generated_flags_version";
 // validate at a time. Per-repo (`repo_meta`, like `graph_index_version`): a shared DB holds repos
 // rebuilt by different binaries.
 // 1: initial version (#493).
-const LOGICAL_KEY_VERSION: &str = "1";
+// 2: canonical scope_path included in LogicalSymbolKey derivation (#776).
+const LOGICAL_KEY_VERSION: &str = "2";
 const LOGICAL_KEY_VERSION_KEY: &str = "logical_key_version";
 
 #[derive(Debug, Error)]

@@ -80,6 +80,9 @@ impl ParserBackend for Rust {
 }
 
 fn impl_name(node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(target_type) = node.child_by_field_name("type") {
+        return Some(target_type);
+    }
     let mut cursor = node.walk();
     node.named_children(&mut cursor).find(|child| {
         matches!(child.kind(), "type_identifier" | "generic_type" | "scoped_type_identifier")

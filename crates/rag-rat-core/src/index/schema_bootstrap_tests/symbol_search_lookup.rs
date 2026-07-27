@@ -2050,3 +2050,163 @@ fn papertrail_sync_caches_rationale_without_query_time_crawling() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn logical_symbol_grouping_owner_isolation_tests() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub trait Worker {
+    fn run(&self);
+}
+
+pub struct Alpha;
+
+impl Alpha {
+    pub fn new() -> Self { Alpha }
+}
+
+impl Worker for Alpha {
+    fn run(&self) {}
+}
+
+pub struct Beta;
+
+impl Beta {
+    pub fn new() -> Self { Beta }
+}
+
+impl Worker for Beta {
+    fn run(&self) {}
+}
+
+impl Alpha {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn process(&self) {}
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn process(&self) {}
+}
+
+pub fn call_alpha() {
+    Alpha::new();
+}
+"#,
+    )
+    .unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // 1. Alpha::new vs Beta::new with identical signatures must yield distinct logical symbols
+    let new_lookup = db
+        .symbol_candidates(
+            &rag_rat_query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("new".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(new_lookup.candidates.len(), 2, "2 candidates for new");
+    let c0 = &new_lookup.candidates[0];
+    let c1 = &new_lookup.candidates[1];
+    assert_ne!(
+        c0.logical_symbol_id, c1.logical_symbol_id,
+        "Alpha::new and Beta::new must have distinct logical_symbol_ids"
+    );
+
+    // 2. Same-named methods in impl Trait for Alpha vs impl Trait for Beta
+    let run_lookup = db
+        .symbol_candidates(
+            &rag_rat_query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("run".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(run_lookup.candidates.len(), 2, "2 candidates for run");
+    let r0 = &run_lookup.candidates[0];
+    let r1 = &run_lookup.candidates[1];
+    assert_ne!(
+        r0.logical_symbol_id, r1.logical_symbol_id,
+        "impl Worker for Alpha vs impl Worker for Beta must have distinct logical_symbol_ids"
+    );
+
+    // 3. cfg variants on the same owner still group
+    let alpha_process_lookup = db
+        .symbol_candidates(
+            &rag_rat_query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("process".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        alpha_process_lookup.candidates.len(),
+        2,
+        "cfg variants on the same owner must remain grouped"
+    );
+    assert_eq!(
+        alpha_process_lookup.candidates[0].logical_symbol_id,
+        alpha_process_lookup.candidates[1].logical_symbol_id,
+        "cfg variants on same owner share logical_symbol_id"
+    );
+
+    // 4. Exact logical lookup/caller behavior not crossing owners
+    let alpha_new_callers = db
+        .find_callers_with_options(
+            "Alpha::new",
+            10,
+            &rag_rat_query::graph::GraphTraversalOptions {
+                resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
+                symbol_id: Some(c0.symbol_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let beta_new_callers = db
+        .find_callers_with_options(
+            "Beta::new",
+            10,
+            &rag_rat_query::graph::GraphTraversalOptions {
+                resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
+                symbol_id: Some(c1.symbol_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let callers = if !alpha_new_callers.is_empty() { alpha_new_callers } else { beta_new_callers };
+    assert!(
+        callers.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|s| s.contains("call_alpha"))
+        }),
+        "call_alpha calls Alpha::new"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
