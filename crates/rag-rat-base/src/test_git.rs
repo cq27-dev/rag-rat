@@ -152,6 +152,11 @@ mod tests {
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
             .env_remove("GIT_COMMON_DIR")
+            // An inherited invalid `GIT_*_DATE` would fail the commit BEFORE the hook runs, and a
+            // template could plant a second hook — the repro must measure only the pinned file.
+            .env_remove("GIT_TEMPLATE_DIR")
+            .env_remove("GIT_AUTHOR_DATE")
+            .env_remove("GIT_COMMITTER_DATE")
             .output()
             .unwrap();
         assert!(!out.status.success(), "the hostile global hook must fail the commit");
