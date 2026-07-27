@@ -292,6 +292,8 @@ pub fn live_oracle_pass(
             session.tool_version(),
             path,
             &callees[0].file_sha,
+            input.commit_sha,
+            input.worktree_id,
         )?;
         let is_covered = |c: &store::EdgeJoinCandidate| {
             covered.contains(&(
@@ -412,14 +414,23 @@ pub fn live_oracle_pass(
                 continue;
             };
 
-            let logical_symbol_of = |symbol_id: i64| -> Option<i64> {
-                if let Some(cached) = logical_cache.borrow().get(&symbol_id) {
-                    return *cached;
+            // Resolve the logical ids of the heuristic + compiler targets up front, propagating
+            // a DB failure instead of swallowing it to `None` — a swallowed error would degrade
+            // a real Confirm (same logical symbol) into a Contradict and corrupt precision while
+            // later writes still succeed (#534 review). The closure then reads the warmed cache.
+            let warm_logical = |id: i64| -> anyhow::Result<()> {
+                if !logical_cache.borrow().contains_key(&id) {
+                    let logical = store::logical_symbol_id_for_member(conn, id)?;
+                    logical_cache.borrow_mut().insert(id, logical);
                 }
-                let logical = store::logical_symbol_id_for_member(conn, symbol_id).unwrap_or(None);
-                logical_cache.borrow_mut().insert(symbol_id, logical);
-                logical
+                Ok(())
             };
+            warm_logical(symbol_id)?;
+            if let Some(heuristic_id) = candidate.to_symbol_id {
+                warm_logical(heuristic_id)?;
+            }
+            let logical_symbol_of =
+                |id: i64| -> Option<i64> { logical_cache.borrow().get(&id).copied().flatten() };
             let kind = join::classify_in_corpus(
                 &candidate.confidence,
                 candidate.to_symbol_id,
@@ -428,13 +439,14 @@ pub fn live_oracle_pass(
             );
 
             // Moniker: the target's batch moniker verbatim, else the content-stable local
-            // sentinel (module docs — NEVER the LSP moniker string).
+            // sentinel (module docs — NEVER the LSP moniker string). A DB failure propagates.
+            if let std::collections::hash_map::Entry::Vacant(slot) = moniker_cache.entry(symbol_id)
+            {
+                slot.insert(store::batch_moniker_for_symbol(conn, symbol_id, moniker_source)?);
+            }
             let scip_symbol = moniker_cache
-                .entry(symbol_id)
-                .or_insert_with(|| {
-                    store::batch_moniker_for_symbol(conn, symbol_id, moniker_source).unwrap_or(None)
-                })
-                .clone()
+                .get(&symbol_id)
+                .and_then(Clone::clone)
                 .unwrap_or_else(|| live_local_sentinel(&candidate.source_path, candidate));
 
             let row = EdgeOracleRow {
@@ -527,12 +539,17 @@ fn live_local_sentinel(source_path: &str, candidate: &store::EdgeJoinCandidate) 
 }
 
 /// The `file://` URI of a checkout root — the base every document URI hangs off. Encodes any
-/// non-URI-path byte as %XX (spaces, non-ASCII); `/` is preserved. A Windows drive prefix
-/// (`C:`) keeps its colon UNENCODED — `file:///C:/repo`, not `file:///C%3A/repo` — because
-/// that is the canonical form rust-analyzer returns for definition URIs, and `path_from_uri`'s
-/// literal prefix match must agree with it (#534 review).
+/// non-URI-path byte as %XX (spaces, non-ASCII); `/` is preserved. Two Windows forms keep the
+/// shape rust-analyzer returns canonically (so `path_from_uri`'s literal prefix match agrees,
+/// #534 review): a drive prefix (`C:`) keeps its colon unencoded (`file:///C:/repo`), and a UNC
+/// path (`\\server\share`) becomes an authority URI (`file://server/share/…`, no extra slash).
 fn root_uri_for(checkout_root: &Path) -> String {
     let lossy = checkout_root.to_string_lossy().replace('\\', "/");
+    // UNC: `//server/share/…` → `file://server/share/…` (the server is the URI authority, not a
+    // path segment). Encode each segment but keep the `/` separators.
+    if let Some(unc) = lossy.strip_prefix("//") {
+        return format!("file://{}", encode_uri_path(unc));
+    }
     let with_lead = if lossy.starts_with('/') { lossy } else { format!("/{lossy}") };
     let bytes = with_lead.as_bytes();
     // Drive prefix: `/C:/…` after the leading-slash normalization.
@@ -597,6 +614,19 @@ mod tests {
         assert_eq!(path_from_uri(&root, "file:///C:/repo/src/lib.rs"), Some("src/lib.rs".into()));
         // A drive root with a space still encodes the non-drive part.
         assert_eq!(root_uri_for(Path::new(r"D:\my repo")), "file:///D:/my%20repo");
+    }
+
+    #[test]
+    fn root_uri_maps_a_unc_path_to_an_authority_url() {
+        // `\\server\share\repo` → `file://server/share/repo` (authority form), matching the
+        // canonical URI rust-analyzer returns; a naive join would emit `file:////server/...`
+        // and misclass every in-repo definition as external (#534 review).
+        let root = root_uri_for(Path::new(r"\\server\share\repo"));
+        assert_eq!(root, "file://server/share/repo");
+        assert_eq!(
+            path_from_uri(&root, "file://server/share/repo/src/a.rs"),
+            Some("src/a.rs".into())
+        );
     }
 
     #[test]

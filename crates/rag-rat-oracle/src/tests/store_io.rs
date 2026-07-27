@@ -542,3 +542,72 @@ fn edge_join_candidates_for_paths_scopes_and_chunks() {
         store::edge_join_candidates_for_paths(&h.conn, COMMIT, WORKTREE, &[]).unwrap().is_empty()
     );
 }
+
+/// `live_covered_edges_for_path` (the budget-continuation coverage read, #534) must NOT count a
+/// verdict whose resolved DEFINITION no longer exists in the active checkout — the surfacing
+/// read rejects such a row, so continuation would otherwise skip re-resolving the edge forever
+/// behind evidence the read path never shows.
+#[test]
+fn live_covered_edges_excludes_a_stale_definition_verdict() {
+    let h = Harness::new();
+    let src = h.add_file("src.rs", "fn caller() { target(); }\n");
+    let sha = h.file_sha("src.rs");
+    // A live verdict resolving to a symbol that does NOT exist (id 9999) — a def that was
+    // deleted/reindexed away.
+    let stale = h.add_edge(src, "target", 14, 20, "NameOnly", None);
+    let key = h.edge_content_key(stale);
+    store::write_edge_oracle(&h.conn, OracleTool::RaLsp, "v", &EdgeOracleRow {
+        source_path: &key.source_path,
+        source_start_byte: key.source_start_byte,
+        source_end_byte: key.source_end_byte,
+        callee_start_byte: key.callee_start_byte,
+        callee_end_byte: key.callee_end_byte,
+        edge_kind: &key.edge_kind,
+        file_sha: &sha,
+        resolved_symbol_id: Some(9999),
+        scip_symbol: "local ra-lsp-stale",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+
+    let covered = store::live_covered_edges_for_path(
+        &h.conn,
+        OracleTool::RaLsp,
+        "v",
+        "src.rs",
+        &sha,
+        COMMIT,
+        WORKTREE,
+    )
+    .unwrap();
+    assert!(covered.is_empty(), "a verdict with a vanished definition is not coverage");
+
+    // A verdict with NULL resolved_symbol_id (external-ish) or a live definition IS coverage.
+    let real_target = h.add_symbol(src, "target", 0, 25);
+    let live = h.add_edge_with_kind(src, "target", 14, 20, "references_type", "NameOnly", None);
+    let live_key = h.edge_content_key(live);
+    store::write_edge_oracle(&h.conn, OracleTool::RaLsp, "v", &EdgeOracleRow {
+        source_path: &live_key.source_path,
+        source_start_byte: live_key.source_start_byte,
+        source_end_byte: live_key.source_end_byte,
+        callee_start_byte: live_key.callee_start_byte,
+        callee_end_byte: live_key.callee_end_byte,
+        edge_kind: &live_key.edge_kind,
+        file_sha: &sha,
+        resolved_symbol_id: Some(real_target),
+        scip_symbol: "local ra-lsp-live",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+    let covered = store::live_covered_edges_for_path(
+        &h.conn,
+        OracleTool::RaLsp,
+        "v",
+        "src.rs",
+        &sha,
+        COMMIT,
+        WORKTREE,
+    )
+    .unwrap();
+    assert_eq!(covered.len(), 1, "the live-definition verdict is coverage; the stale one is not");
+}

@@ -53,6 +53,17 @@ pub(crate) fn with_oracle_write_lock<T>(
 /// error. Prints the `OracleReport` (or the `Blocked` outcome) as JSON.
 fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
     let tool = args.tool.core();
+    // A live-only tool (`ra-lsp`) has no whole-checkout `.scip` — reject BOTH the tool-driven and
+    // the `--scip` prebuilt branches here (the prebuilt branch never reaches
+    // `produce_scip_with_tool`'s batch gate). Otherwise a `--scip` run would persist batch-shaped
+    // verdicts + a run row under the live identity and supersede genuine watcher-session verdicts
+    // in the currency gate (#534 review).
+    anyhow::ensure!(
+        tool.batch_capable(),
+        "`oracle run` cannot drive the live tool `{}` — it resolves from the watcher under \
+         `[oracle.live] enabled`, not a whole-checkout `.scip`",
+        tool.as_db_str()
+    );
     if let Some(scip_path) = &args.scip {
         // Pre-built index: reading a file is fast, so this whole path runs under the lock.
         let scip_bytes = fs::read(scip_path).map_err(|err| {
@@ -657,6 +668,26 @@ mod tests {
         assert!(ok, "oracle run should succeed once the lock is free");
         handle.join().unwrap();
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #534: a live-only tool has no whole-checkout `.scip`, so `oracle run --tool ra-lsp` (even
+    /// with a prebuilt `--scip`, the branch that skips `produce_scip_with_tool`'s gate) is
+    /// rejected before touching the index — never persist a batch-shaped run under the live id.
+    #[test]
+    fn oracle_run_rejects_the_live_only_tool() {
+        let (root, config) = temp_config();
+        IndexDatabase::rebuild(&config).unwrap();
+        let scip_path = root.join("empty.scip");
+        std::fs::write(&scip_path, []).unwrap();
+        let args = OracleArgs {
+            command: OracleCommand::Run(OracleRunArgs {
+                tool: OracleToolArg::RaLsp,
+                scip: Some(scip_path),
+            }),
+        };
+        let err = super::oracle(&config, &args).unwrap_err();
+        assert!(err.to_string().contains("live tool"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

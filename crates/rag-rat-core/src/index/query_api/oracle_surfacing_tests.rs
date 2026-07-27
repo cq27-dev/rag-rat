@@ -480,6 +480,63 @@ fn compare_graph_to_scip_dedupes_cross_tool_contradictions_batch_first() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// #534: when the canonical batch tool has ANY verdict on an edge (here a `Confirm`) but the
+/// live tool `Contradict`s the same edge, `compare_graph_to_scip` suppresses the live
+/// contradiction — a batch-covered edge never surfaces a live-only disagreement (the batch is
+/// authoritative; showing it would be a false "compiler disagrees with the graph").
+#[test]
+fn compare_graph_to_scip_suppresses_a_live_contradiction_on_a_batch_covered_edge() {
+    let root = temp_root();
+    fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+    let config = rust_config(root.to_path_buf());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let (edge_id, cs, ce, path) = call_edge(&db);
+    // Batch (rust-analyzer): resolve in-corpus → Confirm (agreement-shaped, no contradiction).
+    db.run_oracle_from_scip(
+        OracleTool::RustAnalyzer,
+        "v-batch",
+        &scip_with(
+            &path,
+            cs,
+            ce,
+            "scip-rust crate held-mini `target`().",
+            Some(&path),
+            Some((29, 35)),
+        ),
+    )
+    .unwrap();
+    // Force the heuristic edge in-corpus-resolved so the live external resolution is a
+    // Contradict, then write it under the live tool for the SAME edge.
+    let target_sym: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE edges SET confidence = 'Exact', resolution = 'exact', to_symbol_id = ?2 WHERE \
+             id = ?1",
+            params![edge_id, target_sym],
+        )
+        .unwrap();
+    db.run_oracle_from_scip(
+        OracleTool::RaLsp,
+        "v-live",
+        &scip_with(&path, cs, ce, "scip-rust cargo other 1.0 `target`().", None, None),
+    )
+    .unwrap();
+
+    let compare = db.compare_graph_to_scip().unwrap();
+    assert_eq!(
+        compare.summary.contradictions, 0,
+        "the batch Confirm covers the edge, so the live Contradict is suppressed: {compare:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// #82 P0: when a run EXISTS but examined 0 in-scope verdicts, `compare_graph_to_scip` must WARN
 /// — that is "run-but-empty" (the silent symptom of the scope bug), not "compiler agrees". Here
 /// a run writes a verdict, then the callsite file drifts so the current-content gate

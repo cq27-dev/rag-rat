@@ -368,21 +368,31 @@ pub(crate) type LiveEdgeKey = (i64, i64, i64, i64, String);
 /// (source span + callee span + edge kind), never the callee start alone: two edges can share
 /// one token (`calls_name` + `references_type`), and a start-byte key would let the first
 /// written row mark BOTH covered and starve the other forever.
+///
+/// A verdict whose resolved DEFINITION no longer exists in the active checkout (the def file was
+/// edited + reindexed between passes while THIS file's bytes held) is NOT counted covered — it
+/// applies the same definition-current predicate the surfacing reads use, so continuation
+/// re-resolves the edge instead of skipping it forever behind evidence the read path rejects.
 pub(crate) fn live_covered_edges_for_path(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
     source_path: &str,
     file_sha: &str,
+    commit_sha: &str,
+    worktree_id: &str,
 ) -> anyhow::Result<std::collections::HashSet<LiveEdgeKey>> {
     let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
+    let def_current = edge_oracle_def_current_predicate("?5", "?6");
     let mut stmt = conn.prepare(&format!(
         "SELECT source_start_byte, source_end_byte, callee_start_byte, callee_end_byte, edge_kind
          FROM edge_oracle
-         WHERE tool = ?1 AND tool_version = ?2 AND source_path = ?3 AND file_sha = ?4{repo_clause}"
+         WHERE tool = ?1 AND tool_version = ?2 AND source_path = ?3 AND file_sha = \
+         ?4{repo_clause}{def_current}"
     ))?;
-    let rows =
-        stmt.query_map(params![tool.as_db_str(), tool_version, source_path, file_sha], |row| {
+    let rows = stmt.query_map(
+        params![tool.as_db_str(), tool_version, source_path, file_sha, commit_sha, worktree_id],
+        |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -390,7 +400,8 @@ pub(crate) fn live_covered_edges_for_path(
                 row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
             ))
-        })?;
+        },
+    )?;
     let mut out = std::collections::HashSet::new();
     for row in rows {
         out.insert(row?);
@@ -422,8 +433,31 @@ pub(crate) fn migrate_live_verdicts_to_version(
 ) -> anyhow::Result<u64> {
     let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
     let scope = active_checkout_file_predicate("?4", "?5");
-    // Drop old-version rows whose content key the new version already covers in THIS checkout
-    // (PK is (repo_id?, tool, tool_version, source_path, spans…, edge_kind)).
+    // The active-checkout, current-CONTENT live-edge predicate: the row's `file_sha` must equal
+    // the checkout's CURRENT `files.sha256`, so a sibling worktree's row (same path + spans, but
+    // its own content sha) is NOT treated as this checkout's — without the sha correlation a
+    // repo-wide relabel would move the sibling's row while only this checkout records the
+    // new-version run, hiding the sibling's verdicts behind its still-old currency gate.
+    let active_current = format!(
+        "EXISTS (
+             SELECT 1
+             FROM edges_data
+             JOIN files ON files.id = edges_data.source_file_id
+             JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
+             WHERE files.path = edge_oracle.source_path
+               AND files.sha256 = edge_oracle.file_sha
+               AND edges_data.source_start_byte = edge_oracle.source_start_byte
+               AND edges_data.source_end_byte = edge_oracle.source_end_byte
+               AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
+               AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
+               AND ek.value = edge_oracle.edge_kind
+               AND edges_data.hidden = 0
+               AND {scope})"
+    );
+    // Drop old-version rows whose content key the new version already occupies (the PK is
+    // (repo_id?, tool, tool_version, source_path, spans…, edge_kind) — file_sha is NOT in it, so
+    // the UPDATE below would otherwise hit a PK collision), restricted to rows current in THIS
+    // checkout.
     conn.execute(
         &format!(
             "DELETE FROM edge_oracle
@@ -434,19 +468,7 @@ pub(crate) fn migrate_live_verdicts_to_version(
                            callee_start_byte, callee_end_byte, edge_kind
                     FROM edge_oracle
                     WHERE tool = ?1 AND tool_version = ?3{repo_clause})
-               AND EXISTS (
-                    SELECT 1
-                    FROM edges_data
-                    JOIN files ON files.id = edges_data.source_file_id
-                    JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
-                    WHERE files.path = edge_oracle.source_path
-                      AND edges_data.source_start_byte = edge_oracle.source_start_byte
-                      AND edges_data.source_end_byte = edge_oracle.source_end_byte
-                      AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
-                      AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
-                      AND ek.value = edge_oracle.edge_kind
-                      AND edges_data.hidden = 0
-                      AND {scope})"
+               AND {active_current}"
         ),
         params![tool.as_db_str(), from_version, to_version, commit_sha, worktree_id],
     )?;
@@ -454,19 +476,7 @@ pub(crate) fn migrate_live_verdicts_to_version(
         &format!(
             "UPDATE edge_oracle SET tool_version = ?3
              WHERE tool = ?1 AND tool_version = ?2{repo_clause}
-               AND EXISTS (
-                    SELECT 1
-                    FROM edges_data
-                    JOIN files ON files.id = edges_data.source_file_id
-                    JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
-                    WHERE files.path = edge_oracle.source_path
-                      AND edges_data.source_start_byte = edge_oracle.source_start_byte
-                      AND edges_data.source_end_byte = edge_oracle.source_end_byte
-                      AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
-                      AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
-                      AND ek.value = edge_oracle.edge_kind
-                      AND edges_data.hidden = 0
-                      AND {scope})"
+               AND {active_current}"
         ),
         params![tool.as_db_str(), from_version, to_version, commit_sha, worktree_id],
     )?;
