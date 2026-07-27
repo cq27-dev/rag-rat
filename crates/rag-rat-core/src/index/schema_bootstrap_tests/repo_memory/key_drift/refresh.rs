@@ -590,14 +590,10 @@ fn a_rebuild_carrying_a_committed_leftover_defers_the_stamp() {
 /// Overlap rather than containment: a chunk begins BEFORE its symbol when it captures the leading
 /// doc comment, so `symbol.start <= chunk.start` would reject the right answer.
 ///
-/// NOTE the second half of this test. These two methods have BYTE-IDENTICAL declaration lines, and
-/// `signature` — the trimmed first line — is part of `LogicalSymbolKey`, so they collapse into ONE
-/// logical symbol. Every logical-id-anchored surface therefore still applies to both, and no
-/// chunk-side resolution can change that; it is a defect in the identity key. (When the
-/// declaration lines DIFFER the two are distinct logical symbols and the leak is real and fixed —
-/// see `a_decision_record_does_not_leak_between_distinct_same_named_methods`.) This test pins the
-/// raw-`symbol_id` precision that IS fixable here, plus the collapse itself, so the day the
-/// identity key gains a scope discriminator, this test notices.
+/// The two methods also have byte-identical declaration lines. Their owner scope must therefore
+/// remain part of logical identity; otherwise logical-id-anchored data leaks between `Alpha` and
+/// `Beta`. This test pins both guarantees: chunk binding selects the concrete overlapping method,
+/// and logical grouping keeps methods owned by different types separate.
 #[test]
 fn a_chunk_binding_resolves_the_symbol_it_overlaps_not_an_arbitrary_same_named_sibling() {
     let root = unique_temp_root();
@@ -661,13 +657,9 @@ fn a_chunk_binding_resolves_the_symbol_it_overlaps_not_an_arbitrary_same_named_s
     );
     assert_eq!(beta.symbol_id, Some(beta_symbol), "and the second method's chunk binds the second",);
 
-    // The known remaining imprecision, pinned deliberately: logical grouping is
-    // `(repo_id, path, logical_name)`, so these two distinct methods are ONE logical symbol and
-    // anything anchored to it applies to both.
-    assert_eq!(
+    assert_ne!(
         alpha.logical_symbol_id, beta.logical_symbol_id,
-        "same-named symbols in one file still share a logical id — if this ever fails, grouping \
-         gained a discriminator and the logical-id-anchored surfaces became per-method",
+        "same-named methods owned by different Rust types must remain distinct logical symbols",
     );
 
     let _ = fs::remove_dir_all(&root);
