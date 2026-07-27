@@ -47,6 +47,14 @@ pub fn command(dir: &Path, args: &[&str]) -> Command {
         .env_remove("GIT_NAMESPACE")
         .env_remove("GIT_CONFIG")
         .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        // `GIT_TEMPLATE_DIR` would copy template hooks into every fixture `git init` (local hooks
+        // bypass config isolation entirely), and inherited `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`
+        // leak into fixture commits (an invalid value fails the commit outright) — callers like
+        // the CLI's `git_commit` pin their own dates afterwards.
+        .env_remove("GIT_TEMPLATE_DIR")
+        .env_remove("GIT_AUTHOR_DATE")
+        .env_remove("GIT_COMMITTER_DATE")
         .env("GIT_AUTHOR_NAME", "rag-rat-test")
         .env("GIT_AUTHOR_EMAIL", "rag-rat-test@example.invalid")
         .env("GIT_COMMITTER_NAME", "rag-rat-test")
@@ -97,14 +105,19 @@ mod tests {
     }
 
     /// Guard the guard: the ambient failure this isolates against (#581's repro) really happens
-    /// WITHOUT the helper, so the isolation can never silently degrade to a no-op.
+    /// WITHOUT the helper, so the isolation can never silently degrade to a no-op. The hook
+    /// writes a marker file, so the assertion proves the hook RAN (a bare `exit 1` could be
+    /// masked by an earlier failure such as a missing identity), and an identity is pinned so the
+    /// commit can only fail because of the hook.
     #[test]
     fn the_ambient_failure_mode_is_real() {
         let root = crate::test_scratch::ScratchDir::new("git-isolation-repro");
         let hooks = root.join("hooks");
         std::fs::create_dir_all(&hooks).unwrap();
+        let marker = root.join("hook-ran.marker");
         let pre_commit = hooks.join("pre-commit");
-        std::fs::write(&pre_commit, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(&pre_commit, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()))
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -121,6 +134,11 @@ mod tests {
         let out = Command::new("git")
             .current_dir(root.path())
             .args(["commit", "-q", "-m", "seed"])
+            // The identity is pinned, so the commit cannot fail early for a missing `user.*`.
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
             .env("GIT_CONFIG_GLOBAL", root.join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             // The repro pins the hostile GLOBAL file, but ambient command-scope config
@@ -136,6 +154,16 @@ mod tests {
             .env_remove("GIT_COMMON_DIR")
             .output()
             .unwrap();
-        assert!(!out.status.success(), "the hostile global hook must fire without isolation");
+        assert!(!out.status.success(), "the hostile global hook must fail the commit");
+        assert!(
+            marker.exists(),
+            "the pinned hook really RAN — without the marker a non-success could be masked by an \
+             unrelated failure",
+        );
+
+        // The same fixture repo, through the isolated helper: the hook never fires.
+        std::fs::remove_file(&marker).unwrap();
+        run(&root, &["commit", "-q", "-m", "second"]);
+        assert!(!marker.exists(), "the isolated helper let the hostile hook fire");
     }
 }
