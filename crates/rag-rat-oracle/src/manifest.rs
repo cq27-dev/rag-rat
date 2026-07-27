@@ -123,7 +123,17 @@ impl ToolManifest {
     /// `scip` subcommand as `Available`, then fail the actual run. `Blocked` must mean "can't
     /// produce SCIP."
     pub fn probe(&self) -> ToolAvailability {
-        match detect_version(self.program) {
+        self.probe_with_cwd(None)
+    }
+
+    /// Probe from `cwd`. The live rust-analyzer backend uses this so rustup directory overrides in
+    /// the indexed checkout select the same toolchain for `--version` and the later LSP process.
+    pub fn probe_in(&self, cwd: &Path) -> ToolAvailability {
+        self.probe_with_cwd(Some(cwd))
+    }
+
+    fn probe_with_cwd(&self, cwd: Option<&Path>) -> ToolAvailability {
+        match detect_version_in(self.program, cwd) {
             Some(version) if self.can_emit_scip() => ToolAvailability::Available {
                 tool: self.tool.as_db_str().to_string(),
                 program: self.program.to_string(),
@@ -333,8 +343,13 @@ fn has_gradle_build(root: &Path) -> bool {
 /// program is absent / not executable / exits non-zero. The version string is opaque (recorded as
 /// `tool_version` for content-addressed staleness — a different version invalidates prior
 /// verdicts).
-fn detect_version(program: &str) -> Option<String> {
-    let output = Command::new(program).arg("--version").output().ok()?;
+fn detect_version_in(program: &str, cwd: Option<&Path>) -> Option<String> {
+    let mut command = Command::new(program);
+    command.arg("--version");
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -386,8 +401,18 @@ mod tests {
     fn detect_version_reads_a_known_program() {
         // `cargo --version` is reliably present in the test environment (we're building with it).
         // Proves the version-detection path returns a non-empty line for a real program.
-        let version = detect_version("cargo");
+        let version = detect_version_in("cargo", None);
         assert!(version.is_some_and(|v| v.starts_with("cargo")));
+    }
+
+    #[test]
+    fn detect_version_in_applies_the_checkout_cwd() {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("oracle-probe-cwd");
+        assert!(detect_version_in("cargo", Some(root.path())).is_some());
+        assert!(
+            detect_version_in("cargo", Some(&root.path().join("missing"))).is_none(),
+            "a missing cwd must prevent spawn, proving current_dir is applied"
+        );
     }
 
     #[test]
@@ -402,7 +427,7 @@ mod tests {
             languages: &["rust"],
             install_hint: "hint",
         };
-        assert!(detect_version("cargo").is_some(), "cargo reports a version");
+        assert!(detect_version_in("cargo", None).is_some(), "cargo reports a version");
         assert!(!manifest.can_emit_scip(), "cargo has no `scip` subcommand");
         assert!(
             !manifest.probe().is_available(),

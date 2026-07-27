@@ -22,9 +22,9 @@
 //!   only READS the moniker table.
 //! - **Currency.** The verdict rows + the backing `oracle_runs` row commit in ONE transaction — the
 //!   per-tool currency gate (`callee_moniker_current_clause`) must never see live rows without a
-//!   backing run. A run row is recorded only for a pass that wrote ≥1 row. There is NO
-//!   authoritative clear: live's scope is only this pass's changed files (the batch pass owns
-//!   whole-checkout authority).
+//!   backing run. A run row is recorded for a pass that wrote ≥1 row or migrated tool-version
+//!   currency. There is NO authoritative clear: live's scope is only this pass's changed files (the
+//!   batch pass owns whole-checkout authority).
 //! - **Refine cache.** When a live write CHANGES an existing row's `scip_symbol` for an UNCHANGED
 //!   `file_sha`, the scip-mode clone refinements that consulted the old evidence are invalidated
 //!   (nothing in the refinement key folds oracle content — the same reasoning as the batch hook in
@@ -72,11 +72,11 @@ impl LiveOracleSession {
     /// session's verdicts came from.
     pub fn spawn(checkout_root: &Path, now_ms: i64) -> Option<Self> {
         let manifest = ToolManifest::for_tool(OracleTool::RaLsp);
-        let ToolAvailability::Available { version, .. } = manifest.probe() else {
+        let ToolAvailability::Available { version, .. } = manifest.probe_in(checkout_root) else {
             return None;
         };
         let root_uri = root_uri_for(checkout_root)?;
-        let mut client = LspClient::spawn(manifest.program, &[]).ok()?;
+        let mut client = LspClient::spawn(manifest.program, &[], checkout_root).ok()?;
         client.initialize(&root_uri).ok()?;
         Some(Self { client, tool_version: version, root_uri, last_used_ms: now_ms })
     }
@@ -125,7 +125,7 @@ pub struct LivePassInput<'a> {
     /// The active checkout the just-reindexed files (and their edge candidates) are scoped to.
     pub commit_sha: &'a str,
     pub worktree_id: &'a str,
-    /// The checkout root: document URIs are `root_uri/path`, and target bytes are read from
+    /// The checkout root: `url::Url` converts each document path, and target bytes are read from
     /// `checkout_root/path`.
     pub checkout_root: &'a Path,
     /// Repo-relative paths the pass may resolve (the maintenance pass's changed set plus any
@@ -156,6 +156,9 @@ pub struct LivePassReport {
     pub contradicted: u64,
     /// Candidates/definitions skipped for content drift (callsite or definition document).
     pub skipped_drifted: u64,
+    /// Writes skipped because a sibling checkout still owns the same content key + tool version
+    /// for different file bytes (the schema cannot represent both because SHA is outside the PK).
+    pub skipped_content_collisions: u64,
     /// Definitions skipped as out-of-corpus for live purposes: target outside the checkout root,
     /// in an unindexed file, or mapping to no indexed symbol. Live writes no `resolved-external`
     /// rows (see the module docs).
@@ -163,7 +166,7 @@ pub struct LivePassReport {
     /// Callees the server left unresolved (a `null` definition — e.g. still indexing).
     pub unresolved: u64,
     /// Whether the scip-mode refine cache was invalidated (a row's `scip_symbol` changed under
-    /// an unchanged `file_sha`).
+    /// unchanged bytes, or newly inserted non-local evidence became visible).
     pub refinements_invalidated: bool,
     /// Whether an `oracle_runs` row backs this pass (when `rows_written > 0` or a version
     /// migration made the new `tool_version` current).
@@ -283,14 +286,17 @@ pub fn live_oracle_pass(
         // makes the indexed callee ranges point at the wrong content. Skip, never mis-resolve.
         let Ok(bytes) = std::fs::read(input.checkout_root.join(path)) else {
             report.skipped_drifted += callees.len() as u64;
+            report.unfinished_paths.push(path.clone());
             continue;
         };
         if hex_sha256(&bytes) != callees[0].file_sha {
             report.skipped_drifted += callees.len() as u64;
+            report.unfinished_paths.push(path.clone());
             continue;
         }
         let Ok(text) = String::from_utf8(bytes) else {
             report.skipped_drifted += callees.len() as u64;
+            report.unfinished_paths.push(path.clone());
             continue;
         };
 
@@ -355,16 +361,19 @@ pub fn live_oracle_pass(
                 break 'files;
             },
         };
-        // Fully sent only when nothing was budget-deferred: `files_resolved` documents "every
-        // callee of this file was sent", so a truncated file must not inflate it (the field
-        // rides `oracle_runs.stats_json` into status consumers).
-        if deferred_count == 0 {
-            report.files_resolved += 1;
-        } else {
-            // The budget cut this file short; it rides the backlog and resumes at the deferred
-            // callees (the covered-skip above makes that resume exact).
+        // The caller may change while synchronous requests are in flight. Re-read AFTER the batch:
+        // the server resolved the didOpen snapshot, and writing it against an already-changed disk
+        // file would look current until the queued reindex catches up (or forever if its event was
+        // missed).
+        if std::fs::read(input.checkout_root.join(path))
+            .ok()
+            .is_none_or(|current| hex_sha256(&current) != callees[0].file_sha)
+        {
+            report.skipped_drifted += to_resolve.len() as u64;
             report.unfinished_paths.push(path.clone());
+            continue;
         }
+        let mut retry_file = deferred_count > 0;
         // Definition bytes are cached ONLY within this file's batch: a def file edited between
         // two source files' LSP requests would otherwise be hashed + position-converted from a
         // stale snapshot, defeating the definition-side drift gate. (The indexed sha + symbol
@@ -391,6 +400,7 @@ pub fn live_oracle_pass(
                 .clone();
             let Some(def_disk) = def_disk else {
                 report.skipped_drifted += 1;
+                retry_file = true;
                 continue;
             };
             let indexed_sha = match def_indexed_sha.entry(def_path.clone()) {
@@ -413,6 +423,7 @@ pub fn live_oracle_pass(
                 Some(sha) if sha == hex_sha256(&def_disk) => {},
                 Some(_) => {
                     report.skipped_drifted += 1;
+                    retry_file = true;
                     continue;
                 },
             }
@@ -422,6 +433,7 @@ pub fn live_oracle_pass(
                 index.byte_at_position(target_range.end),
             ) else {
                 report.skipped_drifted += 1;
+                retry_file = true;
                 continue;
             };
             let spans = match def_spans.entry(def_path.clone()) {
@@ -487,13 +499,23 @@ pub fn live_oracle_pass(
                 scip_symbol: &scip_symbol,
                 kind,
             };
-            // Refine-cache interplay: a CHANGED scip_symbol under an UNCHANGED file_sha moves
-            // oracle evidence nothing in the refinement key folds — invalidate (same-value
-            // upserts deliberately skip).
-            if let Some((old_sha, old_symbol)) =
-                store::existing_verdict_scip_symbol(conn, tool, session.tool_version(), &row)?
-                && old_sha == candidate.file_sha
-                && old_symbol != scip_symbol
+            let existing =
+                store::existing_verdict_scip_symbol(conn, tool, session.tool_version(), &row)?;
+            // The content-key PK excludes file_sha. Preserve a different-SHA row while any sibling
+            // checkout still joins to it; overwriting would make that sibling lose live evidence.
+            if let Some((old_sha, _)) = &existing
+                && old_sha != &candidate.file_sha
+                && store::verdict_content_is_current_anywhere(conn, &row, old_sha)?
+            {
+                report.skipped_content_collisions += 1;
+                continue;
+            }
+            // Refine-cache interplay: CHANGED evidence under the same bytes, OR newly inserted
+            // NON-LOCAL moniker evidence, moves data absent from the refinement key. Local
+            // sentinels are filtered by the consumer and are refine-neutral.
+            if existing.as_ref().is_some_and(|(old_sha, old_symbol)| {
+                old_sha == &candidate.file_sha && old_symbol != &scip_symbol
+            }) || (existing.is_none() && !super::scip::is_local_symbol(&scip_symbol))
             {
                 refinements_stale = true;
             }
@@ -506,6 +528,16 @@ pub fn live_oracle_pass(
                 // Live never emits ResolvedExternal (out-of-corpus defs are skipped above).
                 OracleResolutionKind::ResolvedExternal => {},
             }
+        }
+        // Fully resolved only when nothing was budget- or drift-deferred. A definition that changed
+        // during this caller's batch requeues the CALLER because the definition's own watcher event
+        // does not enumerate every caller that resolved into it.
+        if retry_file {
+            if !report.unfinished_paths.contains(path) {
+                report.unfinished_paths.push(path.clone());
+            }
+        } else {
+            report.files_resolved += 1;
         }
     }
 

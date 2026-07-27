@@ -2810,6 +2810,14 @@ fn oracle_defaults_off_and_parses_overrides() {
 }
 
 #[test]
+fn oracle_live_rejects_a_zero_request_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rag-rat.toml");
+    std::fs::write(&path, "[oracle.live]\nenabled = true\nmax_requests_per_pass = 0\n").unwrap();
+    assert!(matches!(Config::load(path), Err(ConfigError::OracleLiveRequestBudgetZero)));
+}
+
+#[test]
 fn rejects_unknown_language() {
     let root = std::env::current_dir().unwrap();
     let simple = BTreeMap::from([("cobol".to_string(), vec![".".to_string()])]);

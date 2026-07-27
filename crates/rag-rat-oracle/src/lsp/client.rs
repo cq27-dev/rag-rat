@@ -10,6 +10,7 @@
 //! whole client unit-testable without a real `rust-analyzer`.
 
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use serde_json::{Value, json};
@@ -42,12 +43,14 @@ pub(crate) struct LspClient {
 }
 
 impl LspClient {
-    /// Spawn `program args…` as a language server, piping its stdio into the JSON-RPC transport.
-    /// stderr is discarded (server diagnostics are not part of the protocol). The session starts at
-    /// the LSP default encoding (UTF-16) until [`initialize`](Self::initialize) negotiates one.
-    pub(crate) fn spawn(program: &str, args: &[&str]) -> io::Result<Self> {
+    /// Spawn `program args…` from `cwd` as a language server, piping stdio into the JSON-RPC
+    /// transport. stderr is discarded (server diagnostics are not part of the protocol). The
+    /// session starts at the LSP default encoding (UTF-16) until
+    /// [`initialize`](Self::initialize) negotiates one.
+    pub(crate) fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Self> {
         let mut child = Command::new(program)
             .args(args)
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -383,6 +386,15 @@ mod tests {
 
     #[test]
     fn spawn_of_a_missing_program_errors() {
-        assert!(LspClient::spawn("rag-rat-no-such-lsp-xyzzy", &[]).is_err());
+        assert!(LspClient::spawn("rag-rat-no-such-lsp-xyzzy", &[], Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn spawn_applies_the_checkout_cwd() {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("lsp-spawn-cwd");
+        assert!(
+            LspClient::spawn("cargo", &["--version"], &root.path().join("missing")).is_err(),
+            "a missing cwd must prevent spawn"
+        );
     }
 }

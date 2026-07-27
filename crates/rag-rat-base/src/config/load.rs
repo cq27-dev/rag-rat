@@ -369,6 +369,9 @@ fn validate_raw(raw: RawConfig) -> Result<RawConfig, ConfigError> {
     if raw.dream.is_some() {
         return Err(ConfigError::DreamTableMoved);
     }
+    if raw.oracle.live.max_requests_per_pass == Some(0) {
+        return Err(ConfigError::OracleLiveRequestBudgetZero);
+    }
     Ok(raw)
 }
 

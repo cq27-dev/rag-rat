@@ -306,7 +306,7 @@ pub(crate) struct RawOracle {
     auto_run_quiet_period_secs: Option<u64>,
     auto_run_min_interval_secs: Option<u64>,
     #[serde(default)]
-    live: RawOracleLive,
+    pub(crate) live: RawOracleLive,
 }
 
 impl From<RawOracle> for OracleConfig {
@@ -329,7 +329,7 @@ impl From<RawOracle> for OracleConfig {
 pub(crate) struct RawOracleLive {
     enabled: Option<bool>,
     idle_shutdown_secs: Option<u64>,
-    max_requests_per_pass: Option<u64>,
+    pub(crate) max_requests_per_pass: Option<u64>,
 }
 
 impl From<RawOracleLive> for OracleLiveConfig {

@@ -174,6 +174,11 @@ pub enum ConfigError {
          sync"
     )]
     PapertrailIntervalZero(&'static str),
+    #[error(
+        "[oracle.live] `max_requests_per_pass` must be positive — zero leaves every live path \
+         permanently backlogged"
+    )]
+    OracleLiveRequestBudgetZero,
 }
 
 pub use discovery::{

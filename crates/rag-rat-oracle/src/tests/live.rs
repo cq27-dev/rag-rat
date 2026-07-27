@@ -134,8 +134,9 @@ fn live_verdict_copies_the_batch_moniker_verbatim() {
     let mut session = fake_session(&uri, Some((def.clone(), (0, 3), (0, 9))));
     let worklist = vec!["src.rs".to_string()];
 
-    live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
+    assert!(report.refinements_invalidated, "new non-local evidence invalidates cached refinement");
     assert_eq!(
         scip_symbol_of(&h, edge),
         TARGET_MONIKER,
@@ -239,6 +240,79 @@ fn live_pass_skips_a_drifted_callsite_and_records_no_run() {
     assert_eq!(report.rows_written, 0);
     assert!(!report.run_recorded);
     assert_eq!(live_run_count(&h.conn), 0, "a pass that wrote nothing records no run row");
+    assert_eq!(report.unfinished_paths, ["src.rs"], "drifted caller is retried after reindex");
+}
+
+#[test]
+fn live_pass_revalidates_the_caller_after_lsp_requests() {
+    let h = Harness::new();
+    let (_src, _target, _edge) = seed_corpus(&h);
+    let uri = root_uri(&h);
+    let def = def_uri(&h, "defs.rs");
+    let root = h.root().to_path_buf();
+    let client = client_with_server(move |msg: &Value| {
+        let id = msg.get("id").cloned();
+        match msg.get("method").and_then(Value::as_str) {
+            Some("initialize") => Some(vec![json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {"capabilities": {"positionEncoding": "utf-16"}}
+            })]),
+            Some("textDocument/definition") => {
+                std::fs::write(root.join("src.rs"), "fn changed() { target(); }\n").unwrap();
+                Some(vec![json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"uri": def,
+                               "range": {"start": {"line": 0, "character": 3},
+                                         "end": {"line": 0, "character": 9}}}
+                })])
+            },
+            _ if id.is_none() => Some(vec![]),
+            _ => Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": null})]),
+        }
+    });
+    let mut session = LiveOracleSession::from_client(client, LIVE_VERSION, &uri);
+    let worklist = vec!["src.rs".to_string()];
+
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+    assert_eq!(report.rows_written, 0);
+    assert_eq!(report.skipped_drifted, 1);
+    assert_eq!(report.unfinished_paths, ["src.rs"]);
+}
+
+#[test]
+fn live_pass_requeues_a_caller_when_its_definition_drifts() {
+    let h = Harness::new();
+    let (_src, _target, _edge) = seed_corpus(&h);
+    let uri = root_uri(&h);
+    let def = def_uri(&h, "defs.rs");
+    let root = h.root().to_path_buf();
+    let client = client_with_server(move |msg: &Value| {
+        let id = msg.get("id").cloned();
+        match msg.get("method").and_then(Value::as_str) {
+            Some("initialize") => Some(vec![json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {"capabilities": {"positionEncoding": "utf-16"}}
+            })]),
+            Some("textDocument/definition") => {
+                std::fs::write(root.join("defs.rs"), "fn changed_target() {}\n").unwrap();
+                Some(vec![json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"uri": def,
+                               "range": {"start": {"line": 0, "character": 3},
+                                         "end": {"line": 0, "character": 9}}}
+                })])
+            },
+            _ if id.is_none() => Some(vec![]),
+            _ => Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": null})]),
+        }
+    });
+    let mut session = LiveOracleSession::from_client(client, LIVE_VERSION, &uri);
+    let worklist = vec!["src.rs".to_string()];
+
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+    assert_eq!(report.rows_written, 0);
+    assert_eq!(report.skipped_drifted, 1);
+    assert_eq!(report.unfinished_paths, ["src.rs"]);
 }
 
 #[test]
@@ -666,6 +740,53 @@ fn live_version_migration_blocks_a_different_content_destination_collision() {
         "active currency stays on its still-valid old row"
     );
     assert_eq!(scip_symbol_of(&h, edge), "local ra-lsp-active");
+}
+
+#[test]
+fn live_same_version_write_preserves_a_current_sibling_content_row() {
+    let h = Harness::new();
+    let (_src, _target, edge) = seed_corpus(&h);
+    let key = h.edge_content_key(edge);
+    let sibling_file = h.add_file_in_scope("src.rs", OTHER_COMMIT, OTHER_WORKTREE);
+    let sibling_sha = h.file_sha_for_commit("src.rs", OTHER_COMMIT);
+    h.add_edge(sibling_file, "target", 14, 20, "NameOnly", None);
+    crate::store::write_edge_oracle(
+        &h.conn,
+        OracleTool::RaLsp,
+        LIVE_VERSION,
+        &crate::store::EdgeOracleRow {
+            source_path: &key.source_path,
+            source_start_byte: key.source_start_byte,
+            source_end_byte: key.source_end_byte,
+            callee_start_byte: key.callee_start_byte,
+            callee_end_byte: key.callee_end_byte,
+            edge_kind: &key.edge_kind,
+            file_sha: &sibling_sha,
+            resolved_symbol_id: None,
+            scip_symbol: "local ra-lsp-sibling",
+            kind: OracleResolutionKind::Upgrade,
+        },
+    )
+    .unwrap();
+
+    let uri = root_uri(&h);
+    let def = def_uri(&h, "defs.rs");
+    let mut session = fake_session(&uri, Some((def, (0, 3), (0, 9))));
+    let worklist = vec!["src.rs".to_string()];
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+    assert_eq!(report.rows_written, 0);
+    assert_eq!(report.skipped_content_collisions, 1);
+    let (stored_sha, stored_symbol): (String, String) = h
+        .conn
+        .query_row(
+            "SELECT file_sha, scip_symbol FROM edge_oracle
+             WHERE tool = 'ra-lsp' AND tool_version = ?1",
+            [LIVE_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((stored_sha, stored_symbol), (sibling_sha, "local ra-lsp-sibling".into()));
 }
 
 #[test]

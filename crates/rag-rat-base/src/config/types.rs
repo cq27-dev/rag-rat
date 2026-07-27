@@ -244,7 +244,7 @@ pub struct OracleLiveConfig {
     pub idle_shutdown_secs: u64,
     /// Cap on LSP requests a single pass may issue (default 200) — the budget that keeps a
     /// big change set from monopolizing the maintenance pass. Unfinished files ride the next
-    /// pass via the watcher's backlog.
+    /// pass via the watcher's backlog. Must be positive; zero is rejected at config load.
     pub max_requests_per_pass: u64,
 }
 

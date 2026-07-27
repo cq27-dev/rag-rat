@@ -37,7 +37,7 @@ the batch verdict wins.
 [oracle.live]
 enabled = false               # off by default — opt in explicitly
 idle_shutdown_secs = 900      # shut the language server down after 15 min idle
-max_requests_per_pass = 200   # cap on LSP requests per maintenance pass; the rest rides the next pass
+max_requests_per_pass = 200   # positive cap per maintenance pass; zero is rejected
 ```
 
 **Standalone:** `[oracle.live]` does NOT imply or require `[oracle] auto_run`. Without a batch
@@ -47,4 +47,5 @@ moniker-anchored memory relocation get nothing until a batch `oracle run` comple
 status` says so when that's the case). Each completed batch run auto-upgrades subsequent live
 passes to the real monikers. Live runs only from the resident watcher (never one-shot hook/CLI
 maintenance passes, which would pay a language-server warm-up per invocation), and needs
-`rust-analyzer` on `PATH`; a missing tool degrades quietly like a missing embedding model.
+`rust-analyzer` on `PATH`; probe and launch run from the checkout root so rustup directory overrides
+apply. A missing tool degrades quietly like a missing embedding model.

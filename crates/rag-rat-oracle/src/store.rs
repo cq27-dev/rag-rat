@@ -673,6 +673,41 @@ pub(crate) fn existing_verdict_scip_symbol(
     .map_err(Into::into)
 }
 
+/// Whether `row`'s content key is still a live edge for `file_sha` in ANY checkout of the active
+/// repo. Live rows are content-keyed without `file_sha` in the PK, so an ordinary same-version
+/// upsert must not replace a different-SHA row while a sibling checkout still joins to it.
+pub(crate) fn verdict_content_is_current_anywhere(
+    conn: &Connection,
+    row: &EdgeOracleRow<'_>,
+    file_sha: &str,
+) -> anyhow::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM edges_data
+             JOIN files ON files.id = edges_data.source_file_id
+             JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
+             WHERE files.path = ?1 AND files.sha256 = ?2
+               AND edges_data.source_start_byte = ?3
+               AND edges_data.source_end_byte = ?4
+               AND edges_data.callee_start_byte = ?5
+               AND edges_data.callee_end_byte = ?6
+               AND ek.value = ?7
+               AND edges_data.hidden = 0)",
+        params![
+            row.source_path,
+            file_sha,
+            row.source_start_byte,
+            row.source_end_byte,
+            row.callee_start_byte,
+            row.callee_end_byte,
+            row.edge_kind,
+        ],
+        |db_row| db_row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 /// All symbols defined in a file (by path, scoped to commit/worktree), with their byte spans, so a
 /// SCIP definition range can be mapped to the enclosing symbol by overlap.
 pub(crate) fn symbol_spans_for_path(
