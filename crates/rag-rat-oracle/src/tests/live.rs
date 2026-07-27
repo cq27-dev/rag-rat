@@ -742,6 +742,73 @@ fn live_version_migration_blocks_a_different_content_destination_collision() {
     assert_eq!(scip_symbol_of(&h, edge), "local ra-lsp-active");
 }
 
+/// A destination row for bytes no live checkout still owns is retained history, not a collision.
+/// Version migration must replace it with the active checkout's current evidence.
+#[test]
+fn live_version_migration_replaces_a_stale_destination_collision() {
+    let h = Harness::new();
+    let (_src, _target, edge) = seed_corpus(&h);
+    let key = h.edge_content_key(edge);
+    let active_sha = h.file_sha("src.rs");
+    crate::store::write_edge_oracle(
+        &h.conn,
+        OracleTool::RaLsp,
+        "old-v",
+        &crate::store::EdgeOracleRow {
+            source_path: &key.source_path,
+            source_start_byte: key.source_start_byte,
+            source_end_byte: key.source_end_byte,
+            callee_start_byte: key.callee_start_byte,
+            callee_end_byte: key.callee_end_byte,
+            edge_kind: &key.edge_kind,
+            file_sha: &active_sha,
+            resolved_symbol_id: None,
+            scip_symbol: "local ra-lsp-current",
+            kind: OracleResolutionKind::Upgrade,
+        },
+    )
+    .unwrap();
+    crate::store::write_edge_oracle(
+        &h.conn,
+        OracleTool::RaLsp,
+        "new-v",
+        &crate::store::EdgeOracleRow {
+            source_path: &key.source_path,
+            source_start_byte: key.source_start_byte,
+            source_end_byte: key.source_end_byte,
+            callee_start_byte: key.callee_start_byte,
+            callee_end_byte: key.callee_end_byte,
+            edge_kind: &key.edge_kind,
+            file_sha: "stale-unowned-sha",
+            resolved_symbol_id: None,
+            scip_symbol: "local ra-lsp-stale",
+            kind: OracleResolutionKind::Upgrade,
+        },
+    )
+    .unwrap();
+
+    let copied = crate::store::migrate_live_verdicts_to_version(
+        &h.conn,
+        OracleTool::RaLsp,
+        "old-v",
+        "new-v",
+        COMMIT,
+        WORKTREE,
+    )
+    .unwrap();
+    assert_eq!(copied, crate::store::LiveVersionMigration::Copied(1));
+    let (sha, symbol): (String, String) = h
+        .conn
+        .query_row(
+            "SELECT file_sha, scip_symbol FROM edge_oracle
+             WHERE tool = 'ra-lsp' AND tool_version = 'new-v'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((sha, symbol), (active_sha, "local ra-lsp-current".into()));
+}
+
 #[test]
 fn live_same_version_write_preserves_a_current_sibling_content_row() {
     let h = Harness::new();

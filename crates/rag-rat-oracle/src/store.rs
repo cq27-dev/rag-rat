@@ -361,8 +361,9 @@ pub(crate) fn indexed_file_sha_for_path(
 pub(crate) type LiveEdgeKey = (i64, i64, i64, i64, String);
 
 /// The full content keys of a file's edges already covered by a CURRENT live verdict for
-/// `(tool, tool_version)` — current meaning the row's `file_sha` matches the file's indexed
-/// content NOW (the content-addressed currency the live pass keys on, #534). The budget
+/// `(tool, tool_version)` — current meaning this checkout's latest run selects `tool_version` and
+/// the row's `file_sha` matches the file's indexed content NOW (the content-addressed currency the
+/// live pass keys on, #534). The budget
 /// continuation mechanism: a file a prior pass truncated resumes where it stopped, because
 /// already-verdicted callees are skipped by the live pass. The key is the FULL edge identity
 /// (source span + callee span + edge kind), never the callee start alone: two edges can share
@@ -382,6 +383,14 @@ pub(crate) fn live_covered_edges_for_path(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<std::collections::HashSet<LiveEdgeKey>> {
+    // Shared content-key rows are NOT usable continuation coverage until this checkout has a run
+    // establishing the same tool version as current. Without this gate, a sibling's rows can make
+    // a fresh checkout skip every request while surfacing rejects them for missing currency.
+    if latest_run_tool_version(conn, tool, commit_sha, worktree_id)?.as_deref()
+        != Some(tool_version)
+    {
+        return Ok(std::collections::HashSet::new());
+    }
     let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
     let def_current = edge_oracle_def_current_predicate("?5", "?6");
     let mut stmt = conn.prepare(&format!(
@@ -468,6 +477,22 @@ pub(crate) fn migrate_live_verdicts_to_version(
     );
     let (repo_col, repo_value) =
         if oracle_repo_scope(conn)?.is_some() { ("repo_id, ", "repo_id, ") } else { ("", "") };
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let generation = rag_rat_db::schema::active_generation(conn)?;
+    // Unlike the active-source predicate above, destination currency must look across EVERY
+    // checkout. Bypass temp.files and pin the raw tables to this repo's live generation.
+    let dest_current = "EXISTS (
+         SELECT 1
+         FROM main.edges_data all_edges
+         JOIN main.files all_files ON all_files.id = all_edges.source_file_id
+         JOIN main.name_strings all_kinds ON all_kinds.id = all_edges.edge_kind_id
+         WHERE all_files.repo_id = ?6 AND all_files.generation = ?7
+           AND all_files.path = dest.source_path AND all_files.sha256 = dest.file_sha
+           AND all_edges.source_start_byte = dest.source_start_byte
+           AND all_edges.source_end_byte = dest.source_end_byte
+           AND all_edges.callee_start_byte = dest.callee_start_byte
+           AND all_edges.callee_end_byte = dest.callee_end_byte
+           AND all_kinds.value = dest.edge_kind AND all_edges.hidden = 0)";
     let collision = conn.query_row(
         &format!(
             "SELECT EXISTS (
@@ -484,14 +509,53 @@ pub(crate) fn migrate_live_verdicts_to_version(
                   AND dest.edge_kind = old.edge_kind{dest_repo_clause}
                  WHERE old.tool = ?1 AND old.tool_version = ?2{repo_clause}
                    AND dest.file_sha != old.file_sha
-                   AND {active_current})"
+                   AND {active_current}
+                   AND {dest_current})"
         ),
-        params![tool.as_db_str(), from_version, to_version, commit_sha, worktree_id],
+        params![
+            tool.as_db_str(),
+            from_version,
+            to_version,
+            commit_sha,
+            worktree_id,
+            repo_id,
+            generation,
+        ],
         |row| row.get::<_, bool>(0),
     )?;
     if collision {
         return Ok(LiveVersionMigration::BlockedByContentCollision);
     }
+    // A destination collision that is NOT current anywhere is stale retained history (for example
+    // v1→v2→v1 after content changed). Remove it so INSERT below can copy current evidence instead
+    // of being silently ignored by the content-key PK.
+    conn.execute(
+        &format!(
+            "DELETE FROM edge_oracle AS dest
+             WHERE dest.tool = ?1 AND dest.tool_version = ?3{dest_repo_clause}
+               AND NOT {dest_current}
+               AND EXISTS (
+                   SELECT 1 FROM edge_oracle old
+                   WHERE old.tool = ?1 AND old.tool_version = ?2{repo_clause}
+                     AND old.source_path = dest.source_path
+                     AND old.source_start_byte = dest.source_start_byte
+                     AND old.source_end_byte = dest.source_end_byte
+                     AND old.callee_start_byte = dest.callee_start_byte
+                     AND old.callee_end_byte = dest.callee_end_byte
+                     AND old.edge_kind = dest.edge_kind
+                     AND old.file_sha != dest.file_sha
+                     AND {active_current})"
+        ),
+        params![
+            tool.as_db_str(),
+            from_version,
+            to_version,
+            commit_sha,
+            worktree_id,
+            repo_id,
+            generation,
+        ],
+    )?;
     // COPY, never relabel: two checkouts with identical bytes + spans intentionally share the old
     // row. Keeping it lets a sibling's old-version currency continue surfacing the verdict while
     // this checkout switches to the copied new-version row.
@@ -681,19 +745,22 @@ pub(crate) fn verdict_content_is_current_anywhere(
     row: &EdgeOracleRow<'_>,
     file_sha: &str,
 ) -> anyhow::Result<bool> {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let generation = rag_rat_db::schema::active_generation(conn)?;
     conn.query_row(
         "SELECT EXISTS (
              SELECT 1
-             FROM edges_data
-             JOIN files ON files.id = edges_data.source_file_id
-             JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
-             WHERE files.path = ?1 AND files.sha256 = ?2
-               AND edges_data.source_start_byte = ?3
-               AND edges_data.source_end_byte = ?4
-               AND edges_data.callee_start_byte = ?5
-               AND edges_data.callee_end_byte = ?6
+             FROM main.edges_data all_edges
+             JOIN main.files all_files ON all_files.id = all_edges.source_file_id
+             JOIN main.name_strings ek ON ek.id = all_edges.edge_kind_id
+             WHERE all_files.repo_id = ?8 AND all_files.generation = ?9
+               AND all_files.path = ?1 AND all_files.sha256 = ?2
+               AND all_edges.source_start_byte = ?3
+               AND all_edges.source_end_byte = ?4
+               AND all_edges.callee_start_byte = ?5
+               AND all_edges.callee_end_byte = ?6
                AND ek.value = ?7
-               AND edges_data.hidden = 0)",
+               AND all_edges.hidden = 0)",
         params![
             row.source_path,
             file_sha,
@@ -702,6 +769,8 @@ pub(crate) fn verdict_content_is_current_anywhere(
             row.callee_start_byte,
             row.callee_end_byte,
             row.edge_kind,
+            repo_id,
+            generation,
         ],
         |db_row| db_row.get(0),
     )

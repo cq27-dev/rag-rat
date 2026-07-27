@@ -599,6 +599,8 @@ fn live_covered_edges_excludes_a_stale_definition_verdict() {
         kind: OracleResolutionKind::Upgrade,
     })
     .unwrap();
+    store::record_oracle_run(&h.conn, OracleTool::RaLsp, "v", COMMIT, WORKTREE, "Completed", "{}")
+        .unwrap();
     let covered = store::live_covered_edges_for_path(
         &h.conn,
         OracleTool::RaLsp,
@@ -610,4 +612,56 @@ fn live_covered_edges_excludes_a_stale_definition_verdict() {
     )
     .unwrap();
     assert_eq!(covered.len(), 1, "the live-definition verdict is coverage; the stale one is not");
+}
+
+/// Content-keyed verdict rows can be shared by identical checkout content, but continuation
+/// currency cannot: a sibling checkout's run must not make a fresh checkout skip LSP requests.
+#[test]
+fn live_covered_edges_requires_this_checkouts_current_run() {
+    let h = Harness::new();
+    let src = h.add_file("src.rs", "fn caller() { target(); }\n");
+    let edge = h.add_edge(src, "target", 14, 20, "NameOnly", None);
+    let key = h.edge_content_key(edge);
+    let sha = h.file_sha("src.rs");
+    store::write_edge_oracle(&h.conn, OracleTool::RaLsp, "v", &EdgeOracleRow {
+        source_path: &key.source_path,
+        source_start_byte: key.source_start_byte,
+        source_end_byte: key.source_end_byte,
+        callee_start_byte: key.callee_start_byte,
+        callee_end_byte: key.callee_end_byte,
+        edge_kind: &key.edge_kind,
+        file_sha: &sha,
+        resolved_symbol_id: None,
+        scip_symbol: "local ra-lsp-shared",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+    store::record_oracle_run(
+        &h.conn,
+        OracleTool::RaLsp,
+        "v",
+        OTHER_COMMIT,
+        OTHER_WORKTREE,
+        "Completed",
+        "{}",
+    )
+    .unwrap();
+
+    let covered = || {
+        store::live_covered_edges_for_path(
+            &h.conn,
+            OracleTool::RaLsp,
+            "v",
+            "src.rs",
+            &sha,
+            COMMIT,
+            WORKTREE,
+        )
+        .unwrap()
+    };
+    assert!(covered().is_empty(), "a sibling's run does not establish this checkout's currency");
+
+    store::record_oracle_run(&h.conn, OracleTool::RaLsp, "v", COMMIT, WORKTREE, "Completed", "{}")
+        .unwrap();
+    assert_eq!(covered().len(), 1, "this checkout's matching run activates shared coverage");
 }
