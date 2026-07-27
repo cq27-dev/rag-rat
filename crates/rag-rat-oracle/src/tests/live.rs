@@ -485,7 +485,11 @@ fn live_version_migration_leaves_a_sibling_checkouts_rows_alone() {
     )
     .unwrap();
 
-    assert_eq!(moved, 1, "only the active checkout's row moves");
+    assert_eq!(
+        moved,
+        crate::store::LiveVersionMigration::Copied(1),
+        "only the active checkout's row copies"
+    );
     let sibling_version: String = h
         .conn
         .query_row(
@@ -541,7 +545,7 @@ fn live_version_migration_preserves_a_shared_old_version_row() {
         WORKTREE,
     )
     .unwrap();
-    assert_eq!(copied, 1);
+    assert_eq!(copied, crate::store::LiveVersionMigration::Copied(1));
 
     let mut versions = h
         .conn
@@ -553,6 +557,93 @@ fn live_version_migration_preserves_a_shared_old_version_row() {
         .unwrap();
     versions.dedup();
     assert_eq!(versions, ["new-v", "old-v"], "both checkout currencies retain coverage");
+}
+
+/// The content-key PK excludes `file_sha`, so two different file versions cannot both occupy the
+/// same edge key + tool version. The transition must remain on the old currency instead of letting
+/// a sibling's destination row make active evidence disappear.
+#[test]
+fn live_version_migration_blocks_a_different_content_destination_collision() {
+    let h = Harness::new();
+    let (_src, _target, edge) = seed_corpus(&h);
+    let key = h.edge_content_key(edge);
+    let active_sha = h.file_sha("src.rs");
+    crate::store::write_edge_oracle(
+        &h.conn,
+        OracleTool::RaLsp,
+        LIVE_VERSION,
+        &crate::store::EdgeOracleRow {
+            source_path: &key.source_path,
+            source_start_byte: key.source_start_byte,
+            source_end_byte: key.source_end_byte,
+            callee_start_byte: key.callee_start_byte,
+            callee_end_byte: key.callee_end_byte,
+            edge_kind: &key.edge_kind,
+            file_sha: &active_sha,
+            resolved_symbol_id: None,
+            scip_symbol: "local ra-lsp-active",
+            kind: OracleResolutionKind::Upgrade,
+        },
+    )
+    .unwrap();
+    crate::store::record_oracle_run(
+        &h.conn,
+        OracleTool::RaLsp,
+        LIVE_VERSION,
+        COMMIT,
+        WORKTREE,
+        "Completed",
+        "{}",
+    )
+    .unwrap();
+
+    let sibling_file = h.add_file_in_scope("src.rs", OTHER_COMMIT, OTHER_WORKTREE);
+    let sibling_sha = h.file_sha_for_commit("src.rs", OTHER_COMMIT);
+    h.add_edge(sibling_file, "target", 14, 20, "NameOnly", None);
+    crate::store::write_edge_oracle(
+        &h.conn,
+        OracleTool::RaLsp,
+        "ra-test-2",
+        &crate::store::EdgeOracleRow {
+            source_path: &key.source_path,
+            source_start_byte: key.source_start_byte,
+            source_end_byte: key.source_end_byte,
+            callee_start_byte: key.callee_start_byte,
+            callee_end_byte: key.callee_end_byte,
+            edge_kind: &key.edge_kind,
+            file_sha: &sibling_sha,
+            resolved_symbol_id: None,
+            scip_symbol: "local ra-lsp-sibling",
+            kind: OracleResolutionKind::Upgrade,
+        },
+    )
+    .unwrap();
+
+    let client = client_with_server(move |msg: &Value| {
+        let id = msg.get("id").cloned();
+        match msg.get("method").and_then(Value::as_str) {
+            Some("initialize") => Some(vec![json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {"capabilities": {"positionEncoding": "utf-16"}}
+            })]),
+            _ if id.is_none() => Some(vec![]),
+            _ => Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": null})]),
+        }
+    });
+    let uri = root_uri(&h);
+    let mut session = LiveOracleSession::from_client(client, "ra-test-2", &uri);
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &[], 100)).unwrap();
+
+    assert_eq!(report.status, "VersionMigrationBlocked");
+    assert!(!report.version_migrated);
+    assert_eq!(
+        crate::store::latest_run_tool_version(&h.conn, OracleTool::RaLsp, COMMIT, WORKTREE)
+            .unwrap()
+            .as_deref(),
+        Some(LIVE_VERSION),
+        "active currency stays on its still-valid old row"
+    );
+    assert_eq!(scip_symbol_of(&h, edge), "local ra-lsp-active");
 }
 
 #[test]

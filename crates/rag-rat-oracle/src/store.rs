@@ -409,14 +409,24 @@ pub(crate) fn live_covered_edges_for_path(
     Ok(out)
 }
 
-/// Copy every current-checkout `edge_oracle` row of `tool` from one `tool_version` to another,
-/// returning the inserted row count. The live oracle's version-transition path (#534): a respawn
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveVersionMigration {
+    Copied(u64),
+    /// The destination version already owns the same content key for different file bytes. Because
+    /// `file_sha` is not in the PK, both checkout-scoped verdicts cannot coexist under that
+    /// version.
+    BlockedByContentCollision,
+}
+
+/// Copy every current-checkout `edge_oracle` row of `tool` from one `tool_version` to another.
+/// The live oracle's version-transition path (#534): a respawn
 /// probing a NEW `rust-analyzer --version` would otherwise make the first partial pass's run row
 /// the latest for the whole checkout and gate every prior-version verdict out of currency —
 /// collapsing live coverage to the handful of files the new session revisited. The rows are
 /// content-addressed (`file_sha` still gates drift), so copying them under the new version
-/// preserves coverage; a row the new version already wrote (same content key) wins via `INSERT OR
-/// IGNORE`.
+/// preserves coverage. An identical destination row wins via `INSERT OR IGNORE`; a destination
+/// row for DIFFERENT bytes blocks the whole transition before any copy, because the content-key PK
+/// cannot represent both and advancing currency would hide one checkout's valid verdict.
 ///
 /// SCOPE (load-bearing): the copied set is restricted to rows whose LIVE EDGE belongs to the active
 /// `(commit_sha, worktree_id)` checkout — the SAME content join [`clear_edge_oracle_for_tool`]
@@ -432,8 +442,9 @@ pub(crate) fn migrate_live_verdicts_to_version(
     to_version: &str,
     commit_sha: &str,
     worktree_id: &str,
-) -> anyhow::Result<u64> {
-    let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
+) -> anyhow::Result<LiveVersionMigration> {
+    let repo_clause = oracle_repo_scope_clause(conn, "old")?;
+    let dest_repo_clause = oracle_repo_scope_clause(conn, "dest")?;
     let scope = active_checkout_file_predicate("?4", "?5");
     // The active-checkout, current-CONTENT live-edge predicate: the row's `file_sha` must equal
     // the checkout's CURRENT `files.sha256`, so a sibling worktree's row (same path + spans, but
@@ -445,18 +456,42 @@ pub(crate) fn migrate_live_verdicts_to_version(
              FROM edges_data
              JOIN files ON files.id = edges_data.source_file_id
              JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
-             WHERE files.path = edge_oracle.source_path
-               AND files.sha256 = edge_oracle.file_sha
-               AND edges_data.source_start_byte = edge_oracle.source_start_byte
-               AND edges_data.source_end_byte = edge_oracle.source_end_byte
-               AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
-               AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
-               AND ek.value = edge_oracle.edge_kind
+             WHERE files.path = old.source_path
+               AND files.sha256 = old.file_sha
+               AND edges_data.source_start_byte = old.source_start_byte
+               AND edges_data.source_end_byte = old.source_end_byte
+               AND edges_data.callee_start_byte = old.callee_start_byte
+               AND edges_data.callee_end_byte = old.callee_end_byte
+               AND ek.value = old.edge_kind
                AND edges_data.hidden = 0
                AND {scope})"
     );
     let (repo_col, repo_value) =
         if oracle_repo_scope(conn)?.is_some() { ("repo_id, ", "repo_id, ") } else { ("", "") };
+    let collision = conn.query_row(
+        &format!(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM edge_oracle old
+                 JOIN edge_oracle dest
+                   ON dest.tool = old.tool
+                  AND dest.tool_version = ?3
+                  AND dest.source_path = old.source_path
+                  AND dest.source_start_byte = old.source_start_byte
+                  AND dest.source_end_byte = old.source_end_byte
+                  AND dest.callee_start_byte = old.callee_start_byte
+                  AND dest.callee_end_byte = old.callee_end_byte
+                  AND dest.edge_kind = old.edge_kind{dest_repo_clause}
+                 WHERE old.tool = ?1 AND old.tool_version = ?2{repo_clause}
+                   AND dest.file_sha != old.file_sha
+                   AND {active_current})"
+        ),
+        params![tool.as_db_str(), from_version, to_version, commit_sha, worktree_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if collision {
+        return Ok(LiveVersionMigration::BlockedByContentCollision);
+    }
     // COPY, never relabel: two checkouts with identical bytes + spans intentionally share the old
     // row. Keeping it lets a sibling's old-version currency continue surfacing the verdict while
     // this checkout switches to the copied new-version row.
@@ -469,13 +504,13 @@ pub(crate) fn migrate_live_verdicts_to_version(
              SELECT {repo_value}source_path, source_start_byte, source_end_byte,
                     callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, ?3,
                     resolved_symbol_id, scip_symbol, kind, computed_at
-             FROM edge_oracle
-             WHERE tool = ?1 AND tool_version = ?2{repo_clause}
+             FROM edge_oracle old
+             WHERE old.tool = ?1 AND old.tool_version = ?2{repo_clause}
                AND {active_current}"
         ),
         params![tool.as_db_str(), from_version, to_version, commit_sha, worktree_id],
     )?;
-    Ok(moved as u64)
+    Ok(LiveVersionMigration::Copied(moved as u64))
 }
 
 /// [`edge_join_candidates`] restricted to a set of source paths — the live oracle's per-pass

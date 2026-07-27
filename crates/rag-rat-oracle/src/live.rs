@@ -221,8 +221,7 @@ pub fn live_oracle_pass(
         store::latest_run_tool_version(conn, tool, input.commit_sha, input.worktree_id)?
         && old_version != session.tool_version()
     {
-        version_migrated = true;
-        let moved = store::migrate_live_verdicts_to_version(
+        let migration = store::migrate_live_verdicts_to_version(
             conn,
             tool,
             &old_version,
@@ -230,8 +229,23 @@ pub fn live_oracle_pass(
             input.commit_sha,
             input.worktree_id,
         )?;
-        if moved > 0 {
-            refinements_stale = true;
+        match migration {
+            store::LiveVersionMigration::Copied(moved) => {
+                version_migrated = true;
+                if moved > 0 {
+                    refinements_stale = true;
+                }
+            },
+            store::LiveVersionMigration::BlockedByContentCollision => {
+                // The content-key PK cannot hold both checkouts' different bytes under the new
+                // version. Do NOT process/write with that version or record its currency: preserve
+                // the active checkout's old-version coverage and retry after the collision clears.
+                report.unfinished_paths = input.worklist.to_vec();
+                report.status = "VersionMigrationBlocked".to_string();
+                tx.commit()?;
+                session.touch(rag_rat_base::time::now_ms());
+                return Ok(report);
+            },
         }
     }
     let mut aborted: Option<String> = None;
