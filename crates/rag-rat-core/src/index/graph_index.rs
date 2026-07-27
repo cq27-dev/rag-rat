@@ -104,9 +104,8 @@ pub(crate) fn realign_logical_symbol_ids(conn: &rusqlite::Connection) -> rusqlit
     }
     let has_scope_path = conn.prepare("SELECT scope_path FROM symbols LIMIT 0").is_ok();
     let scope_path_subquery = if has_scope_path {
-        "(SELECT COALESCE(s.scope_path, '') FROM logical_symbol_members m \
-           JOIN symbols s ON s.id = m.symbol_id \
-          WHERE m.logical_symbol_id = ls.id LIMIT 1)"
+        "(SELECT COALESCE(s.scope_path, '') FROM logical_symbol_members m JOIN symbols s ON s.id = \
+         m.symbol_id WHERE m.logical_symbol_id = ls.id LIMIT 1)"
     } else {
         "''"
     };
@@ -547,7 +546,6 @@ struct LogicalKeyDriftCandidate {
     id: i64,
     kind: String,
     qualified_name: Option<String>,
-    scope_path: Option<String>,
     signature: Option<String>,
 }
 
@@ -1445,9 +1443,6 @@ impl IndexDatabase {
             "
             SELECT ls.id, ls.kind,
                    (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
-                   (SELECT COALESCE(s.scope_path, '') FROM logical_symbol_members m
-                      JOIN symbols s ON s.id = m.symbol_id
-                     WHERE m.logical_symbol_id = ls.id LIMIT 1),
                    {UNANIMOUS_MEMBER_SIGNATURE_SQL}
             FROM main.logical_symbols ls
             WHERE ls.repo_id = ?1 AND ls.path = ?2 AND ls.logical_name = ?3
@@ -1459,8 +1454,7 @@ impl IndexDatabase {
                     id: row.get(0)?,
                     kind: row.get(1)?,
                     qualified_name: row.get(2)?,
-                    scope_path: row.get(3)?,
-                    signature: row.get(4)?,
+                    signature: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1468,7 +1462,6 @@ impl IndexDatabase {
             .into_iter()
             .filter(|candidate| {
                 drift_evidence_agrees(&old.qualified_name, &candidate.qualified_name)
-                    || drift_evidence_agrees(&old.scope_path, &candidate.scope_path)
                     || drift_evidence_agrees(&old.signature, &candidate.signature)
             })
             .collect())

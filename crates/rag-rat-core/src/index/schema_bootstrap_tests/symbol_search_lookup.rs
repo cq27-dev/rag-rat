@@ -2052,7 +2052,7 @@ fn papertrail_sync_caches_rationale_without_query_time_crawling() {
 }
 
 #[test]
-fn logical_symbol_grouping_owner_isolation_tests() {
+fn logical_symbol_grouping_preserves_rust_method_owners() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -2118,10 +2118,26 @@ pub fn call_alpha() {
         .unwrap();
 
     assert_eq!(new_lookup.candidates.len(), 2, "2 candidates for new");
-    let c0 = &new_lookup.candidates[0];
-    let c1 = &new_lookup.candidates[1];
+    let scope_path = |symbol_id: i64| {
+        db.storage
+            .connection()
+            .query_row("SELECT scope_path FROM symbols WHERE id = ?1", [symbol_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+    };
+    let alpha_new = new_lookup
+        .candidates
+        .iter()
+        .find(|candidate| scope_path(candidate.symbol_id) == "Alpha::new")
+        .expect("Alpha::new candidate");
+    let beta_new = new_lookup
+        .candidates
+        .iter()
+        .find(|candidate| scope_path(candidate.symbol_id) == "Beta::new")
+        .expect("Beta::new candidate");
     assert_ne!(
-        c0.logical_symbol_id, c1.logical_symbol_id,
+        alpha_new.logical_symbol_id, beta_new.logical_symbol_id,
         "Alpha::new and Beta::new must have distinct logical_symbol_ids"
     );
 
@@ -2142,10 +2158,18 @@ pub fn call_alpha() {
         .unwrap();
 
     assert_eq!(run_lookup.candidates.len(), 2, "2 candidates for run");
-    let r0 = &run_lookup.candidates[0];
-    let r1 = &run_lookup.candidates[1];
+    let alpha_run = run_lookup
+        .candidates
+        .iter()
+        .find(|candidate| scope_path(candidate.symbol_id) == "Alpha::run")
+        .expect("impl Worker for Alpha must use the implementing type as its owner");
+    let beta_run = run_lookup
+        .candidates
+        .iter()
+        .find(|candidate| scope_path(candidate.symbol_id) == "Beta::run")
+        .expect("impl Worker for Beta must use the implementing type as its owner");
     assert_ne!(
-        r0.logical_symbol_id, r1.logical_symbol_id,
+        alpha_run.logical_symbol_id, beta_run.logical_symbol_id,
         "impl Worker for Alpha vs impl Worker for Beta must have distinct logical_symbol_ids"
     );
 
@@ -2177,35 +2201,32 @@ pub fn call_alpha() {
 
     // 4. Exact logical lookup/caller behavior not crossing owners
     let alpha_new_callers = db
-        .find_callers_with_options(
-            "Alpha::new",
-            10,
-            &rag_rat_query::graph::GraphTraversalOptions {
-                resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
-                symbol_id: Some(c0.symbol_id),
-                ..Default::default()
-            },
-        )
+        .find_callers_with_options("Alpha::new", 10, &rag_rat_query::graph::GraphTraversalOptions {
+            resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
+            symbol_id: Some(alpha_new.symbol_id),
+            ..Default::default()
+        })
         .unwrap();
 
     let beta_new_callers = db
-        .find_callers_with_options(
-            "Beta::new",
-            10,
-            &rag_rat_query::graph::GraphTraversalOptions {
-                resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
-                symbol_id: Some(c1.symbol_id),
-                ..Default::default()
-            },
-        )
+        .find_callers_with_options("Beta::new", 10, &rag_rat_query::graph::GraphTraversalOptions {
+            resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
+            symbol_id: Some(beta_new.symbol_id),
+            ..Default::default()
+        })
         .unwrap();
 
-    let callers = if !alpha_new_callers.is_empty() { alpha_new_callers } else { beta_new_callers };
     assert!(
-        callers.iter().any(|edge| {
-            edge.from_symbol.as_deref().is_some_and(|s| s.contains("call_alpha"))
-        }),
+        alpha_new_callers
+            .iter()
+            .any(|edge| { edge.from_symbol.as_deref().is_some_and(|s| s.contains("call_alpha")) }),
         "call_alpha calls Alpha::new"
+    );
+    assert!(
+        beta_new_callers
+            .iter()
+            .all(|edge| { !edge.from_symbol.as_deref().is_some_and(|s| s.contains("call_alpha")) }),
+        "call_alpha must not appear as a caller of Beta::new"
     );
 
     let _ = fs::remove_dir_all(&root);
