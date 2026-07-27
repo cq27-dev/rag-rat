@@ -42,9 +42,11 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
 
+use path_slash::PathExt as _;
 use rag_rat_base::hash::hex_sha256;
 use rusqlite::Connection;
 use serde::Serialize;
+use url::Url;
 
 use super::lsp::client::LspClient;
 use super::lsp::position::LineIndex;
@@ -73,7 +75,7 @@ impl LiveOracleSession {
         let ToolAvailability::Available { version, .. } = manifest.probe() else {
             return None;
         };
-        let root_uri = root_uri_for(checkout_root);
+        let root_uri = root_uri_for(checkout_root)?;
         let mut client = LspClient::spawn(manifest.program, &[]).ok()?;
         client.initialize(&root_uri).ok()?;
         Some(Self { client, tool_version: version, root_uri, last_used_ms: now_ms })
@@ -328,13 +330,11 @@ pub fn live_oracle_pass(
         let (to_resolve, deferred) = unverdicted.split_at(remaining.min(unverdicted.len()));
         let deferred_count = deferred.len();
 
-        // Join on exactly one separator: a root URI already ending in `/` (a filesystem-root `/`
-        // or a drive root `C:\`) would otherwise produce `file:////…` / `file:///C://…`, which
-        // rust-analyzer's canonical single-slash form then fails to prefix-match (#534 review).
-        // `strip_suffix` drops at most ONE slash — `trim_end_matches('/')` would eat `file:///`
-        // down to `file:`.
-        let root = session.root_uri.strip_suffix('/').unwrap_or(&session.root_uri);
-        let uri = format!("{root}/{}", encode_uri_path(path));
+        // Platform-aware file URL conversion handles drive/UNC/verbatim prefixes and percent
+        // encoding; hand-joining the root and DB path repeatedly produced malformed URIs.
+        let uri: String = Url::from_file_path(input.checkout_root.join(path))
+            .map_err(|()| anyhow::anyhow!("cannot convert live-oracle document path to file URL"))?
+            .into();
         let starts: Vec<usize> =
             to_resolve.iter().filter_map(|c| usize::try_from(c.callee_start_byte).ok()).collect();
         report.requests_used += starts.len() as u64;
@@ -564,150 +564,80 @@ fn live_local_sentinel(source_path: &str, candidate: &store::EdgeJoinCandidate) 
     format!("local ra-lsp-{}", &hash[..16])
 }
 
-/// The `file://` URI of a checkout root — the base every document URI hangs off. Encodes any
-/// non-URI-path byte as %XX (spaces, non-ASCII); `/` is preserved. Two Windows forms keep the
-/// shape rust-analyzer returns canonically (so `path_from_uri`'s literal prefix match agrees,
-/// #534 review): a drive prefix (`C:`) keeps its colon unencoded (`file:///C:/repo`), and a UNC
-/// path (`\\server\share`) becomes an authority URI (`file://server/share/…`, no extra slash).
-fn root_uri_for(checkout_root: &Path) -> String {
-    let lossy = checkout_root.to_string_lossy().replace('\\', "/");
-    // `Path::canonicalize` on Windows returns verbatim paths. Normalize those BEFORE the UNC
-    // branch: `\\?\C:\repo` becomes `//?/C:/repo` after separator replacement and would otherwise
-    // be mistaken for an authority named `?`; verbatim UNC uses the `\\?\UNC\server\share` form.
-    let lossy = if let Some(unc) = lossy.strip_prefix("//?/UNC/") {
-        format!("//{unc}")
-    } else if let Some(drive) = lossy.strip_prefix("//?/") {
-        drive.to_string()
-    } else {
-        lossy
-    };
-    // UNC: `//server/share/…` → `file://server/share/…` (the server is the URI authority, not a
-    // path segment). Encode each segment but keep the `/` separators.
-    if let Some(unc) = lossy.strip_prefix("//") {
-        return format!("file://{}", encode_uri_path(unc));
-    }
-    let with_lead = if lossy.starts_with('/') { lossy } else { format!("/{lossy}") };
-    let bytes = with_lead.as_bytes();
-    // Drive prefix: `/C:/…` after the leading-slash normalization.
-    let drive_len =
-        if bytes.len() >= 4 && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' { 3 } else { 0 };
-    format!("file://{}{}", &with_lead[..drive_len], encode_uri_path(&with_lead[drive_len..]))
+/// The canonical `file://` URL of a checkout directory. `url` handles native disk,
+/// verbatim-disk, UNC, and verbatim-UNC prefixes on Windows and percent-encodes path bytes.
+fn root_uri_for(checkout_root: &Path) -> Option<String> {
+    Url::from_directory_path(checkout_root).ok().map(Into::into)
 }
 
-/// Percent-encode a URI path: keep the RFC 3986 unreserved set plus `/`; %XX-encode the rest.
-fn encode_uri_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' =>
-                out.push(byte as char),
-            _ => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "%{byte:02X}");
-            },
-        }
-    }
-    out
-}
-
-/// The repo-relative path of a `file://` document URI under `root_uri`, percent-decoded; `None`
-/// when the URI points outside the checkout (an external dependency — nothing live can write).
+/// The repo-relative slash path of a `file://` document URI under `root_uri`; `None` when either
+/// URL is not a native file path or the target is outside the checkout.
 fn path_from_uri(root_uri: &str, uri: &str) -> Option<String> {
-    let rest = uri.strip_prefix(root_uri)?;
-    // Require a path boundary after a non-root checkout URI. A lexical prefix such as
-    // `file:///work/repo` must not accept `file:///work/repository/x.rs` as `sitory/x.rs`.
-    // Slash-terminated roots (`file:///`, `file:///C:/`) already supply that boundary.
-    let rest = if root_uri.ends_with('/') { rest } else { rest.strip_prefix('/')? };
-    let mut bytes = Vec::with_capacity(rest.len());
-    let raw = rest.as_bytes();
-    let mut i = 0;
-    while i < raw.len() {
-        if raw[i] == b'%' && i + 2 < raw.len() {
-            let hex = std::str::from_utf8(&raw[i + 1..i + 3]).ok()?;
-            bytes.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
-        } else {
-            bytes.push(raw[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(bytes).ok()
+    let root = Url::parse(root_uri).ok()?.to_file_path().ok()?;
+    let target = Url::parse(uri).ok()?.to_file_path().ok()?;
+    let relative = target.strip_prefix(root).ok()?;
+    Some(relative.to_slash_lossy().into_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn root_uri_encodes_spaces_and_preserves_slashes() {
-        assert_eq!(root_uri_for(Path::new("/tmp/my repo")), "file:///tmp/my%20repo");
-        assert_eq!(root_uri_for(Path::new("/plain/path")), "file:///plain/path");
+        assert_eq!(
+            root_uri_for(Path::new("/tmp/my repo")).as_deref(),
+            Some("file:///tmp/my%20repo/")
+        );
+        assert_eq!(root_uri_for(Path::new("/plain/path")).as_deref(), Some("file:///plain/path/"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn root_uri_keeps_a_windows_drive_colon_verbatim() {
         // rust-analyzer returns `file:///C:/repo/…` canonically; encoding the drive colon
         // (`file:///C%3A/repo`) would break `path_from_uri`'s prefix match and class every
         // in-repo definition as external (#534 review).
-        let root = root_uri_for(Path::new(r"C:\repo"));
-        assert_eq!(root, "file:///C:/repo");
+        let root = root_uri_for(Path::new(r"C:\repo")).unwrap();
+        assert_eq!(root, "file:///C:/repo/");
         assert_eq!(path_from_uri(&root, "file:///C:/repo/src/lib.rs"), Some("src/lib.rs".into()));
         // A drive root with a space still encodes the non-drive part.
-        assert_eq!(root_uri_for(Path::new(r"D:\my repo")), "file:///D:/my%20repo");
-    }
-
-    #[test]
-    fn root_uri_strips_windows_verbatim_prefixes() {
-        // Canonical Windows paths carry `\\?\`; rust-analyzer emits ordinary canonical file URLs.
-        assert_eq!(root_uri_for(Path::new(r"\\?\C:\repo")), "file:///C:/repo");
         assert_eq!(
-            root_uri_for(Path::new(r"\\?\UNC\server\share\repo")),
-            "file://server/share/repo"
+            root_uri_for(Path::new(r"D:\my repo")).as_deref(),
+            Some("file:///D:/my%20repo/")
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn root_uri_strips_windows_verbatim_prefixes() {
+        // `url` maps canonical Windows verbatim prefixes to ordinary canonical file URLs.
+        assert_eq!(root_uri_for(Path::new(r"\\?\C:\repo")).as_deref(), Some("file:///C:/repo/"));
+        assert_eq!(
+            root_uri_for(Path::new(r"\\?\UNC\server\share\repo")).as_deref(),
+            Some("file://server/share/repo/")
+        );
+    }
+
+    #[cfg(windows)]
     #[test]
     fn root_uri_maps_a_unc_path_to_an_authority_url() {
         // `\\server\share\repo` → `file://server/share/repo` (authority form), matching the
         // canonical URI rust-analyzer returns; a naive join would emit `file:////server/...`
         // and misclass every in-repo definition as external (#534 review).
-        let root = root_uri_for(Path::new(r"\\server\share\repo"));
-        assert_eq!(root, "file://server/share/repo");
+        let root = root_uri_for(Path::new(r"\\server\share\repo")).unwrap();
+        assert_eq!(root, "file://server/share/repo/");
         assert_eq!(
             path_from_uri(&root, "file://server/share/repo/src/a.rs"),
             Some("src/a.rs".into())
         );
     }
 
-    #[test]
-    fn document_join_uses_one_separator_at_a_slash_terminated_root() {
-        // A checkout AT the filesystem root (`/`) or a drive root (`C:\`) yields a root URI
-        // ending in `/`; joining a document must not double the separator or the server's
-        // canonical URI won't prefix-match (#534 review).
-        let root = root_uri_for(Path::new("/"));
-        assert_eq!(root, "file:///");
-        let doc = format!(
-            "{}/{}",
-            root.strip_suffix('/').unwrap_or(&root),
-            encode_uri_path("src/lib.rs")
-        );
-        assert_eq!(doc, "file:///src/lib.rs");
-        assert_eq!(path_from_uri(&root, &doc), Some("src/lib.rs".into()));
-
-        let drive = root_uri_for(Path::new(r"C:\"));
-        assert_eq!(drive, "file:///C:/");
-        let doc = format!(
-            "{}/{}",
-            drive.strip_suffix('/').unwrap_or(&drive),
-            encode_uri_path("src/lib.rs")
-        );
-        assert_eq!(doc, "file:///C:/src/lib.rs");
-        assert_eq!(path_from_uri(&drive, &doc), Some("src/lib.rs".into()));
-    }
-
+    #[cfg(unix)]
     #[test]
     fn path_from_uri_decodes_and_rejects_external() {
-        let root = "file:///tmp/my%20repo";
+        let root = "file:///tmp/my%20repo/";
         assert_eq!(
             path_from_uri(root, "file:///tmp/my%20repo/src/a file.rs"),
             Some("src/a file.rs".to_string())
@@ -716,17 +646,15 @@ mod tests {
         assert_eq!(path_from_uri(root, "file:///tmp/my%20repository/src/lib.rs"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn document_uri_encodes_the_relative_path() {
-        // A repo path carrying URI-reserved bytes (`#`, `%`, spaces, non-ASCII) must be encoded
-        // BEFORE joining the root URI, or the server parses `b.rs` as a fragment and the opened
-        // document never associates with the indexed file (#534 review).
-        assert_eq!(encode_uri_path("src/a b#c%.rs"), "src/a%20b%23c%25.rs");
-        let root = root_uri_for(Path::new("/repo"));
-        let uri = format!("{}/{}", root, encode_uri_path("src/доки/a b.rs"));
+        let root = root_uri_for(Path::new("/repo")).unwrap();
+        let uri: String = Url::from_file_path("/repo/src/доки/a b#c%.rs").unwrap().into();
+        assert!(uri.contains("a%20b%23c%25.rs"));
         assert_eq!(
             path_from_uri(&root, &uri),
-            Some("src/доки/a b.rs".to_string()),
+            Some("src/доки/a b#c%.rs".to_string()),
             "encode → open → decode round-trips the reserved-byte path"
         );
     }

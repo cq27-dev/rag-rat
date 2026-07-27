@@ -139,6 +139,9 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 tempfile = "3"
 toon-format = { version = "0.5.0", default-features = false }
 toml = "1.1"
+# Standards-compliant file URL conversion for the live LSP oracle: native disk/UNC/verbatim path
+# prefixes plus percent encoding/decoding. Already present transitively through HTTP dependencies.
+url = "2.5"
 # Structured debug logging (config-gated `[log]`; off by default). Native-only crate, so the
 # thread/file-based appender is unrestricted. See rag-rat-core/src/logging.
 tracing = "0.1"
