@@ -34,9 +34,9 @@
 //!   — the live analog of the batch join's index-vs-disk content gate. Anything else is skipped,
 //!   never mis-joined.
 //!
-//! Out of scope: watcher-level respawn backoff and independent idle scheduling (#535), non-Rust
-//! backends (#536), and `resolved-external` verdicts (a live definition outside the checkout has
-//! no batch-interchangeable SCIP symbol string, so it is skipped, not written).
+//! Out of scope: non-Rust backends (#536) and `resolved-external` verdicts (a live definition
+//! outside the checkout has no batch-interchangeable SCIP symbol string, so it is skipped, not
+//! written).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -61,7 +61,6 @@ pub struct LiveOracleSession {
     client: LspClient,
     tool_version: String,
     root_uri: String,
-    last_used_ms: i64,
 }
 
 impl LiveOracleSession {
@@ -70,7 +69,7 @@ impl LiveOracleSession {
     /// as a missing embedding model or batch tool (never an error, never a failed pass). The
     /// version is RE-probed at every spawn so `tool_version` always names the binary this
     /// session's verdicts came from.
-    pub fn spawn(checkout_root: &Path, now_ms: i64) -> Option<Self> {
+    pub fn spawn(checkout_root: &Path) -> Option<Self> {
         let manifest = ToolManifest::for_tool(OracleTool::RaLsp);
         let ToolAvailability::Available { version, .. } = manifest.probe_in(checkout_root) else {
             return None;
@@ -78,7 +77,7 @@ impl LiveOracleSession {
         let root_uri = root_uri_for(checkout_root)?;
         let mut client = LspClient::spawn(manifest.program, &[], checkout_root).ok()?;
         client.initialize(&root_uri).ok()?;
-        Some(Self { client, tool_version: version, root_uri, last_used_ms: now_ms })
+        Some(Self { client, tool_version: version, root_uri })
     }
 
     /// Test seam: a session over an injected (fake-server) client transport. Runs the
@@ -102,26 +101,11 @@ impl LiveOracleSession {
 
     #[cfg(test)]
     fn from_initialized_client(client: LspClient, tool_version: &str, root_uri: &str) -> Self {
-        Self {
-            client,
-            tool_version: tool_version.to_string(),
-            root_uri: root_uri.to_string(),
-            last_used_ms: 0,
-        }
+        Self { client, tool_version: tool_version.to_string(), root_uri: root_uri.to_string() }
     }
 
     pub fn tool_version(&self) -> &str {
         &self.tool_version
-    }
-
-    pub fn last_used_ms(&self) -> i64 {
-        self.last_used_ms
-    }
-
-    /// Whether the session has gone `idle_ms` without a pass — the watcher's cue to shut it
-    /// down (an idle server shouldn't hold rust-analyzer's resident memory).
-    pub fn idle_for(&self, now_ms: i64, idle_ms: u64) -> bool {
-        now_ms.saturating_sub(self.last_used_ms) > idle_ms as i64
     }
 
     /// Graceful LSP teardown (`shutdown` + `exit`); the client's Drop hard-kills as the
@@ -129,10 +113,6 @@ impl LiveOracleSession {
     pub fn shutdown(self) {
         let mut this = self;
         let _ = this.client.shutdown();
-    }
-
-    fn touch(&mut self, now_ms: i64) {
-        self.last_used_ms = now_ms;
     }
 
     fn readiness_checkpoint(&mut self) -> std::io::Result<Option<u64>> {
@@ -215,13 +195,11 @@ pub fn live_oracle_pass(
         Ok(None) => {
             report.unfinished_paths = input.worklist.to_vec();
             report.status = "Warming".to_string();
-            session.touch(rag_rat_base::time::now_ms());
             return Ok(report);
         },
         Err(err) => {
             report.unfinished_paths = input.worklist.to_vec();
             report.status = format!("Aborted: {err}");
-            session.touch(rag_rat_base::time::now_ms());
             return Ok(report);
         },
     }
@@ -284,7 +262,6 @@ pub fn live_oracle_pass(
                 report.unfinished_paths = input.worklist.to_vec();
                 report.status = "VersionMigrationBlocked".to_string();
                 tx.commit()?;
-                session.touch(rag_rat_base::time::now_ms());
                 return Ok(report);
             },
         }
@@ -636,9 +613,6 @@ pub fn live_oracle_pass(
         };
     }
     tx.commit()?;
-    // Stamp usage at COMPLETION, not the pass's start: a pass longer than the idle window must
-    // not read as idle on the next pass (that would force a needless respawn + warm-up).
-    session.touch(rag_rat_base::time::now_ms());
     Ok(report)
 }
 

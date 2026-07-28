@@ -523,7 +523,6 @@ fn the_event_loop_drain_persists_a_placement_failure_while_running() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
-        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2686,7 +2685,7 @@ fn pass_worker_runs_requests_in_order_and_reports_completion() {
         let ran = Arc::clone(&ran);
         move |request: &PassRequest| {
             ran.lock().unwrap().push(request.clone());
-            false
+            None
         }
     })
     .expect("worker thread spawns");
@@ -2696,7 +2695,7 @@ fn pass_worker_runs_requests_in_order_and_reports_completion() {
         .unwrap();
     for _ in 0..2 {
         match done_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(LoopMsg::PassDone { live_oracle_retry: false }) => {},
+            Ok(LoopMsg::PassDone { live_oracle_wake_in: None }) => {},
             other => panic!("expected PassDone, got {other:?}"),
         }
     }
@@ -2757,7 +2756,6 @@ fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
-        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2793,7 +2791,7 @@ fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
         );
 
         // Completing the pass dispatches the coalesced follow-up.
-        tx.send(LoopMsg::PassDone { live_oracle_retry: false }).unwrap();
+        tx.send(LoopMsg::PassDone { live_oracle_wake_in: None }).unwrap();
         assert_eq!(
             pass_rx.recv_timeout(Duration::from_secs(5)),
             Ok(PassRequest::Maintenance {
@@ -2854,7 +2852,6 @@ fn events_during_a_pass_do_not_redispatch_until_the_cooldown_elapses() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
-        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2878,7 +2875,7 @@ fn events_during_a_pass_do_not_redispatch_until_the_cooldown_elapses() {
         // debounce is already past due and the loop's own PassDone iteration is where the
         // back-to-back redispatch used to happen.
         std::thread::sleep(Duration::from_millis(100));
-        tx.send(LoopMsg::PassDone { live_oracle_retry: false }).unwrap();
+        tx.send(LoopMsg::PassDone { live_oracle_wake_in: None }).unwrap();
 
         // The pre-#823 behavior was an immediate redispatch here. The follow-up must instead
         // wait out the cooldown (2 s; the 700 ms probe leaves ample CI-jitter margin)...
@@ -2950,7 +2947,6 @@ fn a_due_periodic_sweep_overrides_the_pass_cooldown() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
-        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2962,7 +2958,7 @@ fn a_due_periodic_sweep_overrides_the_pass_cooldown() {
             pass_rx.recv_timeout(Duration::from_secs(5)),
             Ok(PassRequest::Maintenance { run_gc: false, overlay_scope: OverlayScope::All }),
         );
-        tx.send(LoopMsg::PassDone { live_oracle_retry: false }).unwrap();
+        tx.send(LoopMsg::PassDone { live_oracle_wake_in: None }).unwrap();
 
         // The next sweep falls due one second later — deep inside the cooldown — and must
         // dispatch anyway: the backstop bypasses the cooldown.
@@ -3764,7 +3760,6 @@ fn event_loop_ignores_fs_errors_and_exits_on_disconnect() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
-        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -3818,7 +3813,6 @@ fn periodic_sweep_dispatches_all_overlay_scope() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
-        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -3842,7 +3836,7 @@ fn periodic_sweep_dispatches_all_overlay_scope() {
 }
 
 #[test]
-fn live_oracle_backlog_retries_without_events_or_periodic_sweeps() {
+fn live_oracle_deadline_dispatches_without_events_or_periodic_sweeps() {
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -3878,21 +3872,21 @@ fn live_oracle_backlog_retries_without_events_or_periodic_sweeps() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
-        live_oracle_retry_interval: Duration::from_millis(25),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
 
     std::thread::scope(|scope| {
         let handle = scope.spawn(move || event_loop.run());
-        tx.send(LoopMsg::PassDone { live_oracle_retry: true }).unwrap();
+        tx.send(LoopMsg::PassDone { live_oracle_wake_in: Some(Duration::from_millis(25)) })
+            .unwrap();
         assert_eq!(
             pass_rx.recv_timeout(Duration::from_secs(5)),
             Ok(PassRequest::Maintenance {
                 run_gc: false,
                 overlay_scope: OverlayScope::Linked(BTreeSet::new())
             }),
-            "the resident backlog must provide its own retry source",
+            "backlog retries and idle shutdown must share an independent wake source",
         );
 
         stop.store(true, Ordering::Relaxed);
@@ -4035,7 +4029,6 @@ fn idle_watcher_enqueues_papertrail_evaluation_without_filesystem_activity() {
         scheduler: &mut scheduler,
         papertrail_tx: Some(&papertrail_tx),
         papertrail_interval: Some(Duration::from_millis(50)),
-        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -4093,7 +4086,6 @@ fn papertrail_deadline_fires_during_an_in_flight_pass_and_ticks_coalesce() {
         scheduler: &mut scheduler,
         papertrail_tx: Some(&papertrail_tx),
         papertrail_interval: Some(Duration::from_millis(100)),
-        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };

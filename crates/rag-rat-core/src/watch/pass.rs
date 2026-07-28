@@ -190,7 +190,7 @@ pub(crate) enum PassRequest {
 #[derive(Debug)]
 pub(crate) enum LoopMsg {
     Fs(notify::Result<Event>),
-    PassDone { live_oracle_retry: bool },
+    PassDone { live_oracle_wake_in: Option<Duration> },
     PapertrailDone,
     Wake,
 }
@@ -246,20 +246,20 @@ impl PassScheduler {
 /// each pass still takes the write lock itself, so concurrent writers (git-hook `maintenance`,
 /// other servers' elected watchers, the CLI) serialize exactly as before; the single worker
 /// thread is what keeps THIS watcher to one pass at a time. Each request is answered with
-/// [`LoopMsg::PassDone`] so the loop can refresh worktree watch state, schedule any live-oracle
-/// backlog retry, and dispatch a coalesced follow-up; the worker exits when the request channel
-/// closes.
+/// [`LoopMsg::PassDone`] so the loop can refresh worktree watch state, schedule the live oracle's
+/// next backlog-retry or idle-shutdown wake, and dispatch a coalesced follow-up; the worker exits
+/// when the request channel closes.
 pub(crate) fn spawn_pass_worker(
     pass_rx: Receiver<PassRequest>,
     done_tx: Sender<LoopMsg>,
-    mut run_pass_request: impl FnMut(&PassRequest) -> bool + Send + 'static,
+    mut run_pass_request: impl FnMut(&PassRequest) -> Option<Duration> + Send + 'static,
 ) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("rag-rat-watch-pass".to_string())
         .spawn(move || {
             while let Ok(request) = pass_rx.recv() {
-                let live_oracle_retry = run_pass_request(&request);
-                if done_tx.send(LoopMsg::PassDone { live_oracle_retry }).is_err() {
+                let live_oracle_wake_in = run_pass_request(&request);
+                if done_tx.send(LoopMsg::PassDone { live_oracle_wake_in }).is_err() {
                     return;
                 }
             }
