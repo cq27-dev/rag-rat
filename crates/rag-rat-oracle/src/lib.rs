@@ -735,6 +735,12 @@ pub enum OracleTool {
     /// from `RustAnalyzer` (live run rows would otherwise wedge the batch staleness gate). Never
     /// batch-capable.
     TsLsp,
+    /// The LIVE `clangd` client (#536) — C and C++ from one resident session. Distinct from
+    /// [`Self::ScipClang`] on the same reasoning as the other live tools. Unlike them, this
+    /// backend's server PERSISTS ITS OWN INDEX into the checkout (`.cache/clangd/`): clangd's
+    /// background index is what resolves a call across translation units, and no flag relocates
+    /// it — with the index off, a call resolves only to its header declaration.
+    ClangdLsp,
 }
 
 impl OracleTool {
@@ -750,6 +756,7 @@ impl OracleTool {
         Self::ScipJava,
         Self::RaLsp,
         Self::TsLsp,
+        Self::ClangdLsp,
     ];
 
     pub fn as_db_str(self) -> &'static str {
@@ -766,7 +773,7 @@ impl OracleTool {
     /// verdicts from the watcher and have no `scip_command`; every batch driver must skip them
     /// rather than try to invoke them as indexers.
     pub fn batch_capable(self) -> bool {
-        !matches!(self, Self::RaLsp | Self::TsLsp)
+        !matches!(self, Self::RaLsp | Self::TsLsp | Self::ClangdLsp)
     }
 
     /// The batch tool whose `logical_symbol_monikers` rows a LIVE tool copies into its own
@@ -781,6 +788,7 @@ impl OracleTool {
         match self {
             Self::RaLsp => Some(Self::RustAnalyzer),
             Self::TsLsp => Some(Self::ScipTypescript),
+            Self::ClangdLsp => Some(Self::ScipClang),
             _ => None,
         }
     }
@@ -814,8 +822,12 @@ impl OracleTool {
                 PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
             // The live tools never parse a `.scip` (the live client negotiates its own LSP
             // encoding per session); their arms exist only for exhaustiveness.
-            Self::RustAnalyzer | Self::ScipClang | Self::ScipPython | Self::RaLsp | Self::TsLsp =>
-                PositionEncoding::UnspecifiedPositionEncoding,
+            Self::RustAnalyzer
+            | Self::ScipClang
+            | Self::ScipPython
+            | Self::RaLsp
+            | Self::TsLsp
+            | Self::ClangdLsp => PositionEncoding::UnspecifiedPositionEncoding,
         }
     }
 }

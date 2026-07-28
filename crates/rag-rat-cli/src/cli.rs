@@ -765,6 +765,9 @@ pub(crate) enum OracleToolArg {
     /// The live watcher oracle for TypeScript (#536). Same status/run semantics as `ra-lsp`.
     #[value(name = "ts-lsp")]
     TsLsp,
+    /// The live watcher oracle for C/C++ (#536). Same status/run semantics as `ra-lsp`.
+    #[value(name = "clangd-lsp")]
+    ClangdLsp,
 }
 
 impl OracleToolArg {
@@ -777,6 +780,7 @@ impl OracleToolArg {
             OracleToolArg::ScipJava => rag_rat_oracle::OracleTool::ScipJava,
             OracleToolArg::RaLsp => rag_rat_oracle::OracleTool::RaLsp,
             OracleToolArg::TsLsp => rag_rat_oracle::OracleTool::TsLsp,
+            OracleToolArg::ClangdLsp => rag_rat_oracle::OracleTool::ClangdLsp,
         }
     }
 }

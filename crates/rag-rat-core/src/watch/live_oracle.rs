@@ -281,8 +281,8 @@ impl LiveBackendTail {
             self.backlog = worklist;
             return;
         }
-        // This backend's language must be an indexed language of the checkout.
-        if !config.targets.iter().any(|target| target.language == self.backend.language) {
+        // One of this backend's languages must be indexed in the checkout (clangd serves two).
+        if !config.targets.iter().any(|target| self.backend.resolves_language(target.language)) {
             return;
         }
 

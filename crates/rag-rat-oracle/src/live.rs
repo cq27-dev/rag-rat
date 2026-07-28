@@ -111,7 +111,7 @@ impl LiveOracleSession {
         };
         let mut client = LspClient::spawn(
             manifest.program,
-            manifest.live_args,
+            &backend.spawn_args(manifest.live_args, checkout_root),
             checkout_root,
             backend.readiness,
         )

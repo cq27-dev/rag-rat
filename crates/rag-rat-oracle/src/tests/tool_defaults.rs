@@ -44,6 +44,7 @@ fn default_position_encoding_is_utf16_for_typescript_and_java() {
     assert_eq!(OracleTool::ScipPython.default_position_encoding(), UNSPEC);
     assert_eq!(OracleTool::RaLsp.default_position_encoding(), UNSPEC);
     assert_eq!(OracleTool::TsLsp.default_position_encoding(), UNSPEC);
+    assert_eq!(OracleTool::ClangdLsp.default_position_encoding(), UNSPEC);
 }
 
 /// #534/#536: a live tool is NEVER batch-capable — every batch driver (the auto-run loop, the init
@@ -51,12 +52,13 @@ fn default_position_encoding_is_utf16_for_typescript_and_java() {
 /// `batch_moniker_source` names the batch tool whose monikers the live writer copies.
 #[test]
 fn live_tools_are_gated_out_of_the_batch_paths() {
-    let live = [OracleTool::RaLsp, OracleTool::TsLsp];
+    let live = [OracleTool::RaLsp, OracleTool::TsLsp, OracleTool::ClangdLsp];
     for &tool in OracleTool::ALL {
         assert_eq!(tool.batch_capable(), !live.contains(&tool), "{tool:?}");
     }
     assert_eq!(OracleTool::RaLsp.batch_moniker_source(), Some(OracleTool::RustAnalyzer));
     assert_eq!(OracleTool::TsLsp.batch_moniker_source(), Some(OracleTool::ScipTypescript));
+    assert_eq!(OracleTool::ClangdLsp.batch_moniker_source(), Some(OracleTool::ScipClang));
     for tool in OracleTool::ALL.iter().filter(|t| t.batch_capable()) {
         assert_eq!(tool.batch_moniker_source(), None, "{tool:?}");
     }

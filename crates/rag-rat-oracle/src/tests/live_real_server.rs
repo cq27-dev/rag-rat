@@ -200,3 +200,86 @@ fn a_file_its_ancestor_config_excludes_still_warms_the_server() {
     assert_eq!(h.verdict(edge).expect("a verdict").1, Some(target));
     session.shutdown();
 }
+
+/// Real-server verification for the live clangd backend (#536).
+///
+/// The property worth proving here is different from TypeScript's. clangd resolves a call ACROSS
+/// translation units only through its background index, which it persists into the checkout — and
+/// with that index disabled it answers with the callee's header DECLARATION instead. This asserts
+/// the shipped configuration lands on the definition in the other translation unit, because that
+/// is the whole reason the write into the checkout is accepted.
+const C_LIB_H: &str = "int greet(const char *name);\n";
+const C_LIB_C: &str =
+    "#include \"lib.h\"\n\nint greet(const char *name) {\n  return (int)name[0];\n}\n";
+const C_MAIN_C: &str = "#include \"lib.h\"\n\nint run(void) {\n  return greet(\"world\");\n}\n";
+
+#[test]
+#[ignore = "needs clangd on PATH"]
+fn real_clangd_resolves_a_call_into_another_translation_unit() {
+    let h = Harness::new();
+    std::fs::create_dir_all(h.root().join("src")).unwrap();
+    std::fs::write(h.root().join("src/lib.h"), C_LIB_H).unwrap();
+    std::fs::write(h.root().join("src/lib.c"), C_LIB_C).unwrap();
+    std::fs::write(h.root().join("src/main.c"), C_MAIN_C).unwrap();
+    // The compilation database is what clangd builds its cross-TU index from; without it the
+    // backend is Blocked and, if forced, would answer with the header declaration.
+    // Deliberately in a directory clangd does NOT search on its own — not the root, and not the
+    // `build/` subdirectory it also checks. Only the `--compile-commands-dir` the backend derives
+    // makes this resolvable, so this fixture proves that wiring rather than assuming it.
+    std::fs::create_dir_all(h.root().join("out")).unwrap();
+    let root = h.root().display();
+    std::fs::write(
+        h.root().join("out/compile_commands.json"),
+        format!(
+            r#"[{{"directory":"{root}","file":"{root}/src/lib.c","command":"cc -c src/lib.c"}},
+                {{"directory":"{root}","file":"{root}/src/main.c","command":"cc -c src/main.c"}}]"#
+        ),
+    )
+    .unwrap();
+
+    // Seed the callee's DEFINITION in lib.c — deliberately not the declaration in lib.h, which is
+    // what a mis-configured clangd would resolve to.
+    let defs = h.add_file("src/lib.c", C_LIB_C);
+    let definition = h.add_symbol(defs, "greet", 0, C_LIB_C.len());
+    let src = h.add_file("src/main.c", C_MAIN_C);
+    let call = C_MAIN_C.rfind("greet").expect("the call site");
+    let edge = h.add_edge(src, "greet", call, call + "greet".len(), "NameOnly", None);
+    // The header is indexed too, so resolving to the declaration would map to a DIFFERENT symbol
+    // rather than simply failing — which is what makes the assertion below discriminating.
+    let header = h.add_file("src/lib.h", C_LIB_H);
+    let declaration = h.add_symbol(header, "greet", 0, C_LIB_H.len());
+
+    let mut session = LiveOracleSession::spawn(crate::OracleTool::ClangdLsp, h.root())
+        .expect("clangd must be on PATH for this test");
+    let worklist = vec!["src/main.c".to_string()];
+    let input = LivePassInput {
+        commit_sha: COMMIT,
+        worktree_id: WORKTREE,
+        checkout_root: h.root(),
+        worklist: &worklist,
+        max_requests: 100,
+        started_at_ms: 1_000,
+    };
+
+    let deadline = Instant::now() + WARMUP_BUDGET;
+    let report = loop {
+        let report = live_oracle_pass(&h.conn, &mut session, &input).unwrap();
+        if report.status != "Warming" {
+            break report;
+        }
+        assert!(Instant::now() < deadline, "clangd never reported a completed index load");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+
+    assert_eq!(report.status, "Completed", "{report:?}");
+    let (kind, resolved, symbol) = h.verdict(edge).expect("a verdict once clangd is ready");
+    assert_eq!(kind, "upgrade");
+    assert_eq!(
+        resolved,
+        Some(definition),
+        "the call must resolve to the DEFINITION in the other translation unit; resolving to the \
+         header declaration ({declaration:?}) means the background index is not doing its job",
+    );
+    assert!(symbol.starts_with("local clangd-lsp-"), "{symbol}");
+    session.shutdown();
+}

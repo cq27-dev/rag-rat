@@ -19,6 +19,7 @@ fn persisted_enums_round_trip_through_db_strings() {
         (OracleTool::ScipJava, "scip-java"),
         (OracleTool::RaLsp, "ra-lsp"),
         (OracleTool::TsLsp, "ts-lsp"),
+        (OracleTool::ClangdLsp, "clangd-lsp"),
     ];
     for (tool, token) in tokens {
         assert_eq!(tool.as_db_str(), token);

@@ -96,6 +96,17 @@ const FLOOR_DIRS: &[&str] = &[
     "__pycache__",
 ];
 
+/// Floors that are a PATH, not a bare directory name — matched as consecutive components anywhere
+/// under `config.root`.
+///
+/// `.cache` alone is far too broad to floor: the floor is unconditional and cannot be whitelisted
+/// back, so flooring the name would silently drop a tracked `.cache/` that a repo genuinely uses
+/// for sources. What actually has to be excluded is the index the live clangd oracle makes the
+/// checkout write to itself — `.cache/clangd/` — which no clangd flag or environment variable can
+/// relocate. Unfloored, those writes raise watcher events, which schedule maintenance passes,
+/// which run the live oracle, which keeps clangd indexing: a loop the repo feeds itself.
+const FLOOR_PATHS: &[&[&str]] = &[&[".cache", "clangd"]];
+
 /// Whether a single path component matches a floor directory name (see [`FLOOR_DIRS`]).
 fn is_floor_dir(name: &str) -> bool {
     FLOOR_DIRS.contains(&name)
@@ -387,9 +398,15 @@ pub(crate) fn target_ancestor_dirs(root: &Path, target_dirs: &[PathBuf]) -> Vec<
     dirs
 }
 
-/// Whether any component of the (`config.root`-relative) `rel` path is a floor directory name.
+/// Whether the (`config.root`-relative) `rel` path is floored: any component is a floor directory
+/// name, or any run of consecutive components matches a [`FLOOR_PATHS`] entry.
 fn rel_contains_floor_dir(rel: &Path) -> bool {
-    rel.components().any(|component| component.as_os_str().to_str().is_some_and(is_floor_dir))
+    let components: Vec<&str> =
+        rel.components().filter_map(|component| component.as_os_str().to_str()).collect();
+    if components.iter().any(|name| is_floor_dir(name)) {
+        return true;
+    }
+    FLOOR_PATHS.iter().any(|floor| components.windows(floor.len()).any(|window| window == *floor))
 }
 
 /// The gitignore base for `root` given an enclosing worktree root `wt`, or `None` when `wt` is not
@@ -446,6 +463,26 @@ mod tests {
         assert!(m.is_ignored(&tmp.join("node_modules/pkg/index.ts"), false));
         assert!(m.is_ignored(&tmp.join(".build/checkouts/Dep/Sources/Dep.swift"), false));
         assert!(!m.is_ignored(&tmp.join("src/lib.rs"), false));
+    }
+
+    #[test]
+    fn clangds_own_index_is_floored_without_swallowing_every_dot_cache() {
+        // The live clangd oracle makes the checkout's OWN tooling write here: clangd persists its
+        // background index to `.cache/clangd/index/` and no flag relocates it. Unfloored, those
+        // writes raise watcher events that schedule passes that run clangd that writes again.
+        let (_scratch, tmp) = tempdir();
+        let m = compile(&tmp);
+        assert!(m.is_ignored(&tmp.join(".cache/clangd"), true));
+        assert!(m.is_ignored(&tmp.join(".cache/clangd/index/main.c.ABC123.idx"), false));
+        // …but the floor is unconditional and cannot be whitelisted back, so it must NOT swallow a
+        // `.cache/` a repo genuinely tracks, nor a nested one it happens to own.
+        assert!(!m.is_ignored(&tmp.join(".cache"), true));
+        assert!(!m.is_ignored(&tmp.join(".cache/generated/api.ts"), false));
+        assert!(!m.is_ignored(&tmp.join("src/.cache/fixtures/sample.c"), false));
+        // The floor is a consecutive-component match, so a same-named pair deeper in the tree is
+        // floored too (a nested checkout's clangd index), while `clangd` alone never is.
+        assert!(m.is_ignored(&tmp.join("vendor/dep/.cache/clangd/index/a.idx"), false));
+        assert!(!m.is_ignored(&tmp.join("src/clangd/wrapper.c"), false));
     }
 
     #[test]

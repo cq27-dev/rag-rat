@@ -36,6 +36,7 @@ patch for files being edited, and where both tools cover the same edge the batch
 |---|---|---|---|
 | `ra-lsp` | Rust | `rust-analyzer` | — |
 | `ts-lsp` | TypeScript / TSX | `typescript-language-server` | a `tsconfig.json` project (see below) |
+| `clangd-lsp` | C / C++ | `clangd` | a `compile_commands.json` anywhere in the checkout (see below) |
 
 ```toml
 [oracle.live]
@@ -56,6 +57,18 @@ trusts an answer (asked mid-load, the server resolves an imported callee to the 
 rather than the definition). The config does not have to be at the checkout root — a monorepo with
 `packages/*/tsconfig.json` is fine — but a checkout with none is reported `Blocked` rather than run
 blind.
+
+**C/C++ needs a `compile_commands.json`, and clangd writes into the checkout.** clangd resolves a
+call across translation units only through its background index, and it builds that index from the
+compilation database — without one it answers with the callee's header declaration instead, and
+reports no progress the oracle can wait on, so the backend is `Blocked`. The database may sit
+anywhere in the checkout: clangd itself only looks in an opened file's ancestor directories and
+their `build/` subdirectory, so rag-rat finds the database and passes its location to the server.
+An out-of-tree CMake build (`build/`, `out/`, `cmake-build-debug/`, …) therefore works unchanged. That index is persisted to
+`.cache/clangd/` *inside the checkout*: no clangd flag or environment variable relocates it, and
+disabling it is what costs the cross-translation-unit resolution. So enabling the live oracle in a
+C/C++ checkout means accepting that write. rag-rat ignores `.cache/` when indexing, so the files it
+writes never feed back into the watcher.
 
 **Standalone:** `[oracle.live]` does NOT imply or require `[oracle] auto_run`. Without a batch
 baseline the live pass is *moniker-blind* — it upgrades edge confidence tiers under `local
