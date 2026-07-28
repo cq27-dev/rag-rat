@@ -103,6 +103,7 @@ mod tests {
             Frame::Hello { account_id: [3; 32], have: vec![[1; 32]] },
             Frame::Entries { entries: vec![vec![9, 9, 9]], more: false },
             Frame::Done,
+            Frame::Ack,
         ];
         let to_send = sent.clone();
         let writer = tokio::spawn(async move {

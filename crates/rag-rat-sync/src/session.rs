@@ -4,7 +4,9 @@
 //! every account-log entry hash it holds, then streams the entries the other lacks and ends with
 //! [`Frame::Done`]. The two directions run concurrently over one bidirectional stream, so a large
 //! transfer in one direction never blocks the other (the deadlock a send-then-receive ordering
-//! would cause on a bounded stream).
+//! would cause on a bounded stream). After both data directions finish, a role-ordered
+//! [`Frame::Ack`] exchange proves both receivers consumed the complete peer stream before the
+//! dialer closes.
 //!
 //! The session is transport-agnostic — generic over any [`AsyncRead`]/[`AsyncWrite`] pair — and
 //! trusts nothing it receives: every entry is handed to [`SyncStore::ingest`], which re-verifies it
@@ -16,6 +18,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use crate::auth::AuthRole;
 use crate::codec::{self, CodecError};
 use crate::wire::{Frame, MAX_ENTRIES_PER_PAGE, MAX_HELLO_HASHES};
 
@@ -117,13 +120,14 @@ pub async fn run_session<S, R, W>(
     store: &mut S,
     send: W,
     recv: R,
+    role: AuthRole,
 ) -> Result<SessionReport, SessionError>
 where
     S: SyncStore,
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    run_session_with_idle_timeout(store, send, recv, DEFAULT_IDLE_TIMEOUT).await
+    run_session_with_idle_timeout(store, send, recv, role, DEFAULT_IDLE_TIMEOUT).await
 }
 
 /// [`run_session`] with an explicit idle timeout — the receiver aborts if the peer sends no frame
@@ -132,6 +136,7 @@ pub async fn run_session_with_idle_timeout<S, R, W>(
     store: &mut S,
     mut send: W,
     mut recv: R,
+    role: AuthRole,
     idle_timeout: Duration,
 ) -> Result<SessionReport, SessionError>
 where
@@ -153,7 +158,7 @@ where
             .map_err(SessionError::Codec)?;
         // If the receiver aborted before delivering the peer hello, there is nothing to stream.
         let Ok(peer_have) = peer_have_rx.await else {
-            return Ok(0usize);
+            return Ok((send, 0usize));
         };
         let mut to_send: Vec<Vec<u8>> = snapshot
             .into_iter()
@@ -172,11 +177,9 @@ where
                 .map_err(SessionError::Codec)?;
         }
         codec::write_frame(&mut send, &Frame::Done).await.map_err(SessionError::Codec)?;
-        // Cleanly finish the send half. On an iroh stream `shutdown` maps to quinn `finish` (a FIN
-        // the peer sees after the last frame); dropping without it would RESET and could truncate
-        // the final page. On a duplex it just closes the write half → clean EOF for the peer.
-        send.shutdown().await.map_err(|e| SessionError::Codec(CodecError::Io(e)))?;
-        Ok::<usize, SessionError>(total)
+        // Keep the send half open for the completion acknowledgement. Returning ownership lets the
+        // role-ordered phase below send it only after this side has consumed the peer's `Done`.
+        Ok::<(W, usize), SessionError>((send, total))
     };
 
     let receiver = async {
@@ -244,6 +247,11 @@ where
                     }
                     break;
                 },
+                Ok(Frame::Ack) => {
+                    return Err(SessionError::Protocol(
+                        "peer acknowledged before sending Done".into(),
+                    ));
+                },
                 Ok(Frame::Hello { .. }) => {
                     return Err(SessionError::Protocol("a second hello mid-session".into()));
                 },
@@ -257,15 +265,61 @@ where
                 Err(e) => return Err(e),
             }
         }
-        Ok::<(usize, usize), SessionError>((received, newly_stored))
+        Ok::<(R, usize, usize), SessionError>((recv, received, newly_stored))
     };
 
     // `try_join!`, not `join!`: if either half errors, the other is cancelled immediately. Without
     // it, a peer that sends a bad frame and stops reading would leave the sender blocked on QUIC
     // flow control mid-stream, and the session would hang instead of failing.
-    let (entries_sent, (entries_received, entries_newly_stored)) =
+    let ((mut send, entries_sent), (mut recv, entries_received, entries_newly_stored)) =
         tokio::try_join!(sender, receiver)?;
+    complete_session(&mut send, &mut recv, role, idle_timeout).await?;
     Ok(SessionReport { entries_sent, entries_received, entries_newly_stored })
+}
+
+/// Prove both data streams were consumed before the dialer may close the connection. The ordering
+/// is deliberate: the dialer acknowledges first, the acceptor reads that proof before replying,
+/// and the dialer waits for the reply. The acceptor endpoint then keeps the connection alive until
+/// the dialer closes, so its final acknowledgement cannot be truncated in flight.
+async fn complete_session<R, W>(
+    send: &mut W,
+    recv: &mut R,
+    role: AuthRole,
+    idle_timeout: Duration,
+) -> Result<(), SessionError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    match role {
+        AuthRole::Dialer => {
+            send_ack_and_finish(send).await?;
+            read_ack_before(recv, idle_timeout).await
+        },
+        AuthRole::Acceptor => {
+            read_ack_before(recv, idle_timeout).await?;
+            send_ack_and_finish(send).await
+        },
+    }
+}
+
+async fn send_ack_and_finish<W: AsyncWrite + Unpin>(send: &mut W) -> Result<(), SessionError> {
+    codec::write_frame(send, &Frame::Ack).await.map_err(SessionError::Codec)?;
+    // On iroh this maps to QUIC FIN. The acceptor remains alive until the dialer closes, while the
+    // dialer does not close until it has read the acceptor's acknowledgement.
+    send.shutdown().await.map_err(|e| SessionError::Codec(CodecError::Io(e)))
+}
+
+async fn read_ack_before<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    idle_timeout: Duration,
+) -> Result<(), SessionError> {
+    match read_frame_before(recv, idle_timeout).await? {
+        Frame::Ack => Ok(()),
+        _ => Err(SessionError::Protocol(
+            "peer sent another data-phase frame instead of the completion acknowledgement".into(),
+        )),
+    }
 }
 
 /// Read the next frame, failing if the peer sends nothing within `idle_timeout`. Folds a clean EOF
@@ -278,7 +332,7 @@ async fn read_frame_before<R: AsyncRead + Unpin>(
     match tokio::time::timeout(idle_timeout, codec::read_frame(recv)).await {
         Ok(Ok(frame)) => Ok(frame),
         Ok(Err(CodecError::Eof)) => Err(SessionError::Protocol(
-            "peer closed the stream before sending Done — transfer truncated".into(),
+            "peer closed the stream before session completion — transfer truncated".into(),
         )),
         Ok(Err(e)) => Err(SessionError::Codec(e)),
         Err(_elapsed) => Err(SessionError::Protocol(format!(
@@ -338,8 +392,10 @@ mod tests {
     async fn sync_pair(a: &mut MemStore, b: &mut MemStore) -> (SessionReport, SessionReport) {
         let (a_send, b_recv) = tokio::io::duplex(1 << 20);
         let (b_send, a_recv) = tokio::io::duplex(1 << 20);
-        let (ra, rb) =
-            tokio::join!(run_session(a, a_send, a_recv), run_session(b, b_send, b_recv),);
+        let (ra, rb) = tokio::join!(
+            run_session(a, a_send, a_recv, AuthRole::Dialer),
+            run_session(b, b_send, b_recv, AuthRole::Acceptor),
+        );
         (ra.unwrap(), rb.unwrap())
     }
 
@@ -384,6 +440,82 @@ mod tests {
         assert_eq!(rb.entries_newly_stored, 0);
     }
 
+    #[tokio::test]
+    async fn completion_ack_is_required_after_done() {
+        let mut receiver = MemStore::new([3; 32], &[]);
+        let (mut peer_send, recv) = tokio::io::duplex(1 << 16);
+        let (send, _peer_recv) = tokio::io::duplex(1 << 16);
+        let feeder = tokio::spawn(async move {
+            codec::write_frame(&mut peer_send, &Frame::Hello { account_id: [3; 32], have: vec![] })
+                .await
+                .unwrap();
+            codec::write_frame(&mut peer_send, &Frame::Done).await.unwrap();
+            // Drop without Ack: Done terminates the data phase, not the delivery handshake.
+        });
+
+        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
+        feeder.await.unwrap();
+        assert!(
+            matches!(result, Err(SessionError::Protocol(ref message)) if message.contains("completion")),
+            "Done without Ack must not report a delivered session: {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_before_done_is_rejected() {
+        let mut receiver = MemStore::new([4; 32], &[]);
+        let (mut peer_send, recv) = tokio::io::duplex(1 << 16);
+        let (send, _peer_recv) = tokio::io::duplex(1 << 16);
+        let feeder = tokio::spawn(async move {
+            codec::write_frame(&mut peer_send, &Frame::Hello { account_id: [4; 32], have: vec![] })
+                .await
+                .unwrap();
+            codec::write_frame(&mut peer_send, &Frame::Ack).await.unwrap();
+        });
+
+        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
+        feeder.await.unwrap();
+        assert!(
+            matches!(result, Err(SessionError::Protocol(ref message)) if message.contains("before sending Done")),
+            "an early Ack cannot skip the data phase: {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptor_replies_only_after_the_dialer_ack() {
+        let mut acceptor = MemStore::new([5; 32], &[]);
+        let (acceptor_send, mut dialer_recv) = tokio::io::duplex(1 << 16);
+        let (mut dialer_send, acceptor_recv) = tokio::io::duplex(1 << 16);
+
+        let dialer = async move {
+            codec::write_frame(&mut dialer_send, &Frame::Hello {
+                account_id: [5; 32],
+                have: vec![],
+            })
+            .await
+            .unwrap();
+            codec::write_frame(&mut dialer_send, &Frame::Done).await.unwrap();
+
+            assert!(matches!(codec::read_frame(&mut dialer_recv).await, Ok(Frame::Hello { .. })));
+            assert_eq!(codec::read_frame(&mut dialer_recv).await.unwrap(), Frame::Done);
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(20),
+                    codec::read_frame(&mut dialer_recv),
+                )
+                .await
+                .is_err(),
+                "the acceptor must wait for the dialer acknowledgement before replying",
+            );
+
+            codec::write_frame(&mut dialer_send, &Frame::Ack).await.unwrap();
+            assert_eq!(codec::read_frame(&mut dialer_recv).await.unwrap(), Frame::Ack);
+        };
+        let session = run_session(&mut acceptor, acceptor_send, acceptor_recv, AuthRole::Acceptor);
+        let ((), report) = tokio::join!(dialer, session);
+        report.unwrap();
+    }
+
     /// A stream that ends after a `more: true` page — a truncated transfer — must FAIL, not report
     /// success, or the caller would treat a partial account as complete.
     #[tokio::test]
@@ -405,7 +537,7 @@ mod tests {
             .unwrap();
             // … then drop without Done: a truncated stream.
         });
-        let result = run_session(&mut receiver, send, recv).await;
+        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
         feeder.await.unwrap();
         assert!(
             matches!(result, Err(SessionError::Protocol(_))),
@@ -430,7 +562,7 @@ mod tests {
                 .unwrap();
             write_frame(&mut peer_send, &Frame::Done).await.unwrap();
         });
-        let result = run_session(&mut receiver, send, recv).await;
+        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
         feeder.await.unwrap();
         assert!(
             matches!(result, Err(SessionError::Protocol(_))),
@@ -458,6 +590,7 @@ mod tests {
             &mut receiver,
             send,
             recv,
+            AuthRole::Dialer,
             std::time::Duration::from_millis(50),
         )
         .await;
@@ -487,7 +620,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = run_session(&mut receiver, send, recv).await;
+        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
         feeder.await.unwrap();
         match result {
             Err(SessionError::Protocol(m)) => assert!(m.contains("after the final page"), "{m}"),
@@ -509,7 +642,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = run_session(&mut receiver, send, recv).await;
+        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
         feeder.await.unwrap();
         // Assert the SPECIFIC guard fired — a dropped feeder also trips the EOF-before-Done guard,
         // so a bare `Protocol` match would not distinguish the empty-page rejection from it.
@@ -540,8 +673,10 @@ mod tests {
         let mut b = MemStore::new([2; 32], &[entry(2)]);
         let (a_send, b_recv) = tokio::io::duplex(1 << 16);
         let (b_send, a_recv) = tokio::io::duplex(1 << 16);
-        let (ra, rb) =
-            tokio::join!(run_session(&mut a, a_send, a_recv), run_session(&mut b, b_send, b_recv),);
+        let (ra, rb) = tokio::join!(
+            run_session(&mut a, a_send, a_recv, AuthRole::Dialer),
+            run_session(&mut b, b_send, b_recv, AuthRole::Acceptor),
+        );
         assert!(matches!(ra, Err(SessionError::Protocol(_))));
         assert!(matches!(rb, Err(SessionError::Protocol(_))));
     }

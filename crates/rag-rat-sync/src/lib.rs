@@ -7,7 +7,7 @@
 //! local write does. The transport adds movement, never trust.
 //!
 //! Layers, bottom up:
-//! - [`wire`] — the frozen CBOR frame protocol (hello / entries / done).
+//! - [`wire`] — the frozen CBOR frame protocol (hello / entries / done / ack).
 //! - [`codec`] — length-prefixed framing over any async byte stream (iroh in production, an
 //!   in-memory duplex in tests).
 //! - [`session`] — the symmetric state machine and the [`session::SyncStore`] seam.

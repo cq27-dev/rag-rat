@@ -312,12 +312,11 @@ pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
     })
     .await
     .map_err(SyncFailure::Auth)?;
-    let report = run_session(store, send, recv).await.map_err(SyncFailure::Session)?;
-    // The DIALER drives the close: our `run_session` returned only after reading the acceptor's
-    // finished streams, so closing now can't truncate our own read. The acceptor waits for this
-    // close (bounded) before closing its side, so any entries it streamed reach us first. The
-    // reverse (entries WE pushed that the acceptor is still reading) can still truncate on this
-    // close — bounded and self-healing (next cadence re-sends the diff); see issue #926.
+    let report =
+        run_session(store, send, recv, AuthRole::Dialer).await.map_err(SyncFailure::Session)?;
+    // The role-ordered completion acknowledgement proves the acceptor consumed everything we
+    // pushed before replying, and we consumed its whole stream before sending our acknowledgement.
+    // The dialer therefore closes only after both directions are delivered.
     conn.close(0u32.into(), b"done");
     Ok(report)
 }
@@ -380,9 +379,10 @@ pub async fn accept_and_sync<S: SyncStore + NodeAuth>(
     })
     .await
     .map_err(SyncFailure::Auth)?;
-    let report = run_session(store, send, recv).await.map_err(SyncFailure::Session)?;
-    // As the ACCEPTOR we may have STREAMED entries the dialer is still reading; wait for the dialer
-    // to close first so those frames are delivered, then close (see `GRACEFUL_CLOSE_TIMEOUT`).
+    let report =
+        run_session(store, send, recv, AuthRole::Acceptor).await.map_err(SyncFailure::Session)?;
+    // The acceptor sends the final completion acknowledgement. Keep the connection alive until the
+    // dialer reads it and closes, bounded so a vanished dialer cannot wedge the server.
     let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
     conn.close(0u32.into(), b"done");
     Ok(report)
@@ -486,13 +486,12 @@ where
     // Route the session to the store the negotiated ALPN names (validated to be one of the two
     // routed ALPNs above, so the `else` is the content stream, not an unknown-ALPN fallthrough).
     let report = if alpn.as_slice() == SYNC_ALPN {
-        run_session(account_store, send, recv).await
+        run_session(account_store, send, recv, AuthRole::Acceptor).await
     } else {
-        run_session(content_store, send, recv).await
+        run_session(content_store, send, recv, AuthRole::Acceptor).await
     }
     .map_err(SyncFailure::Session)?;
-    // As the ACCEPTOR we may have STREAMED entries the dialer is still reading; wait for the dialer
-    // to close first so those frames are delivered, then close (see `GRACEFUL_CLOSE_TIMEOUT`).
+    // Keep the acceptor alive until the dialer reads its final acknowledgement and closes.
     let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
     conn.close(0u32.into(), b"done");
     Ok((alpn, report))
@@ -641,6 +640,39 @@ mod tests {
             .port();
         EndpointAddr::new(endpoint.id())
             .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+    }
+
+    #[tokio::test]
+    async fn dialer_push_is_acknowledged_before_the_connection_closes() {
+        let source = database();
+        let account = rag_rat_oplog::local_account(&source, NOW).unwrap();
+        let expected = rag_rat_oplog::account_entries_for_sync(&source, account).unwrap();
+        let destination = database();
+        let (listener, dialer) = loopback_endpoints().await;
+        let mut source_store = crate::store::OplogSyncStore::new(&source, account, || NOW);
+        let mut destination_store =
+            crate::store::OplogSyncStore::new(&destination, account, || NOW);
+        let policy = AuthPolicy::Open;
+
+        // This is the direction #926 exposed: the dialer has the data and may close as soon as its
+        // own session returns, while the acceptor is still ingesting the pushed stream.
+        let server = accept_and_sync(&listener, &mut destination_store, policy, || NOW);
+        let client = connect_and_sync(
+            &dialer,
+            direct_addr(&listener),
+            SYNC_ALPN,
+            &mut source_store,
+            policy,
+            NOW,
+        );
+        let (server_result, client_result) = tokio::join!(server, client);
+        let server_report = server_result.unwrap();
+        let client_report = client_result.unwrap();
+
+        assert_eq!(client_report.entries_sent, expected.len());
+        assert_eq!(server_report.entries_newly_stored, expected.len());
+        let received = rag_rat_oplog::account_entries_for_sync(&destination, account).unwrap();
+        assert_eq!(received.len(), expected.len(), "the acceptor ingested the full dialer push");
     }
 
     #[tokio::test]

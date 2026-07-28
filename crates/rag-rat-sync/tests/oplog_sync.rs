@@ -6,7 +6,7 @@
 //! receiver re-verifies via `account_ingest`.
 
 use rag_rat_oplog::{AccountId, account_entries_for_sync, local_account};
-use rag_rat_sync::{OplogSyncStore, run_session};
+use rag_rat_sync::{AuthRole, OplogSyncStore, run_session};
 use rusqlite::Connection;
 
 const NOW: i64 = 1_700_000_000_000;
@@ -39,8 +39,8 @@ async fn a_fresh_peer_restores_an_account_over_the_session() {
     let (a_send, b_recv) = tokio::io::duplex(1 << 20);
     let (b_send, a_recv) = tokio::io::duplex(1 << 20);
     let (source_report, dest_report) = tokio::join!(
-        run_session(&mut source_store, a_send, a_recv),
-        run_session(&mut dest_store, b_send, b_recv),
+        run_session(&mut source_store, a_send, a_recv, AuthRole::Acceptor),
+        run_session(&mut dest_store, b_send, b_recv, AuthRole::Dialer),
     );
     let source_report = source_report.unwrap();
     let dest_report = dest_report.unwrap();
@@ -83,8 +83,8 @@ async fn two_peers_in_sync_transfer_nothing() {
     let (a_send, b_recv) = tokio::io::duplex(1 << 16);
     let (b_send, a_recv) = tokio::io::duplex(1 << 16);
     let (ra, rb) = tokio::join!(
-        run_session(&mut a_store, a_send, a_recv),
-        run_session(&mut b_store, b_send, b_recv),
+        run_session(&mut a_store, a_send, a_recv, AuthRole::Acceptor),
+        run_session(&mut b_store, b_send, b_recv, AuthRole::Dialer),
     );
     let (ra, rb) = (ra.unwrap(), rb.unwrap());
     assert_eq!(ra.entries_newly_stored, 0);
@@ -150,8 +150,8 @@ async fn a_fresh_peer_restores_the_accounts_content_after_the_account_log() {
         let (a_send, b_recv) = tokio::io::duplex(1 << 20);
         let (b_send, a_recv) = tokio::io::duplex(1 << 20);
         let (ra, rb) = tokio::join!(
-            run_session(&mut src, a_send, a_recv),
-            run_session(&mut dst, b_send, b_recv),
+            run_session(&mut src, a_send, a_recv, AuthRole::Acceptor),
+            run_session(&mut dst, b_send, b_recv, AuthRole::Dialer),
         );
         ra.unwrap();
         rb.unwrap();
@@ -164,8 +164,8 @@ async fn a_fresh_peer_restores_the_accounts_content_after_the_account_log() {
         let (a_send, b_recv) = tokio::io::duplex(1 << 20);
         let (b_send, a_recv) = tokio::io::duplex(1 << 20);
         let (ra, rb) = tokio::join!(
-            run_session(&mut src, a_send, a_recv),
-            run_session(&mut dst, b_send, b_recv),
+            run_session(&mut src, a_send, a_recv, AuthRole::Acceptor),
+            run_session(&mut dst, b_send, b_recv, AuthRole::Dialer),
         );
         ra.unwrap();
         rb.unwrap()

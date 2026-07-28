@@ -2,10 +2,11 @@
 //!
 //! One symmetric protocol for device↔device and device↔server: both peers send [`Frame::Hello`]
 //! naming the account and every account-log entry hash they already hold, then each streams the
-//! entries the other lacks as [`Frame::Entries`] pages, ending with [`Frame::Done`]. The receiver
-//! feeds every entry through the op-log ingest seam, which re-verifies signature, canonicity, and
-//! chain continuity from scratch — the sender is never trusted, so a malformed or forged frame is
-//! rejected exactly as a malformed local write would be.
+//! entries the other lacks as [`Frame::Entries`] pages, ending with [`Frame::Done`]. A role-ordered
+//! [`Frame::Ack`] exchange then proves both receivers consumed their peer's complete stream before
+//! the dialer closes the connection. The receiver feeds every entry through the op-log ingest seam,
+//! which re-verifies signature, canonicity, and chain continuity from scratch — the sender is never
+//! trusted, so a malformed or forged frame is rejected exactly as a malformed local write would be.
 //!
 //! Frames are canonical CBOR arrays tagged by a leading discriminant, encoded by hand with
 //! `minicbor::Encoder` to match the op-log's envelope style (no derive). The byte layout is a
@@ -14,10 +15,10 @@
 use minicbor::{Decoder, Encoder};
 
 /// The ALPN for the ACCOUNT-LOG stream. Versioned: a breaking wire change bumps the suffix so an
-/// old peer declines the handshake instead of misreading frames. Bumped to `/2` for the #881 auth
-/// phase (the `Auth` frame exchanged before any inventory) — a `/1` peer, which would stream its
-/// inventory without authenticating, must not interoperate.
-pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/2";
+/// old peer declines the handshake instead of misreading frames. Bumped to `/3` for the #926
+/// role-ordered completion acknowledgement; a `/2` peer would stop after `Done` and deadlock or
+/// truncate a `/3` peer waiting for proof that its stream was consumed.
+pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/3";
 
 /// The ALPN for the `/3` CONTENT stream — the memories themselves (#907). Same frame protocol and
 /// same account-level auth phase as [`SYNC_ALPN`]; only the STORE differs (`OplogContentSyncStore`
@@ -25,7 +26,8 @@ pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/2";
 /// acceptor picks the store from `conn.alpn()` and the account-log wire stays byte-identical. A
 /// peer that does not speak this ALPN simply never exchanges content — account-log sync is
 /// unaffected.
-pub const CONTENT_SYNC_ALPN: &[u8] = b"rag-rat/content/1";
+/// Bumped to `/2` alongside [`SYNC_ALPN`] because content uses the same completion state machine.
+pub const CONTENT_SYNC_ALPN: &[u8] = b"rag-rat/content/2";
 
 /// Domain tag committed into every frame's leading array element, so a frame from another protocol
 /// (or a truncated one) cannot be mistaken for a valid frame.
@@ -66,8 +68,12 @@ pub enum Frame {
     /// A page of `signed_bytes` the peer lacked. `more` is true when further pages follow.
     Entries { entries: Vec<Vec<u8>>, more: bool },
     /// The sender has streamed every entry the peer lacked. A session ends when both directions are
-    /// `Done`.
+    /// `Done`, followed by the role-ordered acknowledgement exchange.
     Done,
+    /// Confirms that the sender consumed the peer's complete stream through [`Frame::Done`]. The
+    /// dialer sends first; the acceptor replies only after reading it, so the dialer can close
+    /// after the reply without truncating either direction.
+    Ack,
 }
 
 mod tag {
@@ -75,6 +81,7 @@ mod tag {
     pub const ENTRIES: u8 = 1;
     pub const DONE: u8 = 2;
     pub const AUTH: u8 = 3;
+    pub const ACK: u8 = 4;
 }
 
 /// A frame that failed to decode. Kept distinct from an I/O error so the session can treat a
@@ -140,6 +147,11 @@ impl Frame {
                 enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
                 enc.u8(tag::DONE).expect(INFALLIBLE);
             },
+            Frame::Ack => {
+                enc.array(2).expect(INFALLIBLE);
+                enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
+                enc.u8(tag::ACK).expect(INFALLIBLE);
+            },
         }
         buf
     }
@@ -161,6 +173,7 @@ impl Frame {
             tag::ENTRIES => 4,
             tag::DONE => 2,
             tag::AUTH => 4,
+            tag::ACK => 2,
             other => return Err(WireError::Malformed(format!("unknown frame tag {other}"))),
         };
         if outer != expected_outer {
@@ -221,6 +234,7 @@ impl Frame {
                 Ok(Frame::Entries { entries, more })
             },
             tag::DONE => Ok(Frame::Done),
+            tag::ACK => Ok(Frame::Ack),
             other => Err(WireError::Malformed(format!("unknown frame tag {other}"))),
         }
     }
@@ -255,8 +269,8 @@ mod tests {
     /// acceptor can route account-log vs content by ALPN.
     #[test]
     fn alpn_identifiers_are_frozen() {
-        assert_eq!(SYNC_ALPN, b"rag-rat/sync/2");
-        assert_eq!(CONTENT_SYNC_ALPN, b"rag-rat/content/1");
+        assert_eq!(SYNC_ALPN, b"rag-rat/sync/3");
+        assert_eq!(CONTENT_SYNC_ALPN, b"rag-rat/content/2");
         assert_eq!(crate::enrollment::ENROLL_ALPN, b"rag-rat/enroll/1");
         assert_ne!(SYNC_ALPN, CONTENT_SYNC_ALPN);
         assert_ne!(SYNC_ALPN, crate::enrollment::ENROLL_ALPN);
@@ -272,6 +286,7 @@ mod tests {
         roundtrip(&Frame::Entries { entries: vec![vec![1, 2, 3], vec![]], more: true });
         roundtrip(&Frame::Entries { entries: vec![], more: false });
         roundtrip(&Frame::Done);
+        roundtrip(&Frame::Ack);
     }
 
     #[test]
@@ -347,6 +362,19 @@ mod tests {
             [
                 0x82, 0x74, b'r', b'a', b'g', b'-', b'r', b'a', b't', b'/', b's', b'y', b'n', b'c',
                 b'-', b'f', b'r', b'a', b'm', b'e', b'/', b'1', 0x02,
+            ],
+        );
+    }
+
+    #[test]
+    fn ack_frame_bytes_are_frozen() {
+        let bytes = Frame::Ack.encode();
+        assert_eq!(
+            bytes,
+            // array(2), text "rag-rat/sync-frame/1", u8 4
+            [
+                0x82, 0x74, b'r', b'a', b'g', b'-', b'r', b'a', b't', b'/', b's', b'y', b'n', b'c',
+                b'-', b'f', b'r', b'a', b'm', b'e', b'/', b'1', 0x04,
             ],
         );
     }
