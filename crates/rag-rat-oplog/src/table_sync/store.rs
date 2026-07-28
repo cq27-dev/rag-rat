@@ -16,6 +16,8 @@ use anyhow::Context;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::row_op::{self, DecodedRowOp, RowOp};
+use crate::AccountId;
+use crate::account::device_is_effective_writer;
 use crate::device::{DevicePublic, DeviceSecret};
 use crate::entry::{self, SignedEntry, VerifiedEntry};
 use crate::op::{DeviceFingerprint, OpMeta};
@@ -54,6 +56,12 @@ pub(crate) enum AcceptOutcome {
     /// The entry conflicts with the stored chain (a second genesis, or a lamport at/behind the
     /// tail) — an equivocation the transport milestone will quarantine with evidence.
     Fork,
+    /// The signing device is not a roster-effective writer of the account (off-roster, removed, or
+    /// read-only), so the entry is DROPPED — not stored, not relayed, chain not advanced (#935).
+    /// RETRYABLE, not peer misbehavior: the local fold may not have applied the author's
+    /// `DeviceAdd` yet, so a caller must never penalize the peer, and the sync frontier
+    /// re-offers the entry once the account log delivers the enrollment.
+    Unauthorized,
 }
 
 /// Mint one local row op as a signed entry on `stream` and store it.
@@ -109,6 +117,7 @@ fn next_stream_lamport(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result
 /// PAYLOAD.
 pub(crate) fn accept_row_entry(
     tx: &Transaction<'_>,
+    account_id: AccountId,
     expected_stream: StreamId,
     expected_tables: &[&str],
     signed_bytes: &[u8],
@@ -148,6 +157,23 @@ pub(crate) fn accept_row_entry(
     }
     if entry_exists(tx, &verified.entry_hash)? {
         return Ok(AcceptOutcome::AlreadyPresent);
+    }
+    // Authority gate (#935): the signing device must be a roster-effective WRITER of the account.
+    // Placed AFTER `entry_exists` so an entry stored while the device WAS a writer still reports
+    // `AlreadyPresent` after its removal (dedup precedence over authority), and BEFORE
+    // `insert_entry` and the `StoredInert` path so an off-roster / removed / read-only
+    // principal can never store or retain a row. Dropping (not storing) is correct here: chains
+    // are per `(stream, device)`, so an unauthorized device has no legitimate chain that
+    // dropping could wedge.
+    //
+    // Known liveness gap: this is current-roster authority, not as-of-authoring authority. A
+    // fresh replica that ingests a since-removed writer's entries drops even the rows that device
+    // legitimately authored before removal, so those rows never reach it — the entry lacks the
+    // roster epoch needed to distinguish pre- from post-removal authorship. The epoch-aware fix
+    // (roster reference in the wire format) is #892; an interim re-adoption pass, where an active
+    // writer re-authors orphaned rows under its own chain, is #997.
+    if !device_is_effective_writer(tx, account_id, verified.device_fingerprint)? {
+        return Ok(AcceptOutcome::Unauthorized);
     }
     match classify(tx, expected_stream, &verified)? {
         ChainFit::Ok => {},
@@ -277,9 +303,48 @@ mod tests {
     use super::*;
     use crate::table_sync::row_op::TypedValue;
 
+    /// The account every table-sync test scopes to. `accept_row_entry` gates on the signing device
+    /// being a roster-effective writer of THIS account.
+    fn account() -> AccountId {
+        AccountId::from_bytes([9; 32])
+    }
+
+    /// Insert a roster-effective row so `device_is_effective_writer(account(), fp)` sees `fp` at
+    /// `role`. `roster_ref` is the PRIMARY KEY, so it must be unique per row — the fingerprint is a
+    /// fine per-device key for a test, and `INSERT OR IGNORE` keeps re-enrollment idempotent.
+    fn enroll(c: &rusqlite::Connection, account: AccountId, fp: DeviceFingerprint, role: &str) {
+        c.execute(
+            "INSERT OR IGNORE INTO account_roster_history
+                 (roster_ref, account_id, device_fingerprint, role, effective_at, closed_at)
+             VALUES (?1, ?2, ?3, ?4, 0, NULL)",
+            params![
+                fp.to_bytes().as_slice(),
+                account.to_bytes().as_slice(),
+                fp.to_bytes().as_slice(),
+                role
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Mark `fp`'s roster row removed (`closed_at` set) — an off-roster device after removal.
+    fn remove_from_roster(c: &rusqlite::Connection, account: AccountId, fp: DeviceFingerprint) {
+        c.execute(
+            "UPDATE account_roster_history SET closed_at = 1
+             WHERE account_id = ?1 AND device_fingerprint = ?2",
+            params![account.to_bytes().as_slice(), fp.to_bytes().as_slice()],
+        )
+        .unwrap();
+    }
+
     fn conn() -> rusqlite::Connection {
         let c = rusqlite::Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&c, &crate::test_hooks()).unwrap();
+        // The behavior tests (chain / lamport / fork / payload) use the `[1; 32]` device; enroll it
+        // as an effective writer of account() so the #935 authority gate admits it and they reach
+        // the logic under test. The authority tests below use OTHER devices and set their
+        // own state.
+        enroll(&c, account(), DeviceSecret::from_seed(&[1; 32]).public().fingerprint(), "owner");
         c
     }
 
@@ -302,9 +367,16 @@ mod tests {
         // A fresh store accepts the wire and decodes the same op.
         let mut b = conn();
         let tx = b.transaction().unwrap();
-        let outcome =
-            accept_row_entry(&tx, stream(), &["t"], &signed.signed_bytes, &secret.public(), 0)
-                .unwrap();
+        let outcome = accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t"],
+            &signed.signed_bytes,
+            &secret.public(),
+            0,
+        )
+        .unwrap();
         assert_eq!(outcome, AcceptOutcome::Stored {
             op: op("r1"),
             meta: OpMeta { lamport: 0, device: secret.public().fingerprint() }
@@ -348,13 +420,29 @@ mod tests {
         };
         let tx = b.transaction().unwrap();
         assert!(matches!(
-            accept_row_entry(&tx, stream(), &["t"], &signed.signed_bytes, &secret.public(), 0)
-                .unwrap(),
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &signed.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
             AcceptOutcome::Stored { .. }
         ));
         assert_eq!(
-            accept_row_entry(&tx, stream(), &["t"], &signed.signed_bytes, &secret.public(), 0)
-                .unwrap(),
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &signed.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
             AcceptOutcome::AlreadyPresent,
         );
     }
@@ -373,8 +461,16 @@ mod tests {
         let tx = b.transaction().unwrap();
         let other = StreamId::from_bytes([9; 32]);
         assert!(
-            accept_row_entry(&tx, other, &["t"], &signed.signed_bytes, &secret.public(), 0)
-                .is_err(),
+            accept_row_entry(
+                &tx,
+                account(),
+                other,
+                &["t"],
+                &signed.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .is_err(),
             "an entry cannot be re-homed onto a stream it was not signed for",
         );
     }
@@ -396,15 +492,31 @@ mod tests {
         // The genesis routed to a scope that does NOT include "t": stored INERT (the chain still
         // advances), not applied.
         assert_eq!(
-            accept_row_entry(&tx, stream(), &["other"], &first.signed_bytes, &secret.public(), 0)
-                .unwrap(),
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["other"],
+                &first.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
             AcceptOutcome::StoredInert("table not in scope"),
         );
         // The chain is not wedged: the next entry (which links to the first) still stores +
         // applies.
         assert!(matches!(
-            accept_row_entry(&tx, stream(), &["t"], &second.signed_bytes, &secret.public(), 0)
-                .unwrap(),
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &second.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
             AcceptOutcome::Stored { .. },
         ));
     }
@@ -426,14 +538,30 @@ mod tests {
         let mut b = conn();
         let tx = b.transaction().unwrap();
         assert_eq!(
-            accept_row_entry(&tx, stream(), &["t"], &garbage.signed_bytes, &secret.public(), 0)
-                .unwrap(),
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &garbage.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
             AcceptOutcome::StoredInert("undecodable op payload"),
         );
         // One bad payload does not wedge the chain: the next valid entry still applies.
         assert!(matches!(
-            accept_row_entry(&tx, stream(), &["t"], &valid.signed_bytes, &secret.public(), 0)
-                .unwrap(),
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &valid.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
             AcceptOutcome::Stored { .. },
         ));
     }
@@ -453,8 +581,16 @@ mod tests {
         let mut b = conn();
         let tx = b.transaction().unwrap();
         assert!(
-            accept_row_entry(&tx, stream(), &["t"], &poison.signed_bytes, &secret.public(), 0)
-                .is_err(),
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &poison.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .is_err(),
             "an out-of-bound lamport is rejected before it can poison the stream counter",
         );
     }
@@ -487,6 +623,7 @@ mod tests {
             matches!(
                 accept_row_entry(
                     &tx,
+                    account(),
                     stream(),
                     &["t"],
                     &at_bound.signed_bytes,
@@ -502,8 +639,16 @@ mod tests {
         let mut bad = conn();
         let tx = bad.transaction().unwrap();
         assert!(
-            accept_row_entry(&tx, stream(), &["t"], &beyond.signed_bytes, &secret.public(), 0)
-                .is_err(),
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &beyond.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .is_err(),
             "a lamport one past the advance bound is refused",
         );
     }
@@ -523,8 +668,16 @@ mod tests {
         };
         let tx = b.transaction().unwrap();
         assert_eq!(
-            accept_row_entry(&tx, stream(), &["t"], &second.signed_bytes, &secret.public(), 0)
-                .unwrap(),
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &second.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
             AcceptOutcome::MissingPredecessor,
         );
     }
@@ -552,15 +705,171 @@ mod tests {
 
         let mut b = conn();
         let tx = b.transaction().unwrap();
-        accept_row_entry(&tx, stream(), &["t"], &e1.signed_bytes, &secret.public(), 0).unwrap();
-        accept_row_entry(&tx, stream(), &["t"], &e2.signed_bytes, &secret.public(), 0).unwrap();
+        accept_row_entry(&tx, account(), stream(), &["t"], &e1.signed_bytes, &secret.public(), 0)
+            .unwrap();
+        accept_row_entry(&tx, account(), stream(), &["t"], &e2.signed_bytes, &secret.public(), 0)
+            .unwrap();
         // Links past the tail to the STORED ancestor e1 (which already has a successor) → an
         // equivocation, not a missing predecessor.
         assert_eq!(
-            accept_row_entry(&tx, stream(), &["t"], &fork.signed_bytes, &secret.public(), 0)
-                .unwrap(),
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &fork.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
             AcceptOutcome::Fork,
             "a fork linking to a stored ancestor is a Fork, not a MissingPredecessor",
+        );
+    }
+
+    // ─── #935: roster/role authority gate ───
+
+    /// A signed, decodable row entry from `secret` on `stream()` — built without storing (like the
+    /// garbage/fork helpers), enough to drive the authority gate.
+    fn signed_row(secret: &DeviceSecret, id: &str) -> SignedEntry {
+        entry::sign_entry_from_op_bytes(secret, stream(), None, 0, row_op::encode(&op(id)))
+    }
+
+    fn accept(
+        tx: &Transaction<'_>,
+        acct: AccountId,
+        signed: &SignedEntry,
+        pubkey: &DevicePublic,
+    ) -> AcceptOutcome {
+        accept_row_entry(tx, acct, stream(), &["t"], &signed.signed_bytes, pubkey, 0).unwrap()
+    }
+
+    fn stream_entry_count(tx: &Transaction<'_>) -> i64 {
+        tx.query_row(
+            "SELECT COUNT(*) FROM table_sync_entries WHERE stream_id = ?1",
+            params![stream().to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_off_roster_device_is_unauthorized_and_stores_nothing() {
+        let secret = DeviceSecret::from_seed(&[2; 32]); // never enrolled
+        let signed = signed_row(&secret, "r1");
+        let mut b = conn();
+        let tx = b.transaction().unwrap();
+        assert_eq!(accept(&tx, account(), &signed, &secret.public()), AcceptOutcome::Unauthorized);
+        assert_eq!(stream_entry_count(&tx), 0, "an unauthorized entry advances no chain");
+    }
+
+    #[test]
+    fn a_read_only_device_is_unauthorized() {
+        let secret = DeviceSecret::from_seed(&[3; 32]);
+        let signed = signed_row(&secret, "r1");
+        let mut b = conn();
+        enroll(&b, account(), secret.public().fingerprint(), "read_only");
+        let tx = b.transaction().unwrap();
+        assert_eq!(accept(&tx, account(), &signed, &secret.public()), AcceptOutcome::Unauthorized);
+    }
+
+    #[test]
+    fn a_member_and_an_owner_may_author() {
+        for (seed, role) in [([4u8; 32], "member"), ([1u8; 32], "owner")] {
+            let secret = DeviceSecret::from_seed(&seed);
+            let signed = signed_row(&secret, "r1");
+            let mut b = conn();
+            enroll(&b, account(), secret.public().fingerprint(), role);
+            let tx = b.transaction().unwrap();
+            assert!(
+                matches!(
+                    accept(&tx, account(), &signed, &secret.public()),
+                    AcceptOutcome::Stored { .. }
+                ),
+                "{role} may author table rows",
+            );
+        }
+    }
+
+    #[test]
+    fn a_removed_writer_is_unauthorized() {
+        let secret = DeviceSecret::from_seed(&[1; 32]); // conn() enrolls it as owner
+        let signed = signed_row(&secret, "r1");
+        let mut b = conn();
+        remove_from_roster(&b, account(), secret.public().fingerprint());
+        let tx = b.transaction().unwrap();
+        assert_eq!(accept(&tx, account(), &signed, &secret.public()), AcceptOutcome::Unauthorized);
+    }
+
+    #[test]
+    fn a_writer_in_another_account_is_unauthorized_here() {
+        let secret = DeviceSecret::from_seed(&[1; 32]); // owner in account()
+        let signed = signed_row(&secret, "r1");
+        let mut b = conn();
+        let tx = b.transaction().unwrap();
+        let other = AccountId::from_bytes([0xAA; 32]);
+        assert_eq!(accept(&tx, other, &signed, &secret.public()), AcceptOutcome::Unauthorized);
+    }
+
+    #[test]
+    fn the_authority_gate_precedes_forward_compat_retention() {
+        // An off-roster device authoring an UNDECODABLE payload is dropped Unauthorized, never
+        // retained StoredInert: the gate runs before the forward-compat path, so an unauthorized
+        // principal can never populate a retained stream.
+        let secret = DeviceSecret::from_seed(&[2; 32]);
+        let garbage = entry::sign_entry_from_op_bytes(&secret, stream(), None, 0, vec![0x00]);
+        let mut b = conn();
+        let tx = b.transaction().unwrap();
+        assert_eq!(accept(&tx, account(), &garbage, &secret.public()), AcceptOutcome::Unauthorized);
+        assert_eq!(stream_entry_count(&tx), 0);
+    }
+
+    #[test]
+    fn an_unauthorized_drop_heals_after_the_device_is_enrolled() {
+        // Roster lag: dropped before the author's DeviceAdd folds locally, accepted on the re-offer
+        // after it does — so `Unauthorized` is retryable, not terminal.
+        let secret = DeviceSecret::from_seed(&[5; 32]);
+        let signed = signed_row(&secret, "r1");
+        let mut b = conn();
+        {
+            let tx = b.transaction().unwrap();
+            assert_eq!(
+                accept(&tx, account(), &signed, &secret.public()),
+                AcceptOutcome::Unauthorized
+            );
+            tx.commit().unwrap();
+        }
+        enroll(&b, account(), secret.public().fingerprint(), "member"); // the DeviceAdd folded
+        let tx = b.transaction().unwrap();
+        assert!(
+            matches!(
+                accept(&tx, account(), &signed, &secret.public()),
+                AcceptOutcome::Stored { .. }
+            ),
+            "the re-offer is accepted once the author is roster-effective",
+        );
+    }
+
+    #[test]
+    fn already_present_takes_precedence_over_a_later_removal() {
+        // An entry stored while the device WAS a writer still reports AlreadyPresent after removal
+        // (the gate sits after `entry_exists`), preserving dedup/frontier semantics.
+        let secret = DeviceSecret::from_seed(&[1; 32]);
+        let signed = signed_row(&secret, "r1");
+        let mut b = conn();
+        {
+            let tx = b.transaction().unwrap();
+            assert!(matches!(
+                accept(&tx, account(), &signed, &secret.public()),
+                AcceptOutcome::Stored { .. }
+            ));
+            tx.commit().unwrap();
+        }
+        remove_from_roster(&b, account(), secret.public().fingerprint());
+        let tx = b.transaction().unwrap();
+        assert_eq!(
+            accept(&tx, account(), &signed, &secret.public()),
+            AcceptOutcome::AlreadyPresent
         );
     }
 }

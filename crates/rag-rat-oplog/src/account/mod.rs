@@ -120,7 +120,6 @@ pub use secrets::{
 // store that cannot yet prune them, since the tombstone horizon is still outstanding on #609.
 #[allow(unused_imports, reason = "C6 authoring seam is frozen before transport wiring lands")]
 pub use snapshot::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
-pub(crate) use storage::stream_owner_account;
 pub use storage::{
     CapacityScope, IngestOutcome, SyncAccountEntry, account_effective_count,
     account_entries_for_enrollment, account_entries_for_sync, account_entry_ref, account_ingest,
@@ -129,3 +128,4 @@ pub use storage::{
     owner_control_authority, owner_control_authority_in_snapshot, owner_secrets_authority,
     roster_content_authority, stream_owner_effective, verify_enrollment_device_add,
 };
+pub(crate) use storage::{device_is_effective_writer, stream_owner_account};

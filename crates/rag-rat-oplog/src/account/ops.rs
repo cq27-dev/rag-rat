@@ -61,6 +61,8 @@ pub enum DeviceRole {
 impl DeviceRole {
     /// Whether this role may author content (a member on a granted stream, or an owner directly). A
     /// read-only device may not — this is the single predicate the content-authority gate consults.
+    /// (The table-sync ingest gate checks the equivalent `role IN ('member','owner')` at the SQL
+    /// level in `device_is_effective_writer`, so it does not need a Rust predicate here.)
     pub(in crate::account) fn can_author_content(self) -> bool {
         matches!(self, DeviceRole::Member | DeviceRole::Owner)
     }

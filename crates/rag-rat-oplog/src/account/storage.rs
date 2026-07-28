@@ -2377,6 +2377,30 @@ pub(super) fn effective_roster_entry_in_snapshot(
         .transpose()
 }
 
+/// Whether `fingerprint` is currently a roster-effective WRITER (`Member`/`Owner`, `closed_at IS
+/// NULL`) of `account_id` — the exact admission fact the table-sync ingest gate needs (#935). An
+/// order-free `EXISTS`: one fingerprint can hold several open roster rows (siblings that all won at
+/// the same tail), so a single-row `SELECT role` would be nondeterministic, but "does an effective
+/// writer row exist" is not. `role` is the immutable ENROLLMENT role — Owner *promotion* lives in
+/// `account_owner_incarnations` and is irrelevant here (Member and Owner both write; a `ReadOnly`
+/// enrollment cannot be promoted, per §9), so this must NOT become a join with the incarnation
+/// table. A device effective in a DIFFERENT account resolves false, so wrong-account is covered.
+pub(crate) fn device_is_effective_writer(
+    conn: &Connection,
+    account_id: AccountId,
+    fingerprint: DeviceFingerprint,
+) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM account_roster_history
+             WHERE account_id = ?1 AND device_fingerprint = ?2 AND closed_at IS NULL
+               AND role IN ('member', 'owner')
+         )",
+        params![account_id.to_bytes().as_slice(), fingerprint.to_bytes().as_slice()],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
 /// The x25519 key the ONE accepted enrollment entry at `roster_ref` certifies for `fingerprint`
 /// (genesis → its founder / header device; DeviceAdd → the ADDED device), routed through the
 /// small-order / identity blocklist. Bound to that exact `entry_hash`, so a rejected/forked sibling

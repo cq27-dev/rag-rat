@@ -43,6 +43,11 @@ pub(crate) enum IngestOutcome {
     Parked(&'static str),
     /// A type mismatch — stored, unprojectable, surfaced.
     Quarantined(String),
+    /// The signing device is not a roster-effective writer (off-roster, removed, or read-only), so
+    /// the entry was DROPPED (#935). RETRYABLE — the local fold may lag the author's `DeviceAdd`; a
+    /// caller must not treat it as peer misbehavior, and the frontier re-offers it once the account
+    /// log delivers the enrollment.
+    Unauthorized,
 }
 
 /// Author the row ops that bring peers up to this device's state, returning each as signed wire
@@ -110,8 +115,15 @@ pub(crate) fn ingest(
     let scope_tables: Vec<&str> =
         ctx.registry.iter().filter(|s| s.scope_id == scope_id).map(|s| s.name).collect();
     Ok(
-        match store::accept_row_entry(tx, stream, &scope_tables, signed_bytes, pubkey, ctx.now_ms)?
-        {
+        match store::accept_row_entry(
+            tx,
+            ctx.account_id,
+            stream,
+            &scope_tables,
+            signed_bytes,
+            pubkey,
+            ctx.now_ms,
+        )? {
             AcceptOutcome::Stored { op, meta } => {
                 // `accept_row_entry` already validated the op's table is in `scope_tables`, so
                 // exactly one spec matches; the fallback is defensive, never
@@ -130,6 +142,7 @@ pub(crate) fn ingest(
             AcceptOutcome::AlreadyPresent => IngestOutcome::AlreadyPresent,
             AcceptOutcome::MissingPredecessor => IngestOutcome::Parked("missing predecessor"),
             AcceptOutcome::Fork => IngestOutcome::Parked("fork"),
+            AcceptOutcome::Unauthorized => IngestOutcome::Unauthorized,
         },
     )
 }
@@ -196,6 +209,9 @@ mod tests {
         }
 
         fn ingest_all(&mut self, entries: &[Vec<u8>], from: &DevicePublic) {
+            // The receiver has folded the author's DeviceAdd, so it is an effective writer here —
+            // otherwise the #935 authority gate would drop every entry as Unauthorized.
+            enroll_writer(&self.conn, AccountId::from_bytes([42; 32]), from.fingerprint());
             let tx = self.conn.transaction().unwrap();
             let ctx = SyncCtx {
                 repo_id: "repo",
@@ -209,6 +225,27 @@ mod tests {
             }
             tx.commit().unwrap();
         }
+    }
+
+    /// Enroll `fp` as a roster-effective writer (Owner) of `account`, so the #935 ingest gate
+    /// admits its entries — the receiver-side view after it has folded the author's
+    /// `DeviceAdd`.
+    fn enroll_writer(
+        conn: &rusqlite::Connection,
+        account: AccountId,
+        fp: crate::op::DeviceFingerprint,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO account_roster_history
+                 (roster_ref, account_id, device_fingerprint, role, effective_at, closed_at)
+             VALUES (?1, ?2, ?3, 'owner', 0, NULL)",
+            rusqlite::params![
+                fp.to_bytes().as_slice(),
+                account.to_bytes().as_slice(),
+                fp.to_bytes().as_slice()
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -306,6 +343,9 @@ mod tests {
         };
         assert_eq!(entries.len(), 2, "one op per table in the scope");
 
+        // B has folded A's DeviceAdd, so A is an effective writer here (else the #935 gate drops
+        // it).
+        enroll_writer(&b_conn, account, a_dev.secret().public().fingerprint());
         // B ingests both over the ONE shared scope stream; each must route to its own table.
         {
             let tx = b_conn.transaction().unwrap();
