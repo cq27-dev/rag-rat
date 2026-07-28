@@ -9,10 +9,17 @@ use super::*;
 /// `impl<U> Foo<U>` alike: valid cfg variants may spell an equivalent generic owner with
 /// different binder names and must remain ONE logical symbol. Trait-impl markers
 /// (`Type as Trait`) survive — only generics fold, so two traits' methods stay distinct (#567).
-/// Every SQL read of `symbols.scope_path` that feeds a [`LogicalSymbolKey`] funnels through
-/// here; comparing a normalized key against a raw path is always a bug.
-fn logical_scope_path(raw: String) -> String {
-    if raw.contains('<') { crate::index::edges::degeneric_path(&raw) } else { raw }
+/// RUST ONLY: in C-family scopes `<` is not always a generic opener (`Foo::operator<` has no
+/// closing `>`, so folding would swallow the rest of the path and collide `operator<` with
+/// `operator<<`) — other languages keep their raw scope. Every SQL read of `symbols.scope_path`
+/// that feeds a [`LogicalSymbolKey`] funnels through here; comparing a normalized key against a
+/// raw path is always a bug.
+fn logical_scope_path(language: &str, raw: String) -> String {
+    if language == Language::Rust.as_str() && raw.contains('<') {
+        crate::index::edges::degeneric_path(&raw)
+    } else {
+        raw
+    }
 }
 
 /// Grouping key that collapses cfg variants / overloads of one symbol into a single logical symbol.
@@ -131,16 +138,19 @@ pub(crate) fn realign_logical_symbol_ids(conn: &rusqlite::Connection) -> rusqlit
     ))?;
     let rows = stmt
         .query_map([], |r| {
+            let language: String = r.get(2)?;
             Ok(Row {
                 old_id: r.get(0)?,
                 repo_id: r.get(1)?,
-                language: r.get(2)?,
                 path: r.get(3)?,
                 name: r.get(4)?,
                 qualified_name: r.get(5)?,
                 kind: r.get(6)?,
                 signature: r.get(7)?,
-                scope_path: r.get::<_, Option<String>>(8)?.map(logical_scope_path),
+                scope_path: r
+                    .get::<_, Option<String>>(8)?
+                    .map(|path| logical_scope_path(&language, path)),
+                language,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -805,21 +815,44 @@ impl IndexDatabase {
             "
         ))?;
         let mut rows = stmt.query(params![self.active_repo_id, self.active_generation])?;
-        let mut current: Option<(LogicalSymbolKey, Vec<LogicalSymbolMemberRow>)> = None;
+        let mut members_sorted = Vec::new();
         while let Some(row) = rows.next()? {
-            let member = LogicalSymbolMemberRow {
+            let language: String = row.get(2)?;
+            let scope_path = logical_scope_path(&language, row.get(5)?);
+            members_sorted.push(LogicalSymbolMemberRow {
                 symbol_id: row.get(0)?,
                 path: row.get(1)?,
-                language: row.get(2)?,
+                language,
                 name: row.get(3)?,
                 qualified_name: row.get(4)?,
-                scope_path: logical_scope_path(row.get(5)?),
+                scope_path,
                 kind: row.get(6)?,
                 signature: row.get(7)?,
                 start_line: row.get(8)?,
                 end_line: row.get(9)?,
                 file_id: row.get(10)?,
-            };
+            });
+        }
+        // The SQL ORDER BY sorts the RAW scope, but grouping compares the NORMALIZED one — and
+        // equal-normalized rows need not be raw-adjacent (`Foo<A> as Runs::f`, `Foo<A>::f`,
+        // `Foo<B> as Runs::f`: the inherent method splits the trait pair). A split group derives
+        // the SAME stable id twice and the second insert dies on the primary key, so re-sort on
+        // the exact tuple the group-boundary comparison uses (spans/id only as deterministic
+        // member order within a group).
+        members_sorted.sort_by(|a, b| {
+            (&a.language, &a.path, &a.name, &a.qualified_name, &a.scope_path, &a.kind)
+                .cmp(&(&b.language, &b.path, &b.name, &b.qualified_name, &b.scope_path, &b.kind))
+                .then_with(|| a.signature.cmp(&b.signature))
+                .then_with(|| {
+                    (a.start_line, a.end_line, a.symbol_id).cmp(&(
+                        b.start_line,
+                        b.end_line,
+                        b.symbol_id,
+                    ))
+                })
+        });
+        let mut current: Option<(LogicalSymbolKey, Vec<LogicalSymbolMemberRow>)> = None;
+        for member in members_sorted {
             // Compare the member's key fields against the current group WITHOUT allocating a key
             // per row (only per group, on a boundary).
             let same_group = current.as_ref().is_some_and(|(key, _)| {
@@ -945,12 +978,15 @@ impl IndexDatabase {
         ])?;
         let mut claims: BTreeMap<ReplacedSymbolKey, GroupedKeyClaim> = BTreeMap::new();
         while let Some(row) = rows.next()? {
+            let language: String = row.get(0)?;
             let key = ReplacedSymbolKey {
-                language: row.get(0)?,
                 path: row.get(1)?,
                 name: row.get(2)?,
                 qualified_name: row.get(3)?,
-                scope_path: row.get::<_, Option<String>>(4)?.map(logical_scope_path),
+                scope_path: row
+                    .get::<_, Option<String>>(4)?
+                    .map(|path| logical_scope_path(&language, path)),
+                language,
                 kind: row.get(5)?,
                 signature: row.get(6)?,
             };
@@ -1015,12 +1051,15 @@ impl IndexDatabase {
         ])?;
         let mut inserted: BTreeMap<ReplacedSymbolKey, Vec<ReplacementSymbolSpan>> = BTreeMap::new();
         while let Some(row) = rows.next()? {
+            let language: String = row.get(0)?;
             let key = ReplacedSymbolKey {
-                language: row.get(0)?,
                 path: row.get(1)?,
                 name: row.get(2)?,
                 qualified_name: row.get(3)?,
-                scope_path: row.get::<_, Option<String>>(4)?.map(logical_scope_path),
+                scope_path: row
+                    .get::<_, Option<String>>(4)?
+                    .map(|path| logical_scope_path(&language, path)),
+                language,
                 kind: row.get(5)?,
                 signature: row.get(6)?,
             };
@@ -1174,7 +1213,8 @@ impl IndexDatabase {
                       JOIN symbols s ON s.id = m.symbol_id
                      WHERE m.logical_symbol_id = ls.id LIMIT 1),
                    ls.kind,
-                   {UNANIMOUS_MEMBER_SIGNATURE_SQL}
+                   {UNANIMOUS_MEMBER_SIGNATURE_SQL},
+                   ls.language
             FROM main.logical_symbols ls
             WHERE ls.repo_id = ?1
               AND ls.id IN ({reference_sources}
@@ -1183,12 +1223,15 @@ impl IndexDatabase {
         ))?;
         let rows = stmt
             .query_map(params![self.active_repo_id], |row| {
+                let language: String = row.get(7)?;
                 Ok(LogicalKeyDriftRow {
                     old_id: row.get(0)?,
                     path: row.get(1)?,
                     name: row.get(2)?,
                     qualified_name: row.get(3)?,
-                    scope_path: row.get::<_, Option<String>>(4)?.map(logical_scope_path),
+                    scope_path: row
+                        .get::<_, Option<String>>(4)?
+                        .map(|path| logical_scope_path(&language, path)),
                     kind: row.get(5)?,
                     signature: row.get(6)?,
                 })
@@ -1258,18 +1301,22 @@ impl IndexDatabase {
                                   JOIN symbols s ON s.id = m.symbol_id
                                  WHERE m.logical_symbol_id = ls.id LIMIT 1),
                                ls.kind,
-                               {UNANIMOUS_MEMBER_SIGNATURE_SQL}
+                               {UNANIMOUS_MEMBER_SIGNATURE_SQL},
+                               ls.language
                         FROM main.logical_symbols ls
                         WHERE ls.id = ?1 AND ls.repo_id = ?2
                         "
                     ),
                     params![old.old_id, self.active_repo_id],
                     |row| {
+                        let language: String = row.get(6)?;
                         Ok(DriftKey {
                             path: row.get(0)?,
                             name: row.get(1)?,
                             qualified_name: row.get(2)?,
-                            scope_path: row.get::<_, Option<String>>(3)?.map(logical_scope_path),
+                            scope_path: row
+                                .get::<_, Option<String>>(3)?
+                                .map(|path| logical_scope_path(&language, path)),
                             kind: row.get(4)?,
                             signature: row.get(5)?,
                         })

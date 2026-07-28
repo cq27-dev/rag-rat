@@ -2073,6 +2073,71 @@ fn papertrail_sync_caches_rationale_without_query_time_crawling() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// The stable-id collision shape: cfg variants of a GENERIC impl with different binder names
+/// (`impl<A>` / `impl<B>`) plus an inherent method whose raw scope sorts BETWEEN the two trait
+/// rows (`Foo<A> as Runs::f` < `Foo<A>::f` < `Foo<B> as Runs::f`). Grouping compares the
+/// degeneric scope, so both trait rows carry one key — but under the raw SQL order they were
+/// non-adjacent, the group split, and the second half re-derived the same stable id straight
+/// into a `logical_symbols.id` UNIQUE violation.
+#[test]
+fn cfg_variant_generic_impls_rebuild_without_id_collisions() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Foo<T>(T);
+
+pub trait Runs {
+    fn f(&self);
+}
+
+#[cfg(feature = "alpha")]
+impl<A> Foo<A> {
+    pub fn f(&self) {}
+}
+
+#[cfg(not(feature = "alpha"))]
+impl<B> Foo<B> {
+    pub fn f(&self) {}
+}
+
+#[cfg(feature = "alpha")]
+impl<A> Runs for Foo<A> {
+    fn f(&self) {}
+}
+
+#[cfg(not(feature = "alpha"))]
+impl<B> Runs for Foo<B> {
+    fn f(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Binder names fold away: the two inherent variants are ONE logical symbol, the two trait
+    // variants another — two distinct groups, four members.
+    let (groups, members): (i64, i64) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(DISTINCT m.logical_symbol_id), COUNT(*)
+             FROM logical_symbol_members m
+             JOIN symbols s ON s.id = m.symbol_id
+             WHERE s.name = 'f'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((groups, members), (2, 4), "two binder-folded groups covering all four variants");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn logical_symbol_grouping_preserves_rust_method_owners() {
     let root = unique_temp_root();
