@@ -136,3 +136,64 @@ fn real_typescript_server_warms_before_it_resolves_an_imported_callee() {
 
     session.shutdown();
 }
+
+#[test]
+#[ignore = "needs typescript-language-server on PATH + RAG_RAT_TS_NODE_MODULES"]
+fn a_file_its_ancestor_config_excludes_still_warms_the_server() {
+    // The warm-up picks a document by ANCESTOR config, not by evaluating `include`/`exclude`.
+    // This pins why that is enough: a file the ancestor config excludes still triggers an
+    // observable project load, because the server loads that project in order to decide the file
+    // is not in it. If this ever fails, the warm-up needs real project membership — until then,
+    // reimplementing tsconfig glob semantics would be a second source of truth for no gain.
+    let h = Harness::new();
+    std::fs::create_dir_all(h.root().join("src")).unwrap();
+    std::fs::create_dir_all(h.root().join("scripts")).unwrap();
+    // The config governs the whole checkout but INCLUDES only `src`.
+    std::fs::write(
+        h.root().join("tsconfig.json"),
+        r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"bundler",
+            "strict":true},"include":["src"]}"#,
+    )
+    .unwrap();
+    std::fs::write(h.root().join("package.json"), r#"{"name":"excluded","version":"1.0.0"}"#)
+        .unwrap();
+    std::fs::write(h.root().join("scripts/lib.ts"), LIB_TS).unwrap();
+    link_typescript(h.root());
+
+    let defs = h.add_file("scripts/lib.ts", LIB_TS);
+    let target = h.add_symbol(defs, "greet", 0, LIB_TS.len());
+    let src = h.add_file("scripts/main.ts", MAIN_TS);
+    let call = MAIN_TS.rfind("greet").expect("the call site");
+    let edge = h.add_edge(src, "greet", call, call + "greet".len(), "NameOnly", None);
+
+    let mut session = LiveOracleSession::spawn(crate::OracleTool::TsLsp, h.root())
+        .expect("an excluded file still lives under a config, so the backend is not blocked");
+    let worklist = vec!["scripts/main.ts".to_string()];
+    let input = LivePassInput {
+        commit_sha: COMMIT,
+        worktree_id: WORKTREE,
+        checkout_root: h.root(),
+        worklist: &worklist,
+        max_requests: 100,
+        started_at_ms: 1_000,
+    };
+
+    assert_eq!(live_oracle_pass(&h.conn, &mut session, &input).unwrap().status, "Warming");
+    let deadline = Instant::now() + WARMUP_BUDGET;
+    let report = loop {
+        let report = live_oracle_pass(&h.conn, &mut session, &input).unwrap();
+        if report.status != "Warming" {
+            break report;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an excluded file never warmed the server within {WARMUP_BUDGET:?} — the warm-up now \
+             needs real tsconfig membership, not ancestry",
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+
+    assert_eq!(report.status, "Completed", "{report:?}");
+    assert_eq!(h.verdict(edge).expect("a verdict").1, Some(target));
+    session.shutdown();
+}

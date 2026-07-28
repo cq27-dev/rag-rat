@@ -135,9 +135,17 @@ fn is_searchable_dir(name: &str) -> bool {
     name != "node_modules" && !name.starts_with('.')
 }
 
-/// The directory of the nearest `tsconfig.json` at or above `path`, stopping at `root` — how
-/// tsserver decides which project a file belongs to. `None` means the file would open as an
-/// inferred project, which loads SILENTLY (no progress cycle).
+/// The directory of the nearest `tsconfig.json` at or above `path`, stopping at `root`. `None`
+/// means no config governs the file at all, and opening it produces NO project-load progress.
+///
+/// ANCESTRY IS THE WHOLE TEST — deliberately. A config's `files`/`include`/`exclude` decide
+/// membership, so an ancestor config does not prove the file is *in* that project; the tempting
+/// "fix" is to evaluate those globs here. Measured against the real server, that would be wasted
+/// complexity: opening a file whose ancestor config EXCLUDES it (root `"include": ["src"]`,
+/// opening `scripts/main.ts`) still emits a full `$/progress` begin/end cycle, because tsserver
+/// loads the config project in order to decide the file isn't in it. The load is observable either
+/// way. Only a file with no ancestor config at all loads silently. Do not reimplement tsconfig
+/// glob semantics here — it would add a second, subtler source of truth for no gain.
 fn enclosing_tsconfig_dir(root: &Path, path: &Path) -> Option<PathBuf> {
     let mut dir = path.parent()?;
     loop {

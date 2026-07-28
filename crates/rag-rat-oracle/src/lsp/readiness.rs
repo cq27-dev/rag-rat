@@ -92,7 +92,19 @@ pub(crate) struct ReadinessTracker {
     /// Work-done progress tokens the server has begun and not yet ended. Every `$/progress` we
     /// see is server-created work-done progress: partial-result progress only flows for a
     /// `partialResultToken` the client supplied, and this client never sends one.
-    in_flight: HashSet<String>,
+    ///
+    /// Keyed by the token's JSON value, not its rendering: LSP allows a `ProgressToken` to be an
+    /// integer OR a string, so flattening both to text would let `7` and `"7"` share a slot —
+    /// ending either would empty the set and report ready while the other load is still running.
+    in_flight: HashSet<ProgressToken>,
+}
+
+/// An LSP `ProgressToken`, which the protocol defines as `integer | string`. Kept as a typed value
+/// so two tokens are equal only when the server meant them to be.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ProgressToken {
+    Number(String),
+    Text(String),
 }
 
 impl ReadinessTracker {
@@ -148,12 +160,12 @@ impl ReadinessTracker {
     }
 }
 
-/// A progress token, which LSP allows to be either a string or an integer. Normalized to a string
-/// so both forms key the same in-flight set.
-fn progress_token(params: &Value) -> Option<String> {
+/// The `token` of a `$/progress` notification, preserving whether the server sent it as a number
+/// or a string (see [`ProgressToken`]).
+fn progress_token(params: &Value) -> Option<ProgressToken> {
     match params.get("token")? {
-        Value::String(token) => Some(token.clone()),
-        Value::Number(token) => Some(token.to_string()),
+        Value::String(token) => Some(ProgressToken::Text(token.clone())),
+        Value::Number(token) => Some(ProgressToken::Number(token.to_string())),
         _ => None,
     }
 }
@@ -275,8 +287,6 @@ mod tests {
 
     #[test]
     fn integer_progress_tokens_pair_with_their_own_end() {
-        // LSP allows an integer ProgressToken; normalizing to a string must not make two distinct
-        // tokens collide or a matching pair miss each other.
         let (mut tracker, state) = tracker(ReadinessPolicy::WorkDoneProgress);
         tracker.observe(&json!({
             "method": "$/progress", "params": {"token": 7, "value": {"kind": "begin"}}
@@ -285,6 +295,28 @@ mod tests {
             "method": "$/progress", "params": {"token": 7, "value": {"kind": "end"}}
         }));
         assert!(state.checkpoint().is_some());
+    }
+
+    #[test]
+    fn an_integer_token_never_shares_a_slot_with_the_same_digits_as_a_string() {
+        // LSP's ProgressToken is `integer | string`, so `7` and `"7"` are DIFFERENT tokens. If
+        // both keyed one slot, ending either would empty the set and report ready while the other
+        // load was still running — persisting a warming server's answers, the exact failure this
+        // whole policy exists to prevent.
+        let (mut tracker, state) = tracker(ReadinessPolicy::WorkDoneProgress);
+        for token in [json!(7), json!("7")] {
+            tracker.observe(&json!({
+                "method": "$/progress", "params": {"token": token, "value": {"kind": "begin"}}
+            }));
+        }
+        tracker.observe(&json!({
+            "method": "$/progress", "params": {"token": 7, "value": {"kind": "end"}}
+        }));
+        assert_eq!(state.checkpoint(), None, "the string token's load is still in flight");
+        tracker.observe(&json!({
+            "method": "$/progress", "params": {"token": "7", "value": {"kind": "end"}}
+        }));
+        assert!(state.checkpoint().is_some(), "ready only once BOTH loads drained");
     }
 
     #[test]
