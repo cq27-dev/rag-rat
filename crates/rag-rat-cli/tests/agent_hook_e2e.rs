@@ -237,23 +237,7 @@ impl TestRepo {
     }
 
     fn add_file_memory(&self, marker: &str) {
-        rag_rat_core::IndexDatabase::open_config(&self.config)
-            .unwrap()
-            .memory_create(RepoMemoryCreate {
-                kind: "Invariant".to_string(),
-                title: marker.to_string(),
-                body: "The read hook must surface this memory title.".to_string(),
-                confidence: "high".to_string(),
-                created_by: Some("agent-hook-e2e".to_string()),
-                source: Some("agent".to_string()),
-                tags: Vec::new(),
-                payload_json: None,
-                bind: RepoMemoryBindTarget {
-                    path: Some("src/lib.rs".to_string()),
-                    ..Default::default()
-                },
-            })
-            .unwrap();
+        add_file_memory(&self.config, marker);
     }
 
     /// Spawn `rag-rat mcp` and drive `initialize` so the server is fully up and `run_stdio_unix`
@@ -299,7 +283,7 @@ impl TestRepo {
     }
 
     /// Run the hook client with a Grep `tool_input` for the indexed symbol under the given session,
-    /// cwd = repo root (so `find_config` walks up to our `rag-rat.toml`).
+    /// cwd = repo root (so governing config discovery reaches our `rag-rat.toml`).
     fn run_hook_session(&self, session_id: &str) -> String {
         let input = serde_json::json!({
             "session_id": session_id, "cwd": self.root.as_path(), "hook_event_name": "PreToolUse",
@@ -355,6 +339,31 @@ impl LinkedTestRepo {
         assert!(symbol_indexed_in_checkout(&self.config, &self.linked, "branch_clone_xyz"));
         assert!(!symbol_indexed_in_checkout(&self.config, &self.main, "branch_clone_xyz"));
     }
+
+    fn add_file_memory(&self, marker: &str) {
+        add_file_memory(&self.config, marker);
+    }
+}
+
+#[cfg(unix)]
+fn add_file_memory(config: &rag_rat_base::config::Config, marker: &str) {
+    rag_rat_core::IndexDatabase::open_config(config)
+        .unwrap()
+        .memory_create(RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: marker.to_string(),
+            body: "The read hook must surface this memory title.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("agent-hook-e2e".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget {
+                path: Some("src/lib.rs".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
 }
 
 #[cfg(unix)]
@@ -552,6 +561,43 @@ fn cursor_and_vscode_read_payloads_emit_bounded_augmentation() {
             .as_str()
             .unwrap()
             .contains("READ-AUGMENT-MARKER")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_and_vscode_reads_resolve_main_governed_linked_worktrees() {
+    let repo = LinkedTestRepo::indexed();
+    repo.add_file_memory("LINKED-READ-AUGMENT-MARKER");
+    let linked_file = repo.linked.join("src/lib.rs");
+
+    let cursor = serde_json::json!({
+        "hook_event_name": "postToolUse",
+        "conversation_id": "cursor-linked-read",
+        "workspace_roots": [repo.main.as_path(), repo.linked.as_path()],
+        "tool_name": "Read",
+        "tool_input": {"file_path": &linked_file},
+    });
+    let (stdout, status) = run_hook_for(Some("cursor"), &cursor.to_string(), &repo.linked);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(output["additional_context"].as_str().unwrap().contains("LINKED-READ-AUGMENT-MARKER"));
+
+    let vscode = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-linked-read",
+        "cwd": repo.linked.as_path(),
+        "tool_name": "read_file",
+        "tool_input": {"filePath": &linked_file},
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &vscode.to_string(), &repo.linked);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("LINKED-READ-AUGMENT-MARKER")
     );
 }
 

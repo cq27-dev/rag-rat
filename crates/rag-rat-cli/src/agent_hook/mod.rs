@@ -631,7 +631,7 @@ fn session_start(input: &HookInput) -> anyhow::Result<Option<String>> {
         Some("startup") | Some("clear") | Some("compact") => {},
         _ => return Ok(None),
     }
-    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(None) };
+    let Some(config) = find_governing_config(Path::new(&input.cwd)) else { return Ok(None) };
     // Do not open/create an absent database. Hooks are inert until the first index exists.
     if !config.database.is_file() {
         return Ok(None);
@@ -717,7 +717,7 @@ fn pretooluse(input: &HookInput) -> anyhow::Result<Option<String>> {
         return read_augment_hook(input);
     }
     let Some(search) = extract_search(input) else { return Ok(None) };
-    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(None) };
+    let Some(config) = find_governing_config(Path::new(&input.cwd)) else { return Ok(None) };
 
     // Pass the session cwd through both paths so the grep-augmentation is scoped to the worktree
     // the session is in (a linked worktree gets its branch overlay), not just the base index
@@ -732,7 +732,7 @@ fn pretooluse(input: &HookInput) -> anyhow::Result<Option<String>> {
 /// tracked, root-relative path with something to say. Prefers the warm listener (per-session
 /// dedup); falls back to a direct read-only compose.
 fn read_augment_hook(input: &HookInput) -> anyhow::Result<Option<String>> {
-    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(None) };
+    let Some(config) = find_governing_config(Path::new(&input.cwd)) else { return Ok(None) };
     let Some(file_path) = input.tool_input.get("file_path").and_then(|v| v.as_str()) else {
         return Ok(None);
     };
@@ -1309,24 +1309,12 @@ pub fn format_digest(o: &Orientation, live: bool, enabled: bool) -> String {
     out
 }
 
-/// Walk up from the hook's cwd to the nearest rag-rat.toml and load it. `None` ⇒ not a rag-rat repo
-/// ⇒ silent no-op (what makes `--global` install safe). Shares the upward-walk primitive with
-/// `Config::load`'s discovery seam ([`rag_rat_base::config::nearest_config_at_or_above`]). Used by
-/// the READ paths (SessionStart / grep/read augmentation): cheaper than governing discovery,
-/// and a linked worktree with no branch-local config merely loses context there (not an incorrect
-/// index). The edit-reindex path instead uses [`find_governing_config`].
-fn find_config(start: &Path) -> Option<Config> {
-    rag_rat_base::config::nearest_config_at_or_above(start)
-        .and_then(|path| Config::load(&path).ok())
-}
-
-/// Resolve the GOVERNING config for the edit hook's cwd and load it, falling back to the MAIN
+/// Resolve the GOVERNING config for the hook's cwd and load it, falling back to the MAIN
 /// worktree's config for a linked worktree with no branch-local `rag-rat.toml` (the documented
-/// main-governed setup) — the same governing discovery the CLI's own entry uses. Unlike
-/// [`find_config`], the edit-reindex path MUST resolve this: bare `nearest_config_at_or_above`
-/// stops at the linked worktree root and returns `None` there, so the hook would exit before
-/// reindexing a linked-checkout edit and leave that worktree stale. `Config::load`'s seam then
-/// re-anchors root to main and `reindex_paths` routes the edit through the overlay.
+/// main-governed setup) — the same governing discovery the CLI's own entry uses. Bare
+/// `nearest_config_at_or_above` stops at the linked worktree root and returns `None` there, which
+/// would silently disable session, augmentation, clone-check, and reindex hooks. `Config::load`'s
+/// seam then re-anchors root to main; each operation separately selects the active overlay.
 /// `discover_config_path` returns a path even when none exists; `Config::load` then fails → `None`,
 /// preserving the no-config no-op.
 fn find_governing_config(start: &Path) -> Option<Config> {
