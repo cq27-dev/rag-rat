@@ -101,29 +101,43 @@ layer and may record provenance freely.)
 
 ## Repo orientation
 
-- Rust workspace, nine crates in a layered DAG (Rust 2024 edition):
+- Rust workspace, 13 crates in a layered DAG (Rust 2024 edition):
   - `rag-rat-base` — foundation: config, repo identity/discovery, language + embedding-model
     registries, path classification, canonical JSON, locks, logging.
   - `rag-rat-db` — the SQLite substrate: schema/migrations (+ the `MigrationHooks` seam),
     storage, meta, chunk-text store/compression.
-  - satellites on db+base: `rag-rat-llm` (embedder providers, cookbook provisioning),
-    `rag-rat-papertrail` (tracker mirrors: GitHub/GitLab), `rag-rat-clones` (fingerprints,
-    postings, refine/antiunify), `rag-rat-oracle` (SCIP/LSP evidence, verdict store),
-    `rag-rat-query` (the read layer: graph/impact/symbol/tree queries, repo-memory reads +
-    evidence engine, pagerank), `rag-rat-dream` (memory-maintenance findings + verify/compact
-    model passes, on query+llm).
+  - domain layers on base+db: `rag-rat-llm` (embedder providers, cookbook provisioning),
+    `rag-rat-papertrail` (provider-neutral GitHub/GitLab tracker mirrors), `rag-rat-clones`
+    (fingerprints, postings, refine/antiunify), and `rag-rat-oracle` (SCIP/LSP evidence,
+    manifests, verdict store).
+  - `rag-rat-query` — the read layer: graph/impact/symbol/tree queries, repo-memory reads +
+    evidence resolution, pagerank, orientation primitives.
+  - `rag-rat-dream` — deterministic memory-maintenance findings plus model-driven verify/compact
+    passes, built on query+llm.
+  - `rag-rat-oplog` — signed, hash-chained memory op-log: operation model, projection fold,
+    account/authority substrate, content-candidate DAG, durable store.
   - `rag-rat-core` — the engine that remains: indexing + tree-sitter graph, the
-    `IndexDatabase` query surface, memory writes + op-log/account sync, watcher, eval.
-  - `rag-rat-mcp` (the STDIO MCP server), `rag-rat-cli` (the `rag-rat` binary).
+    `IndexDatabase` query surface, memory-write orchestration, watcher, eval.
+  - `rag-rat-sync` — iroh QUIC peer transport for exchanging signed op-log entries.
+  - entrypoints: `rag-rat-mcp` (the STDIO MCP server) and `rag-rat-cli` (package name `rag-rat`,
+    the CLI binary).
   All crates version in lockstep; see docs/releasing.md.
 - `rag-rat.toml` (repo root) configures what gets indexed and the SQLite database path.
 
+## Worktree correctness
+
+All changes that affect indexing or worktree-overlay behavior MUST support both the main checkout and
+linked worktrees sharing the same database. Every such change MUST include regression tests that
+exercise worktree behavior, including active-checkout scope and sibling-checkout preservation or
+isolation as applicable. Single-checkout coverage alone is not sufficient for index/overlay changes.
+
 ## Style
 
-Follow the `rust-modern-style` conventions: closed/persisted enums with `as_db_str`/`from_db_str`,
-`{self, ..}` imports for mixed lists, read/write-obvious DB method names, injected time (`now_ms()`),
-parameter structs over long arg trains, `mod.rs` as a curated index. Keep SQL in helpers named for
-the domain question, with invariant comments and tests (migrations included).
+Follow the `rust-modern-style` conventions: closed/persisted enums use strum-backed stable tokens
+behind `as_db_str`/`from_db_str`, `{self, ..}` imports for mixed lists, read/write-obvious DB method
+names, injected time (`now_ms()`), parameter structs over long arg trains, `mod.rs` as a curated
+index. Keep SQL in helpers named for the domain question, with invariant comments and tests
+(migrations included).
 
 ## Build / test
 

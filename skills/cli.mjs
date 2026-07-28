@@ -8,15 +8,14 @@
  *   npx @rag-rat/skills remove          # remove them
  *
  * It is a THIN wrapper over the vercel-labs `skills` CLI (https://github.com/vercel-labs/skills),
- * pinned to rag-rat's canonical skills directory. Rather than reinvent a multi-agent installer, the
- * default command delegates to `skills add <rag-rat's .agents/skills>`, which knows how to place a
+ * pinned to rag-rat's public plugin skill bundle. Rather than reinvent a multi-agent installer, the
+ * default command delegates to `skills add <rag-rat's plugin/skills>`, which knows how to place a
  * SKILL.md into 70+ agents (Claude Code → .claude/skills, Codex → .codex/skills, Cursor, opencode,
  * …), symlink or copy, project or --global. Every flag you pass is forwarded verbatim.
  *
- * SOURCE is pinned to the `.agents/skills` PATH (not the bare repo) on purpose: rag-rat mirrors its
- * skills into .claude/ and .codex/ via symlinks for its own agents, and pointing `skills` at the
- * whole repo would rediscover those mirror copies. Pinning the one canonical directory installs each
- * skill exactly once.
+ * SOURCE is pinned to the curated `plugin/skills` PATH (not `.agents/skills`) on purpose:
+ * `.agents/skills` also contains contributor-only repo guidance that must not ship through this
+ * public installer. The plugin bundle is the public projection and installs each public skill once.
  */
 
 // cross-spawn, not node:child_process — on Windows `npx` is a `.cmd` shim that Node can only run
@@ -25,8 +24,8 @@
 // args itself, so we never enable `shell` and untrusted args pass through verbatim.
 import spawn from "cross-spawn";
 
-/** rag-rat's canonical skill directory on GitHub (walked one level deep: <name>/SKILL.md). */
-const SOURCE = "https://github.com/cq27-dev/rag-rat/tree/main/.agents/skills";
+/** rag-rat's public skill bundle on GitHub (walked one level deep: <name>/SKILL.md). */
+const SOURCE = "https://github.com/cq27-dev/rag-rat/tree/main/plugin/skills";
 
 /** rag-rat's own skills — used to scope destructive/refresh subcommands to ONLY these. */
 const RAG_RAT_SKILLS = ["using-rag-rat", "dream-review", "init-rag-rat", "configure-rag-rat-dream"];
@@ -53,7 +52,7 @@ const SAFE_MAINT_FLAGS = new Set(["-g", "--global", "-p", "--project", "-y", "--
 
 function usage() {
   process.stdout.write(
-    `@rag-rat/skills — install rag-rat's agent skills (using-rag-rat, dream-review)\n\n` +
+    `@rag-rat/skills — install rag-rat's public agent skills\n\n` +
       `Usage:\n` +
       `  npx @rag-rat/skills [add|install]   install into your agent(s) (default)\n` +
       `  npx @rag-rat/skills update          refresh rag-rat's installed skills\n` +

@@ -10,7 +10,7 @@ not need to `cargo install` / `brew install` / put `rag-rat` on `PATH` first.
 ```
 plugin/                          plugin root (CLAUDE_PLUGIN_ROOT / CODEX_PLUGIN_ROOT)
   scripts/launch.js                the all-OS hook launcher (resolves the binary; never installs)
-  skills/                          shared skills: using-rag-rat, dream-review
+  skills/                          curated public skills (four rag-rat workflows)
   hooks/hooks.json                 Claude hooks (auto-discovered)
   .mcp.json                        Codex MCP config (root) → npx @rag-rat/bin mcp
   .claude-plugin/plugin.json       Claude: mcpServers → npx @rag-rat/bin mcp
@@ -51,9 +51,10 @@ Version comes from `plugin.json`. Intel Mac has no prebuilt → the launcher pri
 
 ## Skills
 
-`using-rag-rat` and `dream-review`, copied from the repo's `.agents/skills/` source of truth. One
-`skills/` dir serves every harness (a package step should regenerate it from `.agents/skills/` so the
-copies never drift).
+`using-rag-rat`, `dream-review`, `init-rag-rat`, and `configure-rag-rat-dream`, copied from the
+repo's `.agents/skills/` source of truth. One `skills/` dir serves every harness and is also the
+public source used by `@rag-rat/skills`. Regeneration must copy this explicit allowlist, never mirror
+all of `.agents/skills`: contributor-only guidance such as `rust-modern-style` stays repository-local.
 
 ## Hooks
 

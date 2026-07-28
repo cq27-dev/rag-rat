@@ -1,7 +1,7 @@
 {
   "name": "@rag-rat/skills",
-  "version": "0.1.1",
-  "description": "One-command installer for rag-rat's agent skills (using-rag-rat, dream-review, init-rag-rat, configure-rag-rat-dream). A thin wrapper over the vercel-labs `skills` CLI, pinned to rag-rat's canonical skills directory, so `npx @rag-rat/skills` places them into Claude Code, Codex, Cursor, and 70+ other agents.",
+  "version": "0.1.2",
+  "description": "One-command installer for rag-rat's public agent skills (using-rag-rat, dream-review, init-rag-rat, configure-rag-rat-dream). A thin wrapper over the vercel-labs `skills` CLI, pinned to rag-rat's curated plugin skill bundle.",
   "license": "MIT",
   "repository": {
     "type": "git",

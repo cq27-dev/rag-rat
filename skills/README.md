@@ -48,7 +48,7 @@ npx @rag-rat/skills -y                   # non-interactive
 ## How it works
 
 This package is a **thin wrapper** over the [`skills`](https://github.com/vercel-labs/skills) CLI,
-pinned to rag-rat's canonical skill directory (`.agents/skills` in the rag-rat repo). It doesn't
+pinned to rag-rat's curated public skill bundle (`plugin/skills` in the rag-rat repo). It doesn't
 reinvent the multi-agent installer — `skills` already knows how to place a `SKILL.md` into every
 supported agent, symlink-or-copy, project-or-global. `npx @rag-rat/skills` is just the branded,
 single-command entry point; it forwards your flags verbatim.
@@ -56,8 +56,9 @@ single-command entry point; it forwards your flags verbatim.
 Equivalent to running:
 
 ```bash
-npx skills add https://github.com/cq27-dev/rag-rat/tree/main/.agents/skills
+npx skills add https://github.com/cq27-dev/rag-rat/tree/main/plugin/skills
 ```
 
-The skills themselves live in [`.agents/skills/`](https://github.com/cq27-dev/rag-rat/tree/main/.agents/skills)
-in the rag-rat repo — that's the single source of truth; this package installs from it.
+The public skills are copied from the repository's `.agents/skills` source of truth into
+[`plugin/skills/`](https://github.com/cq27-dev/rag-rat/tree/main/plugin/skills). Repository-only
+contributor skills remain under `.agents/skills` and are deliberately absent from this installer.
