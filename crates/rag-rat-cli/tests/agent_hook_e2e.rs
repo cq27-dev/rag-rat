@@ -54,6 +54,15 @@ fn run_hook_for(
     (String::from_utf8_lossy(&out.stdout).into_owned(), out.status)
 }
 
+#[cfg(unix)]
+fn clone_candidate(name: &str) -> String {
+    format!(
+        "pub fn {name}(x: i64, y: i64) -> i64 {{\n    let a = x + y;\n    let b = a * 2;\n    let \
+         c = b - x;\n    let d = c + y;\n    let e = d * 3;\n    let f = e - a;\n    let g = f + \
+         b;\n    let h = g - c;\n    h + d + e + f + g\n}}\n"
+    )
+}
+
 #[test]
 fn no_rag_rat_toml_means_silent_exit_zero() {
     let dir = unique_dir("hook-noindex");
@@ -337,6 +346,14 @@ impl LinkedTestRepo {
         assert!(!linked.join("rag-rat.toml").exists());
         assert!(symbol_indexed_in_checkout(&config, &main, "main_checkout_xyz"));
         Self { main, linked, config }
+    }
+
+    fn add_clone_candidate(&self) {
+        let path = self.linked.join("src/branch_clone.rs");
+        fs::write(&path, clone_candidate("branch_clone_xyz")).unwrap();
+        rag_rat_core::watch::reindex_paths(&self.config, &[path], |_| {}).unwrap();
+        assert!(symbol_indexed_in_checkout(&self.config, &self.linked, "branch_clone_xyz"));
+        assert!(!symbol_indexed_in_checkout(&self.config, &self.main, "branch_clone_xyz"));
     }
 }
 
@@ -668,6 +685,53 @@ fn cursor_and_vscode_reindex_only_the_active_linked_worktree() {
     assert!(!symbol_indexed_in_checkout(&repo.config, &repo.linked, "cursor_linked_xyz"));
     assert!(symbol_indexed_in_checkout(&repo.config, &repo.main, "main_checkout_xyz"));
     assert!(!symbol_indexed_in_checkout(&repo.config, &repo.main, "vscode_linked_xyz"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_and_vscode_clone_checks_use_the_active_linked_worktree() {
+    let repo = LinkedTestRepo::indexed();
+    repo.add_clone_candidate();
+
+    let cursor_path = repo.linked.join("src/cursor_new.rs");
+    let cursor_content = clone_candidate("cursor_new_xyz");
+    fs::write(&cursor_path, &cursor_content).unwrap();
+    let cursor = serde_json::json!({
+        "hook_event_name": "postToolUse",
+        "conversation_id": "cursor-linked-clone",
+        "workspace_roots": [repo.main.as_path(), repo.linked.as_path()],
+        "tool_name": "Write",
+        "tool_input": {"file_path": &cursor_path, "content": cursor_content},
+    });
+    let (stdout, status) = run_hook_for(Some("cursor"), &cursor.to_string(), &repo.linked);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        output["additional_context"].as_str().unwrap().contains("branch_clone_xyz"),
+        "Cursor clone check must read the linked overlay: {stdout}"
+    );
+
+    let vscode_path = repo.linked.join("src/vscode_new.rs");
+    let vscode_content = clone_candidate("vscode_new_xyz");
+    let vscode = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-linked-clone",
+        "cwd": repo.linked.as_path(),
+        "tool_name": "multi_replace_string_in_file",
+        "tool_input": {
+            "replacements": [{"filePath": &vscode_path, "newString": vscode_content}],
+        },
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &vscode.to_string(), &repo.linked);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("branch_clone_xyz"),
+        "VS Code multi-file clone check must read the linked overlay: {stdout}"
+    );
 }
 
 #[cfg(unix)]

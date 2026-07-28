@@ -1002,13 +1002,14 @@ fn clone_check_skipped_for_size(indexed: bool, function_count: u64) -> bool {
 /// index owes a heal/migrate, index too large, no parseable functions) is a SILENT no-op, so it
 /// never blocks or perceptibly delays a write.
 fn clone_check(input: &HookInput) -> anyhow::Result<Option<String>> {
-    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(None) };
+    let Some(config) = find_governing_config(Path::new(&input.cwd)) else { return Ok(None) };
     if !config.database.is_file() {
         return Ok(None); // index not built yet
     }
     // `try_open_config_read_only` returns None when the index still owes a heal/migrate (NOT
     // ready), so this is the no-op-when-not-ready guard — the same gate the MCP read tools use.
-    let Some(db) = IndexDatabase::try_open_config_read_only(&config)? else { return Ok(None) };
+    let Some(mut db) = IndexDatabase::try_open_config_read_only(&config)? else { return Ok(None) };
+    db.use_worktree_scope(&config.root, Some(Path::new(&input.cwd)))?;
     // The size guard bounds ONLY the RAM fallback. When a live postings generation is eligible the
     // check is a bounded indexed lookup (#296 phase 4), so run it regardless of corpus size; only
     // the fallback no-ops above the cap.
@@ -1016,7 +1017,7 @@ fn clone_check(input: &HookInput) -> anyhow::Result<Option<String>> {
     if clone_check_skipped_for_size(indexed, db.clone_check_function_count().unwrap_or(u64::MAX)) {
         return Ok(None);
     }
-    let inputs = extract_clone_inputs(input, &config.root);
+    let inputs = extract_clone_inputs(input, &session_indexed_root(&config, &input.cwd));
     if inputs.is_empty() {
         return Ok(None);
     }
@@ -1034,37 +1035,40 @@ fn extract_clone_inputs(input: &HookInput, root: &Path) -> Vec<CloneCheckInput> 
         return extract_apply_patch_inputs(&input.tool_input, root);
     }
     let ti = &input.tool_input;
-    let Some(file_path) = ti.get("file_path").and_then(|v| v.as_str()) else { return Vec::new() };
-    let abs = Path::new(file_path);
-    let Some(language) = Language::from_path(abs) else { return Vec::new() };
-    // The indexed refs are root-relative, so relativize for the parse + the self-file exclusion.
-    let rel = abs.strip_prefix(root).unwrap_or(abs).to_path_buf();
-    let texts: Vec<String> = match input.tool_name.as_str() {
-        "Write" => ti
-            .get("content")
-            .and_then(|v| v.as_str())
-            .map(|s| vec![s.to_string()])
-            .unwrap_or_default(),
-        "Edit" => ti
-            .get("new_string")
-            .and_then(|v| v.as_str())
-            .map(|s| vec![s.to_string()])
-            .unwrap_or_default(),
+    let default_path = ti.get("file_path").and_then(|value| value.as_str());
+    match input.tool_name.as_str() {
+        "Write" => default_path
+            .zip(ti.get("content").and_then(|value| value.as_str()))
+            .and_then(|(path, text)| clone_input(path, text, root))
+            .into_iter()
+            .collect(),
+        "Edit" => default_path
+            .zip(ti.get("new_string").and_then(|value| value.as_str()))
+            .and_then(|(path, text)| clone_input(path, text, root))
+            .into_iter()
+            .collect(),
         "MultiEdit" => ti
             .get("edits")
-            .and_then(|v| v.as_array())
-            .map(|edits| {
-                edits
-                    .iter()
-                    .filter_map(|e| {
-                        e.get("new_string").and_then(|v| v.as_str()).map(str::to_string)
-                    })
-                    .collect()
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|edit| {
+                let path =
+                    edit.get("file_path").and_then(|value| value.as_str()).or(default_path)?;
+                let text = edit.get("new_string").and_then(|value| value.as_str())?;
+                clone_input(path, text, root)
             })
-            .unwrap_or_default(),
+            .collect(),
         _ => Vec::new(),
-    };
-    texts.into_iter().map(|text| CloneCheckInput { text, language, path: rel.clone() }).collect()
+    }
+}
+
+fn clone_input(file_path: &str, text: &str, root: &Path) -> Option<CloneCheckInput> {
+    let abs = Path::new(file_path);
+    let language = Language::from_path(abs)?;
+    // Indexed refs are root-relative, so relativize for parsing and self-file exclusion.
+    let path = abs.strip_prefix(root).unwrap_or(abs).to_path_buf();
+    Some(CloneCheckInput { text: text.to_string(), language, path })
 }
 
 /// Extract clone-check inputs from a Codex / Cursor `apply_patch` V4A envelope
@@ -1308,7 +1312,7 @@ pub fn format_digest(o: &Orientation, live: bool, enabled: bool) -> String {
 /// Walk up from the hook's cwd to the nearest rag-rat.toml and load it. `None` ⇒ not a rag-rat repo
 /// ⇒ silent no-op (what makes `--global` install safe). Shares the upward-walk primitive with
 /// `Config::load`'s discovery seam ([`rag_rat_base::config::nearest_config_at_or_above`]). Used by
-/// the READ paths (SessionStart / grep-augment / clone-check): cheaper than governing discovery,
+/// the READ paths (SessionStart / grep/read augmentation): cheaper than governing discovery,
 /// and a linked worktree with no branch-local config merely loses context there (not an incorrect
 /// index). The edit-reindex path instead uses [`find_governing_config`].
 fn find_config(start: &Path) -> Option<Config> {

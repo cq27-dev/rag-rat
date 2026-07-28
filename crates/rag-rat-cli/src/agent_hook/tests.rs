@@ -195,6 +195,15 @@ fn vscode_multi_replacements_preserve_each_edited_path() {
     assert_eq!(normalized.input.tool_name, "MultiEdit");
     assert_eq!(normalized.input.tool_input["edits"][0]["file_path"], "src/a.rs");
     assert_eq!(normalized.input.tool_input["edits"][1]["file_path"], "/other/b.rs");
+    let clone_inputs = extract_clone_inputs(&normalized.input, Path::new("/repo"));
+    assert_eq!(clone_inputs.iter().map(|input| input.path.as_path()).collect::<Vec<_>>(), vec![
+        Path::new("src/a.rs"),
+        Path::new("/other/b.rs"),
+    ]);
+    assert_eq!(clone_inputs.iter().map(|input| input.text.as_str()).collect::<Vec<_>>(), vec![
+        "fn a() {}",
+        "fn b() {}",
+    ]);
     assert_eq!(extract_edited_paths(&normalized.input), vec![
         PathBuf::from("/repo/src/a.rs"),
         PathBuf::from("/other/b.rs"),
@@ -958,6 +967,23 @@ fn extract_clone_inputs_write_edit_multiedit() {
         "fn a() {}",
         "fn b() {}"
     ]);
+
+    let per_file = write_event(
+        "MultiEdit",
+        serde_json::json!({
+            "edits": [
+                {"file_path": "/repo/src/a.rs", "new_string": "fn a() {}"},
+                {"file_path": "/repo/src/b.py", "new_string": "def b(): pass"},
+            ]
+        }),
+    );
+    let per_file = super::extract_clone_inputs(&per_file, root);
+    assert_eq!(per_file.iter().map(|input| input.path.as_path()).collect::<Vec<_>>(), vec![
+        Path::new("src/a.rs"),
+        Path::new("src/b.py"),
+    ]);
+    assert_eq!(per_file[0].language, Language::Rust);
+    assert_eq!(per_file[1].language, Language::Python);
 }
 
 #[test]
