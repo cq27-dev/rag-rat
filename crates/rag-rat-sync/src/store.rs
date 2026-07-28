@@ -6,22 +6,21 @@
 //! transport therefore adds no trust — a synced entry passes exactly the checks a local write does.
 
 use rag_rat_oplog::{
-    AccountId, ContentIngestOutcome, IngestOutcome, account_entries_for_sync, account_entry_ref,
-    account_ingest, account_signed_entry_exists, account_signed_hash, content_entries_for_sync,
-    content_entry_ref, content_ingest, content_signed_entry_exists, content_signed_hash,
-    sign_local_node_binding, verify_node_binding,
+    AccountId, ContentIngestOutcome, DeviceRole, IngestOutcome, account_entries_for_sync,
+    account_entry_ref, account_ingest, account_signed_entry_exists, account_signed_hash,
+    content_entries_for_sync, content_entry_ref, content_ingest, content_signed_entry_exists,
+    content_signed_hash, sign_local_node_binding, verify_node_binding,
 };
 use rusqlite::Connection;
 
-use crate::auth::NodeAuth;
+use crate::auth::{NodeAuth, PeerCapability};
 use crate::session::{Ingested, SyncStore};
 
 /// Mint this account's signed node binding for `local_node`. A store with no local device yet (a
 /// fresh peer being onboarded) has nothing to prove, so it returns an EMPTY binding rather than
-/// failing: an `Open` peer ignores it, while a `Closed` peer fails to verify it (an empty binding
-/// decodes to nothing) and correctly refuses — onboarding a not-yet-roster device is the deferred
-/// invite-token flow, not something `Closed` admits. Shared by both op-log stores — the binding is
-/// account-level, identical whether the session moves account entries or content.
+/// failing: an `Open` peer admits it as read-only, while a `Closed` peer fails to verify it (an
+/// empty binding decodes to nothing) and correctly refuses. Shared by both op-log stores — the
+/// binding is account-level, identical whether the session moves account entries or content.
 fn sign_binding(
     conn: &Connection,
     account_id: AccountId,
@@ -36,8 +35,8 @@ fn sign_binding(
     }
 }
 
-/// Whether a peer's binding authorizes it for `account_id`, given its authenticated `remote_node`.
-/// Collapses the internal failure taxonomy to a bool so the transport's wire refusal stays uniform;
+/// The capability a peer's binding grants for `account_id`, given its authenticated `remote_node`.
+/// Collapses the internal failure taxonomy to `None` so the transport's wire refusal stays uniform;
 /// a `?`-propagated error here is a real DB fault, not a rejected peer.
 fn authorize_binding(
     conn: &Connection,
@@ -45,8 +44,17 @@ fn authorize_binding(
     binding: &[u8],
     remote_node: &[u8; 32],
     now_ms: i64,
-) -> anyhow::Result<bool> {
-    Ok(verify_node_binding(conn, account_id, binding, remote_node, now_ms)?.is_ok())
+) -> anyhow::Result<Option<PeerCapability>> {
+    Ok(verify_node_binding(conn, account_id, binding, remote_node, now_ms)?
+        .ok()
+        .map(capability_for_role))
+}
+
+fn capability_for_role(role: DeviceRole) -> PeerCapability {
+    match role {
+        DeviceRole::ReadOnly => PeerCapability::ReadOnly,
+        DeviceRole::Member | DeviceRole::Owner => PeerCapability::ReadWrite,
+    }
 }
 
 /// A [`SyncStore`] over one account's op log on a live connection. Scoped to a single account: a
@@ -228,7 +236,7 @@ impl NodeAuth for OplogSyncStore<'_> {
         binding: &[u8],
         remote_node: &[u8; 32],
         now_ms: i64,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<PeerCapability>> {
         authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
     }
 }
@@ -243,7 +251,19 @@ impl NodeAuth for OplogContentSyncStore<'_> {
         binding: &[u8],
         remote_node: &[u8; 32],
         now_ms: i64,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<PeerCapability>> {
         authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_read_only_roster_role_lacks_push_capability() {
+        assert_eq!(capability_for_role(DeviceRole::ReadOnly), PeerCapability::ReadOnly);
+        assert_eq!(capability_for_role(DeviceRole::Member), PeerCapability::ReadWrite);
+        assert_eq!(capability_for_role(DeviceRole::Owner), PeerCapability::ReadWrite);
     }
 }

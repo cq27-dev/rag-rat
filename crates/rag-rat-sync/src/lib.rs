@@ -23,7 +23,9 @@ pub mod session;
 pub mod store;
 pub mod wire;
 
-pub use auth::{AuthConfig, AuthError, AuthPolicy, AuthRole, NodeAuth, run_auth_phase};
+pub use auth::{
+    AuthConfig, AuthError, AuthPolicy, AuthRole, NodeAuth, PeerCapability, run_auth_phase,
+};
 pub use endpoint::{
     EndpointError, SyncFailure, accept_and_dispatch, accept_and_sync, accept_enrollment,
     build_endpoint, connect_and_enroll, connect_and_sync, endpoint_addr, node_id_from_secret,

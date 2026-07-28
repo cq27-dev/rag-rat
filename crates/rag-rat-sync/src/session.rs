@@ -9,16 +9,17 @@
 //! dialer closes.
 //!
 //! The session is transport-agnostic — generic over any [`AsyncRead`]/[`AsyncWrite`] pair — and
-//! trusts nothing it receives: every entry is handed to [`SyncStore::ingest`], which re-verifies it
-//! from scratch. It is deliberately NOT `Send`-bound: [`SyncStore`] wraps a SQLite connection, so a
-//! caller runs one session at a time on a single task (concurrent sessions are a later slice).
+//! trusts nothing it receives: entries from a read-only peer are refused before ingest; every entry
+//! from a read-write peer is handed to [`SyncStore::ingest`], which re-verifies it from scratch. It
+//! is deliberately NOT `Send`-bound: [`SyncStore`] wraps a SQLite connection, so a caller runs one
+//! session at a time on a single task (concurrent sessions are a later slice).
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::auth::AuthRole;
+use crate::auth::{AuthRole, PeerCapability};
 use crate::codec::{self, CodecError};
 use crate::wire::{Frame, MAX_ENTRIES_PER_PAGE, MAX_HELLO_HASHES};
 
@@ -94,6 +95,8 @@ pub enum SessionError {
     Codec(CodecError),
     /// The peer opened with something other than a hello, or named a different account.
     Protocol(String),
+    /// Authentication admitted the peer for reads, but it attempted to push entries.
+    UnauthorizedPush,
     /// Reading the local entry snapshot failed.
     Store(anyhow::Error),
 }
@@ -103,6 +106,9 @@ impl std::fmt::Display for SessionError {
         match self {
             SessionError::Codec(e) => write!(f, "sync session transport: {e}"),
             SessionError::Protocol(m) => write!(f, "sync session protocol violation: {m}"),
+            SessionError::UnauthorizedPush => {
+                write!(f, "read-only peer attempted to push sync entries")
+            },
             SessionError::Store(e) => write!(f, "sync session store: {e}"),
         }
     }
@@ -110,7 +116,8 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
-/// Run one session to completion over `send`/`recv`, syncing account entries with the peer.
+/// Run one session to completion over `send`/`recv`, syncing account entries with the peer while
+/// enforcing the capability returned by the preceding auth phase.
 ///
 /// Both halves run under `join!` on the current task — no spawn, so `store` (and its SQLite
 /// connection) need not be `Send`. The sender owns an up-front snapshot of local entries; the
@@ -121,13 +128,15 @@ pub async fn run_session<S, R, W>(
     send: W,
     recv: R,
     role: AuthRole,
+    peer_capability: PeerCapability,
 ) -> Result<SessionReport, SessionError>
 where
     S: SyncStore,
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    run_session_with_idle_timeout(store, send, recv, role, DEFAULT_IDLE_TIMEOUT).await
+    run_session_with_idle_timeout(store, send, recv, role, peer_capability, DEFAULT_IDLE_TIMEOUT)
+        .await
 }
 
 /// [`run_session`] with an explicit idle timeout — the receiver aborts if the peer sends no frame
@@ -137,6 +146,7 @@ pub async fn run_session_with_idle_timeout<S, R, W>(
     mut send: W,
     mut recv: R,
     role: AuthRole,
+    peer_capability: PeerCapability,
     idle_timeout: Duration,
 ) -> Result<SessionReport, SessionError>
 where
@@ -209,6 +219,12 @@ where
         loop {
             match read_frame_before(&mut recv, idle_timeout).await {
                 Ok(Frame::Entries { entries, more }) => {
+                    // Read admission never implies write authority. Reject the frame before
+                    // inspecting or ingesting its payload so an anonymous/open or roster-read-only
+                    // peer cannot consume storage or verification work.
+                    if !peer_capability.can_push() {
+                        return Err(SessionError::UnauthorizedPush);
+                    }
                     // A page after the one that declared `more: false` contradicts the sequencing —
                     // the peer said the previous page was the last.
                     if saw_final {
@@ -393,8 +409,8 @@ mod tests {
         let (a_send, b_recv) = tokio::io::duplex(1 << 20);
         let (b_send, a_recv) = tokio::io::duplex(1 << 20);
         let (ra, rb) = tokio::join!(
-            run_session(a, a_send, a_recv, AuthRole::Dialer),
-            run_session(b, b_send, b_recv, AuthRole::Acceptor),
+            run_session(a, a_send, a_recv, AuthRole::Dialer, PeerCapability::ReadWrite),
+            run_session(b, b_send, b_recv, AuthRole::Acceptor, PeerCapability::ReadWrite),
         );
         (ra.unwrap(), rb.unwrap())
     }
@@ -411,6 +427,63 @@ mod tests {
         assert_eq!(a.entries.len(), 5, "the full peer is unchanged");
         assert_eq!(b.entries.len(), 5, "the empty peer is now complete");
         assert_eq!(a.entries, b.entries, "both hold the same set — restore-from-peer");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_peer_can_pull_the_full_set() {
+        let full: Vec<_> = (0u8..5).map(entry).collect();
+        let mut server = MemStore::new([0xad; 32], &full);
+        let mut reader = MemStore::new([0xad; 32], &[]);
+        let (server_send, reader_recv) = tokio::io::duplex(1 << 20);
+        let (reader_send, server_recv) = tokio::io::duplex(1 << 20);
+
+        let (server_report, reader_report) = tokio::join!(
+            run_session(
+                &mut server,
+                server_send,
+                server_recv,
+                AuthRole::Acceptor,
+                PeerCapability::ReadOnly,
+            ),
+            run_session(
+                &mut reader,
+                reader_send,
+                reader_recv,
+                AuthRole::Dialer,
+                PeerCapability::ReadWrite,
+            ),
+        );
+        assert_eq!(server_report.unwrap().entries_sent, full.len());
+        assert_eq!(reader_report.unwrap().entries_newly_stored, full.len());
+        assert_eq!(reader.entries, server.entries, "read-only admission retains pull access");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_peers_entries_are_rejected_before_ingest() {
+        let mut reader = MemStore::new([0xae; 32], &[entry(1)]);
+        let mut server = MemStore::new([0xae; 32], &[]);
+        let (reader_send, server_recv) = tokio::io::duplex(1 << 20);
+        let (server_send, reader_recv) = tokio::io::duplex(1 << 20);
+
+        let (reader_result, server_result) = tokio::join!(
+            run_session(
+                &mut reader,
+                reader_send,
+                reader_recv,
+                AuthRole::Dialer,
+                PeerCapability::ReadWrite,
+            ),
+            run_session(
+                &mut server,
+                server_send,
+                server_recv,
+                AuthRole::Acceptor,
+                PeerCapability::ReadOnly,
+            ),
+        );
+        assert!(reader_result.is_err(), "the peer observes the refused session");
+        assert!(matches!(server_result, Err(SessionError::UnauthorizedPush)));
+        assert!(server.entries.is_empty(), "the read-only frame reached no ingest call");
     }
 
     #[tokio::test]
@@ -453,7 +526,9 @@ mod tests {
             // Drop without Ack: Done terminates the data phase, not the delivery handshake.
         });
 
-        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
+        let result =
+            run_session(&mut receiver, send, recv, AuthRole::Dialer, PeerCapability::ReadWrite)
+                .await;
         feeder.await.unwrap();
         assert!(
             matches!(result, Err(SessionError::Protocol(ref message)) if message.contains("completion")),
@@ -473,7 +548,9 @@ mod tests {
             codec::write_frame(&mut peer_send, &Frame::Ack).await.unwrap();
         });
 
-        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
+        let result =
+            run_session(&mut receiver, send, recv, AuthRole::Dialer, PeerCapability::ReadWrite)
+                .await;
         feeder.await.unwrap();
         assert!(
             matches!(result, Err(SessionError::Protocol(ref message)) if message.contains("before sending Done")),
@@ -511,7 +588,13 @@ mod tests {
             codec::write_frame(&mut dialer_send, &Frame::Ack).await.unwrap();
             assert_eq!(codec::read_frame(&mut dialer_recv).await.unwrap(), Frame::Ack);
         };
-        let session = run_session(&mut acceptor, acceptor_send, acceptor_recv, AuthRole::Acceptor);
+        let session = run_session(
+            &mut acceptor,
+            acceptor_send,
+            acceptor_recv,
+            AuthRole::Acceptor,
+            PeerCapability::ReadWrite,
+        );
         let ((), report) = tokio::join!(dialer, session);
         report.unwrap();
     }
@@ -537,7 +620,9 @@ mod tests {
             .unwrap();
             // … then drop without Done: a truncated stream.
         });
-        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
+        let result =
+            run_session(&mut receiver, send, recv, AuthRole::Dialer, PeerCapability::ReadWrite)
+                .await;
         feeder.await.unwrap();
         assert!(
             matches!(result, Err(SessionError::Protocol(_))),
@@ -562,7 +647,9 @@ mod tests {
                 .unwrap();
             write_frame(&mut peer_send, &Frame::Done).await.unwrap();
         });
-        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
+        let result =
+            run_session(&mut receiver, send, recv, AuthRole::Dialer, PeerCapability::ReadWrite)
+                .await;
         feeder.await.unwrap();
         assert!(
             matches!(result, Err(SessionError::Protocol(_))),
@@ -591,6 +678,7 @@ mod tests {
             send,
             recv,
             AuthRole::Dialer,
+            PeerCapability::ReadWrite,
             std::time::Duration::from_millis(50),
         )
         .await;
@@ -620,7 +708,9 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
+        let result =
+            run_session(&mut receiver, send, recv, AuthRole::Dialer, PeerCapability::ReadWrite)
+                .await;
         feeder.await.unwrap();
         match result {
             Err(SessionError::Protocol(m)) => assert!(m.contains("after the final page"), "{m}"),
@@ -642,7 +732,9 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = run_session(&mut receiver, send, recv, AuthRole::Dialer).await;
+        let result =
+            run_session(&mut receiver, send, recv, AuthRole::Dialer, PeerCapability::ReadWrite)
+                .await;
         feeder.await.unwrap();
         // Assert the SPECIFIC guard fired — a dropped feeder also trips the EOF-before-Done guard,
         // so a bare `Protocol` match would not distinguish the empty-page rejection from it.
@@ -674,8 +766,8 @@ mod tests {
         let (a_send, b_recv) = tokio::io::duplex(1 << 16);
         let (b_send, a_recv) = tokio::io::duplex(1 << 16);
         let (ra, rb) = tokio::join!(
-            run_session(&mut a, a_send, a_recv, AuthRole::Dialer),
-            run_session(&mut b, b_send, b_recv, AuthRole::Acceptor),
+            run_session(&mut a, a_send, a_recv, AuthRole::Dialer, PeerCapability::ReadWrite,),
+            run_session(&mut b, b_send, b_recv, AuthRole::Acceptor, PeerCapability::ReadWrite,),
         );
         assert!(matches!(ra, Err(SessionError::Protocol(_))));
         assert!(matches!(rb, Err(SessionError::Protocol(_))));

@@ -21,6 +21,7 @@
 
 use minicbor::{Decoder, Encoder};
 
+use super::ops::DeviceRole;
 use super::storage;
 use crate::account::AccountId;
 use crate::device::DevicePublic;
@@ -145,17 +146,17 @@ fn decode(bytes: &[u8]) -> Result<DecodedBinding, NodeAuthError> {
 }
 
 /// Verify a peer's node binding for `account_id` against the current fold and the connection's
-/// authenticated `remote_node_pubkey`. Returns `Ok(())` iff every check passes — see the module doc
-/// for why all three (roster, node match, freshness) are required. The caller re-runs this PER
-/// connection (never caches) so a device removed since a prior session is refused, and collapses
-/// any `Err` to a single uniform wire refusal.
+/// authenticated `remote_node_pubkey`. Returns the peer's current effective roster role iff every
+/// check passes — see the module doc for why all three (roster, node match, freshness) are
+/// required. The caller re-runs this PER connection (never caches) so a removal or role change
+/// since a prior session takes effect, and collapses any `Err` to a single uniform wire refusal.
 pub fn verify_node_binding(
     conn: &rusqlite::Connection,
     account_id: AccountId,
     binding_bytes: &[u8],
     remote_node_pubkey: &[u8; 32],
     now_ms: i64,
-) -> anyhow::Result<Result<(), NodeAuthError>> {
+) -> anyhow::Result<Result<DeviceRole, NodeAuthError>> {
     let b = match decode(binding_bytes) {
         Ok(b) => b,
         Err(e) => return Ok(Err(e)),
@@ -183,10 +184,11 @@ pub fn verify_node_binding(
     // is allowed — the roster gate is read access, not authoring authority; gating on Owner
     // would break a member device restoring its own account.
     let fingerprint = DeviceFingerprint::from_bytes(cbor::sha256(&b.device_pubkey));
-    let effective = storage::list_effective_roster_fingerprints(conn, account_id)?;
-    if !effective.contains(&fingerprint) {
+    let Some((_roster_ref, role)) =
+        storage::effective_roster_entry_in_snapshot(conn, account_id, fingerprint)?
+    else {
         return Ok(Err(NodeAuthError::NotRosterDevice));
-    }
+    };
     // Freshness: bounds the stolen-transport-seed residual. The binding may not be older than
     // MAX_BINDING_AGE_MS nor dated more than MAX_BINDING_FUTURE_SKEW_MS ahead of the verifier.
     if b.issued_at_ms < now_ms.saturating_sub(MAX_BINDING_AGE_MS)
@@ -194,7 +196,7 @@ pub fn verify_node_binding(
     {
         return Ok(Err(NodeAuthError::Expired));
     }
-    Ok(Ok(()))
+    Ok(Ok(role))
 }
 
 fn fixed32(dec: &mut Decoder<'_>) -> Result<[u8; 32], NodeAuthError> {
@@ -213,11 +215,11 @@ fn fixed64(dec: &mut Decoder<'_>) -> Result<[u8; 64], NodeAuthError> {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
+    use rusqlite::{Connection, Transaction, TransactionBehavior};
 
     use super::*;
-    use crate::account::local_account;
-    use crate::device::DeviceSecret;
+    use crate::account::{EnrollingDevice, author_device_add_in_tx, local_account};
+    use crate::device::{DeviceSecret, DeviceX25519Secret};
 
     const NOW: i64 = 1_700_000_000_000;
     const NODE: [u8; 32] = [7u8; 32];
@@ -254,7 +256,36 @@ mod tests {
     fn a_valid_binding_from_a_roster_device_verifies() {
         let (conn, account) = db_with_account();
         let binding = sign_local(&conn, account, &NODE, NOW);
-        assert_eq!(verify_node_binding(&conn, account, &binding, &NODE, NOW).unwrap(), Ok(()));
+        assert_eq!(
+            verify_node_binding(&conn, account, &binding, &NODE, NOW).unwrap(),
+            Ok(DeviceRole::Owner),
+        );
+    }
+
+    #[test]
+    fn a_valid_binding_returns_the_effective_roster_role() {
+        let (conn, account) = db_with_account();
+        let reader = DeviceSecret::from_seed(&[0x31; 32]);
+        let reader_x = DeviceX25519Secret::from_seed(&[0x32; 32]);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: reader.public().to_bytes(),
+                x25519_pubkey: reader_x.public().to_bytes(),
+                label: None,
+            },
+            DeviceRole::ReadOnly,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let binding = sign_with(&reader, account, &NODE, NOW);
+        assert_eq!(
+            verify_node_binding(&conn, account, &binding, &NODE, NOW).unwrap(),
+            Ok(DeviceRole::ReadOnly),
+        );
     }
 
     #[test]

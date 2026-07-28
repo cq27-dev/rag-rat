@@ -414,7 +414,7 @@ fn device_roster_effective(
     let probe = OplogSyncStore::new(conn, account_id, time::now_ms);
     let now = time::now_ms();
     let binding = probe.local_binding(local_node, now)?;
-    probe.authorize(&binding, local_node, now)
+    Ok(probe.authorize(&binding, local_node, now)?.is_some())
 }
 
 /// Meta key for this index's persisted iroh node secret (the transport identity).
