@@ -91,6 +91,15 @@ fn scip_symbol_of(h: &Harness, edge_id: i64) -> String {
     h.verdict(edge_id).map(|(_, _, symbol)| symbol).expect("a persisted verdict")
 }
 
+/// A work-done progress notification a fake server can interleave — the readiness signal of every
+/// backend whose policy is [`crate::lsp::readiness::ReadinessPolicy::WorkDoneProgress`].
+fn progress(token: &str, kind: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0", "method": "$/progress",
+        "params": {"token": token, "value": {"kind": kind}}
+    })
+}
+
 #[test]
 fn live_pass_upgrades_a_name_only_edge_and_records_the_run() {
     let h = Harness::new();
@@ -1018,14 +1027,6 @@ mod typescript {
         .unwrap()
     }
 
-    /// A progress notification the fake server can interleave.
-    fn progress(token: &str, kind: &str) -> Value {
-        json!({
-            "jsonrpc": "2.0", "method": "$/progress",
-            "params": {"token": token, "value": {"kind": kind}}
-        })
-    }
-
     /// A TypeScript-backed session over a fake server, recording every method the client sent.
     /// `emit_on_initialize` rides alongside the `initialize` response (the seam for handing the
     /// session a completed progress cycle), and `emit_on_definition` before a definition result.
@@ -1395,5 +1396,231 @@ mod typescript {
         live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
         assert_eq!(opened.lock().unwrap().as_slice(), ["typescriptreact"]);
+    }
+}
+
+/// The live clangd backend (#536). Its project marker is a compilation database the SERVER
+/// discovers, not a config that encloses its own sources, which makes two pass branches reachable
+/// that no other backend has: the session ends when the checkout stops pointing at the database it
+/// was spawned against, and a file whose database the server cannot find on its own is skipped
+/// rather than resolved. Both depend on a session carrying a REAL layout, so these resolve one with
+/// [`LiveBackend::resolve_layout`] over a fixture checkout rather than building one by hand.
+mod clangd {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::OracleTool;
+    use crate::backend::{self, LiveBackend, ProjectLayout};
+    use crate::live::InjectedSession;
+    use crate::lsp::client::test_support::client_with_server_policy;
+    use crate::lsp::readiness::ReadinessPolicy;
+
+    const CLANGD_VERSION: &str = "clangd-test-1";
+    /// `caller` calls `target`; the callee identifier sits at byte 20.
+    const C_CALLER_SRC: &str = "void caller(void) { target(); }\n";
+    const C_CALLEE_START: usize = 20;
+    const C_CALLEE_END: usize = 26;
+    /// The same caller with TWO calls: callee identifiers at bytes 20 and 30.
+    const C_CALLER_TWICE_SRC: &str = "void caller(void) { target(); target(); }\n";
+    /// The definition file: `target`'s identifier span is (0,5)–(0,11), inside the symbol's 0–20.
+    const C_DEFS_SRC: &str = "void target(void) {}\n";
+    /// A compilation database with one complete entry. `[]` parses but names no translation unit,
+    /// and the layout resolver classes such a file UNUSABLE — a fixture written that way would put
+    /// the checkout in a different state than the one under test.
+    const COMPDB: &str = r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c"}]"#;
+
+    fn clangd_run_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM oracle_runs WHERE tool = 'clangd-lsp'", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    /// Write a usable compilation database in `relative_dir`, creating it if needed.
+    fn write_compdb(h: &Harness, relative_dir: &str) {
+        let dir = h.root().join(relative_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
+    }
+
+    /// [`Harness::add_file`] for a path in a subdirectory, which it does not create itself.
+    fn add_c_file(h: &Harness, path: &str, contents: &str) -> i64 {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(h.root().join(parent)).unwrap();
+        }
+        h.add_file(path, contents)
+    }
+
+    /// The layout the real resolver finds in the fixture checkout as it stands right now.
+    fn clangd_layout(h: &Harness) -> ProjectLayout {
+        LiveBackend::for_tool(OracleTool::ClangdLsp)
+            .expect("a live backend")
+            .resolve_layout(h.root())
+    }
+
+    /// A clangd-backed session over a fake server that reports a completed index cycle alongside
+    /// `initialize` and answers every definition with `definition` (or a `null`). The session
+    /// behaves as though it resolved `layout` `resolved_ago` ago. Also returns every document URI
+    /// the client opened or asked about.
+    fn clangd_session(
+        h: &Harness,
+        layout: ProjectLayout,
+        resolved_ago: Duration,
+        definition: Option<FakeDefTarget>,
+    ) -> (LiveOracleSession, Arc<Mutex<Vec<String>>>) {
+        let touched = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&touched);
+        let client = client_with_server_policy(
+            move |msg: &Value| {
+                let id = msg.get("id").cloned();
+                let method = msg.get("method").and_then(Value::as_str);
+                if matches!(method, Some("textDocument/didOpen" | "textDocument/definition")) {
+                    let uri = msg["params"]["textDocument"]["uri"].as_str().unwrap_or_default();
+                    captured.lock().unwrap().push(uri.to_string());
+                }
+                match method {
+                    Some("initialize") => Some(vec![
+                        progress("index", "begin"),
+                        progress("index", "end"),
+                        json!({"jsonrpc": "2.0", "id": id, "result": {"capabilities": {}}}),
+                    ]),
+                    Some("textDocument/definition") => {
+                        let result = match &definition {
+                            Some((uri, (sl, sc), (el, ec))) => json!({
+                                "uri": uri,
+                                "range": {"start": {"line": sl, "character": sc},
+                                          "end": {"line": el, "character": ec}}
+                            }),
+                            None => Value::Null,
+                        };
+                        Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": result})])
+                    },
+                    _ if id.is_none() => Some(vec![]),
+                    _ => Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": null})]),
+                }
+            },
+            ReadinessPolicy::WorkDoneProgress,
+        );
+        let session = LiveOracleSession::from_injected(InjectedSession {
+            tool: OracleTool::ClangdLsp,
+            client,
+            tool_version: CLANGD_VERSION,
+            root_uri: &root_uri(h),
+            layout,
+            // Subtracted, never `Instant - Duration`: that panics when the monotonic clock is
+            // younger than the age being modelled.
+            layout_resolved_at: Instant::now()
+                .checked_sub(resolved_ago)
+                .expect("the monotonic clock predates the modelled layout age"),
+        });
+        (session, touched)
+    }
+
+    #[test]
+    fn an_aged_out_layout_pointing_elsewhere_aborts_the_pass_and_requeues_the_worklist() {
+        let h = Harness::new();
+        let defs = add_c_file(&h, "src/lib.c", C_DEFS_SRC);
+        h.add_symbol(defs, "target", 0, 20);
+        let src = add_c_file(&h, "src/main.c", C_CALLER_SRC);
+        let edge = h.add_edge(src, "target", C_CALLEE_START, C_CALLEE_END, "NameOnly", None);
+        write_compdb(&h, "build");
+        // The session pins `build/`; the database then moves. The running server already holds an
+        // argv derived from the old layout, so this cannot be corrected in place — resolving the
+        // new project's files under the old project's flags selects a different preprocessor
+        // branch, and the wrong definition would be persisted as a real verdict.
+        let pinned = clangd_layout(&h);
+        std::fs::create_dir_all(h.root().join("out")).unwrap();
+        std::fs::rename(
+            h.root().join("build/compile_commands.json"),
+            h.root().join("out/compile_commands.json"),
+        )
+        .unwrap();
+        // Aged past the cache's lifetime, so the pass re-resolves the layout before anything else.
+        let (mut session, touched) = clangd_session(
+            &h,
+            pinned,
+            backend::LAYOUT_MAX_AGE + Duration::from_secs(1),
+            Some((def_uri(&h, "src/lib.c"), (0, 5), (0, 11))),
+        );
+        // A path carrying NO candidates rides too: the abort requeues the WORKLIST, not the
+        // candidate-bearing part of it.
+        let worklist = vec!["src/main.c".to_string(), "src/untouched.c".to_string()];
+
+        let report =
+            live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+        // The watcher drops the session on the "Aborted:" PREFIX and on nothing else, so the
+        // prefix is the contract this branch depends on — not the wording after it.
+        assert!(report.status.starts_with("Aborted:"), "{}", report.status);
+        assert_eq!(report.unfinished_paths, worklist, "the whole worklist rides the next pass");
+        assert_eq!(report.rows_written, 0);
+        assert_eq!(report.requests_used, 0);
+        assert!(h.verdict(edge).is_none(), "a session whose database moved must write nothing");
+        assert_eq!(clangd_run_count(&h.conn), 0);
+        assert!(
+            touched.lock().unwrap().is_empty(),
+            "the layout check precedes every document request, so a session that can never be \
+             correct asks nothing",
+        );
+    }
+
+    #[test]
+    fn a_file_whose_database_the_server_cannot_find_is_skipped_and_never_deferred() {
+        let h = Harness::new();
+        // TWO compilation databases, so no `--compile-commands-dir` is passed (it is global) and
+        // each file's database has to be discoverable from its own ancestors or one of their
+        // `build/` subdirectories. `a/` holds one; nothing at or above `b/` does.
+        write_compdb(&h, "a");
+        write_compdb(&h, "z");
+        let defs = add_c_file(&h, "a/lib.c", C_DEFS_SRC);
+        let target = h.add_symbol(defs, "target", 0, 20);
+        let configured = add_c_file(&h, "a/main.c", C_CALLER_SRC);
+        let resolvable =
+            h.add_edge(configured, "target", C_CALLEE_START, C_CALLEE_END, "NameOnly", None);
+        let unconfigurable = add_c_file(&h, "b/main.c", C_CALLER_TWICE_SRC);
+        // TWO callees in the skipped file, so the counter is unmistakably candidates, not files.
+        let first_skipped = h.add_edge(unconfigurable, "target", 20, 26, "NameOnly", None);
+        let second_skipped = h.add_edge(unconfigurable, "target", 30, 36, "NameOnly", None);
+        let layout = clangd_layout(&h);
+        let (mut session, touched) = clangd_session(
+            &h,
+            layout,
+            Duration::ZERO,
+            Some((def_uri(&h, "a/lib.c"), (0, 5), (0, 11))),
+        );
+        // The unconfigurable file comes FIRST: skipping it must not end the pass.
+        let worklist = vec!["b/main.c".to_string(), "a/main.c".to_string()];
+
+        let report =
+            live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+        assert_eq!(report.skipped_unconfigured, 2, "both candidates of the unconfigurable file");
+        assert_eq!(report.rows_written, 1);
+        assert_eq!(report.upgraded, 1);
+        assert_eq!(report.requests_used, 1, "only the configured file's callee is asked about");
+        assert_eq!(report.status, "Completed");
+        assert_eq!(clangd_run_count(&h.conn), 1);
+        assert_eq!(
+            h.verdict(resolvable).expect("the configured file still resolves").1,
+            Some(target),
+        );
+        assert!(h.verdict(first_skipped).is_none());
+        assert!(h.verdict(second_skipped).is_none());
+        // NOT deferred: retrying cannot help until the checkout's layout changes, so a backlog
+        // entry here would be re-skipped on every pass forever.
+        assert!(
+            report.unfinished_paths.is_empty(),
+            "an unconfigurable path must not ride the backlog: {:?}",
+            report.unfinished_paths,
+        );
+        // The server never even sees the document it cannot be configured for: with fallback flags
+        // its answer would be wrong rather than absent, and a wrong verdict is what this skip
+        // exists to prevent.
+        let touched = touched.lock().unwrap();
+        assert!(!touched.is_empty(), "the configured document did reach the server");
+        assert!(
+            touched.iter().all(|uri| uri.ends_with("a/main.c")),
+            "the unconfigurable document must never reach the server: {touched:?}",
+        );
     }
 }

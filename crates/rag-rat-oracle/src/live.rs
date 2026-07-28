@@ -89,6 +89,24 @@ pub enum LiveSpawnBlocked {
     Unavailable,
 }
 
+/// Test seam: the state [`LiveOracleSession::spawn`] derives from the checkout, supplied directly
+/// so a test can drive the pass's layout-dependent branches — the per-file "can this session
+/// configure that file" gate, and the age-out re-resolve that ends a session whose pinned database
+/// has moved. Neither is reachable through a session whose layout is the empty default.
+#[cfg(test)]
+pub(crate) struct InjectedSession<'a> {
+    pub(crate) tool: OracleTool,
+    pub(crate) client: LspClient,
+    pub(crate) tool_version: &'a str,
+    pub(crate) root_uri: &'a str,
+    /// Build this with [`LiveBackend::resolve_layout`] against a real fixture directory: a
+    /// hand-built layout would assert against a resolver the pass never runs.
+    pub(crate) layout: ProjectLayout,
+    /// When `layout` was resolved. `Instant::now()` keeps it valid for the whole pass; anything
+    /// older than [`backend::LAYOUT_MAX_AGE`] makes the first pass re-resolve and compare.
+    pub(crate) layout_resolved_at: Instant,
+}
+
 impl LiveOracleSession {
     /// Probe `tool`'s language server and spawn the resident client for `checkout_root`.
     ///
@@ -153,21 +171,47 @@ impl LiveOracleSession {
 
     /// The tool-parameterized warm session seam: drives the pass through a specific backend's
     /// language ids, sentinel namespace, and moniker source.
+    ///
+    /// The layout is the empty default, which a backend with a checkout-scoped project marker
+    /// reads as "no compilation database anywhere" and therefore skips every file for. Those
+    /// backends need [`Self::from_injected`].
     #[cfg(test)]
     pub(crate) fn from_warming_client_for(
         tool: OracleTool,
-        mut client: LspClient,
+        client: LspClient,
         tool_version: &str,
         root_uri: &str,
     ) -> Self {
+        Self::from_injected(InjectedSession {
+            tool,
+            client,
+            tool_version,
+            root_uri,
+            layout: ProjectLayout::default(),
+            layout_resolved_at: Instant::now(),
+        })
+    }
+
+    /// Test seam: a warming session over an injected client AND an injected project layout. Runs
+    /// the `initialize` handshake exactly like [`Self::spawn`] so the negotiated encoding is real.
+    #[cfg(test)]
+    pub(crate) fn from_injected(injected: InjectedSession<'_>) -> Self {
+        let InjectedSession {
+            tool,
+            mut client,
+            tool_version,
+            root_uri,
+            layout,
+            layout_resolved_at,
+        } = injected;
         client.initialize(root_uri).expect("test server completes the handshake");
         Self {
             backend: LiveBackend::for_tool(tool).expect("a live backend"),
             client,
             tool_version: tool_version.to_string(),
             root_uri: root_uri.to_string(),
-            layout: ProjectLayout::default(),
-            layout_resolved_at: Instant::now(),
+            layout,
+            layout_resolved_at,
         }
     }
 

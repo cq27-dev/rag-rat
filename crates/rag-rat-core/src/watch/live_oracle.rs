@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use rag_rat_base::config::Config;
 use rag_rat_base::time::now_ms;
-use rag_rat_oracle::{LiveBackend, LiveOracleSession};
+use rag_rat_oracle::{LiveBackend, LiveOracleSession, LivePassReport};
 
 use crate::index::IndexDatabase;
 
@@ -184,6 +184,10 @@ struct LiveBackendTail {
     /// whether that has been reported. See [`WARMING_PASSES_BEFORE_REPORT`].
     warming_passes: u32,
     warming_reported: bool,
+    /// Whether a pass that asked the server nothing because it could configure none of its files
+    /// has already been reported. Cleared as soon as a pass issues a request. See
+    /// [`LiveBackendTail::note_unconfigured`].
+    unconfigured_reported: bool,
 }
 
 /// How many consecutive warming passes go by before the watcher says so. A cold language server
@@ -206,6 +210,7 @@ impl LiveBackendTail {
             prerequisite_reported: false,
             warming_passes: 0,
             warming_reported: false,
+            unconfigured_reported: false,
         }
     }
 
@@ -238,6 +243,40 @@ impl LiveBackendTail {
                  TypeScript, that a `typescript` package resolves for the tsconfig project)."
             );
         }
+    }
+
+    /// Report a pass that issued no requests at all while skipping candidates whose files the
+    /// session cannot configure.
+    ///
+    /// Skipping such a file is the correct answer — the server would otherwise answer it with
+    /// fallback flags, which resolve a call into another translation unit to the callee's header
+    /// declaration, and that wrong answer would be persisted as a real verdict. But the skip is
+    /// deliberately not deferred, so a pass made entirely of them writes no rows AND leaves no
+    /// backlog: the two things the per-pass log keys on. Say it once, and reset as soon as a pass
+    /// issues a request, so a checkout the session can configure stays quiet.
+    fn note_unconfigured(&mut self, report: &LivePassReport) {
+        // One request is enough to prove this session configures something in this checkout.
+        if report.requests_used > 0 {
+            self.unconfigured_reported = false;
+            return;
+        }
+        if report.skipped_unconfigured == 0 || self.unconfigured_reported {
+            return;
+        }
+        self.unconfigured_reported = true;
+        tracing::warn!(
+            target: "rag_rat_core::watch",
+            tool = self.backend.tool.as_db_str(),
+            skipped = report.skipped_unconfigured,
+            "live oracle: this pass sent the server no requests and skipped candidates because \
+             the session cannot configure their files. A compilation database is pinned for the \
+             server (`--compile-commands-dir`) only when the checkout holds exactly one; \
+             otherwise the server has to find each file's database itself, and a file it cannot \
+             find one for is skipped rather than answered with fallback flags. Those files stay \
+             unresolvable until the checkout's layout changes — leave a single compilation \
+             database, or put each file's database in one of its ancestor directories or that \
+             directory's `build/`."
+        );
     }
 
     /// This backend's share of one pass: resolve pending work, or shut an otherwise-workless
@@ -353,7 +392,14 @@ impl LiveBackendTail {
                     self.lifecycle.on_stable_batch();
                 }
                 self.note_warming(&report.status);
-                if report.rows_written > 0 || !report.unfinished_paths.is_empty() {
+                self.note_unconfigured(&report);
+                // A pass whose candidates were all skipped as unconfigured writes no rows and
+                // defers nothing (those skips are not retried), so it has to be admitted to the
+                // log on its own count or the pass leaves no trace at all.
+                if report.rows_written > 0
+                    || !report.unfinished_paths.is_empty()
+                    || report.skipped_unconfigured > 0
+                {
                     tracing::info!(
                         target: "rag_rat_core::watch",
                         rows_written = report.rows_written,
@@ -362,6 +408,7 @@ impl LiveBackendTail {
                         contradicted = report.contradicted,
                         requests = report.requests_used,
                         deferred = report.unfinished_paths.len(),
+                        skipped_unconfigured = report.skipped_unconfigured,
                         refinements_invalidated = report.refinements_invalidated,
                         status = %report.status,
                         "live oracle pass"
@@ -552,6 +599,74 @@ mod tests {
         tail.note_warming("Completed");
         assert_eq!(tail.warming_passes, 0);
         assert!(!tail.warming_reported);
+    }
+
+    /// A `MakeWriter` that appends every formatted log line into a shared buffer, so a test can
+    /// assert on the `tracing` events a pass actually emitted — and on how many times.
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` with warnings captured, returning what it logged. The subscriber is thread-local
+    /// (`with_default`), so parallel tests do not see each other's output.
+    fn captured_warnings(body: impl FnOnce()) -> String {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CaptureWriter(std::sync::Arc::clone(&buffer)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let logged = buffer.lock().unwrap().clone();
+        String::from_utf8(logged).expect("formatted log lines are UTF-8")
+    }
+
+    #[test]
+    fn a_backend_that_can_configure_nothing_is_reported_once_then_stays_quiet() {
+        // A candidate skipped because the session cannot configure its file is deliberately NOT
+        // deferred — retrying cannot help until the checkout's layout changes. So a pass made
+        // entirely of such skips writes no rows and leaves no backlog, and without a report of its
+        // own the backend resolves nothing pass after pass while saying nothing at all.
+        let mut tail = LiveBackendTail::new(backend(rag_rat_oracle::OracleTool::ClangdLsp));
+        let all_skipped =
+            || LivePassReport { skipped_unconfigured: 3, ..LivePassReport::default() };
+        let occurrences = |logged: &str| logged.matches("cannot configure their files").count();
+
+        let logged = captured_warnings(|| {
+            tail.note_unconfigured(&all_skipped());
+            tail.note_unconfigured(&all_skipped());
+        });
+        assert_eq!(occurrences(&logged), 1, "reported ONCE, not on every later pass: {logged:?}");
+
+        // A pass that issues a request proves the session configures something here, so the
+        // report is not repeated for it…
+        let quiet = captured_warnings(|| {
+            tail.note_unconfigured(&LivePassReport {
+                requests_used: 1,
+                skipped_unconfigured: 1,
+                ..LivePassReport::default()
+            });
+        });
+        assert_eq!(occurrences(&quiet), 0, "a pass that resolves anything is not a dry spell");
+        // …and the streak is cleared, so a later all-skipped pass reports afresh.
+        let again = captured_warnings(|| tail.note_unconfigured(&all_skipped()));
+        assert_eq!(occurrences(&again), 1, "a new dry spell must be reported: {again:?}");
     }
 
     #[test]
