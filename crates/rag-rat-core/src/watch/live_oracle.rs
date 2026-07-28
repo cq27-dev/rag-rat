@@ -90,14 +90,15 @@ impl LiveOracleTail {
                 // session so the next pass respawns a clean one instead of reusing a broken
                 // transport (the aborted files are already requeued in `unfinished_paths`).
                 if report.status.starts_with("Aborted:")
-                    && let Some(session) = self.session.take()
+                    && let Some(_aborted_session) = self.session.take()
                 {
+                    // Let the binding hard-kill on Drop; graceful shutdown would attempt another
+                    // bounded request against the same wedged transport.
                     tracing::warn!(
                         target: "rag_rat_core::watch",
                         status = %report.status,
                         "live oracle: server aborted; session dropped, respawn on next pass"
                     );
-                    session.shutdown();
                 }
                 if report.rows_written > 0 || !report.unfinished_paths.is_empty() {
                     tracing::info!(

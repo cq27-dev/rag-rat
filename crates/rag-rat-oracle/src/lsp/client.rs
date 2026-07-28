@@ -1,9 +1,10 @@
 //! The resident LSP client: process lifecycle (spawn, `initialize` handshake with position-encoding
 //! negotiation, graceful `shutdown`, kill-on-drop) and synchronous JSON-RPC request/response over
-//! the [`super::protocol`] framing. A reader-pump thread feeds a bounded-wait channel so a wedged
-//! server cannot hold the repository write lock forever. Requests remain single-flight: the client
-//! reads until it sees the response for the id it just sent, tracking status notifications and
-//! replying to server→client requests so a server awaiting that reply cannot deadlock the loop.
+//! the [`super::protocol`] framing. Dedicated transport workers keep blocking pipe I/O off the
+//! maintenance thread, while bounded waits prevent a wedged server from holding the repository
+//! write lock forever. Requests remain single-flight: the client reads until it sees the response
+//! for the id it just sent and replies to server→client requests so a server awaiting that reply
+//! cannot deadlock the loop.
 //!
 //! The transport is injectable (`Box<dyn Write/BufRead>`): [`LspClient::spawn`] wires a child
 //! process, while tests wire an in-process fake server over `std::io::pipe`. That is what makes the
@@ -12,7 +13,9 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,7 +33,17 @@ const METHOD_NOT_FOUND: i64 = -32601;
 /// request so a live but non-responsive language server cannot block all writers indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Only responses and server requests enter this queue; ordinary notifications are discarded and
+/// readiness is coalesced separately. Bounding the remainder prevents an idle server from growing
+/// the client's heap without limit.
+const INCOMING_QUEUE_CAPACITY: usize = 64;
+
 type IncomingMessage = io::Result<Option<Value>>;
+
+struct OutgoingMessage {
+    message: Value,
+    completed: SyncSender<io::Result<()>>,
+}
 
 /// A JSON-RPC error object from a response (`code` + `message`), so callers can distinguish a
 /// `MethodNotFound` (optional-capability) from a real failure.
@@ -42,12 +55,12 @@ struct LspRpcError {
 /// A live language-server session. Owns the transport and (for a spawned server) the child process,
 /// which it kills on drop so a crashed or abandoned pass never leaks a resident `rust-analyzer`.
 pub(crate) struct LspClient {
-    writer: Box<dyn Write + Send>,
+    outgoing: SyncSender<OutgoingMessage>,
     incoming: Receiver<IncomingMessage>,
     next_id: i64,
     encoding: LspEncoding,
     request_timeout: Duration,
-    server_ready: bool,
+    server_ready: Arc<AtomicBool>,
     /// The child process for a spawned server; `None` for an injected (test) transport. Present so
     /// [`Drop`] can hard-kill it.
     child: Option<Child>,
@@ -70,13 +83,17 @@ impl LspClient {
             child.stdin.take().ok_or_else(|| io::Error::other("child stdin unavailable"))?;
         let stdout =
             child.stdout.take().ok_or_else(|| io::Error::other("child stdout unavailable"))?;
+        let server_ready = Arc::new(AtomicBool::new(false));
         Ok(Self {
-            writer: Box::new(stdin),
-            incoming: spawn_reader_pump(Box::new(BufReader::new(stdout))),
+            outgoing: spawn_writer_pump(Box::new(stdin)),
+            incoming: spawn_reader_pump(
+                Box::new(BufReader::new(stdout)),
+                Arc::clone(&server_ready),
+            ),
             next_id: 1,
             encoding: LspEncoding::Utf16,
             request_timeout: REQUEST_TIMEOUT,
-            server_ready: false,
+            server_ready,
             child: Some(child),
         })
     }
@@ -91,13 +108,14 @@ impl LspClient {
         writer: Box<dyn Write + Send>,
         request_timeout: Duration,
     ) -> Self {
+        let server_ready = Arc::new(AtomicBool::new(false));
         Self {
-            writer,
-            incoming: spawn_reader_pump(reader),
+            outgoing: spawn_writer_pump(writer),
+            incoming: spawn_reader_pump(reader, Arc::clone(&server_ready)),
             next_id: 1,
             encoding: LspEncoding::Utf16,
             request_timeout,
-            server_ready: false,
+            server_ready,
             child: None,
         }
     }
@@ -113,13 +131,19 @@ impl LspClient {
     /// deliberately not ready: sending definitions before the first status can turn warm-up
     /// `null`s into permanently missing evidence.
     pub(crate) fn is_server_ready(&mut self) -> io::Result<bool> {
+        let deadline = Instant::now() + self.request_timeout;
         loop {
+            if Instant::now() >= deadline {
+                return Err(request_timeout_error("server readiness", self.request_timeout));
+            }
             match self.incoming.try_recv() {
                 Ok(message) => {
                     let message = message?.ok_or_else(server_closed_error)?;
-                    self.handle_server_message(&message)?;
+                    self.handle_server_message(&message, deadline)?;
                 },
-                Err(TryRecvError::Empty) => return Ok(self.server_ready),
+                Err(TryRecvError::Empty) => {
+                    return Ok(self.server_ready.load(Ordering::Relaxed));
+                },
                 Err(TryRecvError::Disconnected) => return Err(server_closed_error()),
             }
         }
@@ -127,7 +151,7 @@ impl LspClient {
 
     #[cfg(test)]
     pub(crate) fn assume_ready(&mut self) {
-        self.server_ready = true;
+        self.server_ready.store(true, Ordering::Relaxed);
     }
 
     /// Send a request and return its `result`, mapping a JSON-RPC `error` response to an `Err`.
@@ -167,8 +191,8 @@ impl LspClient {
         let id = self.next_id;
         self.next_id += 1;
         let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        protocol::write_message(&mut self.writer, &request)?;
         let deadline = Instant::now() + self.request_timeout;
+        self.send_message_until(request, deadline, method)?;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -184,7 +208,7 @@ impl LspClient {
             // A `method`-bearing message is server→client: a notification (no id) is ignored; a
             // request (id present) MUST be answered so the server doesn't block waiting on us.
             if msg.get("method").is_some() {
-                self.handle_server_message(&msg)?;
+                self.handle_server_message(&msg, deadline)?;
                 continue;
             }
             // A response with no `method`: ours iff the id matches (single-flight; a stray id is
@@ -209,7 +233,7 @@ impl LspClient {
     /// Send a notification (no id, no response expected).
     pub(crate) fn notify(&mut self, method: &str, params: Value) -> io::Result<()> {
         let notification = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        protocol::write_message(&mut self.writer, &notification)
+        self.send_message_until(notification, Instant::now() + self.request_timeout, method)
     }
 
     /// The `initialize`/`initialized` handshake: advertise the byte-space-friendly encodings we
@@ -252,15 +276,10 @@ impl LspClient {
         self.notify("exit", Value::Null)
     }
 
-    fn handle_server_message(&mut self, message: &Value) -> io::Result<()> {
+    fn handle_server_message(&mut self, message: &Value, deadline: Instant) -> io::Result<()> {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             return Ok(());
         };
-        if method == "experimental/serverStatus" {
-            let params = &message["params"];
-            self.server_ready = params.get("quiescent").and_then(Value::as_bool) == Some(true)
-                && params.get("health").and_then(Value::as_str) != Some("error");
-        }
         let Some(peer_id) = message.get("id") else {
             return Ok(());
         };
@@ -277,26 +296,103 @@ impl LspClient {
                           "message": "not handled by the rag-rat live oracle"}
             }),
         };
-        protocol::write_message(&mut self.writer, &reply)
+        self.send_message_until(reply, deadline, method)
+    }
+
+    fn send_message_until(
+        &self,
+        message: Value,
+        deadline: Instant,
+        operation: &str,
+    ) -> io::Result<()> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(request_timeout_error(operation, self.request_timeout));
+        }
+        let (completed, completion) = mpsc::sync_channel(1);
+        self.outgoing.try_send(OutgoingMessage { message, completed }).map_err(
+            |err| match err {
+                TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "server stdin worker is still blocked on an earlier message",
+                ),
+                TrySendError::Disconnected(_) => server_stdin_closed_error(),
+            },
+        )?;
+        match completion.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) =>
+                Err(request_timeout_error(operation, self.request_timeout)),
+            Err(RecvTimeoutError::Disconnected) => Err(server_stdin_closed_error()),
+        }
     }
 }
 
-fn spawn_reader_pump(mut reader: Box<dyn BufRead + Send>) -> Receiver<IncomingMessage> {
-    let (sender, receiver) = mpsc::channel();
+fn spawn_writer_pump(mut writer: Box<dyn Write + Send>) -> SyncSender<OutgoingMessage> {
+    let (sender, receiver) = mpsc::sync_channel::<OutgoingMessage>(1);
+    thread::spawn(move || {
+        while let Ok(outgoing) = receiver.recv() {
+            let result = protocol::write_message(&mut writer, &outgoing.message);
+            let terminal = result.is_err();
+            if outgoing.completed.send(result).is_err() || terminal {
+                return;
+            }
+        }
+    });
+    sender
+}
+
+fn spawn_reader_pump(
+    mut reader: Box<dyn BufRead + Send>,
+    server_ready: Arc<AtomicBool>,
+) -> Receiver<IncomingMessage> {
+    let (sender, receiver) = mpsc::sync_channel(INCOMING_QUEUE_CAPACITY);
     thread::spawn(move || {
         loop {
             let message = protocol::read_message(&mut reader);
-            let terminal = !matches!(&message, Ok(Some(_)));
-            if sender.send(message).is_err() || terminal {
-                return;
+            match message {
+                Ok(Some(message)) if is_server_status(&message) => {
+                    server_ready.store(status_is_ready(&message), Ordering::Relaxed);
+                },
+                Ok(Some(message)) if should_queue_incoming(&message) => {
+                    if sender.send(Ok(Some(message))).is_err() {
+                        return;
+                    }
+                },
+                // Diagnostics, logs, and progress are irrelevant to this client.
+                Ok(Some(_)) => {},
+                terminal => {
+                    let _ = sender.send(terminal);
+                    return;
+                },
             }
         }
     });
     receiver
 }
 
+fn is_server_status(message: &Value) -> bool {
+    message.get("method").and_then(Value::as_str) == Some("experimental/serverStatus")
+}
+
+fn should_queue_incoming(message: &Value) -> bool {
+    // Responses and server requests have ids. Ordinary notifications do not and would otherwise
+    // accumulate while the watcher is idle.
+    message.get("id").is_some()
+}
+
+fn status_is_ready(message: &Value) -> bool {
+    let params = &message["params"];
+    params.get("quiescent").and_then(Value::as_bool) == Some(true)
+        && params.get("health").and_then(Value::as_str) != Some("error")
+}
+
 fn server_closed_error() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, "server closed before responding")
+}
+
+fn server_stdin_closed_error() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "server stdin closed before accepting the message")
 }
 
 fn request_timeout_error(method: &str, timeout: Duration) -> io::Error {
@@ -529,6 +625,55 @@ mod tests {
         let err = client.request("custom/thing", json!({})).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(err.to_string().contains("custom/thing"));
+    }
+
+    #[test]
+    fn notification_times_out_when_the_server_stops_consuming_stdin() {
+        let (blocked_read, blocked_write) = std::io::pipe().unwrap();
+        let mut client = LspClient::from_transport_with_timeout(
+            Box::new(BufReader::new(io::empty())),
+            Box::new(blocked_write),
+            Duration::from_millis(20),
+        );
+        let err = client
+            .notify("textDocument/didOpen", json!({"text": "x".repeat(8 * 1024 * 1024)}))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("textDocument/didOpen"));
+        drop(blocked_read); // Release the writer worker after proving the caller is bounded.
+    }
+
+    #[test]
+    fn reader_pump_discards_an_idle_notification_flood() {
+        let mut framed = Vec::new();
+        for sequence in 0..INCOMING_QUEUE_CAPACITY * 2 {
+            protocol::write_message(
+                &mut framed,
+                &json!({
+                    "jsonrpc": "2.0", "method": "window/logMessage",
+                    "params": {"sequence": sequence}
+                }),
+            )
+            .unwrap();
+        }
+        protocol::write_message(
+            &mut framed,
+            &json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}}),
+        )
+        .unwrap();
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let incoming =
+            spawn_reader_pump(Box::new(BufReader::new(std::io::Cursor::new(framed))), ready);
+        assert_eq!(
+            incoming.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(),
+            Some(json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}})),
+            "ordinary notifications must not occupy the bounded response queue"
+        );
+        assert!(
+            incoming.recv_timeout(Duration::from_secs(1)).unwrap().unwrap().is_none(),
+            "EOF follows the preserved response"
+        );
     }
 
     #[test]
