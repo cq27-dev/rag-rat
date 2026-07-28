@@ -6,14 +6,15 @@
 //! transport therefore adds no trust — a synced entry passes exactly the checks a local write does.
 
 use rag_rat_oplog::{
-    AccountId, ContentIngestOutcome, DeviceRole, IngestOutcome, account_entries_for_sync,
-    account_entry_ref, account_ingest, account_signed_entry_exists, account_signed_hash,
-    content_entries_for_sync, content_entry_ref, content_ingest, content_signed_entry_exists,
-    content_signed_hash, sign_local_node_binding, verify_node_binding,
+    AccountId, ContentIngestOutcome, DeviceRole, IngestOutcome, NodeAuthError,
+    account_effective_count, account_entries_for_sync, account_entry_ref, account_ingest,
+    account_signed_entry_exists, account_signed_hash, content_entries_for_sync, content_entry_ref,
+    content_ingest, content_signed_entry_exists, content_signed_hash, sign_local_node_binding,
+    verify_node_binding,
 };
 use rusqlite::Connection;
 
-use crate::auth::{NodeAuth, PeerCapability};
+use crate::auth::{LocalAuth, NodeAuth, PeerAuthorization, PeerCapability};
 use crate::session::{Ingested, SyncStore};
 
 /// Mint this account's signed node binding for `local_node`. A store with no local device yet (a
@@ -35,19 +36,23 @@ fn sign_binding(
     }
 }
 
-/// The capability a peer's binding grants for `account_id`, given its authenticated `remote_node`.
-/// Collapses the internal failure taxonomy to `None` so the transport's wire refusal stays uniform;
-/// a `?`-propagated error here is a real DB fault, not a rejected peer.
+/// The verdict for a peer's binding to `account_id`, given its authenticated `remote_node`.
+/// Binding failures collapse to `Rejected`; only a valid binding whose roster cannot be checked
+/// because this store has no effective account fold is `Unavailable`. The transport still renders
+/// every refusal uniformly; a propagated error here is a real DB fault.
 fn authorize_binding(
     conn: &Connection,
     account_id: AccountId,
     binding: &[u8],
     remote_node: &[u8; 32],
     now_ms: i64,
-) -> anyhow::Result<Option<PeerCapability>> {
-    Ok(verify_node_binding(conn, account_id, binding, remote_node, now_ms)?
-        .ok()
-        .map(capability_for_role))
+) -> anyhow::Result<PeerAuthorization> {
+    Ok(match verify_node_binding(conn, account_id, binding, remote_node, now_ms)? {
+        Ok(role) => PeerAuthorization::Granted(capability_for_role(role)),
+        Err(NodeAuthError::NotRosterDevice) if account_effective_count(conn, account_id)? == 0 =>
+            PeerAuthorization::Unavailable,
+        Err(_) => PeerAuthorization::Rejected,
+    })
 }
 
 fn capability_for_role(role: DeviceRole) -> PeerCapability {
@@ -55,6 +60,20 @@ fn capability_for_role(role: DeviceRole) -> PeerCapability {
         DeviceRole::ReadOnly => PeerCapability::ReadOnly,
         DeviceRole::Member | DeviceRole::Owner => PeerCapability::ReadWrite,
     }
+}
+
+fn local_auth(
+    conn: &Connection,
+    account_id: AccountId,
+    local_node: &[u8; 32],
+    now_ms: i64,
+) -> anyhow::Result<LocalAuth> {
+    let binding = sign_binding(conn, account_id, local_node, now_ms)?;
+    let capability = match authorize_binding(conn, account_id, &binding, local_node, now_ms)? {
+        PeerAuthorization::Granted(capability) => capability,
+        PeerAuthorization::Rejected | PeerAuthorization::Unavailable => PeerCapability::ReadOnly,
+    };
+    Ok(LocalAuth { binding, capability })
 }
 
 /// A [`SyncStore`] over one account's op log on a live connection. Scoped to a single account: a
@@ -227,8 +246,8 @@ impl SyncStore for OplogContentSyncStore<'_> {
 // binding freshness must track the live clock, or a reused store would mint stale bindings and
 // never advance the replay window.
 impl NodeAuth for OplogSyncStore<'_> {
-    fn local_binding(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<Vec<u8>> {
-        sign_binding(self.conn, self.account_id, local_node, now_ms)
+    fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
+        local_auth(self.conn, self.account_id, local_node, now_ms)
     }
 
     fn authorize(
@@ -236,14 +255,14 @@ impl NodeAuth for OplogSyncStore<'_> {
         binding: &[u8],
         remote_node: &[u8; 32],
         now_ms: i64,
-    ) -> anyhow::Result<Option<PeerCapability>> {
+    ) -> anyhow::Result<PeerAuthorization> {
         authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
     }
 }
 
 impl NodeAuth for OplogContentSyncStore<'_> {
-    fn local_binding(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<Vec<u8>> {
-        sign_binding(self.conn, self.account_id, local_node, now_ms)
+    fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
+        local_auth(self.conn, self.account_id, local_node, now_ms)
     }
 
     fn authorize(
@@ -251,7 +270,7 @@ impl NodeAuth for OplogContentSyncStore<'_> {
         binding: &[u8],
         remote_node: &[u8; 32],
         now_ms: i64,
-    ) -> anyhow::Result<Option<PeerCapability>> {
+    ) -> anyhow::Result<PeerAuthorization> {
         authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
     }
 }

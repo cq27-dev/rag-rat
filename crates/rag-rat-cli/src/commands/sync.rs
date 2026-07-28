@@ -6,7 +6,9 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use rag_rat_base::config::Config;
 use rag_rat_base::{hash, locks, time};
-use rag_rat_sync::{AuthPolicy, NodeAuth, OplogContentSyncStore, OplogSyncStore};
+use rag_rat_sync::{
+    AuthPolicy, NodeAuth, OplogContentSyncStore, OplogSyncStore, PeerAuthorization,
+};
 use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
 
@@ -413,8 +415,8 @@ fn device_roster_effective(
 ) -> anyhow::Result<bool> {
     let probe = OplogSyncStore::new(conn, account_id, time::now_ms);
     let now = time::now_ms();
-    let binding = probe.local_binding(local_node, now)?;
-    Ok(probe.authorize(&binding, local_node, now)?.is_some())
+    let local = probe.local_auth(local_node, now)?;
+    Ok(matches!(probe.authorize(&local.binding, local_node, now)?, PeerAuthorization::Granted(_),))
 }
 
 /// Meta key for this index's persisted iroh node secret (the transport identity).

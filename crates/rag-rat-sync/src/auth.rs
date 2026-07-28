@@ -42,8 +42,8 @@ const MAX_AUTH_FRAME_BYTES: u32 = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthPolicy {
     /// Admit any dialer for reads. A valid roster binding determines its capability when available;
-    /// otherwise an acceptor keeps the dialer read-only, while a dialer permits its explicitly
-    /// selected server to send the snapshot needed to restore roster state.
+    /// a rejected binding remains read-only. Only a dialer whose local authority is unavailable
+    /// permits its explicitly selected server to send the snapshot needed to restore roster state.
     Open,
     /// Admit only a peer whose binding verifies against this account's roster and the connection's
     /// authenticated remote node id. The default for a private account.
@@ -77,6 +77,40 @@ impl PeerCapability {
     }
 }
 
+/// The local store's verdict for a peer binding. `Unavailable` is distinct from rejection so a
+/// fresh Open dialer with no account authority yet can bootstrap from its selected server without
+/// letting a peer gain capability by withholding or corrupting a binding we could validate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAuthorization {
+    Granted(PeerCapability),
+    Rejected,
+    Unavailable,
+}
+
+/// The binding this side presents and its locally-derived data-phase capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAuth {
+    pub binding: Vec<u8>,
+    pub capability: PeerCapability,
+}
+
+/// Directional data-phase capabilities established around mutual authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCapabilities {
+    pub local: PeerCapability,
+    pub peer: PeerCapability,
+}
+
+impl SessionCapabilities {
+    pub const fn new(local: PeerCapability, peer: PeerCapability) -> Self {
+        Self { local, peer }
+    }
+
+    pub const fn bidirectional() -> Self {
+        Self::new(PeerCapability::ReadWrite, PeerCapability::ReadWrite)
+    }
+}
+
 /// The non-stream inputs to one auth handshake, bundled so [`run_auth_phase`] takes the stream
 /// pair, the authorizer, and this — rather than a long argument train.
 #[derive(Debug, Clone, Copy)]
@@ -104,20 +138,20 @@ pub struct AuthConfig {
 /// [`crate::session::SyncStore`] so the auth phase is testable without the data-phase machinery.
 pub trait NodeAuth {
     /// Our signed binding vouching that `local_node` is this account's local device, stamped
-    /// `now_ms`. `Err` if this store cannot authorize (e.g. no local account/device yet — the
-    /// onboarding case).
-    fn local_binding(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<Vec<u8>>;
+    /// `now_ms`, plus the capability our current effective role permits us to exercise. A store
+    /// with no effective local role presents an empty/invalid binding and remains read-only.
+    fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth>;
 
-    /// The capability granted by `binding` to a peer whose iroh-authenticated node key is
-    /// `remote_node`, judged fresh against `now_ms`. `None` is a uniform refusal; the store
-    /// collapses its internal failure taxonomy so the wire cannot distinguish a malformed binding
-    /// from a removed device. `Err` is reserved for a real fault (for example a failed DB read).
+    /// The verdict for `binding` from a peer whose iroh-authenticated node key is `remote_node`,
+    /// judged fresh against `now_ms`. `Rejected` collapses the internal failure taxonomy so the
+    /// wire cannot distinguish a malformed binding from a removed device. `Unavailable` means this
+    /// store has no effective account authority yet. `Err` is reserved for a real storage fault.
     fn authorize(
         &self,
         binding: &[u8],
         remote_node: &[u8; 32],
         now_ms: i64,
-    ) -> anyhow::Result<Option<PeerCapability>>;
+    ) -> anyhow::Result<PeerAuthorization>;
 }
 
 /// A node-authorization handshake that did not admit the connection.
@@ -147,51 +181,54 @@ impl std::fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-/// Run the mutual auth handshake. On success, returns what the peer may do in the data phase; the
-/// caller passes that capability to [`crate::session::run_session`] over the same stream. On `Err`
-/// the caller drops the connection without revealing any inventory.
+/// Run the mutual auth handshake. On success, returns what each side may transmit in the data
+/// phase; the caller passes those capabilities to [`crate::session::run_session`] over the same
+/// stream. On `Err` the caller drops the connection without revealing any inventory.
 pub async fn run_auth_phase<W, R, A>(
     send: &mut W,
     recv: &mut R,
     auth: &A,
     cfg: AuthConfig,
-) -> Result<PeerCapability, AuthError>
+) -> Result<SessionCapabilities, AuthError>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
     A: NodeAuth,
 {
-    let capability = match cfg.role {
+    let capabilities = match cfg.role {
         // Acceptor verifies the dialer BEFORE revealing its own binding.
         AuthRole::Acceptor => {
-            let capability = verify_peer(recv, auth, &cfg).await?;
-            send_ours(send, auth, &cfg).await?;
-            capability
+            let peer = verify_peer(recv, auth, &cfg).await?;
+            let local = send_ours(send, auth, &cfg).await?;
+            SessionCapabilities::new(local, peer)
         },
         // Dialer presents first (to the node it already authenticated), then verifies the acceptor
         // before proceeding to the data phase.
         AuthRole::Dialer => {
-            send_ours(send, auth, &cfg).await?;
-            verify_peer(recv, auth, &cfg).await?
+            let local = send_ours(send, auth, &cfg).await?;
+            let peer = verify_peer(recv, auth, &cfg).await?;
+            SessionCapabilities::new(local, peer)
         },
     };
-    Ok(capability)
+    Ok(capabilities)
 }
 
 async fn send_ours<W: AsyncWrite + Unpin>(
     send: &mut W,
     auth: &dyn NodeAuth,
     cfg: &AuthConfig,
-) -> Result<(), AuthError> {
-    // A store that cannot mint a binding (no local account/device) cannot authorize — fail closed.
-    let binding =
-        auth.local_binding(&cfg.local_node, cfg.now_ms).map_err(|_| AuthError::Unauthorized)?;
+) -> Result<PeerCapability, AuthError> {
+    // Derive the binding and local send capability from one account snapshot. An anonymous or
+    // locally removed device may still present an empty/invalid binding under Open, but remains
+    // read-only so the session sender never uploads entries.
+    let local =
+        auth.local_auth(&cfg.local_node, cfg.now_ms).map_err(|_| AuthError::Unauthorized)?;
     // Bound the WRITE by the same pre-auth deadline as the read: a peer that opens the stream but
     // never grants receive credit would otherwise hang this write forever, blocking the acceptor's
     // single-session accept slot — a pre-auth DoS.
-    let frame = Frame::Auth { account_id: cfg.account_id, binding };
+    let frame = Frame::Auth { account_id: cfg.account_id, binding: local.binding };
     match tokio::time::timeout(cfg.pre_auth_timeout, codec::write_frame(send, &frame)).await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => Ok(local.capability),
         Ok(Err(e)) => Err(AuthError::Codec(e)),
         Err(_elapsed) => Err(AuthError::Timeout),
     }
@@ -224,21 +261,18 @@ async fn verify_peer<R: AsyncRead + Unpin>(
         // Open admission grants an unverified dialer READ, never WRITE. A fresh dialer cannot yet
         // verify the selected server's roster binding, so it must permit that acceptor to serve the
         // requested snapshot; ingest still verifies every entry from scratch.
-        AuthPolicy::Open => {
-            let unverified_peer_capability = match cfg.role {
-                AuthRole::Dialer => PeerCapability::ReadWrite,
-                AuthRole::Acceptor => PeerCapability::ReadOnly,
-            };
-            Ok(auth
-                .authorize(&binding, &cfg.remote_node, cfg.now_ms)
-                .ok()
-                .flatten()
-                .unwrap_or(unverified_peer_capability))
+        AuthPolicy::Open => match auth.authorize(&binding, &cfg.remote_node, cfg.now_ms) {
+            Ok(PeerAuthorization::Granted(capability)) => Ok(capability),
+            Ok(PeerAuthorization::Unavailable) if cfg.role == AuthRole::Dialer =>
+                Ok(PeerCapability::ReadWrite),
+            Ok(PeerAuthorization::Rejected | PeerAuthorization::Unavailable) | Err(_) =>
+                Ok(PeerCapability::ReadOnly),
         },
         AuthPolicy::Closed => {
             match auth.authorize(&binding, &cfg.remote_node, cfg.now_ms) {
-                Ok(Some(capability)) => Ok(capability),
-                Ok(None) => Err(AuthError::Unauthorized),
+                Ok(PeerAuthorization::Granted(capability)) => Ok(capability),
+                Ok(PeerAuthorization::Rejected | PeerAuthorization::Unavailable) =>
+                    Err(AuthError::Unauthorized),
                 // A real fault (DB read failed) is not the same as a rejected peer, but it still
                 // means we cannot admit — surface it uniformly rather than admitting on error.
                 Err(_) => Err(AuthError::Unauthorized),
@@ -261,12 +295,13 @@ mod tests {
     /// independently of the binding crypto (covered by the oplog `node_binding` tests).
     struct FakeAuth {
         binding: Vec<u8>,
-        capability: Option<PeerCapability>,
+        local_capability: PeerCapability,
+        authorization: PeerAuthorization,
     }
 
     impl NodeAuth for FakeAuth {
-        fn local_binding(&self, _local_node: &[u8; 32], _now_ms: i64) -> anyhow::Result<Vec<u8>> {
-            Ok(self.binding.clone())
+        fn local_auth(&self, _local_node: &[u8; 32], _now_ms: i64) -> anyhow::Result<LocalAuth> {
+            Ok(LocalAuth { binding: self.binding.clone(), capability: self.local_capability })
         }
 
         fn authorize(
@@ -274,8 +309,8 @@ mod tests {
             _binding: &[u8],
             _remote_node: &[u8; 32],
             _now_ms: i64,
-        ) -> anyhow::Result<Option<PeerCapability>> {
-            Ok(self.capability)
+        ) -> anyhow::Result<PeerAuthorization> {
+            Ok(self.authorization)
         }
     }
 
@@ -285,7 +320,7 @@ mod tests {
         dialer_policy: AuthPolicy,
         acceptor: FakeAuth,
         acceptor_policy: AuthPolicy,
-    ) -> (Result<PeerCapability, AuthError>, Result<PeerCapability, AuthError>) {
+    ) -> (Result<SessionCapabilities, AuthError>, Result<SessionCapabilities, AuthError>) {
         let (mut d_send, mut a_recv) = tokio::io::duplex(1 << 16);
         let (mut a_send, mut d_recv) = tokio::io::duplex(1 << 16);
         // Short: the happy path never waits, and a refusal leaves the peer's read pending (the
@@ -314,25 +349,35 @@ mod tests {
     }
 
     fn ok_auth() -> FakeAuth {
-        FakeAuth { binding: vec![1, 2, 3], capability: Some(PeerCapability::ReadWrite) }
+        FakeAuth {
+            binding: vec![1, 2, 3],
+            local_capability: PeerCapability::ReadWrite,
+            authorization: PeerAuthorization::Granted(PeerCapability::ReadWrite),
+        }
     }
 
     #[tokio::test]
     async fn mutual_closed_authorization_admits_both() {
         let (d, a) =
             run_pair(ok_auth(), ACCT, AuthPolicy::Closed, ok_auth(), AuthPolicy::Closed).await;
-        assert_eq!(d.unwrap(), PeerCapability::ReadWrite);
-        assert_eq!(a.unwrap(), PeerCapability::ReadWrite);
+        assert_eq!(d.unwrap(), SessionCapabilities::bidirectional());
+        assert_eq!(a.unwrap(), SessionCapabilities::bidirectional());
     }
 
     #[tokio::test]
     async fn closed_authorization_returns_the_peers_effective_capability() {
-        let acceptor =
-            FakeAuth { binding: vec![1, 2, 3], capability: Some(PeerCapability::ReadOnly) };
+        let acceptor = FakeAuth {
+            binding: vec![1, 2, 3],
+            local_capability: PeerCapability::ReadWrite,
+            authorization: PeerAuthorization::Granted(PeerCapability::ReadOnly),
+        };
         let (dialer, acceptor) =
             run_pair(ok_auth(), ACCT, AuthPolicy::Closed, acceptor, AuthPolicy::Closed).await;
-        assert_eq!(dialer.unwrap(), PeerCapability::ReadWrite);
-        assert_eq!(acceptor.unwrap(), PeerCapability::ReadOnly);
+        assert_eq!(dialer.unwrap(), SessionCapabilities::bidirectional());
+        assert_eq!(
+            acceptor.unwrap(),
+            SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
+        );
     }
 
     #[tokio::test]
@@ -341,7 +386,11 @@ mod tests {
         // binding, it aborts without revealing anything — the dialer's read then fails (no Auth
         // frame arrives). This is the mutual-auth ordering that stops inventory (and here even the
         // acceptor's binding) leaking to an unauthorized peer.
-        let acceptor = FakeAuth { binding: vec![9, 9, 9], capability: None };
+        let acceptor = FakeAuth {
+            binding: vec![9, 9, 9],
+            local_capability: PeerCapability::ReadWrite,
+            authorization: PeerAuthorization::Rejected,
+        };
         let (dialer, accept) =
             run_pair(ok_auth(), ACCT, AuthPolicy::Closed, acceptor, AuthPolicy::Closed).await;
         assert!(matches!(accept, Err(AuthError::Unauthorized)), "acceptor refused: {accept:?}");
@@ -352,12 +401,41 @@ mod tests {
     async fn open_policy_allows_the_selected_acceptor_to_serve_an_anonymous_dialer() {
         // Neither side can verify the other's binding yet. Open admits the dialer read-only, while
         // the dialer permits the server it explicitly selected to send the requested snapshot.
-        let anon_dialer = FakeAuth { binding: vec![], capability: None };
-        let acceptor = FakeAuth { binding: vec![1, 2, 3], capability: None };
+        let anon_dialer = FakeAuth {
+            binding: vec![],
+            local_capability: PeerCapability::ReadOnly,
+            authorization: PeerAuthorization::Unavailable,
+        };
+        let acceptor = FakeAuth {
+            binding: vec![1, 2, 3],
+            local_capability: PeerCapability::ReadWrite,
+            authorization: PeerAuthorization::Rejected,
+        };
         let (d, a) =
             run_pair(anon_dialer, ACCT, AuthPolicy::Open, acceptor, AuthPolicy::Open).await;
-        assert_eq!(d.unwrap(), PeerCapability::ReadWrite);
-        assert_eq!(a.unwrap(), PeerCapability::ReadOnly);
+        assert_eq!(
+            d.unwrap(),
+            SessionCapabilities::new(PeerCapability::ReadOnly, PeerCapability::ReadWrite),
+        );
+        assert_eq!(
+            a.unwrap(),
+            SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
+        );
+    }
+
+    #[tokio::test]
+    async fn open_policy_does_not_elevate_a_rejected_selected_acceptor() {
+        let dialer = FakeAuth {
+            binding: vec![4, 5, 6],
+            local_capability: PeerCapability::ReadWrite,
+            authorization: PeerAuthorization::Rejected,
+        };
+        let (dialer, _acceptor) =
+            run_pair(dialer, ACCT, AuthPolicy::Open, ok_auth(), AuthPolicy::Open).await;
+        assert_eq!(
+            dialer.unwrap(),
+            SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
+        );
     }
 
     #[tokio::test]

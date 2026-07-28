@@ -24,7 +24,8 @@ pub mod store;
 pub mod wire;
 
 pub use auth::{
-    AuthConfig, AuthError, AuthPolicy, AuthRole, NodeAuth, PeerCapability, run_auth_phase,
+    AuthConfig, AuthError, AuthPolicy, AuthRole, LocalAuth, NodeAuth, PeerAuthorization,
+    PeerCapability, SessionCapabilities, run_auth_phase,
 };
 pub use endpoint::{
     EndpointError, SyncFailure, accept_and_dispatch, accept_and_sync, accept_enrollment,

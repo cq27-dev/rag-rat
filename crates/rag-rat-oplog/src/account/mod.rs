@@ -122,10 +122,10 @@ pub use secrets::{
 pub use snapshot::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub(crate) use storage::stream_owner_account;
 pub use storage::{
-    CapacityScope, IngestOutcome, SyncAccountEntry, account_entries_for_enrollment,
-    account_entries_for_sync, account_entry_ref, account_ingest, account_signed_entry_exists,
-    account_signed_hash, auth_len_freshness, backfill_authority_projection,
-    grant_effective_for_device, owned_streams_for_account, owner_control_authority,
-    owner_control_authority_in_snapshot, owner_secrets_authority, roster_content_authority,
-    stream_owner_effective, verify_enrollment_device_add,
+    CapacityScope, IngestOutcome, SyncAccountEntry, account_effective_count,
+    account_entries_for_enrollment, account_entries_for_sync, account_entry_ref, account_ingest,
+    account_signed_entry_exists, account_signed_hash, auth_len_freshness,
+    backfill_authority_projection, grant_effective_for_device, owned_streams_for_account,
+    owner_control_authority, owner_control_authority_in_snapshot, owner_secrets_authority,
+    roster_content_authority, stream_owner_effective, verify_enrollment_device_add,
 };

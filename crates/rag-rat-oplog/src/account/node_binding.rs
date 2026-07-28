@@ -179,6 +179,14 @@ pub fn verify_node_binding(
     if pubkey.verify(&preimage, &b.signature).is_err() {
         return Ok(Err(NodeAuthError::BadSignature));
     }
+    // Freshness must be checked BEFORE roster lookup. A fresh dialer with no account state uses a
+    // valid-but-unknown signer to distinguish bootstrap unavailability from rejection; letting an
+    // expired binding reach that lookup would incorrectly grant the bootstrap exception.
+    if b.issued_at_ms < now_ms.saturating_sub(MAX_BINDING_AGE_MS)
+        || b.issued_at_ms > now_ms.saturating_add(MAX_BINDING_FUTURE_SKEW_MS)
+    {
+        return Ok(Err(NodeAuthError::Expired));
+    }
     // Roster membership: the signer's fingerprint (self-certified as `sha256(device_pubkey)`, never
     // resolved from a fold-independent key store) must be effective in the CURRENT fold. Any role
     // is allowed — the roster gate is read access, not authoring authority; gating on Owner
@@ -189,13 +197,6 @@ pub fn verify_node_binding(
     else {
         return Ok(Err(NodeAuthError::NotRosterDevice));
     };
-    // Freshness: bounds the stolen-transport-seed residual. The binding may not be older than
-    // MAX_BINDING_AGE_MS nor dated more than MAX_BINDING_FUTURE_SKEW_MS ahead of the verifier.
-    if b.issued_at_ms < now_ms.saturating_sub(MAX_BINDING_AGE_MS)
-        || b.issued_at_ms > now_ms.saturating_add(MAX_BINDING_FUTURE_SKEW_MS)
-    {
-        return Ok(Err(NodeAuthError::Expired));
-    }
     Ok(Ok(role))
 }
 
