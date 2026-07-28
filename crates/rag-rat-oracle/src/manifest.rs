@@ -169,13 +169,20 @@ impl ToolManifest {
     /// hint, and a prerequisite is moot until the tool exists.
     pub fn probe_runnable_in(&self, root: &Path) -> ToolAvailability {
         let availability = self.probe_in(root);
-        match (&availability, self.prerequisite_blocked(root)) {
-            (ToolAvailability::Available { .. }, Some(hint)) => ToolAvailability::Blocked {
+        if !availability.is_available() {
+            // Already blocked, and the prerequisite is not evaluated at all — checking it would
+            // only be discarded, and for the live TypeScript backend it is a whole-checkout
+            // project search. `oracle status` with no `--tool` probes every backend, so an
+            // eagerly-evaluated prerequisite would walk a large checkout once per absent tool.
+            return availability;
+        }
+        match self.prerequisite_blocked(root) {
+            Some(hint) => ToolAvailability::Blocked {
                 tool: self.tool.as_db_str().to_string(),
                 program: self.program.to_string(),
                 hint,
             },
-            _ => availability,
+            None => availability,
         }
     }
 

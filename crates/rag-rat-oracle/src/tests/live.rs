@@ -1199,6 +1199,102 @@ mod typescript {
     }
 
     #[test]
+    fn a_ts_pass_leaves_a_sibling_checkout_and_the_other_live_tool_untouched() {
+        // This backend is the SECOND writer into `edge_oracle`/`oracle_runs`, whose rows are keyed
+        // by (tool, tool_version, content, commit, worktree). Two dimensions therefore have to
+        // hold at once: a sibling checkout's rows must survive a pass in this one, and the two
+        // live tools must not read or overwrite each other's verdicts on their own edges.
+        let h = Harness::new();
+        let (target, edge) = seed_ts_corpus(&h);
+
+        // A SIBLING checkout with its own edge and its own ts-lsp verdict.
+        let sibling_file = h.add_file_in_scope("other.ts", OTHER_COMMIT, OTHER_WORKTREE);
+        let sibling_edge = h.add_edge(sibling_file, "greet", 9, 14, "NameOnly", None);
+        let sibling_key = h.edge_content_key(sibling_edge);
+        crate::store::write_edge_oracle(&h.conn, OracleTool::TsLsp, TS_VERSION, &{
+            crate::store::EdgeOracleRow {
+                source_path: &sibling_key.source_path,
+                source_start_byte: sibling_key.source_start_byte,
+                source_end_byte: sibling_key.source_end_byte,
+                callee_start_byte: sibling_key.callee_start_byte,
+                callee_end_byte: sibling_key.callee_end_byte,
+                edge_kind: &sibling_key.edge_kind,
+                file_sha: "sibling-sha",
+                resolved_symbol_id: None,
+                scip_symbol: "local ts-lsp-sibling",
+                kind: OracleResolutionKind::Upgrade,
+            }
+        })
+        .unwrap();
+
+        // A RUST edge in THIS checkout, already carrying an ra-lsp verdict from its own backend.
+        let rust_defs = h.add_file("defs.rs", DEFS_SRC);
+        h.add_symbol(rust_defs, "target", 0, 13);
+        let rust_src = h.add_file("caller.rs", CALLER_SRC);
+        let rust_edge = h.add_edge(
+            rust_src,
+            "target",
+            CALLER_CALLEE_START,
+            CALLER_CALLEE_END,
+            "NameOnly",
+            None,
+        );
+        let rust_key = h.edge_content_key(rust_edge);
+        crate::store::write_edge_oracle(&h.conn, OracleTool::RaLsp, LIVE_VERSION, &{
+            crate::store::EdgeOracleRow {
+                source_path: &rust_key.source_path,
+                source_start_byte: rust_key.source_start_byte,
+                source_end_byte: rust_key.source_end_byte,
+                callee_start_byte: rust_key.callee_start_byte,
+                callee_end_byte: rust_key.callee_end_byte,
+                edge_kind: &rust_key.edge_kind,
+                file_sha: "rust-sha",
+                resolved_symbol_id: None,
+                scip_symbol: "local ra-lsp-rust",
+                kind: OracleResolutionKind::Upgrade,
+            }
+        })
+        .unwrap();
+
+        let definition = def_uri(&h, "lib.ts");
+        let (mut session, _sent) = ts_session(
+            &h,
+            vec![progress("load", "begin"), progress("load", "end")],
+            Vec::new(),
+            Some(definition),
+        );
+        let worklist = vec!["main.ts".to_string()];
+        let report =
+            live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+        assert_eq!(report.rows_written, 1, "{report:?}");
+
+        // This checkout's TypeScript edge got its verdict under ts-lsp…
+        assert_eq!(h.verdict(edge).expect("a ts verdict").1, Some(target));
+        // …the sibling checkout's ts-lsp row is untouched (a pass here is not a whole-tool clear)…
+        // `edge_oracle` is CONTENT-keyed — checkout scope comes from the join to edges/files, not
+        // from a column — so the sibling's row is identified by its own source path.
+        let sibling_symbol: String = h
+            .conn
+            .query_row(
+                "SELECT scip_symbol FROM edge_oracle WHERE tool = 'ts-lsp' AND source_path = ?1",
+                rusqlite::params![sibling_key.source_path],
+                |row| row.get(0),
+            )
+            .expect("the sibling checkout's row survives");
+        assert_eq!(sibling_symbol, "local ts-lsp-sibling");
+        // …and the OTHER live tool's verdict on its own Rust edge is neither read nor rewritten.
+        let rust_symbol: String = h
+            .conn
+            .query_row("SELECT scip_symbol FROM edge_oracle WHERE tool = 'ra-lsp'", [], |row| {
+                row.get(0)
+            })
+            .expect("the ra-lsp row survives");
+        assert_eq!(rust_symbol, "local ra-lsp-rust");
+        // The run row is scoped to this checkout and this tool only.
+        assert_eq!(ts_run_count(&h.conn), 1);
+    }
+
+    #[test]
     fn a_checkout_with_no_project_is_not_re_opened_every_pass() {
         // Opening a project-less document emits no progress cycle, so it cannot warm anything.
         // Doing it anyway would burn a notification per pass forever. (The manifest gate normally

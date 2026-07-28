@@ -53,9 +53,13 @@ fn write_ts_fixture(root: &Path) {
         .unwrap();
 }
 
-/// Point the fixture at a TypeScript install. The server falls back to a bundled compiler when it
-/// finds none, and that fallback does not resolve cross-file imports — which would make this test
-/// pass for the wrong reason (an unresolved callee writes no verdict either).
+/// Point the fixture at a TypeScript install, which the server needs to resolve the project at
+/// all.
+///
+/// Measured with none resolvable: the server emits NO project-load progress cycle and answers the
+/// definition `null`. That is safe — no cycle means the session never reports ready, so the pass
+/// never asks — but it would make this test pass for the wrong reason, since an unresolved callee
+/// writes no verdict either. (It is also why the watcher reports a backend that never warms.)
 fn link_typescript(root: &Path) {
     let node_modules = std::env::var("RAG_RAT_TS_NODE_MODULES").expect(
         "set RAG_RAT_TS_NODE_MODULES to a node_modules directory containing `typescript` — \

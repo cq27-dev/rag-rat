@@ -180,7 +180,21 @@ struct LiveBackendTail {
     /// Whether this backend's unmet checkout prerequisite has already been reported. The block is
     /// permanent until the checkout changes, so it is worth saying — once, not on every retry.
     prerequisite_reported: bool,
+    /// Consecutive passes this backend has spent warming without ever resolving anything, and
+    /// whether that has been reported. See [`WARMING_PASSES_BEFORE_REPORT`].
+    warming_passes: u32,
+    warming_reported: bool,
 }
+
+/// How many consecutive warming passes go by before the watcher says so. A cold language server
+/// legitimately warms for a pass or two; a server that never becomes ready is a real problem the
+/// operator cannot otherwise see, because the safe behaviour — never ask a warming server — is
+/// also a SILENT one.
+///
+/// The causes are open-ended (a language server that cannot resolve a compiler for the project, a
+/// broken toolchain install, a project too large to load inside the retry window), so this reports
+/// the observed state rather than trying to predict any particular cause.
+const WARMING_PASSES_BEFORE_REPORT: u32 = 5;
 
 impl LiveBackendTail {
     fn new(backend: LiveBackend) -> Self {
@@ -190,6 +204,8 @@ impl LiveBackendTail {
             backlog: Vec::new(),
             lifecycle: LiveOracleLifecycle::default(),
             prerequisite_reported: false,
+            warming_passes: 0,
+            warming_reported: false,
         }
     }
 
@@ -197,6 +213,31 @@ impl LiveBackendTail {
     /// resident session schedules its own idle shutdown.
     fn next_wake_in(&self, idle: Duration, now: Instant) -> Option<Duration> {
         self.lifecycle.next_wake_in(!self.backlog.is_empty(), idle, now)
+    }
+
+    /// Track consecutive warming passes and report a server that never becomes ready.
+    ///
+    /// Refusing to ask a warming server is the correct behaviour, but on its own it is
+    /// indistinguishable from working: the backlog just rides forever. Say so once, and reset as
+    /// soon as the backend gets anywhere, so a normally-warming server stays quiet.
+    fn note_warming(&mut self, status: &str) {
+        if status != "Warming" {
+            self.warming_passes = 0;
+            self.warming_reported = false;
+            return;
+        }
+        self.warming_passes = self.warming_passes.saturating_add(1);
+        if self.warming_passes >= WARMING_PASSES_BEFORE_REPORT && !self.warming_reported {
+            self.warming_reported = true;
+            tracing::warn!(
+                target: "rag_rat_core::watch",
+                tool = self.backend.tool.as_db_str(),
+                passes = self.warming_passes,
+                "live oracle: the language server has not reported a completed project load — \
+                 it resolves nothing until it does. Check that it can load this project (for \
+                 TypeScript, that a `typescript` package resolves for the tsconfig project)."
+            );
+        }
     }
 
     /// This backend's share of one pass: resolve pending work, or shut an otherwise-workless
@@ -311,6 +352,7 @@ impl LiveBackendTail {
                     // to end an earlier crash/spawn-failure streak. Warm-up alone does not.
                     self.lifecycle.on_stable_batch();
                 }
+                self.note_warming(&report.status);
                 if report.rows_written > 0 || !report.unfinished_paths.is_empty() {
                     tracing::info!(
                         target: "rag_rat_core::watch",
@@ -488,6 +530,28 @@ mod tests {
         // A wrapped counter must not panic or skip anyone.
         assert_eq!(claim_order(2, usize::MAX).collect::<Vec<_>>(), vec![1, 0]);
         assert_eq!(claim_order(0, 5).count(), 0, "no backends is not a division by zero");
+    }
+
+    #[test]
+    fn a_server_that_never_warms_is_reported_once_then_stays_quiet() {
+        // Refusing to ask a warming server is correct but SILENT — on its own it is
+        // indistinguishable from the backend working, and the backlog just rides forever. The
+        // watcher has to say so, once, and stop as soon as the backend gets anywhere.
+        let mut tail =
+            LiveBackendTail::new(LiveBackend::for_tool(rag_rat_oracle::OracleTool::TsLsp).unwrap());
+        for _ in 0..WARMING_PASSES_BEFORE_REPORT - 1 {
+            tail.note_warming("Warming");
+            assert!(!tail.warming_reported, "a normally-warming server must stay quiet");
+        }
+        tail.note_warming("Warming");
+        assert!(tail.warming_reported, "a server that never warms must be reported");
+        tail.note_warming("Warming");
+        assert!(tail.warming_reported, "reported ONCE, not on every later pass");
+
+        // Any progress at all clears the streak, so a later cold start reports afresh.
+        tail.note_warming("Completed");
+        assert_eq!(tail.warming_passes, 0);
+        assert!(!tail.warming_reported);
     }
 
     #[test]
