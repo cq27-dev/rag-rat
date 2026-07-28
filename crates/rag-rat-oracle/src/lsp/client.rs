@@ -291,11 +291,23 @@ impl LspClient {
         };
         let reply = match method {
             "workspace/configuration" => {
-                json!({"jsonrpc": "2.0", "id": peer_id.clone(), "result": []})
+                let item_count = message["params"]["items"].as_array().map_or(0, Vec::len);
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": peer_id.clone(),
+                    "result": vec![Value::Null; item_count],
+                })
             },
-            "client/registerCapability" | "window/workDoneProgress/create" => {
+            "window/workDoneProgress/create" => {
                 json!({"jsonrpc": "2.0", "id": peer_id.clone(), "result": null})
             },
+            "client/registerCapability" => json!({
+                "jsonrpc": "2.0", "id": peer_id.clone(),
+                "error": {
+                    "code": METHOD_NOT_FOUND,
+                    "message": "dynamic capability registration is not supported"
+                }
+            }),
             _ => json!({
                 "jsonrpc": "2.0", "id": peer_id.clone(),
                 "error": {"code": METHOD_NOT_FOUND,
@@ -593,7 +605,8 @@ mod tests {
                     pending_id = msg.get("id").cloned();
                     Some(vec![json!({
                         "jsonrpc": "2.0", "id": 4242,
-                        "method": "workspace/configuration", "params": {"items": []}
+                        "method": "workspace/configuration",
+                        "params": {"items": [{"section": "rust-analyzer"}, {"section": "rust"}]}
                     })])
                 },
                 // Our reply to the server's request (id 4242, no method) → now answer the original.
@@ -608,7 +621,42 @@ mod tests {
         });
         let result = client.request("custom/thing", json!({})).unwrap();
         assert_eq!(result, json!({"ok": true}), "the original request completed after we replied");
-        assert_eq!(server_reply.lock().unwrap().as_ref().unwrap()["result"], json!([]));
+        assert_eq!(
+            server_reply.lock().unwrap().as_ref().unwrap()["result"],
+            json!([null, null]),
+            "workspace/configuration returns one value per requested item",
+        );
+    }
+
+    #[test]
+    fn request_rejects_unsupported_dynamic_capability_registration() {
+        let mut pending_id: Option<Value> = None;
+        let server_reply = Arc::new(Mutex::new(None));
+        let captured_reply = Arc::clone(&server_reply);
+        let mut client = client_with_server(move |msg: &Value| {
+            match msg.get("method").and_then(Value::as_str) {
+                Some("custom/thing") => {
+                    pending_id = msg.get("id").cloned();
+                    Some(vec![json!({
+                        "jsonrpc": "2.0", "id": 4243,
+                        "method": "client/registerCapability",
+                        "params": {"registrations": [{
+                            "id": "definition", "method": "textDocument/definition"
+                        }]}
+                    })])
+                },
+                None if msg.get("id") == Some(&json!(4243)) => {
+                    *captured_reply.lock().unwrap() = Some(msg.clone());
+                    Some(vec![json!({"jsonrpc": "2.0", "id": pending_id.take(), "result": null})])
+                },
+                _ => Some(vec![]),
+            }
+        });
+
+        client.request("custom/thing", json!({})).unwrap();
+        let reply = server_reply.lock().unwrap();
+        assert_eq!(reply.as_ref().unwrap()["error"]["code"], METHOD_NOT_FOUND);
+        assert!(reply.as_ref().unwrap().get("result").is_none());
     }
 
     #[test]

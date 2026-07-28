@@ -30,6 +30,7 @@ use crate::index::{IndexDatabase, papertrail_autosync as autosync};
 pub(crate) const FLEET_DEBOUNCE: Duration = Duration::from_millis(500);
 pub(crate) const FLEET_MAX_LATENCY: Duration = Duration::from_millis(2000);
 pub(crate) const IDLE_WAIT: Duration = Duration::from_millis(500);
+pub(crate) const LIVE_ORACLE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A running watcher. Dropping it signals the thread to stop and joins it.
 #[derive(Debug)]
@@ -223,6 +224,7 @@ fn watcher_main(
                     Some(&mut live_oracle),
                 ),
             };
+            live_oracle.retry_needed()
         }
     }) else {
         return;
@@ -252,6 +254,7 @@ fn watcher_main(
         scheduler: &mut scheduler,
         papertrail_tx: papertrail_tx.as_ref(),
         papertrail_interval,
+        live_oracle_retry_interval: LIVE_ORACLE_RETRY_INTERVAL,
         stop,
         fleet_trigger: &mut fire_fleet_trigger,
     }
@@ -348,6 +351,8 @@ pub(crate) struct EventLoop<'a, W: notify::Watcher> {
     /// `None` disables the papertrail trigger (no tracker bindings, or no worker thread).
     pub(crate) papertrail_tx: Option<&'a Sender<AutosyncRequest>>,
     pub(crate) papertrail_interval: Option<Duration>,
+    /// Delay before retrying a live-oracle backlog without waiting for another filesystem event.
+    pub(crate) live_oracle_retry_interval: Duration,
     pub(crate) stop: &'a AtomicBool,
     /// Injected so tests can observe the fleet firing; production wires [`fleet::trigger`].
     pub(crate) fleet_trigger: &'a mut (dyn FnMut(&Path) + Send),
@@ -382,6 +387,7 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
         let mut papertrail_clock =
             PapertrailClock::new(self.papertrail_tx.and(self.papertrail_interval), Instant::now());
         let mut papertrail_scheduler = PapertrailScheduler::new();
+        let mut live_oracle_retry_at: Option<Instant> = None;
         // The overlay scope accumulated while the debounce is armed (#577): every firing event
         // merges its contribution, and the union rides the next dispatched pass. Cleared ONLY on
         // dispatch, like the debounce itself — mid-pass events keep accumulating for the
@@ -422,6 +428,7 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                     fleet_debounce.due_in(now),
                     sweep.due_in(now),
                     papertrail_clock.due_in(now),
+                    live_oracle_retry_at.map(|at| at.saturating_duration_since(now)),
                 ]
                 .into_iter()
                 .flatten()
@@ -490,9 +497,11 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                     }
                 },
                 Ok(LoopMsg::Fs(Err(_))) => {},
-                Ok(LoopMsg::PassDone) => {
+                Ok(LoopMsg::PassDone { live_oracle_retry }) => {
                     self.scheduler.on_done();
                     let done_at = Instant::now();
+                    live_oracle_retry_at =
+                        live_oracle_retry.then(|| done_at + self.live_oracle_retry_interval);
                     sweep.on_pass_done(done_at);
                     // The cooldown counts from pass COMPLETION (#823) — the armed debounce below
                     // is typically long-elapsed by now, and without this the next iteration
@@ -541,10 +550,14 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                 }
             }
             let periodic_due = sweep.due(now);
+            let live_oracle_retry_due = live_oracle_retry_at.is_some_and(|at| now >= at);
             // The cooldown (#823) holds back only the DEBOUNCE-driven dispatch; a due periodic
             // sweep dispatches regardless — the missed-event backstop is never starved by the
             // cooldown.
-            if periodic_due || (debounce.should_fire(now) && cooldown.ready(now)) {
+            if periodic_due
+                || live_oracle_retry_due
+                || (debounce.should_fire(now) && cooldown.ready(now))
+            {
                 // The periodic sweep is the missed-event backstop, so it refreshes every overlay;
                 // an event-driven pass carries the roots accumulated above (#577). When both are
                 // due at once, `All` is the superset — and because the sweep clock counts from
@@ -564,6 +577,9 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                         sweep.on_dispatch(matches!(overlay_scope, OverlayScope::All));
                     }
                     let _ = self.pass_tx.send(request);
+                    // Every pass retries the resident backlog. Its completion re-arms this only
+                    // when unfinished work remains.
+                    live_oracle_retry_at = None;
                     // Reset ONLY on dispatch: while a pass is in flight the armed debounce (and
                     // the scope accumulated with it) is the record that a follow-up is owed, and
                     // it fires as soon as `PassDone` lands.

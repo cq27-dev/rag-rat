@@ -11,7 +11,7 @@
 //! Everything here is best-effort: a missing `rust-analyzer`, a failed spawn, a warming server,
 //! or a dead server mid-pass never fails the maintenance pass — the worklist rides to the next
 //! pass via the backlog, and an aborted session is dropped so a later pass respawns. Bounded
-//! respawn backoff and idle scheduling independent of maintenance passes remain in #535.
+//! respawn backoff remains in #535.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -34,6 +34,11 @@ pub(crate) struct LiveOracleTail {
 impl LiveOracleTail {
     pub(crate) fn new() -> Self {
         Self { session: None, backlog: Vec::new() }
+    }
+
+    /// Whether the watcher must schedule another pass even if no filesystem event arrives.
+    pub(crate) fn retry_needed(&self) -> bool {
+        !self.backlog.is_empty()
     }
 
     /// One pass's live stage: the idle-shutdown sweep, then (when enabled and there is work)

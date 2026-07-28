@@ -523,6 +523,7 @@ fn the_event_loop_drain_persists_a_placement_failure_while_running() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
+        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2683,7 +2684,10 @@ fn pass_worker_runs_requests_in_order_and_reports_completion() {
     let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
     let worker = spawn_pass_worker(pass_rx, done_tx, {
         let ran = Arc::clone(&ran);
-        move |request: &PassRequest| ran.lock().unwrap().push(request.clone())
+        move |request: &PassRequest| {
+            ran.lock().unwrap().push(request.clone());
+            false
+        }
     })
     .expect("worker thread spawns");
     pass_tx.send(PassRequest::StartupCatchup).unwrap();
@@ -2692,7 +2696,7 @@ fn pass_worker_runs_requests_in_order_and_reports_completion() {
         .unwrap();
     for _ in 0..2 {
         match done_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(LoopMsg::PassDone) => {},
+            Ok(LoopMsg::PassDone { live_oracle_retry: false }) => {},
             other => panic!("expected PassDone, got {other:?}"),
         }
     }
@@ -2753,6 +2757,7 @@ fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
+        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2788,7 +2793,7 @@ fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
         );
 
         // Completing the pass dispatches the coalesced follow-up.
-        tx.send(LoopMsg::PassDone).unwrap();
+        tx.send(LoopMsg::PassDone { live_oracle_retry: false }).unwrap();
         assert_eq!(
             pass_rx.recv_timeout(Duration::from_secs(5)),
             Ok(PassRequest::Maintenance {
@@ -2849,6 +2854,7 @@ fn events_during_a_pass_do_not_redispatch_until_the_cooldown_elapses() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
+        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2872,7 +2878,7 @@ fn events_during_a_pass_do_not_redispatch_until_the_cooldown_elapses() {
         // debounce is already past due and the loop's own PassDone iteration is where the
         // back-to-back redispatch used to happen.
         std::thread::sleep(Duration::from_millis(100));
-        tx.send(LoopMsg::PassDone).unwrap();
+        tx.send(LoopMsg::PassDone { live_oracle_retry: false }).unwrap();
 
         // The pre-#823 behavior was an immediate redispatch here. The follow-up must instead
         // wait out the cooldown (2 s; the 700 ms probe leaves ample CI-jitter margin)...
@@ -2944,6 +2950,7 @@ fn a_due_periodic_sweep_overrides_the_pass_cooldown() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
+        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -2955,7 +2962,7 @@ fn a_due_periodic_sweep_overrides_the_pass_cooldown() {
             pass_rx.recv_timeout(Duration::from_secs(5)),
             Ok(PassRequest::Maintenance { run_gc: false, overlay_scope: OverlayScope::All }),
         );
-        tx.send(LoopMsg::PassDone).unwrap();
+        tx.send(LoopMsg::PassDone { live_oracle_retry: false }).unwrap();
 
         // The next sweep falls due one second later — deep inside the cooldown — and must
         // dispatch anyway: the backstop bypasses the cooldown.
@@ -3757,6 +3764,7 @@ fn event_loop_ignores_fs_errors_and_exits_on_disconnect() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
+        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -3810,6 +3818,7 @@ fn periodic_sweep_dispatches_all_overlay_scope() {
         scheduler: &mut scheduler,
         papertrail_tx: None,
         papertrail_interval: None,
+        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -3829,6 +3838,68 @@ fn periodic_sweep_dispatches_all_overlay_scope() {
         drop(tx);
         drop(pass_tx);
         let _ = handle.join();
+    });
+}
+
+#[test]
+fn live_oracle_backlog_retries_without_events_or_periodic_sweeps() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    config.watch.periodic_sweep_secs = 0;
+    config.watch.pass_cooldown_secs = 3_600;
+    let target_dirs = config.target_directories();
+    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+    let mut linked_worktrees = LinkedWorktreeWatches::default();
+    let mut notify_watcher =
+        <RecordingWatcher as notify::Watcher>::new(|_| {}, notify::Config::default()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (pass_tx, pass_rx) = std::sync::mpsc::channel();
+    let pass_tx_for_loop = pass_tx.clone();
+    let mut scheduler = PassScheduler::new();
+    let _startup = scheduler.dispatch_startup();
+    let stop = AtomicBool::new(false);
+    let mut fleet_trigger = |_: &Path| {};
+
+    let counters = placement_counters();
+    let event_loop = EventLoop {
+        config: &config,
+        target_dirs: &target_dirs,
+        fleet_bin: None,
+        notify_watcher: &mut notify_watcher,
+        counters: &counters,
+        ignore: &mut ignore,
+        linked_worktrees: &mut linked_worktrees,
+        worktree_registry: None,
+        rx,
+        pass_tx: &pass_tx_for_loop,
+        scheduler: &mut scheduler,
+        papertrail_tx: None,
+        papertrail_interval: None,
+        live_oracle_retry_interval: Duration::from_millis(25),
+        stop: &stop,
+        fleet_trigger: &mut fleet_trigger,
+    };
+
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(move || event_loop.run());
+        tx.send(LoopMsg::PassDone { live_oracle_retry: true }).unwrap();
+        assert_eq!(
+            pass_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(PassRequest::Maintenance {
+                run_gc: false,
+                overlay_scope: OverlayScope::Linked(BTreeSet::new())
+            }),
+            "the resident backlog must provide its own retry source",
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = tx.send(LoopMsg::Wake);
+        drop(tx);
+        drop(pass_tx);
+        assert!(!handle.join().unwrap());
     });
 }
 
@@ -3964,6 +4035,7 @@ fn idle_watcher_enqueues_papertrail_evaluation_without_filesystem_activity() {
         scheduler: &mut scheduler,
         papertrail_tx: Some(&papertrail_tx),
         papertrail_interval: Some(Duration::from_millis(50)),
+        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
@@ -4021,6 +4093,7 @@ fn papertrail_deadline_fires_during_an_in_flight_pass_and_ticks_coalesce() {
         scheduler: &mut scheduler,
         papertrail_tx: Some(&papertrail_tx),
         papertrail_interval: Some(Duration::from_millis(100)),
+        live_oracle_retry_interval: Duration::from_secs(30),
         stop: &stop,
         fleet_trigger: &mut fleet_trigger,
     };
