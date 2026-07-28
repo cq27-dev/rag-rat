@@ -483,6 +483,70 @@ fn clear_row_clock(
     Ok(())
 }
 
+/// Every live row's current whole-row-LWW winner for `table`/`repo_id` as `(row_pk, device hex)` —
+/// the live-row half of the re-adoption scan (#997). The `device_fingerprint` is stored as the
+/// lowercase hex the applier wrote (`OpMeta::device.to_string()`); the caller parses it back with
+/// `FromStr`.
+pub(crate) fn row_clock_winners(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    table: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    winners_of("sync_row_clocks", tx, repo_id, table)
+}
+
+/// Every tombstone's current whole-row-LWW winner for `table`/`repo_id` as `(row_pk, device hex)` —
+/// the deletion half of the re-adoption scan (#997). A delete authored by a since-removed writer
+/// lives ONLY here (`apply_remove` cleared the row clock), so scanning row clocks alone would miss
+/// it and a fresh replica could resurrect the row from an older upsert by a current writer.
+pub(crate) fn tombstone_winners(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    table: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    winners_of("sync_row_tombstones", tx, repo_id, table)
+}
+
+fn winners_of(
+    lww_table: &str,
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    table: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    // `lww_table` is one of two `&'static` names chosen by the caller, never untrusted input.
+    let mut stmt = tx.prepare(&format!(
+        "SELECT row_pk, device_fingerprint FROM {lww_table}
+         WHERE repo_id = ?1 AND table_name = ?2"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![repo_id, table], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Build the re-adoption `Upsert` for a live orphaned row: its current pk + full synced
+/// after-image, so re-authoring it under a current key replays the exact current state. `None` if
+/// the row has since vanished (defensive — a live clock implies a live row).
+pub(crate) fn readopt_upsert(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    row_pk: &str,
+) -> anyhow::Result<Option<RowOp>> {
+    let pk = row_op::row_pk_values(row_pk)?;
+    let Some(cells) = read_synced_cells(tx, spec, &pk)? else {
+        return Ok(None);
+    };
+    Ok(Some(RowOp::Upsert { table: spec.name.to_string(), pk, cells }))
+}
+
+/// Build the re-adoption `Remove` for an orphaned tombstone: just the row pk (a delete carries no
+/// after-image).
+pub(crate) fn readopt_remove(spec: &TableSpec, row_pk: &str) -> anyhow::Result<RowOp> {
+    Ok(RowOp::Remove { table: spec.name.to_string(), pk: row_op::row_pk_values(row_pk)? })
+}
+
 /// The row's recorded anti-echo hash, or `None` if the producer has not published it yet. Read by
 /// [`super::produce`].
 pub(crate) fn published_hash(
@@ -517,6 +581,7 @@ pub(crate) fn record_published(
     Ok(())
 }
 
+/// Delete a row's anti-echo record (a delete un-publishes the row); called by [`apply_remove`].
 fn clear_published(
     tx: &Transaction<'_>,
     repo_id: &str,

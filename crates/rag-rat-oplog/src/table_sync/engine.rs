@@ -10,15 +10,19 @@
 //! This is the transport-independent seam the milestone's loopback test drives; the iroh milestone
 //! wraps a per-scope `SyncStore` around exactly these two calls.
 
+use std::collections::{HashMap, HashSet};
+
 use rusqlite::Transaction;
 
 use super::apply::{self, ApplyOutcome};
 use super::produce;
 use super::registry::TableSpec;
+use super::row_op::RowOp;
 use super::scope_stream::scope_stream_id;
 use super::store::{self, AcceptOutcome};
+use crate::account::device_is_effective_writer;
 use crate::device::DevicePublic;
-use crate::op::OpMeta;
+use crate::op::{DeviceFingerprint, OpMeta};
 use crate::{AccountId, LocalDevice};
 
 /// The stable dependencies of a sync pass: the project being synced, the owning account (which the
@@ -52,51 +56,148 @@ pub(crate) enum IngestOutcome {
 
 /// Author the row ops that bring peers up to this device's state, returning each as signed wire
 /// bytes. Empty when everything is already published.
+///
+/// Re-adopts orphaned rows first ([`readopt_orphaned_rows`]): a row or deletion whose whole-row-LWW
+/// winner is a since-removed device is otherwise never re-authored, so a replica enrolled after
+/// that device left never converges on it (#997). Folding re-adoption into the producer is
+/// deliberate — it makes re-authoring an intrinsic part of "bring peers up to date," reachable
+/// wherever the producer is driven, rather than a separate step a future driver must remember.
 pub(crate) fn produce_and_author(
     tx: &Transaction<'_>,
     ctx: &SyncCtx<'_>,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
-    let mut authored = Vec::new();
+    let mut authored = readopt_orphaned_rows(tx, ctx)?;
     for spec in ctx.registry {
-        let stream = scope_stream_id(ctx.repo_id, ctx.account_id, spec.scope_id);
         for op in produce::produce_row_ops(tx, spec, ctx.repo_id)? {
-            let signed = store::author_row_entry(tx, stream, ctx.device.secret(), &op, ctx.now_ms)?;
-            let meta =
-                OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
-            // Self-apply so this authorship enters the LWW clock and published-row record: a later
-            // remote op competes at this lamport, and the producer never re-emits it (no
-            // self-echo). A locally-produced op MUST self-apply cleanly — the registry lint rejects
-            // every shape that would quarantine (nullable pk, cross-row constraint, and the
-            // producer reads well-typed values). If it quarantines anyway, the
-            // published hash is NOT recorded, so the next pass would re-author the same
-            // row forever (unbounded signed-log growth) and peers would quarantine each
-            // copy: surface it and do NOT transmit the junk op.
-            match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
-                apply::ApplyOutcome::Applied => authored.push(signed.signed_bytes),
-                apply::ApplyOutcome::Quarantined(reason) => {
-                    // A locally-produced op self-quarantining is UNREACHABLE for a registered
-                    // table: the lint rejects every shape that would quarantine
-                    // (nullable pk, cross-row constraint,
-                    // ValueType/physical-type mismatch), and the producer reads well-typed
-                    // values. If it somehow happens, FAIL the pass — `author_row_entry` has already
-                    // inserted this entry in the caller's txn, so bailing rolls it back rather than
-                    // leaving it stored-but-unpublished and re-authored (re-signed) every pass
-                    // (unbounded log growth). Assert first, so a test catches the lint/producer
-                    // gap.
-                    debug_assert!(
-                        false,
-                        "table-sync: a locally-produced op self-quarantined on `{}`: {reason}",
-                        spec.name
-                    );
-                    anyhow::bail!(
-                        "table-sync: a locally-produced op self-quarantined on `{}`: {reason}",
-                        spec.name
-                    );
-                },
-            }
+            authored.push(author_and_self_apply(tx, ctx, spec, &op)?);
         }
     }
     Ok(authored)
+}
+
+/// Author `op` on `spec`'s scope stream under the local device key, self-apply it, and return the
+/// signed wire bytes. Self-applying is what enters this authorship into the LWW clock and
+/// published-row record, so a later remote op competes at this lamport and the producer never
+/// re-emits it (no self-echo).
+///
+/// A locally-produced op MUST self-apply cleanly: the registry lint rejects every shape that would
+/// quarantine (nullable pk, cross-row constraint, ValueType/physical-type mismatch), and the
+/// producer and re-adoption builders read well-typed values. If it quarantines anyway, FAIL the
+/// pass — `author_row_entry` has already inserted this entry in the caller's txn, so bailing rolls
+/// it back rather than leaving it stored-but-unpublished and re-authored (re-signed) every pass
+/// (unbounded log growth). Assert first, so a test catches the lint/producer gap.
+fn author_and_self_apply(
+    tx: &Transaction<'_>,
+    ctx: &SyncCtx<'_>,
+    spec: &TableSpec,
+    op: &RowOp,
+) -> anyhow::Result<Vec<u8>> {
+    let stream = scope_stream_id(ctx.repo_id, ctx.account_id, spec.scope_id);
+    let signed = store::author_row_entry(tx, stream, ctx.device.secret(), op, ctx.now_ms)?;
+    let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
+    match apply::apply_row_op(tx, spec, ctx.repo_id, op, meta)? {
+        ApplyOutcome::Applied => Ok(signed.signed_bytes),
+        ApplyOutcome::Quarantined(reason) => {
+            debug_assert!(
+                false,
+                "table-sync: a locally-produced op self-quarantined on `{}`: {reason}",
+                spec.name
+            );
+            anyhow::bail!(
+                "table-sync: a locally-produced op self-quarantined on `{}`: {reason}",
+                spec.name
+            )
+        },
+    }
+}
+
+/// Re-adopt rows and deletions orphaned by a removed writer (#997), returning the signed wire bytes
+/// of each re-authored entry.
+///
+/// The #935 ingest gate accepts an entry only from a *currently* roster-effective writer, so state
+/// whose whole-row-LWW winner is a since-removed device is dropped by any newly-enrolled replica
+/// and re-authored by nobody — it never converges. Two kinds of orphan exist and both are
+/// re-authored under THIS device's key at a fresh `next_stream_lamport`, which is strictly above
+/// the orphan's clock so it wins LWW everywhere and establishes the state on a fresh replica:
+///
+/// - **Live rows** (`sync_row_clocks`): re-author the row's current full after-image as an
+///   `Upsert`.
+/// - **Deletions** (`sync_row_tombstones`): re-author a `Remove`. A delete authored by a removed
+///   writer lives only in the tombstone table (`apply_remove` cleared the row clock), so without
+///   this a fresh replica that accepts an older `Upsert` from a current writer would resurrect the
+///   row. A tombstone whose row also has a live clock is skipped — a concurrent upsert already
+///   resurrected it, and the live-row pass owns that row.
+///
+/// No wire/format change, and no overwrite of newer legitimate state (an orphan has no newer author
+/// by definition). No-op unless the local device is itself a roster-effective writer: a removed
+/// device's re-authorship would be dropped by every peer, so it must not emit futile, log-growing
+/// entries.
+///
+/// Called by [`produce_and_author`] at the start of every producer pass (so it runs in the same
+/// transaction, before any authoring). Exposed on its own so its detection logic is unit-testable
+/// in isolation.
+pub(crate) fn readopt_orphaned_rows(
+    tx: &Transaction<'_>,
+    ctx: &SyncCtx<'_>,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let local_fp = ctx.device.fingerprint();
+    if !device_is_effective_writer(tx, ctx.account_id, local_fp)? {
+        return Ok(Vec::new());
+    }
+    let local_hex = local_fp.to_string();
+    // One roster probe per distinct winner fingerprint, not per row.
+    let mut effective: HashMap<String, bool> = HashMap::new();
+    let mut authored = Vec::new();
+    for spec in ctx.registry {
+        let clocks = apply::row_clock_winners(tx, ctx.repo_id, spec.name)?;
+        // Rows with a live write clock — the tombstone pass skips these so a re-authored delete
+        // never removes a row a concurrent upsert has since resurrected.
+        let live_pks: HashSet<&str> = clocks.iter().map(|(pk, _)| pk.as_str()).collect();
+
+        for (row_pk, winner_hex) in &clocks {
+            if *winner_hex == local_hex
+                || is_effective(tx, ctx.account_id, winner_hex, &mut effective)?
+            {
+                continue;
+            }
+            if let Some(op) = apply::readopt_upsert(tx, spec, row_pk)? {
+                authored.push(author_and_self_apply(tx, ctx, spec, &op)?);
+            }
+        }
+
+        for (row_pk, winner_hex) in apply::tombstone_winners(tx, ctx.repo_id, spec.name)? {
+            if live_pks.contains(row_pk.as_str())
+                || winner_hex == local_hex
+                || is_effective(tx, ctx.account_id, &winner_hex, &mut effective)?
+            {
+                continue;
+            }
+            let op = apply::readopt_remove(spec, &row_pk)?;
+            authored.push(author_and_self_apply(tx, ctx, spec, &op)?);
+        }
+    }
+    Ok(authored)
+}
+
+/// Whether `winner_hex` is a roster-effective writer of `account_id`, memoized across rows within a
+/// re-adoption pass. A stored winner is always the canonical lowercase hex the applier wrote; an
+/// unparseable value cannot match a roster row, so it is treated as not-effective — re-adopting is
+/// safe, since the orphan's current state is re-authored unchanged under the local key.
+fn is_effective(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    winner_hex: &str,
+    cache: &mut HashMap<String, bool>,
+) -> anyhow::Result<bool> {
+    if let Some(&known) = cache.get(winner_hex) {
+        return Ok(known);
+    }
+    let known = match winner_hex.parse::<DeviceFingerprint>() {
+        Ok(fp) => device_is_effective_writer(tx, account_id, fp)?,
+        Err(_) => false,
+    };
+    cache.insert(winner_hex.to_string(), known);
+    Ok(known)
 }
 
 /// Verify, store, and apply one received entry for `scope_id`'s stream, signed by `pubkey`. A scope
@@ -246,6 +347,204 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// Close `fp`'s effective roster row — the device is removed from the account.
+    fn remove_writer(
+        conn: &rusqlite::Connection,
+        account: AccountId,
+        fp: crate::op::DeviceFingerprint,
+    ) {
+        let closed = conn
+            .execute(
+                "UPDATE account_roster_history SET closed_at = 1
+                 WHERE account_id = ?1 AND device_fingerprint = ?2 AND closed_at IS NULL",
+                rusqlite::params![account.to_bytes().as_slice(), fp.to_bytes().as_slice()],
+            )
+            .unwrap();
+        assert_eq!(closed, 1, "the device was on the roster to remove");
+    }
+
+    const ACCT: [u8; 32] = [42; 32];
+
+    fn account() -> AccountId {
+        AccountId::from_bytes(ACCT)
+    }
+
+    fn ctx(device: &LocalDevice) -> SyncCtx<'_> {
+        SyncCtx { repo_id: "repo", account_id: account(), device, registry: REGISTRY, now_ms: 0 }
+    }
+
+    /// Ingest entries WITHOUT the roster side effect `Device::ingest_all` bakes in — the caller
+    /// sets up the roster explicitly so it can model a since-removed author.
+    fn ingest_from(
+        dev: &mut Device,
+        entries: &[Vec<u8>],
+        from: &DevicePublic,
+    ) -> Vec<IngestOutcome> {
+        let tx = dev.conn.transaction().unwrap();
+        let ctx = ctx(&dev.local);
+        let out = entries
+            .iter()
+            .map(|b| ingest(&tx, &ctx, "demo/1", b, from).unwrap())
+            .collect::<Vec<_>>();
+        tx.commit().unwrap();
+        out
+    }
+
+    /// Run one re-adoption pass and return how many entries it re-authored.
+    fn readopt(dev: &mut Device) -> usize {
+        let tx = dev.conn.transaction().unwrap();
+        let n = readopt_orphaned_rows(&tx, &ctx(&dev.local)).unwrap().len();
+        tx.commit().unwrap();
+        n
+    }
+
+    #[test]
+    fn a_removed_writers_row_reaches_a_fresh_replica_via_re_adoption() {
+        let mut a = Device::new(); // the original author, later removed from the roster
+        let mut c = Device::new(); // a current writer that already holds A's row
+        let mut d = Device::new(); // a replica enrolled only AFTER A had left
+
+        // A authors r1.
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'distilled')", []).unwrap();
+        let ea = a.produce();
+        assert_eq!(ea.len(), 1);
+
+        // C ingested A's row while A was an effective writer; A is then removed. C is itself a
+        // current writer.
+        enroll_writer(&c.conn, account(), a.pubkey().fingerprint());
+        enroll_writer(&c.conn, account(), c.local.fingerprint());
+        assert_eq!(ingest_from(&mut c, &ea, &a.pubkey()), vec![IngestOutcome::Applied]);
+        assert_eq!(c.title().as_deref(), Some("distilled"), "C holds A's row");
+        remove_writer(&c.conn, account(), a.pubkey().fingerprint());
+
+        // D knows C as a writer but never knew A. It has no organic path to r1: A's own entry is
+        // refused (A is off D's roster) — the divergence #935 leaves.
+        enroll_writer(&d.conn, account(), c.local.fingerprint());
+        assert!(
+            ingest_from(&mut d, &ea, &a.pubkey()).iter().all(|o| *o == IngestOutcome::Unauthorized),
+            "D refuses A's original entry",
+        );
+        assert_eq!(d.title(), None, "the orphaned row has not reached the fresh replica");
+
+        // C's next producer pass re-adopts the orphaned row (folded into `produce_and_author`) and
+        // re-authors it under C's current key.
+        let re = c.produce();
+        assert_eq!(re.len(), 1, "the orphaned row is re-authored");
+
+        // D accepts C's re-authored entry (C is a current writer) and converges.
+        assert_eq!(ingest_from(&mut d, &re, &c.pubkey()), vec![IngestOutcome::Applied]);
+        assert_eq!(
+            d.title().as_deref(),
+            Some("distilled"),
+            "the re-adopted row reaches the fresh replica",
+        );
+        // Idempotent: with the row now authored under C, there is nothing left to re-adopt.
+        assert!(c.produce().is_empty(), "a re-adopted row is not re-authored again");
+    }
+
+    #[test]
+    fn readopt_targets_only_rows_whose_winner_left_the_roster() {
+        let mut c = Device::new();
+        let mut keep = Device::new(); // stays on the roster
+        let mut gone = Device::new(); // removed after authoring
+
+        keep.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r_keep', 'k')", []).unwrap();
+        gone.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r_gone', 'g')", []).unwrap();
+        let ek = keep.produce();
+        let eg = gone.produce();
+
+        enroll_writer(&c.conn, account(), keep.pubkey().fingerprint());
+        enroll_writer(&c.conn, account(), gone.pubkey().fingerprint());
+        enroll_writer(&c.conn, account(), c.local.fingerprint());
+        ingest_from(&mut c, &ek, &keep.pubkey());
+        ingest_from(&mut c, &eg, &gone.pubkey());
+        remove_writer(&c.conn, account(), gone.pubkey().fingerprint());
+
+        // Only the removed author's row is orphaned — the current writer's row is left alone.
+        assert_eq!(readopt(&mut c), 1, "exactly one row (the orphan) is re-adopted, not both");
+        // The re-authored entry now owns the orphan and `r_keep` stays published under `keep`, so a
+        // following producer pass has nothing to add.
+        assert!(c.produce().is_empty(), "no further re-authoring after the orphan is re-adopted");
+    }
+
+    #[test]
+    fn a_removed_writers_deletion_is_readopted_so_a_fresh_replica_does_not_resurrect_the_row() {
+        let mut b = Device::new(); // creator + re-adopter, a current writer
+        let mut a = Device::new(); // authors the DELETE, later removed
+        let mut d = Device::new(); // a replica that received the create but not the delete
+
+        // B creates r1; A ingests it (B is a writer on A) and then deletes it.
+        b.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'v')", []).unwrap();
+        let b_up = b.produce();
+        enroll_writer(&a.conn, account(), b.pubkey().fingerprint());
+        assert_eq!(ingest_from(&mut a, &b_up, &b.pubkey()), vec![IngestOutcome::Applied]);
+        a.conn.execute("DELETE FROM t_demo WHERE id = 'r1'", []).unwrap();
+        let a_rm = a.produce();
+        assert_eq!(a_rm.len(), 1, "A authors the deletion");
+
+        // B ingested A's delete while A was a writer; A is then removed. On B, r1 is deleted under
+        // a tombstone whose winner is the now-removed A.
+        enroll_writer(&b.conn, account(), a.pubkey().fingerprint());
+        enroll_writer(&b.conn, account(), b.local.fingerprint());
+        assert_eq!(ingest_from(&mut b, &a_rm, &a.pubkey()), vec![IngestOutcome::Applied]);
+        assert_eq!(b.title(), None, "r1 is deleted on B");
+        remove_writer(&b.conn, account(), a.pubkey().fingerprint());
+
+        // D knows B as a writer. It accepts B's create but refuses A's delete (A is off D's
+        // roster), so WITHOUT re-adoption the deleted row resurrects on the fresh replica.
+        enroll_writer(&d.conn, account(), b.local.fingerprint());
+        assert_eq!(ingest_from(&mut d, &b_up, &b.pubkey()), vec![IngestOutcome::Applied]);
+        assert!(
+            ingest_from(&mut d, &a_rm, &a.pubkey())
+                .iter()
+                .all(|o| *o == IngestOutcome::Unauthorized),
+            "D refuses A's deletion",
+        );
+        assert_eq!(
+            d.title().as_deref(),
+            Some("v"),
+            "the row is (wrongly) live on the fresh replica"
+        );
+
+        // B's producer re-adopts the orphaned tombstone and re-authors the deletion under its key.
+        let re = b.produce();
+        assert_eq!(re.len(), 1, "the orphaned deletion is re-authored");
+
+        // D accepts B's re-authored delete; the resurrected row is removed again — convergence.
+        assert_eq!(ingest_from(&mut d, &re, &b.pubkey()), vec![IngestOutcome::Applied]);
+        assert_eq!(d.title(), None, "the re-adopted deletion removes the resurrected row");
+    }
+
+    #[test]
+    fn readopt_leaves_a_current_writers_row_untouched() {
+        let mut c = Device::new();
+        let mut peer = Device::new();
+        peer.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'v')", []).unwrap();
+        let e = peer.produce();
+        enroll_writer(&c.conn, account(), peer.pubkey().fingerprint());
+        enroll_writer(&c.conn, account(), c.local.fingerprint());
+        ingest_from(&mut c, &e, &peer.pubkey());
+        // `peer` stays on the roster, so its row is not orphaned.
+        assert_eq!(readopt(&mut c), 0, "a row owned by a current writer is not re-adopted");
+        assert!(c.produce().is_empty(), "and nothing is re-authored");
+    }
+
+    #[test]
+    fn readopt_does_nothing_when_the_local_device_is_not_a_writer() {
+        let mut c = Device::new();
+        let mut a = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'v')", []).unwrap();
+        let e = a.produce();
+        // A is enrolled (so C accepts its entry); C is NOT a writer.
+        enroll_writer(&c.conn, account(), a.pubkey().fingerprint());
+        ingest_from(&mut c, &e, &a.pubkey());
+        remove_writer(&c.conn, account(), a.pubkey().fingerprint()); // r1 is now orphaned...
+        // ...but a removed/non-writer local device's re-authorship would be dropped by every peer,
+        // so re-adoption is a no-op rather than futile log growth.
+        assert_eq!(readopt(&mut c), 0, "a non-writer local device re-adopts nothing");
+        assert!(c.produce().is_empty(), "and its producer stays silent for the orphaned row");
     }
 
     #[test]
