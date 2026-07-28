@@ -401,12 +401,20 @@ pub(crate) fn target_ancestor_dirs(root: &Path, target_dirs: &[PathBuf]) -> Vec<
 /// Whether the (`config.root`-relative) `rel` path is floored: any component is a floor directory
 /// name, or any run of consecutive components matches a [`FLOOR_PATHS`] entry.
 fn rel_contains_floor_dir(rel: &Path) -> bool {
-    let components: Vec<&str> =
-        rel.components().filter_map(|component| component.as_os_str().to_str()).collect();
-    if components.iter().any(|name| is_floor_dir(name)) {
+    // A component that is not valid UTF-8 can match no floor entry, but it must still BREAK a
+    // floor path's run of consecutive components — dropping it would splice its neighbours
+    // together and read `.cache/<non-utf8>/clangd` as `.cache/clangd`, unconditionally excluding a
+    // tracked tree that merely happens to sit between them.
+    let components: Vec<Option<&str>> =
+        rel.components().map(|component| component.as_os_str().to_str()).collect();
+    if components.iter().flatten().any(|name| is_floor_dir(name)) {
         return true;
     }
-    FLOOR_PATHS.iter().any(|floor| components.windows(floor.len()).any(|window| window == *floor))
+    FLOOR_PATHS.iter().any(|floor| {
+        components
+            .windows(floor.len())
+            .any(|window| window.iter().zip(*floor).all(|(got, want)| *got == Some(*want)))
+    })
 }
 
 /// The gitignore base for `root` given an enclosing worktree root `wt`, or `None` when `wt` is not
@@ -463,6 +471,39 @@ mod tests {
         assert!(m.is_ignored(&tmp.join("node_modules/pkg/index.ts"), false));
         assert!(m.is_ignored(&tmp.join(".build/checkouts/Dep/Sources/Dep.swift"), false));
         assert!(!m.is_ignored(&tmp.join("src/lib.rs"), false));
+    }
+
+    #[test]
+    fn the_clangd_index_floor_is_relative_to_each_checkouts_own_root() {
+        // A linked worktree shares the database with the main checkout, and the live oracle runs
+        // per checkout — each spawning its own clangd, each writing its own `.cache/clangd`. The
+        // floor is applied to the path relative to THAT checkout's root, so a linked worktree's
+        // index is floored on its own account and the main checkout's tree is untouched by it.
+        let (_scratch, main) = tempdir();
+        git_init(&main);
+        write(&main.join(".gitignore"), "ignored-by-git/\n");
+        write(&main.join("src/lib.c"), "int a(void){return 0;}\n");
+        let linked = main.join("wt");
+        write(&linked.join("src/lib.c"), "int b(void){return 0;}\n");
+
+        // Compiled against the LINKED checkout's root, with the main checkout as the gitignore
+        // base above it — the ancestor-chain shape a linked worktree actually has.
+        let m = IgnoreMatcher::compile(&linked, &[PathBuf::from(".")]);
+        assert!(m.is_ignored(&linked.join(".cache/clangd/index/a.idx"), false));
+        assert!(!m.is_ignored(&linked.join("src/lib.c"), false), "its own sources still index");
+        assert!(
+            !m.is_ignored(&linked.join(".cache/generated/api.c"), false),
+            "and the narrow floor still does not swallow the rest of a tracked .cache",
+        );
+        // The main checkout's matcher floors its OWN index, and neither disturbs the other's
+        // sources — the sibling-preservation property this topology exists to check.
+        let main_matcher = IgnoreMatcher::compile(&main, &[PathBuf::from(".")]);
+        assert!(main_matcher.is_ignored(&main.join(".cache/clangd/index/a.idx"), false));
+        assert!(!main_matcher.is_ignored(&main.join("src/lib.c"), false));
+        assert!(
+            main_matcher.is_ignored(&linked.join(".cache/clangd/index/a.idx"), false),
+            "a nested checkout's clangd index is floored from either side",
+        );
     }
 
     #[test]

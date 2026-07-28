@@ -325,7 +325,8 @@ impl ToolManifest {
             // search the warm-up uses, so the gate and the warm-up cannot disagree.
             OracleTool::ClangdLsp | OracleTool::TsLsp => {
                 let backend = super::backend::LiveBackend::for_tool(self.tool)?;
-                (!backend.checkout_can_signal_readiness(root)).then(|| {
+                let layout = backend.resolve_layout(root);
+                (!backend.checkout_can_signal_readiness(root, &layout)).then(|| {
                     format!(
                         "the live {} oracle found no {} project under {} — {} only reports \
                          project-load progress for a real project, and that signal is what tells \
@@ -565,7 +566,19 @@ mod tests {
         assert!(blocked.contains("compile_commands.json"), "{blocked}");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+        // A syntactically valid but EMPTY database describes no project: measured, clangd emits
+        // no readiness cycle for one, so accepting it would report the backend runnable while it
+        // could only ever sit in `Warming`.
         std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
+        assert!(
+            manifest.prerequisite_blocked(&dir).is_some(),
+            "an empty compilation database is not a warmable project",
+        );
+        std::fs::write(
+            dir.join("compile_commands.json"),
+            r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c"}]"#,
+        )
+        .unwrap();
         assert!(manifest.prerequisite_blocked(&dir).is_none());
     }
 

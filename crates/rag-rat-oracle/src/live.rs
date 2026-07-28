@@ -46,6 +46,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
+use std::time::Instant;
 
 use path_slash::PathExt as _;
 use rag_rat_base::hash::hex_sha256;
@@ -53,7 +54,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 use url::Url;
 
-use super::backend::LiveBackend;
+use super::backend::{self, LiveBackend, ProjectLayout};
 use super::lsp::client::LspClient;
 use super::lsp::position::LineIndex;
 use super::store::{self, EdgeOracleRow};
@@ -68,6 +69,11 @@ pub struct LiveOracleSession {
     client: LspClient,
     tool_version: String,
     root_uri: String,
+    /// The checkout's project layout, and when it was resolved. Every layout question the pass
+    /// asks reads this rather than re-walking the checkout — the pass holds the repository write
+    /// lock while it runs — and it is re-resolved once it ages out (`LAYOUT_MAX_AGE`).
+    layout: ProjectLayout,
+    layout_resolved_at: Instant,
 }
 
 /// Why a live session could not be established. The distinction is operational, not cosmetic: a
@@ -96,10 +102,10 @@ impl LiveOracleSession {
             return Err(LiveSpawnBlocked::Unavailable);
         };
         let manifest = ToolManifest::for_tool(tool);
-        // The prerequisite gate is not cosmetic for every backend: the live TypeScript client
-        // needs a tsconfig project because that is what makes the server emit the project-load
-        // signal it has no other way to report. Spawning without it would resolve definitions
-        // during a warm-up window that answers WRONG rather than null.
+        // ONE layout scan per spawn, reused by the gate, the argv, and every later pass. The
+        // prerequisite gate is not cosmetic for these backends: a checkout with no project emits
+        // no readiness signal at all, so the session could only ever sit in `Warming`.
+        let layout = backend.resolve_layout(checkout_root);
         if let Some(hint) = manifest.prerequisite_blocked(checkout_root) {
             return Err(LiveSpawnBlocked::Prerequisite(hint));
         }
@@ -111,13 +117,20 @@ impl LiveOracleSession {
         };
         let mut client = LspClient::spawn(
             manifest.program,
-            &backend.spawn_args(manifest.live_args, checkout_root),
+            &backend.spawn_args(manifest.live_args, &layout),
             checkout_root,
             backend.readiness,
         )
         .map_err(|_| LiveSpawnBlocked::Unavailable)?;
         client.initialize(&root_uri).map_err(|_| LiveSpawnBlocked::Unavailable)?;
-        Ok(Self { backend, client, tool_version: version, root_uri })
+        Ok(Self {
+            backend,
+            client,
+            tool_version: version,
+            root_uri,
+            layout,
+            layout_resolved_at: Instant::now(),
+        })
     }
 
     /// Test seam: a session over an injected (fake-server) client transport. Runs the
@@ -153,6 +166,8 @@ impl LiveOracleSession {
             client,
             tool_version: tool_version.to_string(),
             root_uri: root_uri.to_string(),
+            layout: ProjectLayout::default(),
+            layout_resolved_at: Instant::now(),
         }
     }
 
@@ -202,10 +217,13 @@ impl LiveOracleSession {
         };
         let opened = worklist
             .iter()
-            .filter(|path| self.backend.open_signals_readiness(checkout_root, path))
+            .filter(|path| self.backend.open_signals_readiness(checkout_root, path, &self.layout))
             .find_map(|path| open_document(&checkout_root.join(path)))
             .or_else(|| {
-                self.backend.warmup_document(checkout_root).as_deref().and_then(open_document)
+                self.backend
+                    .warmup_document(checkout_root, &self.layout)
+                    .as_deref()
+                    .and_then(open_document)
             });
         let Some((language_id, uri, text)) = opened else {
             return;
@@ -217,6 +235,30 @@ impl LiveOracleSession {
 
     fn needs_warmup_open(&self) -> bool {
         self.client.needs_warmup_open()
+    }
+
+    /// Whether this session can configure `path` (repo-relative) well enough to trust its answers.
+    fn can_resolve_path(&self, checkout_root: &Path, path: &str) -> bool {
+        self.backend.session_can_resolve(checkout_root, path, &self.layout)
+    }
+
+    /// Re-resolve the checkout's project layout if the cached one has aged out, and report
+    /// whether the session is still valid for it.
+    ///
+    /// `false` means the checkout now pins a DIFFERENT database (one appeared, moved, or was
+    /// removed). That cannot be corrected in place: the server was spawned with an argv derived
+    /// from the old layout, so the session has to be replaced.
+    fn layout_still_holds(&mut self, checkout_root: &Path) -> bool {
+        if self.layout_resolved_at.elapsed() < backend::LAYOUT_MAX_AGE {
+            return true;
+        }
+        let fresh = self.backend.resolve_layout(checkout_root);
+        self.layout_resolved_at = Instant::now();
+        if !fresh.pins_same_database_as(&self.layout) {
+            return false;
+        }
+        self.layout = fresh;
+        true
     }
 
     /// Test barrier: one synchronous round trip. The transport is FIFO, so a returned response
@@ -267,6 +309,11 @@ pub struct LivePassReport {
     /// Writes skipped because a sibling checkout still owns the same content key + tool version
     /// for different file bytes (the schema cannot represent both because SHA is outside the PK).
     pub skipped_content_collisions: u64,
+    /// Candidates skipped because this session could not configure their file — the backend's
+    /// server would have answered with heuristic flags, which resolves cross-unit calls wrongly
+    /// rather than not at all. Never deferred: only a change to the checkout's project layout can
+    /// make them resolvable.
+    pub skipped_unconfigured: u64,
     /// Definitions skipped as out-of-corpus for live purposes: target outside the checkout root,
     /// in an unindexed file, or mapping to no indexed symbol. Live writes no `resolved-external`
     /// rows (see the module docs).
@@ -315,6 +362,16 @@ pub fn live_oracle_pass(
             report.status = format!("Aborted: {err}");
             return Ok(report);
         },
+    }
+    // A resident session caches its project layout; a database deleted or moved since it spawned
+    // would leave it trusting files the server can no longer configure. End the pass so the
+    // watcher replaces the session — its argv was derived from that layout too, so it cannot be
+    // corrected in place.
+    if !session.layout_still_holds(input.checkout_root) {
+        report.unfinished_paths = input.worklist.to_vec();
+        report.status =
+            "Aborted: the checkout's project layout changed since this session started".to_string();
+        return Ok(report);
     }
     let tool = session.tool();
     // The batch tool whose monikers live copies (rust-analyzer for ra-lsp, scip-typescript for
@@ -395,6 +452,16 @@ pub fn live_oracle_pass(
         let Some(callees) = by_path.get(path.as_str()) else {
             continue;
         };
+        // The session may be unable to CONFIGURE this file even though its language qualifies:
+        // with several compilation databases in a checkout, clangd is pointed at none, and a file
+        // whose database it cannot find on its own gets heuristic flags. Measured, that resolves a
+        // cross-translation-unit call to the callee's HEADER DECLARATION — a wrong verdict, not a
+        // missing one, and the covered-skip budget would never revisit it. Skip rather than
+        // resolve, and do NOT defer: retrying cannot help until the checkout's layout changes.
+        if !session.can_resolve_path(input.checkout_root, path) {
+            report.skipped_unconfigured += callees.len() as u64;
+            continue;
+        }
         // Budget gate: nothing left → every candidate-bearing path from here rides the backlog.
         let remaining = input.max_requests.saturating_sub(report.requests_used) as usize;
         if remaining == 0 {

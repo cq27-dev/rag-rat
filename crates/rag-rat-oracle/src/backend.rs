@@ -7,7 +7,9 @@
 //! which readiness signal the server actually emits. Adding a backend is one entry here plus one
 //! manifest entry — not new protocol code.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rag_rat_base::language::Language;
 
@@ -160,6 +162,19 @@ impl LiveBackend {
         self.languages.contains(&language)
     }
 
+    /// Resolve this checkout's project layout — the one filesystem scan a session performs.
+    pub fn resolve_layout(&self, root: &Path) -> ProjectLayout {
+        let Some(marker) = self.project_marker else {
+            return ProjectLayout::default();
+        };
+        match marker.scope {
+            // An enclosing-scoped marker is answered per document by walking UP, which is cheap
+            // and needs no precomputed set.
+            ProjectScope::Enclosing => ProjectLayout::default(),
+            ProjectScope::Checkout => ProjectLayout { marker_dirs: marker_dirs(root, marker.file) },
+        }
+    }
+
     /// Whether opening `path` (repo-relative, under `root`) would produce an observable readiness
     /// signal — i.e. whether it is a useful warm-up document.
     ///
@@ -168,7 +183,12 @@ impl LiveBackend {
     /// progress cycle: opening a file that belongs to no project creates an inferred project
     /// SILENTLY (measured: no `$/progress` at all), so warming on one teaches the session nothing
     /// and it stays `Warming` while a file that IS in a project would have warmed it.
-    pub(crate) fn open_signals_readiness(&self, root: &Path, path: &str) -> bool {
+    pub(crate) fn open_signals_readiness(
+        &self,
+        root: &Path,
+        path: &str,
+        layout: &ProjectLayout,
+    ) -> bool {
         // A document this backend cannot open teaches it nothing, whatever project contains it —
         // and the two live backends' project markers can coexist in one checkout, so the marker
         // alone would let a `.ts` file qualify as a clangd warm-up. Callers filter by language
@@ -182,14 +202,8 @@ impl LiveBackend {
                 self.project_marker.is_some_and(|marker| match marker.scope {
                     ProjectScope::Enclosing =>
                         enclosing_project_dir(root, &root.join(path), marker.file).is_some(),
-                    // One database: the session is pointed at it, so any document works.
-                    // Several: nothing is pointed anywhere, so a document counts only if the
-                    // server would find a database for it on its own.
-                    ProjectScope::Checkout => match marker_dirs(root, marker.file).as_slice() {
-                        [] => false,
-                        [_only] => true,
-                        _ => discoverable_marker_dir(root, &root.join(path), marker.file).is_some(),
-                    },
+                    ProjectScope::Checkout =>
+                        self.session_resolves(root, &root.join(path), layout, marker),
                 }),
         }
     }
@@ -206,7 +220,7 @@ impl LiveBackend {
     /// `None` means the checkout contains no project this backend could ever warm on, which is
     /// also what makes its `prerequisite_blocked` gate fire — the two answer the same question, so
     /// they cannot disagree.
-    pub(crate) fn warmup_document(&self, root: &Path) -> Option<PathBuf> {
+    pub(crate) fn warmup_document(&self, root: &Path, layout: &ProjectLayout) -> Option<PathBuf> {
         match self.readiness {
             // Session-level quiescence needs no document.
             ReadinessPolicy::ServerStatus => None,
@@ -216,17 +230,15 @@ impl LiveBackend {
                         find_document_in_project(root, self.languages, marker.file, false),
                     // The marker can sit anywhere, so the two halves are searched independently
                     // and a document only counts once the marker has been found somewhere.
-                    ProjectScope::Checkout => match marker_dirs(root, marker.file).as_slice() {
-                        [] => None,
-                        [_only] => find_any_document(root, self.languages),
-                        // With several databases the warm-up must pick a document the server can
-                        // actually configure, or it opens one that yields no load cycle. Note this
-                        // SEARCHES for such a document: filtering the first candidate would let a
-                        // single stray file at the root declare the whole checkout unwarmable.
-                        _ => find_document_where(root, self.languages, &|document| {
-                            discoverable_marker_dir(root, document, marker.file).is_some()
+                    // The warm-up must pick a document the session can actually configure, or it
+                    // opens one that yields no load cycle. This SEARCHES for such a document:
+                    // filtering the first candidate would let a single stray file at the root
+                    // declare the whole checkout unwarmable.
+                    ProjectScope::Checkout if layout.is_empty() => None,
+                    ProjectScope::Checkout =>
+                        find_document_where(root, self.languages, &|document| {
+                            self.session_resolves(root, document, layout, marker)
                         }),
-                    },
                 }),
         }
     }
@@ -240,24 +252,96 @@ impl LiveBackend {
     /// invisible to it. Passing the directory we found makes every layout behave the same, and
     /// keeps the prerequisite gate honest: it accepts a database wherever it sits precisely
     /// because the session is then told where that is.
-    pub(crate) fn spawn_args(&self, static_args: &[&'static str], root: &Path) -> Vec<String> {
-        let mut args: Vec<String> = static_args.iter().map(|arg| (*arg).to_string()).collect();
-        if let Some(marker) = self.project_marker
-            && marker.scope == ProjectScope::Checkout
-            && let [only] = marker_dirs(root, marker.file).as_slice()
-        {
-            args.push(format!("--compile-commands-dir={}", only.display()));
+    pub(crate) fn spawn_args(
+        &self,
+        static_args: &[&'static str],
+        layout: &ProjectLayout,
+    ) -> Vec<OsString> {
+        let mut args: Vec<OsString> = static_args.iter().map(OsString::from).collect();
+        if let Some(dir) = layout.sole_marker_dir() {
+            // Built as an OsString, never through `Path::display()`: on Unix a path is bytes, and
+            // formatting a non-UTF-8 component would substitute replacement characters and hand
+            // the server a directory that does not exist.
+            let mut arg = OsString::from("--compile-commands-dir=");
+            arg.push(dir.as_os_str());
+            args.push(arg);
         }
         args
     }
 
+    /// Whether a document at `absolute` is one THIS SESSION can resolve correctly.
+    ///
+    /// With a single database the session is pointed at it, so every document is configured. With
+    /// several, the session points at none and the server falls back to its own lookup — a
+    /// document it cannot find a database for gets heuristic flags, and measured, that resolves a
+    /// cross-translation-unit call to the callee's HEADER DECLARATION. Persisting that is a wrong
+    /// verdict, not a missing one, so such documents are skipped rather than resolved.
+    fn session_resolves(
+        &self,
+        root: &Path,
+        absolute: &Path,
+        layout: &ProjectLayout,
+        marker: ProjectMarker,
+    ) -> bool {
+        if layout.is_empty() {
+            return false;
+        }
+        layout.sole_marker_dir().is_some()
+            || discoverable_marker_dir(root, absolute, marker.file).is_some()
+    }
+
+    /// Whether this session can resolve `path` (repo-relative) — the live pass's per-file gate.
+    pub fn session_can_resolve(&self, root: &Path, path: &str, layout: &ProjectLayout) -> bool {
+        match self.project_marker {
+            Some(marker) if marker.scope == ProjectScope::Checkout =>
+                self.session_resolves(root, &root.join(path), layout, marker),
+            _ => true,
+        }
+    }
+
     /// Whether this checkout can ever produce a readiness signal for this backend. Backs the
     /// manifest's prerequisite gate.
-    pub fn checkout_can_signal_readiness(&self, root: &Path) -> bool {
+    pub fn checkout_can_signal_readiness(&self, root: &Path, layout: &ProjectLayout) -> bool {
         match self.readiness {
             ReadinessPolicy::ServerStatus => true,
-            ReadinessPolicy::WorkDoneProgress => self.warmup_document(root).is_some(),
+            ReadinessPolicy::WorkDoneProgress => self.warmup_document(root, layout).is_some(),
         }
+    }
+}
+
+/// What a live backend learned about a checkout's projects, resolved ONCE per session.
+///
+/// Every question the backend asks about layout — is this checkout usable, which database does the
+/// session point at, which documents can it resolve — is answered from this one value. Re-deriving
+/// them per call meant walking the whole checkout several times per spawn (proving there is no
+/// SECOND database requires a full traversal), and the maintenance pass holds the repository write
+/// lock while that happens.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectLayout {
+    /// Directories holding a USABLE marker, capped at two — the only distinction drawn is
+    /// "exactly one" versus "several".
+    marker_dirs: Vec<PathBuf>,
+}
+
+impl ProjectLayout {
+    /// The single database this session can point the server at, or `None` when the checkout has
+    /// none or has several (in which case the server's own per-file lookup decides).
+    fn sole_marker_dir(&self) -> Option<&Path> {
+        match self.marker_dirs.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.marker_dirs.is_empty()
+    }
+
+    /// Whether this layout pins the session to one database, which is what a re-resolve has to be
+    /// compared against: only a change to the PINNED database can invalidate an argv already
+    /// passed to a running server.
+    pub fn pins_same_database_as(&self, other: &ProjectLayout) -> bool {
+        self.sole_marker_dir() == other.sole_marker_dir()
     }
 }
 
@@ -320,7 +404,8 @@ fn collect_marker_dirs(dir: &Path, marker: &str, found: &mut Vec<PathBuf>) {
     if found.len() >= 2 {
         return;
     }
-    if dir.join(marker).exists() {
+    let candidate = dir.join(marker);
+    if candidate.exists() && marker_is_usable(&candidate) {
         found.push(dir.to_path_buf());
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -340,14 +425,51 @@ fn collect_marker_dirs(dir: &Path, marker: &str, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// How long a resident session may trust its cached project layout.
+///
+/// The layout is cached because resolving it walks the checkout (measured at roughly 80ms for a
+/// 21k-directory tree, and the maintenance pass holds the repository write lock while it runs), so
+/// re-resolving every pass is the wrong trade. But it cannot be trusted for a session's whole
+/// lifetime either: a database added or removed meanwhile would leave a pinned session analysing a
+/// new project's files with the old project's flags — wrong include and define flags select a
+/// different preprocessor branch, so a wrong definition, persisted. This bounds that window to a
+/// minute instead of the idle-shutdown timeout, at an amortised cost of one walk per minute.
+pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// Whether a marker file actually describes a project the server can load.
+///
+/// A syntactically valid but EMPTY compilation database (`[]`) is the case that matters: measured,
+/// clangd emits no progress cycle at all for one, so a checkout holding it can never report ready
+/// and the backend would retry its backlog forever while `oracle status` called it runnable.
+/// Detected by scanning a bounded prefix for an object opener rather than parsing — a real
+/// database can be tens of megabytes, and this runs while the maintenance pass holds the write
+/// lock.
+fn marker_is_usable(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut prefix = [0u8; 64 * 1024];
+    let Ok(read) = file.read(&mut prefix) else {
+        return false;
+    };
+    prefix[..read].contains(&b'{')
+}
+
 /// The marker directory the SERVER would find for `path` on its own — clangd searches an opened
-/// file's ancestor directories and a `build/` subdirectory of each. Used when the checkout holds
-/// several databases and the session therefore points at none.
+/// file's ancestor directories and a `build/` subdirectory of each (measured: a database in an
+/// ancestor's `build/` resolves with no flag passed). Used when the checkout holds several
+/// databases and the session therefore points at none.
+///
+/// Applies the same usability test as the whole-checkout scan: a nearer but EMPTY database is what
+/// clangd would actually pick up, and it configures nothing — treating the file as configured
+/// because some *other* project's database exists is how a fallback-flags answer gets persisted.
 fn discoverable_marker_dir(root: &Path, path: &Path, marker: &str) -> Option<PathBuf> {
     let mut dir = path.parent()?;
     loop {
         for candidate in [dir.to_path_buf(), dir.join("build")] {
-            if candidate.join(marker).exists() {
+            let file = candidate.join(marker);
+            if file.exists() && marker_is_usable(&file) {
                 return Some(candidate);
             }
         }
@@ -356,12 +478,6 @@ fn discoverable_marker_dir(root: &Path, path: &Path, marker: &str) -> Option<Pat
         }
         dir = dir.parent()?;
     }
-}
-
-/// The first file one of `languages` claims at or below `dir`, regardless of any project marker —
-/// the single-database [`ProjectScope::Checkout`] warm-up document.
-fn find_any_document(dir: &Path, languages: &[Language]) -> Option<PathBuf> {
-    find_document_where(dir, languages, &|_| true)
 }
 
 /// The first file one of `languages` claims at or below `dir` that also satisfies `accept`.
@@ -496,6 +612,18 @@ mod tests {
         assert!(!ts.claims_path("src/lib.rs"), "another language's file never enters the worklist");
     }
 
+    /// The `--compile-commands-dir` argument for `dir`, built the way production builds it.
+    fn compdb_arg(dir: &Path) -> OsString {
+        let mut arg = OsString::from("--compile-commands-dir=");
+        arg.push(dir.as_os_str());
+        arg
+    }
+
+    /// A compilation database with one real entry. `[]` is syntactically valid but describes no
+    /// project, and clangd emits no readiness cycle for it — writing that in a fixture would
+    /// assert the very bug `marker_is_usable` exists to catch.
+    const COMPDB: &str = r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c"}]"#;
+
     /// A TypeScript project at `relative_dir` holding one `main.ts`.
     fn write_project(root: &Path, relative_dir: &str) {
         let dir = root.join(relative_dir);
@@ -535,19 +663,19 @@ mod tests {
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         std::fs::write(dir.join("scripts/tool.ts"), "export function x() {}\n").unwrap();
         assert_eq!(
-            ts.warmup_document(&dir),
+            ts.warmup_document(&dir, &ts.resolve_layout(&dir)),
             None,
             "a TypeScript file outside every project is not a warm-up document",
         );
-        assert!(!ts.checkout_can_signal_readiness(&dir));
+        assert!(!ts.checkout_can_signal_readiness(&dir, &ts.resolve_layout(&dir)));
 
         write_project(&dir, "services/teams/foo/web");
         assert_eq!(
-            ts.warmup_document(&dir),
+            ts.warmup_document(&dir, &ts.resolve_layout(&dir)),
             Some(dir.join("services/teams/foo/web/main.ts")),
             "a deeply nested project is still found",
         );
-        assert!(ts.checkout_can_signal_readiness(&dir));
+        assert!(ts.checkout_can_signal_readiness(&dir, &ts.resolve_layout(&dir)));
     }
 
     #[test]
@@ -558,8 +686,8 @@ mod tests {
         let dir = rag_rat_base::test_scratch::ScratchDir::new("ts-lsp-vendored-warmup");
         write_project(&dir, "node_modules/some-dep");
         write_project(&dir, ".cache/tooling");
-        assert_eq!(ts.warmup_document(&dir), None);
-        assert!(!ts.checkout_can_signal_readiness(&dir));
+        assert_eq!(ts.warmup_document(&dir, &ts.resolve_layout(&dir)), None);
+        assert!(!ts.checkout_can_signal_readiness(&dir, &ts.resolve_layout(&dir)));
     }
 
     #[test]
@@ -568,9 +696,15 @@ mod tests {
         // and must not leak into the other backend's gating.
         let rust = LiveBackend::for_tool(OracleTool::RaLsp).unwrap();
         let dir = rag_rat_base::test_scratch::ScratchDir::new("ra-lsp-warmup-doc");
-        assert_eq!(rust.warmup_document(&dir), None);
-        assert!(rust.checkout_can_signal_readiness(&dir), "an empty checkout still signals");
-        assert!(rust.open_signals_readiness(&dir, "src/lib.rs"), "any document will do");
+        assert_eq!(rust.warmup_document(&dir, &rust.resolve_layout(&dir)), None);
+        assert!(
+            rust.checkout_can_signal_readiness(&dir, &rust.resolve_layout(&dir)),
+            "an empty checkout still signals"
+        );
+        assert!(
+            rust.open_signals_readiness(&dir, "src/lib.rs", &rust.resolve_layout(&dir)),
+            "any document will do"
+        );
         assert!(rust.project_marker.is_none(), "session-level readiness needs no project");
     }
 
@@ -608,19 +742,28 @@ mod tests {
         let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-marker");
         let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
         assert_eq!(clangd.project_marker.map(|m| m.file), Some("compile_commands.json"));
-        assert!(!clangd.checkout_can_signal_readiness(&dir), "no compdb ⇒ no signal possible");
+        assert!(
+            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            "no compdb ⇒ no signal possible"
+        );
 
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
-        assert!(!clangd.checkout_can_signal_readiness(&dir), "sources alone are not a project");
-        std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
-        assert_eq!(clangd.warmup_document(&dir), Some(dir.join("src/main.c")));
-        assert!(clangd.checkout_can_signal_readiness(&dir));
+        assert!(
+            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            "sources alone are not a project"
+        );
+        std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
+        assert_eq!(
+            clangd.warmup_document(&dir, &clangd.resolve_layout(&dir)),
+            Some(dir.join("src/main.c"))
+        );
+        assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
         // The two live backends' project markers can coexist in one checkout, so a document
         // qualifies only if THIS backend could open it — not merely because a project contains it.
-        assert!(clangd.open_signals_readiness(&dir, "src/main.c"));
+        assert!(clangd.open_signals_readiness(&dir, "src/main.c", &clangd.resolve_layout(&dir)));
         assert!(
-            !clangd.open_signals_readiness(&dir, "src/app.ts"),
+            !clangd.open_signals_readiness(&dir, "src/app.ts", &clangd.resolve_layout(&dir)),
             "another language's file is not a clangd warm-up document, project or not",
         );
     }
@@ -637,16 +780,22 @@ mod tests {
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("build")).unwrap();
         std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
-        assert!(!clangd.checkout_can_signal_readiness(&dir), "sources with no compdb anywhere");
-
-        std::fs::write(dir.join("build/compile_commands.json"), "[]").unwrap();
         assert!(
-            clangd.checkout_can_signal_readiness(&dir),
+            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            "sources with no compdb anywhere"
+        );
+
+        std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
+        assert!(
+            clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
             "a compdb ANYWHERE in the checkout makes the backend usable",
         );
-        assert_eq!(clangd.warmup_document(&dir), Some(dir.join("src/main.c")));
+        assert_eq!(
+            clangd.warmup_document(&dir, &clangd.resolve_layout(&dir)),
+            Some(dir.join("src/main.c"))
+        );
         assert!(
-            clangd.open_signals_readiness(&dir, "src/main.c"),
+            clangd.open_signals_readiness(&dir, "src/main.c", &clangd.resolve_layout(&dir)),
             "a source with no ancestor compdb still warms clangd",
         );
     }
@@ -660,14 +809,129 @@ mod tests {
         let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
         let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-compdb-dir");
         std::fs::create_dir_all(dir.join("out")).unwrap();
-        std::fs::write(dir.join("out/compile_commands.json"), "[]").unwrap();
+        std::fs::write(dir.join("out/compile_commands.json"), COMPDB).unwrap();
 
-        let args = clangd.spawn_args(&["--background-index"], &dir);
+        let args = clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&dir));
         assert_eq!(args[0], "--background-index", "the static argv comes first");
         assert!(
-            args.contains(&format!("--compile-commands-dir={}", dir.join("out").display())),
+            args.contains(&compdb_arg(&dir.join("out"))),
             "the discovered database directory must be passed: {args:?}",
         );
+    }
+
+    #[test]
+    fn a_file_whose_database_the_session_cannot_reach_is_not_resolvable() {
+        // The sharpest failure this backend has: with several databases the session points at
+        // none, so a file whose database clangd cannot find on its own gets heuristic flags —
+        // measured, that resolves a cross-unit call to the callee's HEADER DECLARATION. The live
+        // pass must skip such files rather than persist the wrong answer.
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-unreachable-db");
+        // `proj-a` keeps its database where clangd looks (`build/`); `proj-b` does not.
+        std::fs::create_dir_all(dir.join("proj-a/build")).unwrap();
+        std::fs::create_dir_all(dir.join("proj-b/out")).unwrap();
+        std::fs::write(dir.join("proj-a/build/compile_commands.json"), COMPDB).unwrap();
+        std::fs::write(dir.join("proj-b/out/compile_commands.json"), COMPDB).unwrap();
+        std::fs::write(dir.join("proj-a/main.c"), "int a(void){return 0;}\n").unwrap();
+        std::fs::write(dir.join("proj-b/main.c"), "int b(void){return 0;}\n").unwrap();
+        let layout = clangd.resolve_layout(&dir);
+
+        assert!(
+            clangd.session_can_resolve(&dir, "proj-a/main.c", &layout),
+            "clangd finds proj-a's database beside it",
+        );
+        assert!(
+            !clangd.session_can_resolve(&dir, "proj-b/main.c", &layout),
+            "proj-b's database is somewhere clangd will not look, and nothing points it there",
+        );
+
+        // With a SINGLE database the session is pointed at it, so every file is configured —
+        // including one whose database is nowhere near it.
+        let single = rag_rat_base::test_scratch::ScratchDir::new("clangd-single-db");
+        std::fs::create_dir_all(single.join("out")).unwrap();
+        std::fs::create_dir_all(single.join("src")).unwrap();
+        std::fs::write(single.join("out/compile_commands.json"), COMPDB).unwrap();
+        std::fs::write(single.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+        let single_layout = clangd.resolve_layout(&single);
+        assert!(clangd.session_can_resolve(&single, "src/main.c", &single_layout));
+    }
+
+    #[test]
+    fn a_re_resolved_layout_reports_when_the_pinned_database_changed() {
+        // The session caches this layout so it does not re-walk the checkout every pass, and
+        // re-resolves once it ages out. What matters on re-resolution is whether the checkout
+        // still pins the SAME database: the server was spawned with an argv derived from the old
+        // one, so a change cannot be corrected in place. Both directions are dangerous — losing
+        // the database leaves the server pointed at a directory that no longer exists, and gaining
+        // one leaves the new project's files analysed with the old project's flags.
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-relayout");
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
+        let pinned = clangd.resolve_layout(&dir);
+        assert!(pinned.pins_same_database_as(&clangd.resolve_layout(&dir)), "unchanged checkout");
+
+        // A SECOND database appears: the checkout no longer pins one, so the session must go.
+        std::fs::create_dir_all(dir.join("other/build")).unwrap();
+        std::fs::write(dir.join("other/build/compile_commands.json"), COMPDB).unwrap();
+        assert!(
+            !pinned.pins_same_database_as(&clangd.resolve_layout(&dir)),
+            "a database added mid-session must invalidate a pinned layout",
+        );
+
+        // And the losing direction: the sole database is removed.
+        std::fs::remove_file(dir.join("other/build/compile_commands.json")).unwrap();
+        std::fs::remove_file(dir.join("build/compile_commands.json")).unwrap();
+        assert!(!pinned.pins_same_database_as(&clangd.resolve_layout(&dir)));
+
+        // A backend with no project marker pins nothing and never goes stale.
+        let rust = LiveBackend::for_tool(OracleTool::RaLsp).unwrap();
+        assert!(rust.resolve_layout(&dir).pins_same_database_as(&rust.resolve_layout(&dir)));
+    }
+
+    #[test]
+    fn a_nearer_empty_database_does_not_make_a_file_configured() {
+        // In a multi-database checkout the session points at none, so per-file discovery decides.
+        // clangd picks up the NEAREST database — if that one is empty it configures nothing, and
+        // the file must not count as resolvable merely because some other project has a real one.
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-nearer-empty");
+        // THREE projects, so the checkout stays multi-database after one is hollowed out —
+        // otherwise it would collapse to the single-database case, where the session pins the one
+        // remaining database and every file is configured by it.
+        for project in ["good", "also-good", "hollow"] {
+            std::fs::create_dir_all(dir.join(project).join("build")).unwrap();
+            std::fs::write(dir.join(project).join("build/compile_commands.json"), COMPDB).unwrap();
+            std::fs::write(dir.join(project).join("main.c"), "int f(void){return 0;}\n").unwrap();
+        }
+        let layout = clangd.resolve_layout(&dir);
+        assert!(clangd.session_can_resolve(&dir, "hollow/main.c", &layout));
+
+        // Hollow out the nearer database; the file is no longer configured, while its sibling
+        // project is untouched.
+        std::fs::write(dir.join("hollow/build/compile_commands.json"), "[]").unwrap();
+        let layout = clangd.resolve_layout(&dir);
+        assert!(
+            !clangd.session_can_resolve(&dir, "hollow/main.c", &layout),
+            "an empty nearest database configures nothing",
+        );
+        assert!(clangd.session_can_resolve(&dir, "good/main.c", &layout));
+    }
+
+    #[test]
+    fn an_empty_compilation_database_is_not_a_project() {
+        // `[]` is valid JSON and a valid database file, but describes nothing to load: measured,
+        // clangd emits no readiness cycle for it at all. Accepting it would report the backend
+        // runnable while it could only ever sit in `Warming`.
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-empty-db");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.c"), "int main(void){return 0;}\n").unwrap();
+        std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
+        assert!(!clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+
+        std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
+        assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
     }
 
     #[test]
@@ -679,17 +943,20 @@ mod tests {
         let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-hidden-build");
         std::fs::create_dir_all(dir.join(".build")).unwrap();
         std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join(".build/compile_commands.json"), "[]").unwrap();
+        std::fs::write(dir.join(".build/compile_commands.json"), COMPDB).unwrap();
         std::fs::write(dir.join("src/main.c"), "int main(void){return 0;}\n").unwrap();
 
-        assert!(clangd.checkout_can_signal_readiness(&dir));
+        assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
         assert!(
             clangd
-                .spawn_args(&["--background-index"], &dir)
-                .contains(&format!("--compile-commands-dir={}", dir.join(".build").display())),
+                .spawn_args(&["--background-index"], &clangd.resolve_layout(&dir))
+                .contains(&compdb_arg(&dir.join(".build"))),
         );
         // The warm-up document still comes from the visible tree.
-        assert_eq!(clangd.warmup_document(&dir), Some(dir.join("src/main.c")));
+        assert_eq!(
+            clangd.warmup_document(&dir, &clangd.resolve_layout(&dir)),
+            Some(dir.join("src/main.c"))
+        );
     }
 
     #[test]
@@ -702,15 +969,15 @@ mod tests {
         std::fs::create_dir_all(dir.join("node_modules/dep")).unwrap();
         std::fs::create_dir_all(dir.join(".git/weird")).unwrap();
         std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("node_modules/dep/compile_commands.json"), "[]").unwrap();
-        std::fs::write(dir.join(".git/weird/compile_commands.json"), "[]").unwrap();
-        std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
+        std::fs::write(dir.join("node_modules/dep/compile_commands.json"), COMPDB).unwrap();
+        std::fs::write(dir.join(".git/weird/compile_commands.json"), COMPDB).unwrap();
+        std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
         std::fs::write(dir.join("src/main.c"), "int main(void){return 0;}\n").unwrap();
 
         assert!(
             clangd
-                .spawn_args(&["--background-index"], &dir)
-                .contains(&format!("--compile-commands-dir={}", dir.display())),
+                .spawn_args(&["--background-index"], &clangd.resolve_layout(&dir))
+                .contains(&OsString::from(format!("--compile-commands-dir={}", dir.display()))),
             "the checkout's own database is still the single unambiguous one",
         );
     }
@@ -727,23 +994,23 @@ mod tests {
         let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-multi-db");
         for project in ["proj-a", "proj-b"] {
             std::fs::create_dir_all(dir.join(project).join("build")).unwrap();
-            std::fs::write(dir.join(project).join("build/compile_commands.json"), "[]").unwrap();
+            std::fs::write(dir.join(project).join("build/compile_commands.json"), COMPDB).unwrap();
             std::fs::write(dir.join(project).join("main.c"), "int main(void){return 0;}\n")
                 .unwrap();
         }
         assert_eq!(
-            clangd.spawn_args(&["--background-index"], &dir),
-            vec!["--background-index".to_string()],
+            clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&dir)),
+            vec![OsString::from("--background-index")],
             "no database may be forced globally when several exist",
         );
         // Each project's own file is still fine: clangd finds `<dir>/build/` beside it.
-        assert!(clangd.open_signals_readiness(&dir, "proj-a/main.c"));
+        assert!(clangd.open_signals_readiness(&dir, "proj-a/main.c", &clangd.resolve_layout(&dir)));
         // A file belonging to no project is not a usable warm-up document here, because nothing
         // points the session at a database on its behalf.
         std::fs::write(dir.join("stray.c"), "int stray(void){return 0;}\n").unwrap();
-        assert!(!clangd.open_signals_readiness(&dir, "stray.c"));
+        assert!(!clangd.open_signals_readiness(&dir, "stray.c", &clangd.resolve_layout(&dir)));
         assert!(
-            clangd.checkout_can_signal_readiness(&dir),
+            clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
             "the per-project files remain warmable, so the backend is not blocked",
         );
     }
@@ -755,15 +1022,18 @@ mod tests {
         let dir = rag_rat_base::test_scratch::ScratchDir::new("static-argv");
         std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
         let ts = LiveBackend::for_tool(OracleTool::TsLsp).unwrap();
-        assert_eq!(ts.spawn_args(&["--stdio"], &dir), vec!["--stdio".to_string()]);
+        assert_eq!(ts.spawn_args(&["--stdio"], &ts.resolve_layout(&dir)), vec![OsString::from(
+            "--stdio"
+        )]);
         let rust = LiveBackend::for_tool(OracleTool::RaLsp).unwrap();
-        assert!(rust.spawn_args(&[], &dir).is_empty());
+        assert!(rust.spawn_args(&[], &rust.resolve_layout(&dir)).is_empty());
         // And with no database anywhere, clangd gets no directory to point at either.
         let empty = rag_rat_base::test_scratch::ScratchDir::new("static-argv-empty");
         let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-        assert_eq!(clangd.spawn_args(&["--background-index"], &empty), vec![
-            "--background-index".to_string()
-        ],);
+        assert_eq!(
+            clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&empty)),
+            vec![OsString::from("--background-index")],
+        );
     }
 
     #[test]
@@ -778,10 +1048,14 @@ mod tests {
         std::fs::write(dir.join("src/main.ts"), "export const x = 1;\n").unwrap();
         std::fs::write(dir.join("config/tsconfig.json"), "{}").unwrap();
         assert!(
-            !ts.open_signals_readiness(&dir, "src/main.ts"),
+            !ts.open_signals_readiness(&dir, "src/main.ts", &ts.resolve_layout(&dir)),
             "a config in a SIBLING directory governs nothing under src/",
         );
-        assert_eq!(ts.warmup_document(&dir), None, "and there is nothing to warm on");
+        assert_eq!(
+            ts.warmup_document(&dir, &ts.resolve_layout(&dir)),
+            None,
+            "and there is nothing to warm on"
+        );
     }
 
     #[test]

@@ -75,7 +75,7 @@ impl LspClient {
     /// — the signal this backend actually emits.
     pub(crate) fn spawn(
         program: &str,
-        args: &[String],
+        args: &[std::ffi::OsString],
         cwd: &Path,
         readiness: ReadinessPolicy,
     ) -> io::Result<Self> {
@@ -847,7 +847,7 @@ mod tests {
         assert!(
             LspClient::spawn(
                 "cargo",
-                &["--version".to_string()],
+                &[std::ffi::OsString::from("--version")],
                 &root.path().join("missing"),
                 ReadinessPolicy::ServerStatus,
             )
