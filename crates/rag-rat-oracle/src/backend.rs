@@ -357,8 +357,15 @@ fn is_searchable_dir(name: &str) -> bool {
 /// compilation database there is as real as one in `build/`. Only trees that cannot hold this
 /// checkout's own database are excluded — VCS internals, rag-rat's own state, clangd's index, and
 /// vendored dependencies.
-fn is_searchable_for_marker(name: &str) -> bool {
-    !matches!(name, "node_modules" | ".git" | ".rag-rat" | ".cache" | ".hg" | ".svn")
+fn is_searchable_for_marker(path: &Path, name: &str) -> bool {
+    if matches!(name, "node_modules" | ".git" | ".rag-rat" | ".hg" | ".svn") {
+        return false;
+    }
+    // Only clangd's OWN index is off-limits under `.cache`, not every build artifact there: a
+    // hidden build such as `.cache/cmake-build/compile_commands.json` is a real database, and
+    // excluding the whole subtree would contradict supporting hidden build directories at all.
+    name != "clangd"
+        || path.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new(".cache"))
 }
 
 /// The directory of the nearest `marker` file at or above `path`, stopping at `root`. `None` means
@@ -394,13 +401,19 @@ fn enclosing_project_dir(root: &Path, path: &Path, marker: &str) -> Option<PathB
 /// usable while it silently never warms.
 fn marker_dirs(root: &Path, marker: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    collect_marker_dirs(root, marker, &mut found);
+    collect_marker_dirs(root, marker, MARKER_SEARCH_MAX_DEPTH, &mut found);
     found
 }
 
+/// How deep the marker search descends. Following directory symlinks is what makes a symlinked
+/// build directory discoverable, and it is also what makes a cycle (`build -> ..`) possible — this
+/// bounds the descent rather than tracking visited inodes, which would cost a stat per entry for a
+/// case that is pathological rather than merely unusual. Deep enough for any real project layout.
+const MARKER_SEARCH_MAX_DEPTH: u32 = 24;
+
 /// Collect marker directories, stopping at two — the only distinction any caller draws is
 /// "exactly one" versus "several", and a monorepo can hold hundreds.
-fn collect_marker_dirs(dir: &Path, marker: &str, found: &mut Vec<PathBuf>) {
+fn collect_marker_dirs(dir: &Path, marker: &str, depth_left: u32, found: &mut Vec<PathBuf>) {
     if found.len() >= 2 {
         return;
     }
@@ -413,15 +426,20 @@ fn collect_marker_dirs(dir: &Path, marker: &str, found: &mut Vec<PathBuf>) {
     };
     let mut subdirectories: Vec<PathBuf> = entries
         .flatten()
-        .filter(|entry| {
-            is_searchable_for_marker(&entry.file_name().to_string_lossy())
-                && entry.file_type().is_ok_and(|kind| kind.is_dir())
-        })
         .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            // `is_dir` FOLLOWS symlinks, unlike `DirEntry::file_type`: `build -> cmake-build-debug`
+            // is an ordinary layout, and its database is reachable through the checkout path.
+            is_searchable_for_marker(path, &name) && path.is_dir()
+        })
         .collect();
     subdirectories.sort();
+    let Some(depth_left) = depth_left.checked_sub(1) else {
+        return;
+    };
     for sub in subdirectories {
-        collect_marker_dirs(&sub, marker, found);
+        collect_marker_dirs(&sub, marker, depth_left, found);
     }
 }
 
@@ -438,22 +456,68 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// Whether a marker file actually describes a project the server can load.
 ///
-/// A syntactically valid but EMPTY compilation database (`[]`) is the case that matters: measured,
-/// clangd emits no progress cycle at all for one, so a checkout holding it can never report ready
-/// and the backend would retry its backlog forever while `oracle status` called it runnable.
-/// Detected by scanning a bounded prefix for an object opener rather than parsing — a real
-/// database can be tens of megabytes, and this runs while the maintenance pass holds the write
-/// lock.
+/// The case that matters is a syntactically valid database that names no translation unit — `[]`,
+/// `{}`, or an array of objects without a `file` key. Measured, clangd emits no progress cycle at
+/// all for one, so a checkout holding it can never report ready and the backend would retry its
+/// backlog forever while `oracle status` called it runnable.
+///
+/// The FIRST entry is parsed, not the whole file and not a byte pattern. A real database can be
+/// tens of megabytes and this runs while the maintenance pass holds the repository write lock, so
+/// parsing all of it is too expensive; scanning for a token is simply wrong in both directions —
+/// it rejects a valid database whose first entry is larger than the window, and accepts a hollow
+/// one that merely contains the token inside some unrelated string.
 fn marker_is_usable(path: &Path) -> bool {
-    use std::io::Read as _;
-    let Ok(mut file) = std::fs::File::open(path) else {
+    /// One compilation-database entry. `file` is the field that names a translation unit; the
+    /// rest of the entry is deliberately ignored.
+    #[derive(serde::Deserialize)]
+    struct CompilationEntry {
+        #[allow(dead_code)]
+        file: String,
+    }
+
+    // One entry is small even when the database is not, so a bounded prefix always contains it.
+    const PREFIX_LIMIT: u64 = 1024 * 1024;
+    let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    let mut prefix = [0u8; 64 * 1024];
-    let Ok(read) = file.read(&mut prefix) else {
+    let mut prefix = Vec::new();
+    if std::io::Read::read_to_end(&mut std::io::Read::take(file, PREFIX_LIMIT), &mut prefix)
+        .is_err()
+    {
         return false;
-    };
-    prefix[..read].contains(&b'{')
+    }
+    let text = String::from_utf8_lossy(&prefix);
+    first_json_object(&text)
+        .is_some_and(|object| serde_json::from_str::<CompilationEntry>(object).is_ok())
+}
+
+/// The first top-level JSON object in `text`, as a slice — brace-matched with string and escape
+/// awareness so a `{` or `}` inside a compile command cannot end it early. `None` when the prefix
+/// holds no complete object.
+fn first_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..start + offset + ch.len_utf8()]);
+                }
+            },
+            _ => {},
+        }
+    }
+    None
 }
 
 /// The marker directory the SERVER would find for `path` on its own — clangd searches an opened
@@ -469,8 +533,13 @@ fn discoverable_marker_dir(root: &Path, path: &Path, marker: &str) -> Option<Pat
     loop {
         for candidate in [dir.to_path_buf(), dir.join("build")] {
             let file = candidate.join(marker);
-            if file.exists() && marker_is_usable(&file) {
-                return Some(candidate);
+            if file.exists() {
+                // STOP at the nearest database, usable or not. clangd loads the first one it
+                // finds and falls back to generic flags if it configures nothing — it does not
+                // continue to a farther ancestor. Continuing here would declare the file
+                // configured by a database clangd never consults, and the live pass would then
+                // trust a fallback-flags answer.
+                return marker_is_usable(&file).then_some(candidate);
             }
         }
         if dir == root {
@@ -916,6 +985,137 @@ mod tests {
             "an empty nearest database configures nothing",
         );
         assert!(clangd.session_can_resolve(&dir, "good/main.c", &layout));
+    }
+
+    #[test]
+    fn the_nearest_database_decides_even_when_it_is_unusable() {
+        // clangd loads the first database it finds walking up and falls back to generic flags if
+        // it configures nothing — it does NOT continue to a farther ancestor. Skipping past an
+        // unusable nearer database would declare the file configured by one clangd never
+        // consults, and the pass would trust a fallback-flags answer.
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-nearest-wins");
+        // A usable database at the root, plus a second project so the layout stays multi-database
+        // (single-database checkouts pin instead of using per-file discovery).
+        std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere/build")).unwrap();
+        std::fs::write(dir.join("elsewhere/build/compile_commands.json"), COMPDB).unwrap();
+        std::fs::create_dir_all(dir.join("sub/build")).unwrap();
+        std::fs::write(dir.join("sub/main.c"), "int s(void){return 0;}\n").unwrap();
+        let layout = clangd.resolve_layout(&dir);
+        assert!(clangd.session_can_resolve(&dir, "sub/main.c", &layout), "falls back to the root");
+
+        // Now `sub` has its own EMPTY database. clangd stops there, so the file is not configured
+        // — even though the root database above it is perfectly good.
+        std::fs::write(dir.join("sub/build/compile_commands.json"), "[]").unwrap();
+        let layout = clangd.resolve_layout(&dir);
+        assert!(
+            !clangd.session_can_resolve(&dir, "sub/main.c", &layout),
+            "an unusable NEARER database means fallback flags, not the ancestor's database",
+        );
+    }
+
+    #[test]
+    fn the_first_database_entry_is_parsed_not_pattern_matched() {
+        // Scanning for a token is wrong in BOTH directions: it rejects a valid database whose
+        // first entry is larger than the window, and accepts a hollow one that merely contains
+        // the token inside an unrelated string. Parsing the first entry settles both.
+        assert_eq!(first_json_object(r#"[{"a":1},{"b":2}]"#), Some(r#"{"a":1}"#));
+        assert_eq!(
+            first_json_object(r#"[{"command":"cc -D'{' x.c","file":"x.c"}]"#),
+            Some(r#"{"command":"cc -D'{' x.c","file":"x.c"}"#),
+            "a brace inside a compile command must not end the object early",
+        );
+        assert_eq!(
+            first_json_object(r#"[{"command":"cc \"{\" x.c","file":"x.c"}]"#),
+            Some(r#"{"command":"cc \"{\" x.c","file":"x.c"}"#),
+            "nor may an escaped quote end the string early",
+        );
+        assert_eq!(first_json_object("[]"), None);
+        assert_eq!(first_json_object(r#"[{"unterminated": 1"#), None);
+
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-db-shape");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+        // A database whose text merely MENTIONS the key names no translation unit.
+        let hollows = ["[]", "{}", r#"[{"note":"{"}]"#, r#"[{"command":"cc \"file\" x.c"}]"#];
+        for hollow in hollows {
+            std::fs::write(dir.join("compile_commands.json"), hollow).unwrap();
+            assert!(
+                !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+                "{hollow} names no translation unit",
+            );
+        }
+        std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
+        assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+
+        // A first entry that puts a large `arguments` array before `file` is still valid — a
+        // fixed-size byte window would have rejected it.
+        let bulky = format!(
+            r#"[{{"directory":"/x","arguments":[{}],"file":"/x/a.c"}}]"#,
+            (0..40_000).map(|i| format!(r#""-DBIG{i}=1""#)).collect::<Vec<_>>().join(","),
+        );
+        assert!(bulky.len() > 512 * 1024, "the fixture must exceed a small scan window");
+        std::fs::write(dir.join("compile_commands.json"), &bulky).unwrap();
+        assert!(
+            clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            "a valid database must not be rejected for putting `file` late in a big first entry",
+        );
+    }
+
+    #[test]
+    fn a_symlinked_build_directory_is_still_searched() {
+        // `build -> cmake-build-debug` is an ordinary layout, and the database is reachable
+        // through the checkout path — but a symlink is not a directory to `DirEntry::file_type`.
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-symlinked-build");
+        std::fs::create_dir_all(dir.join("cmake-build-debug")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("cmake-build-debug/compile_commands.json"), COMPDB).unwrap();
+        std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("cmake-build-debug"), dir.join("build")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(dir.join("cmake-build-debug"), dir.join("build"))
+            .unwrap();
+
+        assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_cannot_hang_the_marker_search() {
+        // Following directory symlinks is what makes the case above work, and it is also what
+        // makes a cycle possible. The search must terminate rather than recurse forever.
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-symlink-cycle");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.join("nested/loop")).unwrap();
+        // Terminates; the checkout has no database, so it reports none.
+        assert!(clangd.resolve_layout(&dir).sole_marker_dir().is_none());
+    }
+
+    #[test]
+    fn a_hidden_build_under_dot_cache_is_still_a_database() {
+        // Only clangd's OWN index is off-limits under `.cache` — excluding the whole subtree would
+        // contradict supporting hidden build directories at all.
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-dot-cache-build");
+        std::fs::create_dir_all(dir.join(".cache/cmake-build")).unwrap();
+        std::fs::create_dir_all(dir.join(".cache/clangd/index")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join(".cache/cmake-build/compile_commands.json"), COMPDB).unwrap();
+        // clangd's own index directory must never be mistaken for a project of ours.
+        std::fs::write(dir.join(".cache/clangd/compile_commands.json"), COMPDB).unwrap();
+        std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+
+        let layout = clangd.resolve_layout(&dir);
+        assert_eq!(
+            layout.sole_marker_dir(),
+            Some(dir.join(".cache/cmake-build").as_path()),
+            "the hidden build counts, and clangd's own index does not",
+        );
     }
 
     #[test]

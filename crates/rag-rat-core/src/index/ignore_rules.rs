@@ -474,36 +474,63 @@ mod tests {
     }
 
     #[test]
-    fn the_clangd_index_floor_is_relative_to_each_checkouts_own_root() {
-        // A linked worktree shares the database with the main checkout, and the live oracle runs
-        // per checkout — each spawning its own clangd, each writing its own `.cache/clangd`. The
-        // floor is applied to the path relative to THAT checkout's root, so a linked worktree's
-        // index is floored on its own account and the main checkout's tree is untouched by it.
+    fn the_clangd_index_floor_holds_in_a_real_linked_worktree() {
+        // A real `git worktree add` checkout, not merely a nested directory: a linked worktree has
+        // its own root and a `.git` FILE rather than a directory, and the live oracle runs per
+        // checkout — each spawning its own clangd, each writing its own `.cache/clangd`. The floor
+        // is applied relative to whichever checkout is being indexed, so neither disturbs the
+        // other's sources.
         let (_scratch, main) = tempdir();
         git_init(&main);
-        write(&main.join(".gitignore"), "ignored-by-git/\n");
         write(&main.join("src/lib.c"), "int a(void){return 0;}\n");
-        let linked = main.join("wt");
-        write(&linked.join("src/lib.c"), "int b(void){return 0;}\n");
+        rag_rat_base::test_git::run(&main, &["add", "-A"]);
+        rag_rat_base::test_git::run(&main, &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "seed",
+        ]);
+        let linked = main.parent().expect("scratch parent").join("linked-wt");
+        rag_rat_base::test_git::run(&main, &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            &linked.to_string_lossy(),
+        ]);
+        assert!(linked.join(".git").is_file(), "a linked worktree carries a .git FILE");
 
-        // Compiled against the LINKED checkout's root, with the main checkout as the gitignore
-        // base above it — the ancestor-chain shape a linked worktree actually has.
-        let m = IgnoreMatcher::compile(&linked, &[PathBuf::from(".")]);
-        assert!(m.is_ignored(&linked.join(".cache/clangd/index/a.idx"), false));
-        assert!(!m.is_ignored(&linked.join("src/lib.c"), false), "its own sources still index");
+        let linked_matcher = IgnoreMatcher::compile(&linked, &[PathBuf::from(".")]);
+        assert!(linked_matcher.is_ignored(&linked.join(".cache/clangd/index/a.idx"), false));
         assert!(
-            !m.is_ignored(&linked.join(".cache/generated/api.c"), false),
-            "and the narrow floor still does not swallow the rest of a tracked .cache",
+            !linked_matcher.is_ignored(&linked.join("src/lib.c"), false),
+            "the linked checkout's own sources still index",
         );
-        // The main checkout's matcher floors its OWN index, and neither disturbs the other's
-        // sources — the sibling-preservation property this topology exists to check.
+        assert!(
+            !linked_matcher.is_ignored(&linked.join(".cache/cmake-build/gen.c"), false),
+            "and the narrow floor does not swallow the rest of a tracked .cache",
+        );
+
+        // The main checkout floors its OWN index, and its sources are untouched by the sibling's
+        // presence — the active-checkout/sibling separation this topology exists to check.
         let main_matcher = IgnoreMatcher::compile(&main, &[PathBuf::from(".")]);
         assert!(main_matcher.is_ignored(&main.join(".cache/clangd/index/a.idx"), false));
         assert!(!main_matcher.is_ignored(&main.join("src/lib.c"), false));
         assert!(
-            main_matcher.is_ignored(&linked.join(".cache/clangd/index/a.idx"), false),
-            "a nested checkout's clangd index is floored from either side",
+            !main_matcher.is_ignored(&linked.join("src/lib.c"), false),
+            "a sibling checkout outside this root is not governed by its matcher at all",
         );
+
+        rag_rat_base::test_git::run(&main, &[
+            "worktree",
+            "remove",
+            "--force",
+            &linked.to_string_lossy(),
+        ]);
     }
 
     #[test]

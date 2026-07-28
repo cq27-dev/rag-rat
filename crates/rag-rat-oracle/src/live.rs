@@ -106,7 +106,7 @@ impl LiveOracleSession {
         // prerequisite gate is not cosmetic for these backends: a checkout with no project emits
         // no readiness signal at all, so the session could only ever sit in `Warming`.
         let layout = backend.resolve_layout(checkout_root);
-        if let Some(hint) = manifest.prerequisite_blocked(checkout_root) {
+        if let Some(hint) = manifest.prerequisite_blocked_with(checkout_root, Some(&layout)) {
             return Err(LiveSpawnBlocked::Prerequisite(hint));
         }
         let ToolAvailability::Available { version, .. } = manifest.probe_in(checkout_root) else {
@@ -345,6 +345,16 @@ pub fn live_oracle_pass(
     input: &LivePassInput<'_>,
 ) -> anyhow::Result<LivePassReport> {
     let mut report = LivePassReport::default();
+    // BEFORE the readiness gate, deliberately: a session that never becomes ready would otherwise
+    // never reach this check, so a database removed during warm-up would leave it warming forever
+    // with no way back. End the pass instead and let the watcher replace the session — its argv
+    // was derived from the old layout, so it cannot be corrected in place.
+    if !session.layout_still_holds(input.checkout_root) {
+        report.unfinished_paths = input.worklist.to_vec();
+        report.status =
+            "Aborted: the checkout now points at a different compilation database".to_string();
+        return Ok(report);
+    }
     match session.readiness_checkpoint() {
         Ok(Some(_)) => {},
         Ok(None) => {
@@ -362,16 +372,6 @@ pub fn live_oracle_pass(
             report.status = format!("Aborted: {err}");
             return Ok(report);
         },
-    }
-    // A resident session caches its project layout; a database deleted or moved since it spawned
-    // would leave it trusting files the server can no longer configure. End the pass so the
-    // watcher replaces the session — its argv was derived from that layout too, so it cannot be
-    // corrected in place.
-    if !session.layout_still_holds(input.checkout_root) {
-        report.unfinished_paths = input.worklist.to_vec();
-        report.status =
-            "Aborted: the checkout's project layout changed since this session started".to_string();
-        return Ok(report);
     }
     let tool = session.tool();
     // The batch tool whose monikers live copies (rust-analyzer for ra-lsp, scip-typescript for

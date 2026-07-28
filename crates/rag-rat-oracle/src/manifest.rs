@@ -250,6 +250,18 @@ impl ToolManifest {
     /// reported as `Blocked` (install-hint UX, exit 0) rather than a subprocess error. The
     /// pre-built `--scip` path never reaches here.
     pub fn prerequisite_blocked(&self, root: &Path) -> Option<String> {
+        self.prerequisite_blocked_with(root, None)
+    }
+
+    /// As [`Self::prerequisite_blocked`], but reusing a project layout the caller already
+    /// resolved. A live spawn resolves one to build the server's argv, and resolving a second
+    /// here would both double the checkout walk under the repository write lock and let the gate
+    /// and the argv observe different layouts if a database changed between the two scans.
+    pub fn prerequisite_blocked_with(
+        &self,
+        root: &Path,
+        layout: Option<&super::backend::ProjectLayout>,
+    ) -> Option<String> {
         match self.tool {
             // scip-python's "deps must be installed" prerequisite has no single sentinel file to
             // check (it's whatever the corpus `prepare` venv installs); a failed environment shows
@@ -325,8 +337,15 @@ impl ToolManifest {
             // search the warm-up uses, so the gate and the warm-up cannot disagree.
             OracleTool::ClangdLsp | OracleTool::TsLsp => {
                 let backend = super::backend::LiveBackend::for_tool(self.tool)?;
-                let layout = backend.resolve_layout(root);
-                (!backend.checkout_can_signal_readiness(root, &layout)).then(|| {
+                let resolved;
+                let layout = match layout {
+                    Some(layout) => layout,
+                    None => {
+                        resolved = backend.resolve_layout(root);
+                        &resolved
+                    },
+                };
+                (!backend.checkout_can_signal_readiness(root, layout)).then(|| {
                     format!(
                         "the live {} oracle found no {} project under {} — {} only reports \
                          project-load progress for a real project, and that signal is what tells \
