@@ -1063,7 +1063,7 @@ mod call_path_receiver_type_hint_tests {
         .unwrap();
 
         let legacy =
-            crate::memory::resolve::edge_fingerprint(crate::memory::EdgeFingerprintParts {
+            crate::memory::resolve::legacy_edge_fingerprint(crate::memory::EdgeFingerprintParts {
                 path: "src/lib.rs",
                 start_line: 10,
                 end_line: 10,

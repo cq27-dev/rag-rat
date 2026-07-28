@@ -667,8 +667,7 @@ fn swift_local_receivers_override_external_bare_name_suppression() {
                 edge_kind: EdgeKind::CallsName,
                 evidence: Some("make()"),
                 receiver_hint: Some(receiver),
-                receiver_type_hint: None,
-                receiver_type_external: false,
+                receiver_type: None,
                 source_file_id: 1,
                 source_language: Some(Language::Swift.as_str()),
                 imported_external: true,
@@ -692,33 +691,66 @@ fn external_receiver_type_hint_never_binds_locally() {
     let symbols = [run];
     let index = SymbolIndex::build(&symbols);
 
-    let request = |receiver_type_external: bool| ResolveSymbolRequest {
+    let request = |receiver_type: ReceiverTypeIdentity<'static>| ResolveSymbolRequest {
         name: "run",
         target_qualified_name: None,
         edge_kind: EdgeKind::CallsName,
         evidence: Some("run()"),
         receiver_hint: Some("w"),
-        receiver_type_hint: Some("Worker"),
-        receiver_type_external,
+        receiver_type: Some(receiver_type),
         source_file_id: 1,
         source_language: Some(Language::Rust.as_str()),
         imported_external: false,
     };
 
     let (target, confidence, reason) =
-        resolve_symbol(request(false), &index).expect("a local Worker receiver resolves");
+        resolve_symbol(request(ReceiverTypeIdentity::LocalUnqualified("Worker")), &index)
+            .expect("a local Worker receiver resolves");
     assert_eq!(target.id, symbols[0].id);
     assert_eq!(confidence, EdgeConfidence::Syntactic);
     assert_eq!(reason, "receiver_type");
 
     // Same call, but `Worker` came from `use external::Worker;` — the receiver-type branch must
     // not bind the call to the unrelated local `Worker::run`.
-    if let Some((_, _, reason)) = resolve_symbol(request(true), &index) {
+    if let Some((_, _, reason)) =
+        resolve_symbol(request(ReceiverTypeIdentity::ExternalQualified("Worker")), &index)
+    {
         assert!(
             !matches!(reason, "receiver_type" | "scope_degeneric"),
             "externally-imported receiver type must not drive resolution, got {reason}"
         );
     }
+}
+
+#[test]
+fn receiver_type_identity_classification() {
+    let external = |root: &str| root == "url" || root == "Url";
+    // Qualified with a local root.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("workers::Worker"), external),
+        Some(ReceiverTypeIdentity::LocalQualified("workers::Worker"))
+    );
+    // Qualified with an externally-imported root.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("url::Url"), external),
+        Some(ReceiverTypeIdentity::ExternalQualified("url::Url"))
+    );
+    // A bare name that IS the external import.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("Url"), external),
+        Some(ReceiverTypeIdentity::ExternalQualified("Url"))
+    );
+    // A bare local name.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("Worker"), external),
+        Some(ReceiverTypeIdentity::LocalUnqualified("Worker"))
+    );
+    // Present-but-empty evidence is Ambiguous (suppresses bare fallback); absent is None.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("  "), external),
+        Some(ReceiverTypeIdentity::Ambiguous)
+    );
+    assert_eq!(ReceiverTypeIdentity::classify(None, external), None);
 }
 
 #[test]
@@ -745,8 +777,7 @@ fn two_trait_impls_on_one_type_decline_receiver_resolution() {
             edge_kind: EdgeKind::CallsName,
             evidence: Some("run()"),
             receiver_hint: Some("worker"),
-            receiver_type_hint: Some("Worker"),
-            receiver_type_external: false,
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
             source_file_id: 1,
             source_language: Some(Language::Rust.as_str()),
             imported_external: false,
@@ -770,8 +801,7 @@ fn two_trait_impls_on_one_type_decline_receiver_resolution() {
             edge_kind: EdgeKind::CallsName,
             evidence: Some("run()"),
             receiver_hint: Some("worker"),
-            receiver_type_hint: Some("Worker"),
-            receiver_type_external: false,
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
             source_file_id: 1,
             source_language: Some(Language::Rust.as_str()),
             imported_external: false,

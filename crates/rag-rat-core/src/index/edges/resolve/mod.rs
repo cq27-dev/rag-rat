@@ -426,11 +426,22 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 edge_kind,
                 evidence: evidence.as_deref(),
                 receiver_hint: resolve_receiver,
-                receiver_type_hint: receiver_type_hint.as_deref(),
-                receiver_type_external: receiver_type_hint.as_deref().is_some_and(|hint| {
-                    let root = hint.split("::").next().unwrap_or(hint);
-                    import_scope.is_external_import(source_file_id, root, ref_byte)
-                }),
+                // A directly qualified external type (`std::string::String`) has no covering
+                // `use`, so the import scope alone cannot see it — the language policy's
+                // known-external roots participate in the classification too.
+                receiver_type: ReceiverTypeIdentity::classify(
+                    receiver_type_hint.as_deref(),
+                    |root| {
+                        import_scope.is_external_import(source_file_id, root, ref_byte)
+                            || crate::index::languages::resolver_policy_for_name(Some(
+                                source_language.as_str(),
+                            ))
+                            .is_some_and(|policy| {
+                                (policy.qualified_root)(root)
+                                    == crate::index::languages::QualifiedRoot::External
+                            })
+                    },
+                ),
                 source_file_id,
                 source_language: Some(source_language.as_str()),
                 imported_external: import_scope.is_external_import(
@@ -661,10 +672,15 @@ pub(crate) fn resolve_and_insert_edges(
                     edge_kind: candidate.edge_kind,
                     evidence,
                     receiver_hint: resolve_receiver,
-                    receiver_type_hint,
-                    receiver_type_external: receiver_type_hint.is_some_and(|hint| {
-                        let root = hint.split("::").next().unwrap_or(hint);
+                    receiver_type: ReceiverTypeIdentity::classify(receiver_type_hint, |root| {
                         import_scope.is_external_import(*file_id, root, ref_byte)
+                            || crate::index::languages::resolver_policy_for_name(
+                                file_language.get(file_id).map(String::as_str),
+                            )
+                            .is_some_and(|policy| {
+                                (policy.qualified_root)(root)
+                                    == crate::index::languages::QualifiedRoot::External
+                            })
                     }),
                     source_file_id: *file_id,
                     source_language: file_language.get(file_id).map(String::as_str),
@@ -823,14 +839,17 @@ pub(crate) fn resolve_symbol<'a>(
     }) {
         return None;
     }
-    // Receiver-type resolution never fires for an externally-imported type: `use
-    // external::Worker; fn f(w: Worker) { w.run() }` must not bind to an unrelated local
-    // `Worker::run` elsewhere in the workspace. The callee-name/qualified-root suppression above
-    // cannot see this case (it inspects `run` and the value receiver `w`, not the inferred type).
-    if let Some(type_hint) = request
-        .receiver_type_hint
-        .filter(|value| !value.is_empty() && !request.receiver_type_external)
-    {
+    // The receiver-type identity is classified ONCE at request build (see
+    // [`ReceiverTypeIdentity`]): only Local identities resolve here — External and Ambiguous
+    // never bind to local symbols. A qualified local hint additionally earns the conservative
+    // tail fallback below; a bare one IS its own tail.
+    let receiver_type = match request.receiver_type {
+        Some(ReceiverTypeIdentity::LocalQualified(path)) => Some((path, true)),
+        Some(ReceiverTypeIdentity::LocalUnqualified(name)) => Some((name, false)),
+        Some(ReceiverTypeIdentity::ExternalQualified(_) | ReceiverTypeIdentity::Ambiguous)
+        | None => None,
+    };
+    if let Some((type_hint, qualified)) = receiver_type {
         let target = format!("{type_hint}::{}", request.name);
         let target_normalized = normalized_scope_path(&target);
 
@@ -883,10 +902,12 @@ pub(crate) fn resolve_symbol<'a>(
         if let Some((symbol, reason)) = try_scope(&target) {
             return Some((symbol, EdgeConfidence::Syntactic, reason));
         }
-        // A module-qualified hint (`workers::Worker` — e.g. a stripped `crate::workers::Worker`
-        // parameter type) rarely equals a container-based scope (`Worker::run`) verbatim; retry
-        // with the type's tail before falling to the loose suffix pass (#567).
-        if type_hint.contains("::") {
+        // Conservative tail FALLBACK, for a PROVEN-LOCAL qualified hint only (#567 review): a
+        // module-qualified hint (`workers::Worker`) rarely equals a container-based scope
+        // (`Worker::run`) verbatim, so retry with the type's tail — `try_scope` still requires
+        // the tail to name exactly one viable target (or one logical symbol's variants), so this
+        // never widens into guessing.
+        if qualified {
             let tail_target = format!("{}::{}", qn_tail(type_hint), request.name);
             if let Some((symbol, reason)) = try_scope(&tail_target) {
                 return Some((symbol, EdgeConfidence::Syntactic, reason));
@@ -1040,9 +1061,11 @@ pub(crate) fn resolve_symbol<'a>(
     // shorthand `.idle`), so binding one to a qualified/receiver-bearing reference here would
     // manufacture a dependency the source never expressed — `client.idle()` becoming a "caller" of
     // `enum Status { case idle }`. Let the language policy exclude those kinds from this fallback.
+    // ANY receiver-type identity — including Ambiguous — suppresses the bare fallback: unusable
+    // evidence is not the same as no evidence.
     let reference_is_bare = request.target_qualified_name.is_none_or(str::is_empty)
         && request.receiver_hint.is_none_or(str::is_empty)
-        && request.receiver_type_hint.is_none_or(str::is_empty);
+        && request.receiver_type.is_none();
     let bare_shape_ok = |symbol: &IndexedSymbol| {
         reference_is_bare
             || !policy.is_some_and(|policy| {

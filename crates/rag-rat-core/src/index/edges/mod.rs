@@ -650,19 +650,60 @@ impl<'a> SymbolIndex<'a> {
     }
 }
 
+/// The ONE explicit classification of a stored receiver-type hint (#567 review): computed once
+/// at request build — the only place the import scope is visible — and consumed by
+/// `resolve_symbol`, so every receiver-type rule hangs off this seam instead of independent
+/// guards. The shared rule set:
+/// - canonicalization (generics folded, `crate::`/`self::` resolved, `super::` declined) happened
+///   at EXTRACTION; the stored hint is already canonical;
+/// - `Local*` identities may resolve; tail matching is a conservative FALLBACK for a qualified
+///   local hint only, and only when the tail names exactly one viable target;
+/// - `ExternalQualified` and `Ambiguous` never resolve against local symbols — `use
+///   external::Worker; fn f(w: Worker) { w.run() }` must not bind to an unrelated local
+///   `Worker::run`, and the callee-name suppression (`imported_external` below) cannot see the TYPE
+///   (it inspects `run` and the value receiver `w`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiverTypeIdentity<'a> {
+    /// Module-qualified (`workers::Worker`) with a workspace-local root.
+    LocalQualified(&'a str),
+    /// A bare local type name (`Worker`) — nothing left to qualify.
+    LocalUnqualified(&'a str),
+    /// The root segment (or the bare name itself) names an external import.
+    ExternalQualified(&'a str),
+    /// Present but unusable evidence (empty after normalization, forms the classifier cannot
+    /// place). Never resolves, and still suppresses the bare-name fallback — unusable evidence
+    /// is not the same as no evidence.
+    Ambiguous,
+}
+
+impl<'a> ReceiverTypeIdentity<'a> {
+    /// Classify a stored hint against the reference's import scope; `None` when the edge carries
+    /// no hint at all. `is_external_root` answers "does this segment name an external import at
+    /// the call site?".
+    pub(crate) fn classify(
+        hint: Option<&'a str>,
+        is_external_root: impl Fn(&str) -> bool,
+    ) -> Option<Self> {
+        let hint = hint?.trim();
+        if hint.is_empty() {
+            return Some(Self::Ambiguous);
+        }
+        Some(match hint.split_once("::") {
+            Some((root, _)) if is_external_root(root) => Self::ExternalQualified(hint),
+            Some(_) => Self::LocalQualified(hint),
+            None if is_external_root(hint) => Self::ExternalQualified(hint),
+            None => Self::LocalUnqualified(hint),
+        })
+    }
+}
+
 pub(crate) struct ResolveSymbolRequest<'a> {
     name: &'a str,
     target_qualified_name: Option<&'a str>,
     edge_kind: EdgeKind,
     evidence: Option<&'a str>,
     receiver_hint: Option<&'a str>,
-    receiver_type_hint: Option<&'a str>,
-    /// The ROOT segment of `receiver_type_hint` names an external import (`use external::Worker;
-    /// fn f(w: Worker)`). `imported_external` below is computed from the CALLEE name and the
-    /// qualified root, so it cannot see this: without a separate flag the receiver-type branch
-    /// would confidently bind an external method call to an unrelated same-named local type
-    /// (#567). When set, the receiver-type branch is skipped entirely — never resolved locally.
-    receiver_type_external: bool,
+    receiver_type: Option<ReceiverTypeIdentity<'a>>,
     source_file_id: i64,
     source_language: Option<&'a str>,
     /// `name` is brought into this file by a `use` from an EXTERNAL dependency crate (#61 Project

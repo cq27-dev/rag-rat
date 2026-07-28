@@ -1664,6 +1664,15 @@ impl IndexDatabase {
                 )?;
             }
             self.resolve_edges()?;
+            // A lagging `logical_key_version` must not survive an on-open graph heal: without
+            // this, an index upgraded across a key-derivation change (e.g. scope_path joining
+            // the key) keeps its OLD merged/split logical ids until some unrelated source
+            // mutation triggers a rebuilding pass — memory bindings and symbol surfaces keep
+            // leaking across owners indefinitely on an otherwise idle repo. The rebuild heals
+            // drifted durable references and stamps the current version itself.
+            if self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() != Some(LOGICAL_KEY_VERSION) {
+                self.rebuild_logical_symbols(KeyVersionStamp::FullRederive)?;
+            }
             self.mark_graph_index_current()?;
             Ok(())
         })();

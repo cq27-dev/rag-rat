@@ -602,7 +602,6 @@ pub(crate) fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeA
     let target_qualified_name: Option<String> = row.get("target_qualified_name")?;
     let receiver_hint: Option<String> = row.get("receiver_hint")?;
     let receiver_type_hint: Option<String> = row.get("receiver_type_hint")?;
-    let hinted = receiver_type_hint.as_deref().filter(|value| !value.is_empty());
     let parts = EdgeFingerprintParts {
         path: &path,
         start_line,
@@ -612,49 +611,65 @@ pub(crate) fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeA
         edge_kind: &edge_kind,
         target_qualified_name: target_qualified_name.as_deref(),
         receiver_hint: receiver_hint.as_deref(),
-        receiver_type_hint: hinted,
+        receiver_type_hint: receiver_type_hint.as_deref().filter(|value| !value.is_empty()),
     };
     Ok(EdgeAnchor {
         edge_id: row.get("edge_id")?,
         fingerprint: edge_fingerprint(parts),
-        // The pre-#567 8-field format for an edge that NOW carries a hint: reindexing under
-        // GRAPH_INDEX_VERSION 12 gives previously hintless call edges a receiver type, changing
-        // their stable fingerprint; a binding persisted before the upgrade still holds the legacy
-        // value and must find the unchanged call site (relocated), not report `gone`.
-        legacy_fingerprint: hinted
-            .is_some()
-            .then(|| edge_fingerprint(EdgeFingerprintParts { receiver_type_hint: None, ..parts })),
+        // Compatibility shadow for bindings persisted before the versioned format (see
+        // `legacy_edge_fingerprint`): they must find their unchanged call site (relocated),
+        // not report `gone`.
+        legacy_fingerprint: Some(legacy_edge_fingerprint(parts)),
         path,
         start_line,
         end_line,
         source_hash: row.get("source_hash")?,
     })
 }
-/// The exact, row-id-independent edge identity (#38). `receiver_type_hint` participates HERE
-/// (unlike the loose from/to/kind/target identity) so a receiver-type-driven re-resolution that
-/// re-points the same call site at a different method (`Alpha::run` → `Beta::run`) changes the
-/// fingerprint even though path/span/names/kind/target/`receiver_hint` all stay put — otherwise
-/// `edge_by_fingerprint` would keep validating a call-path anchor `current` against a target it no
-/// longer resolves to (#567). NULL/empty is folded away (no trailing field appended) so every
-/// fingerprint computed before this field existed is preserved byte-for-byte — legacy edges never
-/// spuriously go stale.
+/// The exact, row-id-independent edge identity (#38), VERSIONED (#567 review): the leading
+/// version line plus the always-present `receiver_type_hint` field mean the two formats can
+/// never collide — so a post-upgrade binding on a hintless edge is NOT masked when that edge
+/// later gains a hint (its stored v2 value matches neither the edge's new v2 fingerprint nor
+/// the legacy form below). `receiver_type_hint` participates (unlike the loose
+/// from/to/kind/target identity) so a receiver-type re-resolution that re-points the same call
+/// site (`Alpha::run` → `Beta::run`) changes the fingerprint. Bindings persisted in the
+/// pre-versioned 8-field format still match through [`legacy_edge_fingerprint`].
 pub(crate) fn edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String {
-    let mut buf = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        parts.path,
-        parts.start_line,
-        parts.end_line,
-        parts.from_name.unwrap_or(""),
-        parts.to_name.unwrap_or(""),
-        parts.edge_kind,
-        parts.target_qualified_name.unwrap_or(""),
-        parts.receiver_hint.unwrap_or("")
-    );
-    if let Some(receiver_type_hint) = parts.receiver_type_hint.filter(|value| !value.is_empty()) {
-        buf.push('\n');
-        buf.push_str(receiver_type_hint);
-    }
-    hex_sha256(buf.as_bytes())
+    hex_sha256(
+        format!(
+            "2\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            parts.path,
+            parts.start_line,
+            parts.end_line,
+            parts.from_name.unwrap_or(""),
+            parts.to_name.unwrap_or(""),
+            parts.edge_kind,
+            parts.target_qualified_name.unwrap_or(""),
+            parts.receiver_hint.unwrap_or(""),
+            parts.receiver_type_hint.unwrap_or("")
+        )
+        .as_bytes(),
+    )
+}
+
+/// The pre-versioned 8-field fingerprint — computed for every live edge as a COMPATIBILITY value
+/// only, so bindings persisted before the version line existed still find their unchanged call
+/// sites. Never stored for new bindings.
+pub(crate) fn legacy_edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String {
+    hex_sha256(
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            parts.path,
+            parts.start_line,
+            parts.end_line,
+            parts.from_name.unwrap_or(""),
+            parts.to_name.unwrap_or(""),
+            parts.edge_kind,
+            parts.target_qualified_name.unwrap_or(""),
+            parts.receiver_hint.unwrap_or("")
+        )
+        .as_bytes(),
+    )
 }
 
 /// One live-edge candidate for call-path re-resolution: the exact fingerprint plus the loose
@@ -732,7 +747,6 @@ pub(crate) fn live_edges_matching_identities(
         let target_qualified_name = row.get::<_, Option<String>>("target_qualified_name")?;
         let receiver_hint = row.get::<_, Option<String>>("receiver_hint")?;
         let receiver_type_hint = row.get::<_, Option<String>>("receiver_type_hint")?;
-        let hinted = receiver_type_hint.as_deref().filter(|value| !value.is_empty());
         let parts = EdgeFingerprintParts {
             path: &path,
             start_line,
@@ -742,15 +756,13 @@ pub(crate) fn live_edges_matching_identities(
             edge_kind: &edge_kind,
             target_qualified_name: target_qualified_name.as_deref(),
             receiver_hint: receiver_hint.as_deref(),
-            receiver_type_hint: hinted,
+            receiver_type_hint: receiver_type_hint.as_deref().filter(|value| !value.is_empty()),
         };
         Ok(LiveEdgeMatch {
             fingerprint: edge_fingerprint(parts),
-            // Same legacy-format shadow as `edge_anchor_row`: pre-upgrade call-path edges hold
-            // 8-field fingerprints and must still consume their unchanged live call site.
-            legacy_fingerprint: hinted.is_some().then(|| {
-                edge_fingerprint(EdgeFingerprintParts { receiver_type_hint: None, ..parts })
-            }),
+            // Same compatibility shadow as `edge_anchor_row`: pre-upgrade call-path edges
+            // hold 8-field fingerprints and must still consume their unchanged live call site.
+            legacy_fingerprint: Some(legacy_edge_fingerprint(parts)),
             from_name,
             to_name,
             edge_kind,
@@ -1202,13 +1214,27 @@ mod receiver_type_hint_fingerprint_tests {
     }
 
     #[test]
-    fn null_and_empty_receiver_type_hint_preserve_the_legacy_fingerprint() {
-        // Legacy edges (indexed before `receiver_type_hint` existed) carry NULL here. Their
-        // fingerprint must stay byte-for-byte identical to the pre-#567 8-field format, or every
-        // already-persisted `repo_memory_call_path_edges.edge_fingerprint` would go stale at once.
+    fn legacy_helper_preserves_the_pre_versioned_format() {
+        // Bindings persisted before the version line hold exactly this 8-field byte format —
+        // `legacy_edge_fingerprint` must reproduce it, and the versioned format must NEVER
+        // collide with it (hint present or not).
         let legacy_format =
             hex_sha256("src/lib.rs\n10\n10\ncaller\nrun\ncalls_name\n\nrecv".as_bytes());
-        assert_eq!(edge_fingerprint(base_parts(None)), legacy_format);
-        assert_eq!(edge_fingerprint(base_parts(Some(""))), legacy_format);
+        assert_eq!(legacy_edge_fingerprint(base_parts(None)), legacy_format);
+        assert_eq!(legacy_edge_fingerprint(base_parts(Some("Alpha"))), legacy_format);
+        assert_ne!(edge_fingerprint(base_parts(None)), legacy_format);
+        assert_ne!(edge_fingerprint(base_parts(Some("Alpha"))), legacy_format);
+    }
+
+    #[test]
+    fn versioned_hintless_binding_is_not_masked_by_a_later_hint_gain() {
+        // A binding created AFTER the upgrade on a then-hintless edge stores the versioned
+        // hintless value. When the same call span later gains a hint (an untyped binding
+        // becomes typed), the stored value must match neither the edge's new versioned
+        // fingerprint nor its legacy compatibility shadow — the change is detected, not
+        // silently reported current.
+        let stored = edge_fingerprint(base_parts(None));
+        assert_ne!(stored, edge_fingerprint(base_parts(Some("Alpha"))));
+        assert_ne!(stored, legacy_edge_fingerprint(base_parts(Some("Alpha"))));
     }
 }

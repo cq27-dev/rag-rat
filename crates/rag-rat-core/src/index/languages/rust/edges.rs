@@ -311,7 +311,10 @@ fn infer_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
             && let Some(type_node) = ancestor.child_by_field_name("type")
         {
             let type_text = node_text(type_node, text);
-            return clean_rust_type_name(&type_text, &[]);
+            let cleaned = clean_rust_type_name(&type_text, &[])?;
+            // Canonical against the IMPL's own module — `mod inner { impl Worker { … } }`
+            // yields `inner::Worker`, matching the method's container-based scope path.
+            return module_qualified_type_path(ancestor, &cleaned, text);
         }
         current = ancestor.parent();
     }
@@ -320,6 +323,11 @@ fn infer_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
 
 fn clean_rust_type_name(raw: &str, fn_generics: &[&str]) -> Option<String> {
     let s = raw.trim();
+    // A raw-pointer TYPE is not a dereferenced expression: `*mut Worker` must decline here,
+    // before the expression cleaner strips the `*` and the pointer masquerades as `Worker`.
+    if s.starts_with('*') {
+        return None;
+    }
     let cleaned = clean_receiver_expr(s).unwrap_or(s);
     if cleaned.starts_with('<') || cleaned.contains(" as ") {
         return None;
@@ -327,17 +335,6 @@ fn clean_rust_type_name(raw: &str, fn_generics: &[&str]) -> Option<String> {
     let without_generics = degeneric_path(cleaned);
     let type_str = without_generics.trim();
     if type_str.is_empty() {
-        return None;
-    }
-    // Root-relative qualifiers never appear in a symbol's container-based scope path: strip
-    // `crate::`/`self::` so `fn f(w: crate::workers::Worker)` still reaches `workers::Worker` /
-    // the `Worker` tail at resolve time. `super::` is relative to a module this function cannot
-    // see — decline rather than misresolve (#567).
-    let type_str = type_str
-        .strip_prefix("crate::")
-        .or_else(|| type_str.strip_prefix("self::"))
-        .unwrap_or(type_str);
-    if type_str.starts_with("super::") {
         return None;
     }
     if type_str.starts_with("dyn ") || type_str.starts_with("impl ") {
@@ -472,8 +469,16 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
     None
 }
 
+/// The ONE canonicalization point for let/param/constructor-derived hints: resolve the
+/// as-written type against the call's lexical module (`mod inner { fn f(w: Worker) }` →
+/// `inner::Worker`), so a bare hint can never exact-match a same-tail owner in a DIFFERENT
+/// module (#567 review). `Self` routes through the impl's own context instead.
 fn canonical_receiver_type(type_name: String, call_node: Node<'_>, text: &str) -> Option<String> {
-    if type_name == "Self" { infer_self_type_hint(call_node, text) } else { Some(type_name) }
+    if type_name == "Self" {
+        infer_self_type_hint(call_node, text)
+    } else {
+        module_qualified_type_path(call_node, &type_name, text)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -918,6 +923,33 @@ mod receiver_type_hint_tests {
     }
 
     #[test]
+    fn test_bare_hint_is_canonical_against_the_lexical_module() {
+        let code = r#"
+            struct Worker;
+            mod inner {
+                struct Worker;
+                fn f(w: &Worker) {
+                    w.run();
+                }
+            }
+        "#;
+        // The parameter's `Worker` is `inner::Worker` — a bare hint would exact-match the ROOT
+        // `Worker::run` scope instead. Canonicalization pins the lexical module.
+        assert_eq!(extract_call_hints(code), vec![Some("inner::Worker".to_string())]);
+    }
+
+    #[test]
+    fn test_raw_pointer_receiver_type_declined() {
+        let code = r#"
+            fn f(p: *mut Worker) {
+                p.is_null();
+            }
+        "#;
+        // `*mut Worker` is a pointer, not a dereferenced `Worker` — no hint.
+        assert_eq!(extract_call_hints(code), vec![None]);
+    }
+
+    #[test]
     fn test_sibling_module_constructor_owners_stay_separate() {
         let code = r#"
             mod a {
@@ -936,8 +968,9 @@ mod receiver_type_hint_tests {
             }
         "#;
         // The unqualified `Factory::new()` inside `mod a` is `a::Factory::new` — module b's
-        // same-tail impl must not classify it. Calls: Factory::new(), worker.run().
-        assert_eq!(extract_call_hints(code), vec![None, Some("WorkerA".to_string())]);
+        // same-tail impl must not classify it, and the produced hint is canonical against the
+        // call's lexical module. Calls: Factory::new(), worker.run().
+        assert_eq!(extract_call_hints(code), vec![None, Some("a::WorkerA".to_string())]);
     }
 
     #[test]
