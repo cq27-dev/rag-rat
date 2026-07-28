@@ -6285,14 +6285,19 @@ pub fn apply_sync_invites_normalized_receipts(conn: &Connection) -> rusqlite::Re
     tx.commit()
 }
 
-/// V093 (#1001): the table-sync forward-compat projection substrate — three facts the engine could
-/// not previously record, each of which silently corrupts a synced table once one registers.
+/// V093 (#1001): the table-sync forward-compat projection substrate — facts the engine could not
+/// previously record, each of which silently corrupts a synced table once one registers.
 ///
 /// - `table_sync_entries.pending_reason` / `.pending_projector_version`: an entry this binary
 ///   cannot fully project (unknown column, unknown op-kind, undecodable payload, table out of
 ///   scope) is retained but was never marked, so redelivery short-circuits on `entry_exists` and
 ///   the payload is unrecoverable. Marking it lets a later binary that understands it replay
 ///   exactly the outstanding set. NULL reason = fully projected.
+/// - `table_sync_entries.quarantine_reason`: the TERMINAL counterpart. A payload rejected on its
+///   own merits — a type mismatch, a constraint violation — is not a version gap, and no later
+///   binary makes those data fit, so it must leave the replay worklist. Recording WHY keeps it
+///   discoverable, instead of a retained entry that looks fully projected but was actually
+///   rejected.
 /// - `table_sync_streams`: `stream_id` is a ONE-WAY sha256 of `(repo_id, account_id, scope_id)`,
 ///   and entries store only the stream id. Replay needs `repo_id` to apply and the scope to resolve
 ///   the table spec, so without this directory a stored entry cannot be replayed at all.
@@ -6311,7 +6316,8 @@ pub fn apply_table_sync_projection_state(conn: &Connection) -> rusqlite::Result<
     if !column_exists(&tx, "table_sync_entries", "pending_reason")? {
         tx.execute_batch(
             "ALTER TABLE table_sync_entries ADD COLUMN pending_reason TEXT;
-             ALTER TABLE table_sync_entries ADD COLUMN pending_projector_version INTEGER;",
+             ALTER TABLE table_sync_entries ADD COLUMN pending_projector_version INTEGER;
+             ALTER TABLE table_sync_entries ADD COLUMN quarantine_reason TEXT;",
         )?;
     }
     if !column_exists(&tx, "sync_published_rows", "projector_version")? {

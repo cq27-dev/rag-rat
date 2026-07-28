@@ -538,6 +538,45 @@ pub(crate) fn published_hash(
         .optional()?)
 }
 
+/// Whether this row holds a local change that has not been authored yet, so a caller replaying an
+/// older retained entry over it would DESTROY work no peer has seen.
+///
+/// A raw local write does not advance `sync_row_clocks` — only authoring-and-self-applying does —
+/// so the ordinary LWW comparison cannot see an unsent edit at all: it compares the incoming op
+/// against the clock of whatever was last *published*, and happily wins. The live ingest path
+/// accepts that exposure because the driver's contract is to author local rows before applying
+/// remote ones; the refold has no such driver, and runs at store open where an edit made just
+/// before the last exit is exactly what is sitting here.
+///
+/// Reports only what it can PROVE, which is what keeps it useful: a cross-column-set hash
+/// comparison is meaningless (the hashes cover different cell lists), so a row published by an
+/// older projector is NOT called unsent — treating it as such would make the refold skip precisely
+/// the rows it exists to repair. Those rows are in the ordinary last-writer-wins regime, where the
+/// refold behaves exactly as live ingest does and the driver's author-before-apply ordering
+/// governs.
+pub(crate) fn row_has_unsent_local_change(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    pk_vals: &[TypedValue],
+) -> anyhow::Result<bool> {
+    let Some(current) = synced_row_hash(tx, spec, pk_vals)? else {
+        // No row: nothing local to lose (the entry is establishing it).
+        return Ok(false);
+    };
+    let row_pk = row_op::row_pk_string(pk_vals);
+    Ok(match published_hash(tx, repo_id, spec.name, &row_pk)? {
+        // Comparable: a differing hash is a demonstrably unsent local change.
+        Some((published, version)) if version == super::refold::TABLE_SYNC_PROJECTOR_VERSION =>
+            published != current,
+        // Published under a different column set — not comparable, so nothing is proven either way.
+        Some(_) => false,
+        // A live row no apply ever published is purely local: the only content there came from this
+        // device, and no peer has seen it.
+        None => true,
+    })
+}
+
 /// Claim `row_pk` as a COMPLETE projection: `hash` covers every synced column this binary knows,
 /// stamped with the projector version that defines that column set.
 pub(crate) fn record_published(

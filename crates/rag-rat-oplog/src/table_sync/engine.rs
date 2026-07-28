@@ -149,7 +149,12 @@ pub(crate) fn ingest(
                 };
                 match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
                     ApplyOutcome::Applied => IngestOutcome::Applied,
-                    ApplyOutcome::Quarantined(why) => IngestOutcome::Quarantined(why),
+                    // Durably recorded as well as returned: the caller sees this one, but nothing
+                    // later could tell a rejected payload from a projected one without the mark.
+                    ApplyOutcome::Quarantined(why) => {
+                        store::record_entry_quarantine(tx, &entry_hash, &why)?;
+                        IngestOutcome::Quarantined(why)
+                    },
                     // A newer producer's column: nothing was written. Mark the stored entry so the
                     // refold replays it once this binary learns the column — only the applier can
                     // see this, which is why `accept_row_entry` handed back the entry hash.

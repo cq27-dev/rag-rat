@@ -5092,6 +5092,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "strum",
  "tempfile",
  "x25519-dalek",
  "zeroize",

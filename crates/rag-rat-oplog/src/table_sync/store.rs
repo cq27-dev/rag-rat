@@ -41,9 +41,15 @@ const MAX_LAMPORT_ADVANCE: u64 = 1 << 32;
 /// mark, redelivery short-circuits on `entry_exists` and the payload is unrecoverable.
 ///
 /// These tokens are SCHEMA: they are written to `table_sync_entries.pending_reason` and read back
-/// by a future binary, so every variant round-trips through [`PendingReason::as_db_str`] /
-/// [`PendingReason::from_db_str`] and a rename needs a migration, exactly like a column rename.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// by a future binary, so a rename needs a migration exactly like a column rename. The tokens are
+/// strum-derived rather than hand-matched so the write and parse sides cannot drift apart as
+/// variants are added, and [`PendingReason::as_db_str`] / [`PendingReason::from_db_str`] stay the
+/// only paths to the stored form. The exact strings are pinned by test, so a `serialize_all` change
+/// cannot silently move them.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum PendingReason {
     /// The op carries a column this registry does not know — a newer producer. Nothing is written:
     /// applying the known subset would leave a row NO device ever authored, and publishing that row
@@ -65,24 +71,14 @@ pub(crate) enum PendingReason {
 
 impl PendingReason {
     pub(crate) fn as_db_str(self) -> &'static str {
-        match self {
-            Self::UnknownColumn => "unknown_column",
-            Self::PartialAfterImage => "partial_after_image",
-            Self::UnknownOpKind => "unknown_op_kind",
-            Self::UndecodablePayload => "undecodable_payload",
-            Self::TableNotInScope => "table_not_in_scope",
-        }
+        self.into()
     }
 
+    /// Exact-token parse: an unrecognized value is `None`, never coerced to a default — a stored
+    /// token this binary does not know means a NEWER binary wrote it, and guessing would silently
+    /// reclassify why an entry is outstanding.
     pub(crate) fn from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "unknown_column" => Some(Self::UnknownColumn),
-            "partial_after_image" => Some(Self::PartialAfterImage),
-            "unknown_op_kind" => Some(Self::UnknownOpKind),
-            "undecodable_payload" => Some(Self::UndecodablePayload),
-            "table_not_in_scope" => Some(Self::TableNotInScope),
-            _ => None,
-        }
+        value.parse().ok()
     }
 }
 
@@ -377,6 +373,28 @@ pub(crate) fn mark_entry_pending(
             SET pending_reason = ?2, pending_projector_version = ?3
           WHERE entry_hash = ?1",
         params![entry_hash.as_slice(), reason.as_db_str(), projector_version],
+    )?;
+    Ok(())
+}
+
+/// Record that an entry was rejected on its own merits — a type mismatch, a constraint violation —
+/// and drop it from the replay worklist.
+///
+/// TERMINAL, unlike a pending mark: those are version gaps a later binary redeems, this is data
+/// that does not fit the table and never will. Both facts have to be durable. Leaving it merely
+/// unmarked would make a rejected payload indistinguishable from a fully projected one, so nothing
+/// downstream could ever report it; leaving it PENDING would retry it on every future projector
+/// bump forever. The entry itself stays stored — it still relays, and it is the evidence.
+pub(crate) fn record_entry_quarantine(
+    tx: &Transaction<'_>,
+    entry_hash: &[u8; 32],
+    reason: &str,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE table_sync_entries
+            SET pending_reason = NULL, pending_projector_version = NULL, quarantine_reason = ?2
+          WHERE entry_hash = ?1",
+        params![entry_hash.as_slice(), reason],
     )?;
     Ok(())
 }

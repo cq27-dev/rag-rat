@@ -147,6 +147,15 @@ fn replay_pending_entry(
     else {
         return repark(tx, pending, PendingReason::TableNotInScope);
     };
+    // NEVER replay over an unsent local edit. A raw local write does not advance the row clock, so
+    // the LWW comparison cannot see it and this older entry would simply win — silently destroying
+    // a change no peer has ever seen, at store open, before anything has had a chance to author
+    // it. Leaving the entry pending costs nothing: once the producer authors that edit (at a
+    // lamport above this entry's, since authoring counts parked entries), a later replay lands
+    // and loses on the merits.
+    if apply::row_has_unsent_local_change(tx, spec, &context.repo_id, op.pk())? {
+        return Ok(());
+    }
     let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
     match apply::apply_row_op(tx, spec, &context.repo_id, &op, meta)? {
         // Folded. `Applied` also covers "deliberately lost" — superseded by a newer winner, or
@@ -155,10 +164,11 @@ fn replay_pending_entry(
         // Terminal, so it stops being outstanding: a type mismatch or a constraint violation is a
         // BROKEN PRODUCER — the values do not fit the declared column types or the table's
         // constraints, and no future binary makes them fit. (A missing column is NOT this case: it
-        // is an older producer, which reports `Unprojectable` and stays on the worklist.) The entry
-        // stays STORED — it still relays, and it is evidence — it just leaves the refold's worklist
-        // instead of being retried on every future bump.
-        ApplyOutcome::Quarantined(_) => store::clear_entry_pending(tx, &pending.entry_hash),
+        // is an older producer, which reports `Unprojectable` and stays on the worklist.) Recorded
+        // rather than merely cleared: this path has no caller to return an outcome to, so without a
+        // durable reason a rejected payload would be indistinguishable from a projected one.
+        ApplyOutcome::Quarantined(why) =>
+            store::record_entry_quarantine(tx, &pending.entry_hash, &why),
         // Still ahead of us — record which gap, under this version, so the next bump can tell
         // "newly stuck" from "stuck since v1".
         ApplyOutcome::Unprojectable(reason) => repark(tx, pending, reason),
@@ -243,6 +253,8 @@ mod tests {
     use super::*;
     use crate::table_sync::engine::{self, IngestOutcome, SyncCtx};
     use crate::table_sync::registry::{ColumnSpec, ValueType};
+    use crate::table_sync::row_op::{Cell, RowOp, TypedValue};
+    use crate::table_sync::scope_stream::scope_stream_id;
     use crate::{AccountId, LocalDevice};
 
     /// The physical table carries both columns; which of them a binary KNOWS is what the two specs
@@ -462,11 +474,19 @@ mod tests {
         b.enroll(a.pubkey().fingerprint());
         b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
 
-        // B edits the same row locally while the entry sits parked.
+        // B edits the same row locally while the entry sits parked, and AUTHORS it — so the row is
+        // published, not unsent (the unsent case is its own test below).
         b.conn
             .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'mine', NULL)", [])
             .unwrap();
         assert_eq!(b.produce(OLD_REGISTRY, "repo").len(), 1, "the local edit is authored");
+        // Published by the OLD binary, so its hash covers the old column set (the single projector
+        // const cannot express two binaries; stamping models it, as the storm test does).
+        b.conn
+            .execute("UPDATE sync_published_rows SET projector_version = ?1", params![
+                TABLE_SYNC_PROJECTOR_VERSION - 1
+            ])
+            .unwrap();
 
         assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
         assert_eq!(
@@ -507,24 +527,60 @@ mod tests {
         // one refold must drain the pending entries of EVERY repo, not the caller's alone.
         // Otherwise a bump triggered from one checkout would stamp the version current while
         // leaving a sibling checkout's entries unreplayed forever.
+        // Repo-SCOPED specs, because a registered table must be (an unscoped table replicated
+        // through per-repo streams has no per-repo bookkeeping and cannot fold under LWW at all —
+        // the deferred account-global gap). Each repo therefore owns a distinct physical row.
+        const SCOPED_OLD: TableSpec = TableSpec {
+            name: "t_scoped",
+            scope_id: "demo/1",
+            pk: &[ColumnSpec { name: "repo_id", value_type: ValueType::Text }, ColumnSpec {
+                name: "id",
+                value_type: ValueType::Text,
+            }],
+            columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }],
+            local_columns: &["later_col"],
+            repo_column: Some("repo_id"),
+        };
+        const SCOPED_NEW: TableSpec = TableSpec {
+            name: "t_scoped",
+            scope_id: "demo/1",
+            pk: &[ColumnSpec { name: "repo_id", value_type: ValueType::Text }, ColumnSpec {
+                name: "id",
+                value_type: ValueType::Text,
+            }],
+            columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }, ColumnSpec {
+                name: "later_col",
+                value_type: ValueType::Text,
+            }],
+            local_columns: &[],
+            repo_column: Some("repo_id"),
+        };
+        let scoped_table = "CREATE TABLE t_scoped(
+                 repo_id TEXT NOT NULL, id TEXT NOT NULL, title TEXT, later_col TEXT,
+                 PRIMARY KEY(repo_id, id)
+             ) STRICT;";
         let mut a = Device::new();
         let mut b = Device::new();
+        a.conn.execute_batch(scoped_table).unwrap();
+        b.conn.execute_batch(scoped_table).unwrap();
         b.enroll(a.pubkey().fingerprint());
 
         for repo in ["repo-one", "repo-two"] {
-            a.conn.execute("DELETE FROM t_demo", []).unwrap();
             a.conn
-                .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', ?1, 'wide')", [
-                    repo,
-                ])
+                .execute(
+                    "INSERT INTO t_scoped(repo_id, id, title, later_col)
+                     VALUES (?1, 'r1', ?1, 'wide')",
+                    [repo],
+                )
                 .unwrap();
-            let entries = a.produce(NEW_REGISTRY, repo);
-            b.ingest(OLD_REGISTRY, repo, &entries, &a.pubkey());
+            let entries = a.produce(&[SCOPED_NEW], repo);
+            assert_eq!(entries.len(), 1, "one row authored for {repo}");
+            b.ingest(&[SCOPED_OLD], repo, &entries, &a.pubkey());
         }
         assert_eq!(b.pending_count(), 2, "one parked entry per repo");
 
         // One refold, driven from a single checkout's connection.
-        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert!(refold_stale_projections_against(&b.conn, &[SCOPED_NEW]).unwrap());
         assert_eq!(b.pending_count(), 0, "both repos' entries were replayed");
         let clocks: i64 = b
             .conn
@@ -689,16 +745,100 @@ mod tests {
     }
 
     #[test]
+    fn the_refold_never_overwrites_an_unsent_local_edit() {
+        // The refold runs at STORE OPEN, before anything has had a chance to author. A raw local
+        // write does not advance the row clock, so an older retained entry would win the ordinary
+        // LWW comparison and destroy a change no peer has ever seen — the one thing this pass must
+        // never do. (The live ingest path tolerates the same exposure only because the driver's
+        // contract is to author local rows first; there is no driver here.)
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let entries = author_wide_row(&mut a);
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
+
+        // B writes the same row locally and exits before the next producer pass.
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'unsent', NULL)", [])
+            .unwrap();
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.row().unwrap().0, "unsent", "the unsent local edit survives the refold");
+        assert_eq!(b.pending_count(), 1, "and the entry stays outstanding rather than being lost");
+
+        // Authoring it settles the race on the merits: the local edit takes a lamport above the
+        // parked entry (authoring counts parked entries), so it wins wherever both are seen.
+        assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1, "the local edit is still authorable");
+    }
+
+    #[test]
+    fn a_quarantine_found_during_replay_is_recorded_rather_than_silently_cleared() {
+        // An entry can park under a narrow registry and then be REJECTED under a wider one: here
+        // the op types `later_col` as an integer while the wider spec declares it text.
+        // That is a broken producer, not a version gap, so it leaves the worklist — but the
+        // rejection has to be durable, or a retained-but-rejected payload is
+        // indistinguishable from a projected one and nothing downstream could ever report
+        // it. This path has no caller to return an outcome to.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let mistyped = RowOp::Upsert {
+            table: "t_demo".to_string(),
+            pk: vec![TypedValue::Text("r1".to_string())],
+            cells: vec![
+                Cell { column: "later_col".to_string(), value: TypedValue::I64(7) },
+                Cell { column: "title".to_string(), value: TypedValue::Text("v".to_string()) },
+            ],
+        };
+        let signed = {
+            let tx = a.conn.transaction().unwrap();
+            let stream = scope_stream_id("repo", account(), "demo/1");
+            let signed =
+                store::author_row_entry(&tx, stream, a.local.secret(), &mistyped, 0).unwrap();
+            tx.commit().unwrap();
+            signed.signed_bytes
+        };
+
+        b.enroll(a.pubkey().fingerprint());
+        assert_eq!(b.ingest(OLD_REGISTRY, "repo", &[signed], &a.pubkey()), vec![
+            IngestOutcome::Retained(PendingReason::UnknownColumn.as_db_str())
+        ],);
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.pending_count(), 0, "a broken payload leaves the retry worklist");
+        let quarantine: Option<String> = b
+            .conn
+            .query_row("SELECT quarantine_reason FROM table_sync_entries", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            quarantine.is_some_and(|why| why.contains("later_col")),
+            "the rejection is durable and names what did not fit"
+        );
+        assert_eq!(b.row(), None, "and nothing was written");
+    }
+
+    #[test]
     fn pending_reasons_round_trip_through_their_stored_tokens() {
-        for reason in [
-            PendingReason::UnknownColumn,
-            PendingReason::PartialAfterImage,
-            PendingReason::UnknownOpKind,
-            PendingReason::UndecodablePayload,
-            PendingReason::TableNotInScope,
-        ] {
+        // Exhaustive over the enum, so a variant added later cannot skip the round trip.
+        for reason in <PendingReason as strum::IntoEnumIterator>::iter() {
             assert_eq!(PendingReason::from_db_str(reason.as_db_str()), Some(reason));
         }
-        assert_eq!(PendingReason::from_db_str("not_a_reason"), None);
+        assert_eq!(
+            PendingReason::from_db_str("not_a_reason"),
+            None,
+            "unknown tokens do not coerce"
+        );
+    }
+
+    #[test]
+    fn pending_reason_tokens_are_pinned() {
+        // These strings are STORED, so they are schema: changing one (or the `serialize_all` rule
+        // that derives them) silently reclassifies every row a prior binary wrote. Pin them
+        // literally — the derive keeps write and parse in step, this keeps the values themselves
+        // from moving.
+        assert_eq!(PendingReason::UnknownColumn.as_db_str(), "unknown_column");
+        assert_eq!(PendingReason::PartialAfterImage.as_db_str(), "partial_after_image");
+        assert_eq!(PendingReason::UnknownOpKind.as_db_str(), "unknown_op_kind");
+        assert_eq!(PendingReason::UndecodablePayload.as_db_str(), "undecodable_payload");
+        assert_eq!(PendingReason::TableNotInScope.as_db_str(), "table_not_in_scope");
     }
 }
