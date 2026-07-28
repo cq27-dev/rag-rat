@@ -177,6 +177,9 @@ struct LiveBackendTail {
     session: Option<LiveOracleSession>,
     backlog: Vec<String>,
     lifecycle: LiveOracleLifecycle,
+    /// Whether this backend's unmet checkout prerequisite has already been reported. The block is
+    /// permanent until the checkout changes, so it is worth saying — once, not on every retry.
+    prerequisite_reported: bool,
 }
 
 impl LiveBackendTail {
@@ -186,6 +189,7 @@ impl LiveBackendTail {
             session: None,
             backlog: Vec::new(),
             lifecycle: LiveOracleLifecycle::default(),
+            prerequisite_reported: false,
         }
     }
 
@@ -241,17 +245,33 @@ impl LiveBackendTail {
             return;
         }
 
-        // Spawn the session lazily on the first eligible pass. `None` (the server is absent, a
-        // checkout prerequisite is unmet, or the spawn failed) leaves the work in the backlog for
-        // a later pass — the same degrade-quietly UX as a missing embedding model.
+        // Spawn the session lazily on the first eligible pass. A decline leaves the work in the
+        // backlog for a later pass — the same degrade-quietly UX as a missing embedding model.
         if self.session.is_none() {
             if !self.lifecycle.can_respawn(now) {
                 self.backlog = worklist;
                 return;
             }
-            self.session = LiveOracleSession::spawn(self.backend.tool, &config.root);
-            if self.session.is_some() {
-                self.lifecycle.on_spawned(now);
+            match LiveOracleSession::spawn(self.backend.tool, &config.root) {
+                Ok(session) => {
+                    self.session = Some(session);
+                    self.lifecycle.on_spawned(now);
+                },
+                // A prerequisite block is PERMANENT until the checkout changes, so retrying it
+                // silently would leave an operator with a live oracle that never runs and no
+                // reason why. Say it once, then fall through to the ordinary backoff (which is
+                // the right cadence for something that cannot fix itself).
+                Err(rag_rat_oracle::LiveSpawnBlocked::Prerequisite(hint)) => {
+                    if !self.prerequisite_reported {
+                        self.prerequisite_reported = true;
+                        tracing::warn!(
+                            target: "rag_rat_core::watch",
+                            tool = self.backend.tool.as_db_str(),
+                            "live oracle blocked: {hint}"
+                        );
+                    }
+                },
+                Err(rag_rat_oracle::LiveSpawnBlocked::Unavailable) => {},
             }
         }
         let Some(session) = &mut self.session else {
@@ -259,6 +279,8 @@ impl LiveBackendTail {
             self.lifecycle.on_failure(Instant::now());
             return;
         };
+        // A session exists, so whatever blocked earlier is resolved; report it again if it returns.
+        self.prerequisite_reported = false;
 
         let result = db.run_live_oracle_pass(session, &worklist, *budget, started_at_ms);
         // Count idleness from completion: a request batch longer than the idle window must not

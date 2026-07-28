@@ -85,9 +85,8 @@ fn real_typescript_server_warms_before_it_resolves_an_imported_callee() {
     let call = MAIN_TS.rfind("greet").expect("the call site");
     let edge = h.add_edge(src, "greet", call, call + "greet".len(), "NameOnly", None);
 
-    let Some(mut session) = LiveOracleSession::spawn(crate::OracleTool::TsLsp, h.root()) else {
-        panic!("typescript-language-server must be on PATH for this test");
-    };
+    let mut session = LiveOracleSession::spawn(crate::OracleTool::TsLsp, h.root())
+        .expect("typescript-language-server must be on PATH for this test");
     let worklist = vec!["src/main.ts".to_string()];
     let input = LivePassInput {
         commit_sha: COMMIT,

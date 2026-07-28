@@ -70,35 +70,54 @@ pub struct LiveOracleSession {
     root_uri: String,
 }
 
+/// Why a live session could not be established. The distinction is operational, not cosmetic: a
+/// `Prerequisite` block is a PERMANENT property of the checkout that a human has to act on, while
+/// `Unavailable` is the ordinary missing-tool degradation the watcher just keeps retrying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveSpawnBlocked {
+    /// A checkout prerequisite this backend needs is unmet, with the operator-facing hint. Retrying
+    /// cannot fix it — only a change to the checkout can — so the caller must SURFACE the hint
+    /// rather than fold it into a spawn-failure retry loop.
+    Prerequisite(String),
+    /// The language server is absent, unrunnable, or the session could not be established.
+    Unavailable,
+}
+
 impl LiveOracleSession {
-    /// Probe `backend`'s language server and spawn the resident client for `checkout_root`, or
-    /// `None` when the tool is unavailable / a checkout prerequisite is unmet / the session can't
-    /// be established — the same degrade-quietly UX as a missing embedding model or batch tool
-    /// (never an error, never a failed pass). The version is RE-probed at every spawn so
-    /// `tool_version` always names the binary this session's verdicts came from.
-    pub fn spawn(tool: OracleTool, checkout_root: &Path) -> Option<Self> {
-        let backend = LiveBackend::for_tool(tool)?;
+    /// Probe `tool`'s language server and spawn the resident client for `checkout_root`.
+    ///
+    /// Never an error and never a failed pass — the same degrade-quietly UX as a missing embedding
+    /// model or batch tool — but the two ways it can decline are reported separately so a
+    /// permanent configuration problem does not masquerade as a transient one. The version is
+    /// RE-probed at every spawn so `tool_version` always names the binary this session's verdicts
+    /// came from.
+    pub fn spawn(tool: OracleTool, checkout_root: &Path) -> Result<Self, LiveSpawnBlocked> {
+        let Some(backend) = LiveBackend::for_tool(tool) else {
+            return Err(LiveSpawnBlocked::Unavailable);
+        };
         let manifest = ToolManifest::for_tool(tool);
         // The prerequisite gate is not cosmetic for every backend: the live TypeScript client
-        // needs a tsconfig.json because that is what makes the server emit the project-load
+        // needs a tsconfig project because that is what makes the server emit the project-load
         // signal it has no other way to report. Spawning without it would resolve definitions
         // during a warm-up window that answers WRONG rather than null.
-        if manifest.prerequisite_blocked(checkout_root).is_some() {
-            return None;
+        if let Some(hint) = manifest.prerequisite_blocked(checkout_root) {
+            return Err(LiveSpawnBlocked::Prerequisite(hint));
         }
         let ToolAvailability::Available { version, .. } = manifest.probe_in(checkout_root) else {
-            return None;
+            return Err(LiveSpawnBlocked::Unavailable);
         };
-        let root_uri = root_uri_for(checkout_root)?;
+        let Some(root_uri) = root_uri_for(checkout_root) else {
+            return Err(LiveSpawnBlocked::Unavailable);
+        };
         let mut client = LspClient::spawn(
             manifest.program,
             manifest.live_args,
             checkout_root,
             backend.readiness,
         )
-        .ok()?;
-        client.initialize(&root_uri).ok()?;
-        Some(Self { backend, client, tool_version: version, root_uri })
+        .map_err(|_| LiveSpawnBlocked::Unavailable)?;
+        client.initialize(&root_uri).map_err(|_| LiveSpawnBlocked::Unavailable)?;
+        Ok(Self { backend, client, tool_version: version, root_uri })
     }
 
     /// Test seam: a session over an injected (fake-server) client transport. Runs the

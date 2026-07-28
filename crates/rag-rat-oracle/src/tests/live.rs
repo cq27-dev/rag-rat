@@ -1181,6 +1181,24 @@ mod typescript {
     }
 
     #[test]
+    fn an_unmet_prerequisite_is_reported_as_such_not_as_a_missing_tool() {
+        // The two ways a spawn declines are operationally different: a prerequisite block is
+        // permanent until the checkout changes and a human has to act on it, while an absent
+        // server is the ordinary degradation the watcher just keeps retrying. Collapsing them
+        // would leave an operator with a live oracle that silently never runs.
+        let h = Harness::new();
+        match LiveOracleSession::spawn(OracleTool::TsLsp, h.root()) {
+            Err(crate::LiveSpawnBlocked::Prerequisite(hint)) => {
+                assert!(hint.contains("tsconfig.json"), "the hint must name the fix: {hint}");
+            },
+            Err(crate::LiveSpawnBlocked::Unavailable) => {
+                panic!("an empty checkout is blocked by its missing project, not by the binary")
+            },
+            Ok(_) => panic!("a checkout with no TypeScript project must not spawn a session"),
+        }
+    }
+
+    #[test]
     fn a_checkout_with_no_project_is_not_re_opened_every_pass() {
         // Opening a project-less document emits no progress cycle, so it cannot warm anything.
         // Doing it anyway would burn a notification per pass forever. (The manifest gate normally

@@ -157,6 +157,28 @@ impl ToolManifest {
         self.probe_with_cwd(Some(cwd))
     }
 
+    /// Probe from `root` AND fold in this tool's checkout prerequisite — "can this backend run
+    /// here?", the question status surfaces should ask.
+    ///
+    /// [`Self::probe_in`] answers only "is the binary installed", which is the more actionable
+    /// half when it is missing but a misleading answer when it is present and the checkout still
+    /// cannot support it: `scip-clang` without a compile_commands.json, `scip-java` without a
+    /// Gradle build, the live TypeScript client without a tsconfig project. Reporting those as
+    /// `Available` says nothing is wrong about a backend that can never produce a verdict. An
+    /// already-`Blocked` probe is returned untouched — an absent binary is the more actionable
+    /// hint, and a prerequisite is moot until the tool exists.
+    pub fn probe_runnable_in(&self, root: &Path) -> ToolAvailability {
+        let availability = self.probe_in(root);
+        match (&availability, self.prerequisite_blocked(root)) {
+            (ToolAvailability::Available { .. }, Some(hint)) => ToolAvailability::Blocked {
+                tool: self.tool.as_db_str().to_string(),
+                program: self.program.to_string(),
+                hint,
+            },
+            _ => availability,
+        }
+    }
+
     fn probe_with_cwd(&self, cwd: Option<&Path>) -> ToolAvailability {
         match detect_version_in(self.program, cwd) {
             Some(version) if self.can_emit_scip() => ToolAvailability::Available {
@@ -438,6 +460,60 @@ mod tests {
                 "{} is batch-only and must declare no live argv",
                 tool.as_db_str()
             );
+        }
+    }
+
+    #[test]
+    fn a_runnable_probe_reports_an_unmet_prerequisite_instead_of_available() {
+        // "installed" is not "can run here". A tool reported Available while its checkout
+        // prerequisite is unmet says nothing is wrong about a backend that can never produce a
+        // verdict — the worst of the three possible answers.
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("probe-runnable");
+        // Stand in for an installed binary whose checkout prerequisite is unmet: `cargo` reliably
+        // versions, scip-clang's capability check is a no-op (it IS the emitter), and its gate
+        // wants a compile_commands.json.
+        let installed_but_unprepared = ToolManifest {
+            tool: OracleTool::ScipClang,
+            program: "cargo",
+            live_args: &[],
+            languages: &["c"],
+            install_hint: "install hint",
+        };
+        assert!(
+            installed_but_unprepared.probe_in(&dir).is_available(),
+            "the stand-in must be installed, or this tests the wrong branch",
+        );
+        match installed_but_unprepared.probe_runnable_in(&dir) {
+            ToolAvailability::Blocked { hint, tool, program } => {
+                assert_eq!(tool, "scip-clang");
+                assert_eq!(program, "cargo");
+                assert!(
+                    hint.contains("compile_commands.json"),
+                    "the hint must name the fix, not repeat the install hint: {hint}",
+                );
+            },
+            other => panic!("an unmet prerequisite must not read as {other:?}"),
+        }
+        // Satisfy the prerequisite and the same probe reports the tool as runnable.
+        std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
+        assert!(installed_but_unprepared.probe_runnable_in(&dir).is_available());
+    }
+
+    #[test]
+    fn a_runnable_probe_keeps_the_install_hint_when_the_binary_is_absent() {
+        // An absent binary is the more actionable half, and a prerequisite is moot until the tool
+        // exists — so the missing-tool hint must survive, not be replaced by a prerequisite one.
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("probe-runnable-absent");
+        let absent = ToolManifest {
+            tool: OracleTool::ScipClang,
+            program: "rag-rat-no-such-tool-xyzzy",
+            live_args: &[],
+            languages: &["c"],
+            install_hint: "install scip-clang",
+        };
+        match absent.probe_runnable_in(&dir) {
+            ToolAvailability::Blocked { hint, .. } => assert_eq!(hint, "install scip-clang"),
+            other => panic!("expected Blocked, got {other:?}"),
         }
     }
 

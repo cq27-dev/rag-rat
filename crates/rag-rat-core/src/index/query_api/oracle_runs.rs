@@ -262,13 +262,21 @@ impl IndexDatabase {
         self.run_oracle(tool, tool_version, scip_bytes, OracleShaSnapshots::default())
     }
 
-    /// Probe whether an oracle tool is installed, for `oracle status`. Config-backed opens probe
-    /// from the checkout root so rustup directory overrides select the same rust-analyzer as the
-    /// watcher. A `Blocked` probe is informational (the tool isn't installed), never an error.
+    /// Probe whether an oracle tool can actually run here, for `oracle status`. Config-backed
+    /// opens probe from the checkout root so rustup directory overrides select the same
+    /// rust-analyzer as the watcher. A `Blocked` probe is informational, never an error.
+    ///
+    /// "Installed" is not the same question as "can run": every backend also has checkout
+    /// prerequisites (`scip-clang` needs a compile_commands.json, `scip-java` a Gradle build, the
+    /// live TypeScript client a tsconfig project). Reporting a tool as available while its
+    /// prerequisite is unmet is the worst answer — it says nothing is wrong when the backend can
+    /// never produce a verdict — so an unmet prerequisite is folded in here as `Blocked` carrying
+    /// its hint. This is the only probe seam with a checkout root to check against.
     pub fn probe_oracle_tool(&self, tool: OracleTool) -> rag_rat_oracle::ToolAvailability {
         let manifest = ToolManifest::for_tool(tool);
         match &self.config {
-            Some(config) => manifest.probe_in(&config.root),
+            Some(config) => manifest.probe_runnable_in(&config.root),
+            // No checkout root to evaluate prerequisites against; report installedness only.
             None => manifest.probe(),
         }
     }
