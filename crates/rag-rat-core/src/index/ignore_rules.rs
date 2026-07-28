@@ -101,10 +101,14 @@ const FLOOR_DIRS: &[&str] = &[
 ///
 /// `.cache` alone is far too broad to floor: the floor is unconditional and cannot be whitelisted
 /// back, so flooring the name would silently drop a tracked `.cache/` that a repo genuinely uses
-/// for sources. What actually has to be excluded is the index the live clangd oracle makes the
-/// checkout write to itself — `.cache/clangd/` — which no clangd flag or environment variable can
-/// relocate. Unfloored, those writes raise watcher events, which schedule maintenance passes,
-/// which run the live oracle, which keeps clangd indexing: a loop the repo feeds itself.
+/// for sources. What has to be excluded is `.cache/clangd/` — the index the live clangd oracle
+/// makes the checkout write to itself, which no clangd flag or environment variable can relocate.
+///
+/// This is the same category as `.rag-rat` above: a tool's own index, living inside the checkout,
+/// which must never be walked or indexed as if it were source. Its `.idx` artifacts carry no
+/// target extension and so would not arm the watcher on their own, but the tree is large and
+/// entirely machine-written, and anything source-shaped appearing there would otherwise be
+/// classified as first-party code.
 const FLOOR_PATHS: &[&[&str]] = &[&[".cache", "clangd"]];
 
 /// Whether a single path component matches a floor directory name (see [`FLOOR_DIRS`]).
@@ -493,7 +497,13 @@ mod tests {
             "-qm",
             "seed",
         ]);
-        let linked = main.parent().expect("scratch parent").join("linked-wt");
+        // Derived from this scratch directory's own unique name: a fixed name in the shared
+        // scratch root collides between repeated or concurrent runs, and `git worktree add`
+        // fails on an existing path.
+        let linked = main
+            .parent()
+            .expect("scratch parent")
+            .join(format!("{}-linked", main.file_name().expect("scratch name").to_string_lossy(),));
         rag_rat_base::test_git::run(&main, &[
             "worktree",
             "add",

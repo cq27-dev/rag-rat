@@ -171,7 +171,7 @@ impl LiveBackend {
             // An enclosing-scoped marker is answered per document by walking UP, which is cheap
             // and needs no precomputed set.
             ProjectScope::Enclosing => ProjectLayout::default(),
-            ProjectScope::Checkout => ProjectLayout { marker_dirs: marker_dirs(root, marker.file) },
+            ProjectScope::Checkout => ProjectLayout { markers: marker_sites(root, marker.file) },
         }
     }
 
@@ -318,23 +318,36 @@ impl LiveBackend {
 /// lock while that happens.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectLayout {
-    /// Directories holding a USABLE marker, capped at two — the only distinction drawn is
-    /// "exactly one" versus "several".
-    marker_dirs: Vec<PathBuf>,
+    /// Marker sites found in the checkout, capped at two — the only distinction drawn is
+    /// "exactly one" versus "several". UNUSABLE sites are recorded too: whether global pinning is
+    /// safe depends on how many databases exist at all, not how many of them work.
+    markers: Vec<MarkerSite>,
+}
+
+/// One marker location, and whether the file there describes a project the server can load.
+#[derive(Debug, Clone)]
+struct MarkerSite {
+    dir: PathBuf,
+    usable: bool,
 }
 
 impl ProjectLayout {
-    /// The single database this session can point the server at, or `None` when the checkout has
-    /// none or has several (in which case the server's own per-file lookup decides).
+    /// The single database this session can point the server at.
+    ///
+    /// `None` unless the checkout holds EXACTLY ONE database and it is usable. A second database
+    /// disqualifies pinning even when it is empty or malformed: `--compile-commands-dir` is
+    /// global, so pinning would hand the working database's flags to files that belong to the
+    /// broken one, where clangd would otherwise stop at their own nearer database and fall back.
+    /// Both are wrong for those files — but only pinning also makes them look configured.
     fn sole_marker_dir(&self) -> Option<&Path> {
-        match self.marker_dirs.as_slice() {
-            [only] => Some(only),
+        match self.markers.as_slice() {
+            [only] if only.usable => Some(&only.dir),
             _ => None,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.marker_dirs.is_empty()
+        self.markers.is_empty()
     }
 
     /// Whether this layout pins the session to one database, which is what a re-resolve has to be
@@ -399,9 +412,9 @@ fn enclosing_project_dir(root: &Path, path: &Path, marker: &str) -> Option<PathB
 /// `--compile-commands-dir` (measured: no progress at all, and calls resolve to header
 /// declarations). Accepting a checkout whose database the server cannot find would report it
 /// usable while it silently never warms.
-fn marker_dirs(root: &Path, marker: &str) -> Vec<PathBuf> {
+fn marker_sites(root: &Path, marker: &str) -> Vec<MarkerSite> {
     let mut found = Vec::new();
-    collect_marker_dirs(root, marker, MARKER_SEARCH_MAX_DEPTH, &mut found);
+    collect_marker_sites(root, marker, MARKER_SEARCH_MAX_DEPTH, &mut found);
     found
 }
 
@@ -413,13 +426,13 @@ const MARKER_SEARCH_MAX_DEPTH: u32 = 24;
 
 /// Collect marker directories, stopping at two — the only distinction any caller draws is
 /// "exactly one" versus "several", and a monorepo can hold hundreds.
-fn collect_marker_dirs(dir: &Path, marker: &str, depth_left: u32, found: &mut Vec<PathBuf>) {
+fn collect_marker_sites(dir: &Path, marker: &str, depth_left: u32, found: &mut Vec<MarkerSite>) {
     if found.len() >= 2 {
         return;
     }
     let candidate = dir.join(marker);
-    if candidate.exists() && marker_is_usable(&candidate) {
-        found.push(dir.to_path_buf());
+    if candidate.exists() {
+        found.push(MarkerSite { dir: dir.to_path_buf(), usable: marker_is_usable(&candidate) });
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -439,7 +452,7 @@ fn collect_marker_dirs(dir: &Path, marker: &str, depth_left: u32, found: &mut Ve
         return;
     };
     for sub in subdirectories {
-        collect_marker_dirs(&sub, marker, depth_left, found);
+        collect_marker_sites(&sub, marker, depth_left, found);
     }
 }
 
@@ -467,12 +480,22 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 /// it rejects a valid database whose first entry is larger than the window, and accepts a hollow
 /// one that merely contains the token inside some unrelated string.
 fn marker_is_usable(path: &Path) -> bool {
-    /// One compilation-database entry. `file` is the field that names a translation unit; the
-    /// rest of the entry is deliberately ignored.
+    /// One compilation-database entry, with the fields the format REQUIRES. `clangd --check`
+    /// rejects an entry missing any of them (`Missing key: "directory"`, `Missing key: "command"
+    /// or "arguments"`) and falls back to generic flags, so an entry naming only a file is not a
+    /// usable database however well-formed its JSON is.
+    ///
+    /// Only the PRESENCE of each field is checked, so every payload is discarded while parsing —
+    /// `file` and `directory` are required by their types, and the invocation is checked below
+    /// because either form satisfies it.
     #[derive(serde::Deserialize)]
     struct CompilationEntry {
         #[allow(dead_code)]
-        file: String,
+        file: serde::de::IgnoredAny,
+        #[allow(dead_code)]
+        directory: serde::de::IgnoredAny,
+        command: Option<serde::de::IgnoredAny>,
+        arguments: Option<serde::de::IgnoredAny>,
     }
 
     // One entry is small even when the database is not, so a bounded prefix always contains it.
@@ -488,7 +511,8 @@ fn marker_is_usable(path: &Path) -> bool {
     }
     let text = String::from_utf8_lossy(&prefix);
     first_json_object(&text)
-        .is_some_and(|object| serde_json::from_str::<CompilationEntry>(object).is_ok())
+        .and_then(|object| serde_json::from_str::<CompilationEntry>(object).ok())
+        .is_some_and(|entry| entry.command.is_some() || entry.arguments.is_some())
 }
 
 /// The first top-level JSON object in `text`, as a slice — brace-matched with string and escape
@@ -985,6 +1009,73 @@ mod tests {
             "an empty nearest database configures nothing",
         );
         assert!(clangd.session_can_resolve(&dir, "good/main.c", &layout));
+    }
+
+    #[test]
+    fn a_broken_second_database_still_disqualifies_global_pinning() {
+        // `--compile-commands-dir` is GLOBAL. With one working database and one empty one,
+        // recording only the working site would look like a single-database checkout and pin it —
+        // handing its flags to the files of the broken project, which clangd would otherwise
+        // resolve by stopping at their own nearer database. Both are wrong for those files, but
+        // only pinning also makes them look configured.
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-broken-second-db");
+        std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
+        std::fs::create_dir_all(dir.join("sub/build")).unwrap();
+        std::fs::write(dir.join("sub/build/compile_commands.json"), "[]").unwrap();
+        std::fs::write(dir.join("sub/main.c"), "int s(void){return 0;}\n").unwrap();
+        std::fs::write(dir.join("root.c"), "int r(void){return 0;}\n").unwrap();
+
+        let layout = clangd.resolve_layout(&dir);
+        assert_eq!(
+            clangd.spawn_args(&["--background-index"], &layout),
+            vec![OsString::from("--background-index")],
+            "a second database disqualifies pinning even when it is unusable",
+        );
+        assert!(clangd.session_can_resolve(&dir, "root.c", &layout));
+        assert!(
+            !clangd.session_can_resolve(&dir, "sub/main.c", &layout),
+            "files of the broken project are not resolvable by either route",
+        );
+
+        // Remove the broken one and the checkout is genuinely single-database again.
+        std::fs::remove_file(dir.join("sub/build/compile_commands.json")).unwrap();
+        let layout = clangd.resolve_layout(&dir);
+        assert!(clangd.spawn_args(&["--background-index"], &layout).contains(&compdb_arg(&dir)));
+        assert!(clangd.session_can_resolve(&dir, "sub/main.c", &layout));
+    }
+
+    #[test]
+    fn an_entry_missing_a_required_field_is_not_a_usable_database() {
+        // clangd rejects an entry lacking `directory` or a compiler invocation and falls back to
+        // generic flags, so a well-formed entry naming only a file is not a usable database.
+        let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-entry-fields");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+        let incomplete = [
+            r#"[{"file":"/x/a.c"}]"#,
+            r#"[{"file":"/x/a.c","command":"cc -c a.c"}]"#,
+            r#"[{"file":"/x/a.c","directory":"/x"}]"#,
+        ];
+        for entry in incomplete {
+            std::fs::write(dir.join("compile_commands.json"), entry).unwrap();
+            assert!(
+                !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+                "{entry} is missing a field clangd requires",
+            );
+        }
+        // Either invocation form is accepted.
+        for complete in [
+            r#"[{"file":"/x/a.c","directory":"/x","command":"cc -c a.c"}]"#,
+            r#"[{"file":"/x/a.c","directory":"/x","arguments":["cc","-c","a.c"]}]"#,
+        ] {
+            std::fs::write(dir.join("compile_commands.json"), complete).unwrap();
+            assert!(
+                clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+                "{complete} is a usable database",
+            );
+        }
     }
 
     #[test]

@@ -1695,6 +1695,31 @@ fn linked_worktree_events_honor_its_ignore_rules() {
             .fires(),
         "a linked worktree .gitignore edit still fires so rules can be recompiled",
     );
+    // The live clangd oracle runs per checkout, so a LINKED worktree spawns its own clangd, which
+    // persists an index into that worktree's own `.cache/clangd/`. That tree is machine-written
+    // state living inside the checkout — the same category as `.rag-rat`, and floored for the same
+    // reason. A source-shaped path there must be classified as ignored rather than armed as an
+    // edit; clangd's actual `.idx` artifacts carry no target extension and never fire either way.
+    assert!(
+        !event_touches_worktree(
+            &mutation_event(worktree.join(".cache/clangd/index/lib.rs")),
+            &worktrees,
+            None
+        )
+        .fires(),
+        "a linked worktree's own clangd index tree must never arm the debounce",
+    );
+    // …while the rest of a `.cache` the worktree genuinely tracks is still watched, since the
+    // floor is deliberately narrower than the whole directory.
+    assert!(
+        event_touches_worktree(
+            &mutation_event(worktree.join(".cache/generated/api.rs")),
+            &worktrees,
+            None
+        )
+        .fires(),
+        "the narrow floor must not silence a tracked .cache subtree",
+    );
 
     std::fs::remove_dir_all(&worktree).ok();
 }
