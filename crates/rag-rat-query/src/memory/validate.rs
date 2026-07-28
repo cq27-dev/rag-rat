@@ -1046,12 +1046,61 @@ mod call_path_receiver_type_hint_tests {
     }
 
     #[test]
+    fn edge_binding_with_pre_upgrade_fingerprint_relocates_after_hint_gain() {
+        // A binding persisted BEFORE receiver_type_hint existed holds the 8-field fingerprint and
+        // a now-dead row id (GRAPH_INDEX_VERSION 12 re-extracts every edge). The re-extracted,
+        // source-unchanged call site gained a hint, so its current fingerprint differs — the
+        // legacy-format fallback must still find it and relocate, not report `gone`.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint, \
+             receiver_type_hint, source_file_id, source_start_line, source_end_line) VALUES \
+             ('caller','run','calls_name','exact','recv','Alpha',?1,10,10)",
+            [file_id],
+        )
+        .unwrap();
+
+        let legacy =
+            crate::memory::resolve::edge_fingerprint(crate::memory::EdgeFingerprintParts {
+                path: "src/lib.rs",
+                start_line: 10,
+                end_line: 10,
+                from_name: Some("caller"),
+                to_name: Some("run"),
+                edge_kind: "calls_name",
+                target_qualified_name: None,
+                receiver_hint: Some("recv"),
+                receiver_type_hint: None,
+            });
+
+        seed_memory(&c, "m1", "r");
+        let mut binding = RepoMemoryBinding {
+            binding_kind: "edge".to_string(),
+            binding_id: legacy,
+            ..call_path_binding("m1", "unused")
+        };
+        binding.memory_id = "m1".to_string();
+
+        assert_eq!(validate_edge_binding(&c, &mut binding).unwrap(), "relocated");
+        assert!(binding.edge_id.is_some(), "the relocated binding adopts the live edge row");
+
+        let mut missing = RepoMemoryBinding {
+            binding_kind: "edge".to_string(),
+            binding_id: "not-a-fingerprint".to_string(),
+            ..call_path_binding("m1", "unused")
+        };
+        assert_eq!(validate_edge_binding(&c, &mut missing).unwrap(), "gone");
+    }
+
+    #[test]
     fn call_path_binding_stops_reading_current_after_receiver_type_hint_repoint() {
-        // End-to-end (#779): `recv.run()` starts resolved against `Alpha` (`receiver_type_hint =
+        // End-to-end (#567): `recv.run()` starts resolved against `Alpha` (`receiver_type_hint =
         // 'Alpha'`). A memory anchors the call path with the fingerprint captured at that moment.
         // Reindexing then re-points the SAME call site's Rust receiver-type inference to `Beta` —
         // path, span, from_name, to_name, edge_kind, target_qualified_name, and receiver_hint all
-        // stay identical, only `receiver_type_hint` changes. Before #779 the fingerprint ignored
+        // stay identical, only `receiver_type_hint` changes. Before #567 the fingerprint ignored
         // `receiver_type_hint`, so `validate_call_path_binding` kept reporting `current` against a
         // target it no longer actually resolved to. It must not anymore.
         let c = mem_db();

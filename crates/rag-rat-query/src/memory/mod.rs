@@ -534,12 +534,17 @@ pub(crate) struct ChunkAnchor {
 pub(crate) struct EdgeAnchor {
     edge_id: i64,
     fingerprint: String,
+    /// The pre-#567 8-field fingerprint — `Some` only when the live edge carries a
+    /// `receiver_type_hint`, so bindings persisted before the hint existed still match their
+    /// unchanged call site (see `edge_anchor_row`).
+    legacy_fingerprint: Option<String>,
     path: String,
     start_line: i64,
     end_line: i64,
     source_hash: String,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct EdgeFingerprintParts<'a> {
     path: &'a str,
     start_line: i64,
@@ -549,7 +554,7 @@ pub(crate) struct EdgeFingerprintParts<'a> {
     edge_kind: &'a str,
     target_qualified_name: Option<&'a str>,
     receiver_hint: Option<&'a str>,
-    /// Rust-only conservative receiver type inference (`recv.run()` → `Alpha`/`Beta`, #779):
+    /// Rust-only conservative receiver type inference (`recv.run()` → `Alpha`/`Beta`, #567):
     /// deliberately excluded from every LOOSE identity (`LiveEdgeMatch`, `CallPathEdge`,
     /// `live_edges_matching_identities`'s identity tuple) so a receiver-type-driven re-resolution
     /// still relocates rather than going `gone`, mirroring `receiver_hint`. It DOES participate in

@@ -584,7 +584,9 @@ pub(crate) fn edge_by_fingerprint(
     let rows = stmt.query_map([], edge_anchor_row)?;
     for row in rows {
         let edge = row?;
-        if edge.fingerprint == fingerprint {
+        if edge.fingerprint == fingerprint
+            || edge.legacy_fingerprint.as_deref() == Some(fingerprint)
+        {
             return Ok(Some(edge));
         }
     }
@@ -600,19 +602,28 @@ pub(crate) fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeA
     let target_qualified_name: Option<String> = row.get("target_qualified_name")?;
     let receiver_hint: Option<String> = row.get("receiver_hint")?;
     let receiver_type_hint: Option<String> = row.get("receiver_type_hint")?;
+    let hinted = receiver_type_hint.as_deref().filter(|value| !value.is_empty());
+    let parts = EdgeFingerprintParts {
+        path: &path,
+        start_line,
+        end_line,
+        from_name: from_name.as_deref(),
+        to_name: to_name.as_deref(),
+        edge_kind: &edge_kind,
+        target_qualified_name: target_qualified_name.as_deref(),
+        receiver_hint: receiver_hint.as_deref(),
+        receiver_type_hint: hinted,
+    };
     Ok(EdgeAnchor {
         edge_id: row.get("edge_id")?,
-        fingerprint: edge_fingerprint(EdgeFingerprintParts {
-            path: &path,
-            start_line,
-            end_line,
-            from_name: from_name.as_deref(),
-            to_name: to_name.as_deref(),
-            edge_kind: &edge_kind,
-            target_qualified_name: target_qualified_name.as_deref(),
-            receiver_hint: receiver_hint.as_deref(),
-            receiver_type_hint: receiver_type_hint.as_deref(),
-        }),
+        fingerprint: edge_fingerprint(parts),
+        // The pre-#567 8-field format for an edge that NOW carries a hint: reindexing under
+        // GRAPH_INDEX_VERSION 12 gives previously hintless call edges a receiver type, changing
+        // their stable fingerprint; a binding persisted before the upgrade still holds the legacy
+        // value and must find the unchanged call site (relocated), not report `gone`.
+        legacy_fingerprint: hinted
+            .is_some()
+            .then(|| edge_fingerprint(EdgeFingerprintParts { receiver_type_hint: None, ..parts })),
         path,
         start_line,
         end_line,
@@ -624,7 +635,7 @@ pub(crate) fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeA
 /// re-points the same call site at a different method (`Alpha::run` → `Beta::run`) changes the
 /// fingerprint even though path/span/names/kind/target/`receiver_hint` all stay put — otherwise
 /// `edge_by_fingerprint` would keep validating a call-path anchor `current` against a target it no
-/// longer resolves to (#779). NULL/empty is folded away (no trailing field appended) so every
+/// longer resolves to (#567). NULL/empty is folded away (no trailing field appended) so every
 /// fingerprint computed before this field existed is preserved byte-for-byte — legacy edges never
 /// spuriously go stale.
 pub(crate) fn edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String {
@@ -650,6 +661,9 @@ pub(crate) fn edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String {
 /// name/kind/target identity a moved-line edge is re-found by.
 pub(crate) struct LiveEdgeMatch {
     pub(crate) fingerprint: String,
+    /// Pre-#567 8-field fingerprint; `Some` only when the live edge carries a
+    /// `receiver_type_hint` (see `edge_anchor_row`).
+    pub(crate) legacy_fingerprint: Option<String>,
     pub(crate) from_name: Option<String>,
     pub(crate) to_name: String,
     pub(crate) edge_kind: String,
@@ -718,17 +732,24 @@ pub(crate) fn live_edges_matching_identities(
         let target_qualified_name = row.get::<_, Option<String>>("target_qualified_name")?;
         let receiver_hint = row.get::<_, Option<String>>("receiver_hint")?;
         let receiver_type_hint = row.get::<_, Option<String>>("receiver_type_hint")?;
+        let hinted = receiver_type_hint.as_deref().filter(|value| !value.is_empty());
+        let parts = EdgeFingerprintParts {
+            path: &path,
+            start_line,
+            end_line,
+            from_name: from_name.as_deref(),
+            to_name: Some(&to_name),
+            edge_kind: &edge_kind,
+            target_qualified_name: target_qualified_name.as_deref(),
+            receiver_hint: receiver_hint.as_deref(),
+            receiver_type_hint: hinted,
+        };
         Ok(LiveEdgeMatch {
-            fingerprint: edge_fingerprint(EdgeFingerprintParts {
-                path: &path,
-                start_line,
-                end_line,
-                from_name: from_name.as_deref(),
-                to_name: Some(&to_name),
-                edge_kind: &edge_kind,
-                target_qualified_name: target_qualified_name.as_deref(),
-                receiver_hint: receiver_hint.as_deref(),
-                receiver_type_hint: receiver_type_hint.as_deref(),
+            fingerprint: edge_fingerprint(parts),
+            // Same legacy-format shadow as `edge_anchor_row`: pre-upgrade call-path edges hold
+            // 8-field fingerprints and must still consume their unchanged live call site.
+            legacy_fingerprint: hinted.is_some().then(|| {
+                edge_fingerprint(EdgeFingerprintParts { receiver_type_hint: None, ..parts })
             }),
             from_name,
             to_name,
@@ -1171,7 +1192,7 @@ mod receiver_type_hint_fingerprint_tests {
     fn receiver_type_hint_repoint_changes_the_stable_fingerprint() {
         // path, span, from_name, to_name, edge_kind, target_qualified_name, and receiver_hint all
         // stay identical — only `receiver_type_hint` differs, as when Rust receiver-type inference
-        // re-points `recv.run()` from `Alpha::run` to `Beta::run` on reindex (#779). The
+        // re-points `recv.run()` from `Alpha::run` to `Beta::run` on reindex (#567). The
         // fingerprint MUST change, or `edge_by_fingerprint`/`edge_by_id` would keep
         // validating a call-path anchor `current` against a target it no longer resolves
         // to.
@@ -1183,7 +1204,7 @@ mod receiver_type_hint_fingerprint_tests {
     #[test]
     fn null_and_empty_receiver_type_hint_preserve_the_legacy_fingerprint() {
         // Legacy edges (indexed before `receiver_type_hint` existed) carry NULL here. Their
-        // fingerprint must stay byte-for-byte identical to the pre-#779 8-field format, or every
+        // fingerprint must stay byte-for-byte identical to the pre-#567 8-field format, or every
         // already-persisted `repo_memory_call_path_edges.edge_fingerprint` would go stale at once.
         let legacy_format =
             hex_sha256("src/lib.rs\n10\n10\ncaller\nrun\ncalls_name\n\nrecv".as_bytes());
