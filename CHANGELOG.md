@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.21.1...rag-rat-base-v0.22.0) - 2026-07-28
+
+### Added
+
+- *(oracle)* live LSP watcher wiring — phase 6 slice 2 ([#534](https://github.com/cq27-dev/rag-rat/pull/534)) ([#972](https://github.com/cq27-dev/rag-rat/pull/972))
+- *(sync)* device-side account-log sync to configured server peers ([#922](https://github.com/cq27-dev/rag-rat/pull/922))
+- *(sync)* [sync] config + `rag-rat sync serve` headless peer ([#909](https://github.com/cq27-dev/rag-rat/pull/909))
+
+### Fixed
+
+- *(tests)* isolate fixture git invocations from the ambient environment ([#975](https://github.com/cq27-dev/rag-rat/pull/975))
+- *(tests)* retain satellite-crate scratch cleanup guards ([#973](https://github.com/cq27-dev/rag-rat/pull/973))
+- *(tests)* retain core unit-test scratch cleanup guards ([#968](https://github.com/cq27-dev/rag-rat/pull/968))
+- *(tests)* retain config scratch cleanup guards ([#967](https://github.com/cq27-dev/rag-rat/pull/967))
+- *(tests)* clean high-volume scratch fixtures ([#963](https://github.com/cq27-dev/rag-rat/pull/963))
+
+### Other
+
+- *(deps)* upgrade Rust dependencies ([#933](https://github.com/cq27-dev/rag-rat/pull/933))
+
 ## [0.21.1](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.21.0...rag-rat-base-v0.21.1) - 2026-07-24
 
 ### Other
