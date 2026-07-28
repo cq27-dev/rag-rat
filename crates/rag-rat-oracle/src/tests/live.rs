@@ -162,6 +162,53 @@ fn live_pass_defers_the_whole_worklist_while_the_server_is_warming() {
 }
 
 #[test]
+fn live_pass_discards_a_definition_batch_when_readiness_regresses() {
+    let h = Harness::new();
+    let (_src, _target, edge) = seed_corpus(&h);
+    let uri = root_uri(&h);
+    let definition_uri = def_uri(&h, "defs.rs");
+    let client = client_with_server(move |msg: &Value| {
+        let id = msg.get("id").cloned();
+        match msg.get("method").and_then(Value::as_str) {
+            Some("initialize") => Some(vec![json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {"capabilities": {"positionEncoding": "utf-16"}}
+            })]),
+            Some("textDocument/definition") => Some(vec![
+                json!({
+                    "jsonrpc": "2.0", "method": "experimental/serverStatus",
+                    "params": {"health": "ok", "quiescent": false}
+                }),
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "uri": definition_uri,
+                        "range": {
+                            "start": {"line": 0, "character": 3},
+                            "end": {"line": 0, "character": 9}
+                        }
+                    }
+                }),
+            ]),
+            _ if id.is_none() => Some(vec![]),
+            _ => Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": null})]),
+        }
+    });
+    let mut session = LiveOracleSession::from_client(client, LIVE_VERSION, &uri);
+    let worklist = vec!["src.rs".to_string()];
+
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+    assert_eq!(report.status, "Warming");
+    assert_eq!(report.requests_used, 1);
+    assert_eq!(report.rows_written, 0);
+    assert_eq!(report.unresolved, 0);
+    assert_eq!(report.unfinished_paths, worklist);
+    assert!(h.verdict(edge).is_none(), "the in-flight batch must be discarded");
+    assert_eq!(live_run_count(&h.conn), 0);
+}
+
+#[test]
 fn live_verdict_copies_the_batch_moniker_verbatim() {
     let h = Harness::new();
     let (_src, target, edge) = seed_corpus(&h);

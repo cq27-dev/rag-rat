@@ -183,7 +183,7 @@ pub struct LivePassReport {
     /// in an unindexed file, or mapping to no indexed symbol. Live writes no `resolved-external`
     /// rows (see the module docs).
     pub skipped_external: u64,
-    /// Callees the server left unresolved (a `null` definition — e.g. still indexing).
+    /// Callees the quiescent server left unresolved (a `null` definition).
     pub unresolved: u64,
     /// Whether the scip-mode refine cache was invalidated (a row's `scip_symbol` changed under
     /// unchanged bytes, or newly inserted non-local evidence became visible).
@@ -290,6 +290,7 @@ pub fn live_oracle_pass(
         }
     }
     let mut aborted: Option<String> = None;
+    let mut warming = false;
     // Per-pass caches: definition-file disk bytes / indexed sha / symbol spans, keyed by
     // repo-relative path (the LSP returns a bounded set of def paths, so these stay small — the
     // whole-checkout sha map is deliberately NOT loaded).
@@ -307,13 +308,25 @@ pub fn live_oracle_pass(
         // Budget gate: nothing left → every candidate-bearing path from here rides the backlog.
         let remaining = input.max_requests.saturating_sub(report.requests_used) as usize;
         if remaining == 0 {
-            report.unfinished_paths.extend(
-                input.worklist[position..]
-                    .iter()
-                    .filter(|p| by_path.contains_key(p.as_str()))
-                    .cloned(),
-            );
+            defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
             break 'files;
+        }
+
+        // Readiness is dynamic: Cargo metadata or workspace changes can put rust-analyzer back
+        // into loading after the pass-entry gate. Never begin another definition batch while it is
+        // non-quiescent, or temporary nulls would become permanently completed unresolved work.
+        match session.is_ready() {
+            Ok(true) => {},
+            Ok(false) => {
+                warming = true;
+                defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
+                break 'files;
+            },
+            Err(err) => {
+                aborted = Some(err.to_string());
+                defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
+                break 'files;
+            },
         }
 
         // Callsite drift gate: the server resolves the DIRTY disk bytes, so those bytes must
@@ -384,18 +397,27 @@ pub fn live_oracle_pass(
             Err(err) => {
                 // A dead/wedged server: keep what earlier files produced, REQUEUE this file and
                 // every candidate-bearing path after it (the watcher rides them into the next
-                // pass and replaces the session), and never fail the maintenance pass over it
-                // (#535 hardens this further).
+                // pass and replaces the session), and never fail the maintenance pass over it.
                 aborted = Some(err.to_string());
-                report.unfinished_paths.extend(
-                    input.worklist[position..]
-                        .iter()
-                        .filter(|p| by_path.contains_key(p.as_str()))
-                        .cloned(),
-                );
+                defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
                 break 'files;
             },
         };
+        // A reload may begin while the synchronous batch is in flight. Discard the whole batch
+        // before interpreting any null definitions, and retry this file once the server is ready.
+        match session.is_ready() {
+            Ok(true) => {},
+            Ok(false) => {
+                warming = true;
+                defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
+                break 'files;
+            },
+            Err(err) => {
+                aborted = Some(err.to_string());
+                defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
+                break 'files;
+            },
+        }
         // The caller may change while synchronous requests are in flight. Re-read AFTER the batch:
         // the server resolved the didOpen snapshot, and writing it against an already-changed disk
         // file would look current until the queued reindex catches up (or forever if its event was
@@ -584,6 +606,7 @@ pub fn live_oracle_pass(
         report.run_recorded = true;
         report.status = match &aborted {
             Some(err) => format!("Aborted: {err}"),
+            None if warming => "Warming".to_string(),
             None if report.rows_written == 0 => "VersionMigrated".to_string(),
             None if report.unfinished_paths.is_empty() => "Completed".to_string(),
             None => "BudgetExhausted".to_string(),
@@ -607,6 +630,7 @@ pub fn live_oracle_pass(
     } else {
         report.status = match &aborted {
             Some(err) => format!("Aborted: {err}"),
+            None if warming => "Warming".to_string(),
             None if report.unfinished_paths.is_empty() => "NoVerdicts".to_string(),
             None => "BudgetExhausted".to_string(),
         };
@@ -616,6 +640,17 @@ pub fn live_oracle_pass(
     // not read as idle on the next pass (that would force a needless respawn + warm-up).
     session.touch(rag_rat_base::time::now_ms());
     Ok(report)
+}
+
+fn defer_candidate_paths_from(
+    report: &mut LivePassReport,
+    worklist: &[String],
+    position: usize,
+    by_path: &HashMap<&str, Vec<&store::EdgeJoinCandidate>>,
+) {
+    report.unfinished_paths.extend(
+        worklist[position..].iter().filter(|path| by_path.contains_key(path.as_str())).cloned(),
+    );
 }
 
 /// The content-stable SCIP-local sentinel a live verdict carries when the resolved symbol has no
