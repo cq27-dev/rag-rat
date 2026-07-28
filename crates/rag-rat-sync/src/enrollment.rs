@@ -95,6 +95,46 @@ impl EnrollmentTicket {
         }
         Ok(ticket)
     }
+
+    /// The human-transferable ticket string an owner prints and a joiner pastes: a scheme tag plus
+    /// the lower-hex of the canonical CBOR. Hex (not base32) needs no new dependency and matches
+    /// the node-secret encoding already persisted by the CLI; the tag makes a wrong paste fail
+    /// with a clear message instead of an opaque CBOR error.
+    pub fn to_ticket_string(&self) -> String {
+        format!("{TICKET_STRING_PREFIX}{}", rag_rat_base::hash::hex_lower(&self.encode()))
+    }
+
+    /// Parse a ticket string produced by [`to_ticket_string`]. Surrounding whitespace is tolerated
+    /// (a pasted line often carries it); the scheme tag, hex, and canonical-CBOR shape are all
+    /// validated, so a mistyped or truncated ticket is rejected rather than half-decoded.
+    pub fn from_ticket_string(s: &str) -> Result<Self, InviteError> {
+        let body = s.trim().strip_prefix(TICKET_STRING_PREFIX).ok_or_else(|| {
+            InviteError::Malformed(format!(
+                "enrollment ticket must start with `{TICKET_STRING_PREFIX}`"
+            ))
+        })?;
+        Self::decode(&decode_ticket_hex(body)?)
+    }
+}
+
+/// Scheme tag prefixing every ticket string — see [`EnrollmentTicket::to_ticket_string`].
+const TICKET_STRING_PREFIX: &str = "ragrat-invite-";
+
+/// Decode the lower-hex body of a ticket string. A wrong length or non-hex character is a corrupt
+/// paste, surfaced as [`InviteError::Malformed`] rather than silently coerced.
+fn decode_ticket_hex(hex: &str) -> Result<Vec<u8>, InviteError> {
+    let hex = hex.trim();
+    if !hex.len().is_multiple_of(2) {
+        return Err(InviteError::Malformed("enrollment ticket hex has an odd length".into()));
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks_exact(2) {
+        match ((pair[0] as char).to_digit(16), (pair[1] as char).to_digit(16)) {
+            (Some(hi), Some(lo)) => out.push(((hi << 4) | lo) as u8),
+            _ => return Err(InviteError::Malformed("enrollment ticket is not valid hex".into())),
+        }
+    }
+    Ok(out)
 }
 
 fn validate_enrollment_route(
@@ -1268,6 +1308,60 @@ mod tests {
             .map(|ordinal| Sha256::digest(ordinal.to_be_bytes()).into())
             .find(|bytes| EndpointId::from_bytes(bytes).is_err())
             .expect("random-looking bytes include an invalid compressed Edwards point")
+    }
+
+    fn sample_ticket() -> EnrollmentTicket {
+        EnrollmentTicket {
+            account_id: AccountId::from_bytes([9u8; 32]),
+            inviter_node_id: crate::endpoint::node_id_from_secret([7u8; 32]),
+            relay_url: "https://relay.example".into(),
+            nonce: [3u8; 32],
+            expires_at_ms: 1_700_000_000_123,
+        }
+    }
+
+    #[test]
+    fn ticket_string_round_trips_through_the_scheme_tag() {
+        let ticket = sample_ticket();
+        let s = ticket.to_ticket_string();
+        assert!(s.starts_with("ragrat-invite-"), "the scheme tag prefixes the string: {s}");
+        assert_eq!(EnrollmentTicket::from_ticket_string(&s).unwrap(), ticket);
+        assert_eq!(
+            EnrollmentTicket::from_ticket_string(&format!("  {s}\n")).unwrap(),
+            ticket,
+            "surrounding whitespace on a pasted line is tolerated",
+        );
+    }
+
+    #[test]
+    fn ticket_string_rejects_a_missing_tag_and_corrupt_hex() {
+        let ticket = sample_ticket();
+        let s = ticket.to_ticket_string();
+        let hex = s.strip_prefix("ragrat-invite-").unwrap();
+        assert!(
+            matches!(EnrollmentTicket::from_ticket_string(hex), Err(InviteError::Malformed(_))),
+            "the bare hex without the scheme tag is refused",
+        );
+        assert!(
+            matches!(
+                EnrollmentTicket::from_ticket_string("ragrat-invite-abc"),
+                Err(InviteError::Malformed(_))
+            ),
+            "an odd-length hex body is refused",
+        );
+        assert!(
+            matches!(
+                EnrollmentTicket::from_ticket_string("ragrat-invite-zz"),
+                Err(InviteError::Malformed(_))
+            ),
+            "a non-hex body is refused",
+        );
+        let mut truncated = s.clone();
+        truncated.truncate(s.len() - 2);
+        assert!(
+            EnrollmentTicket::from_ticket_string(&truncated).is_err(),
+            "dropping a CBOR byte fails the canonical-shape check",
+        );
     }
 
     /// A budget no honest redemption can exceed, for tests that are not exercising the capacity

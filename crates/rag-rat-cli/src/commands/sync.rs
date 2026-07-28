@@ -23,11 +23,19 @@ const SERVE_SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVE_INIT_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
-    // `serve` is a long-running server that manages its own connection; it must run OUTSIDE the
-    // command-wide repo write lock, which would otherwise block indexing, the watcher, and GC for
-    // the entire life of the server.
-    if let SyncCommand::Serve { once } = &args.command {
-        return serve(config, *once);
+    // `serve`, `init`, and `join` bind an endpoint and run their own network loop; they must run
+    // OUTSIDE the command-wide repo write lock (which would block indexing, the watcher, and GC for
+    // the server's whole life) and manage the database-scoped SESSION lock themselves instead.
+    match &args.command {
+        SyncCommand::Serve { once } => return serve(config, *once),
+        SyncCommand::Init { role, label, ttl_secs } =>
+            return init(config, InviteMint {
+                role: role.to_device_role(),
+                label: label.clone(),
+                ttl: Duration::from_secs(*ttl_secs),
+            }),
+        SyncCommand::Join { ticket } => return join(config, ticket),
+        SyncCommand::Enable | SyncCommand::CatchUp { .. } => {},
     }
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
@@ -58,7 +66,8 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "note": "existing live keys were re-wrapped without rotation; no enrollment, pairing, or transport occurred",
             }))
         },
-        SyncCommand::Serve { .. } => unreachable!("serve is dispatched before the write lock"),
+        SyncCommand::Serve { .. } | SyncCommand::Init { .. } | SyncCommand::Join { .. } =>
+            unreachable!("the network commands are dispatched before the write lock"),
     }
 }
 
@@ -71,12 +80,37 @@ fn effective_relay_url(config: &Config) -> String {
     }
 }
 
+/// A one-time enrollment invite `sync init` mints as it starts hosting the pairing exchange.
+struct InviteMint {
+    role: rag_rat_oplog::DeviceRole,
+    label: Option<String>,
+    ttl: Duration,
+}
+
 /// Run a headless store-and-forward peer for this account's op log: bind the sync endpoint over the
 /// configured relay and replicate with peers the roster authorizes. Serves BOTH streams a peer may
 /// negotiate — the account log (`SYNC_ALPN`) and `/3` content (`CONTENT_SYNC_ALPN`) — routing
 /// each connection by its ALPN. Runs until interrupted; `once` serves a single connection (one
 /// stream), so a full account+content sync a device drives needs two connections.
 fn serve(config: &Config, once: bool) -> anyhow::Result<()> {
+    serve_with(config, once, None)
+}
+
+/// Owner-side pairing (`sync init`): mint a one-time invite, print the ticket, then host the
+/// enrollment exchange AND the joiner's follow-up account + content restore until interrupted. It
+/// is the same accept loop as [`serve`] — `accept_and_dispatch` already routes the enrollment ALPN
+/// against the owner's database — so `init` is simply "mint, then serve". Never `--once`: a joiner
+/// needs the enrollment connection plus two sync connections.
+fn init(config: &Config, mint: InviteMint) -> anyhow::Result<()> {
+    serve_with(config, false, Some(mint))
+}
+
+/// Shared machinery behind [`serve`] and [`init`]: acquire the session lock, open the index, bind
+/// the endpoint, and run the ALPN-dispatching accept loop. When `mint` is set (`sync init`), a
+/// one-time invite is minted AFTER the endpoint binds and the roster gate passes — so a bind
+/// failure never strands the candidate reservation the mint makes — and its ticket is printed on
+/// the startup line. Minting enforces founder/owner authority, so a non-owner `init` fails there.
+fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::Result<()> {
     let relay = effective_relay_url(config);
     // Hold a database-scoped session lock for the SERVER'S WHOLE LIFETIME. `sync_node_secret` is
     // store-global, so a second `serve` (or a colocated device-side sync) on the same database
@@ -133,16 +167,51 @@ fn serve(config: &Config, once: bool) -> anyhow::Result<()> {
                  this peer with the Member or Owner role"
             );
         }
+        // `sync init` mints its one-time invite ONLY NOW — after the endpoint bound and the roster
+        // gate passed — so a bind failure (e.g. a bad relay) never strands the candidate
+        // reservation the mint makes, which would otherwise gate the next mint until the
+        // TTL expires. The mint is a single BEGIN IMMEDIATE transaction serialized by
+        // SQLite against any watcher write (the same lock-free posture as the accept loop's
+        // ingests below), so it needs no repo write lock. Minting enforces founder/owner
+        // authority; a non-owner `init` fails here.
+        let invite = match mint {
+            Some(mint) => {
+                let ticket = rag_rat_sync::mint_invite(conn, rag_rat_sync::InviteSpec {
+                    account_id,
+                    inviter_node_id: local_node,
+                    relay_url: relay.clone(),
+                    role: mint.role,
+                    label: mint.label.as_deref(),
+                    now_ms: &|| time::now_ms(),
+                    ttl: mint.ttl,
+                })
+                .map_err(|e| anyhow!("minting the enrollment invite failed: {e}"))?;
+                Some((ticket, mint.role))
+            },
+            None => None,
+        };
         let policy = AuthPolicy::Closed;
 
-        tracing::info!(node_id = %endpoint.id(), relay = %relay, "sync serve listening");
+        tracing::info!(
+            node_id = %endpoint.id(),
+            relay = %relay,
+            minted_invite = invite.is_some(),
+            "sync serve listening"
+        );
         // The dialable node identity must reach the operator on stdout: repository logging is off
         // by default, and a peer cannot connect without the node id (the relay is shared config).
-        crate::print_output(&serde_json::json!({
+        // `sync init` additionally emits the invite ticket to share with the joining device.
+        let mut listening = serde_json::json!({
             "status": "listening",
             "node_id": endpoint.id().to_string(),
             "relay": relay,
-        }))?;
+        });
+        if let Some((ticket, role)) = &invite {
+            listening["invite"] = serde_json::json!(ticket.to_ticket_string());
+            listening["invite_role"] = serde_json::json!(role.as_db_str());
+            listening["invite_expires_at_ms"] = serde_json::json!(ticket.expires_at_ms);
+        }
+        crate::print_output(&listening)?;
 
         // The database-scoped session lock taken at startup is still held for this whole loop
         // (released only when serve exits), keeping this database's node identity singular. A
@@ -207,6 +276,176 @@ fn serve(config: &Config, once: bool) -> anyhow::Result<()> {
     })
 }
 
+/// Joiner-side pairing (`sync join`): redeem an invite ticket, enrolling THIS device into the
+/// account, then restore its state (account log then `/3` content) from the inviter. Holds the
+/// database-scoped session lock for the whole exchange — enrollment + restore consume candidate
+/// capacity, which must be serialized against any colocated `serve`/device sync (the requirement
+/// `connect_and_enroll` documents).
+fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
+    let ticket = rag_rat_sync::EnrollmentTicket::from_ticket_string(ticket)
+        .map_err(|e| anyhow!("invalid enrollment ticket: {e}"))?;
+    // Bind over the INVITER's relay (the ticket's), not the local `[sync] relay_url`: both peers
+    // must share a relay to meet, and the ticket names where the inviter is reachable. `sync init`
+    // minted the ticket with the relay IT is serving on.
+    let relay = ticket.relay_url.clone();
+    let _session = locks::WriteLock::acquire_sync_session_timeout(
+        &config.database,
+        SERVE_SESSION_LOCK_TIMEOUT,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "another sync session already holds this database's node identity (a `serve` peer or \
+             a device sync is running); stop it before joining"
+        )
+    })?;
+    let lock_repo = locks::write_lock_repo_id(config);
+    let repo_lock =
+        locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SERVE_INIT_LOCK_TIMEOUT)?
+            .ok_or_else(|| {
+            anyhow!("the index write lock is busy (another writer is mid-pass); retry `sync join`")
+        })?;
+    let db = crate::open_index(config)?;
+    let node_key = {
+        let conn = db.connection();
+        // A store already bound to a DIFFERENT account cannot adopt this ticket — enrollment would
+        // corrupt its identity. A matching account is allowed (a resumed or repeated join).
+        if let Some(existing) = rag_rat_oplog::read_local_account(conn)?
+            && existing != ticket.account_id
+        {
+            bail!(
+                "this store already belongs to a different sync account; `sync join` enrolls a \
+                 fresh device"
+            );
+        }
+        // Mint the account device identity if absent (NOT a genesis) so the enrollment request can
+        // present the joiner's keys. `local_device` is idempotent on an existing identity.
+        rag_rat_oplog::local_device(conn, time::now_ms())?;
+        node_secret(conn)?
+    };
+    drop(repo_lock);
+
+    let account_id = ticket.account_id;
+    let runtime =
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    runtime.block_on(async move {
+        let conn = db.connection();
+        let endpoint = rag_rat_sync::build_endpoint(*node_key, &relay)
+            .await
+            .with_context(|| format!("binding the sync endpoint over relay {relay}"))?;
+        let peer = rag_rat_sync::peer_addr_from_bytes(&ticket.inviter_node_id, &relay)
+            .map_err(|e| anyhow!("the ticket's inviter address is invalid: {e}"))?;
+        let local_node = *endpoint.id().as_bytes();
+        // Whether this device is ALREADY a roster member — a resumed join whose enrollment
+        // committed on an earlier run. It decides only whether restore may still proceed if
+        // redemption fails.
+        let already_effective = device_roster_capability(conn, account_id, &local_node)?.is_some();
+
+        // 1) Enrollment — dial the owner over the enroll ALPN. The owner authors this device's
+        //    DeviceAdd and returns the account bootstrap, which `connect_and_enroll` adopts,
+        //    leaving this device roster-effective. Budget / held-entries / transport id are
+        //    recomputed from the local store inside the call, so the placeholders here are
+        //    overwritten.
+        //
+        //    ALWAYS attempt redemption — never skip on an already-effective device. Within the
+        //    receipt-replay window the owner replays the exact prior receipt and adoption is
+        //    idempotent, so a resumed join re-runs cleanly; and a genuinely UNUSED ticket is
+        //    consumed rather than left live for another bearer. Only a consumed/expired/unknown
+        //    nonce on a device that is ALREADY enrolled falls back to restore (a resume past the
+        //    replay window, where enrollment is unnecessary); every other failure — and any failure
+        //    on a not-yet-enrolled device — is a real error.
+        let local = rag_rat_oplog::local_device(conn, time::now_ms())?;
+        let request = rag_rat_sync::EnrollmentRequest {
+            nonce: ticket.nonce,
+            expected_account: account_id,
+            ed25519_pubkey: local.ed25519_public_key(),
+            x25519_pubkey: local.x25519_public_key(),
+            transport_node_id: [0u8; 32],
+            budget: rag_rat_oplog::EnrollmentBudget {
+                account_entries_remaining: 0,
+                account_bytes_remaining: 0,
+                global_entries_remaining: 0,
+                global_bytes_remaining: 0,
+            },
+            held_entry_hashes: Vec::new(),
+        };
+        match rag_rat_sync::connect_and_enroll(
+            &endpoint,
+            peer.clone(),
+            conn,
+            account_id,
+            &request,
+            time::now_ms(),
+        )
+        .await
+        {
+            Ok(_) => {},
+            Err(error)
+                if already_effective
+                    && matches!(
+                        error,
+                        rag_rat_sync::InviteError::Used
+                            | rag_rat_sync::InviteError::Expired
+                            | rag_rat_sync::InviteError::Unknown
+                    ) =>
+                tracing::info!(
+                    %error,
+                    "invite already spent and this device is enrolled; resuming restore"
+                ),
+            Err(error) => return Err(anyhow!("enrollment failed: {error}")),
+        }
+
+        // 2) Restore-from-zero — pull the account log then `/3` content from the inviter, now that
+        //    this device is roster-effective. Content rides on the account log's authority, so the
+        //    account log runs first. The inviter must still be serving (its `sync init` / `serve`).
+        let account_report = {
+            let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
+            rag_rat_sync::connect_and_sync(
+                &endpoint,
+                peer.clone(),
+                rag_rat_sync::SYNC_ALPN,
+                &mut store,
+                AuthPolicy::Closed,
+                time::now_ms(),
+            )
+            .await
+            .map_err(|e| anyhow!("restoring the account log from the inviter failed: {e}"))?
+        };
+        let content_report = {
+            let mut store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
+            rag_rat_sync::connect_and_sync(
+                &endpoint,
+                peer,
+                rag_rat_sync::CONTENT_SYNC_ALPN,
+                &mut store,
+                AuthPolicy::Closed,
+                time::now_ms(),
+            )
+            .await
+            .map_err(|e| anyhow!("restoring content from the inviter failed: {e}"))?
+        };
+        db.fold_wal();
+
+        // The inviter's node id in dial form, so the operator can add it to `[sync] server_peers`
+        // for ongoing sync (auto-persisting it is a deliberate follow-up). The inviter's RELAY must
+        // travel with it: device-side sync rebuilds the peer address from `[sync] relay_url`, so if
+        // the inviter serves on a different relay than this device's default, ongoing sync would
+        // dial the wrong relay unless the operator also points `relay_url` at the inviter's.
+        let inviter = rag_rat_sync::node_id_to_string(&ticket.inviter_node_id)
+            .unwrap_or_else(|_| hash::hex_lower(&ticket.inviter_node_id));
+        crate::print_output(&serde_json::json!({
+            "status": "joined",
+            "account_id": hash::hex_lower(&account_id.to_bytes()),
+            "account_entries_restored": account_report.entries_newly_stored,
+            "content_entries_restored": content_report.entries_newly_stored,
+            "inviter_node_id": inviter,
+            "inviter_relay": ticket.relay_url,
+            "note": "to keep syncing, add inviter_node_id to [sync] server_peers and set [sync] \
+                     relay_url (or RAG_RAT_SYNC_RELAY) to inviter_relay",
+        }))?;
+        anyhow::Ok(())
+    })
+}
+
 /// How long device-side sync waits for the per-database session lock before deferring to the next
 /// maintenance pass. Kept short: a colocated `serve` peer holds this lock for its whole life, so a
 /// long wait would just burn time on every hook before deferring; a transient overlap with another
@@ -224,7 +463,10 @@ pub(crate) enum DeviceSyncOutcome {
     Skipped,
     /// The per-database session lock is held (a serve peer or another sync); retry next pass.
     Deferred,
-    /// Ran against the configured peers: `ok` sessions succeeded, `errors` failed.
+    /// Ran against the configured peers (resolved through the discovery seam): `ok` sessions
+    /// succeeded, `errors` failed. `peers` is the configured count and `ok + errors == peers` — a
+    /// configured id that failed to resolve is logged and counted as an error, so a typo stays
+    /// visible rather than shrinking the peer set to a healthy-looking zero.
     Ran { peers: usize, ok: usize, errors: usize },
 }
 
@@ -274,7 +516,17 @@ pub(crate) fn device_sync_run(
         return Ok(DeviceSyncOutcome::Disabled);
     }
     let relay = effective_relay_url(config);
-    let peers = &config.sync.server_peers;
+    // Resolve which peers to dial through the discovery seam — explicit config today, with
+    // relay-side account-keyed discovery landing behind it (`rag_rat_sync::discover_peers`, #988).
+    // Each entry pairs the peer's node-id string (for logs) with its dialable address; a configured
+    // id that does not parse is logged and dropped there, so it never becomes a dial attempt.
+    let configured = config.sync.server_peers.len();
+    let peers = rag_rat_sync::discover_peers(account_id, &config.sync.server_peers, &relay);
+    // Count the dropped (unresolvable) configured ids as errors: otherwise an all-typo
+    // `server_peers` reports a healthy-looking `ran` with zero peers and stamps the cadence
+    // watermark, silently suppressing sync until the next interval (repository logging is off
+    // by default).
+    let unresolved = configured.saturating_sub(peers.len());
 
     let runtime =
         tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
@@ -283,20 +535,16 @@ pub(crate) fn device_sync_run(
             .await
             .with_context(|| format!("binding the sync endpoint over relay {relay}"))?;
         let mut ok = 0usize;
-        let mut errors = 0usize;
-        for peer in peers {
-            let addr = match rag_rat_sync::peer_addr(peer, &relay) {
-                Ok(addr) => addr,
-                Err(e) => {
-                    errors += 1;
-                    tracing::warn!(peer, error = %e, "skipping a server peer with an invalid node id");
-                    continue;
-                },
-            };
-            // Account log FIRST — it carries the roster + stream ownership that AUTHORIZE content, so
-            // leading with it minimizes parking on the peer. The account-log result IS the peer's
-            // outcome, so `ok + errors` stays equal to the number of configured peers. `/3` content
-            // rides on top: best-effort, attempted only once the account log reached the peer, and a
+        let mut errors = unresolved;
+        for (peer, addr) in &peers {
+            // Own a copy of the resolved address: it is dialed twice (account log, then content),
+            // and `addr` is a borrow into `peers`.
+            let addr = (*addr).clone();
+            // Account log FIRST — it carries the roster + stream ownership that AUTHORIZE content,
+            // so leading with it minimizes parking on the peer. The account-log result
+            // IS the peer's outcome, so `ok + errors` (seeded with the unresolvable count)
+            // stays equal to the number of configured peers. `/3` content rides on top:
+            // best-effort, attempted only once the account log reached the peer, and a
             // content hiccup is logged — never a peer failure.
             let account_ok = {
                 let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
@@ -362,7 +610,7 @@ pub(crate) fn device_sync_run(
     // fails the hook), but it is now cadence-limited exactly like an unreachable peer.
     record_device_sync(conn)?;
     let (ok, errors) = result?;
-    Ok(DeviceSyncOutcome::Ran { peers: peers.len(), ok, errors })
+    Ok(DeviceSyncOutcome::Ran { peers: configured, ok, errors })
 }
 
 /// The cadence gate: whether enough time has passed since the last device-side sync attempt.
@@ -491,7 +739,7 @@ mod tests {
 
     use super::{
         DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, decode_node_secret, device_can_serve,
-        device_can_sync, device_sync_due, device_sync_run, node_secret, record_device_sync,
+        device_can_sync, device_sync_due, device_sync_run, join, node_secret, record_device_sync,
     };
 
     fn schema_conn() -> Connection {
@@ -571,6 +819,27 @@ mod tests {
         assert!(!device_can_serve(read_only));
         assert!(device_can_serve(Some(rag_rat_sync::PeerCapability::ReadWrite)));
         assert!(!device_can_sync(None));
+    }
+
+    #[test]
+    fn join_rejects_a_malformed_ticket_before_touching_the_store() {
+        // The ticket is decoded before any lock or index open, so a bad ticket fails fast without a
+        // real database — `min_config` points at a nonexistent path that must not be opened here.
+        let err = join(&min_config(), "not-a-real-ticket").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid enrollment ticket"),
+            "a malformed ticket is rejected up front: {err}",
+        );
+    }
+
+    #[test]
+    fn invite_role_maps_to_the_device_role() {
+        use rag_rat_oplog::DeviceRole;
+
+        use crate::cli::InviteRole;
+        assert_eq!(InviteRole::ReadOnly.to_device_role(), DeviceRole::ReadOnly);
+        assert_eq!(InviteRole::Member.to_device_role(), DeviceRole::Member);
+        assert_eq!(InviteRole::Owner.to_device_role(), DeviceRole::Owner);
     }
 
     #[test]

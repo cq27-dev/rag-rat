@@ -29,8 +29,8 @@ pub use auth::{
 };
 pub use endpoint::{
     EndpointError, SyncFailure, accept_and_dispatch, accept_and_sync, accept_enrollment,
-    build_endpoint, connect_and_enroll, connect_and_sync, endpoint_addr, node_id_from_secret,
-    peer_addr,
+    build_endpoint, connect_and_enroll, connect_and_sync, discover_peers, endpoint_addr,
+    node_id_from_secret, node_id_to_string, peer_addr, peer_addr_from_bytes,
 };
 pub use enrollment::{
     ENROLL_ALPN, EnrollmentReceipt, EnrollmentRequest, EnrollmentTicket, InviteError, InviteSpec,

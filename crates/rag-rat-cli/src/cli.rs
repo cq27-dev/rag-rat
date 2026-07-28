@@ -219,6 +219,64 @@ pub(crate) enum SyncCommand {
         #[arg(long)]
         once: bool,
     },
+    /// Mint a one-time enrollment invite on THIS (owner) device and host the pairing exchange.
+    #[command(long_about = "Owner-side pairing. Mints a one-time, role-fixed invite ticket, \
+                            prints it, then binds the sync endpoint and hosts enrollment plus \
+                            the joiner's follow-up account + content restore until interrupted \
+                            (Ctrl-C). Share the printed ticket with the joining device, which \
+                            redeems it with `rag-rat sync join <ticket>`. Must run on the \
+                            account's FOUNDER device (the one that ran `rag-rat sync enable`); \
+                            hosting enrollment from a granted owner is not yet supported.")]
+    Init {
+        /// Role granted to the joining device, fixed at mint time (default: least-privilege
+        /// read-only). `read-only` reads/syncs; `member` also authors content; `owner` also holds
+        /// full control authority (granting an owner does not yet let it host enrollment — only
+        /// the founder can run `sync init`).
+        #[arg(long, value_enum, default_value_t = InviteRole::ReadOnly)]
+        role: InviteRole,
+        /// Optional human label recorded for the joining device (e.g. "laptop").
+        #[arg(long, value_name = "NAME")]
+        label: Option<String>,
+        /// Invite lifetime in seconds before it expires (default 900 = 15 minutes).
+        #[arg(long, value_name = "SECS", default_value_t = 900)]
+        ttl_secs: u64,
+    },
+    /// Enroll THIS device into an account with an invite ticket, then restore its state.
+    #[command(long_about = "Joiner-side pairing. Decodes the invite ticket printed by `rag-rat \
+                            sync init` on an owner device, dials that owner, enrolls this device \
+                            into the account roster, then restores the account log and its \
+                            content. The inviting owner must be online (running `rag-rat sync \
+                            init` or `rag-rat sync serve`).")]
+    Join {
+        /// The invite ticket string printed by `rag-rat sync init` on the owner device.
+        #[arg(value_name = "TICKET")]
+        ticket: String,
+    },
+}
+
+/// Roster role an operator grants a joining device at `sync init` time. Mirrors
+/// [`rag_rat_oplog::DeviceRole`] with CLI-friendly token names; fixed into the invite at mint time
+/// so a joiner cannot escalate.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum InviteRole {
+    /// Reads and syncs only — the default, least-privilege role.
+    #[value(name = "read-only")]
+    ReadOnly,
+    /// Reads, syncs, and authors content.
+    Member,
+    /// Reads, syncs, authors content, and holds full control authority. (Hosting enrollment via
+    /// `sync init` is currently limited to the account's founder device.)
+    Owner,
+}
+
+impl InviteRole {
+    pub(crate) fn to_device_role(self) -> rag_rat_oplog::DeviceRole {
+        match self {
+            InviteRole::ReadOnly => rag_rat_oplog::DeviceRole::ReadOnly,
+            InviteRole::Member => rag_rat_oplog::DeviceRole::Member,
+            InviteRole::Owner => rag_rat_oplog::DeviceRole::Owner,
+        }
+    }
 }
 
 #[derive(Debug, Args)]

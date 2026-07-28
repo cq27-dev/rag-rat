@@ -110,6 +110,59 @@ pub fn peer_addr(node_id: &str, relay_url: &str) -> Result<EndpointAddr, Endpoin
     Ok(EndpointAddr::new(id).with_relay_url(relay))
 }
 
+/// Build a dialable [`EndpointAddr`] from a peer's node id BYTES — the form an
+/// [`crate::EnrollmentTicket`] carries — and the shared relay URL. The byte-oriented sibling of
+/// [`peer_addr`], so the enrollment CLI can dial a ticket's inviter without naming an iroh type.
+pub fn peer_addr_from_bytes(
+    node_id: &[u8; 32],
+    relay_url: &str,
+) -> Result<EndpointAddr, EndpointError> {
+    let id = EndpointId::from_bytes(node_id).map_err(|e| EndpointError::PeerId(e.to_string()))?;
+    let relay =
+        RelayUrl::from_str(relay_url.trim()).map_err(|e| EndpointError::RelayUrl(e.to_string()))?;
+    Ok(EndpointAddr::new(id).with_relay_url(relay))
+}
+
+/// Resolve the peers a device-side sync should dial for `account_id` into dialable addresses, each
+/// paired with the node-id string that names it (for logging). This is the single seam the sync
+/// driver iterates: today it maps each explicitly configured node id through the pinned relay,
+/// logging and skipping any that do not parse, so a misconfigured entry surfaces in the logs rather
+/// than aborting the whole pass.
+///
+/// `account_id` is unused by the explicit-config resolver — it is the parameter a relay-backed
+/// resolver keys on. When peers of an account are online together they should auto-discover and
+/// sync directly instead of every device carrying a static peer list; because the driver only ever
+/// iterates this function, that lands as an implementation swap here, not a driver rewrite. A
+/// discovered peer fills the same `(node_id, addr)` shape a configured one does.
+// TODO(discovery, #988): a relay-side account-keyed resolver plugs in here — query the pinned
+// relay for the endpoints advertising `account_id` and compose them with the configured peers.
+pub fn discover_peers(
+    account_id: AccountId,
+    configured_peers: &[String],
+    relay_url: &str,
+) -> Vec<(String, EndpointAddr)> {
+    let _ = account_id; // reserved for the relay-backed resolver (see the TODO above)
+    configured_peers
+        .iter()
+        .filter_map(|peer| match peer_addr(peer, relay_url) {
+            Ok(addr) => Some((peer.clone(), addr)),
+            Err(error) => {
+                tracing::warn!(peer, %error, "skipping a configured sync peer with an invalid node id");
+                None
+            },
+        })
+        .collect()
+}
+
+/// The dialable node-id string for a peer's node id BYTES — the inverse of the byte form a ticket
+/// or discovery record carries, in the z-base-32 shape `[sync] server_peers` accepts. Lets the
+/// enrollment CLI print a joinable peer id without naming an iroh type.
+pub fn node_id_to_string(node_id: &[u8; 32]) -> Result<String, EndpointError> {
+    EndpointId::from_bytes(node_id)
+        .map(|id| id.to_string())
+        .map_err(|e| EndpointError::PeerId(e.to_string()))
+}
+
 /// This endpoint's dialable address — hand it (or a ticket wrapping it) to a peer so it can
 /// [`connect_and_sync`] back.
 pub fn endpoint_addr(endpoint: &Endpoint) -> EndpointAddr {
@@ -550,6 +603,28 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
         conn
+    }
+
+    #[test]
+    fn discover_peers_resolves_valid_ids_and_drops_invalid_ones() {
+        let valid = node_id_to_string(&node_id_from_secret([7u8; 32])).unwrap();
+        let peers = discover_peers(
+            AccountId::from_bytes([1u8; 32]),
+            &[valid.clone(), "not-a-node-id".to_string()],
+            "https://relay.example",
+        );
+        assert_eq!(peers.len(), 1, "the unparseable id is dropped, the valid one resolves");
+        assert_eq!(peers[0].0, valid, "the resolved entry keeps its node-id label");
+    }
+
+    #[test]
+    fn node_id_string_round_trips_through_bytes() {
+        let bytes = node_id_from_secret([9u8; 32]);
+        let text = node_id_to_string(&bytes).unwrap();
+        // `peer_addr` parses the same z-base-32 form, so the string is a valid dial id, and
+        // `peer_addr_from_bytes` reaches the same address from the raw bytes a ticket carries.
+        assert!(peer_addr(&text, "https://relay.example").is_ok());
+        assert!(peer_addr_from_bytes(&bytes, "https://relay.example").is_ok());
     }
 
     struct TestStore {

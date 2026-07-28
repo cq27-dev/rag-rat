@@ -647,6 +647,223 @@ async fn a_real_iroh_round_trip_restores_content_via_alpn_dispatch() {
     );
 }
 
+/// Two loopback endpoints with NO relay (`RelayMode::Disabled`), reachable only by their direct
+/// 127.0.0.1 socket address — a relay-free transport so the pairing drill runs in CI, unlike the
+/// `#[ignore]` live tests that dial over a real relay.
+async fn loopback_endpoints() -> (iroh::Endpoint, iroh::Endpoint) {
+    use rag_rat_sync::{CONTENT_SYNC_ALPN, ENROLL_ALPN, SYNC_ALPN};
+    let bind = |seed: [u8; 32]| async move {
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![SYNC_ALPN.to_vec(), CONTENT_SYNC_ALPN.to_vec(), ENROLL_ALPN.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .secret_key(iroh::SecretKey::from_bytes(&seed))
+            .bind()
+            .await
+            .unwrap()
+    };
+    (bind([0x31; 32]).await, bind([0x32; 32]).await)
+}
+
+/// A relay-free, directly dialable address for a loopback endpoint (its 127.0.0.1 socket).
+fn direct_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
+    let port = endpoint
+        .addr()
+        .ip_addrs()
+        .next()
+        .expect("a bound endpoint advertises at least one socket address")
+        .port();
+    iroh::EndpointAddr::new(endpoint.id())
+        .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
+/// The pairing acceptance drill (#930): a FRESH device holding no account enrolls into an owner's
+/// account over the real iroh transport (loopback endpoints, no relay), then restores the account
+/// log and its `/3` content — byte-identical — over the same endpoints. This is the D4
+/// restore-from-zero criterion running in CI, composing the enrollment exchange
+/// (`accept_enrollment` / `connect_and_enroll`) with steady-state sync (`accept_and_dispatch` /
+/// `connect_and_sync`).
+///
+/// Content is `Plaintext`-sealed so the assertion is a byte-level restore of the moved entries;
+/// sealed-key delivery to a joiner is covered separately by the oplog enrollment key-catch-up
+/// tests.
+#[tokio::test]
+async fn a_fresh_device_enrolls_then_restores_the_account_byte_for_byte() {
+    use std::collections::BTreeSet;
+
+    use rag_rat_oplog::{
+        DeviceRole, MemoryOp, NodeContent, NodeId, SealPolicy, author_content_batch,
+        content_entries_for_sync, ensure_owned_stream_v2_in_tx,
+    };
+    use rag_rat_sync::{
+        AuthPolicy, CONTENT_SYNC_ALPN, EnrollmentRequest, InviteSpec, OplogContentSyncStore,
+        SYNC_ALPN, accept_and_dispatch, accept_enrollment, connect_and_enroll, connect_and_sync,
+        mint_invite,
+    };
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    // Owner: an account, an owned stream, two authored memories.
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let stream = {
+        let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+        let s = ensure_owned_stream_v2_in_tx(&tx, "repo-a", NOW).unwrap();
+        tx.commit().unwrap();
+        s
+    };
+    let node = |id: &str, title: &str| MemoryOp::NodeCreate {
+        node_id: NodeId::from(id),
+        content: NodeContent {
+            kind: "Invariant".into(),
+            title: title.into(),
+            body: "body".into(),
+            confidence: "high".into(),
+            source: "agent".into(),
+            tags: Vec::new(),
+            payload: None,
+        },
+    };
+    author_content_batch(
+        &owner,
+        stream,
+        &[node("n1", "first"), node("n2", "second")],
+        SealPolicy::Plaintext,
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        content_entries_for_sync(&owner, account).unwrap().len(),
+        2,
+        "the owner authored two memories to restore",
+    );
+
+    // Joiner: a fresh store with a device identity but no account membership yet.
+    let joiner = fresh_db();
+    assert!(
+        rag_rat_oplog::read_local_account(&joiner).unwrap().is_none(),
+        "the joiner starts with no account",
+    );
+
+    let (owner_ep, joiner_ep) = loopback_endpoints().await;
+    let owner_addr = direct_addr(&owner_ep);
+
+    // 1) Enrollment — the pairing moment. The owner atomically authors the joiner's DeviceAdd.
+    {
+        let local = rag_rat_oplog::local_device(&joiner, NOW).unwrap();
+        let ticket = mint_invite(&owner, InviteSpec {
+            account_id: account,
+            inviter_node_id: *owner_ep.id().as_bytes(),
+            relay_url: "https://relay.example".into(),
+            role: DeviceRole::Member,
+            label: Some("laptop"),
+            now_ms: &|| NOW,
+            ttl: std::time::Duration::from_secs(60),
+        })
+        .unwrap();
+        // Budget / held / transport are recomputed inside `connect_and_enroll`; the placeholders
+        // here mirror how the CLI hands off a freshly minted request.
+        let request = EnrollmentRequest {
+            nonce: ticket.nonce,
+            expected_account: account,
+            ed25519_pubkey: local.ed25519_public_key(),
+            x25519_pubkey: local.x25519_public_key(),
+            transport_node_id: [0u8; 32],
+            budget: rag_rat_oplog::enrollment_budget(&joiner, account, NOW).unwrap(),
+            held_entry_hashes: Vec::new(),
+        };
+        let server = accept_enrollment(&owner_ep, &owner, || NOW);
+        let client =
+            connect_and_enroll(&joiner_ep, owner_addr.clone(), &joiner, account, &request, NOW);
+        let (server_r, client_r) = tokio::join!(server, client);
+        server_r.unwrap();
+        client_r.unwrap();
+    }
+    assert_eq!(
+        rag_rat_oplog::read_local_account(&joiner).unwrap(),
+        Some(account),
+        "the joiner adopted the account on enrollment",
+    );
+
+    let policy = AuthPolicy::Closed;
+
+    // 2) Account log first — the roster + stream ownership that authorize content acceptance.
+    {
+        let mut owner_account = OplogSyncStore::new(&owner, account, || NOW);
+        let mut owner_content = OplogContentSyncStore::new(&owner, account, || NOW);
+        let mut joiner_account = OplogSyncStore::new(&joiner, account, || NOW);
+        let server =
+            accept_and_dispatch(&owner_ep, &mut owner_account, &mut owner_content, policy, || NOW);
+        let client = connect_and_sync(
+            &joiner_ep,
+            owner_addr.clone(),
+            SYNC_ALPN,
+            &mut joiner_account,
+            policy,
+            NOW,
+        );
+        let (server_r, client_r) = tokio::join!(server, client);
+        assert_eq!(server_r.unwrap().0, SYNC_ALPN, "the account-log connection routed by ALPN");
+        client_r.unwrap();
+    }
+
+    // 3) Content — accepted now that its authority is present on the joiner.
+    {
+        let mut owner_account = OplogSyncStore::new(&owner, account, || NOW);
+        let mut owner_content = OplogContentSyncStore::new(&owner, account, || NOW);
+        let mut joiner_content = OplogContentSyncStore::new(&joiner, account, || NOW);
+        let server =
+            accept_and_dispatch(&owner_ep, &mut owner_account, &mut owner_content, policy, || NOW);
+        let client = connect_and_sync(
+            &joiner_ep,
+            owner_addr,
+            CONTENT_SYNC_ALPN,
+            &mut joiner_content,
+            policy,
+            NOW,
+        );
+        let (server_r, client_r) = tokio::join!(server, client);
+        assert_eq!(server_r.unwrap().0, CONTENT_SYNC_ALPN, "the content connection routed by ALPN");
+        client_r.unwrap();
+    }
+
+    // Restore-from-zero: the joiner's account log and content are byte-identical to the owner's
+    // FINAL state — the owner's account log grew by the joiner's own `DeviceAdd` during enrollment,
+    // so the comparison reads the owner after pairing, not the pre-pairing snapshot.
+    let signed = |entries: Vec<Vec<u8>>| -> BTreeSet<Vec<u8>> { entries.into_iter().collect() };
+    let owner_account = signed(
+        account_entries_for_sync(&owner, account)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.signed_bytes)
+            .collect(),
+    );
+    let owner_content = signed(
+        content_entries_for_sync(&owner, account)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.signed_bytes)
+            .collect(),
+    );
+    let joiner_account = signed(
+        account_entries_for_sync(&joiner, account)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.signed_bytes)
+            .collect(),
+    );
+    let joiner_content = signed(
+        content_entries_for_sync(&joiner, account)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.signed_bytes)
+            .collect(),
+    );
+    assert_eq!(
+        joiner_account, owner_account,
+        "the account log restored byte-for-byte on the joiner"
+    );
+    assert_eq!(joiner_content, owner_content, "the content restored byte-for-byte on the joiner");
+}
+
 /// A peer that offers a valid entry for a DIFFERENT account than the session is scoped to must not
 /// have it stored — the account-scoped store rejects it before ingest, so it cannot grow other
 /// accounts through a session that never named them.

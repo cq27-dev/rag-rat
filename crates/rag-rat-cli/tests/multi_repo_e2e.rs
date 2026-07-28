@@ -138,8 +138,10 @@ fn sync_enable_is_narrow_idempotent_and_help_is_honest() {
     let help = run_ok(&root, &data_dir, &model_cache, &["sync", "--help"]);
     assert!(help.contains("enable"));
     assert!(help.contains("does not configure transport or peers"));
+    // Pairing shipped (#930): `init` mints an invite and hosts the exchange, `join` redeems it.
+    assert!(help.contains("init"));
+    assert!(help.contains("join"));
     assert!(!help.contains("disable"));
-    assert!(!help.contains("pair"));
     assert!(!help.contains("push"));
     assert!(!help.contains("pull"));
 
