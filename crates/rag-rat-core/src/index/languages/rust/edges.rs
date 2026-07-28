@@ -573,41 +573,35 @@ fn same_file_constructor_return(
     while let Some(parent) = root.parent() {
         root = parent;
     }
+    // Impl candidacy is decided on CANONICAL module-qualified owner paths, never on the type
+    // tail alone: one file may hold `mod a { impl Factory }` and `mod b { impl Factory }`, and a
+    // tail match would classify `a::Factory::new()` through module b's constructor. Candidates
+    // the canonicalization cannot tell apart (either side undecidable) still count — and MORE
+    // THAN ONE surviving candidate is ambiguity, which must decline rather than fall back to
+    // the naming convention (only a MISSING same-file definition keeps the convention).
     let owner_tail = qn_tail(owner);
+    let owner_canonical = module_qualified_type_path(node, owner, text);
+    let mut candidates: Vec<CtorReturn> = Vec::new();
     let mut stack = vec![root];
     while let Some(current) = stack.pop() {
         let mut cursor = current.walk();
         for child in current.named_children(&mut cursor) {
             match child.kind() {
                 "impl_item" => {
-                    let impl_type_matches = child
-                        .child_by_field_name("type")
-                        .map(|type_node| degeneric_path(&node_text(type_node, text)))
-                        .is_some_and(|impl_type| qn_tail(impl_type.trim()) == owner_tail);
-                    if !impl_type_matches {
+                    let Some(type_node) = child.child_by_field_name("type") else { continue };
+                    let impl_type = node_text(type_node, text);
+                    if qn_tail(degeneric_path(&impl_type).trim()) != owner_tail {
                         continue;
                     }
-                    let Some(body) = child.child_by_field_name("body") else { continue };
-                    let mut body_cursor = body.walk();
-                    for item in body.named_children(&mut body_cursor) {
-                        if item.kind() != "function_item"
-                            || child_name_text(item, text).as_deref() != Some(ctor)
-                        {
-                            continue;
-                        }
-                        let Some(return_node) = item.child_by_field_name("return_type") else {
-                            // A "constructor" declared to return `()` constructs nothing.
-                            return CtorReturn::Opaque;
-                        };
-                        let declared = node_text(return_node, text);
-                        let trimmed = declared.trim();
-                        if trimmed == "Self" || qn_tail(&degeneric_path(trimmed)) == owner_tail {
-                            return CtorReturn::SelfLike;
-                        }
-                        return match clean_rust_type_name(trimmed, fn_generics) {
-                            Some(declared) => CtorReturn::Other(declared),
-                            None => CtorReturn::Opaque,
-                        };
+                    let Some(classified) =
+                        classify_constructor_return(child, text, ctor, owner_tail, fn_generics)
+                    else {
+                        continue; // this impl does not define the constructor
+                    };
+                    let impl_canonical = module_qualified_type_path(child, &impl_type, text);
+                    match (&owner_canonical, &impl_canonical) {
+                        (Some(owner_path), Some(impl_path)) if owner_path != impl_path => {},
+                        _ => candidates.push(classified),
                     }
                 },
                 // Constructors can sit inside inline modules; anything else cannot contain an
@@ -617,7 +611,92 @@ fn same_file_constructor_return(
             }
         }
     }
-    CtorReturn::Unknown
+    match candidates.len() {
+        0 => CtorReturn::Unknown,
+        1 => candidates.into_iter().next().expect("len checked"),
+        _ => CtorReturn::Opaque,
+    }
+}
+
+/// Classify the declared return type of `impl { fn <ctor> }`, or `None` when this impl does not
+/// define the constructor at all.
+fn classify_constructor_return(
+    impl_node: Node<'_>,
+    text: &str,
+    ctor: &str,
+    owner_tail: &str,
+    fn_generics: &[&str],
+) -> Option<CtorReturn> {
+    let body = impl_node.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    for item in body.named_children(&mut cursor) {
+        if item.kind() != "function_item" || child_name_text(item, text).as_deref() != Some(ctor) {
+            continue;
+        }
+        let Some(return_node) = item.child_by_field_name("return_type") else {
+            // A "constructor" declared to return `()` constructs nothing.
+            return Some(CtorReturn::Opaque);
+        };
+        let declared = node_text(return_node, text);
+        let trimmed = declared.trim();
+        if trimmed == "Self" || qn_tail(&degeneric_path(trimmed)) == owner_tail {
+            return Some(CtorReturn::SelfLike);
+        }
+        return Some(match clean_rust_type_name(trimmed, fn_generics) {
+            Some(declared) => CtorReturn::Other(declared),
+            None => CtorReturn::Opaque,
+        });
+    }
+    None
+}
+
+/// The canonical module-qualified path of a type mentioned at `context`: enclosing `mod` names
+/// (outermost first) resolved against the reference — `crate::` restarts at the file root,
+/// `self::` keeps the current module, each leading `super::` pops one module (declining on
+/// underflow), and an otherwise relative path appends to the current module. UFCS and
+/// qualified-projection forms (`<T as Trait>::Out`) decline. File-local by construction: paths
+/// from two files never compare here.
+fn module_qualified_type_path(context: Node<'_>, raw_type: &str, text: &str) -> Option<String> {
+    let degeneric = degeneric_path(raw_type.trim());
+    let cleaned = degeneric.trim();
+    if cleaned.is_empty() || cleaned.starts_with('<') || cleaned.contains(" as ") {
+        return None;
+    }
+    let mut modules = enclosing_module_path(context, text);
+    let relative = if let Some(rest) = cleaned.strip_prefix("crate::") {
+        modules.clear();
+        rest
+    } else if let Some(rest) = cleaned.strip_prefix("self::") {
+        rest
+    } else {
+        let mut rest = cleaned;
+        while let Some(popped) = rest.strip_prefix("super::") {
+            modules.pop()?;
+            rest = popped;
+        }
+        rest
+    };
+    if relative.is_empty() {
+        return None;
+    }
+    modules.extend(relative.split("::").map(str::to_string));
+    Some(modules.join("::"))
+}
+
+/// Enclosing `mod` names of `node`, outermost first.
+fn enclosing_module_path(node: Node<'_>, text: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "mod_item"
+            && let Some(name) = child_name_text(ancestor, text)
+        {
+            modules.push(name);
+        }
+        current = ancestor.parent();
+    }
+    modules.reverse();
+    modules
 }
 
 /// Whether `node` is a control-flow construct whose pattern rebinds `recv` for the region the
@@ -836,6 +915,50 @@ mod receiver_type_hint_tests {
             }
         "#;
         assert_eq!(extract_call_hints(code), vec![None, Some("Worker".to_string())]);
+    }
+
+    #[test]
+    fn test_sibling_module_constructor_owners_stay_separate() {
+        let code = r#"
+            mod a {
+                impl Factory {
+                    fn new() -> WorkerA { WorkerA }
+                }
+                fn make() {
+                    let worker = Factory::new();
+                    worker.run();
+                }
+            }
+            mod b {
+                impl Factory {
+                    fn new() -> WorkerB { WorkerB }
+                }
+            }
+        "#;
+        // The unqualified `Factory::new()` inside `mod a` is `a::Factory::new` — module b's
+        // same-tail impl must not classify it. Calls: Factory::new(), worker.run().
+        assert_eq!(extract_call_hints(code), vec![None, Some("WorkerA".to_string())]);
+    }
+
+    #[test]
+    fn test_indistinguishable_constructor_candidates_decline() {
+        let code = r#"
+            #[cfg(feature = "alpha")]
+            impl Factory {
+                fn new() -> WorkerA { WorkerA }
+            }
+            #[cfg(not(feature = "alpha"))]
+            impl Factory {
+                fn new() -> WorkerB { WorkerB }
+            }
+            fn make() {
+                let worker = Factory::new();
+                worker.run();
+            }
+        "#;
+        // Two same-module candidates the canonical path cannot tell apart disagree on the
+        // return type — ambiguity must decline, not pick the first traversal hit.
+        assert_eq!(extract_call_hints(code), vec![None, None]);
     }
 
     #[test]
