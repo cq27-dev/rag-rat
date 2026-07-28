@@ -668,6 +668,7 @@ fn swift_local_receivers_override_external_bare_name_suppression() {
                 evidence: Some("make()"),
                 receiver_hint: Some(receiver),
                 receiver_type_hint: None,
+                receiver_type_external: false,
                 source_file_id: 1,
                 source_language: Some(Language::Swift.as_str()),
                 imported_external: true,
@@ -680,6 +681,107 @@ fn swift_local_receivers_override_external_bare_name_suppression() {
         assert_eq!(confidence, EdgeConfidence::Syntactic);
         assert_eq!(resolution, "target_name_fallback");
     }
+}
+
+#[test]
+fn external_receiver_type_hint_never_binds_locally() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "crate::Worker::run".to_string();
+    run.scope_path = "Worker::run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+
+    let request = |receiver_type_external: bool| ResolveSymbolRequest {
+        name: "run",
+        target_qualified_name: None,
+        edge_kind: EdgeKind::CallsName,
+        evidence: Some("run()"),
+        receiver_hint: Some("w"),
+        receiver_type_hint: Some("Worker"),
+        receiver_type_external,
+        source_file_id: 1,
+        source_language: Some(Language::Rust.as_str()),
+        imported_external: false,
+    };
+
+    let (target, confidence, reason) =
+        resolve_symbol(request(false), &index).expect("a local Worker receiver resolves");
+    assert_eq!(target.id, symbols[0].id);
+    assert_eq!(confidence, EdgeConfidence::Syntactic);
+    assert_eq!(reason, "receiver_type");
+
+    // Same call, but `Worker` came from `use external::Worker;` — the receiver-type branch must
+    // not bind the call to the unrelated local `Worker::run`.
+    if let Some((_, _, reason)) = resolve_symbol(request(true), &index) {
+        assert!(
+            !matches!(reason, "receiver_type" | "scope_degeneric"),
+            "externally-imported receiver type must not drive resolution, got {reason}"
+        );
+    }
+}
+
+#[test]
+fn two_trait_impls_on_one_type_decline_receiver_resolution() {
+    // `impl TraitA for Worker { fn run }` + `impl TraitB for Worker { fn run }` with identical
+    // signatures: the trait marker in the raw scope keeps them distinct, both surface as
+    // `Worker::run` through normalization, and a `worker.run()` hint that could hit either must
+    // decline instead of confidently picking the first row.
+    let mut a = preferred_candidate(1, Language::Rust, "function");
+    a.name = "run".to_string();
+    a.qualified_name = "src/worker.rs::run".to_string();
+    a.scope_path = "Worker as TraitA::run".to_string();
+    let mut b = preferred_candidate(2, Language::Rust, "function");
+    b.name = "run".to_string();
+    b.qualified_name = "src/worker.rs::run".to_string();
+    b.scope_path = "Worker as TraitB::run".to_string();
+    let symbols = [a, b];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: None,
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("run()"),
+            receiver_hint: Some("worker"),
+            receiver_type_hint: Some("Worker"),
+            receiver_type_external: false,
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+        },
+        &index,
+    );
+    if let Some((_, _, reason)) = resolved {
+        assert!(
+            !matches!(reason, "receiver_type" | "scope_degeneric"),
+            "two candidate trait impls must stay ambiguous, got {reason}"
+        );
+    }
+
+    // With only ONE trait impl in scope the same hint binds through the normalized surface.
+    let solo = [symbols[0].clone()];
+    let solo_index = SymbolIndex::build(&solo);
+    let (target, confidence, reason) = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: None,
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("run()"),
+            receiver_hint: Some("worker"),
+            receiver_type_hint: Some("Worker"),
+            receiver_type_external: false,
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+        },
+        &solo_index,
+    )
+    .expect("a single trait impl resolves through the normalized scope");
+    assert_eq!(target.id, 1);
+    assert_eq!(confidence, EdgeConfidence::Syntactic);
+    assert_eq!(reason, "scope_degeneric");
 }
 
 #[test]

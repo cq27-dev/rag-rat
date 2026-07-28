@@ -453,7 +453,10 @@ fn indexes_real_world_rust_graph_patterns() {
             .unwrap();
     assert_eq!(receiver_hint.as_deref(), Some("worker"));
     assert_eq!(receiver_type_hint.as_deref(), Some("Worker"));
-    assert_eq!(resolution, "receiver_type");
+    // `serve` lives in a TRAIT impl, so its raw scope carries the trait marker
+    // (`Worker as Service::serve`) and the hint target `Worker::serve` binds through the
+    // normalized surface — hence `scope_degeneric`, not the exact-scope `receiver_type`.
+    assert_eq!(resolution, "scope_degeneric");
     let syntactic_callers = db.find_callers("serve", 10).unwrap();
     assert!(
         syntactic_callers.iter().any(|edge| {
@@ -2177,16 +2180,19 @@ pub fn call_alpha() {
         .unwrap();
 
     assert_eq!(run_lookup.candidates.len(), 2, "2 candidates for run");
+    // Trait impls carry the trait marker in their raw scope (`Type as Trait::method`): the
+    // implementing type stays the owner for receiver matching (the resolver folds the marker
+    // away), while the trait keeps same-signature methods from TWO traits on one type apart.
     let alpha_run = run_lookup
         .candidates
         .iter()
-        .find(|candidate| scope_path(candidate.symbol_id) == "Alpha::run")
-        .expect("impl Worker for Alpha must use the implementing type as its owner");
+        .find(|candidate| scope_path(candidate.symbol_id) == "Alpha as Worker::run")
+        .expect("impl Worker for Alpha must own its method as `Alpha as Worker`");
     let beta_run = run_lookup
         .candidates
         .iter()
-        .find(|candidate| scope_path(candidate.symbol_id) == "Beta::run")
-        .expect("impl Worker for Beta must use the implementing type as its owner");
+        .find(|candidate| scope_path(candidate.symbol_id) == "Beta as Worker::run")
+        .expect("impl Worker for Beta must own its method as `Beta as Worker`");
     assert_ne!(
         alpha_run.logical_symbol_id, beta_run.logical_symbol_id,
         "impl Worker for Alpha vs impl Worker for Beta must have distinct logical_symbol_ids"

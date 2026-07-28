@@ -5,6 +5,16 @@ use std::collections::BTreeMap;
 
 use super::*;
 
+/// Logical identity stores the DEGENERIC scope — `Foo::run` for `impl<T> Foo<T>` and
+/// `impl<U> Foo<U>` alike: valid cfg variants may spell an equivalent generic owner with
+/// different binder names and must remain ONE logical symbol. Trait-impl markers
+/// (`Type as Trait`) survive — only generics fold, so two traits' methods stay distinct (#567).
+/// Every SQL read of `symbols.scope_path` that feeds a [`LogicalSymbolKey`] funnels through
+/// here; comparing a normalized key against a raw path is always a bug.
+fn logical_scope_path(raw: String) -> String {
+    if raw.contains('<') { crate::index::edges::degeneric_path(&raw) } else { raw }
+}
+
 /// Grouping key that collapses cfg variants / overloads of one symbol into a single logical symbol.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct LogicalSymbolKey {
@@ -130,7 +140,7 @@ pub(crate) fn realign_logical_symbol_ids(conn: &rusqlite::Connection) -> rusqlit
                 qualified_name: r.get(5)?,
                 kind: r.get(6)?,
                 signature: r.get(7)?,
-                scope_path: r.get(8)?,
+                scope_path: r.get::<_, Option<String>>(8)?.map(logical_scope_path),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -803,7 +813,7 @@ impl IndexDatabase {
                 language: row.get(2)?,
                 name: row.get(3)?,
                 qualified_name: row.get(4)?,
-                scope_path: row.get(5)?,
+                scope_path: logical_scope_path(row.get(5)?),
                 kind: row.get(6)?,
                 signature: row.get(7)?,
                 start_line: row.get(8)?,
@@ -940,7 +950,7 @@ impl IndexDatabase {
                 path: row.get(1)?,
                 name: row.get(2)?,
                 qualified_name: row.get(3)?,
-                scope_path: row.get(4)?,
+                scope_path: row.get::<_, Option<String>>(4)?.map(logical_scope_path),
                 kind: row.get(5)?,
                 signature: row.get(6)?,
             };
@@ -1010,7 +1020,7 @@ impl IndexDatabase {
                 path: row.get(1)?,
                 name: row.get(2)?,
                 qualified_name: row.get(3)?,
-                scope_path: row.get(4)?,
+                scope_path: row.get::<_, Option<String>>(4)?.map(logical_scope_path),
                 kind: row.get(5)?,
                 signature: row.get(6)?,
             };
@@ -1178,7 +1188,7 @@ impl IndexDatabase {
                     path: row.get(1)?,
                     name: row.get(2)?,
                     qualified_name: row.get(3)?,
-                    scope_path: row.get(4)?,
+                    scope_path: row.get::<_, Option<String>>(4)?.map(logical_scope_path),
                     kind: row.get(5)?,
                     signature: row.get(6)?,
                 })
@@ -1259,7 +1269,7 @@ impl IndexDatabase {
                             path: row.get(0)?,
                             name: row.get(1)?,
                             qualified_name: row.get(2)?,
-                            scope_path: row.get(3)?,
+                            scope_path: row.get::<_, Option<String>>(3)?.map(logical_scope_path),
                             kind: row.get(4)?,
                             signature: row.get(5)?,
                         })

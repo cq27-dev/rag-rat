@@ -48,7 +48,23 @@ impl ParserBackend for Rust {
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
         let name = match node.kind() {
             "mod_item" | "trait_item" => parser::child_name(node)?,
-            "impl_item" => impl_name(node)?,
+            "impl_item" => {
+                let segment = parser::node_text(impl_name(node)?, text)?;
+                // `impl Trait for Type`: keep the trait's tail in the scope segment
+                // (`Type as Trait`) so two traits' same-named, same-signature methods on one
+                // type stay DISTINCT logical symbols instead of collapsing into one. Resolution
+                // folds the ` as Trait` marker away (`normalized_scope_path`), so the receiver
+                // surface both traits expose is still `Type::method` — and a call that could hit
+                // either declines as ambiguous (#567).
+                return match node.child_by_field_name("trait") {
+                    Some(trait_node) => {
+                        let trait_text = parser::node_text(trait_node, text)?;
+                        let tail = trait_text.rsplit("::").next().unwrap_or(&trait_text).trim();
+                        Some(if tail.is_empty() { segment } else { format!("{segment} as {tail}") })
+                    },
+                    None => Some(segment),
+                };
+            },
             _ => return None,
         };
         parser::node_text(name, text)

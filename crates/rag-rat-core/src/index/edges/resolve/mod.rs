@@ -427,6 +427,10 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 evidence: evidence.as_deref(),
                 receiver_hint: resolve_receiver,
                 receiver_type_hint: receiver_type_hint.as_deref(),
+                receiver_type_external: receiver_type_hint.as_deref().is_some_and(|hint| {
+                    let root = hint.split("::").next().unwrap_or(hint);
+                    import_scope.is_external_import(source_file_id, root, ref_byte)
+                }),
                 source_file_id,
                 source_language: Some(source_language.as_str()),
                 imported_external: import_scope.is_external_import(
@@ -658,6 +662,10 @@ pub(crate) fn resolve_and_insert_edges(
                     evidence,
                     receiver_hint: resolve_receiver,
                     receiver_type_hint,
+                    receiver_type_external: receiver_type_hint.is_some_and(|hint| {
+                        let root = hint.split("::").next().unwrap_or(hint);
+                        import_scope.is_external_import(*file_id, root, ref_byte)
+                    }),
                     source_file_id: *file_id,
                     source_language: file_language.get(file_id).map(String::as_str),
                     imported_external: import_scope.is_external_import(
@@ -815,42 +823,78 @@ pub(crate) fn resolve_symbol<'a>(
     }) {
         return None;
     }
-    if let Some(type_hint) = request.receiver_type_hint.filter(|value| !value.is_empty()) {
+    // Receiver-type resolution never fires for an externally-imported type: `use
+    // external::Worker; fn f(w: Worker) { w.run() }` must not bind to an unrelated local
+    // `Worker::run` elsewhere in the workspace. The callee-name/qualified-root suppression above
+    // cannot see this case (it inspects `run` and the value receiver `w`, not the inferred type).
+    if let Some(type_hint) = request
+        .receiver_type_hint
+        .filter(|value| !value.is_empty() && !request.receiver_type_external)
+    {
         let target = format!("{type_hint}::{}", request.name);
-        let target_degeneric = degeneric_path(&target);
+        let target_normalized = normalized_scope_path(&target);
 
-        let scope_exact = index
-            .by_scope_path
-            .get(target.as_str())
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|symbol| kind_matches(symbol))
-            .collect::<Vec<_>>();
-        match scope_exact.as_slice() {
-            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "receiver_type")),
-            [_, ..] if same_logical_symbol(&scope_exact) =>
-                return Some((scope_exact[0], EdgeConfidence::Syntactic, "receiver_type")),
-            _ => {},
+        // One receiver target, two surfaces. Exact: the raw scope map (reason `receiver_type`).
+        // Normalized: BOTH maps — plain-scope symbols live only in `by_scope_path` (skipped when
+        // the target needed no normalization: that key was just tried), normalization-changed
+        // symbols (generics, trait-impl owners) only in `by_normalized_scope_path` (reason
+        // `scope_degeneric`). Two traits' same-named methods on one type meet on the normalized
+        // surface as DISTINCT logical symbols and decline as ambiguous.
+        let try_scope = |target: &str| -> Option<(&'a IndexedSymbol, &'static str)> {
+            let scope_exact = index
+                .by_scope_path
+                .get(target)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|symbol| kind_matches(symbol))
+                .collect::<Vec<_>>();
+            match scope_exact.as_slice() {
+                [symbol] => return Some((*symbol, "receiver_type")),
+                [_, ..] if same_logical_symbol(&scope_exact) =>
+                    return Some((scope_exact[0], "receiver_type")),
+                _ => {},
+            }
+            let target_normalized = normalized_scope_path(target);
+            let scope_normalized = index
+                .by_scope_path
+                .get(target_normalized.as_ref())
+                .filter(|_| target_normalized.as_ref() != target)
+                .into_iter()
+                .flatten()
+                .chain(
+                    index
+                        .by_normalized_scope_path
+                        .get(target_normalized.as_ref())
+                        .into_iter()
+                        .flatten(),
+                )
+                .copied()
+                .filter(|symbol| kind_matches(symbol))
+                .collect::<Vec<_>>();
+            match scope_normalized.as_slice() {
+                [symbol] => Some((*symbol, "scope_degeneric")),
+                [_, ..] if same_logical_symbol(&scope_normalized) =>
+                    Some((scope_normalized[0], "scope_degeneric")),
+                _ => None,
+            }
+        };
+
+        if let Some((symbol, reason)) = try_scope(&target) {
+            return Some((symbol, EdgeConfidence::Syntactic, reason));
         }
-
-        let scope_degeneric = index
-            .by_degeneric_scope_path
-            .get(&target_degeneric)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|symbol| kind_matches(symbol))
-            .collect::<Vec<_>>();
-        match scope_degeneric.as_slice() {
-            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "scope_degeneric")),
-            [_, ..] if same_logical_symbol(&scope_degeneric) =>
-                return Some((scope_degeneric[0], EdgeConfidence::Syntactic, "scope_degeneric")),
-            _ => {},
+        // A module-qualified hint (`workers::Worker` — e.g. a stripped `crate::workers::Worker`
+        // parameter type) rarely equals a container-based scope (`Worker::run`) verbatim; retry
+        // with the type's tail before falling to the loose suffix pass (#567).
+        if type_hint.contains("::") {
+            let tail_target = format!("{}::{}", qn_tail(type_hint), request.name);
+            if let Some((symbol, reason)) = try_scope(&tail_target) {
+                return Some((symbol, EdgeConfidence::Syntactic, reason));
+            }
         }
 
         let scope_suffix = format!("::{target}");
-        let scope_degeneric_suffix = format!("::{target_degeneric}");
+        let scope_normalized_suffix = format!("::{target_normalized}");
         let receiver_suffix_matches = index
             .by_name
             .get(short_name(request.name))
@@ -860,7 +904,8 @@ pub(crate) fn resolve_symbol<'a>(
             .filter(|symbol| {
                 kind_matches(symbol)
                     && (symbol.scope_path.ends_with(&scope_suffix)
-                        || degeneric_path(&symbol.scope_path).ends_with(&scope_degeneric_suffix))
+                        || normalized_scope_path(&symbol.scope_path)
+                            .ends_with(&scope_normalized_suffix))
             })
             .collect::<Vec<_>>();
         match receiver_suffix_matches.as_slice() {
@@ -911,19 +956,27 @@ pub(crate) fn resolve_symbol<'a>(
                 return Some((scope_exact[0], EdgeConfidence::Syntactic, "logical_variant")),
             _ => {},
         }
-        let qualified_degeneric = degeneric_path(qualified);
-        let scope_degeneric = index
-            .by_degeneric_scope_path
-            .get(&qualified_degeneric)
+        let qualified_normalized = normalized_scope_path(qualified);
+        let scope_normalized = index
+            .by_scope_path
+            .get(qualified_normalized.as_ref())
+            .filter(|_| qualified_normalized.as_ref() != qualified)
             .into_iter()
             .flatten()
+            .chain(
+                index
+                    .by_normalized_scope_path
+                    .get(qualified_normalized.as_ref())
+                    .into_iter()
+                    .flatten(),
+            )
             .copied()
             .filter(|symbol| kind_matches(symbol))
             .collect::<Vec<_>>();
-        match scope_degeneric.as_slice() {
+        match scope_normalized.as_slice() {
             [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "scope_degeneric")),
-            [_, ..] if same_logical_symbol(&scope_degeneric) =>
-                return Some((scope_degeneric[0], EdgeConfidence::Syntactic, "scope_degeneric")),
+            [_, ..] if same_logical_symbol(&scope_normalized) =>
+                return Some((scope_normalized[0], EdgeConfidence::Syntactic, "scope_degeneric")),
             _ => {},
         }
         let scope_suffix = format!("::{qualified}");

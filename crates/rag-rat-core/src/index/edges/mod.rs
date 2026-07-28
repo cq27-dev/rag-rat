@@ -568,6 +568,31 @@ pub(crate) fn degeneric_path(path: &str) -> String {
     result
 }
 
+/// [`degeneric_path`] plus trait-impl owner folding: the `Type as Trait` scope segment emitted
+/// for `impl Trait for Type` collapses to `Type`, so a source-form target (`Type::method`, a
+/// receiver-type hint) finds trait-impl methods while their RAW scope keeps the trait — two
+/// traits' same-named methods stay distinct logical symbols yet expose the same receiver
+/// surface, and a call that could hit either declines as ambiguous (#567). The trait tail never
+/// contains `::` (see the Rust `scope_segment`), so per-`::`-segment splitting is sound.
+/// Borrowed ⇔ the path needs no normalization — the hot rebuild path allocates nothing for the
+/// plain-scope majority.
+pub(crate) fn normalized_scope_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.contains('<') && !path.contains(" as ") {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let degeneric = degeneric_path(path);
+    if !degeneric.contains(" as ") {
+        return std::borrow::Cow::Owned(degeneric);
+    }
+    std::borrow::Cow::Owned(
+        degeneric
+            .split("::")
+            .map(|segment| segment.split(" as ").next().unwrap_or(segment).trim_end())
+            .collect::<Vec<_>>()
+            .join("::"),
+    )
+}
+
 /// Name-keyed indexes over the symbol set, built once per resolve pass. Edge resolution used to
 /// scan the entire `Vec<IndexedSymbol>` (several times) per edge — O(edges × symbols), the single
 /// biggest cost in a full rebuild. These maps make each lookup ~O(1). Bucket order mirrors the
@@ -580,9 +605,9 @@ pub(crate) struct SymbolIndex<'a> {
     /// qualified path fires for methods/nested items instead of collapsing to bare-name
     /// collisions.
     by_scope_path: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
-    /// Scope path with generics stripped, e.g. `SymbolIndex::build` matching
-    /// `SymbolIndex<'a>::build`.
-    by_degeneric_scope_path: HashMap<String, Vec<&'a IndexedSymbol>>,
+    /// Scope path with generics stripped and trait-impl owners folded (`SymbolIndex::build`
+    /// matching `SymbolIndex<'a>::build`; `Worker::run` matching `Worker as Service::run`).
+    by_normalized_scope_path: HashMap<String, Vec<&'a IndexedSymbol>>,
     /// Short-name fallback (`symbol.name`).
     by_name: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
     /// Candidates for the `qualified_name.ends_with("::{q}")` suffix match, keyed by the last
@@ -595,18 +620,23 @@ impl<'a> SymbolIndex<'a> {
     fn build(symbols: &'a [IndexedSymbol]) -> Self {
         let mut by_qualified: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_scope_path: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
-        let mut by_degeneric_scope_path: HashMap<String, Vec<&IndexedSymbol>> = HashMap::new();
+        let mut by_normalized_scope_path: HashMap<String, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_qn_tail: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         for symbol in symbols {
             by_qualified.entry(symbol.qualified_name.as_str()).or_default().push(symbol);
             by_scope_path.entry(symbol.scope_path.as_str()).or_default().push(symbol);
-            let degeneric = degeneric_path(&symbol.scope_path);
-            by_degeneric_scope_path.entry(degeneric).or_default().push(symbol);
+            // Only paths the normalization actually changes go into the normalized map (`Owned`
+            // ⇔ changed) — a plain scope is already reachable through `by_scope_path`, and
+            // skipping it avoids one String per symbol on the hot rebuild path. Lookups consult
+            // BOTH maps.
+            if let std::borrow::Cow::Owned(normalized) = normalized_scope_path(&symbol.scope_path) {
+                by_normalized_scope_path.entry(normalized).or_default().push(symbol);
+            }
             by_name.entry(symbol.name.as_str()).or_default().push(symbol);
             by_qn_tail.entry(qn_tail(&symbol.qualified_name)).or_default().push(symbol);
         }
-        Self { by_qualified, by_scope_path, by_degeneric_scope_path, by_name, by_qn_tail }
+        Self { by_qualified, by_scope_path, by_normalized_scope_path, by_name, by_qn_tail }
     }
 
     /// Whether `file_id` itself defines a symbol named `name`. Import-alias rebinding defers when
@@ -627,6 +657,12 @@ pub(crate) struct ResolveSymbolRequest<'a> {
     evidence: Option<&'a str>,
     receiver_hint: Option<&'a str>,
     receiver_type_hint: Option<&'a str>,
+    /// The ROOT segment of `receiver_type_hint` names an external import (`use external::Worker;
+    /// fn f(w: Worker)`). `imported_external` below is computed from the CALLEE name and the
+    /// qualified root, so it cannot see this: without a separate flag the receiver-type branch
+    /// would confidently bind an external method call to an unrelated same-named local type
+    /// (#567). When set, the receiver-type branch is skipped entirely — never resolved locally.
+    receiver_type_external: bool,
     source_file_id: i64,
     source_language: Option<&'a str>,
     /// `name` is brought into this file by a `use` from an EXTERNAL dependency crate (#61 Project
