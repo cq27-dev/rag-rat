@@ -7,11 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.22.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.21.1...rag-rat-base-v0.22.0) - 2026-07-28
+## [0.22.0](https://github.com/cq27-dev/rag-rat/compare/v0.21.1...v0.22.0) - 2026-07-28
 
 ### Added
 
-- *(oracle)* live LSP watcher wiring — phase 6 slice 2 ([#534](https://github.com/cq27-dev/rag-rat/pull/534)) ([#972](https://github.com/cq27-dev/rag-rat/pull/972))
+- *(oracle)* live `rust-analyzer` resolution for changed Rust call edges in watch mode ([#534](https://github.com/cq27-dev/rag-rat/pull/534)) ([#972](https://github.com/cq27-dev/rag-rat/pull/972))
 - *(sync)* device-side account-log sync to configured server peers ([#922](https://github.com/cq27-dev/rag-rat/pull/922))
 - *(sync)* [sync] config + `rag-rat sync serve` headless peer ([#909](https://github.com/cq27-dev/rag-rat/pull/909))
 
