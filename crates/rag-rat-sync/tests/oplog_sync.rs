@@ -676,6 +676,87 @@ fn direct_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
         .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
+/// Multi-round reconciliation (#878): `connect_and_reconcile` re-dials until a round is dry, so a
+/// single session's `Done` is never mistaken for a complete store. Over loopback: a fresh peer
+/// takes TWO rounds (one transfers the account, one confirms the fixpoint), and re-running against
+/// the now-in-sync peer takes exactly ONE (immediately dry — no over-dialing). The serve side
+/// accepts each re-dial in a select loop and drops the pending accept once the client converges.
+#[tokio::test]
+async fn connect_and_reconcile_pulls_an_account_to_a_fixpoint_over_loopback() {
+    use rag_rat_sync::{
+        AuthPolicy, MAX_RECONCILE_ROUNDS, OplogSyncStore, ReconcileReport, SYNC_ALPN,
+        accept_and_sync, connect_and_reconcile,
+    };
+
+    let source = fresh_db();
+    let account = local_account(&source, NOW).unwrap();
+    let want = account_entries_for_sync(&source, account).unwrap();
+    assert!(!want.is_empty(), "the source has account entries to transfer");
+
+    let dest = fresh_db();
+    let (listener, dialer) = loopback_endpoints().await;
+    let listener_addr = direct_addr(&listener);
+    let policy = AuthPolicy::Open; // a fresh dest pulls the account log read-only
+
+    // Drive the client (which re-dials internally) while the serve side accepts each connection,
+    // stopping when the client resolves.
+    async fn reconcile_with_server(
+        source: &Connection,
+        dest: &Connection,
+        account: AccountId,
+        listener: &iroh::Endpoint,
+        dialer: &iroh::Endpoint,
+        addr: iroh::EndpointAddr,
+        policy: AuthPolicy,
+    ) -> ReconcileReport {
+        let mut src_store = OplogSyncStore::new(source, account, || NOW);
+        let mut dst_store = OplogSyncStore::new(dest, account, || NOW);
+        let client = connect_and_reconcile(
+            dialer,
+            addr,
+            SYNC_ALPN,
+            &mut dst_store,
+            policy,
+            || NOW,
+            MAX_RECONCILE_ROUNDS,
+        );
+        tokio::pin!(client);
+        loop {
+            tokio::select! {
+                resolved = &mut client => break resolved.unwrap(),
+                accepted = accept_and_sync(listener, &mut src_store, policy, || NOW) => {
+                    accepted.unwrap();
+                }
+            }
+        }
+    }
+
+    let report = reconcile_with_server(
+        &source,
+        &dest,
+        account,
+        &listener,
+        &dialer,
+        listener_addr.clone(),
+        policy,
+    )
+    .await;
+    assert_eq!(report.rounds, 2, "one round transfers the account, one confirms the fixpoint");
+    assert!(report.converged, "the reconciliation reached a fixpoint");
+    assert_eq!(
+        account_entries_for_sync(&dest, account).unwrap().len(),
+        want.len(),
+        "the whole account restored across the reconciliation",
+    );
+
+    let again =
+        reconcile_with_server(&source, &dest, account, &listener, &dialer, listener_addr, policy)
+            .await;
+    assert_eq!(again.rounds, 1, "an already-in-sync peer converges in a single dry round");
+    assert!(again.converged);
+    assert_eq!(again.entries_newly_stored, 0, "nothing new to store when already converged");
+}
+
 /// The pairing acceptance drill (#930): a FRESH device holding no account enrolls into an owner's
 /// account over the real iroh transport (loopback endpoints, no relay), then restores the account
 /// log and its `/3` content — byte-identical — over the same endpoints. This is the D4

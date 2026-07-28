@@ -396,29 +396,33 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
 
         // 2) Restore-from-zero — pull the account log then `/3` content from the inviter, now that
         //    this device is roster-effective. Content rides on the account log's authority, so the
-        //    account log runs first. The inviter must still be serving (its `sync init` / `serve`).
+        //    account log runs first. Each stream reconciles to a fixpoint (#878): a single session
+        //    can report `Done` while the store is still incomplete, so re-run until dry (or the
+        //    round cap). The inviter must still be serving (its `sync init` / `serve`).
         let account_report = {
             let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
-            rag_rat_sync::connect_and_sync(
+            rag_rat_sync::connect_and_reconcile(
                 &endpoint,
                 peer.clone(),
                 rag_rat_sync::SYNC_ALPN,
                 &mut store,
                 AuthPolicy::Closed,
-                time::now_ms(),
+                time::now_ms,
+                rag_rat_sync::MAX_RECONCILE_ROUNDS,
             )
             .await
             .map_err(|e| anyhow!("restoring the account log from the inviter failed: {e}"))?
         };
         let content_report = {
             let mut store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
-            rag_rat_sync::connect_and_sync(
+            rag_rat_sync::connect_and_reconcile(
                 &endpoint,
                 peer,
                 rag_rat_sync::CONTENT_SYNC_ALPN,
                 &mut store,
                 AuthPolicy::Closed,
-                time::now_ms(),
+                time::now_ms,
+                rag_rat_sync::MAX_RECONCILE_ROUNDS,
             )
             .await
             .map_err(|e| anyhow!("restoring content from the inviter failed: {e}"))?
@@ -437,6 +441,9 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             "account_id": hash::hex_lower(&account_id.to_bytes()),
             "account_entries_restored": account_report.entries_newly_stored,
             "content_entries_restored": content_report.entries_newly_stored,
+            // `converged=false` means the restore hit the reconciliation round cap and a later
+            // device-side sync should continue — the account/content stores may not be complete yet.
+            "converged": account_report.converged && content_report.converged,
             "inviter_node_id": inviter,
             "inviter_relay": ticket.relay_url,
             "note": "to keep syncing, add inviter_node_id to [sync] server_peers and set [sync] \
@@ -546,21 +553,29 @@ pub(crate) fn device_sync_run(
             // stays equal to the number of configured peers. `/3` content rides on top:
             // best-effort, attempted only once the account log reached the peer, and a
             // content hiccup is logged — never a peer failure.
+            // Reconcile each stream to a fixpoint (#878): a single session can report `Done` while
+            // the store is still incomplete (adversarial dependent-before-authorizer ordering, or a
+            // large active account), so re-run until a round is dry or the round cap is hit. A
+            // capped (non-converged) pass just defers the remainder to the next
+            // cadence.
             let account_ok = {
                 let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
-                match rag_rat_sync::connect_and_sync(
+                match rag_rat_sync::connect_and_reconcile(
                     &endpoint,
                     addr.clone(),
                     rag_rat_sync::SYNC_ALPN,
                     &mut store,
                     AuthPolicy::Closed,
-                    time::now_ms(),
+                    time::now_ms,
+                    rag_rat_sync::MAX_RECONCILE_ROUNDS,
                 )
                 .await
                 {
                     Ok(report) => {
                         tracing::info!(
                             peer,
+                            rounds = report.rounds,
+                            converged = report.converged,
                             sent = report.entries_sent,
                             stored = report.entries_newly_stored,
                             "device sync (account log) complete"
@@ -575,18 +590,21 @@ pub(crate) fn device_sync_run(
             };
             if account_ok {
                 let mut store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
-                match rag_rat_sync::connect_and_sync(
+                match rag_rat_sync::connect_and_reconcile(
                     &endpoint,
                     addr,
                     rag_rat_sync::CONTENT_SYNC_ALPN,
                     &mut store,
                     AuthPolicy::Closed,
-                    time::now_ms(),
+                    time::now_ms,
+                    rag_rat_sync::MAX_RECONCILE_ROUNDS,
                 )
                 .await
                 {
                     Ok(report) => tracing::info!(
                         peer,
+                        rounds = report.rounds,
+                        converged = report.converged,
                         sent = report.entries_sent,
                         stored = report.entries_newly_stored,
                         "device sync (content) complete"

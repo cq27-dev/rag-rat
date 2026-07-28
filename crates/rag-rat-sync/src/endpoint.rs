@@ -377,6 +377,92 @@ pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
     Ok(report)
 }
 
+/// The most times a dialer re-runs a sync session against ONE peer before giving up on convergence
+/// for this pass. A cooperative account reaches a fixpoint in a handful of rounds; a peer still not
+/// dry after this many re-syncs is withholding an authorizer or is pathologically active, so stop
+/// with `converged = false` and let the next maintenance pass continue — device-side sync re-runs
+/// the loop on its cadence, so a capped pass only defers the remainder, it never loses it.
+pub const MAX_RECONCILE_ROUNDS: usize = 8;
+
+/// What a multi-round reconciliation moved (aggregated across its rounds). `converged` is true when
+/// the loop stopped on a fully quiet round — nothing stored, sent, or received in either direction,
+/// so both peers hold the union of what each offered. It is false when the round cap was hit first:
+/// the store may still be incomplete and a later pass should continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub rounds: usize,
+    pub entries_newly_stored: usize,
+    pub entries_sent: usize,
+    pub converged: bool,
+}
+
+/// Whether reconciliation should run another round, given the round just completed (#878). A single
+/// `run_session` can report `Done` while a store is still incomplete — an adversarial sender
+/// streaming dependents before their authorizer overruns the pre-verify eviction budget (only the
+/// survivors promote), and even a cooperative large account may not reach a fixpoint in one pass.
+/// Re-running converges: each store grows monotonically and every hello advertises parked entries
+/// (#877), so a re-sent dependent promotes once its authorizer is present on that side.
+///
+/// The fixpoint is a fully QUIET round — nothing stored, sent, OR received. All three matter:
+/// `sent` catches a PUSH that made the acceptor evict (the confirmation quiet round proves the
+/// re-pushed entries finally landed), `received` catches a peer that still has data for us, and
+/// `stored` catches local promotion progress. This is reliable because a store under
+/// [`MAX_HELLO_HASHES`] (65_536) advertises its COMPLETE inventory — parked entries included — so
+/// the counters reflect real gaps, not redelivery, for every store D targets. A store OVER that cap
+/// advertises only a bounded inventory, so a peer may re-offer already-held entries every round and
+/// the session never fully quiets; the round cap then stops it with `converged = false`, the honest
+/// outcome given the deliberate absence of a remainder-reconcile protocol for such stores.
+fn reconcile_step(report: &SessionReport, rounds_done: usize, max_rounds: usize) -> ReconcileStep {
+    let quiet = report.entries_newly_stored == 0
+        && report.entries_sent == 0
+        && report.entries_received == 0;
+    if quiet {
+        ReconcileStep::Stop { converged: true }
+    } else if rounds_done >= max_rounds {
+        // Still moving at the cap: the store may not be complete yet — a later maintenance pass
+        // continues from where this left off.
+        ReconcileStep::Stop { converged: false }
+    } else {
+        ReconcileStep::Continue
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileStep {
+    Continue,
+    Stop { converged: bool },
+}
+
+/// Dial `peer` repeatedly, running one [`connect_and_sync`] session per round until the transfer
+/// reaches a fixpoint or the round cap — the multi-round reconciliation #878 needs so a single
+/// session's `Done` is never mistaken for a complete store. The serve acceptor already loops
+/// accepting connections, so this dialer-side loop is all it takes: no wire change. `now_ms` is
+/// read fresh each round so every re-dialed session stamps the time it actually ran (a long
+/// reconciliation must not authorize against a pre-loop timestamp).
+pub async fn connect_and_reconcile<S: SyncStore + NodeAuth>(
+    endpoint: &Endpoint,
+    peer: EndpointAddr,
+    alpn: &[u8],
+    store: &mut S,
+    policy: AuthPolicy,
+    now_ms: impl Fn() -> i64,
+    max_rounds: usize,
+) -> Result<ReconcileReport, SyncFailure> {
+    let mut entries_newly_stored = 0;
+    let mut entries_sent = 0;
+    let mut rounds = 0;
+    loop {
+        let report =
+            connect_and_sync(endpoint, peer.clone(), alpn, store, policy, now_ms()).await?;
+        rounds += 1;
+        entries_newly_stored += report.entries_newly_stored;
+        entries_sent += report.entries_sent;
+        if let ReconcileStep::Stop { converged } = reconcile_step(&report, rounds, max_rounds) {
+            return Ok(ReconcileReport { rounds, entries_newly_stored, entries_sent, converged });
+        }
+    }
+}
+
 /// Accept ONE inbound connection and run a session against it. D4's `sync serve` loops this;
 /// keeping it single-shot here keeps the store's `!Send` connection on one task (no spawn).
 ///
@@ -603,6 +689,28 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
         conn
+    }
+
+    #[test]
+    fn reconcile_step_loops_until_a_fully_quiet_round() {
+        let quiet = SessionReport::default();
+        // Nothing moved in either direction — the fixpoint.
+        assert_eq!(reconcile_step(&quiet, 1, 8), ReconcileStep::Stop { converged: true });
+        // Each direction of movement, on its own, keeps the loop going under the cap: `stored`
+        // (local promotion), `received` (peer still has data), and `sent` (our push may have made
+        // the acceptor evict — a quiet confirmation round must prove the re-push landed).
+        let stored =
+            SessionReport { entries_sent: 0, entries_received: 0, entries_newly_stored: 2 };
+        let received =
+            SessionReport { entries_sent: 0, entries_received: 5, entries_newly_stored: 0 };
+        let sent = SessionReport { entries_sent: 3, entries_received: 0, entries_newly_stored: 0 };
+        for report in [&stored, &received, &sent] {
+            assert_eq!(reconcile_step(report, 1, 8), ReconcileStep::Continue);
+        }
+        // Still moving at the cap stops UN-converged so a later maintenance pass continues.
+        assert_eq!(reconcile_step(&sent, 8, 8), ReconcileStep::Stop { converged: false });
+        // A quiet round at the cap is still the converged fixpoint.
+        assert_eq!(reconcile_step(&quiet, 8, 8), ReconcileStep::Stop { converged: true });
     }
 
     #[test]
