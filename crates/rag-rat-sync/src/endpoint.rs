@@ -15,8 +15,9 @@
 //! [`accept_and_sync`] run the mutual node-authorization handshake ([`run_auth_phase`]) BEFORE any
 //! inventory is exchanged. Under [`AuthPolicy::Closed`] a peer is admitted only if it presents a
 //! signed binding proving its authenticated node id belongs to a roster device of the account;
-//! under [`AuthPolicy::Open`] any peer is admitted to read, while writes still require a valid
-//! effective roster role.
+//! under [`AuthPolicy::Open`] an acceptor admits any dialer to read but rejects its entry frames
+//! without a write-capable roster role. A fresh dialer may accept entries from the transport-pinned
+//! server it explicitly selected so it can restore the roster; storage still verifies every entry.
 //! The ONBOARDING case uses the separate [`ENROLL_ALPN`] exchange: an owner atomically redeems a
 //! one-time invite into a roster `DeviceAdd` before normal sync authentication can admit the new
 //! device.
@@ -764,6 +765,37 @@ mod tests {
         assert_eq!(server_result.unwrap().entries_sent, expected.len());
         assert_eq!(client_result.unwrap().entries_newly_stored, expected.len());
         assert_eq!(reader_store.entries.len(), expected.len());
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_open_dialer_can_pull_from_the_selected_server() {
+        let source = database();
+        let account = rag_rat_oplog::local_account(&source, NOW).unwrap();
+        let expected = rag_rat_oplog::account_entries_for_sync(&source, account).unwrap();
+        let destination = database();
+        let (listener, dialer) = loopback_endpoints().await;
+        let mut source_store = crate::store::OplogSyncStore::new(&source, account, || NOW);
+        let mut destination_store =
+            crate::store::OplogSyncStore::new(&destination, account, || NOW);
+
+        let server = accept_and_sync(&listener, &mut source_store, AuthPolicy::Open, || NOW);
+        let client = connect_and_sync(
+            &dialer,
+            direct_addr(&listener),
+            SYNC_ALPN,
+            &mut destination_store,
+            AuthPolicy::Open,
+            NOW,
+        );
+        let (server_result, client_result) = tokio::join!(server, client);
+
+        assert_eq!(server_result.unwrap().entries_sent, expected.len());
+        assert_eq!(client_result.unwrap().entries_newly_stored, expected.len());
+        assert_eq!(
+            rag_rat_oplog::account_entries_for_sync(&destination, account).unwrap().len(),
+            expected.len(),
+            "the anonymous dialer restored the selected server's account snapshot",
+        );
     }
 
     #[tokio::test]

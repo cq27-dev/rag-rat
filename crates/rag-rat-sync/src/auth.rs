@@ -41,8 +41,9 @@ const MAX_AUTH_FRAME_BYTES: u32 = 1024;
 /// account being `Open` must not open a private one on the same endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthPolicy {
-    /// Admit any peer for reads. A valid roster binding may additionally grant write capability;
-    /// anonymous or invalid bindings remain read-only.
+    /// Admit any dialer for reads. A valid roster binding determines its capability when available;
+    /// otherwise an acceptor keeps the dialer read-only, while a dialer permits its explicitly
+    /// selected server to send the snapshot needed to restore roster state.
     Open,
     /// Admit only a peer whose binding verifies against this account's roster and the connection's
     /// authenticated remote node id. The default for a private account.
@@ -60,9 +61,10 @@ pub enum AuthRole {
     Acceptor,
 }
 
-/// What the authenticated peer may do in the data phase. Read admission and write authority are
-/// deliberately separate: an anonymous peer admitted by [`AuthPolicy::Open`] can pull, but only an
-/// effective roster role with authoring authority may push entries.
+/// Whether the authenticated peer may transmit entries in the data phase. This is a transport
+/// capability, not proof that the peer authored those entries: under [`AuthPolicy::Open`], a dialer
+/// permits its explicitly selected server to send the snapshot needed to restore roster state.
+/// Every received entry still passes the store's cryptographic and authority checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerCapability {
     ReadOnly,
@@ -219,14 +221,20 @@ async fn verify_peer<R: AsyncRead + Unpin>(
     // Every rejection below is the SAME uniform error — no not-on-roster / bad-sig distinction on
     // the wire.
     match cfg.policy {
-        // Open admission grants anonymous READ, never anonymous WRITE. A valid effective roster
-        // binding may still elevate the peer to ReadWrite; an invalid binding or a local lookup
-        // fault safely degrades to the anonymous capability instead of widening authority.
-        AuthPolicy::Open => Ok(auth
-            .authorize(&binding, &cfg.remote_node, cfg.now_ms)
-            .ok()
-            .flatten()
-            .unwrap_or(PeerCapability::ReadOnly)),
+        // Open admission grants an unverified dialer READ, never WRITE. A fresh dialer cannot yet
+        // verify the selected server's roster binding, so it must permit that acceptor to serve the
+        // requested snapshot; ingest still verifies every entry from scratch.
+        AuthPolicy::Open => {
+            let unverified_peer_capability = match cfg.role {
+                AuthRole::Dialer => PeerCapability::ReadWrite,
+                AuthRole::Acceptor => PeerCapability::ReadOnly,
+            };
+            Ok(auth
+                .authorize(&binding, &cfg.remote_node, cfg.now_ms)
+                .ok()
+                .flatten()
+                .unwrap_or(unverified_peer_capability))
+        },
         AuthPolicy::Closed => {
             match auth.authorize(&binding, &cfg.remote_node, cfg.now_ms) {
                 Ok(Some(capability)) => Ok(capability),
@@ -341,10 +349,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_policy_admits_a_peer_that_would_fail_closed() {
-        // The acceptor cannot verify the dialer's empty binding, but Open still admits it with the
-        // anonymous read-only capability. The dialer recognizes the acceptor as a roster writer.
-        let anon_dialer = FakeAuth { binding: vec![], capability: Some(PeerCapability::ReadWrite) };
+    async fn open_policy_allows_the_selected_acceptor_to_serve_an_anonymous_dialer() {
+        // Neither side can verify the other's binding yet. Open admits the dialer read-only, while
+        // the dialer permits the server it explicitly selected to send the requested snapshot.
+        let anon_dialer = FakeAuth { binding: vec![], capability: None };
         let acceptor = FakeAuth { binding: vec![1, 2, 3], capability: None };
         let (d, a) =
             run_pair(anon_dialer, ACCT, AuthPolicy::Open, acceptor, AuthPolicy::Open).await;
