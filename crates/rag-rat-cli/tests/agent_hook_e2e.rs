@@ -14,9 +14,9 @@ use std::{
 
 mod common;
 
-#[cfg(unix)]
-use common::ScratchRoot;
 use common::unique_dir;
+#[cfg(unix)]
+use common::{ScratchRoot, git, git_commit};
 #[cfg(unix)]
 use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
 
@@ -303,6 +303,44 @@ impl TestRepo {
 }
 
 #[cfg(unix)]
+struct LinkedTestRepo {
+    main: ScratchRoot,
+    linked: ScratchRoot,
+    config: rag_rat_base::config::Config,
+}
+
+#[cfg(unix)]
+impl LinkedTestRepo {
+    fn indexed() -> Self {
+        let main = unique_dir("hook-linked-main");
+        fs::create_dir_all(main.join("src")).unwrap();
+        fs::write(main.join("src/lib.rs"), "pub fn main_checkout_xyz() {}\n").unwrap();
+        fs::write(main.join(".gitignore"), ".rag-rat/\nrag-rat.toml\n").unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git_commit(&main, &["-q", "-m", "base"]);
+
+        let config_path = main.join("rag-rat.toml");
+        fs::write(
+            &config_path,
+            "[index]\nroot = \".\"\ndatabase = \
+             \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        let config = rag_rat_base::config::Config::load(&config_path).unwrap();
+        rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
+
+        let linked = unique_dir("hook-linked-worktree");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+        assert!(!linked.join("rag-rat.toml").exists());
+        assert!(symbol_indexed_in_checkout(&config, &main, "main_checkout_xyz"));
+        Self { main, linked, config }
+    }
+}
+
+#[cfg(unix)]
 struct McpServer {
     child: Child,
     _stdin: std::process::ChildStdin,
@@ -530,6 +568,16 @@ fn cursor_and_vscode_session_start_wrap_the_orientation_digest() {
             .unwrap()
             .contains("rag-rat repo intelligence")
     );
+
+    let resumed = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "vscode-resume",
+        "cwd": repo.root.as_path(),
+        "source": "resume",
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &resumed.to_string(), &repo.root);
+    assert!(status.success());
+    assert!(stdout.is_empty(), "resumed sessions must not receive another orientation digest");
 }
 
 #[cfg(unix)]
@@ -567,6 +615,87 @@ fn vscode_post_edit_backgrounds_a_scoped_reindex() {
     assert!(status.success());
     assert!(stdout.is_empty(), "edit reindex must not add AI context: {stdout}");
     wait_for_symbol(&repo.config, "vscode_edit_xyz", Duration::from_secs(30));
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_and_vscode_reindex_only_the_active_linked_worktree() {
+    let repo = LinkedTestRepo::indexed();
+    let linked_file = repo.linked.join("src/lib.rs");
+
+    fs::write(&linked_file, "pub fn cursor_linked_xyz() {}\n").unwrap();
+    let cursor = serde_json::json!({
+        "hook_event_name": "afterFileEdit",
+        "conversation_id": "cursor-linked-edit",
+        "workspace_roots": [repo.main.as_path(), repo.linked.as_path()],
+        "file_path": &linked_file,
+        "edits": [{"new_string": "pub fn cursor_linked_xyz() {}"}],
+    });
+    let (stdout, status) = run_hook_for(Some("cursor"), &cursor.to_string(), &repo.linked);
+    assert!(status.success());
+    assert!(stdout.is_empty());
+    wait_for_checkout_symbol(
+        &repo.config,
+        &repo.linked,
+        "cursor_linked_xyz",
+        Duration::from_secs(30),
+    );
+    assert!(symbol_indexed_in_checkout(&repo.config, &repo.main, "main_checkout_xyz"));
+    assert!(!symbol_indexed_in_checkout(&repo.config, &repo.main, "cursor_linked_xyz"));
+
+    fs::write(&linked_file, "pub fn vscode_linked_xyz() {}\n").unwrap();
+    let vscode = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "vscode-linked-edit",
+        "cwd": repo.linked.as_path(),
+        "tool_name": "multi_replace_string_in_file",
+        "tool_input": {
+            "replacements": [{
+                "filePath": &linked_file,
+                "newString": "pub fn vscode_linked_xyz() {}",
+            }],
+        },
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &vscode.to_string(), &repo.linked);
+    assert!(status.success());
+    assert!(stdout.is_empty());
+    wait_for_checkout_symbol(
+        &repo.config,
+        &repo.linked,
+        "vscode_linked_xyz",
+        Duration::from_secs(30),
+    );
+    assert!(!symbol_indexed_in_checkout(&repo.config, &repo.linked, "cursor_linked_xyz"));
+    assert!(symbol_indexed_in_checkout(&repo.config, &repo.main, "main_checkout_xyz"));
+    assert!(!symbol_indexed_in_checkout(&repo.config, &repo.main, "vscode_linked_xyz"));
+}
+
+#[cfg(unix)]
+fn symbol_indexed_in_checkout(
+    config: &rag_rat_base::config::Config,
+    checkout: &Path,
+    symbol: &str,
+) -> bool {
+    let mut db = rag_rat_core::IndexDatabase::open_config(config).unwrap();
+    db.use_worktree_scope(&config.root, Some(checkout)).unwrap();
+    db.symbols(symbol, None, 10).unwrap().iter().any(|candidate| candidate.name == symbol)
+}
+
+#[cfg(unix)]
+fn wait_for_checkout_symbol(
+    config: &rag_rat_base::config::Config,
+    checkout: &Path,
+    symbol: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if symbol_indexed_in_checkout(config, checkout, symbol) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("edited symbol `{symbol}` not indexed for {} within {timeout:?}", checkout.display());
 }
 
 #[cfg(unix)]

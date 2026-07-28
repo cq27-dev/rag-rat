@@ -9,6 +9,7 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "^(Grep|Read|Bash|Write|Edit|MultiEdit)$",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install agent-hook auto", "timeout": 10 }
         ]
@@ -16,6 +17,7 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "^(Write|Edit|MultiEdit)$",
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install agent-hook auto", "timeout": 10 }
         ]

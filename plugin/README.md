@@ -79,8 +79,8 @@ unconfigured, unindexed, unavailable, or not yet present in the launcher's cache
 - `PreToolUse` on `Grep`/`Bash` (10s) → grep-augmentation.
 - `PreToolUse` on `Write`/`Edit`/`MultiEdit` (10s) → write-time clone check.
 - `PostToolUse` on successful edits → detached, watcher-aware scoped reindex.
-- The manifest has one dispatcher per lifecycle event. Irrelevant tools are filtered inside the
-  adapter rather than by matcher-only registration.
+- The manifest has one dispatcher per lifecycle event, with combined matchers preventing unrelated
+  tool calls from launching the hook process. The adapter still validates every payload it receives.
 
 **Codex** (`.codex-plugin/hooks/hooks.json`, `{"hooks":{…}}` wrapper):
 - `SessionStart` → repo orientation digest.

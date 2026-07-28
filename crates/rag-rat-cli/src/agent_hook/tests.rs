@@ -179,6 +179,44 @@ fn vscode_tool_names_and_camel_case_inputs_normalize() {
 }
 
 #[test]
+fn vscode_multi_replacements_preserve_each_edited_path() {
+    let value = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "cwd": "/repo",
+        "tool_name": "multi_replace_string_in_file",
+        "tool_input": {
+            "replacements": [
+                {"filePath": "src/a.rs", "newString": "fn a() {}"},
+                {"filePath": "/other/b.rs", "newString": "fn b() {}"},
+            ]
+        },
+    });
+    let normalized = normalize_hook(&value.to_string(), AgentHookHarnessArg::Vscode).unwrap();
+    assert_eq!(normalized.input.tool_name, "MultiEdit");
+    assert_eq!(normalized.input.tool_input["edits"][0]["file_path"], "src/a.rs");
+    assert_eq!(normalized.input.tool_input["edits"][1]["file_path"], "/other/b.rs");
+    assert_eq!(extract_edited_paths(&normalized.input), vec![
+        PathBuf::from("/repo/src/a.rs"),
+        PathBuf::from("/other/b.rs"),
+    ]);
+}
+
+#[test]
+fn vscode_session_start_maps_only_new_to_startup() {
+    for (source, expected) in
+        [("new", "startup"), ("resume", "resume"), ("clear", "clear"), ("compact", "compact")]
+    {
+        let value = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "cwd": "/repo",
+            "source": source,
+        });
+        let normalized = normalize_hook(&value.to_string(), AgentHookHarnessArg::Vscode).unwrap();
+        assert_eq!(normalized.input.source.as_deref(), Some(expected), "source={source}");
+    }
+}
+
+#[test]
 fn snake_case_and_camel_case_paths_normalize_identically() {
     for field in ["file_path", "filePath"] {
         let value = serde_json::json!({
@@ -247,21 +285,25 @@ fn context_output_contains_only_intentional_context() {
 
 #[test]
 fn hook_manifests_register_one_dispatcher_per_event() {
-    for manifest in [
-        include_str!("../../../../plugin/hooks/hooks.json"),
-        include_str!("../../../../plugin/hooks.vscode.json"),
-    ] {
-        let value: serde_json::Value = serde_json::from_str(manifest).unwrap();
-        for event in ["SessionStart", "PreToolUse", "PostToolUse"] {
-            let entries = value["hooks"][event].as_array().expect("event array");
-            assert_eq!(entries.len(), 1, "{event} must have one dispatcher");
-            assert!(entries[0].get("matcher").is_none(), "{event} must not rely on matchers");
-        }
+    let claude: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../plugin/hooks/hooks.json")).unwrap();
+    for event in ["SessionStart", "PreToolUse", "PostToolUse"] {
+        let entries = claude["hooks"][event].as_array().expect("event array");
+        assert_eq!(entries.len(), 1, "Claude {event} must have one dispatcher");
     }
+    assert!(claude["hooks"]["SessionStart"][0].get("matcher").is_none());
+    assert_eq!(
+        claude["hooks"]["PreToolUse"][0]["matcher"],
+        "^(Grep|Read|Bash|Write|Edit|MultiEdit)$"
+    );
+    assert_eq!(claude["hooks"]["PostToolUse"][0]["matcher"], "^(Write|Edit|MultiEdit)$");
 
     let vscode: serde_json::Value =
         serde_json::from_str(include_str!("../../../../plugin/hooks.vscode.json")).unwrap();
     for event in ["SessionStart", "PreToolUse", "PostToolUse"] {
+        let entries = vscode["hooks"][event].as_array().expect("event array");
+        assert_eq!(entries.len(), 1, "VS Code {event} must have one dispatcher");
+        assert!(entries[0].get("matcher").is_none(), "VS Code ignores matchers");
         let command = vscode["hooks"][event][0]["command"].as_str().unwrap();
         assert!(command.contains("${PLUGIN_ROOT}/scripts/launch.js"));
         assert!(command.ends_with("agent-hook vscode"));

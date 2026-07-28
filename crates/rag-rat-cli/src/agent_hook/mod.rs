@@ -214,7 +214,10 @@ fn normalize_vscode(value: &serde_json::Value) -> Option<NormalizedHook> {
     };
     let (dispatch, output_event) = match event {
         "SessionStart" => {
-            input.source = Some("startup".to_string());
+            input.source = value
+                .get("source")
+                .and_then(|field| field.as_str())
+                .map(|source| if source == "new" { "startup" } else { source }.to_string());
             (Dispatch::SessionStart, OutputEvent::SessionStart)
         },
         "PreToolUse" | "PostToolUse" => {
@@ -349,8 +352,16 @@ fn normalize_tool_input(tool_name: &str, value: &serde_json::Value) -> serde_jso
         let normalized = edits
             .iter()
             .filter_map(|edit| {
-                let new_string = string_field(edit, &["new_string", "newString", "replacement"])?;
-                Some(serde_json::json!({ "new_string": new_string }))
+                let mut normalized = serde_json::Map::new();
+                if let Some(path) = string_field(edit, &["file_path", "filePath", "path"]) {
+                    normalized.insert("file_path".to_string(), path.into());
+                }
+                if let Some(new_string) =
+                    string_field(edit, &["new_string", "newString", "replacement"])
+                {
+                    normalized.insert("new_string".to_string(), new_string.into());
+                }
+                (!normalized.is_empty()).then_some(serde_json::Value::Object(normalized))
             })
             .collect::<Vec<_>>();
         out.insert("edits".to_string(), normalized.into());
@@ -881,6 +892,11 @@ fn extract_edited_paths(input: &HookInput) -> Vec<PathBuf> {
                 .unwrap_or_default();
             if let Some(files) = input.tool_input.get("files").and_then(|value| value.as_array()) {
                 paths.extend(files.iter().filter_map(|path| path.as_str().map(str::to_string)));
+            }
+            if let Some(edits) = input.tool_input.get("edits").and_then(|value| value.as_array()) {
+                paths.extend(edits.iter().filter_map(|edit| {
+                    string_field(edit, &["file_path", "filePath", "path"]).map(str::to_string)
+                }));
             }
             paths
         },
