@@ -5,9 +5,11 @@
 //! fingerprint) — the winner replaces the whole row atomically; a loser is a no-op.
 //! Insert-vs-update is decided by row existence, never a blind upsert. A cell whose value disagrees
 //! with its column's declared type quarantines the whole op (a broken producer, surfaced, not
-//! silently coerced); a cell for a column this binary's registry doesn't know is skipped (a newer
-//! producer, forward compatible). After a winning apply the row's synced-column hash is recorded,
-//! which is what stops the producer re-emitting a row it just received (see [`super::produce`]).
+//! silently coerced); an op naming a column this binary's registry doesn't know is PARKED whole (a
+//! newer producer — see [`apply_upsert`]), never applied in part, so every local row stays a
+//! complete after-image some device actually authored. After a winning apply the row's
+//! synced-column hash is recorded WITH the projector version whose column set it covers, which is
+//! what stops the producer re-emitting a row it just received (see [`super::produce`]).
 //! Deletes and the resurrection guard use the same row clock plus a per-row tombstone; a losing op
 //! never touches the published hash, so an unsent local edit is never silently marked as sent.
 
@@ -16,14 +18,24 @@ use rusqlite::{OptionalExtension, Transaction, params_from_iter};
 
 use super::registry::{TableSpec, ValueType};
 use super::row_op::{self, Cell, RowOp, TypedValue};
+use super::store::PendingReason;
 use crate::op::OpMeta;
 
-/// The result of applying one row op. `Quarantined` means the op was structurally storable but its
-/// content is unprojectable (a type mismatch) — the entry is retained, the row is left untouched.
+/// The result of applying one row op.
+///
+/// `Quarantined` means the op was structurally storable but its content is unprojectable in a way a
+/// later binary will NOT fix (a type mismatch, a constraint violation, a partial after-image from a
+/// broken producer) — the entry is retained, the row is left untouched.
+///
+/// `Unprojectable` means this binary does not understand the payload YET — a newer producer used a
+/// column this registry lacks. Nothing is written and the entry is marked pending, so a later
+/// binary that learns the column replays it. The distinction matters: quarantine is terminal,
+/// pending is a version gap.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ApplyOutcome {
     Applied,
     Quarantined(String),
+    Unprojectable(PendingReason),
 }
 
 /// Fold `op` into `spec`'s table for `repo_id`, ordered by `meta`. See the module doc for the merge
@@ -136,6 +148,24 @@ fn apply_upsert(
     cells: &[Cell],
     meta: OpMeta,
 ) -> anyhow::Result<ApplyOutcome> {
+    // FORWARD COMPATIBILITY, decided on the PAYLOAD ALONE (before any row state is read): an op
+    // naming a column this registry does not know cannot be projected into a complete after-image.
+    // PARK it — store the entry, write NOTHING — rather than applying the subset we understand.
+    //
+    // Applying the known cells and skipping the rest would leave a row that NO device ever authored
+    // ({known: new, unknown: whatever this row already held}), and recording its anti-echo hash
+    // would then claim that chimera as a complete projection. Two failures follow: the skipped
+    // value is unrecoverable locally (redelivery short-circuits on `entry_exists`), and after an
+    // upgrade that learns the column the producer re-authors the row with the HOLE at a fresh
+    // winning lamport — destroying the real value on every peer. Parking makes the incomplete
+    // projection unrepresentable instead of containing it after the fact (#1001).
+    if let Some(unknown) =
+        cells.iter().find(|cell| !spec.columns.iter().any(|known| known.name == cell.column))
+    {
+        debug_assert!(!unknown.column.is_empty());
+        return Ok(ApplyOutcome::Unprojectable(PendingReason::UnknownColumn));
+    }
+
     let row_pk = &row_op::row_pk_string(pk_vals);
     let device_hex = &meta.device.to_string();
 
@@ -148,12 +178,13 @@ fn apply_upsert(
         return Ok(ApplyOutcome::Applied);
     }
 
-    // Classify each cell: a known synced column (type-checked), or an unknown column (skipped —
-    // forward compatibility). A type mismatch quarantines the WHOLE op before any write.
+    // Type-check each cell. Every cell's column is known here — an unknown one parked the whole op
+    // above, before any row state was touched. A type mismatch quarantines the op before any write.
     let mut known: Vec<(&str, &TypedValue)> = Vec::new();
     for cell in cells {
         let Some(column) = spec.columns.iter().find(|c| c.name == cell.column) else {
-            continue; // a column this registry doesn't know — a newer producer; skip the cell.
+            debug_assert!(false, "an unknown column parks the op before any cell is classified");
+            return Ok(ApplyOutcome::Unprojectable(PendingReason::UnknownColumn));
         };
         if !value_matches(&cell.value, column.value_type) {
             return Ok(ApplyOutcome::Quarantined(format!(
@@ -169,15 +200,15 @@ fn apply_upsert(
     // two peers with different prior values there would diverge. The producer always emits every
     // synced column (`read_all_rows`), so a partial op is malformed or a version-skew op that
     // cannot cleanly replace this binary's row; quarantine it rather than half-apply. (Decode
-    // rejects duplicate columns and unknown columns are skipped, so `known` holds distinct synced
-    // columns — a full count means all are present.)
+    // rejects duplicate columns and an unknown column parks the op, so `known` holds distinct
+    // synced columns — a full count means all are present.)
+    // PARK, not quarantine: the overwhelmingly likely cause is an OLDER producer whose complete row
+    // under its narrower spec is a partial one under ours — a version gap, redeemed from the
+    // sender's side by #1002's declared column defaults, not a broken producer whose data can never
+    // fit. Quarantining would drop it off the refold's worklist permanently; parking keeps it
+    // outstanding so the binary that can rebuild the missing cells lands it.
     if known.len() != spec.columns.len() {
-        return Ok(ApplyOutcome::Quarantined(format!(
-            "upsert on `{}` is not a full after-image ({} of {} synced columns present)",
-            spec.name,
-            known.len(),
-            spec.columns.len()
-        )));
+        return Ok(ApplyOutcome::Unprojectable(PendingReason::PartialAfterImage));
     }
 
     // Whole-row LWW: the op wins the ENTIRE row iff it beats the row's write clock (or the row is
@@ -483,24 +514,32 @@ fn clear_row_clock(
     Ok(())
 }
 
-/// The row's recorded anti-echo hash, or `None` if the producer has not published it yet. Read by
-/// [`super::produce`].
+/// The row's recorded anti-echo hash and the projector version whose column set it covers, or
+/// `None` if the producer has not published it yet. Read by [`super::produce`].
+///
+/// The version is NOT decoration. `cells_hash` hashes the cell LIST over `spec.columns` of
+/// whichever binary computed it, so a bare hash means "this row under column set C" with C
+/// implicit. Comparing hashes across different column sets is meaningless — they differ
+/// structurally even when the row is untouched — so the producer must know which set a stored hash
+/// covers before trusting a mismatch as a local change.
 pub(crate) fn published_hash(
     tx: &Transaction<'_>,
     repo_id: &str,
     table: &str,
     row_pk: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<(String, i64)>> {
     Ok(tx
         .query_row(
-            "SELECT synced_hash FROM sync_published_rows
+            "SELECT synced_hash, projector_version FROM sync_published_rows
              WHERE repo_id = ?1 AND table_name = ?2 AND row_pk = ?3",
             rusqlite::params![repo_id, table, row_pk],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?)
 }
 
+/// Claim `row_pk` as a COMPLETE projection: `hash` covers every synced column this binary knows,
+/// stamped with the projector version that defines that column set.
 pub(crate) fn record_published(
     tx: &Transaction<'_>,
     repo_id: &str,
@@ -509,10 +548,19 @@ pub(crate) fn record_published(
     hash: &str,
 ) -> anyhow::Result<()> {
     tx.execute(
-        "INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(repo_id, table_name, row_pk) DO UPDATE SET synced_hash = excluded.synced_hash",
-        rusqlite::params![repo_id, table, row_pk, hash],
+        "INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash,
+                                         projector_version)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(repo_id, table_name, row_pk) DO UPDATE
+             SET synced_hash = excluded.synced_hash,
+                 projector_version = excluded.projector_version",
+        rusqlite::params![
+            repo_id,
+            table,
+            row_pk,
+            hash,
+            super::refold::TABLE_SYNC_PROJECTOR_VERSION
+        ],
     )?;
     Ok(())
 }
@@ -803,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_upsert_missing_a_synced_column_is_quarantined() {
+    fn a_partial_upsert_missing_a_synced_column_is_parked() {
         // Whole-row LWW needs a full after-image; a two-column table given only one column can't be
         // cleanly replaced, so the op is quarantined rather than applied as a hybrid row.
         const TWO_COL: TableSpec = TableSpec {
@@ -835,19 +883,28 @@ mod tests {
         let out =
             apply_row_op(&tx, &TWO_COL, "repo", &partial, OpMeta { lamport: 1, device: device(2) })
                 .unwrap();
-        assert!(
-            matches!(out, ApplyOutcome::Quarantined(_)),
-            "a partial after-image is quarantined"
+        assert_eq!(
+            out,
+            ApplyOutcome::Unprojectable(PendingReason::PartialAfterImage),
+            "a partial after-image is PARKED, not quarantined: the likely cause is an older \
+             producer whose narrower complete row is partial under this spec, and #1002's \
+             declared defaults redeem it — quarantining would drop it off the refold worklist for \
+             good"
         );
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM t_two", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 0, "nothing was written");
     }
 
     #[test]
-    fn an_unknown_column_is_skipped_and_the_rest_applies() {
+    fn an_unknown_column_parks_the_whole_op_and_writes_nothing() {
+        // A newer producer's column: this op cannot become a COMPLETE after-image here, so nothing
+        // is written and the entry is left for the refold. Applying the known cell instead (the
+        // pre-#1001 behavior) would leave a row no device authored and — once this binary learned
+        // the column — re-author it with the hole at a winning lamport, destroying the real value
+        // on every peer.
         let mut c = conn();
         let tx = c.transaction().unwrap();
-        apply_row_op(
+        let out = apply_row_op(
             &tx,
             &SPEC,
             "repo",
@@ -858,12 +915,79 @@ mod tests {
             OpMeta { lamport: 1, device: device(2) },
         )
         .unwrap();
+        assert_eq!(out, ApplyOutcome::Unprojectable(PendingReason::UnknownColumn));
+
+        let row_pk = row_op::row_pk_string(&[TypedValue::Text("r1".to_string())]);
+        assert!(published_hash(&tx, "repo", "t_demo", &row_pk).unwrap().is_none());
+        assert!(current_row_clock(&tx, "repo", "t_demo", &row_pk).unwrap().is_none());
         tx.commit().unwrap();
+        assert_eq!(title(&c), None, "a parked op leaves the table untouched");
+    }
+
+    #[test]
+    fn an_unknown_column_parks_without_disturbing_the_row_it_would_have_replaced() {
+        // The dangerous variant: the row already exists from an earlier, fully-understood entry.
+        // The parked op must not partially overwrite it, and must not touch its clock or
+        // published hash — the existing row stays exactly the complete after-image its
+        // author signed.
+        let mut c = conn();
+        let tx = c.transaction().unwrap();
+        apply_row_op(
+            &tx,
+            &SPEC,
+            "repo",
+            &upsert(&[("title", TypedValue::Text("v1".into()))]),
+            OpMeta { lamport: 5, device: device(2) },
+        )
+        .unwrap();
+        let row_pk = row_op::row_pk_string(&[TypedValue::Text("r1".to_string())]);
+        let published_before = published_hash(&tx, "repo", "t_demo", &row_pk).unwrap();
+
+        // A LATER op (higher lamport, would otherwise win) carrying an unknown column.
+        let out = apply_row_op(
+            &tx,
+            &SPEC,
+            "repo",
+            &upsert(&[
+                ("title", TypedValue::Text("v2".into())),
+                ("future_col", TypedValue::Text("unknown".into())),
+            ]),
+            OpMeta { lamport: 9, device: device(2) },
+        )
+        .unwrap();
+        assert_eq!(out, ApplyOutcome::Unprojectable(PendingReason::UnknownColumn));
         assert_eq!(
-            title(&c).as_deref(),
-            Some("kept"),
-            "the known cell applied, the unknown skipped"
+            current_row_clock(&tx, "repo", "t_demo", &row_pk).unwrap().unwrap().0,
+            5,
+            "a parked op does not advance the row clock"
         );
+        assert_eq!(
+            published_hash(&tx, "repo", "t_demo", &row_pk).unwrap(),
+            published_before,
+            "a parked op does not touch the anti-echo record"
+        );
+        tx.commit().unwrap();
+        assert_eq!(title(&c).as_deref(), Some("v1"), "the previous complete row survives intact");
+    }
+
+    #[test]
+    fn a_published_hash_carries_the_column_set_it_covers() {
+        // The hash alone is ambiguous across column-set changes, so the version it was recorded
+        // under is stored with it. `produce` relies on this to tell "changed locally" from
+        // "hashed under a different column set" (see `super::produce`).
+        let mut c = conn();
+        let tx = c.transaction().unwrap();
+        apply_row_op(
+            &tx,
+            &SPEC,
+            "repo",
+            &upsert(&[("title", TypedValue::Text("v".into()))]),
+            OpMeta { lamport: 1, device: device(2) },
+        )
+        .unwrap();
+        let row_pk = row_op::row_pk_string(&[TypedValue::Text("r1".to_string())]);
+        let (_, version) = published_hash(&tx, "repo", "t_demo", &row_pk).unwrap().unwrap();
+        assert_eq!(version, super::super::refold::TABLE_SYNC_PROJECTOR_VERSION);
     }
 
     #[test]
@@ -1013,7 +1137,8 @@ mod tests {
         );
         let current = synced_row_hash(&tx, &SPEC, &[TypedValue::Text("r1".into())]).unwrap();
         assert_ne!(
-            current, published_before,
+            current,
+            published_before.map(|(hash, _version)| hash),
             "the local edit is still pending, not silently dropped"
         );
     }

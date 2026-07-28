@@ -36,18 +36,72 @@ const MAX_ENTRY_LAMPORT: u64 = 1 << 62;
 /// not one. (A peer griefing WITHIN the bound is the auth/roster milestone's job — device removal.)
 const MAX_LAMPORT_ADVANCE: u64 = 1 << 32;
 
+/// Why a retained entry is NOT projected into its table — persisted per entry so a later binary
+/// that understands the payload replays exactly the outstanding set (#1001). Without a durable
+/// mark, redelivery short-circuits on `entry_exists` and the payload is unrecoverable.
+///
+/// These tokens are SCHEMA: they are written to `table_sync_entries.pending_reason` and read back
+/// by a future binary, so every variant round-trips through [`PendingReason::as_db_str`] /
+/// [`PendingReason::from_db_str`] and a rename needs a migration, exactly like a column rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingReason {
+    /// The op carries a column this registry does not know — a newer producer. Nothing is written:
+    /// applying the known subset would leave a row NO device ever authored, and publishing that row
+    /// lets the producer re-author the hole at a winning lamport (see [`super::apply`]).
+    UnknownColumn,
+    /// The op omits a column this registry requires — an OLDER producer, whose complete row under
+    /// its narrower spec is a partial after-image under ours. Whole-row LWW needs the full
+    /// after-image, so nothing is written. Unlike a broken producer this is a version gap, and it
+    /// is redeemed from the SENDER's side: #1002's declared column defaults rebuild the missing
+    /// cells into a complete row, at which point the replay lands it.
+    PartialAfterImage,
+    /// The op-kind is outside this binary's row-op vocabulary.
+    UnknownOpKind,
+    /// The op bytes do not decode at all.
+    UndecodablePayload,
+    /// The op's table is not in this binary's registry for the entry's scope.
+    TableNotInScope,
+}
+
+impl PendingReason {
+    pub(crate) fn as_db_str(self) -> &'static str {
+        match self {
+            Self::UnknownColumn => "unknown_column",
+            Self::PartialAfterImage => "partial_after_image",
+            Self::UnknownOpKind => "unknown_op_kind",
+            Self::UndecodablePayload => "undecodable_payload",
+            Self::TableNotInScope => "table_not_in_scope",
+        }
+    }
+
+    pub(crate) fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "unknown_column" => Some(Self::UnknownColumn),
+            "partial_after_image" => Some(Self::PartialAfterImage),
+            "unknown_op_kind" => Some(Self::UnknownOpKind),
+            "undecodable_payload" => Some(Self::UndecodablePayload),
+            "table_not_in_scope" => Some(Self::TableNotInScope),
+            _ => None,
+        }
+    }
+}
+
 /// The result of accepting a foreign entry. A chain-continuous entry is ALWAYS stored (so one bad
 /// payload cannot wedge the device's chain); whether its payload is APPLIED is a separate decision.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AcceptOutcome {
-    /// Stored, and its known in-scope row op is ready to apply.
+    /// Stored, and its known in-scope row op is ready to apply. `entry_hash` lets the caller mark
+    /// the entry pending if the APPLY turns out to be incomplete (an unknown column), which only
+    /// the registry-aware applier can detect.
     Stored {
         op: RowOp,
         meta: OpMeta,
+        entry_hash: [u8; 32],
     },
     /// Stored and retained, but NOT applied — an undecodable payload, a future op-kind, or a table
-    /// not in this scope. The chain still advanced; the `&str` is the reason, for reporting.
-    StoredInert(&'static str),
+    /// not in this scope. The chain still advanced, and the entry is marked pending so a later
+    /// binary replays it.
+    StoredInert(PendingReason),
     AlreadyPresent,
     /// The lamport advances past the tail but the entry does not link to it (a gap): the
     /// predecessor has not arrived. Routine under out-of-order delivery; the transport retries
@@ -84,7 +138,9 @@ pub(crate) fn author_row_entry(
     let prev_hash = chain_tail(tx, stream, device)?.map(|(_, entry_hash)| entry_hash);
     let signed =
         entry::sign_entry_from_op_bytes(secret, stream, prev_hash, lamport, row_op::encode(op));
-    insert_entry(tx, &signed.entry, &signed.signed_bytes, now_ms)?;
+    // A locally-authored op is projected by construction: the producer builds it from THIS
+    // registry, so it can never carry a column or op-kind this binary does not understand.
+    insert_entry(tx, &signed.entry, &signed.signed_bytes, now_ms, None)?;
     Ok(signed)
 }
 
@@ -180,23 +236,32 @@ pub(crate) fn accept_row_entry(
         ChainFit::Gap => return Ok(AcceptOutcome::MissingPredecessor),
         ChainFit::Conflict => return Ok(AcceptOutcome::Fork),
     }
-    // Chain-continuous: store now so a bad payload can never wedge the device's chain.
-    insert_entry(tx, &verified, signed_bytes, now_ms)?;
-
-    // Classify the payload for application — the entry is already durably stored either way.
-    Ok(match row_op::decode(&verified.op_bytes) {
-        Err(_) => AcceptOutcome::StoredInert("undecodable op payload"),
-        Ok(DecodedRowOp::Unknown { .. }) => AcceptOutcome::StoredInert("unknown op-kind"),
+    // Classify the payload BEFORE storing, so the entry lands with its projection state recorded in
+    // the same INSERT — no store-then-mark window, and no second write.
+    let outcome = match row_op::decode(&verified.op_bytes) {
+        Err(_) => AcceptOutcome::StoredInert(PendingReason::UndecodablePayload),
+        Ok(DecodedRowOp::Unknown { .. }) =>
+            AcceptOutcome::StoredInert(PendingReason::UnknownOpKind),
         Ok(DecodedRowOp::Known(op)) =>
             if expected_tables.contains(&op.table()) {
                 AcceptOutcome::Stored {
                     op,
                     meta: OpMeta { lamport: verified.lamport, device: verified.device_fingerprint },
+                    entry_hash: verified.entry_hash,
                 }
             } else {
-                AcceptOutcome::StoredInert("table not in scope")
+                AcceptOutcome::StoredInert(PendingReason::TableNotInScope)
             },
-    })
+    };
+    // Chain-continuous: store now so a bad payload can never wedge the device's chain.
+    let pending = match &outcome {
+        AcceptOutcome::StoredInert(reason) => Some(*reason),
+        // A `Stored` op may still fail to project on an unknown COLUMN, which only the
+        // registry-aware applier sees; the caller marks it pending via `entry_hash` in that case.
+        _ => None,
+    };
+    insert_entry(tx, &verified, signed_bytes, now_ms, pending)?;
+    Ok(outcome)
 }
 
 /// How a verified entry fits its `(stream, device)` chain tail.
@@ -266,11 +331,14 @@ fn entry_exists(tx: &Transaction<'_>, entry_hash: &[u8; 32]) -> anyhow::Result<b
         .is_some())
 }
 
+/// Store a chain-continuous entry, carrying its projection state (`pending`: `None` = fully
+/// projected) in the same INSERT.
 fn insert_entry(
     tx: &Transaction<'_>,
     verified: &VerifiedEntry,
     signed_bytes: &[u8],
     now_ms: i64,
+    pending: Option<PendingReason>,
 ) -> anyhow::Result<()> {
     let stream_bytes = verified.stream_id.to_bytes();
     let device_bytes = verified.device_fingerprint.to_bytes();
@@ -278,8 +346,8 @@ fn insert_entry(
     tx.execute(
         "INSERT INTO table_sync_entries(
              entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
-             received_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             received_at_ms, pending_reason, pending_projector_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             verified.entry_hash.as_slice(),
             stream_bytes.as_slice(),
@@ -288,9 +356,116 @@ fn insert_entry(
             prev_hash,
             signed_bytes,
             now_ms,
+            pending.map(PendingReason::as_db_str),
+            pending.map(|_| super::refold::TABLE_SYNC_PROJECTOR_VERSION),
         ],
     )?;
     Ok(())
+}
+
+/// Mark a stored entry as not-yet-projected under `projector_version` — the caller-side counterpart
+/// of [`insert_entry`]'s `pending`, for the unknown-COLUMN case that only the registry-aware
+/// applier can detect (the entry is already stored by then).
+pub(crate) fn mark_entry_pending(
+    tx: &Transaction<'_>,
+    entry_hash: &[u8; 32],
+    reason: PendingReason,
+    projector_version: i64,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE table_sync_entries
+            SET pending_reason = ?2, pending_projector_version = ?3
+          WHERE entry_hash = ?1",
+        params![entry_hash.as_slice(), reason.as_db_str(), projector_version],
+    )?;
+    Ok(())
+}
+
+/// Clear an entry's pending mark — it now projects completely.
+pub(crate) fn clear_entry_pending(
+    tx: &Transaction<'_>,
+    entry_hash: &[u8; 32],
+) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE table_sync_entries
+            SET pending_reason = NULL, pending_projector_version = NULL
+          WHERE entry_hash = ?1",
+        params![entry_hash.as_slice()],
+    )?;
+    Ok(())
+}
+
+/// One retained-but-unprojected entry, with everything replay needs except its apply context (which
+/// comes from [`stream_context`], since the stream id hashes that away).
+pub(crate) struct PendingEntry {
+    pub(crate) entry_hash: [u8; 32],
+    pub(crate) stream_id: StreamId,
+    pub(crate) signed_bytes: Vec<u8>,
+}
+
+/// Every entry this binary has not fully projected, in stream/lamport order. Ordered for
+/// determinism and reproducible diagnostics, NOT for correctness: each replay goes through the
+/// unchanged LWW gates, which are arrival-order independent.
+pub(crate) fn pending_entries(tx: &Transaction<'_>) -> anyhow::Result<Vec<PendingEntry>> {
+    let mut stmt = tx.prepare(
+        "SELECT entry_hash, stream_id, signed_bytes FROM table_sync_entries
+          WHERE pending_reason IS NOT NULL
+          ORDER BY stream_id, lamport, device_fingerprint",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(hash, stream, signed_bytes)| {
+            Ok(PendingEntry {
+                entry_hash: fixed32(hash)?,
+                stream_id: StreamId::from_bytes(fixed32(stream)?),
+                signed_bytes,
+            })
+        })
+        .collect()
+}
+
+/// The apply context a stored entry needs to be replayed. `scope_stream_id` is a ONE-WAY sha256 of
+/// `(repo_id, account_id, scope_id)` and entries store only the stream id, so without this
+/// directory a retained entry can never be re-applied: `repo_id` scopes every projected write and
+/// `scope_id` resolves the op's table spec.
+pub(crate) struct StreamContext {
+    pub(crate) repo_id: String,
+    pub(crate) scope_id: String,
+}
+
+/// Record a stream's apply context, idempotently. Called on every authored and ingested entry, so
+/// the directory covers exactly the streams whose entries could ever need replaying.
+pub(crate) fn record_stream_context(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    repo_id: &str,
+    account_id: AccountId,
+    scope_id: &str,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT INTO table_sync_streams(stream_id, repo_id, account_id, scope_id)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(stream_id) DO NOTHING",
+        params![stream.to_bytes().as_slice(), repo_id, account_id.to_bytes().as_slice(), scope_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn stream_context(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+) -> anyhow::Result<Option<StreamContext>> {
+    Ok(tx
+        .query_row(
+            "SELECT repo_id, scope_id FROM table_sync_streams WHERE stream_id = ?1",
+            params![stream.to_bytes().as_slice()],
+            |row| Ok(StreamContext { repo_id: row.get(0)?, scope_id: row.get(1)? }),
+        )
+        .optional()?)
 }
 
 fn fixed32(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
@@ -379,7 +554,8 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, AcceptOutcome::Stored {
             op: op("r1"),
-            meta: OpMeta { lamport: 0, device: secret.public().fingerprint() }
+            meta: OpMeta { lamport: 0, device: secret.public().fingerprint() },
+            entry_hash: signed.entry.entry_hash,
         });
     }
 
@@ -502,7 +678,7 @@ mod tests {
                 0
             )
             .unwrap(),
-            AcceptOutcome::StoredInert("table not in scope"),
+            AcceptOutcome::StoredInert(PendingReason::TableNotInScope),
         );
         // The chain is not wedged: the next entry (which links to the first) still stores +
         // applies.
@@ -530,7 +706,7 @@ mod tests {
             let mut a = conn();
             let tx = a.transaction().unwrap();
             let garbage = entry::sign_entry_from_op_bytes(&secret, stream(), None, 0, vec![0x00]);
-            insert_entry(&tx, &garbage.entry, &garbage.signed_bytes, 0).unwrap();
+            insert_entry(&tx, &garbage.entry, &garbage.signed_bytes, 0, None).unwrap();
             let valid = author_row_entry(&tx, stream(), &secret, &op("r1"), 0).unwrap();
             tx.commit().unwrap();
             (garbage, valid)
@@ -548,7 +724,7 @@ mod tests {
                 0
             )
             .unwrap(),
-            AcceptOutcome::StoredInert("undecodable op payload"),
+            AcceptOutcome::StoredInert(PendingReason::UndecodablePayload),
         );
         // One bad payload does not wedge the chain: the next valid entry still applies.
         assert!(matches!(

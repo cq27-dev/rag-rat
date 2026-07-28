@@ -12,9 +12,9 @@ use std::collections::BTreeSet;
 
 use rusqlite::{Transaction, params};
 
-use super::apply;
 use super::registry::TableSpec;
 use super::row_op::{self, RowOp};
+use super::{apply, refold};
 
 /// The row ops that carry this device's current state of `spec`'s table for `repo_id` to peers.
 /// Empty when everything is already published (the steady state).
@@ -30,13 +30,30 @@ pub(crate) fn produce_row_ops(
         let row_pk = row_op::row_pk_string(&pk);
         live.insert(row_pk.clone());
         let hash = row_op::cells_hash(&cells);
-        if apply::published_hash(tx, repo_id, spec.name, &row_pk)?.as_deref() != Some(hash.as_str())
-        {
+        let changed = match apply::published_hash(tx, repo_id, spec.name, &row_pk)? {
+            // Published under THIS binary's column set: a differing hash is a real local change.
+            Some((published, version)) if version == refold::TABLE_SYNC_PROJECTOR_VERSION =>
+                published != hash,
+            // Published under a DIFFERENT column set. The two hashes cover different cell lists, so
+            // they differ structurally whether or not the row actually changed — the comparison
+            // says nothing. Reading that as a local delta would re-author EVERY row of the table at
+            // a fresh winning lamport on EVERY upgrading device (log growth O(rows x devices),
+            // lamport inflation, and every device claiming authorship of rows it merely received).
+            // So: not comparable, nothing claimed. #1002's per-op spec version replaces this
+            // conservatism by rebuilding a complete after-image from declared column defaults.
+            Some(_) => false,
+            // Never published: a genuinely new local row.
+            None => true,
+        };
+        if changed {
             ops.push(RowOp::Upsert { table: spec.name.to_string(), pk, cells });
         }
     }
 
-    // A published identity with no live row is a local delete.
+    // A published identity with no live row is a local delete. Deliberately version-AGNOSTIC: a
+    // `Remove` carries only the pk, so which column set the stored hash covered is irrelevant.
+    // Gating this on the version would make a locally-deleted row permanently undeletable across a
+    // column change — the delete could never be authored, and peers would keep the row forever.
     for row_pk in published_row_pks(tx, repo_id, spec.name)? {
         if !live.contains(&row_pk) {
             ops.push(RowOp::Remove {
@@ -199,5 +216,28 @@ mod tests {
         let ops = produce_row_ops(&tx, &SPEC, "repo").unwrap();
         assert_eq!(ops.len(), 1);
         assert!(matches!(&ops[0], RowOp::Remove { .. }), "a deleted row produces a Remove");
+    }
+
+    #[test]
+    fn no_table_registers_while_a_stale_hash_blocks_authoring() {
+        // TRIPWIRE for #1002, guarding the one cost of the not-comparable rule above.
+        //
+        // Nothing refreshes a stored published record's version except a WINNING apply, and a row
+        // that never authors never wins — so after a column-set change every pre-existing row is a
+        // permanent authoring dead zone on that device: even a genuine local edit produces no op.
+        // Deleting the row escapes it (`Remove` is version-agnostic), and a peer can still win the
+        // row, but a fully-upgraded roster is symmetrically stuck.
+        //
+        // That is harmless only while no table is registered, because then no column set can
+        // change. #1002 (a per-op spec version + declared column defaults) removes the
+        // conservatism by rebuilding a complete after-image instead of declining to
+        // compare. Registering a table before it lands would ship the dead zone, so fail
+        // loudly at exactly that moment.
+        assert!(
+            super::super::registry::SYNCABLE_TABLES.is_empty(),
+            "a syncable table was registered while `produce_row_ops` still treats a \
+             version-mismatched anti-echo hash as not-comparable: land the per-op spec version \
+             (#1002) first, or the first column addition strands every existing row's local edits"
+        );
     }
 }

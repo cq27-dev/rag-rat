@@ -1378,6 +1378,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_090_ID => Some(90),
             MIGRATION_091_ID => Some(91),
             MIGRATION_092_ID => Some(92),
+            MIGRATION_093_ID => Some(93),
             _ => None,
         })
         .max()
@@ -1479,6 +1480,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_090_ID
             | MIGRATION_091_ID
             | MIGRATION_092_ID
+            | MIGRATION_093_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1577,6 +1579,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_090_ID => migration.checksum != MIGRATION_090_CHECKSUM,
         MIGRATION_091_ID => migration.checksum != MIGRATION_091_CHECKSUM,
         MIGRATION_092_ID => migration.checksum != MIGRATION_092_CHECKSUM,
+        MIGRATION_093_ID => migration.checksum != MIGRATION_093_CHECKSUM,
         _ => false,
     }
 }
@@ -6279,6 +6282,58 @@ pub fn apply_sync_invites_normalized_receipts(conn: &Connection) -> rusqlite::Re
          CREATE INDEX IF NOT EXISTS sync_invites_account_expiry
              ON sync_invites(account_id, expires_at_ms);"
     ))?;
+    tx.commit()
+}
+
+/// V093 (#1001): the table-sync forward-compat projection substrate — three facts the engine could
+/// not previously record, each of which silently corrupts a synced table once one registers.
+///
+/// - `table_sync_entries.pending_reason` / `.pending_projector_version`: an entry this binary
+///   cannot fully project (unknown column, unknown op-kind, undecodable payload, table out of
+///   scope) is retained but was never marked, so redelivery short-circuits on `entry_exists` and
+///   the payload is unrecoverable. Marking it lets a later binary that understands it replay
+///   exactly the outstanding set. NULL reason = fully projected.
+/// - `table_sync_streams`: `stream_id` is a ONE-WAY sha256 of `(repo_id, account_id, scope_id)`,
+///   and entries store only the stream id. Replay needs `repo_id` to apply and the scope to resolve
+///   the table spec, so without this directory a stored entry cannot be replayed at all.
+/// - `sync_published_rows.projector_version`: the anti-echo hash is computed over the hashing
+///   binary's `spec.columns`, so a stored hash means "this row under column set C" with C implicit.
+///   Once a column set grows, every stored hash mismatches structurally and every row reads as a
+///   local delta — re-authoring the whole table at fresh winning lamports on every upgrading
+///   device. Recording the version makes a mismatched hash detectable as NOT COMPARABLE instead.
+///
+/// Additive and idempotent: the sanctioned `index --full` re-apply sees the V093 shape and skips
+/// the column adds. Nothing backfills, because no table is registered yet — `SYNCABLE_TABLES` is
+/// empty, so `table_sync_entries` and `sync_published_rows` are necessarily empty too, and the
+/// `projector_version` default of 0 is therefore unreachable rather than a lie about existing rows.
+pub fn apply_table_sync_projection_state(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if !column_exists(&tx, "table_sync_entries", "pending_reason")? {
+        tx.execute_batch(
+            "ALTER TABLE table_sync_entries ADD COLUMN pending_reason TEXT;
+             ALTER TABLE table_sync_entries ADD COLUMN pending_projector_version INTEGER;",
+        )?;
+    }
+    if !column_exists(&tx, "sync_published_rows", "projector_version")? {
+        tx.execute(
+            "ALTER TABLE sync_published_rows
+                 ADD COLUMN projector_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS table_sync_streams(
+             stream_id  BLOB NOT NULL PRIMARY KEY,
+             repo_id    TEXT NOT NULL,
+             account_id BLOB NOT NULL,
+             scope_id   TEXT NOT NULL
+         ) STRICT;
+         -- The refold's worklist. Partial, so a projector bump costs O(outstanding entries) rather
+         -- than a scan of the whole log, and the steady state (nothing pending) costs nothing.
+         CREATE INDEX IF NOT EXISTS table_sync_entries_pending
+             ON table_sync_entries(pending_reason)
+             WHERE pending_reason IS NOT NULL;",
+    )?;
     tx.commit()
 }
 

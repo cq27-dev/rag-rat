@@ -1,5 +1,5 @@
 //! The table→log sync engine: replicate derived/metadata table rows across an account's devices as
-//! self-describing typed-CBOR row ops on a signed per-scope stream, folded by per-column
+//! self-describing typed-CBOR row ops on a signed per-scope stream, folded by WHOLE-ROW
 //! last-writer-wins.
 //!
 //! Transport-independent. The wire form ([`row_op`]) and the fold/produce pipeline are exercised by
@@ -12,7 +12,12 @@
 mod apply;
 mod engine;
 mod produce;
+mod refold;
 mod registry;
 mod row_op;
 mod scope_stream;
 mod store;
+
+/// The store-open forward-compat seam: replay entries retained but not projected when they
+/// arrived.
+pub use refold::refold_stale_table_sync_projections;

@@ -1404,8 +1404,6 @@ fn migration_090_adds_account_candidate_reservations() {
 /// from the grow-only candidate DAG.
 #[test]
 fn migration_092_normalizes_invite_receipts() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 92, "move this pin with the next schema migration");
-
     let bare = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply_sync_invites(&bare).unwrap();
     bare.execute(
@@ -1461,7 +1459,7 @@ fn migration_092_normalizes_invite_receipts() {
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 92);
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM schema_version
@@ -1471,6 +1469,64 @@ fn migration_092_normalizes_invite_receipts() {
         )
         .unwrap();
     assert_eq!(recorded, 1, "the forward migration records V092");
+}
+
+/// V093 (#1001) records what the table-sync projector could not project, the apply context the
+/// one-way stream id hashes away, and the column set each anti-echo hash covers.
+#[test]
+fn migration_093_adds_table_sync_projection_state() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 93, "move this pin with the next schema migration");
+
+    // Absence is asserted against the PRE-V093 DDL in isolation, never against the full ladder
+    // (which now ends at V093 and would make the check vacuous).
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_table_sync_tables(&bare).unwrap();
+    assert!(
+        !schema::column_exists(&bare, "table_sync_entries", "pending_reason").unwrap(),
+        "the pending mark arrives with V093, not before"
+    );
+    assert!(
+        !schema::column_exists(&bare, "sync_published_rows", "projector_version").unwrap(),
+        "the anti-echo hash is unversioned before V093"
+    );
+    assert!(!schema::table_exists(&bare, "table_sync_streams").unwrap());
+
+    schema::apply_table_sync_projection_state(&bare).unwrap();
+    schema::apply_table_sync_projection_state(&bare).expect("replay is a no-op");
+
+    assert!(schema::column_exists(&bare, "table_sync_entries", "pending_reason").unwrap());
+    assert!(
+        schema::column_exists(&bare, "table_sync_entries", "pending_projector_version").unwrap()
+    );
+    assert!(schema::column_exists(&bare, "sync_published_rows", "projector_version").unwrap());
+    assert!(schema::table_exists(&bare, "table_sync_streams").unwrap());
+
+    // The directory is STRICT and keyed by the stream id, so one stream resolves to exactly one
+    // apply context.
+    bare.execute(
+        "INSERT INTO table_sync_streams(stream_id, repo_id, account_id, scope_id)
+         VALUES (zeroblob(32), 'repo', zeroblob(32), 'anchors/1')",
+        [],
+    )
+    .unwrap();
+    let duplicate = bare.execute(
+        "INSERT INTO table_sync_streams(stream_id, repo_id, account_id, scope_id)
+         VALUES (zeroblob(32), 'other', zeroblob(32), 'overlay/1')",
+        [],
+    );
+    assert!(duplicate.is_err(), "a stream id resolves to one apply context");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '093_table_sync_projection_state'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V093");
 }
 
 /// V091 (#949) tracks the live key-target count each invite reservation covers, so fold-time

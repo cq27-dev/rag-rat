@@ -135,6 +135,13 @@ impl IndexDatabase {
         // V070-tables guard inside skips cleanly); idempotent and serialized by its own
         // IMMEDIATE txn, so racing openers converge.
         rag_rat_oplog::rebuild_all_content_projections_if_stale(storage.connection())?;
+        // #1001: the same discipline for the `/4` table-sync projection. An entry this binary could
+        // not project when it arrived is retained and marked; replaying it HERE — after migrations,
+        // before any produce — is what keeps a payload that arrived from being lost, since
+        // redelivery short-circuits on the entry already being present. Bounded by the pending set,
+        // so the steady state is one indexed probe, and a no-op today because no table is
+        // registered yet; wired now so registering the first one cannot forget it.
+        rag_rat_oplog::refold_stale_table_sync_projections(storage.connection())?;
         // #691 A1: mirror any accepted SYNCED /3 content into the local memory tables now that the
         // projection is current above — the reverse of the authoring reconcile. Store-global (one
         // pass per real repo). A repo with no minted account or no synced content is a cheap no-op,

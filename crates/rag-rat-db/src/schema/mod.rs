@@ -26,7 +26,8 @@ pub use migrations::{
     apply_papertrail_provider_neutral_schema, apply_repo_id_core_scoping,
     apply_repo_id_periphery_scoping, apply_repos_registry, apply_scip_moniker_anchors,
     apply_sync_invites, apply_sync_invites_normalized_receipts,
-    apply_sync_origin_and_edge_tombstone, apply_table_sync_tables,
+    apply_sync_origin_and_edge_tombstone, apply_table_sync_projection_state,
+    apply_table_sync_tables,
 };
 pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_exists};
 pub use purge::{RepoRowCounts, count_repo_rows, purge_repo_rows, repo_scoped_table_names};
@@ -49,7 +50,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 92;
+pub const LATEST_SCHEMA_VERSION: u32 = 93;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -696,6 +697,16 @@ const MIGRATION_092_DESCRIPTION: &str =
      DeviceAdd envelope; the account bootstrap is already durable in the grow-only candidate DAG, \
      and receipt replay reconstructs the snapshot from it instead of storing one full copy per \
      invite (quadratic growth across a fleet). Table rebuild preserving every row";
+const MIGRATION_093_ID: &str = "093_table_sync_projection_state";
+const MIGRATION_093_CHECKSUM: &str = "sha256:rag-rat-table-sync-projection-state-v93";
+const MIGRATION_093_DESCRIPTION: &str =
+    "Table-sync forward-compat projection substrate (#1001): mark entries this binary cannot \
+     fully project (pending_reason / pending_projector_version) so a later binary replays them \
+     instead of losing their payload; a table_sync_streams directory recovering the (repo_id, \
+     account_id, scope_id) apply context that the one-way stream id hashes away, without which a \
+     stored entry cannot be replayed at all; and sync_published_rows.projector_version, since the \
+     anti-echo hash covers the hashing binary's column set and is meaningless without that set's \
+     identity";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1444,6 +1455,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_092_CHECKSUM,
         description: MIGRATION_092_DESCRIPTION,
         apply: MigrationFn::Plain(apply_sync_invites_normalized_receipts),
+    },
+    Migration {
+        id: MIGRATION_093_ID,
+        checksum: MIGRATION_093_CHECKSUM,
+        description: MIGRATION_093_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_table_sync_projection_state),
     },
 ];
 

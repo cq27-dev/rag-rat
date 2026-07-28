@@ -62,13 +62,12 @@ mod project;
 mod store;
 mod stream;
 mod table_sync;
-
 // C1's curated authority seam for the C2 `/3` content envelope and candidate DAG. The account
-// implementation stays private; only typed ingest results and snapshot-consistent point queries
-// cross the phase boundary.
+// implementation stays private; only typed ingest results and snapshot-consistent point
+// queries cross the phase boundary.
 //
-// The C3.4 local-authoring surface `query::memory` reaches for once #664 retargets the live memory
-// path onto the owner-bound `/2`//3 substrate:
+// The C3.4 local-authoring surface `query::memory` reaches for once #664 retargets the live
+// memory path onto the owner-bound `/2`//3 substrate:
 // - `local_account` (C3.4a, #662): the store-global principal owner-bound `/3` content authors
 //   under.
 // - `ensure_owned_stream_v2_in_tx` (C3.4b-ii, #676): publish + resolve a repo's owned `/2` stream.
@@ -83,13 +82,13 @@ mod table_sync;
 // - `rotate_stream_key_in_tx` / `ensure_stream_key_current_in_tx` / `stream_key_rotation_needed`
 //   (C4.4, #607): lazy content-key rotation on device removal — re-seal a fresh higher-epoch key to
 //   the remaining roster when a removed device still holds the current key.
-// `prepare_content_authoring` / `author_prepared_content_batch_in_tx` / `SealPolicy` (C5, #608):
-// policy-aware `/3` authoring prepared before, then executed inside, a caller-owned transaction;
-// `author_content_batch` is the self-transacting convenience composition. The
+// `prepare_content_authoring` / `author_prepared_content_batch_in_tx` / `SealPolicy` (C5,
+// #608): policy-aware `/3` authoring prepared before, then executed inside, a caller-owned
+// transaction; `author_content_batch` is the self-transacting convenience composition. The
 // envelope-layer seal primitives (`sign_sealed_content_entry` / `seal_and_sign_content_entry`)
-// take a `&DeviceSecret`, so — like `sign_content_entry` — they stay account-crate-internal. Keep
-// this crate-root API explicit: adding an account implementation seam must not silently make it a
-// public semver commitment.
+// take a `&DeviceSecret`, so — like `sign_content_entry` — they stay account-crate-internal.
+// Keep this crate-root API explicit: adding an account implementation seam must not silently
+// make it a public semver commitment.
 pub use account::{
     AccountId, AuthoredDurability, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason,
     AuthorityQuery, CapacityScope, CatchUpReport, ContentCapacityScope, ContentEntryHeader,
@@ -160,3 +159,6 @@ pub use op::{
 pub use project::ProjectedState;
 pub use store::{author_batch, author_op, load_projection};
 pub use stream::StreamId;
+// The table-sync forward-compat seam (#1001): replay entries retained but not projected when
+// they arrived. Belongs at store open, before producing — see the module docs.
+pub use table_sync::refold_stale_table_sync_projections;

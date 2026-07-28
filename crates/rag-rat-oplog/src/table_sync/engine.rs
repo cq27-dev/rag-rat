@@ -13,10 +13,10 @@
 use rusqlite::Transaction;
 
 use super::apply::{self, ApplyOutcome};
-use super::produce;
 use super::registry::TableSpec;
 use super::scope_stream::scope_stream_id;
 use super::store::{self, AcceptOutcome};
+use super::{produce, refold};
 use crate::device::DevicePublic;
 use crate::op::OpMeta;
 use crate::{AccountId, LocalDevice};
@@ -56,9 +56,16 @@ pub(crate) fn produce_and_author(
     tx: &Transaction<'_>,
     ctx: &SyncCtx<'_>,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
+    // Never author into a store a NEWER projector folded: our narrower column set would record
+    // anti-echo hashes and park decisions the newer binary has to distrust.
+    refold::assert_projector_not_newer(tx)?;
     let mut authored = Vec::new();
     for spec in ctx.registry {
         let stream = scope_stream_id(ctx.repo_id, ctx.account_id, spec.scope_id);
+        // Record the apply context for every stream we author on: the stream id hashes
+        // (repo_id, account_id, scope_id) one-way, so without the directory a retained entry could
+        // never be replayed by a later binary (see [`super::refold`]).
+        store::record_stream_context(tx, stream, ctx.repo_id, ctx.account_id, spec.scope_id)?;
         for op in produce::produce_row_ops(tx, spec, ctx.repo_id)? {
             let signed = store::author_row_entry(tx, stream, ctx.device.secret(), &op, ctx.now_ms)?;
             let meta =
@@ -73,23 +80,24 @@ pub(crate) fn produce_and_author(
             // copy: surface it and do NOT transmit the junk op.
             match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
                 apply::ApplyOutcome::Applied => authored.push(signed.signed_bytes),
-                apply::ApplyOutcome::Quarantined(reason) => {
-                    // A locally-produced op self-quarantining is UNREACHABLE for a registered
-                    // table: the lint rejects every shape that would quarantine
-                    // (nullable pk, cross-row constraint,
-                    // ValueType/physical-type mismatch), and the producer reads well-typed
-                    // values. If it somehow happens, FAIL the pass — `author_row_entry` has already
-                    // inserted this entry in the caller's txn, so bailing rolls it back rather than
-                    // leaving it stored-but-unpublished and re-authored (re-signed) every pass
-                    // (unbounded log growth). Assert first, so a test catches the lint/producer
-                    // gap.
+                // A locally-produced op failing to self-apply is UNREACHABLE for a registered
+                // table: the lint rejects every shape that would quarantine (nullable pk, cross-row
+                // constraint, ValueType/physical-type mismatch), the producer reads well-typed
+                // values, and it emits only columns from THIS registry so it can never carry one we
+                // do not know. If it somehow happens, FAIL the pass — `author_row_entry` has
+                // already inserted this entry in the caller's txn, so bailing rolls
+                // it back rather than leaving it stored-but-unpublished and
+                // re-authored (re-signed) every pass (unbounded log growth). Assert
+                // first, so a test catches the lint/producer gap.
+                outcome @ (apply::ApplyOutcome::Quarantined(_)
+                | apply::ApplyOutcome::Unprojectable(_)) => {
                     debug_assert!(
                         false,
-                        "table-sync: a locally-produced op self-quarantined on `{}`: {reason}",
+                        "table-sync: a locally-produced op did not self-apply on `{}`: {outcome:?}",
                         spec.name
                     );
                     anyhow::bail!(
-                        "table-sync: a locally-produced op self-quarantined on `{}`: {reason}",
+                        "table-sync: a locally-produced op did not self-apply on `{}`: {outcome:?}",
                         spec.name
                     );
                 },
@@ -111,7 +119,13 @@ pub(crate) fn ingest(
     signed_bytes: &[u8],
     pubkey: &DevicePublic,
 ) -> anyhow::Result<IngestOutcome> {
+    // Same refusal as the producer: an older binary must not re-park, under its own version, an
+    // entry a newer projector already understood and folded.
+    refold::assert_projector_not_newer(tx)?;
     let stream = scope_stream_id(ctx.repo_id, ctx.account_id, scope_id);
+    // The apply context for anything this stream retains — recorded before the entry is stored, so
+    // a pending entry is never left without the mapping its replay needs.
+    store::record_stream_context(tx, stream, ctx.repo_id, ctx.account_id, scope_id)?;
     let scope_tables: Vec<&str> =
         ctx.registry.iter().filter(|s| s.scope_id == scope_id).map(|s| s.name).collect();
     Ok(
@@ -124,7 +138,7 @@ pub(crate) fn ingest(
             pubkey,
             ctx.now_ms,
         )? {
-            AcceptOutcome::Stored { op, meta } => {
+            AcceptOutcome::Stored { op, meta, entry_hash } => {
                 // `accept_row_entry` already validated the op's table is in `scope_tables`, so
                 // exactly one spec matches; the fallback is defensive, never
                 // reached.
@@ -136,9 +150,21 @@ pub(crate) fn ingest(
                 match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
                     ApplyOutcome::Applied => IngestOutcome::Applied,
                     ApplyOutcome::Quarantined(why) => IngestOutcome::Quarantined(why),
+                    // A newer producer's column: nothing was written. Mark the stored entry so the
+                    // refold replays it once this binary learns the column — only the applier can
+                    // see this, which is why `accept_row_entry` handed back the entry hash.
+                    ApplyOutcome::Unprojectable(reason) => {
+                        store::mark_entry_pending(
+                            tx,
+                            &entry_hash,
+                            reason,
+                            refold::TABLE_SYNC_PROJECTOR_VERSION,
+                        )?;
+                        IngestOutcome::Retained(reason.as_db_str())
+                    },
                 }
             },
-            AcceptOutcome::StoredInert(reason) => IngestOutcome::Retained(reason),
+            AcceptOutcome::StoredInert(reason) => IngestOutcome::Retained(reason.as_db_str()),
             AcceptOutcome::AlreadyPresent => IngestOutcome::AlreadyPresent,
             AcceptOutcome::MissingPredecessor => IngestOutcome::Parked("missing predecessor"),
             AcceptOutcome::Fork => IngestOutcome::Parked("fork"),
