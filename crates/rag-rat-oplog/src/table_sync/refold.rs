@@ -119,22 +119,30 @@ fn replay_pending_entry(
     registry: &[TableSpec],
     pending: &PendingEntry,
 ) -> anyhow::Result<()> {
-    // The stream id is a ONE-WAY hash of (repo_id, account_id, scope_id), so an entry whose stream
-    // predates the directory cannot be placed. Leave it pending rather than guessing a repo.
-    // Unreachable by construction — the directory row is written in the same transaction, before
-    // the entry is stored, on BOTH the ingest and produce paths — so assert rather than skip
-    // silently.
+    // The stream id is a ONE-WAY hash of (repo_id, account_id, scope_id), so an entry with no
+    // directory row cannot be placed at all — there is no repo to apply it to and no scope to
+    // resolve its spec. Skip it, still pending.
+    //
+    // Legitimately reachable, not just defensive: `rag-rat rm` sweeps every table carrying
+    // `repo_id`, which includes the directory, while the stream-keyed entry log is deliberately
+    // retained (the sync substrate is excluded from repo purge). A removed repo therefore leaves
+    // exactly this shape, and skipping is the RIGHT answer — a purged repo's history must not
+    // project. See #1004 for aligning the two halves of that purge.
     let Some(context) = store::stream_context(tx, pending.stream_id)? else {
-        debug_assert!(false, "a stored entry has no stream context to replay against");
         return Ok(());
     };
     // These bytes were signature-verified when accepted and have not left this store since, so a
-    // decode failure here means LOCAL corruption. Skip this entry (it stays pending, and stays
-    // stored as evidence) instead of propagating: one unreadable row must not wedge the replay of
-    // every other pending entry, which — because the stamp only advances on success — would
-    // otherwise repeat on every future open.
+    // decode failure here means LOCAL corruption. Record it TERMINALLY rather than propagating or
+    // re-parking: propagating would roll the whole refold back and re-fail on every future open,
+    // and leaving it pending would keep `refold_owed` true forever — an IMMEDIATE transaction and a
+    // pending scan at every store open, for bytes no future binary can decode. The entry stays
+    // stored as evidence, and the reason is discoverable.
     let Ok(signed) = entry::decode_signed(&pending.signed_bytes) else {
-        return Ok(());
+        return store::record_entry_quarantine(
+            tx,
+            &pending.entry_hash,
+            "stored entry bytes no longer decode",
+        );
     };
     let op = match row_op::decode(&signed.entry.op_bytes) {
         Ok(DecodedRowOp::Known(op)) => op,
@@ -673,6 +681,75 @@ mod tests {
     }
 
     #[test]
+    fn an_older_binary_refuses_to_ingest_into_a_store_a_newer_projector_folded() {
+        // The producer's refusal has a sibling on the ingest path, and it is the more important of
+        // the two: ingesting is what would re-park, under this binary's narrower understanding, an
+        // entry the newer projector already folded.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let entries = author_wide_row(&mut a);
+        b.enroll(a.pubkey().fingerprint());
+        b.conn
+            .execute("INSERT INTO oplog_meta(key, value) VALUES (?1, ?2)", params![
+                TABLE_SYNC_PROJECTOR_VERSION_KEY,
+                (TABLE_SYNC_PROJECTOR_VERSION + 1).to_string()
+            ])
+            .unwrap();
+
+        let tx = b.conn.transaction().unwrap();
+        let ctx = SyncCtx {
+            repo_id: "repo",
+            account_id: account(),
+            device: &b.local,
+            registry: OLD_REGISTRY,
+            now_ms: 0,
+        };
+        let ingested = engine::ingest(&tx, &ctx, "demo/1", &entries[0], &a.pubkey());
+        assert!(ingested.is_err(), "an older projector must not ingest into a newer store");
+        assert!(
+            ingested.unwrap_err().to_string().contains("newer rag-rat"),
+            "the refusal names the cause"
+        );
+    }
+
+    #[test]
+    fn an_older_producers_partial_row_parks_and_is_replayed_when_the_gap_closes() {
+        // The mirror of the unknown-column case: a row that is COMPLETE under the author's narrower
+        // spec is PARTIAL under a wider one. Whole-row LWW cannot apply it, but it is a version gap
+        // — redeemed from the sender's side — so it parks and stays on the worklist rather than
+        // being quarantined off it.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'narrow', NULL)", [])
+            .unwrap();
+        let narrow = a.produce(OLD_REGISTRY, "repo");
+        assert_eq!(narrow.len(), 1, "authored under the narrow spec");
+
+        // B knows the wider column set, so the op is missing one of B's synced columns.
+        b.enroll(a.pubkey().fingerprint());
+        assert_eq!(b.ingest(NEW_REGISTRY, "repo", &narrow, &a.pubkey()), vec![
+            IngestOutcome::Retained(PendingReason::PartialAfterImage.as_db_str())
+        ],);
+        assert_eq!(b.row(), None, "a partial after-image writes nothing");
+        assert_eq!(b.pending_count(), 1, "and stays outstanding, not quarantined off the worklist");
+
+        // Still outstanding after a refold that cannot close the gap either — only the SENDER's
+        // side can (declared column defaults, #1002), so the entry must not be dropped meanwhile.
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.pending_count(), 1, "a sender-side gap survives a receiver-side refold");
+        let quarantined: i64 = b
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_entries WHERE quarantine_reason IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 0, "a version gap is never recorded as a terminal rejection");
+    }
+
+    #[test]
     fn redelivery_of_a_parked_entry_changes_nothing_and_keeps_its_mark() {
         // Redelivery cannot rescue a parked entry (it short-circuits on `entry_exists`) — which is
         // exactly why the mark has to survive it. If redelivery cleared the mark, the refold would
@@ -769,6 +846,91 @@ mod tests {
         // Authoring it settles the race on the merits: the local edit takes a lamport above the
         // parked entry (authoring counts parked entries), so it wins wherever both are seen.
         assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1, "the local edit is still authorable");
+    }
+
+    #[test]
+    fn the_refold_never_resurrects_a_row_deleted_locally_but_not_yet_authored() {
+        // The delete counterpart of the unsent-edit guard, and the subtler half: the row is GONE,
+        // so there is no current state to compare — but the surviving published identity is
+        // exactly what the producer's `Remove` branch keys on. Replaying an upsert over it
+        // would recreate the row AND re-record its published hash, after which the producer
+        // sees no delta and the deletion is gone for good.
+        let mut a = Device::new();
+        let mut b = Device::new();
+
+        // B holds r1 from its own authored write, so the row is published at B's lamport 0.
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'v1', NULL)", [])
+            .unwrap();
+        b.produce(OLD_REGISTRY, "repo");
+
+        // A authors r1 TWICE, so the entry that matters sits at a strictly HIGHER lamport than B's
+        // row clock. Without that the replay could lose the lamport-0 tie on fingerprint and the
+        // row would stay deleted for reasons having nothing to do with the guard under test.
+        a.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'first', 'wide')", [])
+            .unwrap();
+        let first = a.produce(NEW_REGISTRY, "repo");
+        a.conn.execute("UPDATE t_demo SET title = 'second' WHERE id = 'r1'", []).unwrap();
+        let second = a.produce(NEW_REGISTRY, "repo");
+        assert_eq!((first.len(), second.len()), (1, 1));
+
+        // Both park on B (each carries the column B does not know); the chain needs both.
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(OLD_REGISTRY, "repo", &first, &a.pubkey());
+        b.ingest(OLD_REGISTRY, "repo", &second, &a.pubkey());
+        assert_eq!(b.pending_count(), 2);
+
+        // B deletes the row locally and exits before the producer can author the removal.
+        b.conn.execute("DELETE FROM t_demo WHERE id = 'r1'", []).unwrap();
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.row(), None, "the unsent deletion survives the refold");
+        // And it is still authorable, so the removal reaches peers.
+        assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1, "the delete is still authorable");
+    }
+
+    #[test]
+    fn a_malformed_key_is_quarantined_rather_than_failing_the_whole_refold() {
+        // An entry parked as out-of-scope never passed `apply_row_op`'s arity check. When a later
+        // registry recognizes its table, the unsent-change probe must not bind that key against a
+        // mismatched placeholder count — that is a parameter-count ERROR, and propagating it out of
+        // the refold would roll the transaction back and fail EVERY subsequent store open on the
+        // same entry. It has to reach the normal quarantine path instead.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let two_key = RowOp::Upsert {
+            table: "t_demo".to_string(),
+            pk: vec![TypedValue::Text("r1".to_string()), TypedValue::Text("extra".to_string())],
+            cells: vec![Cell { column: "title".to_string(), value: TypedValue::Text("v".into()) }],
+        };
+        let signed = {
+            let tx = a.conn.transaction().unwrap();
+            let stream = scope_stream_id("repo", account(), "demo/1");
+            let signed =
+                store::author_row_entry(&tx, stream, a.local.secret(), &two_key, 0).unwrap();
+            tx.commit().unwrap();
+            signed.signed_bytes
+        };
+
+        // Parked because this scope has no such table for the ingesting registry.
+        b.enroll(a.pubkey().fingerprint());
+        assert_eq!(b.ingest(&[], "repo", &[signed], &a.pubkey()), vec![IngestOutcome::Retained(
+            PendingReason::TableNotInScope.as_db_str()
+        )],);
+
+        // The refold must complete — not error — and the malformed entry must be rejected durably.
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.pending_count(), 0);
+        let quarantined: i64 = b
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_entries WHERE quarantine_reason IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 1, "the malformed key is quarantined, not fatal");
     }
 
     #[test]

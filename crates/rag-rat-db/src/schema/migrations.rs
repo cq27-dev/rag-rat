@@ -6313,20 +6313,19 @@ pub fn apply_sync_invites_normalized_receipts(conn: &Connection) -> rusqlite::Re
 /// `projector_version` default of 0 is therefore unreachable rather than a lie about existing rows.
 pub fn apply_table_sync_projection_state(conn: &Connection) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
-    if !column_exists(&tx, "table_sync_entries", "pending_reason")? {
-        tx.execute_batch(
-            "ALTER TABLE table_sync_entries ADD COLUMN pending_reason TEXT;
-             ALTER TABLE table_sync_entries ADD COLUMN pending_projector_version INTEGER;
-             ALTER TABLE table_sync_entries ADD COLUMN quarantine_reason TEXT;",
-        )?;
-    }
-    if !column_exists(&tx, "sync_published_rows", "projector_version")? {
-        tx.execute(
-            "ALTER TABLE sync_published_rows
-                 ADD COLUMN projector_version INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
+    // Per-column, never one guard for the group: a store that applied an EARLIER shape of this
+    // migration already has the first column, so a group guard would skip the rest forever — the
+    // ladder records the migration as applied and never re-runs it, leaving a column missing on a
+    // store that reports itself current.
+    add_column_if_missing(&tx, "table_sync_entries", "pending_reason", "TEXT")?;
+    add_column_if_missing(&tx, "table_sync_entries", "pending_projector_version", "INTEGER")?;
+    add_column_if_missing(&tx, "table_sync_entries", "quarantine_reason", "TEXT")?;
+    add_column_if_missing(
+        &tx,
+        "sync_published_rows",
+        "projector_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS table_sync_streams(
              stream_id  BLOB NOT NULL PRIMARY KEY,

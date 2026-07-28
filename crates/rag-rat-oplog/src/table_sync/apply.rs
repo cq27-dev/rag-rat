@@ -560,11 +560,21 @@ pub(crate) fn row_has_unsent_local_change(
     repo_id: &str,
     pk_vals: &[TypedValue],
 ) -> anyhow::Result<bool> {
-    let Some(current) = synced_row_hash(tx, spec, pk_vals)? else {
-        // No row: nothing local to lose (the entry is establishing it).
+    // A malformed key never reached `apply_row_op`'s arity check (an entry parked as out-of-scope
+    // or unknown-kind was never validated), and binding it against `spec.pk`'s placeholders
+    // would be a parameter-count ERROR — which, propagating out of the refold, would roll back
+    // the transaction and fail every subsequent store open on the same entry. Defer to the
+    // normal path, which quarantines it.
+    if pk_vals.len() != spec.pk.len() {
         return Ok(false);
-    };
+    }
     let row_pk = row_op::row_pk_string(pk_vals);
+    let Some(current) = synced_row_hash(tx, spec, pk_vals)? else {
+        // No row — but a surviving published identity means the row was DELETED locally and not yet
+        // authored. That is precisely what the producer's `Remove` branch keys on, so replaying an
+        // upsert here would recreate the row and discard the unsent deletion for good.
+        return Ok(published_hash(tx, repo_id, spec.name, &row_pk)?.is_some());
+    };
     Ok(match published_hash(tx, repo_id, spec.name, &row_pk)? {
         // Comparable: a differing hash is a demonstrably unsent local change.
         Some((published, version)) if version == super::refold::TABLE_SYNC_PROJECTOR_VERSION =>

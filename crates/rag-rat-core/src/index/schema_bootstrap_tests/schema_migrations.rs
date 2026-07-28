@@ -1498,8 +1498,22 @@ fn migration_093_adds_table_sync_projection_state() {
     assert!(
         schema::column_exists(&bare, "table_sync_entries", "pending_projector_version").unwrap()
     );
+    assert!(schema::column_exists(&bare, "table_sync_entries", "quarantine_reason").unwrap());
     assert!(schema::column_exists(&bare, "sync_published_rows", "projector_version").unwrap());
     assert!(schema::table_exists(&bare, "table_sync_streams").unwrap());
+
+    // Each column is guarded INDIVIDUALLY. A store carrying only part of this migration's shape
+    // still gains the rest: the ladder records V093 as applied and never re-runs it, so a
+    // group-guarded add would leave a column missing on a store that reports itself current.
+    let partial = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_table_sync_tables(&partial).unwrap();
+    partial.execute("ALTER TABLE table_sync_entries ADD COLUMN pending_reason TEXT", []).unwrap();
+    schema::apply_table_sync_projection_state(&partial).unwrap();
+    assert!(
+        schema::column_exists(&partial, "table_sync_entries", "quarantine_reason").unwrap(),
+        "a partially-migrated store still gains the columns it is missing"
+    );
+    assert!(schema::column_exists(&partial, "sync_published_rows", "projector_version").unwrap());
 
     // The directory is STRICT and keyed by the stream id, so one stream resolves to exactly one
     // apply context.
