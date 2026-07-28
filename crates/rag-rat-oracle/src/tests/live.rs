@@ -180,6 +180,10 @@ fn live_pass_discards_a_definition_batch_when_readiness_regresses() {
                     "params": {"health": "ok", "quiescent": false}
                 }),
                 json!({
+                    "jsonrpc": "2.0", "method": "experimental/serverStatus",
+                    "params": {"health": "ok", "quiescent": true}
+                }),
+                json!({
                     "jsonrpc": "2.0", "id": id,
                     "result": {
                         "uri": definition_uri,

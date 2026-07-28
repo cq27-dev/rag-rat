@@ -14,7 +14,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,6 +38,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// the client's heap without limit.
 const INCOMING_QUEUE_CAPACITY: usize = 64;
 
+/// The low bit of `readiness_state` is current readiness; the remaining bits count non-ready
+/// transitions. Keeping both in one atomic makes a checkpoint an indivisible snapshot.
+const SERVER_READY_BIT: u64 = 1;
+
 type IncomingMessage = io::Result<Option<Value>>;
 
 struct OutgoingMessage {
@@ -60,7 +64,7 @@ pub(crate) struct LspClient {
     next_id: i64,
     encoding: LspEncoding,
     request_timeout: Duration,
-    server_ready: Arc<AtomicBool>,
+    readiness_state: Arc<AtomicU64>,
     /// The child process for a spawned server; `None` for an injected (test) transport. Present so
     /// [`Drop`] can hard-kill it.
     child: Option<Child>,
@@ -83,17 +87,17 @@ impl LspClient {
             child.stdin.take().ok_or_else(|| io::Error::other("child stdin unavailable"))?;
         let stdout =
             child.stdout.take().ok_or_else(|| io::Error::other("child stdout unavailable"))?;
-        let server_ready = Arc::new(AtomicBool::new(false));
+        let readiness_state = Arc::new(AtomicU64::new(0));
         Ok(Self {
             outgoing: spawn_writer_pump(Box::new(stdin)),
             incoming: spawn_reader_pump(
                 Box::new(BufReader::new(stdout)),
-                Arc::clone(&server_ready),
+                Arc::clone(&readiness_state),
             ),
             next_id: 1,
             encoding: LspEncoding::Utf16,
             request_timeout: REQUEST_TIMEOUT,
-            server_ready,
+            readiness_state,
             child: Some(child),
         })
     }
@@ -108,14 +112,14 @@ impl LspClient {
         writer: Box<dyn Write + Send>,
         request_timeout: Duration,
     ) -> Self {
-        let server_ready = Arc::new(AtomicBool::new(false));
+        let readiness_state = Arc::new(AtomicU64::new(0));
         Self {
             outgoing: spawn_writer_pump(writer),
-            incoming: spawn_reader_pump(reader, Arc::clone(&server_ready)),
+            incoming: spawn_reader_pump(reader, Arc::clone(&readiness_state)),
             next_id: 1,
             encoding: LspEncoding::Utf16,
             request_timeout,
-            server_ready,
+            readiness_state,
             child: None,
         }
     }
@@ -126,11 +130,12 @@ impl LspClient {
         self.encoding
     }
 
-    /// Drain status notifications already emitted by the server. `true` means rust-analyzer has
-    /// completed background loading (`quiescent`) and is not in an error state. Unknown status is
-    /// deliberately not ready: sending definitions before the first status can turn warm-up
-    /// `null`s into permanently missing evidence.
-    pub(crate) fn is_server_ready(&mut self) -> io::Result<bool> {
+    /// Drain pending server messages and return a checkpoint only when rust-analyzer is ready.
+    /// Comparing checkpoints around a definition batch detects even a non-ready→ready cycle that
+    /// the latest boolean state alone would hide. Unknown status is deliberately not ready:
+    /// sending definitions before the first status can turn warm-up `null`s into permanently
+    /// missing evidence.
+    pub(crate) fn readiness_checkpoint(&mut self) -> io::Result<Option<u64>> {
         let deadline = Instant::now() + self.request_timeout;
         loop {
             if Instant::now() >= deadline {
@@ -142,7 +147,8 @@ impl LspClient {
                     self.handle_server_message(&message, deadline)?;
                 },
                 Err(TryRecvError::Empty) => {
-                    return Ok(self.server_ready.load(Ordering::Relaxed));
+                    let state = self.readiness_state.load(Ordering::SeqCst);
+                    return Ok((state & SERVER_READY_BIT != 0).then_some(state >> 1));
                 },
                 Err(TryRecvError::Disconnected) => return Err(server_closed_error()),
             }
@@ -151,7 +157,7 @@ impl LspClient {
 
     #[cfg(test)]
     pub(crate) fn assume_ready(&mut self) {
-        self.server_ready.store(true, Ordering::Relaxed);
+        self.readiness_state.fetch_or(SERVER_READY_BIT, Ordering::SeqCst);
     }
 
     /// Send a request and return its `result`, mapping a JSON-RPC `error` response to an `Err`.
@@ -344,7 +350,7 @@ fn spawn_writer_pump(mut writer: Box<dyn Write + Send>) -> SyncSender<OutgoingMe
 
 fn spawn_reader_pump(
     mut reader: Box<dyn BufRead + Send>,
-    server_ready: Arc<AtomicBool>,
+    readiness_state: Arc<AtomicU64>,
 ) -> Receiver<IncomingMessage> {
     let (sender, receiver) = mpsc::sync_channel(INCOMING_QUEUE_CAPACITY);
     thread::spawn(move || {
@@ -352,7 +358,16 @@ fn spawn_reader_pump(
             let message = protocol::read_message(&mut reader);
             match message {
                 Ok(Some(message)) if is_server_status(&message) => {
-                    server_ready.store(status_is_ready(&message), Ordering::Relaxed);
+                    let ready = status_is_ready(&message);
+                    if ready {
+                        readiness_state.fetch_or(SERVER_READY_BIT, Ordering::SeqCst);
+                    } else {
+                        let _ = readiness_state.fetch_update(
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                            |state| Some(state.wrapping_add(2) & !SERVER_READY_BIT),
+                        );
+                    }
                 },
                 Ok(Some(message)) if should_queue_incoming(&message) => {
                     if sender.send(Ok(Some(message))).is_err() {
@@ -613,7 +628,7 @@ mod tests {
             }
         });
         client.initialize("file:///repo").unwrap();
-        assert!(client.is_server_ready().unwrap());
+        assert!(client.readiness_checkpoint().unwrap().is_some());
     }
 
     #[test]
@@ -662,9 +677,11 @@ mod tests {
         )
         .unwrap();
 
-        let ready = Arc::new(AtomicBool::new(false));
-        let incoming =
-            spawn_reader_pump(Box::new(BufReader::new(std::io::Cursor::new(framed))), ready);
+        let readiness_state = Arc::new(AtomicU64::new(0));
+        let incoming = spawn_reader_pump(
+            Box::new(BufReader::new(std::io::Cursor::new(framed))),
+            readiness_state,
+        );
         assert_eq!(
             incoming.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(),
             Some(json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}})),

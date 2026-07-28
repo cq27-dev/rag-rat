@@ -135,8 +135,8 @@ impl LiveOracleSession {
         self.last_used_ms = now_ms;
     }
 
-    fn is_ready(&mut self) -> std::io::Result<bool> {
-        self.client.is_server_ready()
+    fn readiness_checkpoint(&mut self) -> std::io::Result<Option<u64>> {
+        self.client.readiness_checkpoint()
     }
 }
 
@@ -210,9 +210,9 @@ pub fn live_oracle_pass(
     input: &LivePassInput<'_>,
 ) -> anyhow::Result<LivePassReport> {
     let mut report = LivePassReport::default();
-    match session.is_ready() {
-        Ok(true) => {},
-        Ok(false) => {
+    match session.readiness_checkpoint() {
+        Ok(Some(_)) => {},
+        Ok(None) => {
             report.unfinished_paths = input.worklist.to_vec();
             report.status = "Warming".to_string();
             session.touch(rag_rat_base::time::now_ms());
@@ -315,9 +315,9 @@ pub fn live_oracle_pass(
         // Readiness is dynamic: Cargo metadata or workspace changes can put rust-analyzer back
         // into loading after the pass-entry gate. Never begin another definition batch while it is
         // non-quiescent, or temporary nulls would become permanently completed unresolved work.
-        match session.is_ready() {
-            Ok(true) => {},
-            Ok(false) => {
+        let readiness_checkpoint = match session.readiness_checkpoint() {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => {
                 warming = true;
                 defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
                 break 'files;
@@ -327,7 +327,7 @@ pub fn live_oracle_pass(
                 defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
                 break 'files;
             },
-        }
+        };
 
         // Callsite drift gate: the server resolves the DIRTY disk bytes, so those bytes must
         // still hash to the indexed `file_sha` the candidates were built from — a mid-pass edit
@@ -405,9 +405,9 @@ pub fn live_oracle_pass(
         };
         // A reload may begin while the synchronous batch is in flight. Discard the whole batch
         // before interpreting any null definitions, and retry this file once the server is ready.
-        match session.is_ready() {
-            Ok(true) => {},
-            Ok(false) => {
+        match session.readiness_checkpoint() {
+            Ok(Some(checkpoint)) if checkpoint == readiness_checkpoint => {},
+            Ok(_) => {
                 warming = true;
                 defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
                 break 'files;
