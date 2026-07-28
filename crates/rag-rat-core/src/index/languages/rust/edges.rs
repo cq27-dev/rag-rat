@@ -329,6 +329,17 @@ fn clean_rust_type_name(raw: &str, fn_generics: &[&str]) -> Option<String> {
     if type_str.is_empty() {
         return None;
     }
+    // Root-relative qualifiers never appear in a symbol's container-based scope path: strip
+    // `crate::`/`self::` so `fn f(w: crate::workers::Worker)` still reaches `workers::Worker` /
+    // the `Worker` tail at resolve time. `super::` is relative to a module this function cannot
+    // see — decline rather than misresolve (#567).
+    let type_str = type_str
+        .strip_prefix("crate::")
+        .or_else(|| type_str.strip_prefix("self::"))
+        .unwrap_or(type_str);
+    if type_str.starts_with("super::") {
+        return None;
+    }
     if type_str.starts_with("dyn ") || type_str.starts_with("impl ") {
         return None;
     }
@@ -371,6 +382,15 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
         if ancestor.kind() == "closure_expression" {
             return None;
         }
+        // A `for`, `if let`/`while let`, or match-arm pattern that rebinds the receiver name
+        // takes priority over every outer `let` and parameter, and its bound type (iterator
+        // element, scrutinee payload) is not recoverable without type inference. Decline —
+        // same rule as closures above: a hint must never survive a rebind this walk cannot
+        // see. Checking ancestors only gives the scoping for free: an arm/loop binding stops
+        // mattering once the call sits outside it (#567).
+        if control_flow_rebinds(ancestor, text, recv) {
+            return None;
+        }
         if ancestor.kind() == "function_item" {
             function_node = Some(ancestor);
             break;
@@ -404,7 +424,10 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
                 &fn_generic_refs,
             ) {
                 VisibleBinding::Typed(type_name, binding_start) => {
-                    if is_reassigned(function_node, binding_start, call_start, recv, text) {
+                    // Scan from the BINDING'S block, not the whole function: an assignment can
+                    // only affect this binding while it is in scope, and that scope is exactly
+                    // this block's subtree.
+                    if is_reassigned(node, binding_start, call_start, recv, text) {
                         return None;
                     }
                     return canonical_receiver_type(type_name, call_node, text);
@@ -509,10 +532,124 @@ fn constructor_owner(value: Option<Node<'_>>, text: &str, fn_generics: &[&str]) 
     let function_text = node_text(function, text);
     let (type_part, method_part) = function_text.rsplit_once("::")?;
     let method_name = method_part.trim();
-    if !matches!(method_name, "new" | "default" | "from") && !method_name.starts_with("with_") {
+    // Only the two strongest conventions survive: Rust does not force ANY method to return
+    // `Self`, so `from`/`with_*` (routinely builder- or conversion-shaped) are declined
+    // outright, and `new`/`default` are verified against the constructor's DECLARED return type
+    // whenever it is visible in this file — a same-file `Factory::new() -> Worker` re-types the
+    // hint to `Worker`; an opaque or unit return declines. Only a constructor defined in
+    // another file falls back to the naming convention (#567).
+    if !matches!(method_name, "new" | "default") {
         return None;
     }
-    clean_rust_type_name(type_part, fn_generics)
+    let owner = clean_rust_type_name(type_part, fn_generics)?;
+    match same_file_constructor_return(value, text, &owner, method_name, fn_generics) {
+        CtorReturn::SelfLike => Some(owner),
+        CtorReturn::Other(declared) => Some(declared),
+        CtorReturn::Opaque => None,
+        CtorReturn::Unknown => Some(owner),
+    }
+}
+
+enum CtorReturn {
+    /// Declared `-> Self` (or the owner type itself) — the convention holds.
+    SelfLike,
+    /// Declared a different clean local type — use THAT as the receiver type.
+    Other(String),
+    /// Declared something this inference cannot name (generics chains, unit, `impl Trait`).
+    Opaque,
+    /// The constructor is not defined in this file — the declaration is not visible here.
+    Unknown,
+}
+
+/// Find `impl <Owner> { fn <ctor> ... }` in THIS file and classify its declared return type.
+fn same_file_constructor_return(
+    node: Node<'_>,
+    text: &str,
+    owner: &str,
+    ctor: &str,
+    fn_generics: &[&str],
+) -> CtorReturn {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let owner_tail = qn_tail(owner);
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            match child.kind() {
+                "impl_item" => {
+                    let impl_type_matches = child
+                        .child_by_field_name("type")
+                        .map(|type_node| degeneric_path(&node_text(type_node, text)))
+                        .is_some_and(|impl_type| qn_tail(impl_type.trim()) == owner_tail);
+                    if !impl_type_matches {
+                        continue;
+                    }
+                    let Some(body) = child.child_by_field_name("body") else { continue };
+                    let mut body_cursor = body.walk();
+                    for item in body.named_children(&mut body_cursor) {
+                        if item.kind() != "function_item"
+                            || child_name_text(item, text).as_deref() != Some(ctor)
+                        {
+                            continue;
+                        }
+                        let Some(return_node) = item.child_by_field_name("return_type") else {
+                            // A "constructor" declared to return `()` constructs nothing.
+                            return CtorReturn::Opaque;
+                        };
+                        let declared = node_text(return_node, text);
+                        let trimmed = declared.trim();
+                        if trimmed == "Self" || qn_tail(&degeneric_path(trimmed)) == owner_tail {
+                            return CtorReturn::SelfLike;
+                        }
+                        return match clean_rust_type_name(trimmed, fn_generics) {
+                            Some(declared) => CtorReturn::Other(declared),
+                            None => CtorReturn::Opaque,
+                        };
+                    }
+                },
+                // Constructors can sit inside inline modules; anything else cannot contain an
+                // impl at item level.
+                "mod_item" | "declaration_list" => stack.push(child),
+                _ => {},
+            }
+        }
+    }
+    CtorReturn::Unknown
+}
+
+/// Whether `node` is a control-flow construct whose pattern rebinds `recv` for the region the
+/// call sits in: a `for` loop, a match arm, or an `if let`/`while let` condition (including
+/// `let`-chains). Only ever called on ANCESTORS of the call, so a `true` here means the rebind is
+/// in scope at the call site — with one deliberate over-approximation: a call inside the
+/// scrutinee/iterator expression itself (`if let Some(w) = w.take()`) still sees the OUTER
+/// binding, but is declined anyway. Conservative by design (#567).
+fn control_flow_rebinds(node: Node<'_>, text: &str, recv: &str) -> bool {
+    match node.kind() {
+        "for_expression" | "match_arm" => node
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| pattern_binds_name(pattern, text, recv)),
+        "if_expression" | "while_expression" => node
+            .child_by_field_name("condition")
+            .is_some_and(|condition| let_condition_binds(condition, text, recv)),
+        _ => false,
+    }
+}
+
+/// Whether any `let_condition` inside `condition` binds `recv`. Recurses through the condition
+/// expression so `let`-chains (`let Some(a) = x && let Some(b) = y`) are covered.
+fn let_condition_binds(condition: Node<'_>, text: &str, recv: &str) -> bool {
+    rag_rat_base::stack::grow_stack(|| {
+        if condition.kind() == "let_condition" {
+            return condition
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| pattern_binds_name(pattern, text, recv));
+        }
+        let mut cursor = condition.walk();
+        condition.named_children(&mut cursor).any(|child| let_condition_binds(child, text, recv))
+    })
 }
 
 fn pattern_binds_name(pattern: Node<'_>, text: &str, recv: &str) -> bool {
@@ -570,7 +707,11 @@ fn check_assignment(
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            if child.start_byte() < call_start {
+            // Only the (binding, call) byte window can hold a relevant assignment — pruning BOTH
+            // bounds keeps this scan proportional to the code between binding and call instead
+            // of the whole enclosing scope. This runs once per candidate hint, the hottest part
+            // of receiver inference on large functions.
+            if child.start_byte() < call_start && child.end_byte() > binding_start {
                 check_assignment(child, binding_start, call_start, recv, text, found);
             }
         }
@@ -668,6 +809,65 @@ mod receiver_type_hint_tests {
     }
 
     #[test]
+    fn test_same_file_factory_return_type_overrides_the_convention() {
+        let code = r#"
+            impl Factory {
+                fn new() -> Worker { Worker }
+            }
+            fn test() {
+                let w = Factory::new();
+                w.run();
+            }
+        "#;
+        // The declared return type is visible in this file: the receiver is a Worker, not a
+        // Factory — the naming convention must lose to the declaration.
+        assert_eq!(extract_call_hints(code), vec![None, Some("Worker".to_string())]);
+    }
+
+    #[test]
+    fn test_same_file_self_returning_constructor_confirms_the_owner() {
+        let code = r#"
+            impl Worker {
+                fn new() -> Self { Worker }
+            }
+            fn test() {
+                let w = Worker::new();
+                w.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None, Some("Worker".to_string())]);
+    }
+
+    #[test]
+    fn test_unit_returning_constructor_declined() {
+        let code = r#"
+            impl Worker {
+                fn new() {}
+            }
+            fn test() {
+                let w = Worker::new();
+                w.run();
+            }
+        "#;
+        // A same-file `new` that returns `()` constructs nothing — the binding's type is unknown.
+        assert_eq!(extract_call_hints(code), vec![None, None]);
+    }
+
+    #[test]
+    fn test_from_and_builder_initializers_declined() {
+        let code = r#"
+            fn test(source: u8) {
+                let a = Worker::from(source);
+                a.run();
+                let b = Worker::with_capacity(4);
+                b.run();
+            }
+        "#;
+        // Rust does not require `from`/`with_*` to return `Self` — no convention inference.
+        assert_eq!(extract_call_hints(code), vec![None, None, None, None]);
+    }
+
+    #[test]
     fn test_reassignment_declined() {
         let code = r#"
             fn test() {
@@ -727,6 +927,83 @@ mod receiver_type_hint_tests {
         "#;
         let hints = extract_call_hints(code);
         assert_eq!(hints, vec![None]);
+    }
+
+    #[test]
+    fn test_crate_qualified_param_type_strips_the_root() {
+        let code = r#"
+            fn test(w: &crate::workers::Worker) {
+                w.run();
+            }
+        "#;
+        // `crate::` never appears in a container-based scope path — the stored hint drops it.
+        assert_eq!(extract_call_hints(code), vec![Some("workers::Worker".to_string())]);
+    }
+
+    #[test]
+    fn test_super_qualified_param_type_declined() {
+        let code = r#"
+            fn test(w: &super::Worker) {
+                w.run();
+            }
+        "#;
+        // `super::` is relative to a module the extractor cannot resolve — decline.
+        assert_eq!(extract_call_hints(code), vec![None]);
+    }
+
+    #[test]
+    fn test_for_loop_rebind_declined() {
+        let code = r#"
+            fn test(worker: &Alpha) {
+                for worker in fetch_betas() {
+                    worker.run();
+                }
+                worker.report();
+            }
+        "#;
+        // fetch_betas() has no receiver; the loop-rebound worker.run() must decline; the call
+        // after the loop is back in the parameter's scope and sees Alpha again.
+        assert_eq!(extract_call_hints(code), vec![None, None, Some("Alpha".to_string())]);
+    }
+
+    #[test]
+    fn test_if_let_rebind_declined() {
+        let code = r#"
+            fn test(msg: &Alpha) {
+                if let Some(msg) = incoming() {
+                    msg.send();
+                }
+            }
+        "#;
+        // incoming() has no receiver; msg.send() must not inherit the Alpha parameter.
+        assert_eq!(extract_call_hints(code), vec![None, None]);
+    }
+
+    #[test]
+    fn test_while_let_rebind_declined() {
+        let code = r#"
+            fn test(job: &Alpha) {
+                while let Some(job) = queue_pop() {
+                    job.execute();
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None, None]);
+    }
+
+    #[test]
+    fn test_match_arm_rebind_scoped_per_arm() {
+        let code = r#"
+            fn test(event: &Alpha) {
+                match next_event() {
+                    Some(event) => event.apply(),
+                    None => event.apply(),
+                }
+            }
+        "#;
+        // The first arm rebinds `event` (decline); the second arm's pattern does not, so the
+        // Alpha parameter is still the receiver there — arm scoping is per-arm, not per-match.
+        assert_eq!(extract_call_hints(code), vec![None, None, Some("Alpha".to_string())]);
     }
 
     #[test]
