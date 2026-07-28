@@ -547,7 +547,8 @@ pub(crate) fn edge_by_id(conn: &Connection, edge_id: i64) -> anyhow::Result<Opti
                edges.to_name AS to_name,
                edges.edge_kind AS edge_kind,
                edges.target_qualified_name AS target_qualified_name,
-               edges.receiver_hint AS receiver_hint
+               edges.receiver_hint AS receiver_hint,
+               edges.receiver_type_hint AS receiver_type_hint
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.id = ?1
@@ -574,7 +575,8 @@ pub(crate) fn edge_by_fingerprint(
                edges.to_name AS to_name,
                edges.edge_kind AS edge_kind,
                edges.target_qualified_name AS target_qualified_name,
-               edges.receiver_hint AS receiver_hint
+               edges.receiver_hint AS receiver_hint,
+               edges.receiver_type_hint AS receiver_type_hint
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         ",
@@ -597,6 +599,7 @@ pub(crate) fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeA
     let edge_kind: String = row.get("edge_kind")?;
     let target_qualified_name: Option<String> = row.get("target_qualified_name")?;
     let receiver_hint: Option<String> = row.get("receiver_hint")?;
+    let receiver_type_hint: Option<String> = row.get("receiver_type_hint")?;
     Ok(EdgeAnchor {
         edge_id: row.get("edge_id")?,
         fingerprint: edge_fingerprint(EdgeFingerprintParts {
@@ -608,6 +611,7 @@ pub(crate) fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeA
             edge_kind: &edge_kind,
             target_qualified_name: target_qualified_name.as_deref(),
             receiver_hint: receiver_hint.as_deref(),
+            receiver_type_hint: receiver_type_hint.as_deref(),
         }),
         path,
         start_line,
@@ -615,21 +619,31 @@ pub(crate) fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeA
         source_hash: row.get("source_hash")?,
     })
 }
+/// The exact, row-id-independent edge identity (#38). `receiver_type_hint` participates HERE
+/// (unlike the loose from/to/kind/target identity) so a receiver-type-driven re-resolution that
+/// re-points the same call site at a different method (`Alpha::run` → `Beta::run`) changes the
+/// fingerprint even though path/span/names/kind/target/`receiver_hint` all stay put — otherwise
+/// `edge_by_fingerprint` would keep validating a call-path anchor `current` against a target it no
+/// longer resolves to (#779). NULL/empty is folded away (no trailing field appended) so every
+/// fingerprint computed before this field existed is preserved byte-for-byte — legacy edges never
+/// spuriously go stale.
 pub(crate) fn edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String {
-    hex_sha256(
-        format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-            parts.path,
-            parts.start_line,
-            parts.end_line,
-            parts.from_name.unwrap_or(""),
-            parts.to_name.unwrap_or(""),
-            parts.edge_kind,
-            parts.target_qualified_name.unwrap_or(""),
-            parts.receiver_hint.unwrap_or("")
-        )
-        .as_bytes(),
-    )
+    let mut buf = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        parts.path,
+        parts.start_line,
+        parts.end_line,
+        parts.from_name.unwrap_or(""),
+        parts.to_name.unwrap_or(""),
+        parts.edge_kind,
+        parts.target_qualified_name.unwrap_or(""),
+        parts.receiver_hint.unwrap_or("")
+    );
+    if let Some(receiver_type_hint) = parts.receiver_type_hint.filter(|value| !value.is_empty()) {
+        buf.push('\n');
+        buf.push_str(receiver_type_hint);
+    }
+    hex_sha256(buf.as_bytes())
 }
 
 /// One live-edge candidate for call-path re-resolution: the exact fingerprint plus the loose
@@ -667,8 +681,8 @@ fn live_edge_match_sql(identity_count: usize) -> String {
         "SELECT files.path AS path, COALESCE(NULLIF(edges.source_start_line, 0), 1) AS \
          start_line, COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, \
          0), 1) AS end_line, edges.from_name, edges.to_name, edges.edge_kind, \
-         edges.target_qualified_name, edges.receiver_hint FROM edges JOIN files ON files.id = \
-         edges.source_file_id WHERE {disjunction}"
+         edges.target_qualified_name, edges.receiver_hint, edges.receiver_type_hint FROM edges \
+         JOIN files ON files.id = edges.source_file_id WHERE {disjunction}"
     )
 }
 
@@ -703,6 +717,7 @@ pub(crate) fn live_edges_matching_identities(
         let edge_kind = row.get::<_, String>("edge_kind")?;
         let target_qualified_name = row.get::<_, Option<String>>("target_qualified_name")?;
         let receiver_hint = row.get::<_, Option<String>>("receiver_hint")?;
+        let receiver_type_hint = row.get::<_, Option<String>>("receiver_type_hint")?;
         Ok(LiveEdgeMatch {
             fingerprint: edge_fingerprint(EdgeFingerprintParts {
                 path: &path,
@@ -713,6 +728,7 @@ pub(crate) fn live_edges_matching_identities(
                 edge_kind: &edge_kind,
                 target_qualified_name: target_qualified_name.as_deref(),
                 receiver_hint: receiver_hint.as_deref(),
+                receiver_type_hint: receiver_type_hint.as_deref(),
             }),
             from_name,
             to_name,
@@ -760,7 +776,8 @@ pub(crate) fn call_path_edge_by_id(
                edges.to_name AS to_name,
                edges.edge_kind AS edge_kind,
                edges.target_qualified_name AS target_qualified_name,
-               edges.receiver_hint AS receiver_hint
+               edges.receiver_hint AS receiver_hint,
+               edges.receiver_type_hint AS receiver_type_hint
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.id = ?1
@@ -775,6 +792,7 @@ pub(crate) fn call_path_edge_by_id(
             let edge_kind: String = row.get("edge_kind")?;
             let target_qualified_name: Option<String> = row.get("target_qualified_name")?;
             let receiver_hint: Option<String> = row.get("receiver_hint")?;
+            let receiver_type_hint: Option<String> = row.get("receiver_type_hint")?;
             let fingerprint = edge_fingerprint(EdgeFingerprintParts {
                 path: &path,
                 start_line,
@@ -784,6 +802,7 @@ pub(crate) fn call_path_edge_by_id(
                 edge_kind: &edge_kind,
                 target_qualified_name: target_qualified_name.as_deref(),
                 receiver_hint: receiver_hint.as_deref(),
+                receiver_type_hint: receiver_type_hint.as_deref(),
             });
             Ok(CallPathEdge {
                 fingerprint,
@@ -1127,5 +1146,48 @@ mod live_edge_match_tests {
             .join("\n");
         assert!(plan.contains("idx_edges_to_name"), "query plan must use to-name index:\n{plan}");
         assert!(!plan.contains("SCAN d"), "query plan must not scan edges_data:\n{plan}");
+    }
+}
+
+#[cfg(test)]
+mod receiver_type_hint_fingerprint_tests {
+    use super::*;
+
+    fn base_parts<'a>(receiver_type_hint: Option<&'a str>) -> EdgeFingerprintParts<'a> {
+        EdgeFingerprintParts {
+            path: "src/lib.rs",
+            start_line: 10,
+            end_line: 10,
+            from_name: Some("caller"),
+            to_name: Some("run"),
+            edge_kind: "calls_name",
+            target_qualified_name: None,
+            receiver_hint: Some("recv"),
+            receiver_type_hint,
+        }
+    }
+
+    #[test]
+    fn receiver_type_hint_repoint_changes_the_stable_fingerprint() {
+        // path, span, from_name, to_name, edge_kind, target_qualified_name, and receiver_hint all
+        // stay identical — only `receiver_type_hint` differs, as when Rust receiver-type inference
+        // re-points `recv.run()` from `Alpha::run` to `Beta::run` on reindex (#779). The
+        // fingerprint MUST change, or `edge_by_fingerprint`/`edge_by_id` would keep
+        // validating a call-path anchor `current` against a target it no longer resolves
+        // to.
+        let alpha = edge_fingerprint(base_parts(Some("Alpha")));
+        let beta = edge_fingerprint(base_parts(Some("Beta")));
+        assert_ne!(alpha, beta, "different receiver_type_hint must yield different fingerprints");
+    }
+
+    #[test]
+    fn null_and_empty_receiver_type_hint_preserve_the_legacy_fingerprint() {
+        // Legacy edges (indexed before `receiver_type_hint` existed) carry NULL here. Their
+        // fingerprint must stay byte-for-byte identical to the pre-#779 8-field format, or every
+        // already-persisted `repo_memory_call_path_edges.edge_fingerprint` would go stale at once.
+        let legacy_format =
+            hex_sha256("src/lib.rs\n10\n10\ncaller\nrun\ncalls_name\n\nrecv".as_bytes());
+        assert_eq!(edge_fingerprint(base_parts(None)), legacy_format);
+        assert_eq!(edge_fingerprint(base_parts(Some(""))), legacy_format);
     }
 }

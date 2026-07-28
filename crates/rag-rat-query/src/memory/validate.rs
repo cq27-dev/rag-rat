@@ -975,3 +975,138 @@ mod content_hash_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod call_path_receiver_type_hint_tests {
+    use super::*;
+
+    fn mem_db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&c, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        c
+    }
+
+    fn set_repo(c: &Connection, repo_id: &str) {
+        c.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', ?1)",
+            [repo_id],
+        )
+        .unwrap();
+    }
+
+    fn seed_file(c: &Connection, path: &str, repo_id: &str) -> i64 {
+        c.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, repo_id, generation) VALUES \
+             (?1,'rust','source',?2,0,0,'','',?3,0)",
+            rusqlite::params![path, format!("sha-{path}"), repo_id],
+        )
+        .unwrap();
+        c.last_insert_rowid()
+    }
+
+    fn seed_memory(c: &Connection, id: &str, repo_id: &str) {
+        c.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
+             (?1,'Invariant','t','b','high','active','agent',1,1,'agent','v1',?2)",
+            rusqlite::params![id, repo_id],
+        )
+        .unwrap();
+    }
+
+    fn call_path_binding(memory_id: &str, edge_sequence_hash: &str) -> RepoMemoryBinding {
+        RepoMemoryBinding {
+            memory_id: memory_id.to_string(),
+            binding_kind: "call_path".to_string(),
+            binding_id: edge_sequence_hash.to_string(),
+            path: None,
+            start_line: None,
+            end_line: None,
+            logical_symbol_id: None,
+            symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            commit_hash: None,
+            tracker: None,
+            project: None,
+            item_key: None,
+            symbol_kind: None,
+            signature_hash: None,
+            moniker_tool: None,
+            moniker_tool_version: None,
+            relocation_reason: None,
+            anchor_status: "current".to_string(),
+            created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn call_path_binding_stops_reading_current_after_receiver_type_hint_repoint() {
+        // End-to-end (#779): `recv.run()` starts resolved against `Alpha` (`receiver_type_hint =
+        // 'Alpha'`). A memory anchors the call path with the fingerprint captured at that moment.
+        // Reindexing then re-points the SAME call site's Rust receiver-type inference to `Beta` —
+        // path, span, from_name, to_name, edge_kind, target_qualified_name, and receiver_hint all
+        // stay identical, only `receiver_type_hint` changes. Before #779 the fingerprint ignored
+        // `receiver_type_hint`, so `validate_call_path_binding` kept reporting `current` against a
+        // target it no longer actually resolved to. It must not anymore.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, target_qualified_name, \
+             receiver_hint, receiver_type_hint, source_file_id, source_start_line, \
+             source_end_line) VALUES \
+             ('caller','run','calls_name','exact',NULL,'recv','Alpha',?1,10,10)",
+            [file_id],
+        )
+        .unwrap();
+        let edge_id: i64 = c
+            .query_row("SELECT id FROM edges WHERE to_name = 'run'", [], |row| row.get(0))
+            .unwrap();
+        let edge = call_path_edge_by_id(&c, edge_id).unwrap().unwrap();
+
+        seed_memory(&c, "m1", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','call_path','hash1',NULL,'current',0,'r')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name, \
+             receiver_hint) VALUES ('m1','hash1',0,?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                edge.fingerprint,
+                edge.from_name,
+                edge.to_name,
+                edge.edge_kind,
+                edge.target_qualified_name,
+                edge.receiver_hint,
+            ],
+        )
+        .unwrap();
+
+        let mut binding = call_path_binding("m1", "hash1");
+        assert_eq!(
+            validate_call_path_binding(&c, &mut binding).unwrap(),
+            "current",
+            "unchanged edge validates current"
+        );
+
+        c.execute("UPDATE edges SET receiver_type_hint = 'Beta' WHERE id = ?1", [edge_id]).unwrap();
+
+        assert_ne!(
+            validate_call_path_binding(&c, &mut binding).unwrap(),
+            "current",
+            "a receiver-type-driven re-resolution must not keep validating current against the \
+             stale method target"
+        );
+    }
+}

@@ -549,6 +549,15 @@ pub(crate) struct EdgeFingerprintParts<'a> {
     edge_kind: &'a str,
     target_qualified_name: Option<&'a str>,
     receiver_hint: Option<&'a str>,
+    /// Rust-only conservative receiver type inference (`recv.run()` → `Alpha`/`Beta`, #779):
+    /// deliberately excluded from every LOOSE identity (`LiveEdgeMatch`, `CallPathEdge`,
+    /// `live_edges_matching_identities`'s identity tuple) so a receiver-type-driven re-resolution
+    /// still relocates rather than going `gone`, mirroring `receiver_hint`. It DOES participate in
+    /// the stable fingerprint so re-resolution to a different method target (Alpha::run →
+    /// Beta::run) is detected as a change instead of silently validating `current` against a stale
+    /// target. NULL/empty is folded away in `edge_fingerprint` so every pre-existing fingerprint
+    /// (computed before this field existed) is preserved byte-for-byte.
+    receiver_type_hint: Option<&'a str>,
 }
 
 #[cfg(test)]
