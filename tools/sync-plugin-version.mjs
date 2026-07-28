@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// Sync the plugin manifests' version to the workspace crate version.
+// Sync non-Cargo manifests' versions to the workspace crate version.
 //
 // release-plz bumps only Cargo.toml ([workspace.package].version) — it has no support for non-Cargo
-// files. The plugin launcher fetches releases/download/v<plugin-version>, so the manifests MUST match
-// the released crate version or it downloads the wrong release. `.github/workflows/release-plz.yml`
-// runs this on the Release PR branch so the manifest bump rides in the same PR that cuts the tag.
+// files. The plugin launcher and MCP Registry metadata MUST match the released crate version or they
+// point at the wrong release. `.github/workflows/release-plz.yml` runs this on the Release PR branch
+// so the manifest bumps ride in the same PR that cuts the tag.
 //
 // Idempotent; run from the repo root. Exits non-zero only on a structural mismatch (so a cargo-dist /
 // release-plz change that moves the version can't silently ship a stale manifest).
@@ -32,18 +32,22 @@ function fail(msg) {
 const VERSION = workspaceVersion();
 let changed = 0;
 
-// 1) The manifests' `"version"` field — each has exactly one; rewrite it surgically to preserve
-// formatting.
+// 1) Manifest `"version"` fields. Most have one; server.json has both server and package versions.
+// Require the exact count so a schema change cannot silently leave one stale.
 const VERSION_FILES = [
-  ".claude-plugin/marketplace.json",
-  "plugin/.claude-plugin/plugin.json",
-  "plugin/.codex-plugin/plugin.json",
-  "plugin/opencode/package.json",
+  [".claude-plugin/marketplace.json", 1],
+  ["plugin/.claude-plugin/plugin.json", 1],
+  ["plugin/.codex-plugin/plugin.json", 1],
+  ["plugin/opencode/package.json", 1],
+  ["server.json", 2],
 ];
-const versionRe = /("version"\s*:\s*)"[^"]*"/;
-for (const file of VERSION_FILES) {
+const versionRe = /("version"\s*:\s*)"[^"]*"/g;
+for (const [file, expectedFields] of VERSION_FILES) {
   const src = readFileSync(file, "utf8");
-  if (!versionRe.test(src)) fail(`no "version" field in ${file}`);
+  const fields = src.match(versionRe)?.length ?? 0;
+  if (fields !== expectedFields) {
+    fail(`expected ${expectedFields} "version" field(s) in ${file}, found ${fields}`);
+  }
   const out = src.replace(versionRe, `$1"${VERSION}"`);
   if (out !== src) {
     writeFileSync(file, out);
