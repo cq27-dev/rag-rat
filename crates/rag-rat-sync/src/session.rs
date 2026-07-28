@@ -280,6 +280,9 @@ where
                     // frame in the data phase is out of sequence.
                     return Err(SessionError::Protocol("an auth frame mid-session".into()));
                 },
+                Ok(Frame::AuthGrant { .. }) => {
+                    return Err(SessionError::Protocol("an auth grant mid-session".into()));
+                },
                 // `read_frame_before` has already mapped EOF (truncated transfer) and idle timeout
                 // into a `SessionError`, so any error here just propagates.
                 Err(e) => return Err(e),

@@ -794,6 +794,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatcher_honors_remote_read_only_grants_for_both_streams() {
+        for alpn in [SYNC_ALPN, CONTENT_SYNC_ALPN] {
+            let database = database();
+            let account_id = rag_rat_oplog::local_account(&database, NOW).unwrap();
+            let account = account_id.to_bytes();
+            let account_entries =
+                rag_rat_oplog::account_entries_for_sync(&database, account_id).unwrap().len();
+            let server_entry = test_entry(1);
+            let stale_local_entry = test_entry(9);
+            let mut account_store =
+                crate::store::OplogSyncStore::new(&database, account_id, || NOW);
+            let mut content_store = TestStore::new(
+                account,
+                [server_entry.clone()],
+                PeerCapability::ReadWrite,
+                PeerCapability::ReadWrite,
+            );
+            // The production account authorizer rejects this fake binding under Open and grants the
+            // dialer read-only access even though the dialer still considers itself write-capable.
+            let mut stale_writer_store = TestStore::new(
+                account,
+                [stale_local_entry.clone()],
+                PeerCapability::ReadWrite,
+                PeerCapability::ReadWrite,
+            );
+            let (listener, dialer) = loopback_endpoints().await;
+
+            let server = accept_and_dispatch(
+                &listener,
+                &mut account_store,
+                &mut content_store,
+                AuthPolicy::Open,
+                || NOW,
+            );
+            let client = connect_and_sync(
+                &dialer,
+                direct_addr(&listener),
+                alpn,
+                &mut stale_writer_store,
+                AuthPolicy::Open,
+                NOW,
+            );
+            let (server_result, client_result) = tokio::join!(server, client);
+
+            let (negotiated, server_report) = server_result.unwrap();
+            let client_report = client_result.unwrap();
+            assert_eq!(negotiated, alpn);
+            assert_eq!(client_report.entries_sent, 0);
+            assert_eq!(server_report.entries_received, 0);
+            assert_eq!(
+                client_report.entries_newly_stored,
+                if alpn == SYNC_ALPN { account_entries } else { 1 },
+            );
+            assert!(!content_store.entries.contains_key(&stale_local_entry.0));
+        }
+    }
+
+    #[tokio::test]
     async fn an_anonymous_open_dialer_can_pull_from_the_selected_server() {
         let source = database();
         let account = rag_rat_oplog::local_account(&source, NOW).unwrap();
@@ -825,7 +883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_anonymous_open_dialer_cannot_push() {
+    async fn an_anonymous_open_dialer_suppresses_its_push() {
         let source = database();
         let account = rag_rat_oplog::local_account(&source, NOW).unwrap();
         let destination = database();
@@ -845,8 +903,8 @@ mod tests {
         );
         let (server_result, client_result) = tokio::join!(server, client);
 
-        assert!(matches!(server_result, Err(SyncFailure::Session(SessionError::UnauthorizedPush))));
-        assert!(client_result.is_err(), "the dialer observes the refused transfer");
+        assert_eq!(server_result.unwrap().entries_received, 0);
+        assert_eq!(client_result.unwrap().entries_sent, 0);
         assert!(
             rag_rat_oplog::account_entries_for_sync(&destination, account).unwrap().is_empty(),
             "anonymous open admission reaches no account ingest",

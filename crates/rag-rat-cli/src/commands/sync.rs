@@ -7,7 +7,7 @@ use anyhow::{Context, anyhow, bail};
 use rag_rat_base::config::Config;
 use rag_rat_base::{hash, locks, time};
 use rag_rat_sync::{
-    AuthPolicy, NodeAuth, OplogContentSyncStore, OplogSyncStore, PeerAuthorization,
+    AuthPolicy, NodeAuth, OplogContentSyncStore, OplogSyncStore, PeerAuthorization, PeerCapability,
 };
 use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
@@ -126,11 +126,11 @@ fn serve(config: &Config, once: bool) -> anyhow::Result<()> {
         // so the serve peer must itself hold an EFFECTIVE (roster-current) device. Fail fast rather
         // than start and silently reject every session.
         let local_node = *endpoint.id().as_bytes();
-        if !device_roster_effective(conn, account_id, &local_node)? {
+        if !device_can_serve(device_roster_capability(conn, account_id, &local_node)?) {
             bail!(
-                "this peer's device is not an effective member of the account (no enrolled \
-                 device, or removed from the roster) — it cannot serve a private account; run \
-                 `rag-rat sync enable` and enroll this peer"
+                "this peer's device is not a write-capable effective member of the account \
+                 (unenrolled, removed, or read-only) — it cannot serve a private account; enroll \
+                 this peer with the Member or Owner role"
             );
         }
         let policy = AuthPolicy::Closed;
@@ -269,7 +269,7 @@ pub(crate) fn device_sync_run(
     // so this local-broken state is cadence-limited exactly like an unreachable peer — otherwise
     // every hook would rebind an endpoint and hit the relay for nothing.
     let local_node = rag_rat_sync::node_id_from_secret(*node_key);
-    if !device_roster_effective(conn, account_id, &local_node)? {
+    if !device_can_sync(device_roster_capability(conn, account_id, &local_node)?) {
         record_device_sync(conn)?;
         return Ok(DeviceSyncOutcome::Disabled);
     }
@@ -402,21 +402,33 @@ fn existing_account_or_hint(conn: &Connection) -> anyhow::Result<rag_rat_oplog::
     )
 }
 
-/// Whether this store's local device is roster-EFFECTIVE — not merely present. Mints its own
-/// binding for `local_node` and runs it through the roster `authorize` path (self-authorization).
-/// Returns `false` for both "no local device" (empty binding) and "removed from the roster" (a
-/// nonempty binding a `Closed` peer would reject as `NotRosterDevice`). Both `serve` (accept) and
-/// device-side sync (dial) gate on this: a non-effective device can neither serve nor sync a
-/// private account, so acting on it would only fail every session.
-fn device_roster_effective(
+/// This store's local device capability when it is roster-EFFECTIVE — not merely present. Mints its
+/// own binding for `local_node` and runs it through the roster `authorize` path
+/// (self-authorization). Returns `None` for both "no local device" (empty binding) and "removed
+/// from the roster" (a nonempty binding a `Closed` peer would reject as `NotRosterDevice`).
+/// Device-side sync accepts either granted capability so a read-only device can pull; `serve`
+/// requires `ReadWrite` because a read-only store-and-forward peer could accept pushes but never
+/// restore data to clients.
+fn device_roster_capability(
     conn: &Connection,
     account_id: rag_rat_oplog::AccountId,
     local_node: &[u8; 32],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<PeerCapability>> {
     let probe = OplogSyncStore::new(conn, account_id, time::now_ms);
     let now = time::now_ms();
     let local = probe.local_auth(local_node, now)?;
-    Ok(matches!(probe.authorize(&local.binding, local_node, now)?, PeerAuthorization::Granted(_),))
+    match probe.authorize(&local.binding, local_node, now)? {
+        PeerAuthorization::Granted(capability) => Ok(Some(capability)),
+        PeerAuthorization::Rejected | PeerAuthorization::Unavailable => Ok(None),
+    }
+}
+
+fn device_can_serve(capability: Option<PeerCapability>) -> bool {
+    matches!(capability, Some(PeerCapability::ReadWrite))
+}
+
+fn device_can_sync(capability: Option<PeerCapability>) -> bool {
+    capability.is_some()
 }
 
 /// Meta key for this index's persisted iroh node secret (the transport identity).
@@ -478,8 +490,8 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, decode_node_secret, device_sync_due,
-        device_sync_run, node_secret, record_device_sync,
+        DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, decode_node_secret, device_can_serve,
+        device_can_sync, device_sync_due, device_sync_run, node_secret, record_device_sync,
     };
 
     fn schema_conn() -> Connection {
@@ -550,6 +562,15 @@ mod tests {
             DeviceSyncOutcome::Skipped,
             "a recent sync suppresses the next attempt before any dial"
         );
+    }
+
+    #[test]
+    fn read_only_devices_can_sync_but_cannot_serve() {
+        let read_only = Some(rag_rat_sync::PeerCapability::ReadOnly);
+        assert!(device_can_sync(read_only));
+        assert!(!device_can_serve(read_only));
+        assert!(device_can_serve(Some(rag_rat_sync::PeerCapability::ReadWrite)));
+        assert!(!device_can_sync(None));
     }
 
     #[test]

@@ -15,10 +15,10 @@
 use minicbor::{Decoder, Encoder};
 
 /// The ALPN for the ACCOUNT-LOG stream. Versioned: a breaking wire change bumps the suffix so an
-/// old peer declines the handshake instead of misreading frames. Bumped to `/3` for the #926
-/// role-ordered completion acknowledgement; a `/2` peer would stop after `Done` and deadlock or
-/// truncate a `/3` peer waiting for proof that its stream was consumed.
-pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/3";
+/// old peer declines the handshake instead of misreading frames. Bumped to `/4` for the
+/// post-binding capability grant: a `/3` sender considers only its own role and can upload when the
+/// receiver has granted it read-only access.
+pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/4";
 
 /// The ALPN for the `/3` CONTENT stream — the memories themselves (#907). Same frame protocol and
 /// same account-level auth phase as [`SYNC_ALPN`]; only the STORE differs (`OplogContentSyncStore`
@@ -26,8 +26,8 @@ pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/3";
 /// acceptor picks the store from `conn.alpn()` and the account-log wire stays byte-identical. A
 /// peer that does not speak this ALPN simply never exchanges content — account-log sync is
 /// unaffected.
-/// Bumped to `/2` alongside [`SYNC_ALPN`] because content uses the same completion state machine.
-pub const CONTENT_SYNC_ALPN: &[u8] = b"rag-rat/content/2";
+/// Bumped to `/3` alongside [`SYNC_ALPN`] because content uses the same auth state machine.
+pub const CONTENT_SYNC_ALPN: &[u8] = b"rag-rat/content/3";
 
 /// Domain tag committed into every frame's leading array element, so a frame from another protocol
 /// (or a truncated one) cannot be mistaken for a valid frame.
@@ -62,6 +62,10 @@ pub enum Frame {
     /// it against its roster and the connection's authenticated remote node id under its own
     /// admission policy, and reveals nothing (not even account confirmation) until it passes.
     Auth { account_id: Hash, binding: Vec<u8> },
+    /// Reports the capability this sender granted the peer after verifying its binding. Each side
+    /// intersects the grant it receives with its own authority before the data phase, so stale
+    /// local roster state cannot make it upload to a receiver that admitted it read-only.
+    AuthGrant { can_push: bool },
     /// Opens the data phase: the account being synced and every account-log entry hash the sender
     /// holds. The peer replies with the entries in ITS store that are not in this set.
     Hello { account_id: Hash, have: Vec<Hash> },
@@ -82,6 +86,7 @@ mod tag {
     pub const DONE: u8 = 2;
     pub const AUTH: u8 = 3;
     pub const ACK: u8 = 4;
+    pub const AUTH_GRANT: u8 = 5;
 }
 
 /// A frame that failed to decode. Kept distinct from an I/O error so the session can treat a
@@ -120,6 +125,12 @@ impl Frame {
                 enc.u8(tag::AUTH).expect(INFALLIBLE);
                 enc.bytes(account_id).expect(INFALLIBLE);
                 enc.bytes(binding).expect(INFALLIBLE);
+            },
+            Frame::AuthGrant { can_push } => {
+                enc.array(3).expect(INFALLIBLE);
+                enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
+                enc.u8(tag::AUTH_GRANT).expect(INFALLIBLE);
+                enc.bool(*can_push).expect(INFALLIBLE);
             },
             Frame::Hello { account_id, have } => {
                 enc.array(3).expect(INFALLIBLE);
@@ -174,6 +185,7 @@ impl Frame {
             tag::DONE => 2,
             tag::AUTH => 4,
             tag::ACK => 2,
+            tag::AUTH_GRANT => 3,
             other => return Err(WireError::Malformed(format!("unknown frame tag {other}"))),
         };
         if outer != expected_outer {
@@ -203,6 +215,7 @@ impl Frame {
                 }
                 Ok(Frame::Auth { account_id, binding: binding.to_vec() })
             },
+            tag::AUTH_GRANT => Ok(Frame::AuthGrant { can_push: dec.bool().map_err(m)? }),
             tag::HELLO => {
                 let inner = dec.array().map_err(m)?;
                 if inner != Some(2) {
@@ -269,8 +282,8 @@ mod tests {
     /// acceptor can route account-log vs content by ALPN.
     #[test]
     fn alpn_identifiers_are_frozen() {
-        assert_eq!(SYNC_ALPN, b"rag-rat/sync/3");
-        assert_eq!(CONTENT_SYNC_ALPN, b"rag-rat/content/2");
+        assert_eq!(SYNC_ALPN, b"rag-rat/sync/4");
+        assert_eq!(CONTENT_SYNC_ALPN, b"rag-rat/content/3");
         assert_eq!(crate::enrollment::ENROLL_ALPN, b"rag-rat/enroll/1");
         assert_ne!(SYNC_ALPN, CONTENT_SYNC_ALPN);
         assert_ne!(SYNC_ALPN, crate::enrollment::ENROLL_ALPN);
@@ -281,6 +294,8 @@ mod tests {
     fn every_frame_roundtrips() {
         roundtrip(&Frame::Auth { account_id: [0xbb; 32], binding: vec![1, 2, 3, 4] });
         roundtrip(&Frame::Auth { account_id: [0; 32], binding: vec![] });
+        roundtrip(&Frame::AuthGrant { can_push: false });
+        roundtrip(&Frame::AuthGrant { can_push: true });
         roundtrip(&Frame::Hello { account_id: [0xaa; 32], have: vec![[1; 32], [2; 32]] });
         roundtrip(&Frame::Hello { account_id: [0; 32], have: vec![] });
         roundtrip(&Frame::Entries { entries: vec![vec![1, 2, 3], vec![]], more: true });
@@ -375,6 +390,19 @@ mod tests {
             [
                 0x82, 0x74, b'r', b'a', b'g', b'-', b'r', b'a', b't', b'/', b's', b'y', b'n', b'c',
                 b'-', b'f', b'r', b'a', b'm', b'e', b'/', b'1', 0x04,
+            ],
+        );
+    }
+
+    #[test]
+    fn auth_grant_frame_bytes_are_frozen() {
+        let bytes = Frame::AuthGrant { can_push: true }.encode();
+        assert_eq!(
+            bytes,
+            // array(3), text "rag-rat/sync-frame/1", u8 5, true
+            [
+                0x83, 0x74, b'r', b'a', b'g', b'-', b'r', b'a', b't', b'/', b's', b'y', b'n', b'c',
+                b'-', b'f', b'r', b'a', b'm', b'e', b'/', b'1', 0x05, 0xf5,
             ],
         );
     }
