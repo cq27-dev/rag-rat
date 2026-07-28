@@ -1,6 +1,6 @@
 ---
 name: rust-modern-style
-description: Apply rag-rat's Rust style when writing or reviewing Rust: current stable idioms, module-qualified free functions and constants, explicit persistence contracts, and narrow APIs.
+description: "Apply rag-rat's Rust style when writing or reviewing Rust: current stable idioms, module-qualified free functions and constants, explicit persistence contracts, and narrow APIs."
 metadata:
   type: code-style
   language: rust
