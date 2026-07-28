@@ -3,6 +3,8 @@
 //! definitions to symbols + batch monikers and persists `ra-lsp` verdicts + a backing run row.
 //! No real rust-analyzer, no network.
 
+use std::sync::{Arc, Mutex};
+
 use serde_json::{Value, json};
 
 use super::*;
@@ -114,6 +116,49 @@ fn live_pass_upgrades_a_name_only_edge_and_records_the_run() {
         "no batch baseline ⇒ the content-stable sentinel: {symbol}"
     );
     assert_eq!(live_run_count(&h.conn), 1, "one backing run row for the writing pass");
+}
+
+#[test]
+fn live_pass_defers_the_whole_worklist_while_the_server_is_warming() {
+    let h = Harness::new();
+    let (_src, _target, _edge) = seed_corpus(&h);
+    let uri = root_uri(&h);
+    let requested_methods = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requested_methods);
+    let client = client_with_server(move |msg: &Value| {
+        let id = msg.get("id").cloned();
+        if let Some(method) = msg.get("method").and_then(Value::as_str) {
+            captured.lock().unwrap().push(method.to_string());
+        }
+        match msg.get("method").and_then(Value::as_str) {
+            Some("initialize") => Some(vec![
+                json!({
+                    "jsonrpc": "2.0", "method": "experimental/serverStatus",
+                    "params": {"health": "ok", "quiescent": false}
+                }),
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"capabilities": {"positionEncoding": "utf-16"}}
+                }),
+            ]),
+            _ if id.is_none() => Some(vec![]),
+            _ => Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": null})]),
+        }
+    });
+    let mut session = LiveOracleSession::from_warming_client(client, LIVE_VERSION, &uri);
+    let worklist = vec!["src.rs".to_string()];
+
+    let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+    assert_eq!(report.status, "Warming");
+    assert_eq!(report.requests_used, 0);
+    assert_eq!(report.rows_written, 0);
+    assert_eq!(report.unfinished_paths, worklist);
+    assert_eq!(live_run_count(&h.conn), 0);
+    assert!(
+        !requested_methods.lock().unwrap().iter().any(|method| method == "textDocument/definition"),
+        "warm-up must not turn temporary null definitions into completed work"
+    );
 }
 
 #[test]

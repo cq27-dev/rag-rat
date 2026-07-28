@@ -1,6 +1,6 @@
-//! The live oracle pass (#74 slice 2 / #534): wire the resident LSP client (slice 1's `lsp`
-//! substrate) to the watcher's maintenance pass and WRITE its per-callee verdicts into the
-//! `edge_oracle` seam, under the distinct [`OracleTool::RaLsp`] tool id.
+//! The live oracle pass: wire the resident LSP client to the watcher's maintenance pass and WRITE
+//! its per-callee verdicts into the `edge_oracle` seam under the distinct
+//! [`OracleTool::RaLsp`] tool id.
 //!
 //! Invariants this module upholds (settled on #74):
 //!
@@ -34,9 +34,9 @@
 //!   — the live analog of the batch join's index-vs-disk content gate. Anything else is skipped,
 //!   never mis-joined.
 //!
-//! Out of scope (later slices): crash/version/warm-up hardening and server→client request
-//! handlers (#535), non-Rust backends (#536), `resolved-external` verdicts (a live def outside
-//! the checkout has no batch-interchangeable SCIP symbol string, so it is skipped, not written).
+//! Out of scope: watcher-level respawn backoff and independent idle scheduling (#535), non-Rust
+//! backends (#536), and `resolved-external` verdicts (a live definition outside the checkout has
+//! no batch-interchangeable SCIP symbol string, so it is skipped, not written).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -86,6 +86,22 @@ impl LiveOracleSession {
     #[cfg(test)]
     pub(crate) fn from_client(mut client: LspClient, tool_version: &str, root_uri: &str) -> Self {
         client.initialize(root_uri).expect("test server completes the handshake");
+        client.assume_ready();
+        Self::from_initialized_client(client, tool_version, root_uri)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_warming_client(
+        mut client: LspClient,
+        tool_version: &str,
+        root_uri: &str,
+    ) -> Self {
+        client.initialize(root_uri).expect("test server completes the handshake");
+        Self::from_initialized_client(client, tool_version, root_uri)
+    }
+
+    #[cfg(test)]
+    fn from_initialized_client(client: LspClient, tool_version: &str, root_uri: &str) -> Self {
         Self {
             client,
             tool_version: tool_version.to_string(),
@@ -117,6 +133,10 @@ impl LiveOracleSession {
 
     fn touch(&mut self, now_ms: i64) {
         self.last_used_ms = now_ms;
+    }
+
+    fn is_ready(&mut self) -> std::io::Result<bool> {
+        self.client.is_server_ready()
     }
 }
 
@@ -190,6 +210,21 @@ pub fn live_oracle_pass(
     input: &LivePassInput<'_>,
 ) -> anyhow::Result<LivePassReport> {
     let mut report = LivePassReport::default();
+    match session.is_ready() {
+        Ok(true) => {},
+        Ok(false) => {
+            report.unfinished_paths = input.worklist.to_vec();
+            report.status = "Warming".to_string();
+            session.touch(rag_rat_base::time::now_ms());
+            return Ok(report);
+        },
+        Err(err) => {
+            report.unfinished_paths = input.worklist.to_vec();
+            report.status = format!("Aborted: {err}");
+            session.touch(rag_rat_base::time::now_ms());
+            return Ok(report);
+        },
+    }
     let tool = OracleTool::RaLsp;
     // The batch tool whose monikers live copies (rust-analyzer for ra-lsp) — always `Some` for a
     // live tool; the join is vacuous without it.

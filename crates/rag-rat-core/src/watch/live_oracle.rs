@@ -8,10 +8,10 @@
 //! (a heal/bootstrap leaves `clone_delta_hint = None`) contributes no paths: live's scope is
 //! exactly "files the pass reindexed", and a whole-checkout sweep is the BATCH pass's job.
 //!
-//! Everything here is best-effort: a missing `rust-analyzer`, a failed spawn, or a dead server
-//! mid-pass never fails the maintenance pass — the worklist rides to the next pass via the
-//! backlog, and the session is dropped so a later pass respawns (crash tolerance/warm-up
-//! hardening is slice 3, #535).
+//! Everything here is best-effort: a missing `rust-analyzer`, a failed spawn, a warming server,
+//! or a dead server mid-pass never fails the maintenance pass — the worklist rides to the next
+//! pass via the backlog, and an aborted session is dropped so a later pass respawns. Bounded
+//! respawn backoff and idle scheduling independent of maintenance passes remain in #535.
 
 use std::collections::{BTreeSet, HashSet};
 

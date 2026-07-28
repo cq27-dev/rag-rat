@@ -1,9 +1,9 @@
 //! The resident LSP client: process lifecycle (spawn, `initialize` handshake with position-encoding
 //! negotiation, graceful `shutdown`, kill-on-drop) and synchronous JSON-RPC request/response over
-//! the [`super::protocol`] framing. Single-flight by design — slice 1 issues one request at a time
-//! from the maintenance-pass worker thread — so `request` reads until it sees the response for the
-//! id it just sent, skipping interleaved notifications and replying `MethodNotFound` to any
-//! server→client request so a server awaiting that reply can't deadlock the loop.
+//! the [`super::protocol`] framing. A reader-pump thread feeds a bounded-wait channel so a wedged
+//! server cannot hold the repository write lock forever. Requests remain single-flight: the client
+//! reads until it sees the response for the id it just sent, tracking status notifications and
+//! replying to server→client requests so a server awaiting that reply cannot deadlock the loop.
 //!
 //! The transport is injectable (`Box<dyn Write/BufRead>`): [`LspClient::spawn`] wires a child
 //! process, while tests wire an in-process fake server over `std::io::pipe`. That is what makes the
@@ -12,6 +12,9 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -22,6 +25,12 @@ use super::protocol;
 /// optional request like `textDocument/moniker`), and the code we reply with to a server→client
 /// request we don't handle.
 const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Definition requests run while the maintenance pass owns the repository write lock. Bound every
+/// request so a live but non-responsive language server cannot block all writers indefinitely.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+type IncomingMessage = io::Result<Option<Value>>;
 
 /// A JSON-RPC error object from a response (`code` + `message`), so callers can distinguish a
 /// `MethodNotFound` (optional-capability) from a real failure.
@@ -34,9 +43,11 @@ struct LspRpcError {
 /// which it kills on drop so a crashed or abandoned pass never leaks a resident `rust-analyzer`.
 pub(crate) struct LspClient {
     writer: Box<dyn Write + Send>,
-    reader: Box<dyn BufRead + Send>,
+    incoming: Receiver<IncomingMessage>,
     next_id: i64,
     encoding: LspEncoding,
+    request_timeout: Duration,
+    server_ready: bool,
     /// The child process for a spawned server; `None` for an injected (test) transport. Present so
     /// [`Drop`] can hard-kill it.
     child: Option<Child>,
@@ -61,22 +72,62 @@ impl LspClient {
             child.stdout.take().ok_or_else(|| io::Error::other("child stdout unavailable"))?;
         Ok(Self {
             writer: Box::new(stdin),
-            reader: Box::new(BufReader::new(stdout)),
+            incoming: spawn_reader_pump(Box::new(BufReader::new(stdout))),
             next_id: 1,
             encoding: LspEncoding::Utf16,
+            request_timeout: REQUEST_TIMEOUT,
+            server_ready: false,
             child: Some(child),
         })
     }
 
     /// Build a client over an injected transport (no child process). The fake-server test seam.
     fn from_transport(reader: Box<dyn BufRead + Send>, writer: Box<dyn Write + Send>) -> Self {
-        Self { writer, reader, next_id: 1, encoding: LspEncoding::Utf16, child: None }
+        Self::from_transport_with_timeout(reader, writer, REQUEST_TIMEOUT)
+    }
+
+    fn from_transport_with_timeout(
+        reader: Box<dyn BufRead + Send>,
+        writer: Box<dyn Write + Send>,
+        request_timeout: Duration,
+    ) -> Self {
+        Self {
+            writer,
+            incoming: spawn_reader_pump(reader),
+            next_id: 1,
+            encoding: LspEncoding::Utf16,
+            request_timeout,
+            server_ready: false,
+            child: None,
+        }
     }
 
     /// The position encoding negotiated during [`initialize`](Self::initialize) (UTF-16 until
     /// then).
     pub(crate) fn encoding(&self) -> LspEncoding {
         self.encoding
+    }
+
+    /// Drain status notifications already emitted by the server. `true` means rust-analyzer has
+    /// completed background loading (`quiescent`) and is not in an error state. Unknown status is
+    /// deliberately not ready: sending definitions before the first status can turn warm-up
+    /// `null`s into permanently missing evidence.
+    pub(crate) fn is_server_ready(&mut self) -> io::Result<bool> {
+        loop {
+            match self.incoming.try_recv() {
+                Ok(message) => {
+                    let message = message?.ok_or_else(server_closed_error)?;
+                    self.handle_server_message(&message)?;
+                },
+                Err(TryRecvError::Empty) => return Ok(self.server_ready),
+                Err(TryRecvError::Disconnected) => return Err(server_closed_error()),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_ready(&mut self) {
+        self.server_ready = true;
     }
 
     /// Send a request and return its `result`, mapping a JSON-RPC `error` response to an `Err`.
@@ -105,10 +156,9 @@ impl LspClient {
 
     /// Send a request and block until its response arrives, returning the `result` (`Ok(Ok)`) or
     /// the JSON-RPC error object (`Ok(Err)`); the outer `io::Result` is the transport. While
-    /// waiting it skips notifications AND — crucially — REPLIES to any server→client request
-    /// with a `MethodNotFound` error, because a server that awaits that reply before answering
-    /// us would otherwise deadlock this single-flight loop (slice 3 can add real handlers for
-    /// `workspace/configuration` etc.).
+    /// waiting it tracks notifications and replies to server→client requests. The whole operation
+    /// shares one deadline, including any interleaved messages, so notification traffic cannot
+    /// postpone timeout indefinitely.
     fn request_raw(
         &mut self,
         method: &str,
@@ -118,21 +168,23 @@ impl LspClient {
         self.next_id += 1;
         let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         protocol::write_message(&mut self.writer, &request)?;
+        let deadline = Instant::now() + self.request_timeout;
         loop {
-            let msg = protocol::read_message(&mut self.reader)?.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "server closed before responding")
-            })?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(request_timeout_error(method, self.request_timeout));
+            }
+            let msg = match self.incoming.recv_timeout(remaining) {
+                Ok(message) => message?.ok_or_else(server_closed_error)?,
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(request_timeout_error(method, self.request_timeout));
+                },
+                Err(RecvTimeoutError::Disconnected) => return Err(server_closed_error()),
+            };
             // A `method`-bearing message is server→client: a notification (no id) is ignored; a
             // request (id present) MUST be answered so the server doesn't block waiting on us.
             if msg.get("method").is_some() {
-                if let Some(peer_id) = msg.get("id") {
-                    let reply = json!({
-                        "jsonrpc": "2.0", "id": peer_id.clone(),
-                        "error": {"code": METHOD_NOT_FOUND,
-                                  "message": "not handled by the rag-rat live oracle"}
-                    });
-                    protocol::write_message(&mut self.writer, &reply)?;
-                }
+                self.handle_server_message(&msg)?;
                 continue;
             }
             // A response with no `method`: ours iff the id matches (single-flight; a stray id is
@@ -178,6 +230,7 @@ impl LspClient {
                 "textDocument": {
                     "definition": { "dynamicRegistration": false, "linkSupport": true },
                 },
+                "experimental": { "serverStatusNotification": true },
             },
         });
         let result = self.request("initialize", params)?;
@@ -198,6 +251,59 @@ impl LspClient {
         self.request("shutdown", Value::Null)?;
         self.notify("exit", Value::Null)
     }
+
+    fn handle_server_message(&mut self, message: &Value) -> io::Result<()> {
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if method == "experimental/serverStatus" {
+            let params = &message["params"];
+            self.server_ready = params.get("quiescent").and_then(Value::as_bool) == Some(true)
+                && params.get("health").and_then(Value::as_str) != Some("error");
+        }
+        let Some(peer_id) = message.get("id") else {
+            return Ok(());
+        };
+        let reply = match method {
+            "workspace/configuration" => {
+                json!({"jsonrpc": "2.0", "id": peer_id.clone(), "result": []})
+            },
+            "client/registerCapability" | "window/workDoneProgress/create" => {
+                json!({"jsonrpc": "2.0", "id": peer_id.clone(), "result": null})
+            },
+            _ => json!({
+                "jsonrpc": "2.0", "id": peer_id.clone(),
+                "error": {"code": METHOD_NOT_FOUND,
+                          "message": "not handled by the rag-rat live oracle"}
+            }),
+        };
+        protocol::write_message(&mut self.writer, &reply)
+    }
+}
+
+fn spawn_reader_pump(mut reader: Box<dyn BufRead + Send>) -> Receiver<IncomingMessage> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            let message = protocol::read_message(&mut reader);
+            let terminal = !matches!(&message, Ok(Some(_)));
+            if sender.send(message).is_err() || terminal {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+fn server_closed_error() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "server closed before responding")
+}
+
+fn request_timeout_error(method: &str, timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("LSP request {method} timed out after {}s", timeout.as_secs_f64()),
+    )
 }
 
 impl Drop for LspClient {
@@ -216,6 +322,7 @@ impl Drop for LspClient {
 pub(crate) mod test_support {
     use std::io::BufReader;
     use std::thread;
+    use std::time::Duration;
 
     use serde_json::Value;
 
@@ -228,6 +335,13 @@ pub(crate) mod test_support {
     /// real EOF rather than blocking. The server thread also exits when the client drops (its
     /// write end closes → the server reads EOF).
     pub(crate) fn client_with_server<H>(handler: H) -> LspClient
+    where
+        H: FnMut(&Value) -> Option<Vec<Value>> + Send + 'static,
+    {
+        client_with_server_timeout(handler, super::REQUEST_TIMEOUT)
+    }
+
+    pub(crate) fn client_with_server_timeout<H>(handler: H, timeout: Duration) -> LspClient
     where
         H: FnMut(&Value) -> Option<Vec<Value>> + Send + 'static,
     {
@@ -248,9 +362,10 @@ pub(crate) mod test_support {
                 }
             }
         });
-        LspClient::from_transport(
+        LspClient::from_transport_with_timeout(
             Box::new(BufReader::new(from_server_read)),
             Box::new(to_server_write),
+            timeout,
         )
     }
 }
@@ -284,6 +399,10 @@ mod tests {
             .expect("an initialize request was sent");
         assert_eq!(
             init["params"]["capabilities"]["textDocument"]["definition"]["linkSupport"].as_bool(),
+            Some(true),
+        );
+        assert_eq!(
+            init["params"]["capabilities"]["experimental"]["serverStatusNotification"].as_bool(),
             Some(true),
         );
     }
@@ -355,6 +474,8 @@ mod tests {
         // dropped the server request, the server would block forever (the run's terminate-after
         // would kill it). A returned result proves the client replied.
         let mut pending_id: Option<Value> = None;
+        let server_reply = Arc::new(Mutex::new(None));
+        let captured_reply = Arc::clone(&server_reply);
         let mut client = client_with_server(move |msg: &Value| {
             match msg.get("method").and_then(Value::as_str) {
                 Some("custom/thing") => {
@@ -365,14 +486,49 @@ mod tests {
                     })])
                 },
                 // Our reply to the server's request (id 4242, no method) → now answer the original.
-                None if msg.get("id") == Some(&json!(4242)) => Some(vec![
-                    json!({"jsonrpc": "2.0", "id": pending_id.take(), "result": {"ok": true}}),
-                ]),
+                None if msg.get("id") == Some(&json!(4242)) => {
+                    *captured_reply.lock().unwrap() = Some(msg.clone());
+                    Some(vec![
+                        json!({"jsonrpc": "2.0", "id": pending_id.take(), "result": {"ok": true}}),
+                    ])
+                },
                 _ => Some(vec![]),
             }
         });
         let result = client.request("custom/thing", json!({})).unwrap();
         assert_eq!(result, json!({"ok": true}), "the original request completed after we replied");
+        assert_eq!(server_reply.lock().unwrap().as_ref().unwrap()["result"], json!([]));
+    }
+
+    #[test]
+    fn server_status_tracks_quiescent_non_error_readiness() {
+        let mut client = client_with_server(|msg: &Value| {
+            let id = msg.get("id").cloned();
+            match msg.get("method").and_then(Value::as_str) {
+                Some("initialize") => Some(vec![
+                    json!({
+                        "jsonrpc": "2.0", "method": "experimental/serverStatus",
+                        "params": {"health": "ok", "quiescent": true}
+                    }),
+                    json!({"jsonrpc": "2.0", "id": id, "result": {"capabilities": {}}}),
+                ]),
+                _ if id.is_none() => Some(vec![]),
+                _ => Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": null})]),
+            }
+        });
+        client.initialize("file:///repo").unwrap();
+        assert!(client.is_server_ready().unwrap());
+    }
+
+    #[test]
+    fn request_times_out_when_the_server_stays_open_without_replying() {
+        let mut client = test_support::client_with_server_timeout(
+            |_msg| Some(vec![]),
+            Duration::from_millis(20),
+        );
+        let err = client.request("custom/thing", json!({})).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("custom/thing"));
     }
 
     #[test]
