@@ -89,7 +89,13 @@ if (process.env.RAG_RAT_BIN) {
 
 // ---- version = the plugin's declared version (single source of truth) -----------------------------
 function readVersion() {
-  for (const c of [path.join(pluginRoot, ".claude-plugin", "plugin.json"), path.join(pluginRoot, "plugin.json")]) {
+  for (const c of [
+    path.join(pluginRoot, ".claude-plugin", "plugin.json"),
+    path.join(pluginRoot, ".cursor-plugin", "plugin.json"),
+    path.join(pluginRoot, ".plugin", "plugin.json"),
+    path.join(pluginRoot, ".codex-plugin", "plugin.json"),
+    path.join(pluginRoot, "plugin.json"),
+  ]) {
     if (fs.existsSync(c)) {
       try {
         const v = JSON.parse(fs.readFileSync(c, "utf8")).version;

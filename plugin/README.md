@@ -1,31 +1,36 @@
 # rag-rat plugin (prototype)
 
-A coding-agent plugin — for **Claude Code, Codex, and opencode** (and any other harness with the
-same plugin shape) — that bundles rag-rat's MCP server, skills, and hooks, and **installs a
+A coding-agent plugin for **Claude Code, Codex, Cursor, VS Code, and opencode** that bundles
+rag-rat's MCP server, skills, and hooks, and **installs a
 version-matched rag-rat binary on first run**. Installing the plugin is one step: the user does
 not need to `cargo install` / `brew install` / put `rag-rat` on `PATH` first.
 
 ## Layout (single source, shared across harnesses)
 
 ```
-plugin/                          plugin root (CLAUDE_PLUGIN_ROOT / CODEX_PLUGIN_ROOT)
+.claude-plugin/marketplace.json  Claude marketplace → plugin/
+.cursor-plugin/marketplace.json  Cursor marketplace → plugin/
+plugin/                          plugin root (harness root token or plugin working directory)
   scripts/launch.js                the all-OS hook launcher (resolves the binary; never installs)
   skills/                          curated public skills (four rag-rat workflows)
   hooks/hooks.json                 Claude hooks (auto-discovered)
+  .cursor-plugin/plugin.json       Cursor plugin manifest
+  hooks.cursor.json                Cursor-native hooks
+  .plugin/plugin.json              VS Code/OpenPlugin manifest
+  hooks.vscode.json                VS Code hooks (one dispatcher per lifecycle event)
   .mcp.json                        Codex MCP config (root) → npx @rag-rat/bin mcp
   .claude-plugin/plugin.json       Claude: mcpServers → npx @rag-rat/bin mcp
-  .claude-plugin/marketplace.json
   .codex-plugin/plugin.json        Codex manifest: mcpServers → ./.mcp.json, skills → ./skills/
   .codex-plugin/hooks/hooks.json   Codex hooks
   opencode/rag-rat.ts              opencode plugin (TS module; MCP self-registration + hooks)
 ```
 
-Both harnesses treat `plugin/` as the plugin root, so `scripts/`, `skills/`, and the launcher are
-shared — no per-harness duplication.
+The harness manifests treat `plugin/` as the plugin root, so `scripts/`, `skills/`, and the launcher
+are shared without per-harness runtime duplication.
 
 ## MCP server & hook launcher
 
-**MCP server** — both manifests launch it as `npx -y @rag-rat/bin@latest mcp`. npx runs in the
+**MCP server** — the manifests launch it through the pinned `@rag-rat/bin` package. npx runs in the
 agent's project working directory (so the server resolves that repo's `rag-rat.toml`) and installs the
 version-matched binary from the `@rag-rat/bin` npm package on first use — no `cargo install` / `brew`
 / `PATH` setup first.
@@ -58,22 +63,64 @@ all of `.agents/skills`: contributor-only guidance such as `rust-modern-style` s
 
 ## Hooks
 
-The hook command routes through the launcher: `node <launcher> --no-install agent-hook`, so it
-resolves the same version-matched binary and never blocks on install. The handler
-(`rag-rat agent-hook`) is harness-neutral: Claude Code, Codex, and Cursor share the same
-`hook_event_name` / `tool_name` / `tool_input` input and the same `hookSpecificOutput.additionalContext`
-output.
+Hook commands route through the launcher in resolve-only mode, so they never install or access the
+network during a tool call. The stable adapter entrypoints are `rag-rat agent-hook cursor` and
+`rag-rat agent-hook vscode`; no argument (or `auto`) preserves Claude/Codex behavior and recognizes
+Cursor's lower-camel lifecycle names when Claude settings are explicitly imported into Cursor.
+
+The adapters consume the complete stdin event locally but never echo it. Only a bounded orientation
+digest, grep/read augmentation, or clone warning can enter model context. Commands, file contents,
+transcripts, tool output, and raw payloads are never copied into hook output. Reindex events emit no
+model context. Every adapter exits successfully and silently when input is malformed or rag-rat is
+unconfigured, unindexed, unavailable, or not yet present in the launcher's cache.
 
 **Claude** (`hooks/hooks.json`, auto-discovered):
 - `SessionStart` (`startup|clear|compact`, 5s) → repo orientation digest.
 - `PreToolUse` on `Grep`/`Bash` (10s) → grep-augmentation.
 - `PreToolUse` on `Write`/`Edit`/`MultiEdit` (10s) → write-time clone check.
+- `PostToolUse` on successful edits → detached, watcher-aware scoped reindex.
+- The manifest has one dispatcher per lifecycle event. Irrelevant tools are filtered inside the
+  adapter rather than by matcher-only registration.
 
 **Codex** (`.codex-plugin/hooks/hooks.json`, `{"hooks":{…}}` wrapper):
 - `SessionStart` → repo orientation digest.
 - `PreToolUse` on `^Bash$` → grep-augmentation.
 - `PreToolUse` on `^apply_patch$` → write-time clone check. The handler parses the V4A diff in
-  `tool_input.command` for added lines (Codex/Cursor edit via `apply_patch`, not `Write`/`Edit`).
+  `tool_input.command` for added lines.
+
+**Cursor** (`.cursor-plugin/plugin.json` → `hooks.cursor.json`):
+- Cursor lifecycle names, workspace roots, tool names, and flat output fields are normalized by the
+  Cursor adapter; Cursor does not share Claude's payload contract.
+- `sessionStart` → bounded orientation through Cursor's `additional_context` field.
+- `beforeShellExecution` → grep augmentation through Cursor's `agent_message` field, only for
+  supported `grep`/`rg`/`ag` commands.
+- File-read augmentation uses generic successful `postToolUse`, whose documented
+  `additional_context` field can safely inject context. `beforeReadFile` is deliberately not used
+  for augmentation because it has no documented model-context output field.
+- `afterFileEdit` triggers watcher-aware scoped reindexing and emits no context.
+- Clone checking runs only when generic write-tool input contains verified `content`, `new_string`,
+  or `edits[].new_string` data. Although native `afterFileEdit` includes old/new edit strings, that
+  event has no documented context output, so rag-rat does not emit a clone warning from it.
+- `beforeMCPExecution` and `afterMCPExecution` are ignored.
+
+Cursor discovers the bundled native manifest and hooks when the plugin is installed from its
+marketplace. For a project-native `.cursor/hooks.json`, invoke a locally installed binary as
+`rag-rat agent-hook cursor`; project hooks run from the project root. Cursor hook failures are
+fail-open by default, and rag-rat does not set `failClosed`.
+
+**VS Code Preview** (`.plugin/plugin.json` → `hooks.vscode.json`):
+- Exactly one matcher-free dispatcher is registered for each of `SessionStart`, `PreToolUse`, and
+  `PostToolUse`. This is required because VS Code currently parses Claude matcher syntax but ignores
+  matcher values.
+- The adapter recognizes VS Code terminal/read/edit names including `run_in_terminal`, `read_file`,
+  `create_file`, and `replace_string_in_file`, and normalizes camelCase fields such as `filePath`,
+  `newString`, and `commandLine`.
+- Session, grep/read, and clone context uses the documented
+  `hookSpecificOutput.additionalContext` channel. Successful edits trigger a silent detached scoped
+  reindex.
+- The OpenPlugin manifest is detected before the bundled Claude manifest, preventing duplicate
+  matcher-induced registrations. Workspace-only setups can place the same three dispatcher entries
+  under `.github/hooks/*.json` and invoke `rag-rat agent-hook vscode`.
 
 **opencode** (`opencode/rag-rat.ts`, a TS plugin module — no hooks manifest exists there):
 - `config` hook → self-registers the `rag-rat` MCP server (`npx -y @rag-rat/bin@<version> mcp`)
@@ -119,15 +166,16 @@ Three options:
 The Codex wiring is built from OpenAI's published hook docs (input field names, PreToolUse tool-name
 regex matching, `hookSpecificOutput.additionalContext` output) but hasn't been exercised against a
 live Codex. Confirm: the plugin `hooks.json` path/schema is read as expected, `^Bash$`/`^apply_patch$`
-matchers actually fire, and the digest/clone-check output is injected. Cursor mirrors the same shape.
+matchers actually fire, and the digest/clone-check output is injected. Cursor and VS Code use their
+dedicated adapters and do not rely on Codex/Claude payload equivalence.
 
 ## Installation for non-Claude agents
 
 Two layers:
 - **Universal (any MCP agent):** register `node <launcher> mcp` in the agent's MCP config — the
   launcher is harness-agnostic and self-installs the binary. This covers every MCP-capable agent.
-- **Native plugin UX:** Claude + Codex manifests are bundled here. Cursor / Windsurf / others follow
-  the same two files (a `plugin.json` + a `hooks.json`) pointed at the shared launcher.
+- **Native plugin UX:** Claude, Codex, Cursor, VS Code OpenPlugin, and opencode manifests are bundled
+  here.
 
 ## Testing
 
@@ -141,7 +189,15 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 
 # SessionStart hook through the launcher:
 printf '%s\n' '{"hook_event_name":"SessionStart","source":"startup"}' \
-  | RAG_RAT_BIN="$(command -v rag-rat)" node scripts/launch.js --no-install agent-hook
+  | RAG_RAT_BIN="$(command -v rag-rat)" node scripts/launch.js --no-install agent-hook auto
+
+# Cursor native event:
+printf '%s\n' '{"hook_event_name":"sessionStart","workspace_roots":["."]}' \
+  | RAG_RAT_BIN="$(command -v rag-rat)" node scripts/launch.js --no-install agent-hook cursor
+
+# VS Code Preview event:
+printf '%s\n' '{"hook_event_name":"SessionStart","source":"new","cwd":"."}' \
+  | RAG_RAT_BIN="$(command -v rag-rat)" node scripts/launch.js --no-install agent-hook vscode
 ```
 
 Verified: launcher syntax; `$RAG_RAT_BIN` override; `PATH` version-match; `--no-install` cold-cache
@@ -167,7 +223,7 @@ Remaining:
 - **Plugin version tracks the release (automated).** The launcher fetches
   `releases/download/v<plugin-version>`, so the manifests' `version` must match the released crate
   version. `.github/workflows/release-plz.yml` runs `tools/sync-plugin-version.mjs` on the Release PR
-  to bump all three manifests in lockstep with `Cargo.toml` — no manual step (proves out on the next
+  to bump every manifest in lockstep with `Cargo.toml` — no manual step (proves out on the next
   release). Aside: a release binary that carries a `+g<hash>` version suffix won't satisfy the strict
   PATH `--version` match, so the launcher downloads rather than reusing an on-PATH release build
   (correct, just not optimal).

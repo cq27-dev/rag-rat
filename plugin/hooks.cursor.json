@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node \"./scripts/launch.js\" --no-install agent-hook cursor",
+        "timeout": 5
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "node \"./scripts/launch.js\" --no-install agent-hook cursor",
+        "timeout": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "node \"./scripts/launch.js\" --no-install agent-hook cursor",
+        "matcher": "Read|Write",
+        "timeout": 10
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "node \"./scripts/launch.js\" --no-install agent-hook cursor",
+        "timeout": 5
+      }
+    ]
+  }
+}

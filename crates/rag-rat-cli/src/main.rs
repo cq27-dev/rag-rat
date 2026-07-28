@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
     // there isn't one.
     match &cli.command {
         Cmd::Init(args) => return init::run(args, cli.config.as_deref().unwrap_or("rag-rat.toml")),
-        Cmd::AgentHook => return agent_hook::run(),
+        Cmd::AgentHook(args) => return agent_hook::run(args.harness),
         // The detached edit-reindex runner discovers its own config from the hook's cwd (a
         // not-a-rag-rat-repo cwd is a silent no-op), so it tolerates config absence like
         // agent-hook.
@@ -118,7 +118,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Cmd::Init(_)
-        | Cmd::AgentHook
+        | Cmd::AgentHook(_)
         | Cmd::EditReindex(_)
         | Cmd::Mcp
         | Cmd::Doctor(_)

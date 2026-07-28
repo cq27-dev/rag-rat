@@ -1,18 +1,13 @@
-//! `rag-rat agent-hook`: the coding-agent hook client (PreToolUse + PostToolUse + SessionStart).
-//! Harness-neutral — Claude Code, Codex, and Cursor all use the same `hook_event_name` /
-//! `tool_name` / `tool_input` input and the same `hookSpecificOutput.additionalContext` output, so
-//! one entrypoint serves all.
+//! `rag-rat agent-hook`: coding-agent hook adapters for Claude/Codex, Cursor, and VS Code.
 //!
 //! Reads the hook JSON from stdin and branches on `hook_event_name`:
 //! - `"SessionStart"`: injects a read-only repo orientation digest into the model context.
-//! - `"PostToolUse"`: after an edit tool completes, triggers a scoped reindex of the edited path(s)
-//!   in a DETACHED child (`edit_reindex`), watcher-aware — see [`posttooluse`]. Scoped to Claude
-//!   Code, whose PostToolUse carries the edited `file_path` (Codex's `apply_patch` PostToolUse
-//!   fires before the write lands, and Cursor's payload is unpinned, so neither is wired — #661).
-//! - PreToolUse (anything else, or absent): grep-augmentation on `Grep`/`Bash` (asks the elected
-//!   listener or falls back to a direct read-only query), and the write-time clone check on the
-//!   edit tools — `Write`/`Edit`/`MultiEdit` (Claude) and `apply_patch` (Codex/Cursor, whose V4A
-//!   diff is parsed for added lines). Prints `additionalContext` JSON.
+//! - successful edit events trigger a scoped reindex in a DETACHED child (`edit_reindex`),
+//!   watcher-aware — see [`posttooluse`].
+//! - tool events run grep/read augmentation or a write-time clone check after harness-specific tool
+//!   names and camel/snake-case fields have been normalized.
+//! - context is serialized only through the selected harness's documented output field; raw stdin
+//!   is never copied into output.
 //!
 //! Exit 0 on every path — the hook must never block a tool call or session start.
 
@@ -30,6 +25,8 @@ use rag_rat_core::query::orientation::Orientation;
 use rag_rat_core::query::{grep_augment, read_augment};
 use rag_rat_db::storage::IndexConnection;
 use serde::Deserialize;
+
+use crate::cli::AgentHookHarnessArg;
 
 pub(crate) mod edit_reindex;
 
@@ -72,6 +69,308 @@ pub struct HookInput {
     /// Present on PreToolUse only.
     #[serde(default)]
     pub tool_input: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Harness {
+    Native,
+    Cursor,
+    Vscode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dispatch {
+    SessionStart,
+    PreToolUse,
+    PostToolUse,
+    CursorPostToolUse,
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputEvent {
+    SessionStart,
+    PreToolUse,
+    CursorBeforeShell,
+    CursorPostToolUse,
+    None,
+}
+
+struct NormalizedHook {
+    harness: Harness,
+    input: HookInput,
+    dispatch: Dispatch,
+    output_event: OutputEvent,
+}
+
+fn normalize_hook(raw: &str, requested: AgentHookHarnessArg) -> Option<NormalizedHook> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let harness = match requested {
+        AgentHookHarnessArg::Cursor => Harness::Cursor,
+        AgentHookHarnessArg::Vscode => Harness::Vscode,
+        AgentHookHarnessArg::Auto => detect_harness(&value),
+    };
+    match harness {
+        Harness::Native => normalize_native(value),
+        Harness::Cursor => normalize_cursor(&value),
+        Harness::Vscode => normalize_vscode(&value),
+    }
+}
+
+fn detect_harness(value: &serde_json::Value) -> Harness {
+    let event = value.get("hook_event_name").and_then(|field| field.as_str()).unwrap_or_default();
+    if value.get("cursor_version").is_some() || event.chars().next().is_some_and(char::is_lowercase)
+    {
+        return Harness::Cursor;
+    }
+    let tool = value.get("tool_name").and_then(|field| field.as_str()).unwrap_or_default();
+    if value.get("source").and_then(|field| field.as_str()) == Some("new") || is_vscode_tool(tool) {
+        return Harness::Vscode;
+    }
+    Harness::Native
+}
+
+fn normalize_native(value: serde_json::Value) -> Option<NormalizedHook> {
+    let input: HookInput = serde_json::from_value(value).ok()?;
+    let (dispatch, output_event) = match input.hook_event_name.as_deref() {
+        Some("SessionStart") => (Dispatch::SessionStart, OutputEvent::SessionStart),
+        Some("PostToolUse") => (Dispatch::PostToolUse, OutputEvent::None),
+        Some("PreToolUse") | None => (Dispatch::PreToolUse, OutputEvent::PreToolUse),
+        _ => (Dispatch::Ignore, OutputEvent::None),
+    };
+    Some(NormalizedHook { harness: Harness::Native, input, dispatch, output_event })
+}
+
+fn normalize_cursor(value: &serde_json::Value) -> Option<NormalizedHook> {
+    let event = value.get("hook_event_name").and_then(|field| field.as_str())?;
+    let cwd = cursor_hook_cwd(value);
+    let session_id = value
+        .get("session_id")
+        .or_else(|| value.get("conversation_id"))
+        .and_then(|field| field.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut input = HookInput { session_id, cwd, ..Default::default() };
+    let (dispatch, output_event) = match event {
+        "sessionStart" => {
+            input.hook_event_name = Some("SessionStart".to_string());
+            input.source = Some("startup".to_string());
+            (Dispatch::SessionStart, OutputEvent::SessionStart)
+        },
+        "beforeShellExecution" => {
+            input.hook_event_name = Some("PreToolUse".to_string());
+            input.tool_name = "Bash".to_string();
+            input.tool_input = normalize_tool_input("Bash", value);
+            (Dispatch::PreToolUse, OutputEvent::CursorBeforeShell)
+        },
+        "beforeReadFile" => {
+            input.hook_event_name = Some("PreToolUse".to_string());
+            input.tool_name = "Read".to_string();
+            input.tool_input = normalize_tool_input("Read", value);
+            // Cursor documents no model-context field for beforeReadFile. The native manifest uses
+            // postToolUse for read augmentation; an explicitly invoked beforeReadFile stays quiet.
+            (Dispatch::PreToolUse, OutputEvent::None)
+        },
+        "afterFileEdit" => {
+            input.hook_event_name = Some("PostToolUse".to_string());
+            input.tool_name = "Edit".to_string();
+            input.tool_input = normalize_tool_input("Edit", value);
+            (Dispatch::PostToolUse, OutputEvent::None)
+        },
+        "postToolUse" => {
+            let raw_tool =
+                value.get("tool_name").and_then(|field| field.as_str()).unwrap_or_default();
+            let tool_input = value.get("tool_input").unwrap_or(&serde_json::Value::Null);
+            let Some(tool_name) = normalize_tool_name(raw_tool, tool_input) else {
+                return Some(NormalizedHook {
+                    harness: Harness::Cursor,
+                    input,
+                    dispatch: Dispatch::Ignore,
+                    output_event: OutputEvent::None,
+                });
+            };
+            input.hook_event_name = Some("PostToolUse".to_string());
+            input.tool_input = normalize_tool_input(&tool_name, tool_input);
+            input.tool_name = tool_name;
+            (Dispatch::CursorPostToolUse, OutputEvent::CursorPostToolUse)
+        },
+        // MCP hooks and every unsupported lifecycle event are intentionally inert.
+        _ => (Dispatch::Ignore, OutputEvent::None),
+    };
+    Some(NormalizedHook { harness: Harness::Cursor, input, dispatch, output_event })
+}
+
+fn normalize_vscode(value: &serde_json::Value) -> Option<NormalizedHook> {
+    let event = value.get("hook_event_name").and_then(|field| field.as_str())?;
+    let mut input = HookInput {
+        session_id: value
+            .get("session_id")
+            .and_then(|field| field.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        cwd: hook_cwd(value),
+        hook_event_name: Some(event.to_string()),
+        ..Default::default()
+    };
+    let (dispatch, output_event) = match event {
+        "SessionStart" => {
+            input.source = Some("startup".to_string());
+            (Dispatch::SessionStart, OutputEvent::SessionStart)
+        },
+        "PreToolUse" | "PostToolUse" => {
+            let raw_tool =
+                value.get("tool_name").and_then(|field| field.as_str()).unwrap_or_default();
+            let tool_input = value.get("tool_input").unwrap_or(&serde_json::Value::Null);
+            let Some(tool_name) = normalize_tool_name(raw_tool, tool_input) else {
+                return Some(NormalizedHook {
+                    harness: Harness::Vscode,
+                    input,
+                    dispatch: Dispatch::Ignore,
+                    output_event: OutputEvent::None,
+                });
+            };
+            input.tool_input = normalize_tool_input(&tool_name, tool_input);
+            input.tool_name = tool_name;
+            if event == "PreToolUse" {
+                (Dispatch::PreToolUse, OutputEvent::PreToolUse)
+            } else {
+                (Dispatch::PostToolUse, OutputEvent::None)
+            }
+        },
+        _ => (Dispatch::Ignore, OutputEvent::None),
+    };
+    Some(NormalizedHook { harness: Harness::Vscode, input, dispatch, output_event })
+}
+
+fn hook_cwd(value: &serde_json::Value) -> String {
+    value
+        .get("cwd")
+        .and_then(|field| field.as_str())
+        .or_else(|| {
+            value
+                .get("workspace_roots")
+                .and_then(|field| field.as_array())
+                .and_then(|roots| roots.first())
+                .and_then(|root| root.as_str())
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn cursor_hook_cwd(value: &serde_json::Value) -> String {
+    if let Some(cwd) = value.get("cwd").and_then(|field| field.as_str()) {
+        return cwd.to_string();
+    }
+    let event_path = string_field(value, &["file_path", "filePath", "path"]).or_else(|| {
+        value
+            .get("tool_input")
+            .and_then(|tool_input| string_field(tool_input, &["file_path", "filePath", "path"]))
+    });
+    let roots = value.get("workspace_roots").and_then(|field| field.as_array());
+    if let (Some(event_path), Some(roots)) = (event_path, roots) {
+        let event_path = Path::new(event_path);
+        if let Some(root) = roots
+            .iter()
+            .filter_map(|root| root.as_str())
+            .filter(|root| event_path.starts_with(root))
+            .max_by_key(|root| Path::new(root).components().count())
+        {
+            return root.to_string();
+        }
+    }
+    hook_cwd(value)
+}
+
+fn is_vscode_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "run_in_terminal"
+            | "runTerminalCommand"
+            | "read_file"
+            | "readFile"
+            | "create_file"
+            | "createFile"
+            | "replace_string_in_file"
+            | "replaceStringInFile"
+            | "multi_replace_string_in_file"
+            | "multiReplaceStringInFile"
+            | "editFiles"
+    )
+}
+
+fn normalize_tool_name(raw_tool: &str, tool_input: &serde_json::Value) -> Option<String> {
+    let normalized = match raw_tool {
+        "Shell" | "Bash" | "run_in_terminal" | "runTerminalCommand" | "run_terminal_command" =>
+            "Bash",
+        "Grep" | "grep_search" | "grepSearch" => "Grep",
+        "Read" | "read_file" | "readFile" => "Read",
+        "create_file" | "createFile" => "Write",
+        "replace_string_in_file" | "replaceStringInFile" => "Edit",
+        "multi_replace_string_in_file" | "multiReplaceStringInFile" | "editFiles" => "MultiEdit",
+        "apply_patch" => "apply_patch",
+        "Write" => {
+            if tool_input.get("edits").is_some() || tool_input.get("replacements").is_some() {
+                "MultiEdit"
+            } else if tool_input.get("new_string").is_some()
+                || tool_input.get("newString").is_some()
+            {
+                "Edit"
+            } else {
+                "Write"
+            }
+        },
+        "Edit" | "MultiEdit" => raw_tool,
+        _ => return None,
+    };
+    Some(normalized.to_string())
+}
+
+fn normalize_tool_input(tool_name: &str, value: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    if let Some(command) = string_field(value, &["command", "commandLine"]) {
+        out.insert("command".to_string(), command.into());
+    }
+    if let Some(pattern) = string_field(value, &["pattern", "query"]) {
+        out.insert("pattern".to_string(), pattern.into());
+    }
+    if let Some(path) = string_field(value, &["file_path", "filePath", "path"]) {
+        let key = if tool_name == "Grep" { "path" } else { "file_path" };
+        out.insert(key.to_string(), path.into());
+    }
+    if let Some(content) = string_field(value, &["content"]) {
+        out.insert("content".to_string(), content.into());
+    }
+    if let Some(new_string) = string_field(value, &["new_string", "newString", "replacement"]) {
+        out.insert("new_string".to_string(), new_string.into());
+    }
+    if let Some(edits) = value.get("edits").or_else(|| value.get("replacements"))
+        && let Some(edits) = edits.as_array()
+    {
+        let normalized = edits
+            .iter()
+            .filter_map(|edit| {
+                let new_string = string_field(edit, &["new_string", "newString", "replacement"])?;
+                Some(serde_json::json!({ "new_string": new_string }))
+            })
+            .collect::<Vec<_>>();
+        out.insert("edits".to_string(), normalized.into());
+    }
+    if let Some(files) = value.get("files").and_then(|field| field.as_array()) {
+        let paths = files
+            .iter()
+            .filter_map(|file| {
+                file.as_str().map(str::to_string).or_else(|| {
+                    string_field(file, &["file_path", "filePath", "path"]).map(str::to_string)
+                })
+            })
+            .collect::<Vec<_>>();
+        out.insert("files".to_string(), serde_json::json!(paths));
+    }
+    serde_json::Value::Object(out)
+}
+
+fn string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| value.get(name).and_then(|field| field.as_str()))
 }
 
 pub struct Search {
@@ -287,38 +586,44 @@ fn shell_tokens(segment: &str) -> Option<Vec<String>> {
     Some(tokens)
 }
 
-/// Entry point for `rag-rat agent-hook`. Every failure path prints nothing and returns
-/// Ok(()) — the hook must never block a grep (spec: error posture).
-pub fn run() -> anyhow::Result<()> {
-    let _ = run_inner(); // swallow: silence is the contract
+/// Entry point for `rag-rat agent-hook`. Every failure path prints nothing and returns `Ok(())`.
+pub fn run(requested: AgentHookHarnessArg) -> anyhow::Result<()> {
+    let _ = run_inner(requested); // swallow: silence is the contract
     Ok(())
 }
 
-fn run_inner() -> anyhow::Result<()> {
+fn run_inner(requested: AgentHookHarnessArg) -> anyhow::Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
-    // Tolerant parse: missing fields use Default so both PreToolUse and SessionStart succeed.
-    let input: HookInput = serde_json::from_str(&raw).unwrap_or_default();
-    match input.hook_event_name.as_deref() {
-        Some("SessionStart") => session_start(&input),
-        Some("PostToolUse") => posttooluse(&input),
-        _ => pretooluse(&input),
+    let Some(normalized) = normalize_hook(&raw, requested) else { return Ok(()) };
+    let context = match normalized.dispatch {
+        Dispatch::SessionStart => session_start(&normalized.input)?,
+        Dispatch::PreToolUse => pretooluse(&normalized.input)?,
+        Dispatch::PostToolUse => {
+            posttooluse(&normalized.input)?;
+            None
+        },
+        Dispatch::CursorPostToolUse => cursor_posttooluse(&normalized.input)?,
+        Dispatch::Ignore => None,
+    };
+    if let Some(context) = context {
+        print_context(normalized.harness, normalized.output_event, &context);
     }
+    Ok(())
 }
 
 /// SessionStart path: inject a read-only repo orientation digest as plain stdout.
 /// Every error path prints nothing and returns Ok — never block session start.
-fn session_start(input: &HookInput) -> anyhow::Result<()> {
+fn session_start(input: &HookInput) -> anyhow::Result<Option<String>> {
     // Allowlist: only fire for meaningful session triggers, not resume.
     match input.source.as_deref() {
         Some("startup") | Some("clear") | Some("compact") => {},
-        _ => return Ok(()),
+        _ => return Ok(None),
     }
-    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
-    // If the DB file does not exist, print a minimal nudge and exit — do NOT open/create it.
+    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(None) };
+    // Do not open/create an absent database. Hooks are inert until the first index exists.
     if !config.database.is_file() {
-        print!("{}", db_absent_notice());
-        return Ok(());
+        return Ok(None);
     }
     // Open read-only; compose the orientation; print the digest.
     // Any error (locked, corrupt, etc.) propagates via `?` to run_inner, which run() swallows
@@ -331,8 +636,7 @@ fn session_start(input: &HookInput) -> anyhow::Result<()> {
     // schema message already carries the remedy (and the non-Linux no-hot-upgrade caveat).
     let schema = rag_rat_db::schema::status(conn.connection())?;
     if schema.state == rag_rat_db::schema::SchemaState::Newer {
-        print!("{}", newer_schema_notice(&schema.message));
-        return Ok(());
+        return Ok(Some(newer_schema_notice(&schema.message)));
     }
     // Scope orientation to the session's worktree: `config.root` (anchored to the main worktree) is
     // the base index, `input.cwd` is where the session is — a linked worktree gets its branch
@@ -346,11 +650,11 @@ fn session_start(input: &HookInput) -> anyhow::Result<()> {
         config.repo_id_override.as_deref(),
     )?;
     let (live, enabled) = watcher_state(&config);
-    print!("{}", format_digest(&o, live, enabled));
+    let mut context = format_digest(&o, live, enabled);
     if let Some(line) = version_check_line(&config) {
-        print!("{line}");
+        context.push_str(&line);
     }
-    Ok(())
+    Ok(Some(context))
 }
 
 /// The session-start notice replacing the digest when the index schema is NEWER than this binary
@@ -394,44 +698,38 @@ fn version_line(status: &rag_rat_core::version_check::VersionStatus) -> Option<S
 
 /// PreToolUse path: the write-time clone check (#287) on the edit tools, read augmentation on
 /// `Read` (#756), grep augmentation on a code search otherwise.
-fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
+fn pretooluse(input: &HookInput) -> anyhow::Result<Option<String>> {
     if matches!(input.tool_name.as_str(), "Write" | "Edit" | "MultiEdit" | "apply_patch") {
         return clone_check(input);
     }
     if input.tool_name == "Read" {
         return read_augment_hook(input);
     }
-    let Some(search) = extract_search(input) else { return Ok(()) };
-    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
+    let Some(search) = extract_search(input) else { return Ok(None) };
+    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(None) };
 
     // Pass the session cwd through both paths so the grep-augmentation is scoped to the worktree
     // the session is in (a linked worktree gets its branch overlay), not just the base index
     // (#219).
     let context = ask_listener(&config, &input.session_id, &input.cwd, &search)
         .unwrap_or_else(|| fallback_compose(&config, &input.cwd, &search));
-    if let Some(context) = context {
-        print_additional_context(&context);
-    }
-    Ok(())
+    Ok(context)
 }
 
 /// Read-augmentation path (#756): when the agent opens a file, inject the repo memories bound to it
 /// (+ its directory) and the load-bearing symbols defined in it. Silent no-op unless the file is a
 /// tracked, root-relative path with something to say. Prefers the warm listener (per-session
 /// dedup); falls back to a direct read-only compose.
-fn read_augment_hook(input: &HookInput) -> anyhow::Result<()> {
-    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
+fn read_augment_hook(input: &HookInput) -> anyhow::Result<Option<String>> {
+    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(None) };
     let Some(file_path) = input.tool_input.get("file_path").and_then(|v| v.as_str()) else {
-        return Ok(());
+        return Ok(None);
     };
     let indexed_root = session_indexed_root(&config, &input.cwd);
-    let Some(rel_path) = worktree_rel_path(file_path, &indexed_root) else { return Ok(()) };
+    let Some(rel_path) = worktree_rel_path(file_path, &indexed_root) else { return Ok(None) };
     let context = ask_listener_read(&config, &input.session_id, &input.cwd, &rel_path)
         .unwrap_or_else(|| fallback_compose_read(&config, &input.cwd, &rel_path));
-    if let Some(context) = context {
-        print_additional_context(&context);
-    }
-    Ok(())
+    Ok(context)
 }
 
 /// The absolute directory that indexed `files.path` are relative to, IN THE SESSION'S checkout.
@@ -490,16 +788,53 @@ fn worktree_rel_path(file_path: &str, worktree_root: &Path) -> Option<String> {
 /// Emit an `additionalContext` block for a PreToolUse hook. PreToolUse contract: additionalContext
 /// only — no `permissionDecision` (Codex rejects the "allow" value, and we only inject context,
 /// never gate the tool). Plain stdout is debug-only.
-fn print_additional_context(context: &str) {
-    println!(
-        "{}",
-        serde_json::json!({
+fn print_context(harness: Harness, event: OutputEvent, context: &str) {
+    if let Some(output) = format_context_output(harness, event, context) {
+        print!("{output}");
+        if harness != Harness::Native || event != OutputEvent::SessionStart {
+            println!();
+        }
+    }
+}
+
+fn format_context_output(harness: Harness, event: OutputEvent, context: &str) -> Option<String> {
+    let output = match (harness, event) {
+        (Harness::Native, OutputEvent::SessionStart) => return Some(context.to_string()),
+        (Harness::Vscode, OutputEvent::SessionStart) => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": context,
+            }
+        }),
+        (Harness::Native | Harness::Vscode, OutputEvent::PreToolUse) => serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "additionalContext": context,
             }
-        })
-    );
+        }),
+        (Harness::Cursor, OutputEvent::SessionStart | OutputEvent::CursorPostToolUse) => {
+            serde_json::json!({ "additional_context": context })
+        },
+        (Harness::Cursor, OutputEvent::CursorBeforeShell) => {
+            serde_json::json!({ "agent_message": context })
+        },
+        (_, OutputEvent::None) | (Harness::Cursor, OutputEvent::PreToolUse) => return None,
+        (
+            Harness::Native | Harness::Vscode,
+            OutputEvent::CursorBeforeShell | OutputEvent::CursorPostToolUse,
+        ) => return None,
+    };
+    Some(output.to_string())
+}
+
+/// Cursor's generic postToolUse is the only documented context channel shared by reads and write
+/// results. Reads reuse PreToolUse composition; edits run a clone check only when the normalized
+/// payload contains actual replacement text. The dedicated afterFileEdit event owns reindexing.
+fn cursor_posttooluse(input: &HookInput) -> anyhow::Result<Option<String>> {
+    if matches!(input.tool_name.as_str(), "Write" | "Edit" | "MultiEdit" | "apply_patch") {
+        return clone_check(input);
+    }
+    pretooluse(input)
 }
 
 /// PostToolUse path (#661): after an edit tool completes, trigger a scoped reindex of the edited
@@ -531,21 +866,39 @@ fn posttooluse(input: &HookInput) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The edited absolute path(s) to reindex, from a PostToolUse edit-tool payload. `Write` / `Edit` /
-/// `MultiEdit` (Claude Code) all carry a single `tool_input.file_path` (MultiEdit batches edits to
-/// ONE file). Any other tool — including `apply_patch`, whose Codex PostToolUse fires before the
-/// write lands — yields nothing, so the trigger stays scoped to the harness that delivers a usable
-/// post-edit event (#661).
+/// The edited absolute path(s) to reindex from a successful post-edit event. Relative paths are
+/// resolved against the event cwd; all further root/scope validation remains owned by
+/// `edit-reindex`. Codex does not register PostToolUse, so accepting an `apply_patch` here is safe
+/// for harnesses that explicitly guarantee the post event fires after the write lands.
 fn extract_edited_paths(input: &HookInput) -> Vec<PathBuf> {
-    match input.tool_name.as_str() {
-        "Write" | "Edit" | "MultiEdit" => input
+    let paths = match input.tool_name.as_str() {
+        "Write" | "Edit" | "MultiEdit" => {
+            let mut paths = input
+                .tool_input
+                .get("file_path")
+                .and_then(|value| value.as_str())
+                .map(|path| vec![path.to_string()])
+                .unwrap_or_default();
+            if let Some(files) = input.tool_input.get("files").and_then(|value| value.as_array()) {
+                paths.extend(files.iter().filter_map(|path| path.as_str().map(str::to_string)));
+            }
+            paths
+        },
+        "apply_patch" => input
             .tool_input
-            .get("file_path")
+            .get("command")
             .and_then(|value| value.as_str())
-            .map(|path| vec![PathBuf::from(path)])
+            .map(parse_v4a_paths)
             .unwrap_or_default(),
         _ => Vec::new(),
-    }
+    };
+    paths
+        .into_iter()
+        .map(|path| {
+            let path = PathBuf::from(path);
+            if path.is_absolute() { path } else { Path::new(&input.cwd).join(path) }
+        })
+        .collect()
 }
 
 /// Which of the edited paths this hook must reindex, given whether a watcher is live. No watcher ⇒
@@ -632,40 +985,27 @@ fn clone_check_skipped_for_size(indexed: bool, function_count: u64) -> bool {
 /// existing indexed code. Best-effort + READ-ONLY — every "not ready" path (no config, DB absent,
 /// index owes a heal/migrate, index too large, no parseable functions) is a SILENT no-op, so it
 /// never blocks or perceptibly delays a write.
-fn clone_check(input: &HookInput) -> anyhow::Result<()> {
-    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
+fn clone_check(input: &HookInput) -> anyhow::Result<Option<String>> {
+    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(None) };
     if !config.database.is_file() {
-        return Ok(()); // index not built yet
+        return Ok(None); // index not built yet
     }
     // `try_open_config_read_only` returns None when the index still owes a heal/migrate (NOT
     // ready), so this is the no-op-when-not-ready guard — the same gate the MCP read tools use.
-    let Some(db) = IndexDatabase::try_open_config_read_only(&config)? else { return Ok(()) };
+    let Some(db) = IndexDatabase::try_open_config_read_only(&config)? else { return Ok(None) };
     // The size guard bounds ONLY the RAM fallback. When a live postings generation is eligible the
     // check is a bounded indexed lookup (#296 phase 4), so run it regardless of corpus size; only
     // the fallback no-ops above the cap.
     let indexed = db.clone_check_indexed_generation().unwrap_or(None).is_some();
     if clone_check_skipped_for_size(indexed, db.clone_check_function_count().unwrap_or(u64::MAX)) {
-        return Ok(());
+        return Ok(None);
     }
     let inputs = extract_clone_inputs(input, &config.root);
     if inputs.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let matches = db.clones_of_texts(&inputs, HOOK_NEAR_THRESHOLD)?;
-    if let Some(context) = format_clone_warning(&matches) {
-        // PreToolUse contract: additionalContext only — a warning, not a block (no
-        // permissionDecision).
-        println!(
-            "{}",
-            serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": context,
-                }
-            })
-        );
-    }
-    Ok(())
+    Ok(format_clone_warning(&matches))
 }
 
 /// Pull the (relative-path, text) inputs to clone-check from an edit tool call:
@@ -770,6 +1110,22 @@ fn parse_v4a_added_lines(patch: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Extract every path affected by a V4A patch, including deletion-only sections that intentionally
+/// have no added text and therefore cannot appear in [`parse_v4a_added_lines`].
+fn parse_v4a_paths(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            ["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "]
+                .into_iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// Render clone-check findings as the `additionalContext` injected back to the agent, or `None`
 /// when there are none (stay silent).
 fn format_clone_warning(matches: &[TextCloneMatch]) -> Option<String> {
@@ -798,12 +1154,6 @@ fn format_clone_warning(matches: &[TextCloneMatch]) -> Option<String> {
          symbol_lookup to inspect them.\n",
     );
     Some(out)
-}
-
-/// One-liner shown when the DB file is absent (no config directory walk — `find_config` already
-/// succeeded, so we know we're in a rag-rat repo; the DB just hasn't been built yet).
-fn db_absent_notice() -> String {
-    format!("{}\nindex not built — run 'rag-rat index'\n", ATTRIBUTION_HEADER.trim_end())
 }
 
 /// Probe whether the per-worktree watcher election lock is currently held (i.e. a watcher is live).

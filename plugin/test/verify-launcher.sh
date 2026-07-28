@@ -26,11 +26,13 @@ pass "launcher syntax"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 printf '{"version":"0.0.0-none"}\n' > "$TMP/plugin.json"
-if env -u RAG_RAT_BIN PLUGIN_ROOT="$TMP" node "$LAUNCH" --no-install agent-hook </dev/null >/dev/null 2>&1; then
-  pass "--no-install no-op exits 0 (cold cache)"
-else
-  fail "--no-install did not exit 0 on a cold cache"
-fi
+for harness in auto cursor vscode; do
+  if env -u RAG_RAT_BIN PLUGIN_ROOT="$TMP" node "$LAUNCH" --no-install agent-hook "$harness" </dev/null >/dev/null 2>&1; then
+    pass "--no-install $harness hook exits 0 (cold cache)"
+  else
+    fail "--no-install $harness hook did not exit 0 on a cold cache"
+  fi
+done
 
 do_handshake=0
 [ -n "${RAG_RAT_BIN:-}" ] && do_handshake=1

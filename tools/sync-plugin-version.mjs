@@ -36,8 +36,11 @@ let changed = 0;
 // Require the exact count so a schema change cannot silently leave one stale.
 const VERSION_FILES = [
   [".claude-plugin/marketplace.json", 1],
+  [".cursor-plugin/marketplace.json", 1],
   ["plugin/.claude-plugin/plugin.json", 1],
   ["plugin/.codex-plugin/plugin.json", 1],
+  ["plugin/.cursor-plugin/plugin.json", 1],
+  ["plugin/.plugin/plugin.json", 1],
   ["plugin/opencode/package.json", 1],
   ["server.json", 2],
 ];

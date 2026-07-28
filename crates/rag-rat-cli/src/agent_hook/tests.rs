@@ -62,6 +62,224 @@ fn session_start_json_without_tool_fields_deserializes() {
 }
 
 #[test]
+fn cursor_events_normalize_to_internal_actions() {
+    let session = normalize_hook(
+        r#"{"hook_event_name":"sessionStart","conversation_id":"c1","workspace_roots":["/repo"]}"#,
+        AgentHookHarnessArg::Cursor,
+    )
+    .unwrap();
+    assert_eq!(session.harness, Harness::Cursor);
+    assert_eq!(session.dispatch, Dispatch::SessionStart);
+    assert_eq!(session.input.cwd, "/repo");
+    assert_eq!(session.input.session_id, "c1");
+
+    let shell = normalize_hook(
+        r#"{"hook_event_name":"beforeShellExecution","command":"rg needle src","cwd":"/repo"}"#,
+        AgentHookHarnessArg::Cursor,
+    )
+    .unwrap();
+    assert_eq!(shell.dispatch, Dispatch::PreToolUse);
+    assert_eq!(shell.output_event, OutputEvent::CursorBeforeShell);
+    assert_eq!(shell.input.tool_name, "Bash");
+    assert_eq!(shell.input.tool_input["command"], "rg needle src");
+
+    let edit = normalize_hook(
+        r#"{"hook_event_name":"afterFileEdit","file_path":"/repo/src/lib.rs","edits":[{"old_string":"a","new_string":"b"}],"workspace_roots":["/repo"]}"#,
+        AgentHookHarnessArg::Cursor,
+    )
+    .unwrap();
+    assert_eq!(edit.dispatch, Dispatch::PostToolUse);
+    assert_eq!(edit.input.tool_input["file_path"], "/repo/src/lib.rs");
+    assert_eq!(edit.input.tool_input["edits"][0]["new_string"], "b");
+}
+
+#[test]
+fn cursor_multi_root_events_use_the_root_containing_the_file() {
+    let edit = normalize_hook(
+        r#"{"hook_event_name":"afterFileEdit","workspace_roots":["/repo-a","/repo-b"],"file_path":"/repo-b/src/lib.rs","edits":[]}"#,
+        AgentHookHarnessArg::Cursor,
+    )
+    .unwrap();
+    assert_eq!(edit.input.cwd, "/repo-b");
+
+    let read = normalize_hook(
+        r#"{"hook_event_name":"postToolUse","workspace_roots":["/repo-a","/repo-b"],"tool_name":"Read","tool_input":{"file_path":"/repo-b/src/lib.rs"}}"#,
+        AgentHookHarnessArg::Cursor,
+    )
+    .unwrap();
+    assert_eq!(read.input.cwd, "/repo-b");
+}
+
+#[test]
+fn cursor_read_uses_posttool_context_channel_only() {
+    let before = normalize_hook(
+        r#"{"hook_event_name":"beforeReadFile","file_path":"/repo/src/lib.rs","workspace_roots":["/repo"]}"#,
+        AgentHookHarnessArg::Cursor,
+    )
+    .unwrap();
+    assert_eq!(before.input.tool_name, "Read");
+    assert_eq!(before.output_event, OutputEvent::None);
+
+    let after = normalize_hook(
+        r#"{"hook_event_name":"postToolUse","tool_name":"Read","tool_input":{"file_path":"/repo/src/lib.rs"},"workspace_roots":["/repo"]}"#,
+        AgentHookHarnessArg::Cursor,
+    )
+    .unwrap();
+    assert_eq!(after.dispatch, Dispatch::CursorPostToolUse);
+    assert_eq!(after.output_event, OutputEvent::CursorPostToolUse);
+}
+
+#[test]
+fn cursor_clone_check_requires_generic_posttool_edit_text() {
+    let dedicated = normalize_hook(
+        r#"{"hook_event_name":"afterFileEdit","file_path":"/repo/src/lib.rs","edits":[{"new_string":"fn added() {}"}],"workspace_roots":["/repo"]}"#,
+        AgentHookHarnessArg::Cursor,
+    )
+    .unwrap();
+    assert_eq!(dedicated.dispatch, Dispatch::PostToolUse);
+    assert_eq!(dedicated.output_event, OutputEvent::None);
+
+    let generic = normalize_hook(
+        r#"{"hook_event_name":"postToolUse","tool_name":"Write","tool_input":{"file_path":"/repo/src/lib.rs","edits":[{"new_string":"fn added() {}"}]},"workspace_roots":["/repo"]}"#,
+        AgentHookHarnessArg::Cursor,
+    )
+    .unwrap();
+    assert_eq!(generic.dispatch, Dispatch::CursorPostToolUse);
+    assert_eq!(generic.input.tool_name, "MultiEdit");
+    assert_eq!(generic.input.tool_input["edits"][0]["new_string"], "fn added() {}");
+    assert_eq!(generic.output_event, OutputEvent::CursorPostToolUse);
+}
+
+#[test]
+fn vscode_tool_names_and_camel_case_inputs_normalize() {
+    let cases = [
+        ("run_in_terminal", serde_json::json!({"command": "rg foo"}), "Bash"),
+        ("read_file", serde_json::json!({"filePath": "/repo/a.rs"}), "Read"),
+        (
+            "create_file",
+            serde_json::json!({"filePath": "/repo/a.rs", "content": "fn a() {}"}),
+            "Write",
+        ),
+        (
+            "replace_string_in_file",
+            serde_json::json!({"filePath": "/repo/a.rs", "newString": "fn b() {}"}),
+            "Edit",
+        ),
+    ];
+    for (tool, tool_input, expected) in cases {
+        let value = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": "/repo",
+            "tool_name": tool,
+            "tool_input": tool_input,
+        });
+        let normalized = normalize_hook(&value.to_string(), AgentHookHarnessArg::Vscode).unwrap();
+        assert_eq!(normalized.input.tool_name, expected, "{tool}");
+    }
+}
+
+#[test]
+fn snake_case_and_camel_case_paths_normalize_identically() {
+    for field in ["file_path", "filePath"] {
+        let value = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": "/repo",
+            "tool_name": "read_file",
+            "tool_input": { (field): "/repo/src/lib.rs" },
+        });
+        let normalized = normalize_hook(&value.to_string(), AgentHookHarnessArg::Vscode).unwrap();
+        assert_eq!(normalized.input.tool_input["file_path"], "/repo/src/lib.rs");
+    }
+}
+
+#[test]
+fn cursor_and_vscode_shell_commands_feed_the_existing_parser() {
+    let cursor = normalize_hook(
+        r#"{"hook_event_name":"beforeShellExecution","command":"rg -n needle src","cwd":"/repo"}"#,
+        AgentHookHarnessArg::Cursor,
+    )
+    .unwrap();
+    let vscode = normalize_hook(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"runTerminalCommand","tool_input":{"commandLine":"rg -n needle src"},"cwd":"/repo"}"#,
+        AgentHookHarnessArg::Vscode,
+    )
+    .unwrap();
+    for normalized in [cursor, vscode] {
+        let search = extract_search(&normalized.input).unwrap();
+        assert_eq!(search.pattern, "needle");
+        assert_eq!(search.search_path.as_deref(), Some("src"));
+    }
+}
+
+#[test]
+fn irrelevant_tools_and_malformed_input_are_silent() {
+    let irrelevant = normalize_hook(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"fetch_webpage","tool_input":{"secret":"RAW-PAYLOAD-SENTINEL"}}"#,
+        AgentHookHarnessArg::Vscode,
+    )
+    .unwrap();
+    assert_eq!(irrelevant.dispatch, Dispatch::Ignore);
+    assert_eq!(irrelevant.output_event, OutputEvent::None);
+    assert!(normalize_hook("not json", AgentHookHarnessArg::Cursor).is_none());
+}
+
+#[test]
+fn context_output_contains_only_intentional_context() {
+    let cursor = format_context_output(
+        Harness::Cursor,
+        OutputEvent::CursorPostToolUse,
+        "bounded augmentation",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&cursor).unwrap(),
+        serde_json::json!({"additional_context": "bounded augmentation"})
+    );
+    assert!(!cursor.contains("RAW-PAYLOAD-SENTINEL"));
+
+    let vscode =
+        format_context_output(Harness::Vscode, OutputEvent::PreToolUse, "bounded augmentation")
+            .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&vscode).unwrap();
+    assert_eq!(value["hookSpecificOutput"]["additionalContext"], "bounded augmentation");
+    assert!(format_context_output(Harness::Cursor, OutputEvent::None, "ignored").is_none());
+}
+
+#[test]
+fn hook_manifests_register_one_dispatcher_per_event() {
+    for manifest in [
+        include_str!("../../../../plugin/hooks/hooks.json"),
+        include_str!("../../../../plugin/hooks.vscode.json"),
+    ] {
+        let value: serde_json::Value = serde_json::from_str(manifest).unwrap();
+        for event in ["SessionStart", "PreToolUse", "PostToolUse"] {
+            let entries = value["hooks"][event].as_array().expect("event array");
+            assert_eq!(entries.len(), 1, "{event} must have one dispatcher");
+            assert!(entries[0].get("matcher").is_none(), "{event} must not rely on matchers");
+        }
+    }
+
+    let vscode: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../plugin/hooks.vscode.json")).unwrap();
+    for event in ["SessionStart", "PreToolUse", "PostToolUse"] {
+        let command = vscode["hooks"][event][0]["command"].as_str().unwrap();
+        assert!(command.contains("${PLUGIN_ROOT}/scripts/launch.js"));
+        assert!(command.ends_with("agent-hook vscode"));
+    }
+
+    let cursor: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../plugin/hooks.cursor.json")).unwrap();
+    for event in ["sessionStart", "beforeShellExecution", "postToolUse", "afterFileEdit"] {
+        let entries = cursor["hooks"][event].as_array().expect("Cursor event array");
+        assert_eq!(entries.len(), 1, "Cursor {event} must have one dispatcher");
+        assert!(
+            entries[0]["command"].as_str().unwrap().ends_with("agent-hook cursor"),
+            "Cursor {event} must select the Cursor adapter"
+        );
+    }
+}
+
+#[test]
 fn parses_grep_tool_input() {
     let json = r#"{"session_id":"s1","cwd":"/repo","hook_event_name":"PreToolUse",
             "tool_name":"Grep","tool_input":{"pattern":"watcher_main","path":"crates"}}"#;
@@ -213,8 +431,8 @@ fn extract_edited_paths_pulls_file_path_from_the_edit_tools() {
 
 #[test]
 fn extract_edited_paths_ignores_non_edit_tools_and_missing_paths() {
-    // A non-edit tool yields nothing — including `apply_patch`, deliberately unscoped (#661).
-    for tool in ["Read", "Grep", "Bash", "apply_patch"] {
+    // A non-edit tool yields nothing.
+    for tool in ["Read", "Grep", "Bash"] {
         let json = format!(
             r#"{{"hook_event_name":"PostToolUse","tool_name":"{tool}",
                 "tool_input":{{"file_path":"/repo/x.rs"}}}}"#,
@@ -226,6 +444,34 @@ fn extract_edited_paths_ignores_non_edit_tools_and_missing_paths() {
     let json = r#"{"hook_event_name":"PostToolUse","tool_name":"Write","tool_input":{}}"#;
     let input: HookInput = serde_json::from_str(json).unwrap();
     assert!(extract_edited_paths(&input).is_empty());
+}
+
+#[test]
+fn extract_edited_paths_resolves_relative_files_and_apply_patch() {
+    let multi = HookInput {
+        cwd: "/repo".to_string(),
+        tool_name: "MultiEdit".to_string(),
+        tool_input: serde_json::json!({"files": ["src/a.rs", "/other/b.rs"]}),
+        ..Default::default()
+    };
+    assert_eq!(extract_edited_paths(&multi), vec![
+        PathBuf::from("/repo/src/a.rs"),
+        PathBuf::from("/other/b.rs"),
+    ]);
+
+    let patch = HookInput {
+        cwd: "/repo".to_string(),
+        tool_name: "apply_patch".to_string(),
+        tool_input: serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: src/lib.rs\n*** Move to: src/moved.rs\n+fn added() {}\n*** Delete File: src/gone.rs\n*** End Patch\n"
+        }),
+        ..Default::default()
+    };
+    assert_eq!(extract_edited_paths(&patch), vec![
+        PathBuf::from("/repo/src/lib.rs"),
+        PathBuf::from("/repo/src/moved.rs"),
+        PathBuf::from("/repo/src/gone.rs"),
+    ]);
 }
 
 #[test]

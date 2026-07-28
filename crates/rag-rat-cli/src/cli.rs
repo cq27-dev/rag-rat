@@ -38,10 +38,9 @@ pub(crate) enum Command {
     /// Scan the repository and write a starter rag-rat.toml (interactive).
     Init(InitArgs),
 
-    /// Internal: coding-agent hook entrypoint (reads a JSON hook event on stdin; Claude Code,
-    /// Codex, Cursor).
+    /// Internal: coding-agent hook entrypoint (reads a JSON hook event on stdin).
     #[command(hide = true)]
-    AgentHook,
+    AgentHook(AgentHookArgs),
 
     /// Internal: the detached edit-driven reindex runner (#661), spawned by the PostToolUse edit
     /// hook. Coalesces a burst of edits via the single-flight and runs one scoped structural
@@ -169,6 +168,22 @@ pub(crate) struct RmArgs {
     /// Preview what would be deleted (per-table row counts) and exit without changing anything.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct AgentHookArgs {
+    /// Input/output contract to normalize. Auto preserves the shared Claude/Codex plugin
+    /// entrypoint and detects Cursor's lower-camel lifecycle names.
+    #[arg(value_enum, default_value_t = AgentHookHarnessArg::Auto)]
+    pub harness: AgentHookHarnessArg,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum AgentHookHarnessArg {
+    #[default]
+    Auto,
+    Cursor,
+    Vscode,
 }
 
 #[derive(Debug, Args)]
@@ -917,6 +932,21 @@ mod tests {
                 assert_eq!(args.action, HookAction::Install);
             },
             other => panic!("expected hooks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_hook_harness_parses_and_defaults_to_auto() {
+        let cli = Cli::try_parse_from(["rag-rat", "agent-hook", "cursor"]).expect("parse");
+        match cli.command {
+            Command::AgentHook(args) => assert_eq!(args.harness, AgentHookHarnessArg::Cursor),
+            other => panic!("expected agent-hook, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["rag-rat", "agent-hook"]).expect("parse default");
+        match cli.command {
+            Command::AgentHook(args) => assert_eq!(args.harness, AgentHookHarnessArg::Auto),
+            other => panic!("expected agent-hook, got {other:?}"),
         }
     }
 
