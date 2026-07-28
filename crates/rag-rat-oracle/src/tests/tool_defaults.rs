@@ -43,32 +43,38 @@ fn default_position_encoding_is_utf16_for_typescript_and_java() {
     assert_eq!(OracleTool::ScipClang.default_position_encoding(), UNSPEC);
     assert_eq!(OracleTool::ScipPython.default_position_encoding(), UNSPEC);
     assert_eq!(OracleTool::RaLsp.default_position_encoding(), UNSPEC);
+    assert_eq!(OracleTool::TsLsp.default_position_encoding(), UNSPEC);
 }
 
-/// #534: the live `ra-lsp` tool is NEVER batch-capable — every batch driver (the auto-run loop,
-/// the init wizard, `produce_scip_with_tool`) must gate it out via the discriminator, and
+/// #534/#536: a live tool is NEVER batch-capable — every batch driver (the auto-run loop, the init
+/// wizard, `produce_scip_with_tool`) must gate it out via the discriminator, and
 /// `batch_moniker_source` names the batch tool whose monikers the live writer copies.
 #[test]
-fn ra_lsp_is_gated_out_of_the_batch_paths() {
+fn live_tools_are_gated_out_of_the_batch_paths() {
+    let live = [OracleTool::RaLsp, OracleTool::TsLsp];
     for &tool in OracleTool::ALL {
-        assert_eq!(tool.batch_capable(), tool != OracleTool::RaLsp, "{tool:?}");
+        assert_eq!(tool.batch_capable(), !live.contains(&tool), "{tool:?}");
     }
     assert_eq!(OracleTool::RaLsp.batch_moniker_source(), Some(OracleTool::RustAnalyzer));
+    assert_eq!(OracleTool::TsLsp.batch_moniker_source(), Some(OracleTool::ScipTypescript));
     for tool in OracleTool::ALL.iter().filter(|t| t.batch_capable()) {
         assert_eq!(tool.batch_moniker_source(), None, "{tool:?}");
     }
 
-    // `produce_scip_with_tool` on the live tool returns the documented Blocked hint and never
+    // `produce_scip_with_tool` on a live tool returns the documented Blocked hint and never
     // builds a `scip_command` (which would be an unreachable! panic).
-    let outcome =
-        produce_scip_with_tool(OracleTool::RaLsp, Path::new("/tmp"), Path::new("/tmp/x.scip"))
-            .unwrap();
-    match outcome {
-        ScipProduction::Blocked { tool, program, hint } => {
-            assert_eq!(tool, "ra-lsp");
-            assert_eq!(program, "rust-analyzer");
-            assert!(hint.contains("[oracle.live]"), "{hint}");
-        },
-        ScipProduction::Produced { .. } => panic!("a live tool must never produce a .scip"),
+    for (tool, program) in
+        [(OracleTool::RaLsp, "rust-analyzer"), (OracleTool::TsLsp, "typescript-language-server")]
+    {
+        let outcome =
+            produce_scip_with_tool(tool, Path::new("/tmp"), Path::new("/tmp/x.scip")).unwrap();
+        match outcome {
+            ScipProduction::Blocked { tool: blocked, program: blocked_program, hint } => {
+                assert_eq!(blocked, tool.as_db_str());
+                assert_eq!(blocked_program, program);
+                assert!(hint.contains("[oracle.live]"), "{hint}");
+            },
+            ScipProduction::Produced { .. } => panic!("a live tool must never produce a .scip"),
+        }
     }
 }

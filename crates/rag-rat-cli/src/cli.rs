@@ -684,10 +684,14 @@ pub(crate) enum OracleToolArg {
     ScipTypescript,
     #[value(name = "scip-java")]
     ScipJava,
-    /// The live watcher oracle (#534). Selectable for `oracle status`; `oracle run --tool
-    /// ra-lsp` degrades to the documented `Blocked` hint (live tools never produce a `.scip`).
+    /// The live watcher oracle for Rust (#534). Selectable for `oracle status`; `oracle run
+    /// --tool ra-lsp` degrades to the documented `Blocked` hint (live tools never produce a
+    /// `.scip`).
     #[value(name = "ra-lsp")]
     RaLsp,
+    /// The live watcher oracle for TypeScript (#536). Same status/run semantics as `ra-lsp`.
+    #[value(name = "ts-lsp")]
+    TsLsp,
 }
 
 impl OracleToolArg {
@@ -699,6 +703,7 @@ impl OracleToolArg {
             OracleToolArg::ScipTypescript => rag_rat_oracle::OracleTool::ScipTypescript,
             OracleToolArg::ScipJava => rag_rat_oracle::OracleTool::ScipJava,
             OracleToolArg::RaLsp => rag_rat_oracle::OracleTool::RaLsp,
+            OracleToolArg::TsLsp => rag_rat_oracle::OracleTool::TsLsp,
         }
     }
 }
@@ -1139,16 +1144,46 @@ mod tests {
     }
 
     #[test]
-    fn oracle_status_accepts_the_live_tool_selector() {
-        // `oracle status --tool ra-lsp` must parse (#534): the status selector includes the
-        // live backend; `oracle run --tool ra-lsp` is gated to Blocked downstream instead.
-        let cli = Cli::try_parse_from(["rag-rat", "oracle", "status", "--tool", "ra-lsp"])
-            .expect("parse");
-        match cli.command {
-            Command::Oracle(OracleArgs { command: OracleCommand::Status(args) }) => {
-                assert_eq!(args.tool, Some(OracleToolArg::RaLsp));
-            },
-            other => panic!("expected oracle status, got {other:?}"),
+    fn oracle_status_accepts_every_live_tool_selector() {
+        // `oracle status --tool <live>` must parse: the status selector includes the live
+        // backends; `oracle run --tool <live>` is gated to Blocked downstream instead.
+        for tool in rag_rat_oracle::OracleTool::ALL.iter().filter(|tool| !tool.batch_capable()) {
+            let cli =
+                Cli::try_parse_from(["rag-rat", "oracle", "status", "--tool", tool.as_db_str()])
+                    .unwrap_or_else(|err| panic!("{} must parse: {err}", tool.as_db_str()));
+            match cli.command {
+                Command::Oracle(OracleArgs { command: OracleCommand::Status(args) }) => {
+                    assert_eq!(args.tool.map(OracleToolArg::core), Some(*tool));
+                },
+                other => panic!("expected oracle status, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_tool_selector_covers_every_registered_oracle_tool() {
+        // The CLI selector and the tool registry drift silently otherwise: a new backend would be
+        // indexed and surfaced but unselectable from `oracle status`/`oracle run`, and its
+        // `--tool` name could disagree with the id its rows are persisted under.
+        use clap::ValueEnum as _;
+        let selectable: Vec<rag_rat_oracle::OracleTool> =
+            OracleToolArg::value_variants().iter().map(|arg| arg.core()).collect();
+        assert_eq!(
+            selectable,
+            rag_rat_oracle::OracleTool::ALL.to_vec(),
+            "OracleToolArg must mirror OracleTool::ALL, in order",
+        );
+        for arg in OracleToolArg::value_variants() {
+            let name = arg
+                .to_possible_value()
+                .expect("every selector variant is selectable")
+                .get_name()
+                .to_string();
+            assert_eq!(
+                name,
+                arg.core().as_db_str(),
+                "the --tool name must match the persisted tool id",
+            );
         }
     }
 

@@ -19,6 +19,7 @@
 //! - `store.rs` — `oracle_runs` / `edge_oracle` read + write helpers.
 
 mod auto_run;
+mod backend;
 mod corpus;
 mod join;
 mod library_usage;
@@ -38,6 +39,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use auto_run::{AutoRunDecision, AutoRunInputs, auto_run_decision};
+pub use backend::LiveBackend;
 pub use corpus::{
     HealthViolation, check_corpus_health, corpora_for_tier, corpus_by_id, load_corpora,
 };
@@ -725,13 +727,19 @@ pub enum OracleTool {
     /// stopping the whole-checkout batch pass. Never batch-capable — see
     /// [`Self::batch_capable`].
     RaLsp,
+    /// The LIVE `typescript-language-server` client (#536) — the TypeScript sibling of
+    /// [`Self::RaLsp`], resolving callees in just-changed `.ts` / `.tsx` files at watcher cadence.
+    /// A DISTINCT tool id from [`Self::ScipTypescript`] for the same reason `RaLsp` is distinct
+    /// from `RustAnalyzer` (live run rows would otherwise wedge the batch staleness gate). Never
+    /// batch-capable.
+    TsLsp,
 }
 
 impl OracleTool {
     /// Every known oracle tool, for "report on all tools" surfaces (`oracle status` with no
     /// `--tool`). Later language backends extend this alongside the enum. Includes the LIVE tools
-    /// (`RaLsp`) — read surfaces merge across every writer with a run; batch-only DRIVERS must
-    /// filter through [`Self::batch_capable`].
+    /// (`RaLsp`, `TsLsp`) — read surfaces merge across every writer with a run; batch-only DRIVERS
+    /// must filter through [`Self::batch_capable`].
     pub const ALL: &[OracleTool] = &[
         Self::RustAnalyzer,
         Self::ScipClang,
@@ -739,6 +747,7 @@ impl OracleTool {
         Self::ScipTypescript,
         Self::ScipJava,
         Self::RaLsp,
+        Self::TsLsp,
     ];
 
     pub fn as_db_str(self) -> &'static str {
@@ -751,20 +760,25 @@ impl OracleTool {
 
     /// Whether this tool produces/consumes whole-checkout `.scip` indexes — the batch paths:
     /// `oracle run`, the background auto-run loop, the init-wizard tool listing, and
-    /// [`produce_scip_with_tool`]. `false` ONLY for the live LSP tools (`RaLsp`), which write
-    /// per-pass verdicts from the watcher and have no `scip_command`; every batch driver must skip
-    /// them rather than try to invoke them as indexers.
+    /// [`produce_scip_with_tool`]. `false` ONLY for the live LSP tools, which write per-pass
+    /// verdicts from the watcher and have no `scip_command`; every batch driver must skip them
+    /// rather than try to invoke them as indexers.
     pub fn batch_capable(self) -> bool {
-        !matches!(self, Self::RaLsp)
+        !matches!(self, Self::RaLsp | Self::TsLsp)
     }
 
     /// The batch tool whose `logical_symbol_monikers` rows a LIVE tool copies into its own
     /// `edge_oracle.scip_symbol` values, so live verdicts are byte-identical to what the batch
     /// pass would write (clone-collapse + memory anchoring treat them as one evidence set, #534).
     /// `None` for a batch tool (it mints monikers itself).
+    ///
+    /// The copy is safe even where the batch tool's monikers are rewritten on the way in
+    /// (`stabilize_moniker_version` is non-identity for `ScipTypescript`): the source is the
+    /// STORED `logical_symbol_monikers` row, which the batch pass already wrote in its final form.
     pub fn batch_moniker_source(self) -> Option<OracleTool> {
         match self {
             Self::RaLsp => Some(Self::RustAnalyzer),
+            Self::TsLsp => Some(Self::ScipTypescript),
             _ => None,
         }
     }
@@ -796,9 +810,9 @@ impl OracleTool {
             // UTF-16 count). Reading them as the UTF-32 fallback mis-converts past astral chars.
             Self::ScipTypescript | Self::ScipJava =>
                 PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
-            // RaLsp never parses a `.scip` (the live client negotiates its own LSP encoding);
-            // the arm exists only for exhaustiveness.
-            Self::RustAnalyzer | Self::ScipClang | Self::ScipPython | Self::RaLsp =>
+            // The live tools never parse a `.scip` (the live client negotiates its own LSP
+            // encoding per session); their arms exist only for exhaustiveness.
+            Self::RustAnalyzer | Self::ScipClang | Self::ScipPython | Self::RaLsp | Self::TsLsp =>
                 PositionEncoding::UnspecifiedPositionEncoding,
         }
     }

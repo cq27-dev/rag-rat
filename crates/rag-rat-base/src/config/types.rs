@@ -245,6 +245,10 @@ pub struct OracleLiveConfig {
     /// Cap on LSP requests a single pass may issue (default 200) — the budget that keeps a
     /// big change set from monopolizing the maintenance pass. Unfinished files ride the next
     /// pass via the watcher's backlog. Must be positive; zero is rejected at config load.
+    ///
+    /// SHARED across live backends, not per backend: the pass holds the repository write lock
+    /// while it runs, so this is a lock-hold bound, and a mixed-language checkout must not spend
+    /// one allowance per language. The backends draw from it in a rotating order so none starves.
     pub max_requests_per_pass: u64,
 }
 

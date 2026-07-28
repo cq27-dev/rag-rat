@@ -27,25 +27,42 @@ run the oracle by hand.
 ## Live LSP oracle (`[oracle.live]`)
 
 The **live** oracle is the per-pass freshness path (#534): the resident watcher's maintenance pass
-resolves the callees of **just-changed Rust files** through a resident `rust-analyzer` language
-server and writes the same `edge_oracle` verdicts the batch pass writes, under a distinct `ra-lsp`
-tool id. The batch pass (`auto_run` / `oracle run`) stays the canonical whole-checkout writer —
-live rows are a freshness patch for files being edited, and where both tools cover the same edge
-the batch verdict wins.
+resolves the callees of **just-changed files** through a resident language server and writes the
+same `edge_oracle` verdicts the batch pass writes, under a distinct live tool id. The batch pass
+(`auto_run` / `oracle run`) stays the canonical whole-checkout writer — live rows are a freshness
+patch for files being edited, and where both tools cover the same edge the batch verdict wins.
+
+| Live tool | Language | Server | Extra requirement |
+|---|---|---|---|
+| `ra-lsp` | Rust | `rust-analyzer` | — |
+| `ts-lsp` | TypeScript / TSX | `typescript-language-server` | a `tsconfig.json` project (see below) |
 
 ```toml
 [oracle.live]
 enabled = false               # off by default — opt in explicitly
-idle_shutdown_secs = 900      # shut the language server down after 15 min idle
+idle_shutdown_secs = 900      # shut each language server down after 15 min idle
 max_requests_per_pass = 200   # positive cap per maintenance pass; zero is rejected
 ```
 
+One setting configures every live backend. A checkout indexed in several of these languages runs
+one resident server per language, each with its own backlog and respawn backoff, so a wedged
+server for one language never stalls another. `max_requests_per_pass` is **shared** across them —
+it bounds the pass, which holds the repository write lock — and the backends take turns claiming
+it so none is starved.
+
+**TypeScript needs a `tsconfig.json`.** `typescript-language-server` reports that it has finished
+loading a project only for a real tsconfig project, and the oracle waits for that signal before it
+trusts an answer (asked mid-load, the server resolves an imported callee to the *import statement*
+rather than the definition). The config does not have to be at the checkout root — a monorepo with
+`packages/*/tsconfig.json` is fine — but a checkout with none is reported `Blocked` rather than run
+blind.
+
 **Standalone:** `[oracle.live]` does NOT imply or require `[oracle] auto_run`. Without a batch
 baseline the live pass is *moniker-blind* — it upgrades edge confidence tiers under `local
-ra-lsp-<n>` sentinel monikers, but clone-collapse (`find_clones` scip refine mode) and
+<tool>-<n>` sentinel monikers, but clone-collapse (`find_clones` scip refine mode) and
 moniker-anchored memory relocation get nothing until a batch `oracle run` completes (`oracle
 status` says so when that's the case). Each completed batch run auto-upgrades subsequent live
 passes to the real monikers. Live runs only from the resident watcher (never one-shot hook/CLI
-maintenance passes, which would pay a language-server warm-up per invocation), and needs
-`rust-analyzer` on `PATH`; probe and launch run from the checkout root so rustup directory overrides
-apply. A missing tool degrades quietly like a missing embedding model.
+maintenance passes, which would pay a language-server warm-up per invocation), and needs the
+backend's server on `PATH`; probe and launch run from the checkout root so directory-scoped
+toolchain overrides apply. A missing tool degrades quietly like a missing embedding model.

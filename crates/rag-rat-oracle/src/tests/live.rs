@@ -982,3 +982,304 @@ fn live_pass_aborts_best_effort_when_the_server_dies_mid_pass() {
     assert_eq!(report.unfinished_paths, vec!["src.rs".to_string()]);
     assert_eq!(live_run_count(&h.conn), 0);
 }
+
+/// The TypeScript live backend (#536). These lock the behaviours that differ from `ra-lsp` — the
+/// readiness signal, the warm-up that makes that signal reachable, the `languageId` documents are
+/// opened under, and the sentinel namespace — against the same fake-server seam.
+mod typescript {
+    use super::*;
+    use crate::OracleTool;
+    use crate::lsp::client::test_support::client_with_server_policy;
+    use crate::lsp::readiness::ReadinessPolicy;
+
+    const TS_VERSION: &str = "ts-test-1";
+    /// `run` calls `greet`; the callee identifier sits at byte 20.
+    const TS_CALLER_SRC: &str = "export function run() { greet(); }\n";
+    const TS_CALLEE_START: usize = 24;
+    const TS_CALLEE_END: usize = 29;
+    const TS_DEFS_SRC: &str = "export function greet() {}\n";
+
+    /// The two-file TypeScript corpus: `lib.ts` defines `greet`, `main.ts` calls it unresolved.
+    /// A `tsconfig.json` makes them a real project, which is what the server needs before it will
+    /// report a project load at all — and what the backend's prerequisite gate requires.
+    fn seed_ts_corpus(h: &Harness) -> (i64, i64) {
+        std::fs::write(h.root().join("tsconfig.json"), "{}").unwrap();
+        let defs = h.add_file("lib.ts", TS_DEFS_SRC);
+        let target = h.add_symbol(defs, "greet", 0, 25);
+        let src = h.add_file("main.ts", TS_CALLER_SRC);
+        let edge = h.add_edge(src, "greet", TS_CALLEE_START, TS_CALLEE_END, "NameOnly", None);
+        (target, edge)
+    }
+
+    fn ts_run_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM oracle_runs WHERE tool = 'ts-lsp'", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    /// A progress notification the fake server can interleave.
+    fn progress(token: &str, kind: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": {"token": token, "value": {"kind": kind}}
+        })
+    }
+
+    /// A TypeScript-backed session over a fake server, recording every method the client sent.
+    /// `emit_on_initialize` rides alongside the `initialize` response (the seam for handing the
+    /// session a completed progress cycle), and `emit_on_definition` before a definition result.
+    fn ts_session(
+        h: &Harness,
+        emit_on_initialize: Vec<Value>,
+        emit_on_definition: Vec<Value>,
+        resolve_to: Option<String>,
+    ) -> (LiveOracleSession, Arc<Mutex<Vec<String>>>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&sent);
+        let uri = root_uri(h);
+        let client = client_with_server_policy(
+            move |msg: &Value| {
+                let id = msg.get("id").cloned();
+                let method = msg.get("method").and_then(Value::as_str);
+                if let Some(method) = method {
+                    // Record the opened URI too: the warm-up asserts WHICH document was chosen.
+                    let entry = match method {
+                        "textDocument/didOpen" => format!(
+                            "didOpen:{}",
+                            msg["params"]["textDocument"]["uri"].as_str().unwrap_or_default()
+                        ),
+                        other => other.to_string(),
+                    };
+                    captured.lock().unwrap().push(entry);
+                }
+                match method {
+                    Some("initialize") => {
+                        let mut out = emit_on_initialize.clone();
+                        out.push(json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"capabilities": {}}
+                        }));
+                        Some(out)
+                    },
+                    Some("textDocument/definition") => {
+                        let mut out = emit_on_definition.clone();
+                        let result = match &resolve_to {
+                            Some(target) => json!({
+                                "targetUri": target,
+                                "targetSelectionRange": {
+                                    "start": {"line": 0, "character": 16},
+                                    "end": {"line": 0, "character": 21}
+                                }
+                            }),
+                            None => Value::Null,
+                        };
+                        out.push(json!({"jsonrpc": "2.0", "id": id, "result": result}));
+                        Some(out)
+                    },
+                    _ if id.is_none() => Some(vec![]),
+                    _ => Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": null})]),
+                }
+            },
+            ReadinessPolicy::WorkDoneProgress,
+        );
+        let session =
+            LiveOracleSession::from_warming_client_for(OracleTool::TsLsp, client, TS_VERSION, &uri);
+        (session, sent)
+    }
+
+    #[test]
+    fn an_unwarmed_session_opens_a_document_to_trigger_the_signal_it_is_waiting_for() {
+        // typescript-language-server starts its project load on the first didOpen, not at
+        // initialize, so a pass that waits for readiness without opening anything waits forever.
+        // The warm-up open breaks that deadlock — WITHOUT asking a single definition, because the
+        // answers during a load are wrong rather than null.
+        let h = Harness::new();
+        seed_ts_corpus(&h);
+        let (mut session, sent) = ts_session(&h, Vec::new(), Vec::new(), None);
+        let worklist = vec!["main.ts".to_string()];
+
+        let report =
+            live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+        assert_eq!(report.status, "Warming");
+        assert_eq!(report.unfinished_paths, worklist, "the work rides to the next pass");
+        assert_eq!(report.requests_used, 0);
+        // The warm-up is notification-only, so a synchronous round trip is what proves the
+        // server has seen it before the assertions read the recorded traffic.
+        session.barrier();
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.iter().any(|entry| entry.starts_with("didOpen:")),
+            "the warm-up must open a document: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|method| method == "textDocument/definition"),
+            "a warming server must never be asked for a definition: {sent:?}"
+        );
+        assert_eq!(ts_run_count(&h.conn), 0);
+    }
+
+    #[test]
+    fn a_completed_progress_cycle_lets_the_next_pass_write_ts_lsp_verdicts() {
+        // The pass after warm-up finds the latched ready state and resolves normally, writing
+        // under the ts-lsp tool id with its own sentinel namespace.
+        let h = Harness::new();
+        let (target, edge) = seed_ts_corpus(&h);
+        let definition = def_uri(&h, "lib.ts");
+        let (mut session, sent) = ts_session(
+            &h,
+            vec![progress("load", "begin"), progress("load", "end")],
+            Vec::new(),
+            Some(definition),
+        );
+        let worklist = vec!["main.ts".to_string()];
+
+        let report =
+            live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+        assert_eq!(report.status, "Completed");
+        assert_eq!(report.rows_written, 1);
+        assert_eq!(report.upgraded, 1);
+        let (kind, resolved, symbol) = h.verdict(edge).expect("verdict persisted");
+        assert_eq!(kind, "upgrade");
+        assert_eq!(resolved, Some(target));
+        assert!(
+            symbol.starts_with("local ts-lsp-"),
+            "a live TS verdict must not borrow another backend's sentinel namespace: {symbol}"
+        );
+        assert_eq!(ts_run_count(&h.conn), 1, "the run row is written under the live TS tool id");
+        assert!(sent.lock().unwrap().iter().any(|method| method == "textDocument/definition"));
+    }
+
+    #[test]
+    fn a_project_load_starting_mid_batch_discards_the_whole_batch() {
+        // The empirical failure this backend exists to survive: asked during a project load,
+        // typescript-language-server answers an imported callee with the IMPORT STATEMENT in the
+        // calling file — a plausible non-null that would persist as a real verdict and never be
+        // revisited until the file's bytes change. A load that begins while the batch is in
+        // flight must therefore invalidate the batch, not merely be noted.
+        let h = Harness::new();
+        let (_target, edge) = seed_ts_corpus(&h);
+        let definition = def_uri(&h, "lib.ts");
+        let (mut session, _sent) = ts_session(
+            &h,
+            vec![progress("load", "begin"), progress("load", "end")],
+            vec![progress("reload", "begin")],
+            Some(definition),
+        );
+        let worklist = vec!["main.ts".to_string()];
+
+        let report =
+            live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+        assert_eq!(report.status, "Warming");
+        assert_eq!(report.rows_written, 0, "a batch that straddled a load must write nothing");
+        assert!(h.verdict(edge).is_none(), "no verdict may survive the discarded batch");
+        assert_eq!(report.unfinished_paths, worklist, "the file retries once the load settles");
+        assert_eq!(ts_run_count(&h.conn), 0);
+    }
+
+    #[test]
+    fn a_checkout_with_no_project_is_not_re_opened_every_pass() {
+        // Opening a project-less document emits no progress cycle, so it cannot warm anything.
+        // Doing it anyway would burn a notification per pass forever. (The manifest gate normally
+        // stops such a checkout before a session is even spawned; this pins the pass-level
+        // behaviour so the two layers agree.)
+        let h = Harness::new();
+        let src = h.add_file("main.ts", TS_CALLER_SRC);
+        h.add_edge(src, "greet", TS_CALLEE_START, TS_CALLEE_END, "NameOnly", None);
+        let (mut session, sent) = ts_session(&h, Vec::new(), Vec::new(), None);
+        let worklist = vec!["main.ts".to_string()];
+
+        let report =
+            live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+        assert_eq!(report.status, "Warming");
+        session.barrier();
+        let sent = sent.lock().unwrap();
+        assert!(
+            !sent.iter().any(|entry| entry.starts_with("didOpen:")),
+            "nothing in this checkout can signal readiness, so nothing is worth opening: {sent:?}",
+        );
+    }
+
+    #[test]
+    fn the_warmup_open_picks_a_file_that_can_actually_produce_the_signal() {
+        // typescript-language-server brackets a TSCONFIG PROJECT's load in a progress cycle;
+        // opening a file that belongs to no project creates an inferred project silently, with no
+        // cycle at all. Warming on such a file leaves the session exactly as un-warmed as before,
+        // so the worklist's first entry is the wrong choice when a sibling IS inside a project.
+        let h = Harness::new();
+        std::fs::create_dir_all(h.root().join("pkg/src")).unwrap();
+        std::fs::create_dir_all(h.root().join("scripts")).unwrap();
+        std::fs::write(h.root().join("pkg/tsconfig.json"), "{}").unwrap();
+        let defs = h.add_file("pkg/src/lib.ts", TS_DEFS_SRC);
+        h.add_symbol(defs, "greet", 0, 25);
+        let loose = h.add_file("scripts/tool.ts", TS_CALLER_SRC);
+        h.add_edge(loose, "greet", TS_CALLEE_START, TS_CALLEE_END, "NameOnly", None);
+        let inside = h.add_file("pkg/src/main.ts", TS_CALLER_SRC);
+        h.add_edge(inside, "greet", TS_CALLEE_START, TS_CALLEE_END, "NameOnly", None);
+
+        let (mut session, sent) = ts_session(&h, Vec::new(), Vec::new(), None);
+        // The project-less file comes FIRST in the worklist; the warm-up must skip past it.
+        let worklist = vec!["scripts/tool.ts".to_string(), "pkg/src/main.ts".to_string()];
+
+        let report =
+            live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+        assert_eq!(report.status, "Warming");
+        session.barrier();
+        let opened: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.strip_prefix("didOpen:").map(str::to_string))
+            .collect();
+        assert!(
+            opened.iter().all(|uri| uri.ends_with("pkg/src/main.ts")),
+            "the warm-up must open the file inside the tsconfig project, not {opened:?}",
+        );
+    }
+
+    #[test]
+    fn documents_are_opened_under_the_extension_s_language_id() {
+        // tsserver rejects (and other servers mis-parse) a document declared under the wrong
+        // languageId, so `.tsx` must open as typescriptreact even though it shares a backend.
+        let h = Harness::new();
+        let defs = h.add_file("lib.ts", TS_DEFS_SRC);
+        h.add_symbol(defs, "greet", 0, 25);
+        let src = h.add_file("view.tsx", TS_CALLER_SRC);
+        h.add_edge(src, "greet", TS_CALLEE_START, TS_CALLEE_END, "NameOnly", None);
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&opened);
+        let uri = root_uri(&h);
+        let client = client_with_server_policy(
+            move |msg: &Value| {
+                let id = msg.get("id").cloned();
+                if msg.get("method").and_then(Value::as_str) == Some("textDocument/didOpen") {
+                    captured.lock().unwrap().push(
+                        msg["params"]["textDocument"]["languageId"].as_str().unwrap().to_string(),
+                    );
+                }
+                match msg.get("method").and_then(Value::as_str) {
+                    Some("initialize") => Some(vec![
+                        progress("load", "begin"),
+                        progress("load", "end"),
+                        json!({"jsonrpc": "2.0", "id": id, "result": {"capabilities": {}}}),
+                    ]),
+                    _ if id.is_none() => Some(vec![]),
+                    _ => Some(vec![json!({"jsonrpc": "2.0", "id": id, "result": null})]),
+                }
+            },
+            ReadinessPolicy::WorkDoneProgress,
+        );
+        let mut session =
+            LiveOracleSession::from_warming_client_for(OracleTool::TsLsp, client, TS_VERSION, &uri);
+        let worklist = vec!["view.tsx".to_string()];
+
+        live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
+
+        assert_eq!(opened.lock().unwrap().as_slice(), ["typescriptreact"]);
+    }
+}

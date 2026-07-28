@@ -16,6 +16,7 @@ mod edge_view;
 mod join_tests;
 mod library_usage;
 mod live;
+mod live_real_server;
 mod monikers;
 mod persisted_enums;
 mod pre_spawn;

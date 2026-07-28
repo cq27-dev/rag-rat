@@ -1,14 +1,21 @@
 //! The live oracle's maintenance-pass tail (#74 slice 2 / #534): the watcher-owned state that
-//! drives [`rag_rat_oracle::live_oracle_pass`] — the resident LSP session (lazily spawned,
-//! idle-shutdown) and the backlog of changed paths a prior pass's request budget didn't reach.
+//! drives [`rag_rat_oracle::live_oracle_pass`] — a resident LSP session per live backend (lazily
+//! spawned, idle-shutdown) and the backlog of changed paths a prior pass's request budget didn't
+//! reach.
 //!
 //! Gating (all cheap, in order): `[oracle.live] enabled` (standalone — it does NOT imply or
-//! require `[oracle] auto_run`), Rust among the checkout's indexed languages, and a non-empty
-//! worklist (backlog ∪ this pass's changed `.rs` paths). A pass with no reliable changed set
-//! (a heal/bootstrap leaves `clone_delta_hint = None`) contributes no paths: live's scope is
-//! exactly "files the pass reindexed", and a whole-checkout sweep is the BATCH pass's job.
+//! require `[oracle] auto_run`), the backend's language among the checkout's indexed languages,
+//! and a non-empty worklist (backlog ∪ this pass's changed paths in that language). A pass with
+//! no reliable changed set (a heal/bootstrap leaves `clone_delta_hint = None`) contributes no
+//! paths: live's scope is exactly "files the pass reindexed", and a whole-checkout sweep is the
+//! BATCH pass's job.
 //!
-//! Everything here is best-effort: a missing `rust-analyzer`, a failed spawn, a warming server,
+//! Backends are INDEPENDENT: each keeps its own session, backlog, and respawn backoff, so a
+//! wedged `rust-analyzer` never stalls TypeScript resolution (and vice versa), and each spends
+//! its own request budget. A mixed-language repo therefore runs several resident servers when it
+//! has several live-capable languages indexed.
+//!
+//! Everything here is best-effort: a missing language server, a failed spawn, a warming server,
 //! or a dead server mid-pass never fails the maintenance pass — the worklist rides to the next
 //! pass via the backlog, and an aborted session is dropped so a later pass respawns with bounded
 //! backoff. The tail reports its next backlog-retry or idle-shutdown deadline to the event loop.
@@ -17,9 +24,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
 use rag_rat_base::config::Config;
-use rag_rat_base::language::Language;
 use rag_rat_base::time::now_ms;
-use rag_rat_oracle::LiveOracleSession;
+use rag_rat_oracle::{LiveBackend, LiveOracleSession};
 
 use crate::index::IndexDatabase;
 
@@ -106,53 +112,108 @@ impl LiveOracleLifecycle {
     }
 }
 
-/// Resident live-oracle state for one watcher: the LSP session + the deferred-path backlog.
-/// Owned by the pass-worker closure (it must outlive individual passes); the hook/CLI
-/// `maintenance_pass*` entry points pass no state, so the live stage only ever runs from the
-/// resident watcher — a one-shot CLI pass must not spawn a minutes-warming language server.
+/// Resident live-oracle state for one watcher: one [`LiveBackendTail`] per live backend. Owned by
+/// the pass-worker closure (it must outlive individual passes); the hook/CLI `maintenance_pass*`
+/// entry points pass no state, so the live stage only ever runs from the resident watcher — a
+/// one-shot CLI pass must not spawn a minutes-warming language server.
 pub(crate) struct LiveOracleTail {
-    session: Option<LiveOracleSession>,
-    backlog: Vec<String>,
-    lifecycle: LiveOracleLifecycle,
+    backends: Vec<LiveBackendTail>,
+    /// Which backend claims the shared request budget first on the next pass. Rotated every pass
+    /// so a language with a constantly-large change set cannot starve the others (see
+    /// [`Self::on_pass`]).
+    first_claim: usize,
 }
 
 impl LiveOracleTail {
     pub(crate) fn new() -> Self {
-        Self { session: None, backlog: Vec::new(), lifecycle: LiveOracleLifecycle::default() }
+        Self { backends: LiveBackend::all().map(LiveBackendTail::new).collect(), first_claim: 0 }
     }
 
-    /// Delay until the watcher should run another pass without waiting for a filesystem event.
-    /// A backlog takes priority; otherwise a resident session schedules its own idle shutdown.
+    /// Delay until the watcher should run another pass without waiting for a filesystem event —
+    /// the EARLIEST any backend needs one, since a single pass services them all.
     pub(crate) fn next_wake_in(&self, config: &Config, now: Instant) -> Option<Duration> {
         if !config.oracle.live.enabled {
             return None;
         }
-        self.lifecycle.next_wake_in(
-            !self.backlog.is_empty(),
-            Duration::from_secs(config.oracle.live.idle_shutdown_secs),
-            now,
-        )
+        let idle = Duration::from_secs(config.oracle.live.idle_shutdown_secs);
+        self.backends.iter().filter_map(|backend| backend.next_wake_in(idle, now)).min()
     }
 
-    /// One pass's live stage: resolve pending work, or shut an otherwise-workless session down
-    /// once idle. Never returns an error — a failure is logged and the work rides the next pass.
+    /// One pass's live stage, for every backend in turn.
+    ///
+    /// `max_requests_per_pass` bounds the whole MAINTENANCE PASS, not each backend: the pass holds
+    /// the repository write lock while it runs, so the cap is a lock-hold guarantee and giving
+    /// every backend its own copy would multiply the real bound by the number of live languages.
+    /// The backends therefore draw from ONE budget, and the order rotates each pass so a language
+    /// with a perpetually-large change set cannot starve the rest (whatever a backend does not
+    /// reach stays in its own backlog).
     pub(crate) fn on_pass(
         &mut self,
         db: &IndexDatabase,
         config: &Config,
         changed_paths: Option<&BTreeSet<String>>,
     ) {
-        let live_cfg = &config.oracle.live;
-        if !live_cfg.enabled {
+        if !config.oracle.live.enabled {
             return;
         }
+        let mut budget = config.oracle.live.max_requests_per_pass;
+        for index in claim_order(self.backends.len(), self.first_claim) {
+            self.backends[index].on_pass(db, config, changed_paths, &mut budget);
+        }
+        self.first_claim = self.first_claim.wrapping_add(1);
+    }
+}
+
+/// Backend indices for one pass, starting at `first` and wrapping — the rotation that keeps the
+/// shared request budget fair across passes.
+fn claim_order(count: usize, first: usize) -> impl Iterator<Item = usize> {
+    (0..count).map(move |offset| (first.wrapping_add(offset)) % count.max(1))
+}
+
+/// One live backend's resident state: its LSP session, deferred-path backlog, and respawn/idle
+/// lifecycle. Independent of every other backend's.
+struct LiveBackendTail {
+    backend: LiveBackend,
+    session: Option<LiveOracleSession>,
+    backlog: Vec<String>,
+    lifecycle: LiveOracleLifecycle,
+}
+
+impl LiveBackendTail {
+    fn new(backend: LiveBackend) -> Self {
+        Self {
+            backend,
+            session: None,
+            backlog: Vec::new(),
+            lifecycle: LiveOracleLifecycle::default(),
+        }
+    }
+
+    /// Delay until this backend needs another pass. A backlog takes priority; otherwise a
+    /// resident session schedules its own idle shutdown.
+    fn next_wake_in(&self, idle: Duration, now: Instant) -> Option<Duration> {
+        self.lifecycle.next_wake_in(!self.backlog.is_empty(), idle, now)
+    }
+
+    /// This backend's share of one pass: resolve pending work, or shut an otherwise-workless
+    /// session down once idle. Never returns an error — a failure is logged and the work rides
+    /// the next pass.
+    fn on_pass(
+        &mut self,
+        db: &IndexDatabase,
+        config: &Config,
+        changed_paths: Option<&BTreeSet<String>>,
+        budget: &mut u64,
+    ) {
+        let live_cfg = &config.oracle.live;
         let now = Instant::now();
         let started_at_ms = now_ms();
 
-        // The worklist: backlog first (older edits wait longest), then this pass's changed Rust
-        // paths, deduped. `changed_paths` is `None` on a heal/bootstrap — no reliable superset,
-        // so only the backlog rides.
-        let worklist = assemble_worklist(std::mem::take(&mut self.backlog), changed_paths);
+        // The worklist: backlog first (older edits wait longest), then this pass's changed paths
+        // in this backend's language, deduped. `changed_paths` is `None` on a heal/bootstrap — no
+        // reliable superset, so only the backlog rides.
+        let worklist =
+            assemble_worklist(std::mem::take(&mut self.backlog), changed_paths, &self.backend);
         let idle_shutdown_due = self.lifecycle.idle_shutdown_due(
             !worklist.is_empty(),
             Duration::from_secs(live_cfg.idle_shutdown_secs),
@@ -168,20 +229,27 @@ impl LiveOracleTail {
             }
             return;
         }
-        // Rust must be an indexed language of this checkout (ra-lsp's language).
-        if !config.targets.iter().any(|target| target.language == Language::Rust) {
+        // An earlier backend spent the pass's whole request allowance. Keep this backend's work
+        // (a spawn + a zero-budget pass would only defer it again, after paying a language-server
+        // warm-up) and let the rotation give it first claim on a later pass.
+        if *budget == 0 {
+            self.backlog = worklist;
+            return;
+        }
+        // This backend's language must be an indexed language of the checkout.
+        if !config.targets.iter().any(|target| target.language == self.backend.language) {
             return;
         }
 
-        // Spawn the session lazily on the first eligible pass. `None` (rust-analyzer absent /
-        // unw spawnable) leaves the work in the backlog for a later pass — the same
-        // degrade-quietly UX as a missing embedding model.
+        // Spawn the session lazily on the first eligible pass. `None` (the server is absent, a
+        // checkout prerequisite is unmet, or the spawn failed) leaves the work in the backlog for
+        // a later pass — the same degrade-quietly UX as a missing embedding model.
         if self.session.is_none() {
             if !self.lifecycle.can_respawn(now) {
                 self.backlog = worklist;
                 return;
             }
-            self.session = LiveOracleSession::spawn(&config.root);
+            self.session = LiveOracleSession::spawn(self.backend.tool, &config.root);
             if self.session.is_some() {
                 self.lifecycle.on_spawned(now);
             }
@@ -192,17 +260,15 @@ impl LiveOracleTail {
             return;
         };
 
-        let result = db.run_live_oracle_pass(
-            session,
-            &worklist,
-            live_cfg.max_requests_per_pass,
-            started_at_ms,
-        );
+        let result = db.run_live_oracle_pass(session, &worklist, *budget, started_at_ms);
         // Count idleness from completion: a request batch longer than the idle window must not
         // force an immediate shutdown and cold respawn.
         self.lifecycle.on_session_used(Instant::now());
         match result {
             Ok(report) => {
+                // Charge what was actually spent against the pass-wide allowance, so the
+                // backends that run after this one see a real remainder.
+                *budget = budget.saturating_sub(report.requests_used);
                 self.backlog = report.unfinished_paths.clone();
                 // An aborted pass means the server died or wedged mid-resolution: drop the
                 // session so the next pass respawns a clean one instead of reusing a broken
@@ -276,12 +342,17 @@ fn should_idle_shutdown(
     !has_pending_work && now.saturating_duration_since(last_used_at) >= idle
 }
 
-/// The pass's worklist: backlog paths first (oldest edits wait longest), then the changed
-/// `.rs` paths (ra-lsp's language), deduped, order-preserving. `None` changed paths (a
-/// heal/bootstrap pass) contributes nothing — only the backlog rides.
+/// The pass's worklist for one backend: backlog paths first (oldest edits wait longest), then the
+/// changed paths this backend's language claims, deduped, order-preserving. `None` changed paths
+/// (a heal/bootstrap pass) contributes nothing — only the backlog rides.
+///
+/// The language filter is what keeps backends disjoint: a changed `.ts` file must never reach the
+/// Rust session, which would open it under the wrong `languageId` and spend budget on a file its
+/// server cannot resolve.
 fn assemble_worklist(
     backlog: Vec<String>,
     changed_paths: Option<&BTreeSet<String>>,
+    backend: &LiveBackend,
 ) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut worklist = Vec::new();
@@ -291,7 +362,7 @@ fn assemble_worklist(
         }
     }
     if let Some(paths) = changed_paths {
-        for path in paths.iter().filter(|p| p.ends_with(".rs")) {
+        for path in paths.iter().filter(|path| backend.claims_path(path)) {
             if seen.insert(path.clone()) {
                 worklist.push(path.clone());
             }
@@ -304,25 +375,108 @@ fn assemble_worklist(
 mod tests {
     use super::*;
 
+    fn backend(tool: rag_rat_oracle::OracleTool) -> LiveBackend {
+        LiveBackend::for_tool(tool).expect("a live backend")
+    }
+
     #[test]
-    fn worklist_dedupes_backlog_against_changed_and_filters_non_rust() {
+    fn worklist_dedupes_backlog_against_changed_and_filters_other_languages() {
+        let rust = backend(rag_rat_oracle::OracleTool::RaLsp);
         let backlog = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
         let changed = BTreeSet::from([
             "src/b.rs".to_string(),
             "src/c.rs".to_string(),
             "Cargo.toml".to_string(),
         ]);
-        let worklist = assemble_worklist(backlog, Some(&changed));
+        let worklist = assemble_worklist(backlog, Some(&changed), &rust);
         // Backlog order first, then new changed paths; duplicates collapse; non-Rust dropped.
         assert_eq!(worklist, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
     }
 
     #[test]
     fn worklist_without_changed_set_rides_backlog_only() {
+        let rust = backend(rag_rat_oracle::OracleTool::RaLsp);
         let backlog = vec!["src/a.rs".to_string()];
         // A heal/bootstrap pass (None) contributes no paths.
-        assert_eq!(assemble_worklist(backlog, None), vec!["src/a.rs"]);
-        assert!(assemble_worklist(Vec::new(), None).is_empty());
+        assert_eq!(assemble_worklist(backlog, None, &rust), vec!["src/a.rs"]);
+        assert!(assemble_worklist(Vec::new(), None, &rust).is_empty());
+    }
+
+    #[test]
+    fn each_backend_claims_only_its_own_languages_changed_paths() {
+        // One changed set, several backends: a `.ts` file reaching the Rust session would be
+        // opened under the wrong languageId and burn budget on a file that server cannot
+        // resolve, and vice versa.
+        let changed = BTreeSet::from([
+            "src/a.rs".to_string(),
+            "src/b.ts".to_string(),
+            "src/c.tsx".to_string(),
+            "README.md".to_string(),
+        ]);
+        assert_eq!(
+            assemble_worklist(
+                Vec::new(),
+                Some(&changed),
+                &backend(rag_rat_oracle::OracleTool::RaLsp)
+            ),
+            vec!["src/a.rs"],
+        );
+        assert_eq!(
+            assemble_worklist(
+                Vec::new(),
+                Some(&changed),
+                &backend(rag_rat_oracle::OracleTool::TsLsp)
+            ),
+            vec!["src/b.ts", "src/c.tsx"],
+        );
+    }
+
+    #[test]
+    fn the_tail_wakes_for_the_earliest_backend_that_needs_one() {
+        // A single pass services every backend, so the tail's deadline is the minimum across
+        // them — a backend with a backlog must not wait for another backend's longer idle timer.
+        let mut tail = LiveOracleTail::new();
+        assert!(tail.backends.len() >= 2, "the multi-backend case must actually be exercised");
+        let now = Instant::now();
+        let idle = Duration::from_secs(600);
+        // One backend holds a backlog (retry cadence); another holds an idle session.
+        tail.backends[0].backlog.push("src/a.rs".to_string());
+        tail.backends[1].lifecycle.on_spawned(now);
+        let earliest = tail
+            .backends
+            .iter()
+            .filter_map(|backend| backend.next_wake_in(idle, now))
+            .min()
+            .expect("at least one backend schedules a wake");
+        assert_eq!(earliest, LIVE_ORACLE_RETRY_INTERVAL, "the backlog's retry wins over idle");
+    }
+
+    #[test]
+    fn the_claim_order_rotates_so_no_backend_starves_the_shared_budget() {
+        // `max_requests_per_pass` bounds the whole pass, so the backends share one allowance. If
+        // the order were fixed, a language whose change set always exhausts it would keep every
+        // other language's backlog permanently unserviced.
+        let order = |first| claim_order(3, first).collect::<Vec<_>>();
+        assert_eq!(order(0), vec![0, 1, 2]);
+        assert_eq!(order(1), vec![1, 2, 0]);
+        assert_eq!(order(2), vec![2, 0, 1]);
+        // Every backend is still visited exactly once per pass, whatever the rotation.
+        assert_eq!(order(7).len(), 3);
+        assert_eq!(order(7).iter().collect::<HashSet<_>>().len(), 3);
+        // A wrapped counter must not panic or skip anyone.
+        assert_eq!(claim_order(2, usize::MAX).collect::<Vec<_>>(), vec![1, 0]);
+        assert_eq!(claim_order(0, 5).count(), 0, "no backends is not a division by zero");
+    }
+
+    #[test]
+    fn one_backends_failure_does_not_disturb_another() {
+        // Backends are independent: a crash streak on one must not gate the other's respawn, or
+        // a wedged rust-analyzer would silently stop TypeScript resolution.
+        let mut tail = LiveOracleTail::new();
+        let now = Instant::now();
+        tail.backends[0].lifecycle.on_failure(now);
+        assert!(!tail.backends[0].lifecycle.can_respawn(now));
+        assert!(tail.backends[1].lifecycle.can_respawn(now), "sibling backoff must be separate");
     }
 
     #[test]

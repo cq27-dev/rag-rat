@@ -22,6 +22,12 @@ pub struct ToolManifest {
     pub tool: OracleTool,
     /// The executable to invoke (looked up on `PATH`).
     pub program: &'static str,
+    /// Arguments the LIVE backends spawn the program with. Language servers disagree on how the
+    /// stdio transport is selected — `rust-analyzer` speaks LSP on stdio by default, while
+    /// `typescript-language-server` prints usage and exits without `--stdio` — so the argv belongs
+    /// to the registry entry, not the client. Empty for batch tools, which build their whole
+    /// invocation in [`ToolManifest::scip_command`].
+    pub live_args: &'static [&'static str],
     /// Languages this backend resolves, for status/diagnostics.
     pub languages: &'static [&'static str],
     /// A one-line install hint surfaced when the tool is absent (the `Blocked` UX).
@@ -52,6 +58,7 @@ impl ToolManifest {
             OracleTool::RustAnalyzer => ToolManifest {
                 tool,
                 program: "rust-analyzer",
+                live_args: &[],
                 languages: &["rust"],
                 install_hint: "rust-analyzer not found on PATH. Install it (e.g. `rustup \
                                component add rust-analyzer`) or pass a pre-built index with \
@@ -60,6 +67,7 @@ impl ToolManifest {
             OracleTool::ScipClang => ToolManifest {
                 tool,
                 program: "scip-clang",
+                live_args: &[],
                 languages: &["c", "cpp"],
                 install_hint: "scip-clang not found on PATH. Install it from \
                                github.com/sourcegraph/scip-clang and generate a \
@@ -71,6 +79,7 @@ impl ToolManifest {
             OracleTool::ScipPython => ToolManifest {
                 tool,
                 program: "scip-python",
+                live_args: &[],
                 languages: &["python"],
                 install_hint: "scip-python not found on PATH. Install it (e.g. `npm install -g \
                                @sourcegraph/scip-python`) AND install the project's dependencies \
@@ -80,6 +89,7 @@ impl ToolManifest {
             OracleTool::ScipTypescript => ToolManifest {
                 tool,
                 program: "scip-typescript",
+                live_args: &[],
                 languages: &["typescript"],
                 install_hint: "scip-typescript not found on PATH. Install it (e.g. `npm install \
                                -g @sourcegraph/scip-typescript`) AND install the project's \
@@ -92,6 +102,7 @@ impl ToolManifest {
             OracleTool::ScipJava => ToolManifest {
                 tool,
                 program: "scip-java",
+                live_args: &[],
                 languages: &["kotlin"],
                 install_hint: "scip-java not found on PATH. Install it (e.g. `cs install \
                                --contrib scip-java`, needs a JVM) — it indexes Kotlin through the \
@@ -104,10 +115,24 @@ impl ToolManifest {
             OracleTool::RaLsp => ToolManifest {
                 tool,
                 program: "rust-analyzer",
+                live_args: &[],
                 languages: &["rust"],
                 install_hint: "rust-analyzer not found on PATH. Install it (e.g. `rustup \
                                component add rust-analyzer`) so the live oracle (`[oracle.live] \
                                enabled`) can spawn it as a language server.",
+            },
+            // The live typescript-language-server client (#536). `--stdio` is REQUIRED: without a
+            // transport flag the program prints usage and exits, so the spawn would fail with an
+            // opaque EOF instead of a session.
+            OracleTool::TsLsp => ToolManifest {
+                tool,
+                program: "typescript-language-server",
+                live_args: &["--stdio"],
+                languages: &["typescript"],
+                install_hint: "typescript-language-server not found on PATH. Install it (e.g. \
+                               `npm install -g typescript-language-server typescript`) so the \
+                               live oracle (`[oracle.live] enabled`) can spawn it as a language \
+                               server.",
             },
         }
     }
@@ -168,9 +193,10 @@ impl ToolManifest {
                     .arg("--help")
                     .output()
                     .is_ok_and(|output| output.status.success()),
-            // The live client drives rust-analyzer as an LSP server (no `scip` subcommand needed);
-            // a successful `--version` (already detected by `probe`) is the capability signal.
-            OracleTool::RaLsp => true,
+            // The live clients drive their program as an LSP server (no `.scip` subcommand
+            // needed); a successful `--version` (already detected by `probe`) is the capability
+            // signal.
+            OracleTool::RaLsp | OracleTool::TsLsp => true,
         }
     }
 
@@ -228,8 +254,36 @@ impl ToolManifest {
                     root.display()
                 )
             }),
-            // The live client has no checkout prerequisite beyond the binary itself.
+            // The live rust-analyzer client has no checkout prerequisite beyond the binary itself:
+            // `experimental/serverStatus` reports quiescence for any checkout.
             OracleTool::RaLsp => None,
+            // The live TS client needs a tsconfig project SOMEWHERE in the checkout, for a
+            // different reason than the batch backend's root-level requirement (which is about
+            // `--infer-tsconfig` writing a tsconfig into the source tree).
+            //
+            // typescript-language-server has no quiescence notification. The only warm-up signal
+            // it emits is the work-done progress cycle bracketing a TSCONFIG PROJECT's load;
+            // opening a file that belongs to no project creates an inferred project silently, with
+            // no progress at all. So a checkout with no tsconfig anywhere can never report ready
+            // and the backend would sit in `Warming` forever — correct (the readiness policy still
+            // refuses to ask), but silent. Block with a reason instead.
+            //
+            // The config does NOT have to be at the root: a monorepo whose projects live at
+            // `packages/*/tsconfig.json` warms fine, because the FIRST project load is what the
+            // cycle reports. Requiring a root config would wrongly disable those checkouts.
+            OracleTool::TsLsp => (!super::backend::LiveBackend::for_tool(self.tool)
+                .is_some_and(|backend| backend.checkout_can_signal_readiness(root)))
+            .then(|| {
+                format!(
+                    "the live TypeScript oracle found no tsconfig.json under {} — \
+                     typescript-language-server only reports project-load progress for a real \
+                     tsconfig project, and that signal is what tells the oracle its answers are \
+                     trustworthy (asked mid-load it resolves an imported callee to the import \
+                     statement instead of the definition). Add a tsconfig.json for the project \
+                     (most TypeScript projects ship one) to enable it.",
+                    root.display()
+                )
+            }),
         }
     }
 
@@ -316,9 +370,10 @@ impl ToolManifest {
             // Unreachable: every batch driver gates live-only tools out BEFORE building a command
             // (`produce_scip_with_tool` returns `Blocked`, the auto-run loop and the wizard filter
             // on `batch_capable`). A live tool has no whole-checkout index invocation.
-            OracleTool::RaLsp => unreachable!(
-                "ra-lsp is a live oracle backend with no scip_command — the caller must gate on \
-                 OracleTool::batch_capable()"
+            tool @ (OracleTool::RaLsp | OracleTool::TsLsp) => unreachable!(
+                "{} is a live oracle backend with no scip_command — the caller must gate on \
+                 OracleTool::batch_capable()",
+                tool.as_db_str()
             ),
         }
     }
@@ -363,212 +418,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_tool_has_a_manifest_entry() {
-        // Exhaustive over the OracleTool registry: each variant must resolve to a manifest with a
-        // non-empty program + hint, so `oracle run`/`status` can always describe it. (The `match`
-        // in `for_tool` is the exhaustiveness guard a new variant trips.)
-        for &tool in OracleTool::ALL {
-            let manifest = ToolManifest::for_tool(tool);
-            assert_eq!(manifest.tool, tool);
-            assert!(!manifest.program.is_empty());
-            assert!(!manifest.install_hint.is_empty());
-            assert!(!manifest.languages.is_empty());
+    fn live_backends_declare_their_stdio_argv_and_batch_tools_declare_none() {
+        // A live backend is spawned as `program live_args…`; batch tools build their whole
+        // invocation in `scip_command`, so a stray `live_args` there would be silently ignored
+        // and mislead the next reader.
+        let ts = ToolManifest::for_tool(OracleTool::TsLsp);
+        assert_eq!(ts.program, "typescript-language-server");
+        assert_eq!(
+            ts.live_args,
+            ["--stdio"],
+            "without a transport flag the program prints usage and exits, so the spawn fails with \
+             an opaque EOF instead of a session"
+        );
+        // rust-analyzer speaks LSP on stdio with no flag — the two backends genuinely differ.
+        assert!(ToolManifest::for_tool(OracleTool::RaLsp).live_args.is_empty());
+        for tool in OracleTool::ALL.iter().filter(|tool| tool.batch_capable()) {
+            assert!(
+                ToolManifest::for_tool(*tool).live_args.is_empty(),
+                "{} is batch-only and must declare no live argv",
+                tool.as_db_str()
+            );
         }
     }
 
     #[test]
-    fn absent_program_probes_blocked_with_hint() {
-        // A program that cannot exist on PATH yields Blocked (never an error), carrying the hint —
-        // the missing-tool UX the `oracle run` command turns into exit 0.
-        let manifest = ToolManifest {
-            tool: OracleTool::RustAnalyzer,
-            program: "rag-rat-no-such-tool-xyzzy",
-            languages: &["rust"],
-            install_hint: "install hint here",
-        };
-        let availability = manifest.probe();
-        assert!(!availability.is_available());
-        match availability {
-            ToolAvailability::Blocked { hint, program, .. } => {
-                assert_eq!(program, "rag-rat-no-such-tool-xyzzy");
-                assert_eq!(hint, "install hint here");
-            },
-            other => panic!("expected Blocked, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn detect_version_reads_a_known_program() {
-        // `cargo --version` is reliably present in the test environment (we're building with it).
-        // Proves the version-detection path returns a non-empty line for a real program.
-        let version = detect_version_in("cargo", None);
-        assert!(version.is_some_and(|v| v.starts_with("cargo")));
-    }
-
-    #[test]
-    fn detect_version_in_applies_the_checkout_cwd() {
-        let root = rag_rat_base::test_scratch::ScratchDir::new("oracle-probe-cwd");
-        assert!(detect_version_in("cargo", Some(root.path())).is_some());
-        assert!(
-            detect_version_in("cargo", Some(&root.path().join("missing"))).is_none(),
-            "a missing cwd must prevent spawn, proving current_dir is applied"
-        );
-    }
-
-    #[test]
-    fn probe_requires_the_scip_subcommand_not_just_a_version() {
-        // `cargo` is on PATH and reports a `--version`, but has no `scip` subcommand — so the
-        // capability check fails and the tool is Blocked, not Available (#82 P3: `Blocked` must
-        // mean "can't produce SCIP," not merely "absent"). We borrow `cargo` as a stand-in
-        // for a binary that exists + versions but can't emit SCIP.
-        let manifest = ToolManifest {
-            tool: OracleTool::RustAnalyzer,
-            program: "cargo",
-            languages: &["rust"],
-            install_hint: "hint",
-        };
-        assert!(detect_version_in("cargo", None).is_some(), "cargo reports a version");
-        assert!(!manifest.can_emit_scip(), "cargo has no `scip` subcommand");
-        assert!(
-            !manifest.probe().is_available(),
-            "a versioned binary lacking `scip` must probe Blocked, not Available"
-        );
-    }
-
-    #[test]
-    fn scip_clang_consumes_a_compdb_not_a_root() {
-        // scip-clang's invocation differs from rust-analyzer's: --compdb-path / --index-output-path
-        // and cwd = root (so the compdb's relative paths resolve), no `scip` subcommand.
-        let manifest = ToolManifest::for_tool(OracleTool::ScipClang);
-        assert_eq!(manifest.program, "scip-clang");
-        let cmd = manifest.scip_command(Path::new("/repo"), Path::new("/tmp/out.scip"));
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        // `--compdb-path` is synthesized via `root.join(..).display()`, so it carries the
-        // platform's path separator (`\` on Windows) — scip-clang runs locally and wants
-        // the native path. Build the expectation the same way rather than hardcoding `/`,
-        // so the assertion holds on Windows.
-        let compdb = Path::new("/repo").join("compile_commands.json");
-        assert_eq!(args, vec![
-            format!("--compdb-path={}", compdb.display()),
-            "--index-output-path=/tmp/out.scip".to_string()
-        ]);
-        // No compile_commands.json under a bogus root → prerequisite Blocked (not a run error).
-        assert!(
-            manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_some(),
-            "missing compile_commands.json must report a prerequisite block"
-        );
-        // rust-analyzer has no such prerequisite.
-        assert!(
-            ToolManifest::for_tool(OracleTool::RustAnalyzer)
-                .prerequisite_blocked(Path::new("/repo"))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn scip_command_targets_output_path() {
-        let manifest = ToolManifest::for_tool(OracleTool::RustAnalyzer);
-        let cmd = manifest.scip_command(Path::new("/repo"), Path::new("/tmp/out.scip"));
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(cmd.get_program().to_string_lossy(), "rust-analyzer");
-        assert_eq!(args, vec!["scip", "/repo", "--output", "/tmp/out.scip"]);
-    }
-
-    #[test]
-    fn scip_python_indexes_a_cwd_with_a_project_name() {
-        // scip-python's invocation: `scip-python index --project-name <root-basename> --cwd <root>
-        // --output <abs>`. The project name (the root's dir name) is what gives in-corpus symbols
-        // a non-empty moniker package, and `--cwd` is where it resolves the installed deps. No
-        // compile_commands.json prerequisite (the venv install is the corpus `prepare` step's job).
-        let manifest = ToolManifest::for_tool(OracleTool::ScipPython);
-        assert_eq!(manifest.program, "scip-python");
-        assert_eq!(manifest.languages, &["python"]);
-        let cmd = manifest.scip_command(Path::new("/work/requests"), Path::new("/tmp/out.scip"));
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, vec![
-            "index",
-            "--project-name",
-            "requests",
-            // Pinned constant version (Codex #176): keeps monikers stable across commits.
-            "--project-version",
-            "_",
-            "--cwd",
-            "/work/requests",
-            "--output",
-            "/tmp/out.scip",
-        ]);
-        assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_none());
-    }
-
-    #[test]
-    fn scip_typescript_indexes_a_cwd() {
-        // scip-typescript's invocation: `scip-typescript index --cwd <root> --output <abs>`. No
-        // `--project-name` / `--project-version` (package.json supplies both; the version is
-        // normalized downstream at moniker-write time). NO `--infer-tsconfig` — that flag writes a
-        // tsconfig into the source tree, so a missing tsconfig is a prerequisite Block instead.
-        let manifest = ToolManifest::for_tool(OracleTool::ScipTypescript);
-        assert_eq!(manifest.program, "scip-typescript");
-        assert_eq!(manifest.languages, &["typescript"]);
-        let cmd = manifest.scip_command(Path::new("/work/ky"), Path::new("/tmp/out.scip"));
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, vec!["index", "--cwd", "/work/ky", "--output", "/tmp/out.scip"]);
-        assert!(!args.iter().any(|a| a == "--infer-tsconfig"), "must not dirty the source tree");
-    }
-
-    #[test]
-    fn scip_typescript_requires_a_tsconfig() {
-        // A checkout without a tsconfig.json is Blocked (install-hint UX), not silently run with
-        // `--infer-tsconfig` writing one into the tree — the read-only-on-source contract.
-        let manifest = ToolManifest::for_tool(OracleTool::ScipTypescript);
-        assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_some());
-        let dir = rag_rat_base::test_scratch::ScratchDir::new("ts-prereq");
-        std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
-        assert!(manifest.prerequisite_blocked(&dir).is_none());
-    }
-
-    #[test]
-    fn scip_java_indexes_through_the_gradle_build_in_cwd() {
-        // scip-java's invocation: `scip-java index --build-tool Gradle --output <abs>`, run with
-        // cwd = root. `--build-tool Gradle` is pinned so a checkout that also has a `pom.xml`
-        // doesn't trip scip-java's "Multiple build tools detected" abort. No `--project-version` —
-        // scip-java emits `.` placeholders for the local project regardless of the build's
-        // group/version, so monikers are already commit-stable.
-        let manifest = ToolManifest::for_tool(OracleTool::ScipJava);
-        assert_eq!(manifest.program, "scip-java");
-        assert_eq!(manifest.languages, &["kotlin"]);
-        let cmd = manifest.scip_command(Path::new("/work/app"), Path::new("/tmp/out.scip"));
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, vec!["index", "--build-tool", "Gradle", "--output", "/tmp/out.scip"]);
-        assert_eq!(cmd.get_current_dir(), Some(Path::new("/work/app")), "runs in the project root");
-    }
-
-    #[test]
-    fn scip_java_requires_a_gradle_build() {
-        // scip-java indexes Kotlin THROUGH the Gradle build; without one it's Blocked (the JVM
-        // analog of scip-clang's compile_commands.json prerequisite). A Maven-only checkout is also
-        // Blocked: scip-java's auto-indexer supports Kotlin for Gradle only, so running it on a
-        // `pom.xml` Kotlin project would fail rather than index (Codex on #193).
-        let manifest = ToolManifest::for_tool(OracleTool::ScipJava);
-        assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_some());
-        let dir = rag_rat_base::test_scratch::ScratchDir::new("java-prereq");
-        assert!(manifest.prerequisite_blocked(&dir).is_some(), "empty dir has no build → Blocked");
-        std::fs::write(dir.join("pom.xml"), "").unwrap();
+    fn the_live_typescript_backend_requires_a_warmable_tsconfig_project() {
+        // Not the batch backend's source-tree reason: typescript-language-server only reports its
+        // project-load progress for a real tsconfig project. With none anywhere it emits no signal
+        // ever, so the backend could only sit in `Warming` — correct, but silent. Block with a
+        // reason instead. The gate asks the same question the warm-up does ("is there a document
+        // whose open would signal readiness?"), so the two cannot disagree.
+        let manifest = ToolManifest::for_tool(OracleTool::TsLsp);
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("ts-lsp-prereq");
+        let blocked = manifest.prerequisite_blocked(&dir).expect("no project ⇒ Blocked");
+        assert!(blocked.contains("tsconfig.json"), "{blocked}");
+        // A config need not sit at the ROOT, and it must have a file to open: the progress cycle
+        // reports a PROJECT load, so an empty project is nothing to warm on.
+        std::fs::create_dir_all(dir.join("packages/app")).unwrap();
+        std::fs::write(dir.join("packages/app/tsconfig.json"), "{}").unwrap();
         assert!(
             manifest.prerequisite_blocked(&dir).is_some(),
-            "Maven-only Kotlin is unsupported by scip-java → Blocked"
+            "a project with no TypeScript file cannot warm the server",
         );
-        // scip-java's GradleBuildTool does NOT recognize `settings.gradle.kts`, so neither do we —
-        // accepting it would pass the gate then fail with "no Gradle tool" (Codex on #193).
-        std::fs::write(dir.join("settings.gradle.kts"), "").unwrap();
-        assert!(
-            manifest.prerequisite_blocked(&dir).is_some(),
-            "settings.gradle.kts is not a scip-java Gradle sentinel → still Blocked"
-        );
-        // …but the `gradlew` wrapper IS one of scip-java's sentinels, so it satisfies the gate.
-        std::fs::write(dir.join("gradlew"), "").unwrap();
+        std::fs::write(dir.join("packages/app/main.ts"), "export function x() {}\n").unwrap();
         assert!(
             manifest.prerequisite_blocked(&dir).is_none(),
-            "a gradlew wrapper is a scip-java Gradle sentinel → satisfied"
+            "a nested project with a file satisfies the gate",
         );
+        // The Rust live backend has no such gate: its signal works for any checkout.
+        assert!(ToolManifest::for_tool(OracleTool::RaLsp).prerequisite_blocked(&dir).is_none());
     }
 }

@@ -14,7 +14,6 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +22,7 @@ use serde_json::{Value, json};
 
 use super::position::LspEncoding;
 use super::protocol;
+use super::readiness::{ReadinessPolicy, ReadinessState, ReadinessTracker};
 
 /// The JSON-RPC `MethodNotFound` code — a server's answer for a method it doesn't implement (an
 /// optional request like `textDocument/moniker`), and the code we reply with to a server→client
@@ -37,10 +37,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// readiness is coalesced separately. Bounding the remainder prevents an idle server from growing
 /// the client's heap without limit.
 const INCOMING_QUEUE_CAPACITY: usize = 64;
-
-/// The low bit of `readiness_state` is current readiness; the remaining bits count non-ready
-/// transitions. Keeping both in one atomic makes a checkpoint an indivisible snapshot.
-const SERVER_READY_BIT: u64 = 1;
 
 type IncomingMessage = io::Result<Option<Value>>;
 
@@ -64,7 +60,8 @@ pub(crate) struct LspClient {
     next_id: i64,
     encoding: LspEncoding,
     request_timeout: Duration,
-    readiness_state: Arc<AtomicU64>,
+    readiness_policy: ReadinessPolicy,
+    readiness_state: Arc<ReadinessState>,
     /// The child process for a spawned server; `None` for an injected (test) transport. Present so
     /// [`Drop`] can hard-kill it.
     child: Option<Child>,
@@ -74,8 +71,14 @@ impl LspClient {
     /// Spawn `program args…` from `cwd` as a language server, piping stdio into the JSON-RPC
     /// transport. stderr is discarded (server diagnostics are not part of the protocol). The
     /// session starts at the LSP default encoding (UTF-16) until
-    /// [`initialize`](Self::initialize) negotiates one.
-    pub(crate) fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Self> {
+    /// [`initialize`](Self::initialize) negotiates one, and interprets readiness under `readiness`
+    /// — the signal this backend actually emits.
+    pub(crate) fn spawn(
+        program: &str,
+        args: &[&str],
+        cwd: &Path,
+        readiness: ReadinessPolicy,
+    ) -> io::Result<Self> {
         let mut child = Command::new(program)
             .args(args)
             .current_dir(cwd)
@@ -87,16 +90,17 @@ impl LspClient {
             child.stdin.take().ok_or_else(|| io::Error::other("child stdin unavailable"))?;
         let stdout =
             child.stdout.take().ok_or_else(|| io::Error::other("child stdout unavailable"))?;
-        let readiness_state = Arc::new(AtomicU64::new(0));
+        let readiness_state = Arc::new(ReadinessState::default());
         Ok(Self {
             outgoing: spawn_writer_pump(Box::new(stdin)),
             incoming: spawn_reader_pump(
                 Box::new(BufReader::new(stdout)),
-                Arc::clone(&readiness_state),
+                ReadinessTracker::new(readiness, Arc::clone(&readiness_state)),
             ),
             next_id: 1,
             encoding: LspEncoding::Utf16,
             request_timeout: REQUEST_TIMEOUT,
+            readiness_policy: readiness,
             readiness_state,
             child: Some(child),
         })
@@ -112,16 +116,37 @@ impl LspClient {
         writer: Box<dyn Write + Send>,
         request_timeout: Duration,
     ) -> Self {
-        let readiness_state = Arc::new(AtomicU64::new(0));
+        Self::from_transport_with(reader, writer, request_timeout, ReadinessPolicy::ServerStatus)
+    }
+
+    fn from_transport_with(
+        reader: Box<dyn BufRead + Send>,
+        writer: Box<dyn Write + Send>,
+        request_timeout: Duration,
+        readiness: ReadinessPolicy,
+    ) -> Self {
+        let readiness_state = Arc::new(ReadinessState::default());
         Self {
             outgoing: spawn_writer_pump(writer),
-            incoming: spawn_reader_pump(reader, Arc::clone(&readiness_state)),
+            incoming: spawn_reader_pump(
+                reader,
+                ReadinessTracker::new(readiness, Arc::clone(&readiness_state)),
+            ),
             next_id: 1,
             encoding: LspEncoding::Utf16,
             request_timeout,
+            readiness_policy: readiness,
             readiness_state,
             child: None,
         }
+    }
+
+    /// Whether this session still needs a warm-up `didOpen` before its backend can report ready.
+    /// See [`ReadinessPolicy::needs_warmup_open`]: a `WorkDoneProgress` server only starts (and
+    /// therefore only reports) its project load once a document is opened, so a pass that waits
+    /// for readiness without opening one would wait forever.
+    pub(crate) fn needs_warmup_open(&self) -> bool {
+        self.readiness_policy.needs_warmup_open() && self.readiness_state.checkpoint().is_none()
     }
 
     /// The position encoding negotiated during [`initialize`](Self::initialize) (UTF-16 until
@@ -130,11 +155,11 @@ impl LspClient {
         self.encoding
     }
 
-    /// Drain pending server messages and return a checkpoint only when rust-analyzer is ready.
-    /// Comparing checkpoints around a definition batch detects even a non-ready→ready cycle that
-    /// the latest boolean state alone would hide. Unknown status is deliberately not ready:
-    /// sending definitions before the first status can turn warm-up `null`s into permanently
-    /// missing evidence.
+    /// Drain pending server messages and return a checkpoint only when the server is ready under
+    /// its backend's [`ReadinessPolicy`]. Comparing checkpoints around a definition batch detects
+    /// even a non-ready→ready cycle that the latest boolean state alone would hide. An unobserved
+    /// signal is deliberately not ready: a warming server answers a definition with a warm-up
+    /// artifact, which the write path would persist as a real verdict.
     pub(crate) fn readiness_checkpoint(&mut self) -> io::Result<Option<u64>> {
         let deadline = Instant::now() + self.request_timeout;
         loop {
@@ -146,10 +171,7 @@ impl LspClient {
                     let message = message?.ok_or_else(server_closed_error)?;
                     self.handle_server_message(&message, deadline)?;
                 },
-                Err(TryRecvError::Empty) => {
-                    let state = self.readiness_state.load(Ordering::SeqCst);
-                    return Ok((state & SERVER_READY_BIT != 0).then_some(state >> 1));
-                },
+                Err(TryRecvError::Empty) => return Ok(self.readiness_state.checkpoint()),
                 Err(TryRecvError::Disconnected) => return Err(server_closed_error()),
             }
         }
@@ -157,7 +179,7 @@ impl LspClient {
 
     #[cfg(test)]
     pub(crate) fn assume_ready(&mut self) {
-        self.readiness_state.fetch_or(SERVER_READY_BIT, Ordering::SeqCst);
+        self.readiness_state.assume_ready();
     }
 
     /// Send a request and return its `result`, mapping a JSON-RPC `error` response to an `Err`.
@@ -260,7 +282,21 @@ impl LspClient {
                 "textDocument": {
                     "definition": { "dynamicRegistration": false, "linkSupport": true },
                 },
-                "experimental": { "serverStatusNotification": true },
+                // A readiness signal must be ASKED for, and ONLY the one this session reads:
+                // a server emits server-initiated work-done progress only when the client
+                // advertises `window.workDoneProgress`, and rust-analyzer emits
+                // `experimental/serverStatus` only under its experimental capability. Advertising
+                // a signal we then discard invites the server to open progress tokens whose
+                // `window/workDoneProgress/create` requests occupy the bounded incoming queue
+                // between passes for no benefit.
+                "window": {
+                    "workDoneProgress":
+                        self.readiness_policy == ReadinessPolicy::WorkDoneProgress,
+                },
+                "experimental": {
+                    "serverStatusNotification":
+                        self.readiness_policy == ReadinessPolicy::ServerStatus,
+                },
             },
         });
         let result = self.request("initialize", params)?;
@@ -362,31 +398,22 @@ fn spawn_writer_pump(mut writer: Box<dyn Write + Send>) -> SyncSender<OutgoingMe
 
 fn spawn_reader_pump(
     mut reader: Box<dyn BufRead + Send>,
-    readiness_state: Arc<AtomicU64>,
+    mut readiness: ReadinessTracker,
 ) -> Receiver<IncomingMessage> {
     let (sender, receiver) = mpsc::sync_channel(INCOMING_QUEUE_CAPACITY);
     thread::spawn(move || {
         loop {
             let message = protocol::read_message(&mut reader);
             match message {
-                Ok(Some(message)) if is_server_status(&message) => {
-                    let ready = status_is_ready(&message);
-                    if ready {
-                        readiness_state.fetch_or(SERVER_READY_BIT, Ordering::SeqCst);
-                    } else {
-                        let _ = readiness_state.fetch_update(
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                            |state| Some(state.wrapping_add(2) & !SERVER_READY_BIT),
-                        );
-                    }
-                },
+                // Readiness signals are coalesced into the shared state, never queued: a
+                // long-running server emits many of them and they carry no reply obligation.
+                Ok(Some(message)) if readiness.observe(&message) => {},
                 Ok(Some(message)) if should_queue_incoming(&message) => {
                     if sender.send(Ok(Some(message))).is_err() {
                         return;
                     }
                 },
-                // Diagnostics, logs, and progress are irrelevant to this client.
+                // Diagnostics, logs, and the other backend's progress chatter are irrelevant.
                 Ok(Some(_)) => {},
                 terminal => {
                     let _ = sender.send(terminal);
@@ -398,20 +425,10 @@ fn spawn_reader_pump(
     receiver
 }
 
-fn is_server_status(message: &Value) -> bool {
-    message.get("method").and_then(Value::as_str) == Some("experimental/serverStatus")
-}
-
 fn should_queue_incoming(message: &Value) -> bool {
     // Responses and server requests have ids. Ordinary notifications do not and would otherwise
     // accumulate while the watcher is idle.
     message.get("id").is_some()
-}
-
-fn status_is_ready(message: &Value) -> bool {
-    let params = &message["params"];
-    params.get("quiescent").and_then(Value::as_bool) == Some(true)
-        && params.get("health").and_then(Value::as_str) != Some("error")
 }
 
 fn server_closed_error() -> io::Error {
@@ -449,7 +466,7 @@ pub(crate) mod test_support {
 
     use serde_json::Value;
 
-    use super::{LspClient, protocol};
+    use super::{LspClient, ReadinessPolicy, protocol};
 
     /// Wire an [`LspClient`] to an in-process fake server run on a thread over two
     /// `std::io::pipe`s. `handler(request)` returns `Some(messages_to_emit)` (notifications can
@@ -464,7 +481,27 @@ pub(crate) mod test_support {
         client_with_server_timeout(handler, super::REQUEST_TIMEOUT)
     }
 
+    /// A fake-server client that interprets readiness under `policy` — the seam for exercising a
+    /// backend whose signal is not rust-analyzer's `experimental/serverStatus`.
+    pub(crate) fn client_with_server_policy<H>(handler: H, policy: ReadinessPolicy) -> LspClient
+    where
+        H: FnMut(&Value) -> Option<Vec<Value>> + Send + 'static,
+    {
+        client_with_server_inner(handler, super::REQUEST_TIMEOUT, policy)
+    }
+
     pub(crate) fn client_with_server_timeout<H>(handler: H, timeout: Duration) -> LspClient
+    where
+        H: FnMut(&Value) -> Option<Vec<Value>> + Send + 'static,
+    {
+        client_with_server_inner(handler, timeout, ReadinessPolicy::ServerStatus)
+    }
+
+    fn client_with_server_inner<H>(
+        handler: H,
+        timeout: Duration,
+        policy: ReadinessPolicy,
+    ) -> LspClient
     where
         H: FnMut(&Value) -> Option<Vec<Value>> + Send + 'static,
     {
@@ -485,10 +522,11 @@ pub(crate) mod test_support {
                 }
             }
         });
-        LspClient::from_transport_with_timeout(
+        LspClient::from_transport_with(
             Box::new(BufReader::new(from_server_read)),
             Box::new(to_server_write),
             timeout,
+            policy,
         )
     }
 }
@@ -528,6 +566,44 @@ mod tests {
             init["params"]["capabilities"]["experimental"]["serverStatusNotification"].as_bool(),
             Some(true),
         );
+    }
+
+    #[test]
+    fn initialize_asks_only_for_the_readiness_signal_this_session_reads() {
+        // Advertising a signal the session then discards invites the server to open progress
+        // tokens whose `window/workDoneProgress/create` requests occupy the bounded incoming
+        // queue between passes, for a signal nothing consumes.
+        for (policy, work_done, server_status) in [
+            (ReadinessPolicy::ServerStatus, false, true),
+            (ReadinessPolicy::WorkDoneProgress, true, false),
+        ] {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let capture = Arc::clone(&captured);
+            let mut client = test_support::client_with_server_policy(
+                move |msg: &Value| {
+                    capture.lock().unwrap().push(msg.clone());
+                    respond(msg, Some("utf-16"))
+                },
+                policy,
+            );
+            client.initialize("file:///repo").unwrap();
+            let requests = captured.lock().unwrap();
+            let capabilities = requests
+                .iter()
+                .find(|m| m.get("method").and_then(Value::as_str) == Some("initialize"))
+                .expect("an initialize request was sent")["params"]["capabilities"]
+                .clone();
+            assert_eq!(
+                capabilities["window"]["workDoneProgress"].as_bool(),
+                Some(work_done),
+                "{policy:?}",
+            );
+            assert_eq!(
+                capabilities["experimental"]["serverStatusNotification"].as_bool(),
+                Some(server_status),
+                "{policy:?}",
+            );
+        }
     }
 
     /// Build an `initialize` response echoing `encoding` (or none when `encoding` is `None`), and a
@@ -725,10 +801,12 @@ mod tests {
         )
         .unwrap();
 
-        let readiness_state = Arc::new(AtomicU64::new(0));
         let incoming = spawn_reader_pump(
             Box::new(BufReader::new(std::io::Cursor::new(framed))),
-            readiness_state,
+            ReadinessTracker::new(
+                ReadinessPolicy::ServerStatus,
+                Arc::new(ReadinessState::default()),
+            ),
         );
         assert_eq!(
             incoming.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(),
@@ -752,14 +830,28 @@ mod tests {
 
     #[test]
     fn spawn_of_a_missing_program_errors() {
-        assert!(LspClient::spawn("rag-rat-no-such-lsp-xyzzy", &[], Path::new(".")).is_err());
+        assert!(
+            LspClient::spawn(
+                "rag-rat-no-such-lsp-xyzzy",
+                &[],
+                Path::new("."),
+                ReadinessPolicy::ServerStatus,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn spawn_applies_the_checkout_cwd() {
         let root = rag_rat_base::test_scratch::ScratchDir::new("lsp-spawn-cwd");
         assert!(
-            LspClient::spawn("cargo", &["--version"], &root.path().join("missing")).is_err(),
+            LspClient::spawn(
+                "cargo",
+                &["--version"],
+                &root.path().join("missing"),
+                ReadinessPolicy::ServerStatus,
+            )
+            .is_err(),
             "a missing cwd must prevent spawn"
         );
     }

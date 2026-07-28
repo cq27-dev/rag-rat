@@ -1,18 +1,19 @@
 //! The live oracle pass: wire the resident LSP client to the watcher's maintenance pass and WRITE
-//! its per-callee verdicts into the `edge_oracle` seam under the distinct
-//! [`OracleTool::RaLsp`] tool id.
+//! its per-callee verdicts into the `edge_oracle` seam under the live backend's distinct tool id
+//! (`ra-lsp`, `ts-lsp`, …). The pass is backend-agnostic: which server it drives, which files it
+//! accepts, and how it knows the server is ready all come from the session's `LiveBackend`.
 //!
 //! Invariants this module upholds (settled on #74):
 //!
-//! - **Tool identity.** Live rows carry `ra-lsp` + the session's probed `rust-analyzer --version`
-//!   (re-probed at every spawn). Reusing the batch `rust-analyzer` id is rejected: a live
-//!   `oracle_runs` row under the batch id would make `auto_run_decision` see the index as
-//!   always-fresh and silently stop the whole-checkout batch pass.
+//! - **Tool identity.** Live rows carry the LIVE tool id + the session's probed `--version`
+//!   (re-probed at every spawn). Reusing the batch tool's id is rejected: a live `oracle_runs` row
+//!   under the batch id would make `auto_run_decision` see the index as always-fresh and silently
+//!   stop the whole-checkout batch pass.
 //! - **Moniker source.** A live verdict's `scip_symbol` is the resolved target's BATCH moniker from
 //!   `logical_symbol_monikers` — byte-identical to what the batch pass writes, so clone-collapse
 //!   (#275) and moniker-anchored memory relocation treat live and batch rows as one evidence set
 //!   with zero consumer changes. When the target has no batch moniker (batch never ran, or the def
-//!   is outside its definitions) the fallback is a `local ra-lsp-<hash>` SCIP-local sentinel:
+//!   is outside its definitions) the fallback is a `local <tool>-<hash>` SCIP-local sentinel:
 //!   `is_local_symbol` skips it before the conflict logic, so it can never poison a batch moniker,
 //!   while the row's `resolved_symbol_id` still upgrades the edge tier. The sentinel's hash is
 //!   content-derived (callsite path + callee span), so it is STABLE across reindexes — a no-op
@@ -34,9 +35,13 @@
 //!   — the live analog of the batch join's index-vs-disk content gate. Anything else is skipped,
 //!   never mis-joined.
 //!
-//! Out of scope: non-Rust backends (#536) and `resolved-external` verdicts (a live definition
-//! outside the checkout has no batch-interchangeable SCIP symbol string, so it is skipped, not
-//! written).
+//! - **Readiness.** A warming server is never asked for a definition, and a batch that straddled a
+//!   reload is discarded rather than interpreted. This is a correctness rule, not a latency one: a
+//!   not-yet-loaded server does not reliably answer `null`, it can answer WRONG (see
+//!   `lsp::readiness`), and a wrong answer would be persisted as a real verdict.
+//!
+//! Out of scope: `resolved-external` verdicts (a live definition outside the checkout has no
+//! batch-interchangeable SCIP symbol string, so it is skipped, not written).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -48,60 +53,92 @@ use rusqlite::Connection;
 use serde::Serialize;
 use url::Url;
 
+use super::backend::LiveBackend;
 use super::lsp::client::LspClient;
 use super::lsp::position::LineIndex;
 use super::store::{self, EdgeOracleRow};
 use super::{OracleResolutionKind, OracleTool, ToolAvailability, ToolManifest, join};
 
-/// A resident live-oracle language-server session: the spawned client, the `tool_version` its
-/// rows are stamped with, and the checkout root URI documents are opened under. Owned by the
-/// watcher's pass worker across passes; spawned lazily on the first eligible pass and shut down
-/// after an idle window (both driven by the watcher).
+/// A resident live-oracle language-server session: the spawned client, the backend it drives, the
+/// `tool_version` its rows are stamped with, and the checkout root URI documents are opened
+/// under. Owned by the watcher's pass worker across passes; spawned lazily on the first eligible
+/// pass and shut down after an idle window (both driven by the watcher).
 pub struct LiveOracleSession {
+    backend: LiveBackend,
     client: LspClient,
     tool_version: String,
     root_uri: String,
 }
 
 impl LiveOracleSession {
-    /// Probe `rust-analyzer` and spawn the resident client for `checkout_root`, or `None` when
-    /// the tool is unavailable / the session can't be established — the same degrade-quietly UX
-    /// as a missing embedding model or batch tool (never an error, never a failed pass). The
-    /// version is RE-probed at every spawn so `tool_version` always names the binary this
-    /// session's verdicts came from.
-    pub fn spawn(checkout_root: &Path) -> Option<Self> {
-        let manifest = ToolManifest::for_tool(OracleTool::RaLsp);
+    /// Probe `backend`'s language server and spawn the resident client for `checkout_root`, or
+    /// `None` when the tool is unavailable / a checkout prerequisite is unmet / the session can't
+    /// be established — the same degrade-quietly UX as a missing embedding model or batch tool
+    /// (never an error, never a failed pass). The version is RE-probed at every spawn so
+    /// `tool_version` always names the binary this session's verdicts came from.
+    pub fn spawn(tool: OracleTool, checkout_root: &Path) -> Option<Self> {
+        let backend = LiveBackend::for_tool(tool)?;
+        let manifest = ToolManifest::for_tool(tool);
+        // The prerequisite gate is not cosmetic for every backend: the live TypeScript client
+        // needs a tsconfig.json because that is what makes the server emit the project-load
+        // signal it has no other way to report. Spawning without it would resolve definitions
+        // during a warm-up window that answers WRONG rather than null.
+        if manifest.prerequisite_blocked(checkout_root).is_some() {
+            return None;
+        }
         let ToolAvailability::Available { version, .. } = manifest.probe_in(checkout_root) else {
             return None;
         };
         let root_uri = root_uri_for(checkout_root)?;
-        let mut client = LspClient::spawn(manifest.program, &[], checkout_root).ok()?;
+        let mut client = LspClient::spawn(
+            manifest.program,
+            manifest.live_args,
+            checkout_root,
+            backend.readiness,
+        )
+        .ok()?;
         client.initialize(&root_uri).ok()?;
-        Some(Self { client, tool_version: version, root_uri })
+        Some(Self { backend, client, tool_version: version, root_uri })
     }
 
     /// Test seam: a session over an injected (fake-server) client transport. Runs the
     /// `initialize` handshake exactly like [`Self::spawn`] so the negotiated encoding is real.
     #[cfg(test)]
-    pub(crate) fn from_client(mut client: LspClient, tool_version: &str, root_uri: &str) -> Self {
-        client.initialize(root_uri).expect("test server completes the handshake");
-        client.assume_ready();
-        Self::from_initialized_client(client, tool_version, root_uri)
+    pub(crate) fn from_client(client: LspClient, tool_version: &str, root_uri: &str) -> Self {
+        let mut session = Self::from_warming_client(client, tool_version, root_uri);
+        session.client.assume_ready();
+        session
     }
 
     #[cfg(test)]
     pub(crate) fn from_warming_client(
+        client: LspClient,
+        tool_version: &str,
+        root_uri: &str,
+    ) -> Self {
+        Self::from_warming_client_for(OracleTool::RaLsp, client, tool_version, root_uri)
+    }
+
+    /// The tool-parameterized warm session seam: drives the pass through a specific backend's
+    /// language ids, sentinel namespace, and moniker source.
+    #[cfg(test)]
+    pub(crate) fn from_warming_client_for(
+        tool: OracleTool,
         mut client: LspClient,
         tool_version: &str,
         root_uri: &str,
     ) -> Self {
         client.initialize(root_uri).expect("test server completes the handshake");
-        Self::from_initialized_client(client, tool_version, root_uri)
+        Self {
+            backend: LiveBackend::for_tool(tool).expect("a live backend"),
+            client,
+            tool_version: tool_version.to_string(),
+            root_uri: root_uri.to_string(),
+        }
     }
 
-    #[cfg(test)]
-    fn from_initialized_client(client: LspClient, tool_version: &str, root_uri: &str) -> Self {
-        Self { client, tool_version: tool_version.to_string(), root_uri: root_uri.to_string() }
+    pub fn tool(&self) -> OracleTool {
+        self.backend.tool
     }
 
     pub fn tool_version(&self) -> &str {
@@ -117,6 +154,58 @@ impl LiveOracleSession {
 
     fn readiness_checkpoint(&mut self) -> std::io::Result<Option<u64>> {
         self.client.readiness_checkpoint()
+    }
+
+    /// Nudge a backend whose readiness signal only appears in response to an open document
+    /// (`typescript-language-server` starts its project load on the first `didOpen`, not at
+    /// `initialize`): send one `didOpen`/`didClose` pair for a worklist file that can actually
+    /// produce the signal, then return.
+    ///
+    /// The file CHOICE matters, it is not just "the first one on disk": a document belonging to no
+    /// tsconfig project opens as an inferred project silently, emitting no progress cycle, so
+    /// warming on it leaves the session exactly as un-warmed as before. A worklist of only such
+    /// files would re-open an ineffective document every pass and never warm — so when none of
+    /// them qualifies the backend supplies one by SEARCHING the checkout. That is worth doing
+    /// because the expensive warm-up is per server, not per project: once any real project has
+    /// loaded, even the project-less files resolve correctly.
+    ///
+    /// Deliberately fire-and-forget. The pass runs under the repository write lock, so blocking
+    /// here for a project load — seconds on a real project — would stall every writer. The
+    /// notifications are enough: the server loads in the background, its progress cycle latches
+    /// the session ready, and the NEXT pass resolves the deferred worklist normally. Closing the
+    /// document immediately does not cancel the load.
+    fn trigger_warmup_open(&mut self, checkout_root: &Path, worklist: &[String]) {
+        let open_document = |absolute: &Path| {
+            let text = std::fs::read_to_string(absolute).ok()?;
+            let uri: String = Url::from_file_path(absolute).ok()?.into();
+            let language_id = self.backend.language_id_for(&absolute.to_string_lossy());
+            Some((language_id, uri, text))
+        };
+        let opened = worklist
+            .iter()
+            .filter(|path| self.backend.open_signals_readiness(checkout_root, path))
+            .find_map(|path| open_document(&checkout_root.join(path)))
+            .or_else(|| {
+                self.backend.warmup_document(checkout_root).as_deref().and_then(open_document)
+            });
+        let Some((language_id, uri, text)) = opened else {
+            return;
+        };
+        if self.client.did_open(&uri, language_id, &text).is_ok() {
+            let _ = self.client.did_close(&uri);
+        }
+    }
+
+    fn needs_warmup_open(&self) -> bool {
+        self.client.needs_warmup_open()
+    }
+
+    /// Test barrier: one synchronous round trip. The transport is FIFO, so a returned response
+    /// proves the server has processed every fire-and-forget notification sent before it —
+    /// without this, a test asserting on the warm-up `didOpen` races the server thread.
+    #[cfg(test)]
+    pub(crate) fn barrier(&mut self) {
+        let _ = self.client.request("$/barrier", serde_json::Value::Null);
     }
 }
 
@@ -193,6 +282,11 @@ pub fn live_oracle_pass(
     match session.readiness_checkpoint() {
         Ok(Some(_)) => {},
         Ok(None) => {
+            // A backend whose readiness signal only fires for an open document can never report
+            // ready while the pass declines to open one. Break that deadlock without blocking.
+            if session.needs_warmup_open() {
+                session.trigger_warmup_open(input.checkout_root, input.worklist);
+            }
             report.unfinished_paths = input.worklist.to_vec();
             report.status = "Warming".to_string();
             return Ok(report);
@@ -203,9 +297,9 @@ pub fn live_oracle_pass(
             return Ok(report);
         },
     }
-    let tool = OracleTool::RaLsp;
-    // The batch tool whose monikers live copies (rust-analyzer for ra-lsp) — always `Some` for a
-    // live tool; the join is vacuous without it.
+    let tool = session.tool();
+    // The batch tool whose monikers live copies (rust-analyzer for ra-lsp, scip-typescript for
+    // ts-lsp) — always `Some` for a live tool; the join is vacuous without it.
     let Some(moniker_source) = tool.batch_moniker_source() else {
         anyhow::bail!("live_oracle_pass requires a live (non-batch) tool");
     };
@@ -369,7 +463,8 @@ pub fn live_oracle_pass(
         let starts: Vec<usize> =
             to_resolve.iter().filter_map(|c| usize::try_from(c.callee_start_byte).ok()).collect();
         report.requests_used += starts.len() as u64;
-        let resolved = match session.client.resolve_definitions(&uri, "rust", &text, &starts) {
+        let language_id = session.backend.language_id_for(path);
+        let resolved = match session.client.resolve_definitions(&uri, language_id, &text, &starts) {
             Ok(resolved) => resolved,
             Err(err) => {
                 // A dead/wedged server: keep what earlier files produced, REQUEUE this file and
@@ -519,7 +614,7 @@ pub fn live_oracle_pass(
             let scip_symbol = moniker_cache
                 .get(&symbol_id)
                 .and_then(Clone::clone)
-                .unwrap_or_else(|| live_local_sentinel(&candidate.source_path, candidate));
+                .unwrap_or_else(|| live_local_sentinel(tool, &candidate.source_path, candidate));
 
             let row = EdgeOracleRow {
                 source_path: &candidate.source_path,
@@ -628,16 +723,24 @@ fn defer_candidate_paths_from(
 }
 
 /// The content-stable SCIP-local sentinel a live verdict carries when the resolved symbol has no
-/// batch moniker: `local ra-lsp-<hash>` keyed by the callsite (path + callee span), so a no-op
+/// batch moniker: `local <tool>-<hash>` keyed by the callsite (path + callee span), so a no-op
 /// re-pass reproduces the SAME string (a same-value upsert — no refine-cache churn). Parses as a
 /// SCIP local symbol, so `is_local_symbol` drops it before `current_callee_monikers`' conflict
 /// logic and it can never poison a batch moniker.
-fn live_local_sentinel(source_path: &str, candidate: &store::EdgeJoinCandidate) -> String {
+///
+/// The tool id namespaces the sentinel so two live backends can never mint the same string for
+/// different evidence; the HASH input deliberately stays callsite-only, so `ra-lsp` rows written
+/// before a second backend existed keep reproducing byte-identically.
+fn live_local_sentinel(
+    tool: OracleTool,
+    source_path: &str,
+    candidate: &store::EdgeJoinCandidate,
+) -> String {
     let hash = hex_sha256(
         format!("{}:{}:{}", source_path, candidate.callee_start_byte, candidate.callee_end_byte)
             .as_bytes(),
     );
-    format!("local ra-lsp-{}", &hash[..16])
+    format!("local {}-{}", tool.as_db_str(), &hash[..16])
 }
 
 /// The canonical `file://` URL of a checkout directory. `url` handles native disk,
@@ -749,12 +852,42 @@ mod tests {
             edge_kind: "calls_name".to_string(),
             to_symbol_id: None,
         };
-        let a = live_local_sentinel("src/lib.rs", &candidate);
-        let b = live_local_sentinel("src/lib.rs", &candidate);
+        let a = live_local_sentinel(OracleTool::RaLsp, "src/lib.rs", &candidate);
+        let b = live_local_sentinel(OracleTool::RaLsp, "src/lib.rs", &candidate);
         assert_eq!(a, b, "same callsite reproduces the same sentinel (no refine churn)");
         assert!(super::super::scip::is_local_symbol(&a), "parses as a SCIP local: {a}");
+        // Pinned: rows written before a second live backend existed must keep reproducing this
+        // exact string, or every ra-lsp verdict churns the refine cache on the next pass.
         assert!(a.starts_with("local ra-lsp-"));
         let other = store::EdgeJoinCandidate { callee_start_byte: 5, ..candidate };
-        assert_ne!(a, live_local_sentinel("src/lib.rs", &other), "span-keyed");
+        assert_ne!(a, live_local_sentinel(OracleTool::RaLsp, "src/lib.rs", &other), "span-keyed");
+    }
+
+    #[test]
+    fn every_live_backend_mints_a_distinct_parseable_sentinel() {
+        // Two backends must never mint the same sentinel for the same callsite (that would make
+        // one backend's evidence indistinguishable from the other's), and every sentinel must
+        // still parse as a SCIP local so it is dropped before the moniker-conflict logic.
+        let candidate = store::EdgeJoinCandidate {
+            edge_id: 1,
+            source_path: "src/lib".to_string(),
+            file_sha: "sha".to_string(),
+            source_start_byte: 0,
+            source_end_byte: 10,
+            callee_start_byte: 4,
+            callee_end_byte: 9,
+            confidence: "NameOnly".to_string(),
+            edge_kind: "calls_name".to_string(),
+            to_symbol_id: None,
+        };
+        let mut seen = std::collections::HashSet::new();
+        for &tool in OracleTool::ALL.iter().filter(|tool| !tool.batch_capable()) {
+            let sentinel = live_local_sentinel(tool, "src/lib", &candidate);
+            assert!(
+                super::super::scip::is_local_symbol(&sentinel),
+                "{sentinel} must parse as a SCIP local"
+            );
+            assert!(seen.insert(sentinel.clone()), "{sentinel} collides across backends");
+        }
     }
 }
