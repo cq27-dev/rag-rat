@@ -621,6 +621,16 @@ fn an_entrys_shape_is_judged_the_way_clangd_judges_it() {
         r#"[{"directory":"/x","command":"cc -c a.c"}]"#,
         r#"[{"file":"/x/a.c","command":"cc -c a.c"}]"#,
         r#"[{"directory":"/x","file":"/x/a.c"}]"#,
+        // Invocation present but EMPTY, so it yields no command line. clangd loads the database
+        // and then reports `Failed to parse command line` for that file (`--check` exits 3), so a
+        // database whose only entry looks like this describes no analysable translation unit.
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":[]}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":[""]}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","command":""}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","command":"   "}]"#,
+        // An element that is not a scalar makes clangd refuse the database outright.
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":[{}]}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":[["cc"]]}]"#,
     ];
     for database in rejected {
         std::fs::write(dir.join("compile_commands.json"), database).unwrap();
@@ -634,7 +644,6 @@ fn an_entrys_shape_is_judged_the_way_clangd_judges_it() {
         // Each invocation in its own correct form, including an empty argument list.
         r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c"}]"#,
         r#"[{"directory":"/x","file":"/x/a.c","arguments":["cc","-c","a.c"]}]"#,
-        r#"[{"directory":"/x","file":"/x/a.c","arguments":[]}]"#,
         // Any scalar is a scalar. clangd reads the node as text and never checks what kind it was:
         // it loads `"directory": 7` and runs the command in a directory literally named `7`, and
         // takes `"command": null` as the command string. Refusing these would be the false
@@ -648,6 +657,16 @@ fn an_entrys_shape_is_judged_the_way_clangd_judges_it() {
         r#"[{"directory":"/x","file":"/x/a.c","arguments":[7,8]}]"#,
         // An unknown key is read and discarded, as clangd does with `output`.
         r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","output":"a.o"}]"#,
+        // One blank word among real ones still leaves a parseable command line.
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":["","cc","-c","a.c"]}]"#,
+        // THE CASE THAT MUST NOT OVER-CORRECT: an empty invocation is a PER-ENTRY failure, not a
+        // database-wide one. Measured — with a good entry alongside it, the good entry's file is
+        // still analysed with the database's own flags, and only the empty entry's file fails. A
+        // real export can carry one degenerate line among a hundred thousand, and condemning the
+        // whole database over it would cost the checkout every live verdict it would otherwise
+        // get.
+        r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c"},
+            {"directory":"/x","file":"/x/b.c","arguments":[]}]"#,
     ];
     for database in accepted {
         std::fs::write(dir.join("compile_commands.json"), database).unwrap();

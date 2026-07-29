@@ -405,7 +405,19 @@ struct CompilationDatabase {
 /// "key present and null" into `None` — and those differ here: `"arguments": null` is a PRESENT
 /// arguments field of the wrong shape, which clangd rejects, while an absent one is satisfied by
 /// `command`. Every payload is discarded, so nothing allocates per entry.
-struct CompilationEntry;
+///
+/// An entry whose invocation is present but EMPTY (`"arguments": []`, `"command": ""`) is a
+/// different failure from every other one here, and the difference is load-bearing. Measured, it
+/// does not reject the database: clangd loads it, and other entries keep working — only the file
+/// that entry names becomes unanalysable (`Failed to parse command line`, and `--check` exits 3).
+/// So such an entry is reported as configuring nothing rather than as an error, and the database
+/// stays usable as long as SOME entry configures a file. Treating it as an error instead would
+/// condemn a 120k-entry database over one degenerate line and cost the checkout all its live
+/// evidence.
+struct CompilationEntry {
+    /// Whether this entry yields a command line clangd can parse.
+    configures_a_file: bool,
+}
 
 /// The entry fields whose shape is constrained. `Other` is every extra key a generator emits
 /// (`output`, and whatever else) — read and discarded, since clangd ignores them too.
@@ -437,6 +449,7 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let (mut file, mut directory, mut invocation) = (false, false, false);
+        let mut configures_a_file = false;
         while let Some(field) = map.next_key::<EntryField>()? {
             match field {
                 EntryField::File => {
@@ -448,11 +461,13 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
                     directory = true;
                 },
                 EntryField::Command => {
-                    map.next_value::<JsonScalar>()?;
+                    // A non-string scalar is not blank: clangd reads the node as text, so `null`,
+                    // `7`, and `true` each become a one-word command line it parses happily.
+                    configures_a_file |= !map.next_value::<JsonScalar>()?.blank;
                     invocation = true;
                 },
                 EntryField::Arguments => {
-                    map.next_value::<JsonSequence>()?;
+                    configures_a_file |= map.next_value::<JsonSequence>()?.carries_an_argument;
                     invocation = true;
                 },
                 EntryField::Other => {
@@ -460,8 +475,9 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
                 },
             }
         }
-        // The same three the server reports: `Missing key: "file"`, `Missing key: "directory"`, and
-        // `Missing key: "command" or "arguments"`.
+        // The three the server reports by REJECTING THE FILE: `Missing key: "file"`, `Missing key:
+        // "directory"`, and `Missing key: "command" or "arguments"`. An empty invocation is not
+        // among them — it is carried out on `configures_a_file` instead.
         if !file {
             return Err(de::Error::missing_field("file"));
         }
@@ -471,13 +487,19 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
         if !invocation {
             return Err(de::Error::custom("entry has neither `command` nor `arguments`"));
         }
-        Ok(CompilationEntry)
+        Ok(CompilationEntry { configures_a_file })
     }
 }
 
-/// Any JSON scalar — string, number, boolean, or null — with the value discarded. Composites are
-/// refused by leaving `visit_seq`/`visit_map` to the erroring defaults.
-struct JsonScalar;
+/// Any JSON scalar — string, number, boolean, or null. The value itself is discarded; only whether
+/// it carries TEXT is kept, because an empty or whitespace-only `command` is what clangd turns into
+/// an unparseable command line. Composites are refused by leaving `visit_seq`/`visit_map` to the
+/// erroring defaults.
+struct JsonScalar {
+    /// Whether the scalar renders as blank text. Only a string can: clangd reads any other scalar
+    /// as its literal text (`null`, `7`, `true`), which is a perfectly good command word.
+    blank: bool,
+}
 
 impl<'de> Deserialize<'de> for JsonScalar {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -495,41 +517,44 @@ impl<'de> Visitor<'de> for JsonScalarVisitor {
     }
 
     fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
-        Ok(JsonScalar)
+        Ok(JsonScalar { blank: false })
     }
 
     fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
-        Ok(JsonScalar)
+        Ok(JsonScalar { blank: false })
     }
 
     fn visit_i128<E: de::Error>(self, _: i128) -> Result<Self::Value, E> {
-        Ok(JsonScalar)
+        Ok(JsonScalar { blank: false })
     }
 
     fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
-        Ok(JsonScalar)
+        Ok(JsonScalar { blank: false })
     }
 
     fn visit_u128<E: de::Error>(self, _: u128) -> Result<Self::Value, E> {
-        Ok(JsonScalar)
+        Ok(JsonScalar { blank: false })
     }
 
     fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
-        Ok(JsonScalar)
+        Ok(JsonScalar { blank: false })
     }
 
-    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
-        Ok(JsonScalar)
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+        Ok(JsonScalar { blank: text.trim().is_empty() })
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(JsonScalar)
+        Ok(JsonScalar { blank: false })
     }
 }
 
-/// A JSON array whose ELEMENTS are discarded — only the shape is checked, matching clangd, which
-/// does not type-check the elements either.
-struct JsonSequence;
+/// A JSON array of command words. Each element must be a scalar — clangd refuses a database whose
+/// `arguments` holds an object or a nested array — but their values are discarded beyond whether
+/// any of them carries text, since `[]` and `[""]` both produce an empty command line.
+struct JsonSequence {
+    carries_an_argument: bool,
+}
 
 impl<'de> Deserialize<'de> for JsonSequence {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -547,10 +572,14 @@ impl<'de> Visitor<'de> for JsonSequenceVisitor {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        // An EMPTY array is accepted on purpose: clangd loads such a database rather than
-        // rejecting it, and this check exists to agree with the server, not to improve on it.
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(JsonSequence)
+        // An empty array is READ rather than rejected — clangd loads such a database, it just
+        // cannot analyse the file that entry names. The whole sequence is still consumed so a
+        // composite element anywhere in it is caught.
+        let mut carries_an_argument = false;
+        while let Some(word) = seq.next_element::<JsonScalar>()? {
+            carries_an_argument |= !word.blank;
+        }
+        Ok(JsonSequence { carries_an_argument })
     }
 }
 
@@ -575,9 +604,13 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor {
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut entries = 0usize;
         // The first entry `CompilationEntry` rejects ends the read: clangd would refuse the
-        // database at that point too, so nothing later in the file could redeem it.
-        while seq.next_element::<CompilationEntry>()?.is_some() {
-            entries += 1;
+        // database at that point too, so nothing later in the file could redeem it. An entry with
+        // an EMPTY invocation is not such a rejection — it simply does not count, because it
+        // configures no file while leaving the rest of the database working.
+        while let Some(entry) = seq.next_element::<CompilationEntry>()? {
+            if entry.configures_a_file {
+                entries += 1;
+            }
         }
         Ok(CompilationDatabase { entries })
     }
