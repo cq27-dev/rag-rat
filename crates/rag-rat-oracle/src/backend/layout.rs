@@ -247,6 +247,17 @@ pub(super) struct MarkerScan {
     pub(super) complete: bool,
 }
 
+/// What a marker search does with one directory entry — see [`MarkerSearch::step_for`].
+enum Step {
+    /// A directory of this checkout, to be searched.
+    Descend(PathBuf),
+    /// Deliberately not searched, and provably unable to hold a database this scan needed, so the
+    /// scan stays complete without it.
+    Excluded,
+    /// Could not be classified, so the scan can no longer prove it saw every database.
+    Indeterminate,
+}
+
 /// How deep the marker search descends — a backstop for a tree that is merely very deep, not the
 /// cycle guard. [`MarkerSearch::visited_links`] is what keeps a symlink loop from re-entering a
 /// directory the search has already descended into; a depth bound alone would still explore every
@@ -293,8 +304,18 @@ impl MarkerSearch<'_> {
             self.truncated = true;
             return;
         };
-        let mut subdirectories: Vec<PathBuf> =
-            entries.flatten().filter_map(|entry| self.searchable_subdirectory(&entry)).collect();
+        let mut subdirectories = Vec::new();
+        for entry in entries {
+            // Every entry gets an explicit disposition. Enumeration itself can fail per item on a
+            // tree that is changing underneath the walk or on a network filesystem, and dropping
+            // those silently (`flatten`) would let a skipped directory holding the second database
+            // pass for "there was no second database".
+            match self.step_for_entry(entry) {
+                Step::Descend(path) => subdirectories.push(path),
+                Step::Excluded => {},
+                Step::Indeterminate => self.truncated = true,
+            }
+        }
         subdirectories.sort();
         let Some(depth_left) = depth_left.checked_sub(1) else {
             // The bound exists for a tree that is merely very deep, but a project nested past it is
@@ -336,53 +357,86 @@ impl MarkerSearch<'_> {
         self.found.push(MarkerSite { dir: dir.to_path_buf(), verdict });
     }
 
-    /// The directory to descend into for `entry`, or `None` when it is not one this search may
-    /// enter — excluded by name, not a directory, or a symlink whose target it has already walked.
-    fn searchable_subdirectory(&mut self, entry: &std::fs::DirEntry) -> Option<PathBuf> {
+    /// What this search does with one ENUMERATED entry, error included.
+    ///
+    /// Enumeration itself can fail per item — a tree changing underneath the walk, a network
+    /// filesystem — and `ReadDir` reports that as an `Err` element rather than by ending. Dropping
+    /// those (`flatten`) would let a skipped directory holding the second database pass for "there
+    /// was no second database", which is exactly the observation `sole_marker_dir` must never make.
+    fn step_for_entry(&mut self, entry: std::io::Result<std::fs::DirEntry>) -> Step {
+        match entry {
+            Ok(entry) => self.step_for(&entry),
+            Err(_) => Step::Indeterminate,
+        }
+    }
+
+    /// What this search does with one directory entry.
+    ///
+    /// Three outcomes rather than `Option`, because "not descended" covers two situations that must
+    /// not be confused. A DELIBERATE exclusion is a statement that nothing behind it could change
+    /// the answer, so the scan stays provably complete. Anything the search could not classify —
+    /// an entry the filesystem would not describe, a link it could not resolve, a nested checkout
+    /// whose sources this checkout may still index — leaves a hole, and a hole means the layout can
+    /// no longer be pinned on. Collapsing the two is how a scan that missed the second database
+    /// reports "exactly one".
+    fn step_for(&mut self, entry: &std::fs::DirEntry) -> Step {
         let path = entry.path();
         let name = path.file_name().unwrap_or_default().to_string_lossy();
+        // EXCLUDED, not indeterminate: every name refused here is also refused by indexing
+        // (`FLOOR_DIRS` floors `.git`, `.rag-rat`, `node_modules`; `FLOOR_PATHS` floors
+        // `.cache/clangd`), so none of them can contain a source whose database this scan needed to
+        // find. That correspondence is what makes skipping them safe — not the names themselves.
         if !is_searchable_for_marker(&path, &name) {
-            return None;
+            return Step::Excluded;
         }
-        // `is_dir` FOLLOWS symlinks, unlike `DirEntry::file_type`: `build -> cmake-build-debug` is
-        // an ordinary layout, and its database is reachable through the checkout path.
-        if !path.is_dir() {
-            return None;
+        // The entry's OWN type first: on Linux this is answered from the readdir result, so
+        // ordinary files and directories cost no extra syscall and only a symlink is resolved.
+        let Ok(kind) = entry.file_type() else {
+            return Step::Indeterminate;
+        };
+        if kind.is_symlink() {
+            // `is_dir` FOLLOWS the link: `build -> cmake-build-debug` is an ordinary layout whose
+            // database is reachable through the checkout path, and a broken link is simply nothing.
+            if !path.is_dir() {
+                return Step::Excluded;
+            }
+            let Ok(target) = path.canonicalize() else {
+                return Step::Indeterminate;
+            };
+            // Outside the checkout is EXCLUDED rather than indeterminate: indexing skips symlinks
+            // outright (`walker::walk_dir`), so nothing reachable only through a link is an indexed
+            // source, and a database out there governs none of this checkout's files.
+            if !target.starts_with(&self.scope) {
+                return Step::Excluded;
+            }
+            // A target already walked is the same tree by another name — nothing new behind it.
+            // This is what makes a checkout with several self-referential links terminate quickly
+            // instead of exploring every path through them.
+            if !self.visited_links.insert(target) {
+                return Step::Excluded;
+            }
+        } else if !kind.is_dir() {
+            return Step::Excluded;
         }
         // A directory that is ITSELF a checkout belongs to that checkout, not this one. The common
         // case is a linked worktree kept inside the main checkout (`git worktree add
         // worktrees/feature`, or this repo's own `.claude/worktrees/<name>`), whose `.git` is a
-        // FILE — so the name-based exclusion above never sees it, and the walk would count the
-        // sibling's `compile_commands.json` as this checkout's. That flips a working
-        // single-database checkout into multi-database mode: `sole_marker_dir` returns `None`,
-        // `--compile-commands-dir` is dropped, and every source outside clangd's own
-        // ancestor/`build/` search stops being resolvable. A nested clone or submodule is excluded
-        // for the same reason, and by the same test — `.git` present, as either a file or a
-        // directory. The search ROOT is exempt: it is entered directly, never through here.
+        // FILE — so the name-based exclusion above never sees it, and the walk would otherwise
+        // count the sibling's `compile_commands.json` as this checkout's. A nested clone or
+        // submodule is the same situation and answers the same test. The search ROOT is exempt: it
+        // is entered directly, never through here.
+        //
+        // INDETERMINATE rather than excluded, and that is the whole point: its databases are not
+        // this checkout's, but its SOURCES may be. Indexing descends an ordinary directory whatever
+        // `.git` file it holds, so a submodule's files can be indexed here while its database stays
+        // invisible to this scan — and pinning the parent's database over them would analyse them
+        // under unrelated defines and include paths. Whether a nested checkout is inside the
+        // indexed corpus is a question this crate cannot answer at all (#1008), so the honest
+        // answer is that the layout is no longer provable.
         if path.join(".git").exists() {
-            // Its databases are not this checkout's, but its SOURCES may still be: the index
-            // walker descends an ordinary directory whatever `.git` file it contains, so a
-            // submodule's files can be indexed here while its database is invisible to this scan.
-            // Pinning the parent's database over them would analyse them under unrelated defines
-            // and include paths, so the scan reports itself incomplete instead. (Whether a nested
-            // checkout is inside the indexed corpus is a question this crate cannot answer — see
-            // #1008.)
-            self.truncated = true;
-            return None;
+            return Step::Indeterminate;
         }
-        // `file_type` describes the LINK, and on Linux it is answered from the readdir result where
-        // the filesystem reports it — so ordinary directories cost nothing here and only the rare
-        // symlink is canonicalized. An ordinary subdirectory cannot leave the checkout, so only a
-        // link is checked against `scope`; skipping a target already walked is what makes a
-        // checkout with several self-referential links terminate quickly instead of exploring every
-        // path through them. A link that cannot be canonicalized is not descended into at all.
-        if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
-            let target = path.canonicalize().ok()?;
-            if !target.starts_with(&self.scope) || !self.visited_links.insert(target) {
-                return None;
-            }
-        }
-        Some(path)
+        Step::Descend(path)
     }
 }
 
@@ -733,5 +787,45 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor {
             }
         }
         Ok(CompilationDatabase { entries })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `MarkerSearch` over `root`, in the state `marker_sites` builds one.
+    fn search_over(root: &Path) -> MarkerSearch<'static> {
+        MarkerSearch {
+            marker: "compile_commands.json",
+            scope: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            visited_links: HashSet::new(),
+            recorded_markers: HashSet::new(),
+            found: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_enumerated_makes_the_scan_incomplete() {
+        // `ReadDir` reports a per-item failure as an `Err` element, and the entry behind it could
+        // have been a directory holding the second database. Silently dropping it would leave the
+        // scan claiming completeness it does not have, and `sole_marker_dir` would then pin the one
+        // database it did see over files the missed one governs.
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("marker-entry-error");
+        let mut search = search_over(&dir);
+
+        let step = search.step_for_entry(Err(std::io::Error::other("enumeration failed")));
+        assert!(matches!(step, Step::Indeterminate), "an unreadable entry is not a decision");
+        assert!(!search.truncated, "step_for_entry classifies; the caller records");
+
+        // The loop's disposition is what turns that into incompleteness, and what a complete scan
+        // must NOT report — so both halves are asserted against a real checkout.
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/compile_commands.json"), "[]").unwrap();
+        assert!(
+            marker_sites(&dir, "compile_commands.json").complete,
+            "a checkout the walk read end to end is complete",
+        );
     }
 }
