@@ -1290,6 +1290,68 @@ fn hop_selectors_separate_overloads_by_handle_and_unite_them_by_qualified_name()
     assert_eq!(shared_callees.matched_symbols, 2);
 }
 
+/// PINS WHERE THE HANDLE LANE STOPS BEING EXACT, AND WHY IT HAS TO. Its reverse predicate has two
+/// arms: logical membership, and — only for an edge the resolver could NOT bind — the qualified
+/// name the call site wrote. The line between them is the whole design.
+///
+/// Above the line: a BOUND edge is attributed by membership alone. Letting the name arm see it too
+/// would hand one overload an edge the resolver gave the other, which is the collapse the handle
+/// exists to end.
+///
+/// Below it: an UNBOUND edge has nothing finer than that name, which two overloads share, so it
+/// lands on both. That is not laxity — traversal SQL runs before the oracle enrichment, and the
+/// oracle never rewrites the `edges` row, so an edge this predicate refuses is one no compiler
+/// verdict can ever put back. Dropping the arm would answer "no callers" for a caller the compiler
+/// verified (`a_compiler_upgraded_unresolved_edge_reaches_the_handle_lane_too`).
+#[test]
+fn a_handle_attributes_a_bound_edge_by_membership_and_an_unbound_one_by_name() {
+    let (_temp, config) = overloaded_config();
+    let db = IndexDatabase::open_config(&config).unwrap();
+    let (alpha, beta) = overload_handles(&db);
+    let conn = db.storage.connection();
+    let callers = |handle: i64| {
+        hop_names(
+            &db.lens_symbol_callers(&LensHopSelector::Handle(handle), 50)
+                .unwrap()
+                .expect("a handle from this checkout resolves")
+                .callers,
+        )
+    };
+
+    // Give both call sites the qualified name the overloads share, on top of the binding the
+    // fixture already made. Each edge is still bound to exactly one overload.
+    conn.execute(
+        "UPDATE edges_data
+            SET target_qualified_name_id =
+                (SELECT id FROM name_strings WHERE value = 'src/lib.rs::run')
+          WHERE to_name_id = (SELECT id FROM name_strings WHERE value = 'run')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(callers(alpha), ["calls_alpha"], "a bound edge is not re-collapsed by its name");
+    assert_eq!(callers(beta), ["calls_beta"]);
+
+    // Now unbind the beta call. Nothing in the index can say which overload it meant any more.
+    let beta_edge: i64 = conn
+        .query_row(
+            "SELECT edges.id
+             FROM edges
+             JOIN symbols source ON source.id = edges.from_symbol_id
+             WHERE edges.edge_kind = 'calls_name' AND edges.to_name = 'run'
+               AND source.name = 'calls_beta'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute("UPDATE edges_data SET to_symbol_id = NULL WHERE id = ?1", [beta_edge]).unwrap();
+    assert_eq!(
+        callers(alpha),
+        ["calls_alpha", "calls_beta"],
+        "an unbound edge reaches every overload the name it wrote could mean"
+    );
+    assert_eq!(callers(beta), ["calls_beta"]);
+}
+
 /// Two `run` overloads whose DECLARATION LINES are byte-identical, so the only thing that told the
 /// overloads in [`OVERLOAD_SOURCE`] apart is gone. The bodies are multi-line on purpose: the
 /// signature the grouping key folds in is the declaration's first non-empty line, which for a

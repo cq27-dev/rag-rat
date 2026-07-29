@@ -1476,3 +1476,108 @@ fn oracle_surfaces_compiler_tier_on_a_real_git_checkout() {
     assert_eq!(hop.confidence, "compiler", "Compiler tier must surface on a real git checkout");
     assert_eq!(hop.resolution_reason.as_deref(), Some("scip:rust-analyzer@v-test"));
 }
+
+/// THE HANDLE LANE MUST NOT LOSE A COMPILER-VERIFIED NEIGHBOUR. A call the heuristic left
+/// unresolved — no `to_symbol_id`, only the target name written at the call site — is exactly the
+/// shape an oracle `Upgrade` exists to rescue, and the rescue happens in `enrich_hops_with_oracle`,
+/// AFTER the traversal's SQL has already decided which edges it admits. An admission filter that
+/// requires a resolved endpoint therefore drops the edge before the compiler ever speaks, and no
+/// oracle run can bring it back: the verdict lives in a side table and the `edges` row is never
+/// mutated.
+///
+/// So the two hop lanes have to agree here, in both directions. A `sym_<hex>` answer that omits a
+/// caller `?ref=` returns reads as "this symbol has no callers", which is the one thing a hop route
+/// must never say wrongly.
+#[test]
+fn a_compiler_upgraded_unresolved_edge_reaches_the_handle_lane_too() {
+    let root = temp_root();
+    fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+    let config = rust_config(root.to_path_buf());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let (edge_id, callee_start, callee_end, path) = call_edge(&db);
+    // Put the edge in the unresolved-but-qualified state: the heuristic bound nothing, and all
+    // that survives is the name the call site wrote. `Syntactic` confidence is what that shape
+    // carries, and what the default callee visibility filter admits an unresolved edge under.
+    let conn = db.storage.connection();
+    conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES ('Syntactic')", []).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE edges_data
+                SET to_symbol_id = NULL,
+                    confidence_id = (SELECT id FROM name_strings WHERE value = 'Syntactic'),
+                    target_qualified_name_id =
+                        (SELECT id FROM name_strings WHERE value = 'src/lib.rs::target')
+              WHERE id = ?1",
+            params![edge_id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    let (to_symbol_id, target_qualified_name): (Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT to_symbol_id, target_qualified_name FROM edges WHERE id = ?1",
+            params![edge_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(to_symbol_id, None, "the fixture must leave the edge unresolved");
+    assert_eq!(target_qualified_name.as_deref(), Some("src/lib.rs::target"));
+
+    let symbol = "scip-rust crate held-mini `target`().";
+    let scip = scip_with(&path, callee_start, callee_end, symbol, Some(&path), Some((29, 35)));
+    let report = db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+    assert!(report.upgraded >= 1, "the oracle must bind the unresolved call; got {report:?}");
+
+    let handle = |name: &str| {
+        db.lens_file_symbols("src/lib.rs")
+            .unwrap()
+            .symbols
+            .into_iter()
+            .find(|symbol| symbol.name == name)
+            .and_then(|symbol| symbol.logical_symbol_id)
+            .unwrap_or_else(|| panic!("the fixture must index {name}"))
+    };
+    let described = |hops: &[LensSymbolHop]| {
+        hops.iter()
+            .map(|hop| (hop.name.clone(), hop.confidence.clone()))
+            .collect::<Vec<(String, String)>>()
+    };
+
+    let callers_by_name = db
+        .lens_symbol_callers(&LensHopSelector::QualifiedName("src/lib.rs::target".into()), 50)
+        .unwrap()
+        .expect("a qualified name always resolves");
+    assert_eq!(
+        described(&callers_by_name.callers),
+        [("caller".to_string(), "compiler".to_string())],
+        "the fallback lane must surface the compiler-verified caller"
+    );
+    let callers_by_handle = db
+        .lens_symbol_callers(&LensHopSelector::Handle(handle("target")), 50)
+        .unwrap()
+        .expect("a handle from this checkout resolves");
+    assert_eq!(
+        described(&callers_by_handle.callers),
+        described(&callers_by_name.callers),
+        "the handle lane must not drop the edge the compiler bound to this very symbol"
+    );
+
+    let callees_by_name = db
+        .lens_symbol_callees(&LensHopSelector::QualifiedName("src/lib.rs::caller".into()), 50)
+        .unwrap()
+        .expect("a qualified name always resolves");
+    assert_eq!(
+        described(&callees_by_name.callees),
+        [("target".to_string(), "compiler".to_string())],
+        "the fallback lane must surface the compiler-verified callee"
+    );
+    let callees_by_handle = db
+        .lens_symbol_callees(&LensHopSelector::Handle(handle("caller")), 50)
+        .unwrap()
+        .expect("a handle from this checkout resolves");
+    assert_eq!(
+        described(&callees_by_handle.callees),
+        described(&callees_by_name.callees),
+        "same loss in the forward direction, where the admission filter is the target filter"
+    );
+}

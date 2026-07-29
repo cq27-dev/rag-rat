@@ -73,14 +73,25 @@ pub(crate) fn reverse_predicate(mode: GraphResolutionMode, logical: bool) -> &'s
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                  )",
+            // LOGICAL ATTRIBUTION RULE (mirrored in `forward_source_predicate`): a RESOLVED
+            // endpoint is attributed by logical membership ALONE. The name arm applies only where
+            // `to_symbol_id IS NULL` — an edge the resolver could not bind, whose recorded target
+            // name is the only attribution there is (and shared with any same-name sibling). Were
+            // the name arm to run on resolved rows too it would hand this symbol an edge the
+            // resolver bound to a DIFFERENT symbol of the same qualified name, which is the
+            // overload collapse the logical seed exists to end (#1028). Dropping the arm entirely
+            // is the opposite error: this SQL runs BEFORE the read-side oracle enrichment, which
+            // rewrites hops in memory and never touches the `edges` row — so an unresolved edge
+            // refused here is one no compiler verdict can put back, in any later run.
             GraphResolutionMode::Syntactic =>
                 "(edges.to_symbol_id IN (
                     SELECT symbol_id
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                   )
-                  OR edges.target_qualified_name_id =
-                        (SELECT id FROM name_strings WHERE value = ?1))",
+                  OR (edges.to_symbol_id IS NULL
+                      AND edges.target_qualified_name_id =
+                            (SELECT id FROM name_strings WHERE value = ?1)))",
             GraphResolutionMode::Fuzzy =>
                 "edges.to_symbol_id IN (
                     SELECT symbol_id
@@ -160,13 +171,19 @@ pub(crate) fn forward_source_predicate(mode: GraphResolutionMode, logical: bool)
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                  )",
+            // Mirror of the logical attribution rule on `reverse_predicate`: membership decides a
+            // resolved source, the name arm covers only a source the resolver left unbound — a
+            // file-level edge, or a body whose enclosing symbol was not indexed. `from_name` holds
+            // the ENCLOSING SYMBOL'S QUALIFIED NAME, which two overloads share, so an ungated arm
+            // would put a sibling overload's outgoing edges on this symbol's callee list.
             GraphResolutionMode::Syntactic =>
                 "edges.from_symbol_id IN (
                     SELECT symbol_id
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                  )
-                 OR edges.from_name_id = (SELECT id FROM name_strings WHERE value = ?1)",
+                 OR (edges.from_symbol_id IS NULL
+                     AND edges.from_name_id = (SELECT id FROM name_strings WHERE value = ?1))",
             GraphResolutionMode::Fuzzy =>
                 "from_symbols.id IN (
                     SELECT symbol_id

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use rag_rat_query::graph::{self, GraphResolutionMode, GraphTraversalOptions};
+use rag_rat_query::graph::{self, GraphTraversalOptions};
 use rusqlite::{Connection, OptionalExtension as _, params_from_iter};
 use serde::Serialize;
 
@@ -38,8 +38,11 @@ pub enum LensHopSelector {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LensHopResolvedBy {
-    /// Resolved by the `sym_<hex>` handle: the hops belong to exactly one logical symbol — which
-    /// is one source symbol unless `matched_symbols > 1`.
+    /// Resolved by the `sym_<hex>` handle: every RESOLVED hop belongs to exactly one logical
+    /// symbol — which is one source symbol unless `matched_symbols > 1`. An unresolved hop is
+    /// matched by the name its call site wrote, so it can also belong to a same-name sibling —
+    /// the index has nothing finer to attribute it by, and dropping it would hide the neighbours a
+    /// compiler oracle later verifies.
     Id,
     /// Resolved by qualified name: every symbol the traversal seeds from it.
     Ref,
@@ -98,8 +101,9 @@ struct HopSymbolInfo {
 /// The traversal a [`LensHopSelector`] resolved to, plus what the answer should report about it.
 #[derive(Debug)]
 struct HopTraversal {
-    /// Name seed for the traversal. Inert on the handle lane, where the seeded predicate is the
-    /// logical-symbol membership set alone; kept truthful so a query log still names the symbol.
+    /// Name seed for the traversal. On the handle lane it no longer selects the RESOLVED edges —
+    /// logical membership does — but it still carries the unresolved arm, which has no symbol id
+    /// to match and only the qualified name the call site wrote.
     seed: String,
     options: GraphTraversalOptions,
     resolved_by: LensHopResolvedBy,
@@ -145,12 +149,20 @@ impl IndexDatabase {
 
     /// Turn the request's selector into the traversal that answers it.
     ///
-    /// The handle lane traverses in `Exact` mode seeded on the logical symbol, which reduces both
-    /// predicates to "an edge endpoint is a member of THIS logical symbol" — the qualified-name OR
-    /// arms that the other modes keep are exactly what re-collapses overloads. Dropping them takes
-    /// nothing off THIS symbol's list: an edge those arms add is either resolved to a DIFFERENT
-    /// symbol that shares the name — where it is already counted, on that symbol's row — or
-    /// resolved to nothing at all, matched through `target_qualified_name`, where no row counts it.
+    /// BOTH lanes traverse in the historical `Syntactic` mode; the handle lane differs only by
+    /// carrying `logical_symbol_id`, which swaps the predicates' qualified-name seed for logical
+    /// membership. That is the whole narrowing, and it is the right one: a RESOLVED edge is
+    /// attributed to the symbol the resolver actually bound, so two overloads sharing a qualified
+    /// name stop reporting each other's neighbours (#1028), while an UNRESOLVED edge keeps being
+    /// matched through the name it wrote at the call site.
+    ///
+    /// Keeping that unresolved arm is load-bearing, not laxity. Traversal SQL runs BEFORE
+    /// `enrich_hops_with_oracle`, and the oracle never mutates the `edges` row — so an edge the
+    /// SQL refuses can never be rescued by a compiler verdict, no matter how many oracle runs
+    /// follow. A stricter mode here would silently answer "no callers" for a caller the compiler
+    /// verified. What the arm costs is precision the index does not have anyway: an unresolved
+    /// edge naming a qualified name two overloads share appears under both, exactly as it does on
+    /// the fallback lane.
     ///
     /// The counts are still NOT this hop list. They count every in-scope edge kind reaching the
     /// symbol id, a traversal keeps only the call kinds, so the hops are a SUBSET and the two
@@ -159,9 +171,9 @@ impl IndexDatabase {
     /// `matched_symbols` being 1 says nothing about that gap. Closing it means restricting the
     /// counts' edge kinds, not widening the traversal.
     ///
-    /// The qualified-name lane keeps the historical `Syntactic` default so an older client that
-    /// sends no handle sees byte-identical hops; `matched_symbols` is how it learns that the name
-    /// it sent covers more than one symbol.
+    /// On the qualified-name lane the traversal is untouched, so an older client that sends no
+    /// handle sees byte-identical hops; `matched_symbols` is how it learns that the name it sent
+    /// covers more than one symbol.
     fn resolve_lens_hop_selector(
         &self,
         selector: &LensHopSelector,
@@ -176,7 +188,6 @@ impl IndexDatabase {
                 Ok(Some(HopTraversal {
                     seed,
                     options: GraphTraversalOptions {
-                        resolution_mode: GraphResolutionMode::Exact,
                         logical_symbol_id: Some(*logical_symbol_id),
                         ..GraphTraversalOptions::default()
                     },
