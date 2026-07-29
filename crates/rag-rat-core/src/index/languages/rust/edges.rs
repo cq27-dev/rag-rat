@@ -396,17 +396,7 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
     }
     let function_node = function_node?;
 
-    let mut fn_generics = Vec::new();
-    if let Some(type_params) = function_node.child_by_field_name("type_parameters") {
-        let mut cursor = type_params.walk();
-        for child in type_params.named_children(&mut cursor) {
-            if (child.kind() == "type_parameter" || child.kind() == "constrained_type_parameter")
-                && let Some(name) = child_name_text(child, text)
-            {
-                fn_generics.push(name);
-            }
-        }
-    }
+    let fn_generics = declared_generics(function_node, text);
     let fn_generic_refs = fn_generics.iter().map(String::as_str).collect::<Vec<_>>();
 
     let mut child_on_path = call_node;
@@ -550,7 +540,7 @@ fn constructor_owner(value: Option<Node<'_>>, text: &str, fn_generics: &[&str]) 
     }
     let owner = clean_rust_type_name(type_part, fn_generics)?;
     let owner_canonical = canonical_receiver_type(owner.clone(), value, text)?;
-    match same_file_constructor_return(value, text, &owner_canonical, method_name, fn_generics) {
+    match same_file_constructor_return(value, text, &owner_canonical, method_name) {
         CtorReturn::SelfLike => Some(owner_canonical),
         CtorReturn::Other(declared) => Some(declared),
         CtorReturn::Opaque | CtorReturn::Unknown => None,
@@ -570,13 +560,7 @@ enum CtorReturn {
 }
 
 /// Find `impl <Owner> { fn <ctor> ... }` in THIS file and classify its declared return type.
-fn same_file_constructor_return(
-    node: Node<'_>,
-    text: &str,
-    owner: &str,
-    ctor: &str,
-    fn_generics: &[&str],
-) -> CtorReturn {
+fn same_file_constructor_return(node: Node<'_>, text: &str, owner: &str, ctor: &str) -> CtorReturn {
     let mut root = node;
     while let Some(parent) = root.parent() {
         root = parent;
@@ -612,7 +596,6 @@ fn same_file_constructor_return(
                                 text,
                                 ctor,
                                 impl_canonical.as_deref(),
-                                fn_generics,
                             ) else {
                                 continue; // this impl does not define the constructor
                             };
@@ -641,7 +624,6 @@ fn classify_constructor_return(
     text: &str,
     ctor: &str,
     impl_canonical: Option<&str>,
-    fn_generics: &[&str],
 ) -> Option<CtorReturn> {
     let body = impl_node.child_by_field_name("body")?;
     let mut cursor = body.walk();
@@ -658,7 +640,16 @@ fn classify_constructor_return(
         if trimmed == "Self" {
             return Some(CtorReturn::SelfLike);
         }
-        let Some(declared) = clean_rust_type_name(trimmed, fn_generics) else {
+        // The declared return is read in the CONSTRUCTOR's scope, so it is checked against the
+        // binders in force THERE and nowhere else — `impl<T> Factory<T> { fn new<U>() -> U }`
+        // returns whatever the call site instantiates, and a module-level type spelled `U` must
+        // not be mistaken for it. The CALLER's binders are deliberately not consulted: they are
+        // not in scope at the declaration, so `fn test<Worker>(..)` calling a constructor that
+        // genuinely returns the concrete `Worker` must still get its hint.
+        let mut binders = declared_generics(impl_node, text);
+        binders.extend(declared_generics(item, text));
+        let binder_refs = binders.iter().map(String::as_str).collect::<Vec<_>>();
+        let Some(declared) = clean_rust_type_name(trimmed, &binder_refs) else {
             return Some(CtorReturn::Opaque);
         };
         let Some(declared_canonical) = module_qualified_type_path(item, &declared, text) else {
@@ -685,20 +676,32 @@ fn module_qualified_type_path(context: Node<'_>, raw_type: &str, text: &str) -> 
     if cleaned.is_empty() || cleaned.starts_with('<') || cleaned.contains(" as ") {
         return None;
     }
-    // An imported bare name denotes the item at the USE's path — which is somewhere else. The
-    // lexical module chain below cannot describe it: inside `mod inner`, `use
-    // crate::workers::Worker` would canonicalize `Worker` to `inner::Worker`, a module that
-    // does not hold the type, and a same-tail type in `inner` would then capture the call. A
-    // potentially-external import declines outright (extraction does not own Cargo/package
-    // locality); a known-local one keeps the BARE name, which is exactly the container-based
-    // scope a top-level declaration carries — unqualified, so it earns neither the tail retry
-    // nor the suffix fallback at resolution.
-    if !cleaned.contains("::") {
-        match lexical_scope_import_root(context, cleaned, text) {
-            Some(UseRoot::External) => return None,
-            Some(UseRoot::Local) => return Some(cleaned.to_string()),
-            None => {},
-        }
+    // `Self::Assoc` names an associated item of the enclosing impl, not a type this canonicalizer
+    // can place. (Bare `Self` is the impl's own type and routes through `infer_self_type_hint`.)
+    if cleaned.strip_prefix("Self::").is_some() {
+        return None;
+    }
+    // An import re-roots a path at the USE's target — somewhere the lexical module chain below
+    // cannot describe. Inside `mod inner`, `use crate::workers::Worker` would canonicalize
+    // `Worker` to `inner::Worker`, a module that does not hold the type, and a same-tail type in
+    // `inner` would then capture the call; `use dep::api as ext` would likewise turn `ext::Worker`
+    // into `inner::ext::Worker`. So an import-bound ROOT SEGMENT — the only part an import can
+    // bind — keeps the path AS WRITTEN, for bare and qualified forms alike. For a bare name that
+    // is exactly the container-based scope a top-level declaration carries.
+    //
+    // Deliberately NOT decided here: whether that import leaves the workspace. Extraction sees
+    // only the `use`'s own root, which cannot tell a dependency from a SIBLING WORKSPACE CRATE —
+    // `use other_crate::module;` + `module::Type` is the ordinary multi-crate idiom, and declining
+    // it here would destroy a hint that resolves exactly. `ReceiverTypeIdentity::classify` owns
+    // that call, against the import scope's `local_crate_roots`, and an `ExternalQualified`
+    // identity never binds to a local symbol. Emitting the honest path and letting the informed
+    // layer decline it is what keeps the two layers from disagreeing.
+    //
+    // `crate`/`self`/`super` are path keywords, never import bindings, and are resolved below.
+    let root = cleaned.split("::").next().unwrap_or(cleaned);
+    if !matches!(root, "crate" | "self" | "super") && lexical_scope_binds_name(context, root, text)
+    {
+        return Some(cleaned.to_string());
     }
     let mut modules = enclosing_module_path(context, text);
     let relative = if let Some(rest) = cleaned.strip_prefix("crate::") {
@@ -721,40 +724,62 @@ fn module_qualified_type_path(context: Node<'_>, raw_type: &str, text: &str) -> 
     Some(modules.join("::"))
 }
 
-/// The root of the innermost enclosing `use` that introduces `name`, scanning outward through
-/// every import scope (block, inline module, file root). `None` when nothing imports the name.
-fn lexical_scope_import_root(context: Node<'_>, name: &str, text: &str) -> Option<UseRoot> {
+/// Whether a `use` visible at `context` introduces `name`, scanning outward through block scopes
+/// and STOPPING at the first enclosing module body.
+///
+/// The stop is the Rust rule, not an optimization: a `use` belongs to the module it is written in
+/// and does NOT descend into a child `mod`. Walking past the boundary makes a file-root
+/// `use dep::api;` look like it binds `api` inside `mod inner { mod api { … } }`, where `api` is
+/// the child module — so a local type would be mistaken for an imported one. Blocks do chain
+/// outward to their module; impl and function bodies are not module boundaries.
+fn lexical_scope_binds_name(context: Node<'_>, name: &str, text: &str) -> bool {
     let mut current = Some(context);
     while let Some(scope) = current {
-        let is_import_scope = scope.kind() == "block"
-            || scope.kind() == "source_file"
+        let module_body = scope.kind() == "source_file"
             || (scope.kind() == "declaration_list"
                 && scope.parent().is_some_and(|parent| parent.kind() == "mod_item"));
-        if is_import_scope && let Some(root) = scope_import_root(scope, name, text) {
-            return Some(root);
+        if (module_body || scope.kind() == "block") && scope_binds_name(scope, name, text) {
+            return true;
+        }
+        if module_body {
+            return false;
         }
         current = scope.parent();
     }
-    None
+    false
 }
 
-fn scope_import_root(scope: Node<'_>, name: &str, text: &str) -> Option<UseRoot> {
+fn scope_binds_name(scope: Node<'_>, name: &str, text: &str) -> bool {
     let mut cursor = scope.walk();
-    scope.named_children(&mut cursor).find_map(|item| {
+    scope.named_children(&mut cursor).any(|item| {
         if item.kind() != "use_declaration" {
-            return None;
+            return false;
         }
         let declaration = &text[item.byte_range()];
         // Most scopes have no relevant import. Avoid the full use-tree walk unless the
         // declaration can contain this exact identifier.
-        if !declaration
-            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-            .any(|part| part == name)
-        {
-            return None;
-        }
-        crate::index::edges::use_binding_root(declaration, name)
+        declaration.split(|ch: char| !ch.is_alphanumeric() && ch != '_').any(|part| part == name)
+            && crate::index::edges::use_binds_name(declaration, name)
     })
+}
+
+/// The generic parameter names `node` itself BINDS (`impl<T> …`, `fn new<U>() …`). A type whose
+/// root names one of them is not a nameable type at all — it is whatever the call site
+/// instantiates — so every declared type read out of `node` is checked against this list.
+fn declared_generics(node: Node<'_>, text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let Some(type_params) = node.child_by_field_name("type_parameters") else {
+        return names;
+    };
+    let mut cursor = type_params.walk();
+    for child in type_params.named_children(&mut cursor) {
+        if (child.kind() == "type_parameter" || child.kind() == "constrained_type_parameter")
+            && let Some(name) = child_name_text(child, text)
+        {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// Enclosing `mod` names of `node`, outermost first.
@@ -977,6 +1002,40 @@ mod receiver_type_hint_tests {
         // The declared return type is visible in this file: the receiver is a Worker, not a
         // Factory — the naming convention must lose to the declaration.
         assert_eq!(extract_call_hints(code), vec![None, Some("Worker".to_string())]);
+    }
+
+    /// A constructor's own generic binder is not a type name. `fn new<U>() -> U` returns whatever
+    /// the CALL SITE instantiates, so reading `U` as the receiver type would hand the call to any
+    /// module-level item that happens to be spelled `U`.
+    #[test]
+    fn test_constructor_own_generic_return_declined() {
+        let code = r#"
+            struct U;
+            impl U { fn run(&self) {} }
+            impl Factory {
+                fn new<U>() -> U { todo!() }
+            }
+            fn test() {
+                let w = Factory::new();
+                w.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None, None]);
+    }
+
+    /// The same rule for a binder introduced by the IMPL rather than the function.
+    #[test]
+    fn test_constructor_impl_generic_return_declined() {
+        let code = r#"
+            impl<T> Factory<T> {
+                fn new() -> T { todo!() }
+            }
+            fn test() {
+                let w = Factory::new();
+                w.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None, None]);
     }
 
     #[test]
@@ -1227,8 +1286,12 @@ mod receiver_type_hint_tests {
         assert_eq!(extract_call_hints(code), vec![None]);
     }
 
+    /// An imported name keeps its BARE form rather than picking up the lexical module: `Url`
+    /// here is NOT `inner::Url`. Whether the import leaves the workspace is not decided at
+    /// extraction — see `receiver_type_identity_classification` and
+    /// `external_receiver_type_hint_never_binds_locally` for the layer that declines it.
     #[test]
-    fn test_inline_module_external_import_declines_receiver_hint() {
+    fn test_inline_module_import_keeps_the_bare_name() {
         let code = r#"
             mod inner {
                 use url::Url;
@@ -1237,11 +1300,12 @@ mod receiver_type_hint_tests {
                 }
             }
         "#;
-        assert_eq!(extract_call_hints(code), vec![None]);
+        assert_eq!(extract_call_hints(code), vec![Some("Url".to_string())]);
     }
 
+    /// An impl body is not a module boundary, so a file-root `use` is in scope inside it.
     #[test]
-    fn test_impl_method_sees_module_level_external_import() {
+    fn test_impl_method_sees_module_level_import() {
         let code = r#"
             use url::Url;
             struct Client;
@@ -1251,7 +1315,7 @@ mod receiver_type_hint_tests {
                 }
             }
         "#;
-        assert_eq!(extract_call_hints(code), vec![None]);
+        assert_eq!(extract_call_hints(code), vec![Some("Url".to_string())]);
     }
 
     /// A `crate::`-rooted import is KNOWN local, but that does not make the lexical module its
@@ -1293,6 +1357,87 @@ mod receiver_type_hint_tests {
             mod inner {
                 use crate::workers::Worker;
                 fn test(w: &crate::workers::Worker) {
+                    w.run();
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![Some("workers::Worker".to_string())]);
+    }
+
+    /// An import binds the ROOT of a qualified path just as it binds a bare name. Prefixing the
+    /// lexical module onto `ext::Url` would mint `inner::ext::Url` — a locally-rooted path whose
+    /// tail retry can land on any local `Url`. The written path is what resolution can classify.
+    #[test]
+    fn test_inline_module_qualified_alias_keeps_the_written_path() {
+        let code = r#"
+            mod inner {
+                use url::api as ext;
+                fn test(w: &ext::Url) {
+                    w.join("child");
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![Some("ext::Url".to_string())]);
+    }
+
+    /// A SIBLING WORKSPACE CRATE is the case extraction must not adjudicate. A `text::Decoder`
+    /// reached through `use libb::text;` resolves EXACTLY against the sibling's symbols, because
+    /// the import scope knows `libb` is a local crate root. Extraction sees only the `use`'s own
+    /// root, which looks identical to a third-party dependency — so it emits the written path and
+    /// leaves the call to `ReceiverTypeIdentity::classify`. Declining here would destroy a
+    /// correct resolution.
+    #[test]
+    fn test_sibling_workspace_crate_import_keeps_the_written_path() {
+        let code = r#"
+            use libb::text;
+            fn drive(d: &text::Decoder) {
+                d.decode();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![Some("text::Decoder".to_string())]);
+    }
+
+    /// A `use` belongs to the module it is written in and does NOT descend into a child `mod`.
+    /// The file-root `use url::api;` is out of scope inside `mod inner`, where `api` is the child
+    /// module — so the type is the LOCAL `inner::api::Url`, and the outward walk must stop at the
+    /// module boundary rather than mistake it for the import.
+    #[test]
+    fn test_a_parent_modules_import_does_not_reach_into_a_child_module() {
+        let code = r#"
+            use url::api;
+            mod inner {
+                pub mod api { pub struct Url; }
+                fn test(u: &api::Url) {
+                    u.join("child");
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![Some("inner::api::Url".to_string())]);
+    }
+
+    /// `Self::Assoc` is an associated item of the enclosing impl, not a placeable type — a hint
+    /// of `Self::Inner` would tail-retry onto any local `Inner`.
+    #[test]
+    fn test_self_qualified_associated_type_declined() {
+        let code = r#"
+            struct Holder;
+            impl Holder {
+                fn test(w: Self::Inner) {
+                    w.run();
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None]);
+    }
+
+    /// The same rule with a local import: `use crate::workers;` re-roots `workers::Worker` at the
+    /// crate root, so the path stands AS WRITTEN — the lexical `inner` is not its owner.
+    #[test]
+    fn test_inline_module_qualified_local_import_keeps_the_written_path() {
+        let code = r#"
+            mod inner {
+                use crate::workers;
+                fn test(w: &workers::Worker) {
                     w.run();
                 }
             }

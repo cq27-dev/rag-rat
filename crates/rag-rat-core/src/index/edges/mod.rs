@@ -1,7 +1,7 @@
 pub(in crate::index) mod extract;
 mod helpers;
 mod imports;
-pub(crate) use imports::{UseRoot, use_binding_root};
+pub(crate) use imports::use_binds_name;
 mod intern;
 mod resolve;
 
@@ -573,8 +573,9 @@ pub(crate) fn degeneric_path(path: &str) -> String {
 /// for `impl Trait for Type` collapses to `Type`, so a source-form target (`Type::method`, a
 /// receiver-type hint) finds trait-impl methods while their RAW scope keeps the trait — two
 /// traits' same-named methods stay distinct logical symbols yet expose the same receiver
-/// surface, and a call that could hit either declines as ambiguous (#567). The trait tail never
-/// contains `::` (see the Rust `scope_segment`), so per-`::`-segment splitting is sound.
+/// surface, and a call that could hit either declines as ambiguous (#567). The marker's trait
+/// path is emitted with `::` rewritten to `.` (see the Rust `trait_marker`), so it is always ONE
+/// `::`-segment and per-`::`-segment splitting is sound.
 /// Borrowed ⇔ the path needs no normalization — the hot rebuild path allocates nothing for the
 /// plain-scope majority.
 pub(crate) fn normalized_scope_path<'a>(

@@ -286,35 +286,6 @@ pub(crate) fn use_binds_name(use_text: &str, name: &str) -> bool {
     use_tree_binds_name(tree, name)
 }
 
-/// Which crate a `use` reaches into: `Local` for a `crate::`/`self::`/`super::` root (this crate,
-/// addressed relatively), `External` for anything else — a dependency, or a sibling workspace
-/// crate, which extraction cannot tell apart without package locality.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum UseRoot {
-    Local,
-    External,
-}
-
-/// The root of the `use` that binds `name`, or `None` when this declaration does not bind it.
-pub(crate) fn use_binding_root(use_text: &str, name: &str) -> Option<UseRoot> {
-    if !use_binds_name(use_text, name) {
-        return None;
-    }
-    let rest = strip_use_visibility(use_text.trim())?;
-    let tree = rest.strip_suffix(';').unwrap_or(rest).trim();
-    let tree = tree.strip_prefix("::").unwrap_or(tree);
-    let root = tree
-        .split("::")
-        .next()
-        .and_then(|segment| segment.split_whitespace().next())
-        .unwrap_or_default();
-    Some(if matches!(root, "crate" | "self" | "super") {
-        UseRoot::Local
-    } else {
-        UseRoot::External
-    })
-}
-
 fn use_tree_binds_name(tree: &str, name: &str) -> bool {
     let tree = tree.trim();
     match tree.find('{') {
@@ -812,10 +783,6 @@ mod tests {
         for unbound in ["crate", "nested", "Worker", "Missing"] {
             assert!(!use_binds_name(declaration, unbound), "{unbound} is not bound");
         }
-        assert_eq!(use_binding_root(declaration, "Alias"), Some(UseRoot::Local));
-        assert_eq!(use_binding_root(declaration, "Missing"), None);
-        assert_eq!(use_binding_root("use url::Url;", "Url"), Some(UseRoot::External));
-        assert_eq!(use_binding_root("use super::a::Helper;", "Helper"), Some(UseRoot::Local));
     }
 
     #[test]
