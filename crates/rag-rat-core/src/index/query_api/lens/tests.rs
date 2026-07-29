@@ -7,7 +7,7 @@ use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
 use rusqlite::params;
 
 use super::hops::adapt_hops;
-use crate::index::IndexDatabase;
+use crate::index::{IndexDatabase, LensHopResolvedBy, LensHopSelector};
 
 const SOURCE: &str = r#"
 pub enum Req { Upsert { id: i64 } }
@@ -120,7 +120,10 @@ fn hops_and_chunk_text_keep_stable_compatibility_fields_on_read_only_open() {
         .find(|symbol| symbol.name == "target")
         .and_then(|symbol| symbol.qname)
         .unwrap();
-    let callers = db.lens_symbol_callers(&target_qname, 50).unwrap();
+    let callers = db
+        .lens_symbol_callers(&LensHopSelector::QualifiedName(target_qname), 50)
+        .unwrap()
+        .expect("a qualified name always resolves");
     assert!(callers.callers.iter().any(|hop| hop.name == "caller"));
     let wire = serde_json::to_value(&callers).unwrap();
     let first = wire["callers"].as_array().unwrap().first().unwrap();
@@ -137,8 +140,9 @@ fn hops_and_chunk_text_keep_stable_compatibility_fields_on_read_only_open() {
         .and_then(|symbol| symbol.qname)
         .unwrap();
     assert!(
-        db.lens_symbol_callees(&caller_qname, 50)
+        db.lens_symbol_callees(&LensHopSelector::QualifiedName(caller_qname.clone()), 50)
             .unwrap()
+            .expect("a qualified name always resolves")
             .callees
             .iter()
             .any(|hop| hop.name == "target")
@@ -614,18 +618,20 @@ fn graph_compositions_exclude_edges_with_out_of_scope_endpoints() {
             && detail.other_name.as_deref() != Some("dead_caller")
     }));
     assert!(
-        db.lens_symbol_callers(&target_qname, 50)
+        db.lens_symbol_callers(&LensHopSelector::QualifiedName(target_qname), 50)
             .unwrap()
+            .expect("a qualified name always resolves")
             .callers
             .iter()
             .all(|hop| hop.name != "dead_caller")
     );
     assert!(
-        db.lens_symbol_callees(&caller_qname, 50).unwrap().callees.iter().all(|hop| hop
-            .qname
-            .as_deref()
-            != Some("crate::missing")
-            && hop.name != "dead_target")
+        db.lens_symbol_callees(&LensHopSelector::QualifiedName(caller_qname), 50)
+            .unwrap()
+            .expect("a qualified name always resolves")
+            .callees
+            .iter()
+            .all(|hop| hop.qname.as_deref() != Some("crate::missing") && hop.name != "dead_target")
     );
 }
 
@@ -656,7 +662,11 @@ fn symbol_callers_preserve_file_level_edges() {
     )
     .unwrap();
 
-    let callers = db.lens_symbol_callers(&target_qname, 50).unwrap().callers;
+    let callers = db
+        .lens_symbol_callers(&LensHopSelector::QualifiedName(target_qname), 50)
+        .unwrap()
+        .expect("a qualified name always resolves")
+        .callers;
     let file_caller = callers.iter().find(|hop| hop.name == "src/lib.rs").unwrap();
     assert_eq!(file_caller.path, "src/lib.rs");
     assert_eq!(file_caller.source_start_line, 2);
@@ -1211,6 +1221,298 @@ fn file_papertrail_deduplicates_items_before_applying_the_limit() {
     assert_eq!(refs.len(), 50);
     assert_eq!(refs.iter().filter(|reference| reference.item_key == "duplicate").count(), 1);
     assert!(refs.iter().any(|reference| reference.item_key == "unique-0"));
+}
+
+/// Two `run` overloads in one file. Both qualify as `src/lib.rs::run`; only their signatures —
+/// and therefore their logical-symbol handles — differ, which is exactly the case a qualified-name
+/// selector cannot express.
+const OVERLOAD_SOURCE: &str = r#"
+pub struct Alpha;
+pub struct Beta;
+
+pub fn alpha_leaf() {}
+pub fn beta_leaf() {}
+
+impl Alpha {
+    pub fn run(&self) { alpha_leaf(); }
+}
+
+impl Beta {
+    pub fn run(&self, extra: i64) { beta_leaf(); let _ = extra; }
+}
+
+pub fn calls_alpha(alpha: &Alpha) { alpha.run(); }
+pub fn calls_beta(beta: &Beta) { beta.run(1); }
+"#;
+
+/// Each overload's own callers and callees are reachable only through its handle: the qualified
+/// name they share reports the union of both, in both directions.
+#[test]
+fn hop_selectors_separate_overloads_by_handle_and_unite_them_by_qualified_name() {
+    let (_temp, config) = overloaded_config();
+    let db = IndexDatabase::try_open_config_read_only(&config).unwrap().expect("read-only index");
+
+    let (alpha, beta) = overload_handles(&db);
+    let qname = "src/lib.rs::run".to_string();
+
+    let alpha_callers =
+        db.lens_symbol_callers(&LensHopSelector::Handle(alpha), 50).unwrap().expect("alpha");
+    assert_eq!(hop_names(&alpha_callers.callers), ["calls_alpha"]);
+    assert_eq!(alpha_callers.resolved_by, LensHopResolvedBy::Id);
+    assert_eq!(alpha_callers.matched_symbols, 1);
+    let beta_callers =
+        db.lens_symbol_callers(&LensHopSelector::Handle(beta), 50).unwrap().expect("beta");
+    assert_eq!(hop_names(&beta_callers.callers), ["calls_beta"]);
+
+    let shared_callers = db
+        .lens_symbol_callers(&LensHopSelector::QualifiedName(qname.clone()), 50)
+        .unwrap()
+        .expect("a qualified name always resolves");
+    assert_eq!(hop_names(&shared_callers.callers), ["calls_alpha", "calls_beta"]);
+    assert_eq!(shared_callers.resolved_by, LensHopResolvedBy::Ref);
+    assert_eq!(
+        shared_callers.matched_symbols, 2,
+        "the fallback must report how many symbols the name it was given covers"
+    );
+
+    let alpha_callees =
+        db.lens_symbol_callees(&LensHopSelector::Handle(alpha), 50).unwrap().expect("alpha");
+    assert_eq!(hop_names(&alpha_callees.callees), ["alpha_leaf"]);
+    let beta_callees =
+        db.lens_symbol_callees(&LensHopSelector::Handle(beta), 50).unwrap().expect("beta");
+    assert_eq!(hop_names(&beta_callees.callees), ["beta_leaf"]);
+    let shared_callees = db
+        .lens_symbol_callees(&LensHopSelector::QualifiedName(qname), 50)
+        .unwrap()
+        .expect("a qualified name always resolves");
+    assert_eq!(hop_names(&shared_callees.callees), ["alpha_leaf", "beta_leaf"]);
+    assert_eq!(shared_callees.matched_symbols, 2);
+}
+
+/// A handle that names nothing in the active checkout — held across a rename, or minted in another
+/// checkout — is reported as absent. Answering it with an empty hop list would read as "this
+/// symbol has no callers", and falling back to the qualified name would reintroduce the union.
+#[test]
+fn an_unresolvable_handle_is_absent_rather_than_empty() {
+    let (_temp, config) = overloaded_config();
+    let db = IndexDatabase::try_open_config_read_only(&config).unwrap().expect("read-only index");
+
+    assert!(db.lens_symbol_callers(&LensHopSelector::Handle(i64::MAX), 50).unwrap().is_none());
+    assert!(db.lens_symbol_callees(&LensHopSelector::Handle(i64::MAX), 50).unwrap().is_none());
+}
+
+/// The fallback's traversal also resolves a BARE SHORT NAME, through the unique-short-name arm its
+/// predicate carries, so `matched_symbols` has to model that arm as well: counting only the
+/// symbols whose QUALIFIED name is the selector reports zero beside a non-empty hop list, which
+/// reads as "the selector matched nothing" — the opposite of the ambiguity signal the field
+/// exists to carry. When the short name is ambiguous the arm is off and nothing is expanded, so
+/// zero is then the truthful answer.
+#[test]
+fn a_short_name_fallback_counts_the_symbol_its_traversal_expanded_to() {
+    let (_temp, config) = overloaded_config();
+    let db = IndexDatabase::try_open_config_read_only(&config).unwrap().expect("read-only index");
+
+    let unique = db
+        .lens_symbol_callers(&LensHopSelector::QualifiedName("alpha_leaf".into()), 50)
+        .unwrap()
+        .expect("a qualified name always resolves");
+    assert_eq!(hop_names(&unique.callers), ["run"], "the short name resolves through the index");
+    assert_eq!(unique.resolved_by, LensHopResolvedBy::Ref);
+    assert_eq!(
+        unique.matched_symbols, 1,
+        "a request answered with hops must not report that it matched no symbol"
+    );
+
+    let ambiguous = db
+        .lens_symbol_callers(&LensHopSelector::QualifiedName("run".into()), 50)
+        .unwrap()
+        .expect("a qualified name always resolves");
+    assert!(ambiguous.callers.is_empty(), "an ambiguous short name expands to nothing");
+    assert_eq!(ambiguous.matched_symbols, 0);
+}
+
+/// Both selectors read the symbol table through the connection's `files` view, so a sibling
+/// checkout's rows are invisible to them: its same-named symbol must not inflate the fallback's
+/// ambiguity report, and its handle must not resolve here. The active checkout keeps answering.
+#[test]
+fn hop_selectors_see_only_the_active_checkouts_symbols() {
+    let (_temp, config) = overloaded_config();
+    let db = IndexDatabase::open_config(&config).unwrap();
+    let (alpha, _) = overload_handles(&db);
+    let conn = db.storage.connection();
+
+    // A file belonging to another checkout of this repo, carrying a THIRD `src/lib.rs::run` under
+    // its own logical symbol.
+    conn.execute(
+        "INSERT INTO main.files(
+             path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+             commit_sha, worktree_id, repo_id, generation
+         ) VALUES ('sibling.rs', 'rust', 'source', 'sibling-sha', 0, 0, 'sibling-commit', '', ?1, \
+         ?2)",
+        params![db.active_repo_id, db.active_generation],
+    )
+    .unwrap();
+    let sibling_file_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO symbols(
+             file_id, language, name, qualified_name_id, kind,
+             start_byte, end_byte, start_line, end_line
+         ) VALUES (
+             ?1, 'rust', 'run',
+             (SELECT id FROM name_strings WHERE value = 'src/lib.rs::run'),
+             'function', 0, 10, 1, 1
+         )",
+        [sibling_file_id],
+    )
+    .unwrap();
+    let sibling_symbol_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO logical_symbols(language, path, logical_name, qualified_name_id, kind,
+             variant_count, group_reason)
+         VALUES ('rust', 'sibling.rs', 'run',
+             (SELECT id FROM name_strings WHERE value = 'src/lib.rs::run'), 'function', 1, 'test')",
+        [],
+    )
+    .unwrap();
+    let sibling_logical_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line, end_line)
+         VALUES (?1, ?2, 1, 1)",
+        [sibling_logical_id, sibling_symbol_id],
+    )
+    .unwrap();
+
+    let shared = db
+        .lens_symbol_callers(&LensHopSelector::QualifiedName("src/lib.rs::run".into()), 50)
+        .unwrap()
+        .expect("a qualified name always resolves");
+    assert_eq!(
+        shared.matched_symbols, 2,
+        "a sibling checkout's symbol is not one this checkout's name covers"
+    );
+    assert_eq!(hop_names(&shared.callers), ["calls_alpha", "calls_beta"]);
+    assert!(
+        db.lens_symbol_callers(&LensHopSelector::Handle(sibling_logical_id), 50).unwrap().is_none(),
+        "a handle whose only member lives in another checkout must read as absent"
+    );
+    assert!(db.lens_symbol_callers(&LensHopSelector::Handle(alpha), 50).unwrap().is_some());
+}
+
+/// The file lanes are where a CodeLens is built, so every row has to carry the handle its own hop
+/// request needs — and two overloads must not share it.
+#[test]
+fn file_lanes_carry_a_distinct_symbol_handle_per_overload() {
+    let (_temp, config) = overloaded_config();
+    let db = IndexDatabase::try_open_config_read_only(&config).unwrap().expect("read-only index");
+
+    let symbols = db.lens_file_symbols("src/lib.rs").unwrap().symbols;
+    let runs = symbols.iter().filter(|symbol| symbol.name == "run").collect::<Vec<_>>();
+    assert_eq!(runs.len(), 2);
+    assert!(runs.iter().all(|symbol| symbol.qname.as_deref() == Some("src/lib.rs::run")));
+    assert_ne!(runs[0].logical_symbol_id, runs[1].logical_symbol_id);
+    assert!(runs.iter().all(|symbol| symbol.logical_symbol_id.is_some()));
+
+    let graph = db.lens_file_graph("src/lib.rs").unwrap().symbols;
+    let graph_runs = graph
+        .iter()
+        .filter(|symbol| symbol.name == "run")
+        .map(|symbol| symbol.logical_symbol_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        graph_runs,
+        runs.iter().map(|symbol| symbol.logical_symbol_id).collect::<Vec<_>>(),
+        "both file lanes must hand out the same handle for the same row"
+    );
+
+    // The handle crosses the wire as its opaque `sym_<hex>` token, never as a number a JSON client
+    // could round past 2^53.
+    let wire = serde_json::to_value(db.lens_file_graph("src/lib.rs").unwrap()).unwrap();
+    let ids = wire["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "run")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().all(|id| id.starts_with("sym_")), "{ids:?}");
+    assert_ne!(ids[0], ids[1]);
+}
+
+fn hop_names(hops: &[super::LensSymbolHop]) -> Vec<String> {
+    let mut names = hops.iter().map(|hop| hop.name.clone()).collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The two handles behind `src/lib.rs::run`, alpha's first.
+fn overload_handles(db: &IndexDatabase) -> (i64, i64) {
+    let mut runs = db
+        .lens_file_symbols("src/lib.rs")
+        .unwrap()
+        .symbols
+        .into_iter()
+        .filter(|symbol| symbol.name == "run")
+        .collect::<Vec<_>>();
+    runs.sort_by_key(|symbol| symbol.start_line);
+    assert_eq!(runs.len(), 2, "the fixture must index both overloads");
+    (runs[0].logical_symbol_id.unwrap(), runs[1].logical_symbol_id.unwrap())
+}
+
+/// Index [`OVERLOAD_SOURCE`] and bind each `run` call site to the overload it actually targets.
+///
+/// The heuristic resolver deliberately leaves a same-name method call unresolved — with two
+/// candidates it refuses to guess — so on the caller side no natural edge distinguishes the
+/// overloads. Binding them here is what a compiler oracle pass produces, and it is the only way
+/// the caller direction can be observed at all.
+fn overloaded_config() -> (tempfile::TempDir, Config) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), OVERLOAD_SOURCE).unwrap();
+    let mut config = Config::minimal_for_database(root.join("index.sqlite"), root);
+    config.database_key_pinned = true;
+    config.targets = vec![ResolvedTarget {
+        name: "rust".into(),
+        language: Language::Rust,
+        directories: vec![PathBuf::from("src")],
+        include: vec!["**/*.rs".into()],
+        exclude: Vec::new(),
+        kind: TargetKind::Source,
+    }];
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    for (caller, callee) in [("calls_alpha", "alpha_leaf"), ("calls_beta", "beta_leaf")] {
+        // The overload each caller means is the one whose body calls that caller's leaf.
+        let target: i64 = conn
+            .query_row(
+                "SELECT run.id
+                 FROM symbols run
+                 JOIN files ON files.id = run.file_id
+                 JOIN edges body ON body.from_symbol_id = run.id
+                 JOIN symbols leaf ON leaf.id = body.to_symbol_id
+                 WHERE run.name = 'run' AND leaf.name = ?1",
+                [callee],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let edge: i64 = conn
+            .query_row(
+                "SELECT edges.id
+                 FROM edges
+                 JOIN symbols source ON source.id = edges.from_symbol_id
+                 WHERE edges.edge_kind = 'calls_name' AND edges.to_name = 'run'
+                   AND source.name = ?1",
+                [caller],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute("UPDATE edges_data SET to_symbol_id = ?1 WHERE id = ?2", [target, edge])
+            .unwrap();
+    }
+    drop(db);
+    (temp, config)
 }
 
 fn indexed_config() -> (tempfile::TempDir, Config) {

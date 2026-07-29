@@ -383,6 +383,27 @@ pub fn unique_symbol_name(conn: &Connection, name: &str) -> anyhow::Result<bool>
     )?;
     Ok(count == 1)
 }
+/// How many active-scope symbols a NAME seed expands to under the `Syntactic` predicates above.
+///
+/// Lives beside those predicates because it answers the same question they do and must not drift
+/// from them: a symbol is a seed match when its qualified name IS `symbol`, or — only while the
+/// seed's short name is unique, which is the `?7` gate the predicates themselves carry — when its
+/// name is that short name. A caller that counts the qualified arm alone reports zero for the
+/// unqualified seed a traversal resolves perfectly well through the short-name arm.
+///
+/// GENERATION-SCOPED via the `files` view, for the reason spelled out on `unique_symbol_name`.
+pub fn syntactic_seed_symbol_count(conn: &Connection, symbol: &str) -> anyhow::Result<u64> {
+    let short = short_name(symbol);
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) AS symbol_count FROM symbols
+         JOIN files ON files.id = symbols.file_id
+         LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+         WHERE qn.value = ?1 OR (?2 = 1 AND symbols.name = ?3)",
+        rusqlite::params![symbol, unique_symbol_name(conn, short)?, short],
+        |row| row.get("symbol_count"),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
 pub(crate) fn resolution_label(
     mode: GraphResolutionMode,
     stored: String,

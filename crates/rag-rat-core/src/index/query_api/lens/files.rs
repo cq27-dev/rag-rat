@@ -18,6 +18,14 @@ pub struct LensFileSymbols {
 
 #[derive(Debug, Serialize)]
 pub struct LensSymbol {
+    /// The stable `sym_<hex>` logical-symbol handle, and the selector a hop request should send
+    /// back: a qualified name is shared by every overload in the file, this is not. `None` only
+    /// where the symbol has no logical-symbol member row in the active scope.
+    #[serde(
+        rename = "id",
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"
+    )]
+    pub logical_symbol_id: Option<i64>,
     pub name: String,
     pub qname: Option<String>,
     pub kind: String,
@@ -36,6 +44,14 @@ pub struct LensFileGraph {
 
 #[derive(Debug, Serialize)]
 pub struct LensFileSymbolGraph {
+    /// Same handle, same contract as [`LensSymbol::logical_symbol_id`]: the graph lane is where a
+    /// CodeLens is built, so the row that reports a caller count also carries the selector that
+    /// drills into exactly those callers.
+    #[serde(
+        rename = "id",
+        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"
+    )]
+    pub logical_symbol_id: Option<i64>,
     pub name: String,
     pub qname: Option<String>,
     pub kind: String,
@@ -70,6 +86,7 @@ pub struct LensDispatchDetail {
 #[derive(Debug)]
 struct FileSymbolRow {
     id: i64,
+    logical_symbol_id: Option<i64>,
     name: String,
     qname: Option<String>,
     kind: String,
@@ -134,6 +151,7 @@ impl IndexDatabase {
         let symbols = list_file_symbols_with_graph_counts(self.storage.connection(), path)?
             .into_iter()
             .map(|row| LensSymbol {
+                logical_symbol_id: row.logical_symbol_id,
                 name: row.name,
                 qname: row.qname,
                 kind: row.kind,
@@ -191,6 +209,7 @@ impl IndexDatabase {
             .map(|row| {
                 let load = importance.get(&row.id);
                 LensFileSymbolGraph {
+                    logical_symbol_id: row.logical_symbol_id,
                     name: row.name,
                     qname: row.qname,
                     kind: row.kind,
@@ -226,12 +245,15 @@ fn list_file_symbols_with_graph_counts(
     path: &str,
 ) -> anyhow::Result<Vec<FileSymbolRow>> {
     let mut stmt = conn.prepare(
+        // `logical_symbol_members` is keyed `(logical_symbol_id, symbol_id)`, and a symbol belongs
+        // to at most one logical symbol, so the LEFT JOIN cannot duplicate a requested row.
         "WITH requested AS MATERIALIZED (
-             SELECT s.id, s.name, ns.value AS qname, s.kind, s.start_line, s.end_line,
-                    s.is_test, s.signature
+             SELECT s.id, member.logical_symbol_id, s.name, ns.value AS qname, s.kind,
+                    s.start_line, s.end_line, s.is_test, s.signature
              FROM symbols s
              JOIN files ON files.id = s.file_id
              LEFT JOIN name_strings ns ON ns.id = s.qualified_name_id
+             LEFT JOIN logical_symbol_members member ON member.symbol_id = s.id
              WHERE files.path = ?1
          ),
          incoming AS (
@@ -257,8 +279,9 @@ fn list_file_symbols_with_graph_counts(
              JOIN files target_file ON target_file.id = target_symbol.file_id
              GROUP BY e.from_symbol_id
          )
-         SELECT requested.id, requested.name, requested.qname, requested.kind,
-                requested.start_line, requested.end_line, requested.is_test, requested.signature,
+         SELECT requested.id, requested.logical_symbol_id, requested.name, requested.qname,
+                requested.kind, requested.start_line, requested.end_line, requested.is_test,
+                requested.signature,
                 COALESCE(incoming.fan_in, 0), COALESCE(outgoing.fan_out, 0),
                 COALESCE(incoming.exact, 0), COALESCE(incoming.syntactic, 0),
                 COALESCE(incoming.name_only, 0), COALESCE(incoming.ambiguous, 0),
@@ -271,22 +294,23 @@ fn list_file_symbols_with_graph_counts(
     let rows = stmt.query_map([path], |row| {
         Ok(FileSymbolRow {
             id: row.get(0)?,
-            name: row.get(1)?,
-            qname: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            end_line: row.get(5)?,
-            is_test: row.get(6)?,
-            signature: row.get(7)?,
-            fan_in: u64::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
-            fan_out: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
+            logical_symbol_id: row.get(1)?,
+            name: row.get(2)?,
+            qname: row.get(3)?,
+            kind: row.get(4)?,
+            start_line: row.get(5)?,
+            end_line: row.get(6)?,
+            is_test: row.get(7)?,
+            signature: row.get(8)?,
+            fan_in: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
+            fan_out: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
             callers: LensGraphCallerCounts {
-                exact: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
-                syntactic: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
-                name_only: u64::try_from(row.get::<_, i64>(12)?).unwrap_or(0),
-                ambiguous: u64::try_from(row.get::<_, i64>(13)?).unwrap_or(0),
-                tests: u64::try_from(row.get::<_, i64>(14)?).unwrap_or(0),
-                dispatch: u64::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
+                exact: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+                syntactic: u64::try_from(row.get::<_, i64>(12)?).unwrap_or(0),
+                name_only: u64::try_from(row.get::<_, i64>(13)?).unwrap_or(0),
+                ambiguous: u64::try_from(row.get::<_, i64>(14)?).unwrap_or(0),
+                tests: u64::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
+                dispatch: u64::try_from(row.get::<_, i64>(16)?).unwrap_or(0),
             },
         })
     })?;

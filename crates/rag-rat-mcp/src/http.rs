@@ -483,18 +483,24 @@ async fn symbol_callers(
     State(state): State<HttpState>,
     Query(query): Query<SymbolHopQuery>,
 ) -> Result<Json<rag_rat_core::index::LensCallers>, ApiError> {
-    let qname = required_qname(query.qname)?;
+    let selector = hop_selector(&query)?;
     let limit = hop_limit(query.limit.as_deref());
-    run_db(state, move |db, _, _| Ok(db.lens_symbol_callers(&qname, limit)?)).await.map(Json)
+    run_db(state, move |db, _, _| Ok(db.lens_symbol_callers(&selector, limit)?))
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(UNKNOWN_SYMBOL_HANDLE.into()))
 }
 
 async fn symbol_callees(
     State(state): State<HttpState>,
     Query(query): Query<SymbolHopQuery>,
 ) -> Result<Json<rag_rat_core::index::LensCallees>, ApiError> {
-    let qname = required_qname(query.qname)?;
+    let selector = hop_selector(&query)?;
     let limit = hop_limit(query.limit.as_deref());
-    run_db(state, move |db, _, _| Ok(db.lens_symbol_callees(&qname, limit)?)).await.map(Json)
+    run_db(state, move |db, _, _| Ok(db.lens_symbol_callees(&selector, limit)?))
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(UNKNOWN_SYMBOL_HANDLE.into()))
 }
 
 async fn chunk_text(
@@ -528,12 +534,25 @@ fn canonical_file_path(
     Ok(db.lens_canonical_file_path(&path, case_insensitive)?.unwrap_or(path))
 }
 
-fn required_qname(qname: Option<String>) -> Result<String, ApiError> {
-    let qname = qname.ok_or_else(|| ApiError::bad_query("missing query parameter `qname`"))?;
-    if qname.is_empty() {
-        return Err(ApiError::bad_query("`qname` must not be empty"));
+const UNKNOWN_SYMBOL_HANDLE: &str = "unknown symbol handle";
+
+/// Pick the selector a hop request is answered by, preferring the stable `sym_<hex>` handle.
+///
+/// `qname` stays accepted because the server and the editor extension version independently: an
+/// installed extension built before the handle existed sends only a name, and answering it with a
+/// 400 would break call navigation on every such install. It is a documented fallback rather than
+/// an equal alternative — a qualified name is shared by every overload in a file, so the answer is
+/// their union, which the response says out loud via `resolved_by` / `matched_symbols`.
+fn hop_selector(query: &SymbolHopQuery) -> Result<rag_rat_core::index::LensHopSelector, ApiError> {
+    if let Some(id) = query.id.as_deref().filter(|value| !value.is_empty()) {
+        return rag_rat_base::serde_big_id::parse_sym_handle(id)
+            .map(rag_rat_core::index::LensHopSelector::Handle)
+            .ok_or_else(|| ApiError::bad_query("`id` must be a `sym_<hex>` symbol handle"));
     }
-    Ok(qname)
+    let qname = query.qname.as_deref().filter(|value| !value.is_empty()).ok_or_else(|| {
+        ApiError::bad_query("missing query parameter `id` (preferred) or `qname`")
+    })?;
+    Ok(rag_rat_core::index::LensHopSelector::QualifiedName(qname.to_string()))
 }
 
 fn hop_limit(raw: Option<&str>) -> u32 {
@@ -746,6 +765,9 @@ struct FileQuery {
 
 #[derive(Deserialize)]
 struct SymbolHopQuery {
+    /// The `sym_<hex>` logical-symbol handle from `/api/file/{symbols,graph}`. Preferred.
+    id: Option<String>,
+    /// Compatibility fallback for a client that has no handle to send.
     qname: Option<String>,
     limit: Option<String>,
 }

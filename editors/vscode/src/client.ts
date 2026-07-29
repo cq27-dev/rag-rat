@@ -14,7 +14,20 @@ export interface Status {
   live_file_count: number;
 }
 
+/**
+ * How a hop request names its symbol. `id` — the server's opaque `sym_<hex>` symbol handle — is
+ * the stable identity and the only selector that separates two overloads: they share a qualified
+ * name, so `qname` alone reports the union of their callers. `qname` remains as the fallback for
+ * a row the server could not hand a handle for.
+ */
+export interface SymbolSelector {
+  id: string | null;
+  qname: string | null;
+}
+
 export interface FileSymbol {
+  /** Opaque `sym_<hex>` symbol handle — pass it back verbatim; never parse it as a number. */
+  id: string | null;
   name: string;
   qname: string | null;
   kind: string;
@@ -84,6 +97,8 @@ export interface FileMemory {
 }
 
 export interface SymbolGraph {
+  /** Opaque `sym_<hex>` symbol handle — pass it back verbatim; never parse it as a number. */
+  id: string | null;
   name: string;
   qname: string | null;
   kind: string;
@@ -239,8 +254,21 @@ export class LensClient {
   ): Promise<{ refs: PapertrailRef[]; decisions: DecisionRecord[] }> {
     return this.get('/api/file/papertrail', { path }, signal);
   }
-  async symbolCallers(qname: string, limit = 50): Promise<unknown[]> {
-    return (await this.get<{ callers: unknown[] }>('/api/symbol/callers', { qname, limit: String(limit) })).callers;
+  /**
+   * Callers of ONE symbol. Sends the handle when the row carried one so overloads stay apart, and
+   * falls back to the qualified name only when it did not — the server then answers with every
+   * symbol of that name, which is the older, ambiguous behaviour.
+   */
+  async symbolCallers(selector: SymbolSelector, limit = 50): Promise<unknown[]> {
+    const params: Record<string, string> = { limit: String(limit) };
+    if (selector.id) {
+      params.id = selector.id;
+    } else if (selector.qname) {
+      params.qname = selector.qname;
+    } else {
+      throw new Error('symbolCallers needs a symbol handle or a qualified name');
+    }
+    return (await this.get<{ callers: unknown[] }>('/api/symbol/callers', params)).callers;
   }
 
   async watchVersions(signal: AbortSignal, onVersion: (version: VersionToken) => void): Promise<void> {

@@ -10,6 +10,7 @@ import type {
   LensClient,
   PapertrailRef,
   SymbolGraph,
+  SymbolSelector,
 } from './client';
 import type { FileStore } from './store';
 
@@ -87,6 +88,25 @@ function openDoc(title: string, markdown: string): Thenable<void> {
   return lensDocs ? lensDocs.open(title, markdown) : Promise.resolve();
 }
 
+/**
+ * Arguments for `rag-rat-lens.showCallers`, built in ONE place for every surface that dispatches
+ * it.
+ *
+ * The CodeLens and the hover link render from the same `SymbolGraph` row and reach the same
+ * handler, so the tuple is a shared contract rather than each surface's own detail: a surface that
+ * assembles it locally can pass a shape the handler no longer reads, and a surface that sends the
+ * row's name instead of its handle answers for every overload sharing that name rather than for
+ * the row the reader is looking at. `undefined` = the row names no symbol the server can resolve,
+ * so the surface must offer no link at all.
+ */
+export function callerCommandArguments(
+  symbol: SymbolGraph,
+): [SymbolSelector, string] | undefined {
+  return symbol.id || symbol.qname
+    ? [{ id: symbol.id, qname: symbol.qname }, symbol.name]
+    : undefined;
+}
+
 export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Disposable {
   private readonly changed = new vscode.EventEmitter<void>();
   readonly onDidChangeCodeLenses = this.changed.event;
@@ -112,7 +132,8 @@ export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Dispo
       const line = Math.min(Math.max(0, s.start_line - 1), document.lineCount - 1);
       const range = new vscode.Range(line, 0, line, 0);
       const total = s.callers.exact + s.callers.syntactic + s.callers.name_only + s.callers.ambiguous;
-      if (total > 0 && s.qname) {
+      const callers = callerCommandArguments(s);
+      if (total > 0 && callers) {
         const tiers = [
           s.callers.exact ? `${s.callers.exact} exact` : '',
           s.callers.syntactic ? `${s.callers.syntactic} syntactic` : '',
@@ -131,7 +152,10 @@ export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Dispo
                 ? `  ⚑${s.fan_in_bucket} load`
                 : ''),
             command: 'rag-rat-lens.showCallers',
-            arguments: [s.qname, s.name],
+            // The lens is built from ONE symbol row, so it carries that row's handle: two
+            // overloads share a qualified name but not a handle, and the count in this title is
+            // counted per symbol. Passing the name alone is what made both lenses answer alike.
+            arguments: callers,
           }),
         );
       } else if (s.fan_in_bucket === 'critical' || s.fan_in_bucket === 'high') {
@@ -225,8 +249,8 @@ export function registerSignalCommands(
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(DOC_SCHEME, (lensDocs = new LensDocProvider())),
 
-    vscode.commands.registerCommand('rag-rat-lens.showCallers', async (qname: string, name: string) => {
-      const rows = (await client.symbolCallers(qname)) as CallerRow[];
+    vscode.commands.registerCommand('rag-rat-lens.showCallers', async (selector: SymbolSelector, name: string) => {
+      const rows = (await client.symbolCallers(selector)) as CallerRow[];
       const picked = await vscode.window.showQuickPick(
         rows.map((r) => ({
           label: `$(symbol-method) ${r.name}`,

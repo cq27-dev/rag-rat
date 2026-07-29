@@ -2257,3 +2257,161 @@ test('open rag-rat-doc documents are withdrawn when the server they came from is
   // Withdrawal is not deletion: an unknown key still reads as absent.
   assert.equal(provider.provideTextDocumentContent({ path: '/never.md' }), 'not found');
 });
+
+test('caller requests prefer the symbol handle and fall back to the qualified name', async (t) => {
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push(request.url);
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end('{"callers":[],"resolved_by":"id","matched_symbols":1}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const LensClient = await loadClient();
+  const address = server.address();
+  const client = new LensClient({
+    invalidate() {},
+    async resolve() {
+      return { baseUrl: `http://127.0.0.1:${address.port}`, token: null };
+    },
+  });
+
+  // Two overloads share `src/lib.rs::run`, so the handle is the only selector that separates
+  // them — it must win even when a qualified name is available alongside it.
+  await client.symbolCallers({ id: 'sym_2029231588695800bf', qname: 'src/lib.rs::run' });
+  const withHandle = new URL(requests[0], 'http://localhost');
+  assert.equal(withHandle.searchParams.get('id'), 'sym_2029231588695800bf');
+  assert.equal(withHandle.searchParams.get('qname'), null);
+
+  // A row the server could not hand a handle for still navigates, by name.
+  await client.symbolCallers({ id: null, qname: 'src/lib.rs::run' });
+  const withName = new URL(requests[1], 'http://localhost');
+  assert.equal(withName.searchParams.get('qname'), 'src/lib.rs::run');
+  assert.equal(withName.searchParams.get('id'), null);
+
+  await assert.rejects(client.symbolCallers({ id: null, qname: null }), /handle or a qualified name/);
+  assert.equal(requests.length, 2, 'a selector-less request must never reach the server');
+});
+
+test('each overload lens carries its own symbol handle', async () => {
+  const lenses = [];
+  const vscode = {
+    CodeLens: class {
+      constructor(range, command) {
+        Object.assign(this, { range, command });
+        lenses.push(this);
+      }
+    },
+    EventEmitter: class {
+      constructor() {
+        this.event = () => ({ dispose() {} });
+      }
+      fire() {}
+      dispose() {}
+    },
+    Range: class {
+      constructor(startLine) {
+        this.startLine = startLine;
+      }
+    },
+  };
+  const { SignalLensProvider } = await loadSourceModule('lenses.ts', vscode);
+
+  const overload = (id, startLine) => ({
+    id,
+    name: 'run',
+    qname: 'src/lib.rs::run',
+    kind: 'function',
+    start_line: startLine,
+    end_line: startLine,
+    is_test: false,
+    callers: { exact: 1, syntactic: 0, name_only: 0, ambiguous: 0, tests: 0, dispatch: 0 },
+    fan_in_score: 1,
+    fan_in_bucket: 'low',
+    dispatch: [],
+  });
+  const provider = new SignalLensProvider({
+    dataFor: async () => ({
+      data: {
+        symbols: [overload('sym_alpha', 9), overload('sym_beta', 13)],
+        coupling: [],
+        refs: [],
+        decisions: [],
+        clones: [],
+      },
+    }),
+  });
+
+  await provider.provideCodeLenses({ lineCount: 40 });
+  const selectors = lenses
+    .filter((lens) => lens.command.command === 'rag-rat-lens.showCallers')
+    .map((lens) => lens.command.arguments[0]);
+  assert.deepEqual(selectors, [
+    { id: 'sym_alpha', qname: 'src/lib.rs::run' },
+    { id: 'sym_beta', qname: 'src/lib.rs::run' },
+  ]);
+});
+
+test('the hover link dispatches show callers exactly as the lens does', async () => {
+  const vscode = {
+    MarkdownString: class {
+      constructor(value) {
+        this.value = value ?? '';
+      }
+      appendMarkdown(text) {
+        this.value += text;
+        return this;
+      }
+    },
+    Hover: class {
+      constructor(contents, range) {
+        Object.assign(this, { contents, range });
+      }
+    },
+    Range: class {
+      constructor(startLine) {
+        this.startLine = startLine;
+      }
+    },
+  };
+  const { GraphHoverProvider } = await loadSourceModule('hover.ts', vscode);
+
+  const row = (id, qname, startLine) => ({
+    id,
+    name: 'run',
+    qname,
+    kind: 'function',
+    start_line: startLine,
+    end_line: startLine,
+    is_test: false,
+    callers: { exact: 1, syntactic: 0, name_only: 0, ambiguous: 0, tests: 0, dispatch: 0 },
+    fan_in_score: 1,
+    fan_in_bucket: 'low',
+    dispatch: [],
+  });
+  const symbols = [
+    row('sym_alpha', 'src/lib.rs::run', 9),
+    row('sym_beta', 'src/lib.rs::run', 13),
+    row(null, 'src/lib.rs::only_named', 17),
+    row(null, null, 21),
+  ];
+  const provider = new GraphHoverProvider({ dataFor: async () => ({ data: { symbols } }) });
+  const commandArguments = async (line) => {
+    const hover = await provider.provideHover({}, { line: line - 1 });
+    const link = /command:rag-rat-lens\.showCallers\?([^)]*)\)/.exec(hover.contents.value);
+    return link ? JSON.parse(decodeURIComponent(link[1])) : undefined;
+  };
+
+  // The hover dispatches the SAME command as the CodeLens, so it has to send what the handler
+  // reads — a selector, not a bare name — and its own row's handle: the two overloads share a
+  // qualified name, so the name alone answers for both.
+  assert.deepEqual(await commandArguments(9), [{ id: 'sym_alpha', qname: 'src/lib.rs::run' }, 'run']);
+  assert.deepEqual(await commandArguments(13), [{ id: 'sym_beta', qname: 'src/lib.rs::run' }, 'run']);
+  // A row without a handle still navigates by name; a row with neither offers no link at all.
+  assert.deepEqual(await commandArguments(17), [
+    { id: null, qname: 'src/lib.rs::only_named' },
+    'run',
+  ]);
+  assert.equal(await commandArguments(21), undefined);
+});

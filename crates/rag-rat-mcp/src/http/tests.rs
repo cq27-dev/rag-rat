@@ -343,6 +343,11 @@ async fn new_routes_reject_missing_or_invalid_parameters() {
         "/api/file/papertrail",
         "/api/symbol/callers",
         "/api/symbol/callees?qname=",
+        // An empty `id` falls through to the qualified name, which is also absent.
+        "/api/symbol/callers?id=",
+        // Neither is a `sym_<hex>` handle, and neither may be read as one.
+        "/api/symbol/callers?id=12345",
+        "/api/symbol/callees?id=sym_zzz",
         "/api/chunk/text",
         "/api/chunk/text?chunk_id=nope",
         "/api/chunk/text?chunk_id=0",
@@ -701,6 +706,164 @@ async fn a_queued_clone_read_holds_no_database_worker() {
         queued.await.expect("the queued clone read completes once the build releases the graph");
     assert!(clones.clone_regions.is_empty(), "a one-function corpus has no clone regions");
     let _ = fs::remove_dir_all(root);
+}
+
+/// Two `run` overloads sharing `src/lib.rs::run`, each with its own caller and its own callee.
+const OVERLOAD_SOURCE: &str = r#"
+pub struct Alpha;
+pub struct Beta;
+
+pub fn alpha_leaf() {}
+pub fn beta_leaf() {}
+
+impl Alpha {
+    pub fn run(&self) { alpha_leaf(); }
+}
+
+impl Beta {
+    pub fn run(&self, extra: i64) { beta_leaf(); let _ = extra; }
+}
+
+pub fn calls_alpha(alpha: &Alpha) { alpha.run(); }
+pub fn calls_beta(beta: &Beta) { beta.run(1); }
+"#;
+
+/// The whole protocol on one fixture: `/api/file/graph` hands out a handle per overload, and the
+/// hop routes answer each handle with that overload's own neighbours. The `qname` fallback stays
+/// reachable and says, in the response, that it covered two symbols at once.
+#[tokio::test]
+async fn hop_routes_prefer_the_symbol_handle_over_the_shared_qualified_name() {
+    let (root, config) = test_config();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), OVERLOAD_SOURCE).unwrap();
+    drop(IndexDatabase::rebuild(&config).unwrap());
+    let conn = rusqlite::Connection::open(&config.database).unwrap();
+    resolve_overload_call_sites(&conn);
+    drop(conn);
+    let app = router(config, ServeOptions::default());
+
+    let graph = get_json(&app, "/api/file/graph?path=src/lib.rs").await;
+    let handles = graph["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "run")
+        .map(|row| row["id"].as_str().expect("every graph row carries its handle").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(handles.len(), 2);
+    assert_ne!(handles[0], handles[1], "overloads must not share one handle");
+    let symbols = get_json(&app, "/api/file/symbols?path=src/lib.rs").await;
+    assert_eq!(
+        symbols["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["name"] == "run")
+            .map(|row| row["id"].clone())
+            .collect::<Vec<_>>(),
+        handles.iter().map(|id| Value::String(id.clone())).collect::<Vec<_>>(),
+        "both file lanes must agree on the handle"
+    );
+
+    for (handle, caller, callee) in
+        [(&handles[0], "calls_alpha", "alpha_leaf"), (&handles[1], "calls_beta", "beta_leaf")]
+    {
+        let callers = get_json(&app, &format!("/api/symbol/callers?id={handle}")).await;
+        assert_eq!(hop_names(&callers["callers"]), [caller]);
+        assert_eq!(callers["resolved_by"], "id");
+        assert_eq!(callers["matched_symbols"], 1);
+        let callees = get_json(&app, &format!("/api/symbol/callees?id={handle}")).await;
+        assert_eq!(hop_names(&callees["callees"]), [callee]);
+        assert_eq!(callees["resolved_by"], "id");
+    }
+
+    let shared = get_json(&app, "/api/symbol/callers?qname=src/lib.rs::run").await;
+    assert_eq!(hop_names(&shared["callers"]), ["calls_alpha", "calls_beta"]);
+    assert_eq!(shared["resolved_by"], "ref");
+    assert_eq!(
+        shared["matched_symbols"], 2,
+        "an older client must be able to see that its selector was ambiguous"
+    );
+    let shared = get_json(&app, "/api/symbol/callees?qname=src/lib.rs::run").await;
+    assert_eq!(hop_names(&shared["callees"]), ["alpha_leaf", "beta_leaf"]);
+    assert_eq!(shared["resolved_by"], "ref");
+
+    // The fallback also answers an unqualified name, so its count has to model that resolution
+    // too: `matched_symbols: 0` beside a non-empty hop list would tell a client its selector
+    // matched nothing.
+    let short = get_json(&app, "/api/symbol/callers?qname=alpha_leaf").await;
+    assert_eq!(hop_names(&short["callers"]), ["run"]);
+    assert_eq!(short["resolved_by"], "ref");
+    assert_eq!(short["matched_symbols"], 1);
+
+    // A handle wins over a qualified name sent in the same request.
+    let both =
+        get_json(&app, &format!("/api/symbol/callers?id={}&qname=src/lib.rs::run", handles[0]))
+            .await;
+    assert_eq!(hop_names(&both["callers"]), ["calls_alpha"]);
+    assert_eq!(both["resolved_by"], "id");
+
+    // A well-formed handle naming nothing here is a 404, not an empty caller list.
+    for route in ["callers", "callees"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/symbol/{route}?id=sym_7fffffffffffffff"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(response).await["error"], "unknown symbol handle");
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Sorted, de-duplicated hop names from a `callers`/`callees` payload.
+fn hop_names(hops: &Value) -> Vec<String> {
+    let mut names = hops
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hop| hop["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Bind each `run` call site to the overload it actually targets, as a compiler oracle pass does.
+/// The heuristic resolver leaves a same-name method call unresolved on purpose, so without this
+/// the caller direction has no edge that could tell the two overloads apart.
+fn resolve_overload_call_sites(conn: &rusqlite::Connection) {
+    for (caller, callee) in [("calls_alpha", "alpha_leaf"), ("calls_beta", "beta_leaf")] {
+        let target: i64 = conn
+            .query_row(
+                "SELECT run.id
+                 FROM symbols run
+                 JOIN files ON files.id = run.file_id
+                 JOIN edges body ON body.from_symbol_id = run.id
+                 JOIN symbols leaf ON leaf.id = body.to_symbol_id
+                 WHERE run.name = 'run' AND leaf.name = ?1",
+                [callee],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let edge: i64 = conn
+            .query_row(
+                "SELECT edges.id
+                 FROM edges
+                 JOIN symbols source ON source.id = edges.from_symbol_id
+                 WHERE edges.edge_kind = 'calls_name' AND edges.to_name = 'run'
+                   AND source.name = ?1",
+                [caller],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute("UPDATE edges_data SET to_symbol_id = ?1 WHERE id = ?2", [target, edge])
+            .unwrap();
+    }
 }
 
 async fn json_body(response: axum::response::Response) -> Value {

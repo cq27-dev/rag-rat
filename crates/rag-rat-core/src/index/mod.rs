@@ -83,11 +83,11 @@ pub use query_api::{
     LensClonePartner, LensCloneRefine, LensCloneRegion, LensCouplingPartner, LensDecisionRecord,
     LensDispatchDetail, LensFileClones, LensFileCoupling, LensFileGraph, LensFileMemories,
     LensFileMemory, LensFilePapertrail, LensFileSymbolGraph, LensFileSymbols,
-    LensGraphCallerCounts, LensPapertrailRef, LensStatus, LensSymbol, LensSymbolHop, LensTreemap,
-    LensTreemapFile, LensVersion, MemoryCounts, MemoryKindCounts, OracleShaSnapshots,
-    PapertrailCursor, RepoContent, RepoFreshness, RepoPapertrail, RepoStatus, RoiFactors,
-    SearchRequest, SyncCatchUpReport, TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES,
-    WalCheckpointReport, WorktreeOverlay, reclaim_freelist_at,
+    LensGraphCallerCounts, LensHopResolvedBy, LensHopSelector, LensPapertrailRef, LensStatus,
+    LensSymbol, LensSymbolHop, LensTreemap, LensTreemapFile, LensVersion, MemoryCounts,
+    MemoryKindCounts, OracleShaSnapshots, PapertrailCursor, RepoContent, RepoFreshness,
+    RepoPapertrail, RepoStatus, RoiFactors, SearchRequest, SyncCatchUpReport, TextCloneMatch,
+    WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay, reclaim_freelist_at,
 };
 pub use schema::RegisteredRepo;
 pub(crate) use util::*;
