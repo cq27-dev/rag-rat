@@ -329,6 +329,11 @@ mod tests {
             rw.connection().query_row(&format!("PRAGMA {name}"), [], |row| row.get(0)).unwrap()
         };
 
+        // #220: a write connection WAITS OUT another writer rather than failing SQLITE_BUSY — WAL
+        // admits one writer at a time, and every shared-store path (a second checkout, the watcher
+        // mid-pass, a lazy heal, the table-sync refold's IMMEDIATE transaction at store open)
+        // relies on this rather than on retry logic of its own.
+        assert_eq!(pragma("busy_timeout"), 5000, "a writer must wait out a concurrent writer");
         // #815: temp b-trees/tables must stay in memory (2 = MEMORY), never spill to /var/tmp
         // external-merge files, and the page cache is a bounded 64 MiB (negative form = KiB).
         assert_eq!(pragma("temp_store"), 2, "temp_store must be MEMORY");

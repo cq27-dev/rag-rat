@@ -266,6 +266,11 @@ fn stored_projector_version(conn: &Connection) -> anyhow::Result<Option<i64>> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    use rag_rat_base::test_scratch::ScratchDir;
+    use rag_rat_db::storage::IndexConnection;
+
     use super::*;
     use crate::table_sync::engine::{self, IngestOutcome, SyncCtx};
     use crate::table_sync::registry::{ColumnSpec, DefaultValue, ValueType};
@@ -1380,5 +1385,359 @@ mod tests {
             ],
             "a stored classification token moved, or a new variant is unpinned"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Two openers of ONE database file.
+    //
+    // A store reached by binaries of different versions is a first-class configuration here —
+    // linked worktrees share one database — but every test above drives it from a single
+    // `Connection`, with the other binary simulated by hand-editing the stamp or an entry's
+    // `pending_projector_version`. That cannot show what a second opener changes: whether the
+    // pending mark, the projector stamp, and the unsent-local-edit guard are FILE state rather than
+    // connection state, and whether the refold's IMMEDIATE transaction really contends for the
+    // store's single write lock. The tests below open the same file twice, for real.
+
+    /// One database file, schema-applied once, plus the scratch dir that owns it.
+    struct SharedStore {
+        dir: ScratchDir,
+    }
+
+    impl SharedStore {
+        fn new(tag: &str) -> Self {
+            let store = Self { dir: ScratchDir::new(tag) };
+            let db = IndexConnection::open(&store.path()).unwrap();
+            rag_rat_db::schema::apply(db.connection(), &crate::test_hooks()).unwrap();
+            db.execute_batch(
+                "CREATE TABLE t_demo(id TEXT PRIMARY KEY, title TEXT, later_col TEXT) STRICT;",
+            )
+            .unwrap();
+            store
+        }
+
+        fn path(&self) -> PathBuf {
+            self.dir.join("index.sqlite")
+        }
+
+        fn open(&self) -> Opener {
+            open_at(&self.path())
+        }
+    }
+
+    /// A production opener of `path`. [`IndexConnection::open`] is what pins the real write-path
+    /// pragmas — WAL plus `busy_timeout = 5000` — and those decide whether a contended IMMEDIATE
+    /// transaction waits or fails, so a hand-rolled `Connection::open` here would exercise a
+    /// configuration that does not ship.
+    fn open_at(path: &Path) -> Opener {
+        let db = IndexConnection::open(path).unwrap();
+        let local = crate::local_device(db.connection(), 0).unwrap();
+        Opener { db, local }
+    }
+
+    /// One opener of a [`SharedStore`]. Deliberately not a [`Device`]: `Device` OWNS its
+    /// connection, while an opener borrows one from the `IndexConnection` carrying the pragmas
+    /// above — so its write paths go through `Transaction::new_unchecked`, exactly as the
+    /// engine's own callers do.
+    struct Opener {
+        db: IndexConnection,
+        local: LocalDevice,
+    }
+
+    impl Opener {
+        fn conn(&self) -> &Connection {
+            self.db.connection()
+        }
+
+        fn fingerprint(&self) -> crate::op::DeviceFingerprint {
+            self.local.secret().public().fingerprint()
+        }
+
+        fn enroll(&self, fp: crate::op::DeviceFingerprint) {
+            self.conn()
+                .execute(
+                    "INSERT OR IGNORE INTO account_roster_history
+                         (roster_ref, account_id, device_fingerprint, role, effective_at, \
+                     closed_at)
+                     VALUES (?1, ?2, ?3, 'owner', 0, NULL)",
+                    params![fp.to_bytes().as_slice(), ACCOUNT.as_slice(), fp.to_bytes().as_slice()],
+                )
+                .unwrap();
+        }
+
+        /// Fallible, because the newer-projector refusal is one of the behaviors under test.
+        fn produce(&self, registry: &[TableSpec], repo_id: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+            let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Deferred)?;
+            let ctx = SyncCtx {
+                repo_id,
+                account_id: account(),
+                device: &self.local,
+                registry,
+                now_ms: 0,
+            };
+            let out = engine::produce_and_author(&tx, &ctx)?;
+            tx.commit()?;
+            Ok(out)
+        }
+
+        fn ingest(
+            &self,
+            registry: &[TableSpec],
+            repo_id: &str,
+            entries: &[Vec<u8>],
+            from: &crate::device::DevicePublic,
+        ) -> Vec<IngestOutcome> {
+            let tx =
+                Transaction::new_unchecked(self.conn(), TransactionBehavior::Deferred).unwrap();
+            let ctx = SyncCtx {
+                repo_id,
+                account_id: account(),
+                device: &self.local,
+                registry,
+                now_ms: 0,
+            };
+            let out = entries
+                .iter()
+                .map(|bytes| engine::ingest(&tx, &ctx, "demo/1", bytes, from).unwrap())
+                .collect();
+            tx.commit().unwrap();
+            out
+        }
+
+        fn refold(&self, registry: &[TableSpec]) -> anyhow::Result<bool> {
+            refold_stale_projections_against(self.conn(), registry)
+        }
+
+        fn row(&self) -> Option<(String, Option<String>)> {
+            self.conn()
+                .query_row("SELECT title, later_col FROM t_demo WHERE id = 'r1'", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()
+                .unwrap()
+        }
+
+        fn pending_count(&self) -> i64 {
+            self.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM table_sync_entries WHERE pending_reason IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+    }
+
+    /// The complete r1 row the wide entry projects to once a NEW-registry binary understands it.
+    fn refolded_row() -> Option<(String, Option<String>)> {
+        Some(("v1".to_string(), Some("wide".to_string())))
+    }
+
+    /// Park one entry in `store`: an in-memory peer authors r1 under the NEW column set, and an
+    /// opener ingests it under the OLD one, which cannot project it. The opener is dropped, so the
+    /// parked state survives only in the file.
+    fn park_wide_entry(store: &SharedStore) {
+        let mut peer = Device::new();
+        let entries = author_wide_row(&mut peer);
+        let opener = store.open();
+        opener.enroll(peer.pubkey().fingerprint());
+        assert_eq!(opener.ingest(OLD_REGISTRY, "repo", &entries, &peer.pubkey()), vec![
+            IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        ]);
+        assert_eq!(opener.pending_count(), 1, "the fixture leaves exactly one entry parked");
+    }
+
+    #[test]
+    fn a_second_opener_refolds_what_the_first_one_parked() {
+        let store = SharedStore::new("table-sync-two-openers-refold");
+        park_wide_entry(&store);
+
+        let first = store.open();
+        let second = store.open();
+        assert_eq!(
+            first.fingerprint(),
+            second.fingerprint(),
+            "two openers of one file are one device identity, not two peers"
+        );
+        assert_eq!(
+            second.pending_count(),
+            1,
+            "the pending mark is file state, not connection state"
+        );
+        assert_eq!(second.row(), None, "and nothing was applied in part");
+
+        assert!(second.refold(NEW_REGISTRY).unwrap());
+        assert_eq!(second.row(), refolded_row());
+
+        // The other, still-open connection sees the committed result — including the stamp, so it
+        // does not redo the work, and the anti-echo hashes, so it emits nothing. Every
+        // single-connection test above assumes exactly this and cannot check it.
+        assert_eq!(first.row(), refolded_row());
+        assert_eq!(first.pending_count(), 0);
+        assert!(!first.refold(NEW_REGISTRY).unwrap(), "the refold is one-shot across openers");
+        assert!(first.produce(NEW_REGISTRY, "repo").unwrap().is_empty(), "and nothing echoes back");
+    }
+
+    #[test]
+    fn the_refold_contends_for_the_stores_single_write_lock() {
+        let store = SharedStore::new("table-sync-two-openers-busy");
+        park_wide_entry(&store);
+
+        let writer = store.open();
+        let refolder = store.open();
+        // A refold that will not wait, so the contention is observable rather than absorbed by the
+        // production timeout (the sibling test covers the waiting half).
+        refolder.conn().busy_timeout(std::time::Duration::ZERO).unwrap();
+
+        // WAL admits exactly one writer, and the other opener is it.
+        let held =
+            Transaction::new_unchecked(writer.conn(), TransactionBehavior::Immediate).unwrap();
+        held.execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r9', 'held', NULL)", [])
+            .unwrap();
+
+        let err = refolder
+            .refold(NEW_REGISTRY)
+            .expect_err("the refold must not proceed without the store's write lock");
+        assert!(rag_rat_db::storage::is_busy(&err), "the refusal is SQLITE_BUSY, got: {err}");
+        assert_eq!(refolder.pending_count(), 1, "and the worklist is untouched");
+
+        // The same refold then succeeds, so the failure was contention rather than a worklist this
+        // opener could never redeem.
+        held.commit().unwrap();
+        assert!(refolder.refold(NEW_REGISTRY).unwrap());
+        assert_eq!(refolder.row(), refolded_row());
+    }
+
+    /// Set by [`note_blocked_then_retry`] the first time SQLite reports the write lock unavailable
+    /// — the only reliable proof that a refold actually BLOCKED rather than finding the lock
+    /// free. Read and reset by the single test below; nothing else touches it, so it is safe
+    /// under the shared-process `cargo test` runner as well as under nextest.
+    static REFOLD_BLOCKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Stands in for the production `busy_timeout` (pinned separately by
+    /// `setup_pins_the_write_path_pragmas` in `rag-rat-db`), because `sqlite3_busy_handler` gives a
+    /// callback and the timeout pragma does not: the hand-off below has to be CAUSAL, not timed. A
+    /// sleep-based hand-off fails both ways — the holder commits before the refold reaches `BEGIN`
+    /// (the test passes without contending), or the holder is descheduled past the timeout (the
+    /// test fails for scheduling reasons).
+    ///
+    /// The ~30s ceiling is a HANG-STOP, not a timeout under test: the holder releases the lock
+    /// within its own 5s watchdog, so patience an order of magnitude past that cannot be reached by
+    /// a correct run — and matching the production 5s here would just reintroduce the spurious
+    /// failure the causal hand-off exists to remove.
+    fn note_blocked_then_retry(attempts: i32) -> bool {
+        REFOLD_BLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
+        if attempts > 3_000 {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        true
+    }
+
+    #[test]
+    fn the_refold_blocks_on_a_concurrent_writer_and_completes_once_it_commits() {
+        use std::sync::atomic::Ordering;
+
+        let store = SharedStore::new("table-sync-two-openers-wait");
+        park_wide_entry(&store);
+        REFOLD_BLOCKED.store(false, Ordering::SeqCst);
+
+        // Opened BEFORE the write lock is taken: `IndexConnection::open` writes pragmas of its own,
+        // and this test is about the refold's contention, not the opener's.
+        let refolder = store.open();
+        refolder.conn().busy_handler(Some(note_blocked_then_retry)).unwrap();
+
+        let path = store.path();
+        let (holding, lock_held) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let opener = open_at(&path);
+            let tx =
+                Transaction::new_unchecked(opener.conn(), TransactionBehavior::Immediate).unwrap();
+            tx.execute(
+                "INSERT INTO t_demo(id, title, later_col) VALUES ('r9', 'concurrent', NULL)",
+                [],
+            )
+            .unwrap();
+            holding.send(()).unwrap();
+            // Hold until the refolder is provably blocked, so the release is caused by the
+            // contention rather than by a clock. The deadline is only a watchdog: if the refold
+            // never blocks, this returns and the assertion below reports it instead of hanging.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !REFOLD_BLOCKED.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            tx.commit().unwrap();
+        });
+
+        lock_held.recv().unwrap();
+        assert!(refolder.refold(NEW_REGISTRY).unwrap(), "the refold completes once the lock frees");
+        writer.join().unwrap();
+        assert!(
+            REFOLD_BLOCKED.load(Ordering::SeqCst),
+            "the refold must have contended for the write lock, not found it free"
+        );
+
+        // And neither write was lost to the other.
+        assert_eq!(refolder.row(), refolded_row());
+        let concurrent: String = refolder
+            .conn()
+            .query_row("SELECT title FROM t_demo WHERE id = 'r9'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(concurrent, "concurrent");
+    }
+
+    #[test]
+    fn an_opener_refuses_to_write_a_store_the_other_folded_with_a_newer_projector() {
+        let store = SharedStore::new("table-sync-two-openers-newer");
+        let newer = store.open();
+        let older = store.open();
+
+        // One process has one `TABLE_SYNC_PROJECTOR_VERSION`, so the newer binary can only be
+        // modelled by the stamp it leaves behind — but the stamp CROSSING two connections is real,
+        // and that crossing is what the refusal depends on in the field.
+        newer
+            .conn()
+            .execute("INSERT INTO oplog_meta(key, value) VALUES (?1, ?2)", params![
+                TABLE_SYNC_PROJECTOR_VERSION_KEY,
+                (TABLE_SYNC_PROJECTOR_VERSION + 1).to_string()
+            ])
+            .unwrap();
+        older
+            .conn()
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'v', NULL)", [])
+            .unwrap();
+
+        let err = older
+            .produce(OLD_REGISTRY, "repo")
+            .expect_err("an older projector must not author into a store a newer one folded");
+        assert!(
+            err.to_string().contains("newer rag-rat"),
+            "the refusal names the cause, got: {err}"
+        );
+        assert!(!older.refold(NEW_REGISTRY).unwrap(), "nor fold the stamp back down");
+    }
+
+    #[test]
+    fn the_unsent_local_edit_guard_sees_the_other_openers_committed_write() {
+        // The guard that keeps the refold from destroying a change no peer has seen must read the
+        // STORE, not one connection's view of it: on a shared file the local edit routinely arrives
+        // through a different opener than the one that refolds at open.
+        let store = SharedStore::new("table-sync-two-openers-unsent");
+        park_wide_entry(&store);
+
+        let editor = store.open();
+        editor
+            .conn()
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'unsent', NULL)", [])
+            .unwrap();
+
+        let refolder = store.open();
+        assert!(refolder.refold(NEW_REGISTRY).unwrap());
+        assert_eq!(
+            refolder.row().unwrap().0,
+            "unsent",
+            "the other opener's unsent edit survives the refold"
+        );
+        assert_eq!(refolder.pending_count(), 1, "and the entry stays outstanding rather than lost");
     }
 }
