@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
 use rag_rat_base::language::Language;
+use rag_rat_base::test_scratch::{self, ScratchDir};
 use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
 use rusqlite::params;
 
@@ -1739,8 +1740,15 @@ fn rust_source_config(source: &str) -> (tempfile::TempDir, Config) {
     (temp, config)
 }
 
-fn indexed_config() -> (tempfile::TempDir, Config) {
-    let temp = tempfile::tempdir().unwrap();
+/// A fully indexed single-crate fixture, returning the scratch guard and its `Config`.
+///
+/// The root comes from [`test_scratch::ScratchDir`], not `tempfile`: scratch paths are handed out
+/// through a symlinked ancestor, so `canonical_config_root` below is a real normalization on every
+/// platform rather than a no-op that only bites on macOS/Windows (#1027). A `tempfile` root is
+/// already canonical on Linux, which would leave this fixture — and the Lens chunk/search paths it
+/// drives — outside the per-PR coverage of root-spelling bugs.
+fn indexed_config() -> (ScratchDir, Config) {
+    let temp = ScratchDir::new("lens-indexed");
     let root = temp.path().to_path_buf();
     fs::create_dir(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), SOURCE).unwrap();
@@ -1750,7 +1758,7 @@ fn indexed_config() -> (tempfile::TempDir, Config) {
     fs::write(root.join(UNICODE_PATH), UNICODE_SOURCE).unwrap();
     fs::write(root.join(FOLDED_PATH), FOLDED_SOURCE).unwrap();
     fs::write(root.join(COMPOSED_PATH), COMPOSED_SOURCE).unwrap();
-    let config_root = rag_rat_base::test_scratch::canonical_config_root(root);
+    let config_root = test_scratch::canonical_config_root(root);
     let mut config =
         Config::minimal_for_database(config_root.join("index.sqlite"), config_root.clone());
     config.database_key_pinned = true;
@@ -1768,8 +1776,10 @@ fn indexed_config() -> (tempfile::TempDir, Config) {
 
 #[test]
 fn per_file_answers_name_the_exact_bytes_they_were_computed_from() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().to_path_buf();
+    // `ScratchDir` + `canonical_config_root`, not `tempfile`: a fixture rooted at a raw temp path
+    // is already canonical on Linux, so it opts out of the root-spelling coverage entirely (#1027).
+    let temp = ScratchDir::new("lens-verbatim");
+    let root = test_scratch::canonical_config_root(temp.path().to_path_buf());
     fs::create_dir(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), SOURCE).unwrap();
     // Verbatim disk bytes: a UTF-8 BOM and CRLF endings. The client compares against this hash, so
@@ -1889,5 +1899,28 @@ fn a_file_answer_and_its_content_hash_come_from_one_snapshot() {
                 .get::<_, String>(0))
             .unwrap(),
         "reindexed"
+    );
+}
+
+/// The fixture root and `config.root` must be two spellings of ONE directory — the shape
+/// `Config::load` produces wherever the system temp is reached through a symlink (macOS `/var` →
+/// `/private/var`) or an 8.3 alias (Windows `RUNNER~1`). A fixture rooted at a `tempfile` /
+/// `temp_dir()` path is already canonical on Linux, so `canonical_config_root` degenerates to a
+/// no-op and a one-sided `strip_prefix(config.root)` regression on the Lens chunk/search paths
+/// would pass the per-PR matrix and redden only the tag-triggered cross-platform legs (#1027).
+#[cfg(unix)]
+#[test]
+fn the_lens_fixture_config_root_diverges_from_its_scratch_spelling() {
+    let (temp, config) = indexed_config();
+    assert_ne!(
+        config.root,
+        temp.path(),
+        "the fixture must reach its root through a symlinked ancestor, or root-spelling bugs stay \
+         invisible on the per-PR matrix",
+    );
+    assert_eq!(
+        config.root,
+        temp.path().canonicalize().unwrap(),
+        "both spellings must name the same directory",
     );
 }

@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::Json;
@@ -12,6 +12,7 @@ use axum::response::IntoResponse;
 use futures_util::StreamExt;
 use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
 use rag_rat_base::language::Language;
+use rag_rat_base::test_scratch::{self, ScratchDir};
 use rag_rat_core::IndexDatabase;
 use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
 use serde_json::Value;
@@ -33,7 +34,7 @@ async fn serve_control_observes_a_stop_that_precedes_the_waiter() {
 
 #[tokio::test]
 async fn non_loopback_serving_requires_authentication() {
-    let (_root, config) = test_config();
+    let (_scratch, _root, config) = test_config();
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let error = serve(
         listener,
@@ -48,7 +49,7 @@ async fn non_loopback_serving_requires_authentication() {
 
 #[tokio::test]
 async fn health_is_available_without_opening_the_database() {
-    let (_root, config) = test_config();
+    let (_scratch, _root, config) = test_config();
     let response = router(config, ServeOptions::default())
         .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
         .await
@@ -63,7 +64,7 @@ async fn health_is_available_without_opening_the_database() {
 
 #[tokio::test]
 async fn bearer_auth_and_exact_origin_are_enforced() {
-    let (_root, config) = test_config();
+    let (_scratch, _root, config) = test_config();
     let app = router(config, ServeOptions {
         auth_token: Some("test-token".into()),
         allowed_origins: vec!["https://lens.example".into()],
@@ -109,7 +110,7 @@ async fn bearer_auth_and_exact_origin_are_enforced() {
 
 #[tokio::test]
 async fn an_allowed_origin_sees_cors_headers_on_auth_failure() {
-    let (_root, config) = test_config();
+    let (_scratch, _root, config) = test_config();
     let app = router(config, ServeOptions {
         auth_token: Some("test-token".into()),
         allowed_origins: vec!["https://lens.example".into()],
@@ -138,7 +139,7 @@ async fn an_allowed_origin_sees_cors_headers_on_auth_failure() {
 /// emitted only for an exact-allowlisted origin, never by default.
 #[tokio::test]
 async fn cors_preflight_is_answered_before_auth_and_opts_into_private_network_access() {
-    let (_root, config) = test_config();
+    let (_scratch, _root, config) = test_config();
     let app = router(config, ServeOptions {
         auth_token: Some("test-token".into()),
         allowed_origins: vec!["https://lens.example".into()],
@@ -211,7 +212,7 @@ async fn cors_preflight_is_answered_before_auth_and_opts_into_private_network_ac
 
 #[tokio::test]
 async fn events_emits_the_current_version_as_sse() {
-    let (root, config) = test_config();
+    let (_scratch, root, config) = test_config();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn current() {}\n").unwrap();
     drop(IndexDatabase::rebuild(&config).unwrap());
@@ -285,12 +286,11 @@ async fn events_emits_the_current_version_as_sse() {
         .await
         .expect("SSE shutdown must not wait for the polling interval");
     assert!(end.is_none(), "SSE body must end when serving stops");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn events_ends_when_a_version_probe_can_no_longer_open_the_index() {
-    let (root, config) = test_config();
+    let (_scratch, root, config) = test_config();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn current() {}\n").unwrap();
     drop(IndexDatabase::rebuild(&config).unwrap());
@@ -312,12 +312,11 @@ async fn events_ends_when_a_version_probe_can_no_longer_open_the_index() {
         .await
         .expect("failed version probes must close the SSE stream");
     assert!(end.is_none(), "a failed version probe must disconnect the client");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn clones_rejects_invalid_theta_and_paths() {
-    let (_root, config) = test_config();
+    let (_scratch, _root, config) = test_config();
     let app = router(config, ServeOptions::default());
     for uri in [
         "/api/file/clones?path=src/a.rs&theta=nan",
@@ -333,7 +332,7 @@ async fn clones_rejects_invalid_theta_and_paths() {
 
 #[tokio::test]
 async fn new_routes_reject_missing_or_invalid_parameters() {
-    let (_root, config) = test_config();
+    let (_scratch, _root, config) = test_config();
     let app = router(config, ServeOptions::default());
     for uri in [
         "/api/file/symbols",
@@ -368,7 +367,7 @@ async fn new_routes_reject_missing_or_invalid_parameters() {
 
 #[tokio::test]
 async fn symbol_graph_hops_and_chunk_routes_preserve_endpoint_wrappers() {
-    let (root, config) = test_config();
+    let (_scratch, root, config) = test_config();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("src/lib.rs"),
@@ -511,12 +510,11 @@ pub fn handle(req: Req) {
         json_body(stale).await["error"].as_str().unwrap().contains("stale"),
         "stale chunk must report as a 404"
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn clones_uses_the_native_lens_composition() {
-    let (root, config) = test_config();
+    let (_scratch, root, config) = test_config();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("src/a.rs"),
@@ -598,12 +596,11 @@ async fn clones_uses_the_native_lens_composition() {
     let body = json_body(response).await;
     assert_eq!(body["clone_regions"][0]["symbol"], "load_user");
     assert_eq!(body["clone_regions"][0]["partners"][0]["path"], "src/b.rs");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn blocking_database_work_obeys_the_timeout() {
-    let (root, config) = test_config();
+    let (_scratch, root, config) = test_config();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
     drop(IndexDatabase::rebuild(&config).unwrap());
@@ -635,12 +632,11 @@ async fn blocking_database_work_obeys_the_timeout() {
     run_db(state, |_, _, _| Ok(()))
         .await
         .expect("a cooperatively cancelled request must release the sole worker permit");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn dropping_a_request_cancels_its_database_work() {
-    let (root, config) = test_config();
+    let (_scratch, root, config) = test_config();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
     drop(IndexDatabase::rebuild(&config).unwrap());
@@ -677,7 +673,6 @@ async fn dropping_a_request_cancels_its_database_work() {
     run_db(state, |_, _, _| Ok(()))
         .await
         .expect("cancelling the abandoned work releases the sole worker permit");
-    let _ = fs::remove_dir_all(root);
 }
 
 /// A clone read that is waiting its turn at the repository-wide graph must wait OUTSIDE the
@@ -686,7 +681,7 @@ async fn dropping_a_request_cancels_its_database_work() {
 /// graph, memory, coupling, and papertrail lane behind it for the length of the build.
 #[tokio::test]
 async fn a_queued_clone_read_holds_no_database_worker() {
-    let (root, config) = test_config();
+    let (_scratch, root, config) = test_config();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
     drop(IndexDatabase::rebuild(&config).unwrap());
@@ -726,7 +721,6 @@ async fn a_queued_clone_read_holds_no_database_worker() {
     let Json(clones) =
         queued.await.expect("the queued clone read completes once the build releases the graph");
     assert!(clones.answer.clone_regions.is_empty(), "a one-function corpus has no clone regions");
-    let _ = fs::remove_dir_all(root);
 }
 
 /// Two `run` overloads sharing `src/lib.rs::run`, each with its own caller and its own callee.
@@ -984,19 +978,20 @@ async fn get_json(app: &axum::Router, uri: &str) -> Value {
     body
 }
 
-/// A fixture repo root plus a `Config` rooted at it. The returned root is the CANONICAL spelling
-/// the `Config` carries (`Config::load` canonicalizes, so a fixture must too): handing back the raw
-/// `temp_dir()` spelling alongside a canonical `config.root` would leave the caller writing its
-/// files through a second name for the same directory — the divergence that hides root-spelling
-/// bugs on the platforms where temp is symlinked (#1027).
-fn test_config() -> (PathBuf, Config) {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root =
-        rag_rat_base::test_scratch::canonical_config_root(std::env::temp_dir().join(format!(
-            "rag-rat-http-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        )));
+/// The scratch guard, the fixture repo root, and a `Config` rooted at it.
+///
+/// The root comes from [`ScratchDir`], not `std::env::temp_dir()`: scratch paths are handed out
+/// through a symlinked ancestor, so `canonical_config_root` is a real normalization on every
+/// platform instead of a no-op that only bites on macOS/Windows (#1027). A `temp_dir()` root is
+/// already canonical on Linux, which would leave the Lens HTTP chunk/search paths outside the
+/// per-PR coverage of root-spelling bugs. It also brings this fixture under the scratch
+/// namespace's stale sweep, so a killed run cannot strand it in the system temp (#726).
+///
+/// The returned root is the CANONICAL spelling the `Config` carries, so callers write their
+/// fixture files through the same name the index records.
+fn test_config() -> (ScratchDir, PathBuf, Config) {
+    let scratch = ScratchDir::new("rag-rat-http-test");
+    let root = test_scratch::canonical_config_root(scratch.path());
     let mut config = Config::minimal_for_database(root.join("index.sqlite"), root.clone());
     config.database_key_pinned = true;
     config.targets = vec![ResolvedTarget {
@@ -1007,5 +1002,25 @@ fn test_config() -> (PathBuf, Config) {
         exclude: Vec::new(),
         kind: TargetKind::Source,
     }];
-    (root, config)
+    (scratch, root, config)
+}
+
+/// The scratch spelling and `config.root` must be two names for ONE directory — the shape
+/// `Config::load` produces wherever the system temp is reached through a symlink (macOS `/var` →
+/// `/private/var`) or an 8.3 alias (Windows `RUNNER~1`). Rooting this fixture at a bare
+/// `temp_dir()` path degenerates `canonical_config_root` to a no-op on Linux, and a one-sided
+/// `strip_prefix(config.root)` regression on the routes below would then pass the per-PR matrix
+/// and redden only the tag-triggered cross-platform legs (#1027).
+#[cfg(unix)]
+#[test]
+fn the_http_fixture_config_root_diverges_from_its_scratch_spelling() {
+    let (scratch, root, config) = test_config();
+    assert_ne!(
+        root,
+        scratch.path(),
+        "the fixture must reach its root through a symlinked ancestor, or root-spelling bugs stay \
+         invisible on the per-PR matrix",
+    );
+    assert_eq!(config.root, root, "the Config carries the canonical spelling");
+    assert_eq!(root, scratch.path().canonicalize().unwrap(), "both spellings name one directory");
 }

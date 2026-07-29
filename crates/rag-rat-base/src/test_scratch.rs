@@ -331,6 +331,11 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
 /// Name of the self-referential symlink inside the namespace that makes every handed-out scratch
 /// path NON-CANONICAL on Unix (see [`aliased_root`]). Not a valid scratch dir name itself —
 /// [`scratch_dir`] always appends `-<pid>-<seq>` — so it can never collide with a `tag`.
+///
+/// Gated with its only reader: [`aliased_root`]'s link-creating branch is Unix-only, so an
+/// ungated const here would be `dead_code` on Windows, where the cross-platform legs deny
+/// warnings.
+#[cfg(unix)]
 const NON_CANONICAL_ALIAS: &str = "via-symlink";
 
 /// `root`, reached through a symlinked ancestor so the paths this module hands out are NOT
@@ -351,8 +356,29 @@ const NON_CANONICAL_ALIAS: &str = "via-symlink";
 /// no attack surface, and [`sweep_stale`] skips symlink entries so it is never followed or swept.
 ///
 /// Unix-only: creating a symlink on Windows needs developer mode or elevation, and Windows has its
-/// own non-canonical spelling anyway. Falls back to `root` unchanged if the link cannot be made,
-/// so a restricted filesystem degrades to the old behavior rather than failing the suite.
+/// own non-canonical spelling anyway — the tripwire tests are gated the same way, so nothing on
+/// Windows depends on this branch.
+///
+/// On Unix it returns `root` unchanged when the link cannot be made (a mount or policy that denies
+/// symlink creation). That is NOT a graceful degradation: the divergence the tripwires assert
+/// disappears with it, so
+/// `scratch_paths_are_not_canonical_so_linux_covers_the_macos_root_divergence` and the per-fixture
+/// `*_diverges_from_its_scratch_spelling` probes fail. Failing loudly is the intended outcome — a
+/// suite that stayed green while silently dropping this coverage is how the class reached the
+/// cross-platform legs in the first place (#1027).
+///
+/// # What it does NOT cover
+///
+/// The alias only reaches paths handed out by [`scratch_dir`] / [`ScratchDir`]. A fixture that
+/// rolls its own root — `std::env::temp_dir().join(...)`, `tempfile::tempdir()` — opts out: that
+/// root is already canonical on Linux, [`canonical_config_root`] degenerates to a no-op, and the
+/// root-spelling class stops being covered on the per-PR matrix. Build index `Config` fixtures on
+/// [`ScratchDir`] for that reason (the roots not on it today are synthetic paths, explicitly
+/// canonicalized ones, and the bench corpus, none of which carry a scratch spelling at all).
+///
+/// It is also only an approximation of Windows: `std::fs::canonicalize` there returns a `\\?\`
+/// verbatim path and expands 8.3 names, neither of which a Unix symlink produces. A root-spelling
+/// bug specific to those two shapes still surfaces first on the cross-platform legs.
 fn aliased_root(root: &Path) -> PathBuf {
     #[cfg(unix)]
     {

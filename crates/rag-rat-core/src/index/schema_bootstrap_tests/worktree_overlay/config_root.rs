@@ -8,6 +8,10 @@
 //!
 //! These tests pin the two halves of the fix: the overlay normalizes the root it is handed, and
 //! refuses (loudly) to run when no subdir can be derived at all.
+//!
+//! Every fixture here spells its root through a symlink, so the whole module is Unix-only and is
+//! gated at its `mod` declaration rather than item by item — a helper added below would otherwise
+//! be `dead_code` on Windows, where the cross-platform legs deny warnings.
 
 use super::*;
 
@@ -25,7 +29,6 @@ fn lens_revision(db: &IndexDatabase) -> String {
 /// `config.root` is set back to the alias spelling ON PURPOSE, after the fixture canonicalized it:
 /// a `Config` assembled in-process (a fixture, an embedding caller, a hand-edited root) carries
 /// whatever spelling it was given, and the overlay must scope correctly regardless.
-#[cfg(unix)]
 fn symlinked_root_fixture() -> (ScratchRoot, ScratchRoot, ScratchRoot, Config, PathBuf) {
     let real = unique_temp_root();
     let _ = fs::remove_dir_all(&real);
@@ -53,7 +56,6 @@ fn symlinked_root_fixture() -> (ScratchRoot, ScratchRoot, ScratchRoot, Config, P
 /// files and move the Lens revision. Before the fix the subdir stripped to nothing, every
 /// candidate kept its `crate/` prefix, no target matched, and the pass reported `Ok(())` having
 /// written nothing — a connected editor was never invalidated.
-#[cfg(unix)]
 #[test]
 fn a_symlinked_config_root_still_scopes_the_overlay_to_the_config_subdir() {
     let (_real, _alias, _linked, config, linked_path) = symlinked_root_fixture();
@@ -78,7 +80,6 @@ fn a_symlinked_config_root_still_scopes_the_overlay_to_the_config_subdir() {
 
 /// Sibling isolation under the same non-canonical root: a SECOND linked worktree's refresh must
 /// not disturb the first one's overlay rows, and the base scope must stay on its own content.
-#[cfg(unix)]
 #[test]
 fn a_symlinked_config_root_keeps_sibling_worktree_overlays_isolated() {
     let (real, _alias, _linked, config, first_path) = symlinked_root_fixture();
@@ -121,7 +122,6 @@ fn a_symlinked_config_root_keeps_sibling_worktree_overlays_isolated() {
 /// A root that resolves OUTSIDE its repository's working tree cannot be scoped at all — the
 /// overlay must say so instead of silently scoping at the repo root and reporting success. The
 /// pre-fix fallback made this indistinguishable from an unchanged worktree.
-#[cfg(unix)]
 #[test]
 fn a_config_root_resolving_outside_the_repo_fails_loudly_instead_of_mis_scoping() {
     let repo = unique_temp_root();
@@ -165,7 +165,6 @@ fn a_config_root_resolving_outside_the_repo_fails_loudly_instead_of_mis_scoping(
 /// The fixture `Config` must carry a CANONICAL root, exactly as `Config::load` does. Without this
 /// the whole suite exercises a configuration production can never produce, and root-spelling bugs
 /// stay invisible on the platform the per-PR matrix runs on.
-#[cfg(unix)]
 #[test]
 fn the_fixture_config_canonicalizes_its_root_like_config_load() {
     let real = unique_temp_root();
