@@ -515,6 +515,12 @@ mod tests {
         // checkout — each spawning its own clangd, each writing its own `.cache/clangd`. The floor
         // is applied relative to whichever checkout is being indexed, so neither disturbs the
         // other's sources.
+        //
+        // This is a MATCHER-level check on two independently compiled matchers; it says nothing
+        // about the rows two checkouts sharing ONE database actually persist. That is
+        // `schema_bootstrap_tests::worktree_overlay::visibility::
+        // clangd_index_floor_holds_for_both_checkouts_sharing_one_database`, which indexes both
+        // checkouts into one database and asserts on the stored file rows.
         let (_scratch, main) = tempdir();
         git_init(&main);
         write(&main.join("src/lib.c"), "int a(void){return 0;}\n");

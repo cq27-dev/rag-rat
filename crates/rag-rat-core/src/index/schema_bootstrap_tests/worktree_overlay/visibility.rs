@@ -423,6 +423,168 @@ fn worktree_overlay_reads_uncommitted_linked_edit_not_head() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+/// A `Config` whose single C target binds the WHOLE checkout root (`directories: ["."]`) — the
+/// binding `rag-rat init` produces for a repo with no conventional source subdirectory. A
+/// `src`-only binding never walks a checkout-root `.cache/`, so it says nothing about the floor.
+fn whole_root_c_config(root: PathBuf) -> Config {
+    Config {
+        trackers: Vec::new(),
+        papertrail: Default::default(),
+        sync: Default::default(),
+        repo_id_override: None,
+        database_key_pinned: true,
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: Language::C.as_str().to_string(),
+            language: Language::C,
+            directories: vec![PathBuf::from(".")],
+            include: Language::C.default_include_globs(),
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        llm: Default::default(),
+        watch: rag_rat_base::config::WatchConfig { overlay_quiet_secs: 0, ..Default::default() },
+        version_check: Default::default(),
+        oracle: Default::default(),
+        search: Default::default(),
+        memory: Default::default(),
+        log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
+    }
+}
+
+/// Every persisted file row whose path sits under a `.cache/clangd` tree, read RAW from
+/// `main.files` — so one call covers the base rows AND every worktree overlay row (and tombstones)
+/// at once, rather than only whichever scope view happens to be active.
+fn clangd_cache_paths(db: &IndexDatabase) -> Vec<String> {
+    let conn = db.storage.connection();
+    let mut stmt = conn
+        .prepare(
+            "SELECT path FROM main.files
+             WHERE path LIKE '.cache/clangd/%' OR instr(path, '/.cache/clangd/') > 0
+             ORDER BY path",
+        )
+        .unwrap();
+    let paths = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+    paths.filter_map(Result::ok).collect()
+}
+
+#[test]
+fn clangd_index_floor_holds_for_both_checkouts_sharing_one_database() {
+    // #536: the live clangd oracle runs PER CHECKOUT — the main checkout and each linked worktree
+    // spawn their own clangd, and each writes its own `.cache/clangd/` INSIDE that checkout. Both
+    // checkouts index into ONE database, so the floor has to hold on the real indexing path in both
+    // scopes; two independently-compiled `IgnoreMatcher`s agreeing proves nothing about the rows
+    // that actually land.
+    //
+    // The cache trees hold files with an INDEXABLE extension (`.c`), not clangd's real `.idx`
+    // artifacts: `.idx` matches no target extension, so the walker's include filter would drop it
+    // on its own and the assertion would hold with the floor deleted.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::create_dir_all(main.join(".cache/clangd/index")).unwrap();
+    fs::create_dir_all(main.join(".cache/cmake-build")).unwrap();
+    fs::write(main.join("src/shared.c"), "int shared_base(void) { return 0; }\n").unwrap();
+    fs::write(main.join("src/main_only.c"), "int main_only_fn(void) { return 1; }\n").unwrap();
+    fs::write(
+        main.join(".cache/clangd/index/main_side.c"),
+        "int main_cache_fn(void) { return 2; }\n",
+    )
+    .unwrap();
+    // Control for the narrowness of the floor AND against a vacuous test: a sibling `.cache/`
+    // subtree that is NOT clangd's index must still be indexed, so an empty clangd-cache result
+    // cannot be explained by "dot-directories under the root are never walked".
+    fs::write(
+        main.join(".cache/cmake-build/main_tool.c"),
+        "int main_tool_fn(void) { return 3; }\n",
+    )
+    .unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "-A"]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+
+    let config = whole_root_c_config(main.clone());
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(names_in_scope(&db, "src/shared.c"), vec!["shared_base".to_string()]);
+    assert!(path_in_scope(&db, "src/main_only.c"), "the main checkout indexes its own sources");
+    assert!(
+        path_in_scope(&db, ".cache/cmake-build/main_tool.c"),
+        "the root binding does reach into `.cache/` — only the clangd subtree is floored",
+    );
+    assert_eq!(
+        clangd_cache_paths(&db),
+        Vec::<String>::new(),
+        "the main checkout's clangd index tree produces no rows",
+    );
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Committed (not merely on disk) so the branch↔base tree diff yields each of these as an
+    // explicit overlay candidate: the floor, not candidate enumeration, is then the only thing that
+    // can keep the linked checkout's own clangd index out of the shared database.
+    fs::create_dir_all(linked.join(".cache/clangd/index")).unwrap();
+    fs::create_dir_all(linked.join(".cache/cmake-build")).unwrap();
+    fs::write(linked.join("src/shared.c"), "int shared_branch(void) { return 0; }\n").unwrap();
+    fs::write(linked.join("src/branch_only.c"), "int branch_only_fn(void) { return 4; }\n")
+        .unwrap();
+    fs::write(
+        linked.join(".cache/clangd/index/linked_side.c"),
+        "int linked_cache_fn(void) { return 5; }\n",
+    )
+    .unwrap();
+    fs::write(
+        linked.join(".cache/cmake-build/branch_tool.c"),
+        "int branch_tool_fn(void) { return 6; }\n",
+    )
+    .unwrap();
+    run_git(&linked, &["add", "-A"]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.indexed >= 2, "the branch's changed sources are indexed as overlay rows");
+
+    // The overlay scope: the linked checkout's own sources are present, its clangd index is not,
+    // and the main checkout's untouched rows still resolve through the shared base.
+    assert_eq!(names_in_scope(&db, "src/shared.c"), vec!["shared_branch".to_string()]);
+    assert!(path_in_scope(&db, "src/branch_only.c"), "the branch-only source is in the overlay");
+    assert!(
+        path_in_scope(&db, ".cache/cmake-build/branch_tool.c"),
+        "the overlay pass does reach the branch's `.cache/` — only the clangd subtree is floored",
+    );
+    assert!(
+        path_in_scope(&db, "src/main_only.c"),
+        "the sibling checkout's unchanged source is preserved under the overlay scope",
+    );
+
+    // The base scope is untouched by the sibling's pass: same symbol, nothing claimed or lost.
+    set_base_scope(&mut db, &main);
+    assert_eq!(
+        names_in_scope(&db, "src/shared.c"),
+        vec!["shared_base".to_string()],
+        "indexing the linked checkout must not rewrite the main checkout's row",
+    );
+    assert!(path_in_scope(&db, "src/main_only.c"), "the main checkout keeps its own sources");
+    assert!(path_in_scope(&db, ".cache/cmake-build/main_tool.c"));
+    assert!(
+        !path_in_scope(&db, "src/branch_only.c"),
+        "the branch-only source does not leak into the base scope",
+    );
+
+    // Raw across BOTH scopes' rows: neither checkout's clangd index reached the database.
+    assert_eq!(
+        clangd_cache_paths(&db),
+        Vec::<String>::new(),
+        "neither checkout's `.cache/clangd` tree produces rows in the shared database",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 #[test]
 fn worktree_overlay_query_routing_selects_scope() {
     let main = unique_temp_root();
