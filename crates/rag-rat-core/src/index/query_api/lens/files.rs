@@ -19,8 +19,10 @@ pub struct LensFileSymbols {
 #[derive(Debug, Serialize)]
 pub struct LensSymbol {
     /// The stable `sym_<hex>` logical-symbol handle, and the selector a hop request should send
-    /// back: a qualified name is shared by every overload in the file, this is not. `None` only
-    /// where the symbol has no logical-symbol member row in the active scope.
+    /// back: a qualified name is shared by every overload in the file, while this is shared only
+    /// by overloads the grouping key cannot tell apart (identical declaration lines), and a hop
+    /// answer says how many symbols the handle it was given covered. `None` only where the symbol
+    /// has no logical-symbol member row in the active scope.
     #[serde(
         rename = "id",
         serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"

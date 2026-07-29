@@ -1223,9 +1223,10 @@ fn file_papertrail_deduplicates_items_before_applying_the_limit() {
     assert!(refs.iter().any(|reference| reference.item_key == "unique-0"));
 }
 
-/// Two `run` overloads in one file. Both qualify as `src/lib.rs::run`; only their signatures —
+/// Two `run` overloads in one file. Both qualify as `src/lib.rs::run`; only their declarations —
 /// and therefore their logical-symbol handles — differ, which is exactly the case a qualified-name
-/// selector cannot express.
+/// selector cannot express. [`COLLAPSED_OVERLOAD_SOURCE`] is the other half of the story: what
+/// happens when the declarations do not differ either.
 const OVERLOAD_SOURCE: &str = r#"
 pub struct Alpha;
 pub struct Beta;
@@ -1287,6 +1288,68 @@ fn hop_selectors_separate_overloads_by_handle_and_unite_them_by_qualified_name()
         .expect("a qualified name always resolves");
     assert_eq!(hop_names(&shared_callees.callees), ["alpha_leaf", "beta_leaf"]);
     assert_eq!(shared_callees.matched_symbols, 2);
+}
+
+/// Two `run` overloads whose DECLARATION LINES are byte-identical, so the only thing that told the
+/// overloads in [`OVERLOAD_SOURCE`] apart is gone. The bodies are multi-line on purpose: the
+/// signature the grouping key folds in is the declaration's first non-empty line, which for a
+/// single-line body would include the body and separate these two again.
+const COLLAPSED_OVERLOAD_SOURCE: &str = r#"
+pub struct Alpha;
+pub struct Beta;
+
+pub fn alpha_leaf() {}
+pub fn beta_leaf() {}
+
+impl Alpha {
+    pub fn run(&self) {
+        alpha_leaf();
+    }
+}
+
+impl Beta {
+    pub fn run(&self) {
+        beta_leaf();
+    }
+}
+"#;
+
+/// PINS THE LIMIT OF THE HANDLE. Overloads that declare identically land in ONE logical symbol, so
+/// they share one handle and the handle lane answers for the whole group — `fn new() -> Self {` on
+/// two impls, or one trait method implemented for several types in a module, are the everyday
+/// shapes of this. Separating them is a property of the grouping key (which folds in the
+/// declaration line so a symbol keeps its handle when its body changes), not of the hop routes.
+///
+/// What the routes owe a reader is therefore not precision they cannot have but an honest count:
+/// `matched_symbols` reports the group's members on the handle lane exactly as it reports the
+/// name's symbols on the fallback lane, so `> 1` means "a union" on BOTH lanes and a surface has
+/// one rule to render. Were this to report 1, a client would state the narrow claim over the wide
+/// answer with nothing on the wire to contradict it.
+#[test]
+fn a_handle_covering_identically_declared_overloads_reports_them_all() {
+    let (_temp, config) = collapsed_overload_config();
+    let db = IndexDatabase::try_open_config_read_only(&config).unwrap().expect("read-only index");
+
+    let symbols = db.lens_file_symbols("src/lib.rs").unwrap().symbols;
+    let runs = symbols.iter().filter(|symbol| symbol.name == "run").collect::<Vec<_>>();
+    assert_eq!(runs.len(), 2);
+    assert!(runs.iter().all(|symbol| symbol.signature.as_deref() == Some("pub fn run(&self) {")));
+    let shared = runs[0].logical_symbol_id.expect("both rows carry a handle");
+    assert_eq!(
+        runs[1].logical_symbol_id,
+        Some(shared),
+        "identical declaration lines collapse into one logical symbol, so one handle"
+    );
+
+    let callees =
+        db.lens_symbol_callees(&LensHopSelector::Handle(shared), 50).unwrap().expect("shared");
+    assert_eq!(hop_names(&callees.callees), ["alpha_leaf", "beta_leaf"]);
+    assert_eq!(callees.resolved_by, LensHopResolvedBy::Id);
+    assert_eq!(
+        callees.matched_symbols, 2,
+        "the handle lane must report a group's members, or the union it returned reads as one \
+         symbol's hops"
+    );
 }
 
 /// A handle that names nothing in the active checkout — held across a rename, or minted in another
@@ -1467,20 +1530,7 @@ fn overload_handles(db: &IndexDatabase) -> (i64, i64) {
 /// overloads. Binding them here is what a compiler oracle pass produces, and it is the only way
 /// the caller direction can be observed at all.
 fn overloaded_config() -> (tempfile::TempDir, Config) {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().to_path_buf();
-    fs::create_dir(root.join("src")).unwrap();
-    fs::write(root.join("src/lib.rs"), OVERLOAD_SOURCE).unwrap();
-    let mut config = Config::minimal_for_database(root.join("index.sqlite"), root);
-    config.database_key_pinned = true;
-    config.targets = vec![ResolvedTarget {
-        name: "rust".into(),
-        language: Language::Rust,
-        directories: vec![PathBuf::from("src")],
-        include: vec!["**/*.rs".into()],
-        exclude: Vec::new(),
-        kind: TargetKind::Source,
-    }];
+    let (temp, config) = rust_source_config(OVERLOAD_SOURCE);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
     for (caller, callee) in [("calls_alpha", "alpha_leaf"), ("calls_beta", "beta_leaf")] {
@@ -1512,6 +1562,34 @@ fn overloaded_config() -> (tempfile::TempDir, Config) {
             .unwrap();
     }
     drop(db);
+    (temp, config)
+}
+
+/// Index [`COLLAPSED_OVERLOAD_SOURCE`]. No call sites to rewire: each overload's own body reaches
+/// its own leaf, so the callee direction alone shows what the shared handle expands to.
+fn collapsed_overload_config() -> (tempfile::TempDir, Config) {
+    let (temp, config) = rust_source_config(COLLAPSED_OVERLOAD_SOURCE);
+    drop(IndexDatabase::rebuild(&config).unwrap());
+    (temp, config)
+}
+
+/// A config over one indexed `src/lib.rs`. NOT indexed yet — a fixture that has to reach into the
+/// database it builds needs the handle `rebuild` returns.
+fn rust_source_config(source: &str) -> (tempfile::TempDir, Config) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), source).unwrap();
+    let mut config = Config::minimal_for_database(root.join("index.sqlite"), root);
+    config.database_key_pinned = true;
+    config.targets = vec![ResolvedTarget {
+        name: "rust".into(),
+        language: Language::Rust,
+        directories: vec![PathBuf::from("src")],
+        include: vec!["**/*.rs".into()],
+        exclude: Vec::new(),
+        kind: TargetKind::Source,
+    }];
     (temp, config)
 }
 

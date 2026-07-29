@@ -17,8 +17,10 @@ export interface Status {
 /**
  * How a hop request names its symbol. `id` — the server's opaque `sym_<hex>` symbol handle — is
  * the stable identity and the only selector that separates two overloads: they share a qualified
- * name, so `qname` alone reports the union of their callers. `qname` remains as the fallback for
- * a row the server could not hand a handle for.
+ * name, so `qname` alone reports the union of their callers. Overloads that DECLARE identically
+ * share a handle too, and the answer then reports how many symbols it covered. `qname` remains as
+ * the fallback for a row the server could not hand a handle for, and for a handle it no longer
+ * knows.
  */
 export interface SymbolSelector {
   id: string | null;
@@ -37,7 +39,7 @@ export interface SymbolSelector {
 export interface SymbolCallers {
   callers: unknown[];
   resolved_by?: 'id' | 'ref';
-  /** Symbols the selector expanded to; `> 1` on the `ref` lane means `callers` is their union. */
+  /** Symbols the selector expanded to; `> 1` on EITHER lane means `callers` is their union. */
   matched_symbols?: number;
 }
 
@@ -171,6 +173,49 @@ export interface VersionToken {
   revision: string;
 }
 
+/**
+ * A rejection that carries the status the Lens server answered with.
+ *
+ * Read it through [`lensHttpStatus`] rather than `instanceof`: the extension ships two bundles
+ * (desktop and web worker) and a class identity is per-bundle, so the structural read is the one
+ * that holds wherever the error is caught.
+ */
+export class LensHttpError extends Error {
+  constructor(
+    readonly lensHttpStatus: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'LensHttpError';
+  }
+}
+
+/** The status behind a rejection; `undefined` when nothing answered at all (transport failure). */
+export function lensHttpStatus(error: unknown): number | undefined {
+  const status = (error as { lensHttpStatus?: unknown } | null | undefined)?.lensHttpStatus;
+  return typeof status === 'number' ? status : undefined;
+}
+
+/**
+ * Whether re-reading discovery could change this outcome.
+ *
+ * A 4xx is a statement about the REQUEST: the discovered endpoint understood it and rejected it,
+ * so re-deriving that endpoint cannot turn a 404 for a stale symbol handle — or a 400 for a
+ * malformed one — into a hit. Invalidating on it discards a working endpoint, and the cached
+ * identity every other lane shares, to arrive back at the same one. The credential statuses are
+ * the exception, because the credential is exactly what discovery carries.
+ *
+ * A transport failure (no status at all) or a 5xx says nothing about the request, and either can
+ * mean this is no longer the server to be talking to — the pre-existing retry stands there.
+ */
+function rediscoveryCanHelp(error: unknown): boolean {
+  const status = lensHttpStatus(error);
+  if (status === undefined || status >= 500) {
+    return true;
+  }
+  return status === 401 || status === 403;
+}
+
 export class LensClient {
   constructor(private readonly resolver: LensEndpointResolver) {}
 
@@ -183,7 +228,7 @@ export class LensClient {
     try {
       return await this.request<T>(endpoint, route, params, signal);
     } catch (error) {
-      if (signal?.aborted) {
+      if (signal?.aborted || !rediscoveryCanHelp(error)) {
         throw error;
       }
       this.resolver.invalidate();
@@ -214,7 +259,7 @@ export class LensClient {
     });
     if (!res.ok) {
       const body = (await res.text()).slice(0, 200);
-      throw new Error(`${route} -> ${res.status}: ${body}`);
+      throw new LensHttpError(res.status, `${route} -> ${res.status}: ${body}`);
     }
     return (await res.json()) as T;
   }
@@ -272,22 +317,36 @@ export class LensClient {
   }
   /**
    * Callers of ONE symbol. Sends the handle when the row carried one so overloads stay apart, and
-   * falls back to the qualified name only when it did not — the server then answers with every
-   * symbol of that name, which is the older, ambiguous behaviour. The whole envelope is returned
-   * so the caller can say which of the two it got.
+   * falls back to the qualified name when it did not — the server then answers with every symbol
+   * of that name, which is the older, ambiguous behaviour. The whole envelope is returned so the
+   * caller can say which of the two it got.
+   *
+   * The name is ALSO the fallback for a handle the server no longer knows. A handle is derived
+   * from the declaration, so editing a signature mints a new one on the next index pass while the
+   * CodeLens already drawn in the gutter still carries the old — a 404 there means the row went
+   * stale, not that the symbol is gone, and the same row supplied a name that still resolves.
+   * Answering wide (labelled as such by `resolved_by`) beats failing a click that worked before
+   * the handle lane existed. Retried only on 404: a 400 means this client built a malformed
+   * handle, and quietly widening the answer would hide the bug that produced it.
    */
   // `async` so a selector-less call REJECTS rather than throwing synchronously: the command
   // handler awaits this, and a synchronous throw would escape its error path.
   async symbolCallers(selector: SymbolSelector, limit = 50): Promise<SymbolCallers> {
-    const params: Record<string, string> = { limit: String(limit) };
+    const route = '/api/symbol/callers';
+    const limits: Record<string, string> = { limit: String(limit) };
     if (selector.id) {
-      params.id = selector.id;
-    } else if (selector.qname) {
-      params.qname = selector.qname;
-    } else {
+      try {
+        return await this.get<SymbolCallers>(route, { ...limits, id: selector.id });
+      } catch (error) {
+        if (lensHttpStatus(error) !== 404 || !selector.qname) {
+          throw error;
+        }
+      }
+    }
+    if (!selector.qname) {
       throw new Error('symbolCallers needs a symbol handle or a qualified name');
     }
-    return this.get<SymbolCallers>('/api/symbol/callers', params);
+    return this.get<SymbolCallers>(route, { ...limits, qname: selector.qname });
   }
 
   async watchVersions(signal: AbortSignal, onVersion: (version: VersionToken) => void): Promise<void> {

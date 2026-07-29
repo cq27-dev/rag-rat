@@ -3,6 +3,7 @@
 // coupling, issues/PRs per file, distill decision records, extract-helper
 // preview for refined clone classes.
 import * as vscode from 'vscode';
+import { lensHttpStatus } from './client';
 import type {
   CloneRegion,
   CouplingPartner,
@@ -116,25 +117,31 @@ export function callerCommandArguments(
 /**
  * What the caller quick pick says it is showing.
  *
- * The rows are the callers of ONE symbol only when the server resolved the request by handle. On
- * the qualified-name fallback they are the union over every symbol of that name, and `0` matched
- * symbols means the name named nothing indexed and the rows came from unresolved call sites alone.
- * Rendering all three as `N callers of foo` states the narrow claim while showing the wide answer.
- * A server that reports neither field says nothing, so neither do we.
+ * `matched_symbols` is the whole answer, and it is read the same way on BOTH lanes: `> 1` means
+ * the rows are a union over that many symbols, so `N callers of foo` would state a narrower claim
+ * than the server made. Which selector produced the union does not change what a reader is
+ * looking at, and both selectors can produce one — a qualified name covers every overload in the
+ * file, and a handle covers every overload the grouping key could not tell apart, which is every
+ * overload declared on an identical line (`fn new() -> Self {` on two impls). Reading the count
+ * only on the fallback lane discards the one signal that is present and correct on the other.
+ *
+ * `0` is reachable only from the fallback lane — a handle with no symbol behind it is a 404, not
+ * an empty answer — and means the name named nothing indexed, so the rows came from unresolved
+ * call sites alone. A server that reports no count says nothing, so neither do we.
  */
 export function callersPlaceholder(
   name: string,
   rowCount: number,
-  answer: Pick<SymbolCallers, 'resolved_by' | 'matched_symbols'>,
+  answer: Pick<SymbolCallers, 'matched_symbols'>,
 ): string {
-  const matched = answer.resolved_by === 'ref' ? answer.matched_symbols : undefined;
+  const matched = answer.matched_symbols;
+  if (matched === undefined || matched === 1) {
+    return `${rowCount} callers of ${name}`;
+  }
   if (matched === 0) {
     return `${rowCount} callers by name — nothing indexed is named ${name}`;
   }
-  if (matched !== undefined && matched > 1) {
-    return `${rowCount} callers of ${matched} symbols named ${name}`;
-  }
-  return `${rowCount} callers of ${name}`;
+  return `${rowCount} callers of ${matched} symbols named ${name}`;
 }
 
 export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Disposable {
@@ -183,8 +190,9 @@ export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Dispo
                 : ''),
             command: 'rag-rat-lens.showCallers',
             // The lens is built from ONE symbol row, so it carries that row's handle: two
-            // overloads share a qualified name but not a handle, and the count in this title is
-            // counted per symbol. Passing the name alone is what made both lenses answer alike.
+            // overloads always share a qualified name, and share a handle only when they declare
+            // on an identical line. The count in this title is counted per symbol. Passing the
+            // name alone is what made every lens on a name answer alike.
             arguments: callers,
           }),
         );
@@ -280,7 +288,24 @@ export function registerSignalCommands(
     vscode.workspace.registerTextDocumentContentProvider(DOC_SCHEME, (lensDocs = new LensDocProvider())),
 
     vscode.commands.registerCommand('rag-rat-lens.showCallers', async (selector: SymbolSelector, name: string) => {
-      const answer = await client.symbolCallers(selector);
+      let answer: SymbolCallers;
+      try {
+        answer = await client.symbolCallers(selector);
+      } catch (error) {
+        // A handle the server no longer knows is a stale gutter decoration, not something the
+        // reader did wrong: the declaration was edited and reindexed under a new handle while
+        // this lens kept the old one. `symbolCallers` already retried by name for every row that
+        // carried one, so reaching here means this row had only the handle. Say that, rather
+        // than raising a "contributed command failed" notification over it. Any other failure is
+        // a real one and keeps surfacing as one.
+        if (lensHttpStatus(error) !== 404) {
+          throw error;
+        }
+        await vscode.window.showWarningMessage(
+          `${name} is no longer in the index under the handle this lens carries — reopen the file to refresh it.`,
+        );
+        return;
+      }
       const rows = answer.callers as CallerRow[];
       const picked = await vscode.window.showQuickPick(
         rows.map((r) => ({

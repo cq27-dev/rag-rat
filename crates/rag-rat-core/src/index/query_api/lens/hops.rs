@@ -11,9 +11,17 @@ use crate::index::IndexDatabase;
 /// How a hop request names the symbol it wants the neighbours of.
 ///
 /// The opaque `sym_<hex>` logical-symbol handle is the stable identity every symbol-shaped surface
-/// hands out, and it is the only selector that distinguishes two overloads sharing one qualified
-/// name — the grouping key folds the signature in, so `Alpha::run` and `Beta::run` are different
-/// logical symbols even though both qualify as `src/lib.rs::run`.
+/// hands out, and it is the only selector that distinguishes overloads sharing one qualified name
+/// — the grouping key folds the signature in, so `Alpha::run(&self)` and `Beta::run(&self, extra:
+/// i64)` are different logical symbols even though both qualify as `src/lib.rs::run`.
+///
+/// It separates them exactly as far as that key does, and no further: the signature the key folds
+/// in is the declaration's first line, so overloads that DECLARE identically (`fn new() -> Self {`
+/// on two impls, one trait method implemented for several types in a file) land in one logical
+/// symbol and behind one handle, which then answers for the group. That is a property of the
+/// grouping key — which is deliberately body-insensitive so a symbol keeps its handle, and its
+/// bound memories, across an edit — not something a hop route can narrow. What the route owes a
+/// reader instead is an honest count: see [`LensCallers::matched_symbols`].
 #[derive(Clone, Debug)]
 pub enum LensHopSelector {
     /// Preferred: the `sym_<hex>` handle, already decoded to its logical-symbol id.
@@ -30,9 +38,10 @@ pub enum LensHopSelector {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LensHopResolvedBy {
-    /// Resolved by the `sym_<hex>` handle: the hops belong to exactly one logical symbol.
+    /// Resolved by the `sym_<hex>` handle: the hops belong to exactly one logical symbol — which
+    /// is one source symbol unless `matched_symbols > 1`.
     Id,
-    /// Resolved by qualified name: `matched_symbols > 1` means the answer is a union.
+    /// Resolved by qualified name: every symbol the traversal seeds from it.
     Ref,
 }
 
@@ -40,13 +49,19 @@ pub enum LensHopResolvedBy {
 pub struct LensCallers {
     pub callers: Vec<LensSymbolHop>,
     pub resolved_by: LensHopResolvedBy,
-    /// Active-scope symbols the selector expanded to. Read it against `resolved_by`, because the
-    /// two lanes count different things: on the handle lane it is the logical symbol's member
-    /// rows (its cfg variants — one symbol for almost every symbol, and always ONE logical
-    /// symbol, so it never signals ambiguity there), and on the fallback lane it is every symbol
-    /// the traversal seeds from the name — by qualified name, or by short name while that short
-    /// name is unambiguous — so `> 1` there says the hops are a union. Zero therefore means the
-    /// name expanded to no symbol at all, never that the answer is unknown.
+    /// Active-scope symbols the selector expanded to. `> 1` means the hops are a union over that
+    /// many symbols, and it means that ON BOTH LANES — a surface has one rule to render, and
+    /// reading the count only on the fallback lane would state the narrow claim over the wide
+    /// answer precisely where the handle covers a group.
+    ///
+    /// The lanes count different sets. On the handle lane it is the logical symbol's scope-visible
+    /// member rows: one for almost every symbol, more for a group holding a symbol's cfg variants
+    /// or several same-file symbols the grouping key could not tell apart (identical declaration
+    /// lines — see [`LensHopSelector`]). On the fallback lane it is every symbol the traversal
+    /// seeds from the name — by qualified name, or by short name while that short name is
+    /// unambiguous. Zero therefore means the name expanded to no symbol at all, never that the
+    /// answer is unknown, and only the fallback lane can report it: a handle with no scope-visible
+    /// member is absent, not empty.
     pub matched_symbols: u64,
 }
 
@@ -133,8 +148,10 @@ impl IndexDatabase {
     /// The handle lane traverses in `Exact` mode seeded on the logical symbol, which reduces both
     /// predicates to "an edge endpoint is a member of THIS logical symbol" — the qualified-name OR
     /// arms that the other modes keep are exactly what re-collapses overloads, and dropping them
-    /// also makes the hop list the drill-down of the caller/fan-out counts `/api/file/symbols` and
-    /// `/api/file/graph` already show, which are counted per symbol id over resolved edges.
+    /// also lines the hop list up with the caller/fan-out counts `/api/file/symbols` and
+    /// `/api/file/graph` already show: those are counted per symbol id over resolved edges, and
+    /// these are the same edges over the handle's members — one and the same set whenever
+    /// `matched_symbols` is 1, which is every handle covering a single symbol.
     ///
     /// The qualified-name lane keeps the historical `Syntactic` default so an older client that
     /// sends no handle sees byte-identical hops; `matched_symbols` is how it learns that the name

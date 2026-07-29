@@ -2341,6 +2341,14 @@ test('the caller quick pick says when its rows are a union rather than one symbo
   await showCallers({ id: 'sym_alpha', qname: 'src/lib.rs::run' }, 'run');
   assert.equal(quickPicks.at(-1), '1 callers of run');
 
+  // Resolved by handle, but the handle covers a GROUP: two overloads that declare identically
+  // share one logical symbol, so the server answered for both and said so. The count is the only
+  // signal that distinguishes this from the line above, and it is present on this lane too — a
+  // reader shown a union has to be told, whichever selector produced it.
+  answer = { callers: [{}, {}], resolved_by: 'id', matched_symbols: 2 };
+  await showCallers({ id: 'sym_shared', qname: 'src/lib.rs::run' }, 'run');
+  assert.equal(quickPicks.at(-1), '2 callers of 2 symbols named run');
+
   // Nothing indexed carries the name: the rows came from unresolved call sites alone, so calling
   // them that symbol's callers would invent a symbol.
   answer = { callers: [], resolved_by: 'ref', matched_symbols: 0 };
@@ -2480,4 +2488,153 @@ test('the hover link dispatches show callers exactly as the lens does', async ()
   // `undefined` field, so the hover would otherwise ship a selector one key short of the one the
   // CodeLens dispatches — a shape difference no typecheck can see across a `command:` URI.
   assert.deepEqual(await commandArguments(25), [{ id: null, qname: 'src/lib.rs::legacy' }, 'run']);
+});
+
+test('a symbol handle the server no longer knows falls back to the name, not to rediscovery', async (t) => {
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push(request.url);
+    if (new URL(request.url, 'http://localhost').searchParams.has('id')) {
+      response.writeHead(404, { 'content-type': 'application/json' });
+      response.end('{"error":"unknown symbol handle"}');
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end('{"callers":[{}],"resolved_by":"ref","matched_symbols":2}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const { LensClient, lensHttpStatus } = await loadClientModule();
+  const address = server.address();
+  let invalidations = 0;
+  const client = new LensClient({
+    invalidate() {
+      invalidations += 1;
+    },
+    async resolve() {
+      return { baseUrl: `http://127.0.0.1:${address.port}`, token: null };
+    },
+  });
+
+  // The handle is derived from the declaration, so editing a signature mints a new one on the
+  // next index pass while the CodeLens already drawn in the gutter still carries the old. The
+  // click must still answer — by the name the same row supplied, wider and labelled as such.
+  const answer = await client.symbolCallers({ id: 'sym_stale', qname: 'src/lib.rs::run' });
+  assert.deepEqual(answer, { callers: [{}], resolved_by: 'ref', matched_symbols: 2 });
+  assert.equal(requests.length, 2);
+  assert.equal(new URL(requests[0], 'http://localhost').searchParams.get('id'), 'sym_stale');
+  assert.equal(
+    new URL(requests[1], 'http://localhost').searchParams.get('qname'),
+    'src/lib.rs::run',
+  );
+
+  // A status line proves the discovered endpoint answered, so discarding it cannot help: it only
+  // costs every other reader a rediscovery of the server that just replied.
+  assert.equal(invalidations, 0);
+
+  // Nothing to fall back to. The rejection carries the status so the surface can tell a stale
+  // lens from a broken server.
+  await assert.rejects(
+    client.symbolCallers({ id: 'sym_stale', qname: null }),
+    (error) => lensHttpStatus(error) === 404,
+  );
+  assert.equal(invalidations, 0);
+});
+
+test('only a failure discovery could fix discards the discovered endpoint', async (t) => {
+  let status = 401;
+  const server = http.createServer((_request, response) => {
+    response.writeHead(status, { 'content-type': 'application/json' });
+    response.end('{"error":"nope"}');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const LensClient = await loadClient();
+  const address = server.address();
+  let invalidations = 0;
+  const client = new LensClient({
+    invalidate() {
+      invalidations += 1;
+    },
+    async resolve() {
+      return { baseUrl: `http://127.0.0.1:${address.port}`, token: 'rotated' };
+    },
+  });
+
+  // The credential is what discovery carries, so a rejected one is exactly what re-reading it
+  // fixes; so is a server that has stopped behaving like itself.
+  await assert.rejects(client.status(), /401/);
+  assert.equal(invalidations, 1);
+  status = 503;
+  await assert.rejects(client.status(), /503/);
+  assert.equal(invalidations, 2);
+
+  // A 4xx is a statement about the request. The endpoint understood it and said no; deriving the
+  // same endpoint again cannot change that, and costs every other lane its cached identity.
+  status = 400;
+  await assert.rejects(client.status(), /400/);
+  assert.equal(invalidations, 2);
+});
+
+test('a click on a lens whose symbol was reindexed says so instead of failing the command', async () => {
+  const quickPicks = [];
+  const warnings = [];
+  const vscode = {
+    EventEmitter: class {
+      constructor() {
+        this.event = () => ({ dispose() {} });
+      }
+      fire() {}
+      dispose() {}
+    },
+    window: {
+      showQuickPick: async (_items, options) => {
+        quickPicks.push(options.placeHolder);
+        return undefined;
+      },
+      showWarningMessage: async (message) => {
+        warnings.push(message);
+        return undefined;
+      },
+    },
+    workspace: { registerTextDocumentContentProvider: () => ({ dispose() {} }) },
+    commands: { executeCommand: async () => undefined },
+  };
+  const registered = new Map();
+  vscode.commands.registerCommand = (id, handler) => {
+    registered.set(id, handler);
+    return { dispose() {} };
+  };
+  const { registerSignalCommands } = await loadSourceModule('lenses.ts', vscode);
+
+  let failure;
+  registerSignalCommands(
+    { subscriptions: [] },
+    {
+      symbolCallers: async () => {
+        throw failure;
+      },
+    },
+  );
+  const showCallers = registered.get('rag-rat-lens.showCallers');
+
+  // The row carried a handle and no name, so the client had nothing to retry with. Before the
+  // handle lane existed this click produced a quick pick; a raw "contributed command failed"
+  // notification is not what a stale gutter decoration deserves.
+  failure = Object.assign(new Error('/api/symbol/callers -> 404: {"error":"unknown symbol handle"}'), {
+    lensHttpStatus: 404,
+  });
+  await showCallers({ id: 'sym_stale', qname: null }, 'run');
+  assert.equal(quickPicks.length, 0);
+  assert.match(warnings.at(-1), /run/);
+  assert.match(warnings.at(-1), /no longer in the index/);
+
+  // Everything else is still a real failure and must keep surfacing as one.
+  failure = Object.assign(new Error('/api/symbol/callers -> 500: boom'), { lensHttpStatus: 500 });
+  await assert.rejects(showCallers({ id: 'sym_stale', qname: null }, 'run'), /500/);
+  failure = new TypeError('fetch failed');
+  await assert.rejects(showCallers({ id: null, qname: 'src/lib.rs::run' }, 'run'), /fetch failed/);
+  assert.equal(warnings.length, 1);
 });
