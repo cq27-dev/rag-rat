@@ -64,7 +64,7 @@ fn live_tools_are_gated_out_of_the_batch_paths() {
     }
 
     // `produce_scip_with_tool` on a live tool returns the documented Blocked hint and never
-    // builds a `scip_command` (which would be an unreachable! panic).
+    // builds an invocation — a live tool has no `BatchSpec`, so there is none to build.
     for (tool, program) in
         [(OracleTool::RaLsp, "rust-analyzer"), (OracleTool::TsLsp, "typescript-language-server")]
     {

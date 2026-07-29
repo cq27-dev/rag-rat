@@ -25,6 +25,14 @@ pub struct LiveBackend {
     /// `languages`, whose entries are the lowercase registry tokens (`c`, `cpp`) — joining those
     /// renders "the live c/cpp oracle" in a hint a human reads.
     pub(crate) display_name: &'static str,
+    /// Arguments this server is spawned with. Language servers disagree on how the stdio transport
+    /// is selected — `rust-analyzer` speaks LSP on stdio by default, while
+    /// `typescript-language-server` prints usage and exits without `--stdio` — so the argv belongs
+    /// to the backend, not the client.
+    ///
+    /// It lives HERE rather than on the shared tool registry, where five batch entries had to
+    /// carry an empty one and a test had to assert they did.
+    pub(crate) stdio_args: &'static [&'static str],
     /// How this server announces that it is ready to answer definitions.
     pub(crate) readiness: ReadinessPolicy,
     /// LSP `languageId` per file extension, first match wins; the last entry is the fallback for
@@ -79,6 +87,8 @@ impl LiveBackend {
             OracleTool::RaLsp => Some(Self {
                 tool,
                 languages: &[Language::Rust],
+                // rust-analyzer speaks LSP on stdio with no flag.
+                stdio_args: &[],
                 display_name: "Rust",
                 // rust-analyzer reports load/index quiescence explicitly, for any checkout.
                 readiness: ReadinessPolicy::ServerStatus,
@@ -88,6 +98,9 @@ impl LiveBackend {
             OracleTool::TsLsp => Some(Self {
                 tool,
                 languages: &[Language::TypeScript],
+                // Without a transport flag the program prints usage and exits, so the spawn would
+                // fail with an opaque EOF instead of yielding a session.
+                stdio_args: &["--stdio"],
                 display_name: "TypeScript",
                 // typescript-language-server has no quiescence notification. The only warm-up
                 // signal it emits is the work-done progress cycle bracketing a project load —
@@ -110,6 +123,10 @@ impl LiveBackend {
             OracleTool::ClangdLsp => Some(Self {
                 tool,
                 languages: &[Language::C, Language::Cpp],
+                // clangd's own default, PINNED because it is load-bearing: it is what resolves a
+                // call across translation units. With it off clangd answers with the header
+                // declaration instead, and emits no project-load progress at all.
+                stdio_args: &["--background-index"],
                 display_name: "C/C++",
                 // clangd brackets its indexing in a work-done progress cycle and, like
                 // typescript-language-server, emits nothing until a document is opened.
@@ -307,12 +324,8 @@ impl LiveBackend {
     /// invisible to it. Passing the directory we found makes every layout behave the same, and
     /// keeps the prerequisite gate honest: it accepts a database wherever it sits precisely
     /// because the session is then told where that is.
-    pub(crate) fn spawn_args(
-        &self,
-        static_args: &[&'static str],
-        layout: &ProjectLayout,
-    ) -> Vec<OsString> {
-        let mut args: Vec<OsString> = static_args.iter().map(OsString::from).collect();
+    pub(crate) fn spawn_args(&self, layout: &ProjectLayout) -> Vec<OsString> {
+        let mut args: Vec<OsString> = self.stdio_args.iter().map(OsString::from).collect();
         if let Some(dir) = layout.sole_marker_dir() {
             // Built as an OsString, never through `Path::display()`: on Unix a path is bytes, and
             // formatting a non-UTF-8 component would substitute replacement characters and hand

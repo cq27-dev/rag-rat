@@ -311,10 +311,11 @@ pub fn produce_scip_with_tool(
     scip_output: &Path,
 ) -> anyhow::Result<ScipProduction> {
     let manifest = ToolManifest::for_tool(tool);
-    // A live-only tool (`ra-lsp`) has no `scip_command` — it writes verdicts from the watcher's
-    // maintenance pass, not a whole-checkout index. Block with that explanation rather than
-    // probing/spawning anything (#534).
-    if !tool.batch_capable() {
+    // The batch declaration's ABSENCE is what says this tool is live-only — it writes verdicts from
+    // the watcher's maintenance pass, not a whole-checkout index. Taking it here rather than gating
+    // on `batch_capable()` separately is what lets the invocation below be infallible: there is no
+    // second place that could disagree about whether this tool has one (#534).
+    let Some(batch) = crate::backend::BatchSpec::for_tool(tool) else {
         return Ok(ScipProduction::Blocked {
             tool: tool.as_db_str().to_string(),
             program: manifest.program.to_string(),
@@ -324,7 +325,7 @@ pub fn produce_scip_with_tool(
                 tool.as_db_str()
             ),
         });
-    }
+    };
     let version = match manifest.probe() {
         ToolAvailability::Available { version, .. } => version,
         ToolAvailability::Blocked { tool, program, hint } => {
@@ -340,7 +341,7 @@ pub fn produce_scip_with_tool(
             hint,
         });
     }
-    let mut command = manifest.scip_command(checkout_root, scip_output);
+    let mut command = (batch.command)(manifest.program, checkout_root, scip_output);
     // Forward the tool's stdout to OUR stderr, never inherit it onto our stdout: the CLI emits the
     // run's JSON report on stdout, and a tool that prints progress to stdout (scip-clang's
     // `[N/M] Indexed …`) would otherwise corrupt that JSON. A piped child + a copy thread keeps
@@ -816,13 +817,13 @@ impl OracleTool {
     /// Whether a BATCH DRIVER can invoke this tool as an indexer — `oracle run`, the background
     /// auto-run loop, the init-wizard tool listing, and [`produce_scip_with_tool`]. `false` ONLY
     /// for the live LSP tools, which write per-pass verdicts from the watcher and have no
-    /// `scip_command`.
+    /// its `BatchSpec` invocation builder.
     ///
     /// This is DISPATCH ONLY. It used to answer read-side precedence and run coverage as well;
     /// those are [`Self::authority`] and [`Self::coverage`] now, because a tool can be a
     /// whole-checkout measurement without being a `.scip` producer.
     pub fn batch_capable(self) -> bool {
-        !matches!(self, Self::RaLsp | Self::TsLsp | Self::ClangdLsp)
+        crate::backend::BatchSpec::for_tool(self).is_some()
     }
 
     /// The batch tool whose `logical_symbol_monikers` rows a LIVE tool copies into its own
@@ -852,8 +853,11 @@ impl OracleTool {
     /// `scip-python` (pyright) exits 1 whenever the analyzed project has type errors — true of most
     /// real-world Python. Restricted to this one verified case; broaden (e.g. scip-typescript, also
     /// a compiler frontend) only with evidence a real corpus needs it.
+    /// Declared on the backend's [`crate::backend::BatchSpec`], so a tool with no batch declaration
+    /// answers `false` without needing an arm.
     pub(crate) fn exit_code_reflects_diagnostics(self) -> bool {
-        matches!(self, Self::ScipPython)
+        crate::backend::BatchSpec::for_tool(self)
+            .is_some_and(|spec| spec.exit_code_reflects_diagnostics)
     }
     /// The position encoding to assume for SCIP documents this tool emits **without** an explicit
     /// `position_encoding` (the protobuf default `Unspecified`). scip-typescript reports ranges in
@@ -861,23 +865,15 @@ impl OracleTool {
     /// reading it as the generic UTF-32 fallback mis-converts columns after any astral
     /// character. The other backends either set the field or are unaffected, so they keep the
     /// conservative `Unspecified` (UTF-32-equivalent) default.
+    /// Declared on the backend's [`crate::backend::BatchSpec`]. A tool with no batch declaration
+    /// produces no `.scip`, so this is never consulted for one — `Unspecified` is the neutral
+    /// element rather than a claim about a live backend, and the six "exists only for
+    /// exhaustiveness" arms this used to carry are gone.
     pub(crate) fn default_position_encoding(self) -> ::scip::types::PositionEncoding {
-        use ::scip::types::PositionEncoding;
-        match self {
-            // scip-typescript and scip-java (JVM/semanticdb) both emit UTF-16 columns with the
-            // field unset — empirically confirmed (a token after an astral char lands at the
-            // UTF-16 count). Reading them as the UTF-32 fallback mis-converts past astral chars.
-            Self::ScipTypescript | Self::ScipJava =>
-                PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
-            // The live tools never parse a `.scip` (the live client negotiates its own LSP
-            // encoding per session); their arms exist only for exhaustiveness.
-            Self::RustAnalyzer
-            | Self::ScipClang
-            | Self::ScipPython
-            | Self::RaLsp
-            | Self::TsLsp
-            | Self::ClangdLsp => PositionEncoding::UnspecifiedPositionEncoding,
-        }
+        crate::backend::BatchSpec::for_tool(self)
+            .map_or(::scip::types::PositionEncoding::UnspecifiedPositionEncoding, |spec| {
+                spec.assumed_position_encoding
+            })
     }
 }
 

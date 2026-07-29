@@ -8,6 +8,7 @@
 //! manifest entry — not new protocol code.
 //!
 //! - `registry.rs` — the [`LiveBackend`] entries and every question the live driver asks of one.
+//! - `spec.rs` — the [`spec::BatchSpec`] entries: what a BATCH driver asks, and nothing else.
 //! - `layout.rs` — the whole-checkout project-marker search and the [`ProjectLayout`] it produces.
 //! - `documents.rs` — the searches that find a document whose open would warm a session.
 
@@ -15,9 +16,11 @@ mod documents;
 mod layout;
 mod registry;
 mod scope;
+mod spec;
 #[cfg(test)]
 mod tests;
 
 pub use layout::{LAYOUT_MAX_AGE, ProjectLayout};
 pub use registry::LiveBackend;
 pub use scope::{CheckoutScope, IndexedCorpus};
+pub(crate) use spec::BatchSpec;

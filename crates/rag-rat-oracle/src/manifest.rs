@@ -24,12 +24,6 @@ pub struct ToolManifest {
     pub tool: OracleTool,
     /// The executable to invoke (looked up on `PATH`).
     pub program: &'static str,
-    /// Arguments the LIVE backends spawn the program with. Language servers disagree on how the
-    /// stdio transport is selected — `rust-analyzer` speaks LSP on stdio by default, while
-    /// `typescript-language-server` prints usage and exits without `--stdio` — so the argv belongs
-    /// to the registry entry, not the client. Empty for batch tools, which build their whole
-    /// invocation in [`ToolManifest::scip_command`].
-    pub live_args: &'static [&'static str],
     /// Languages this backend resolves, for status/diagnostics and for gating the auto-run loop.
     ///
     /// The SAME encoding `LiveBackend::languages` and `ResolvedTarget.language` use. It was once a
@@ -64,7 +58,6 @@ impl ToolManifest {
             OracleTool::RustAnalyzer => ToolManifest {
                 tool,
                 program: "rust-analyzer",
-                live_args: &[],
                 languages: &[Language::Rust],
                 install_hint: "rust-analyzer not found on PATH. Install it (e.g. `rustup \
                                component add rust-analyzer`) or pass a pre-built index with \
@@ -73,7 +66,6 @@ impl ToolManifest {
             OracleTool::ScipClang => ToolManifest {
                 tool,
                 program: "scip-clang",
-                live_args: &[],
                 languages: &[Language::C, Language::Cpp],
                 install_hint: "scip-clang not found on PATH. Install it from \
                                github.com/sourcegraph/scip-clang and generate a \
@@ -85,7 +77,6 @@ impl ToolManifest {
             OracleTool::ScipPython => ToolManifest {
                 tool,
                 program: "scip-python",
-                live_args: &[],
                 languages: &[Language::Python],
                 install_hint: "scip-python not found on PATH. Install it (e.g. `npm install -g \
                                @sourcegraph/scip-python`) AND install the project's dependencies \
@@ -95,7 +86,6 @@ impl ToolManifest {
             OracleTool::ScipTypescript => ToolManifest {
                 tool,
                 program: "scip-typescript",
-                live_args: &[],
                 languages: &[Language::TypeScript],
                 install_hint: "scip-typescript not found on PATH. Install it (e.g. `npm install \
                                -g @sourcegraph/scip-typescript`) AND install the project's \
@@ -108,7 +98,6 @@ impl ToolManifest {
             OracleTool::ScipJava => ToolManifest {
                 tool,
                 program: "scip-java",
-                live_args: &[],
                 languages: &[Language::Kotlin],
                 install_hint: "scip-java not found on PATH. Install it (e.g. `cs install \
                                --contrib scip-java`, needs a JVM) — it indexes Kotlin through the \
@@ -121,7 +110,6 @@ impl ToolManifest {
             OracleTool::RaLsp => ToolManifest {
                 tool,
                 program: "rust-analyzer",
-                live_args: &[],
                 languages: &[Language::Rust],
                 install_hint: "rust-analyzer not found on PATH. Install it (e.g. `rustup \
                                component add rust-analyzer`) so the live oracle (`[oracle.live] \
@@ -133,7 +121,6 @@ impl ToolManifest {
             OracleTool::TsLsp => ToolManifest {
                 tool,
                 program: "typescript-language-server",
-                live_args: &["--stdio"],
                 languages: &[Language::TypeScript],
                 install_hint: "typescript-language-server not found on PATH. Install it (e.g. \
                                `npm install -g typescript-language-server typescript`) so the \
@@ -150,7 +137,6 @@ impl ToolManifest {
             OracleTool::ClangdLsp => ToolManifest {
                 tool,
                 program: "clangd",
-                live_args: &["--background-index"],
                 languages: &[Language::C, Language::Cpp],
                 install_hint: "clangd not found on PATH. Install it (e.g. `apt install clangd`, \
                                or a release from github.com/clangd/clangd) so the live oracle \
@@ -228,27 +214,12 @@ impl ToolManifest {
     /// exit 0; a stripped build without it is `Blocked`, #82 P3). `scip-clang` IS the SCIP
     /// emitter — it has no subcommand — so a successful `--version` (already detected) is the
     /// capability signal and this is a no-op `true`.
+    /// Whether a versioned binary can actually emit a SCIP index — declared per backend as
+    /// [`crate::backend::spec::ScipCapability`]. A tool with no batch declaration is never asked to
+    /// emit one, so it trivially can.
     fn can_emit_scip(&self) -> bool {
-        match self.tool {
-            OracleTool::RustAnalyzer => Command::new(self.program)
-                .arg("scip")
-                .arg("--help")
-                .output()
-                .is_ok_and(|output| output.status.success()),
-            OracleTool::ScipClang => true,
-            // scip-python/typescript/java emit via an `index` subcommand; `index --help` exiting 0
-            // is the analog of rust-analyzer's `scip --help` capability check.
-            OracleTool::ScipPython | OracleTool::ScipTypescript | OracleTool::ScipJava =>
-                Command::new(self.program)
-                    .arg("index")
-                    .arg("--help")
-                    .output()
-                    .is_ok_and(|output| output.status.success()),
-            // The live clients drive their program as an LSP server (no `.scip` subcommand
-            // needed); a successful `--version` (already detected by `probe`) is the capability
-            // signal.
-            OracleTool::RaLsp | OracleTool::TsLsp | OracleTool::ClangdLsp => true,
-        }
+        crate::backend::BatchSpec::for_tool(self.tool)
+            .is_none_or(|spec| spec.capability.holds_for(self.program))
     }
 
     /// A tool-specific prerequisite that must hold before a tool-driven run, beyond the binary
@@ -426,97 +397,6 @@ impl ToolManifest {
             OracleTool::ClangdLsp | OracleTool::TsLsp => None,
         }
     }
-
-    /// Build the command that produces a `.scip` index at `output` for the checkout rooted at
-    /// `root`. `rust-analyzer scip <root> --output <path>` writes the SCIP index to a deterministic
-    /// path so the caller (a temp file) can consume it.
-    pub fn scip_command(&self, root: &Path, output: &Path) -> Command {
-        match self.tool {
-            OracleTool::RustAnalyzer => {
-                let mut cmd = Command::new(self.program);
-                cmd.arg("scip").arg(root).arg("--output").arg(output);
-                cmd
-            },
-            // scip-clang consumes the compilation database, not a source root, and emits the index
-            // directly (no subcommand). Run with cwd = root so the compdb's relative paths
-            // resolve, and point it at `root/compile_commands.json` (prerequisite-checked).
-            OracleTool::ScipClang => {
-                let mut cmd = Command::new(self.program);
-                cmd.current_dir(root)
-                    .arg(format!("--compdb-path={}", root.join("compile_commands.json").display()))
-                    .arg(format!("--index-output-path={}", output.display()));
-                cmd
-            },
-            // scip-python indexes a working directory (not a source root arg) via its `index`
-            // subcommand. `--cwd <root>` is where it resolves the project + its installed deps;
-            // `--project-name` (the root's dir name) becomes the package component of in-corpus
-            // monikers, so a non-empty name is what lets `count_symbols_with_moniker` see them.
-            // `--project-version _` is PINNED (Codex on #176): scip-python otherwise defaults the
-            // version to the checkout's git revision, which is embedded in every SCIP symbol
-            // string, so every commit would churn all Python monikers — breaking
-            // moniker-anchored memory relocation (which resolves by exact moniker per
-            // tool). A constant version keeps a symbol's moniker stable across commits
-            // (and sidesteps scip-python's crash on a non-git checkout, where the
-            // git-rev default is undefined). `--output` is absolute, so it's unaffected
-            // by `--cwd`.
-            OracleTool::ScipPython => {
-                let project_name = root.file_name().and_then(|n| n.to_str()).unwrap_or("project");
-                let mut cmd = Command::new(self.program);
-                cmd.arg("index")
-                    .arg("--project-name")
-                    .arg(project_name)
-                    .arg("--project-version")
-                    .arg("_")
-                    .arg("--cwd")
-                    .arg(root)
-                    .arg("--output")
-                    .arg(output);
-                cmd
-            },
-            // scip-typescript indexes the working dir via its `index` subcommand (like
-            // scip-python), reading the project's `tsconfig.json` (prerequisite-checked — we
-            // deliberately do NOT pass `--infer-tsconfig`, which WRITES a tsconfig into the source
-            // tree, breaking read-only-on-source). No `--project-name` / `--project-version`:
-            // package name + version come from `package.json`. That version is embedded in every
-            // local moniker and has no CLI override, so it's normalized downstream at
-            // moniker-write time (`scip::stabilize_moniker_version`), not here. `--output` is
-            // absolute, unaffected by `--cwd`.
-            OracleTool::ScipTypescript => {
-                let mut cmd = Command::new(self.program);
-                cmd.arg("index").arg("--cwd").arg(root).arg("--output").arg(output);
-                cmd
-            },
-            // scip-java indexes through the build (running it with the semanticdb-kotlinc plugin),
-            // so cwd = root. `--build-tool Gradle` is PINNED: the prerequisite only proved Gradle
-            // is present, but a checkout that ALSO carries a `pom.xml` (Maven→Gradle
-            // migration, parent Maven descriptor) makes scip-java's auto-detection see
-            // multiple build tools and abort with "Multiple build tools detected"
-            // instead of indexing. Forcing Gradle (this backend's only supported Kotlin
-            // path) skips that ambiguity (Codex on #193); the value is matched
-            // case-insensitively upstream. No `--project-version` need (unlike
-            // scip-python): scip-java emits `.` placeholders for the local project's
-            // package/version regardless of the build's `group`/`version`, so monikers
-            // are already commit-stable. `--output` is absolute.
-            OracleTool::ScipJava => {
-                let mut cmd = Command::new(self.program);
-                cmd.current_dir(root)
-                    .arg("index")
-                    .arg("--build-tool")
-                    .arg("Gradle")
-                    .arg("--output")
-                    .arg(output);
-                cmd
-            },
-            // Unreachable: every batch driver gates live-only tools out BEFORE building a command
-            // (`produce_scip_with_tool` returns `Blocked`, the auto-run loop and the wizard filter
-            // on `batch_capable`). A live tool has no whole-checkout index invocation.
-            tool @ (OracleTool::RaLsp | OracleTool::TsLsp | OracleTool::ClangdLsp) => unreachable!(
-                "{} is a live oracle backend with no scip_command — the caller must gate on \
-                 OracleTool::batch_capable()",
-                tool.as_db_str()
-            ),
-        }
-    }
 }
 
 /// Whether `root` has a Gradle build that scip-java can index Kotlin through. The sentinel set
@@ -558,30 +438,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_backends_declare_their_stdio_argv_and_batch_tools_declare_none() {
-        // A live backend is spawned as `program live_args…`; batch tools build their whole
-        // invocation in `scip_command`, so a stray `live_args` there would be silently ignored
-        // and mislead the next reader.
-        let ts = ToolManifest::for_tool(OracleTool::TsLsp);
-        assert_eq!(ts.program, "typescript-language-server");
-        assert_eq!(
-            ts.live_args,
-            ["--stdio"],
-            "without a transport flag the program prints usage and exits, so the spawn fails with \
-             an opaque EOF instead of a session"
-        );
-        // rust-analyzer speaks LSP on stdio with no flag — the two backends genuinely differ.
-        assert!(ToolManifest::for_tool(OracleTool::RaLsp).live_args.is_empty());
-        for tool in OracleTool::ALL.iter().filter(|tool| tool.batch_capable()) {
-            assert!(
-                ToolManifest::for_tool(*tool).live_args.is_empty(),
-                "{} is batch-only and must declare no live argv",
-                tool.as_db_str()
-            );
-        }
-    }
-
-    #[test]
     fn a_runnable_probe_reports_an_unmet_prerequisite_instead_of_available() {
         // "installed" is not "can run here". A tool reported Available while its checkout
         // prerequisite is unmet says nothing is wrong about a backend that can never produce a
@@ -593,7 +449,6 @@ mod tests {
         let installed_but_unprepared = ToolManifest {
             tool: OracleTool::ScipClang,
             program: "cargo",
-            live_args: &[],
             languages: &[Language::C],
             install_hint: "install hint",
         };
@@ -631,7 +486,6 @@ mod tests {
         let absent = ToolManifest {
             tool: OracleTool::ScipClang,
             program: "rag-rat-no-such-tool-xyzzy",
-            live_args: &[],
             languages: &[Language::C],
             install_hint: "install scip-clang",
         };
@@ -648,7 +502,6 @@ mod tests {
         // header declaration instead, and emits no project-load progress at all.
         let manifest = ToolManifest::for_tool(OracleTool::ClangdLsp);
         assert_eq!(manifest.program, "clangd");
-        assert_eq!(manifest.live_args, ["--background-index"]);
         assert_eq!(manifest.languages, [Language::C, Language::Cpp], "one server, both dialects");
 
         // The compilation database is what clangd builds that index from — the same file the
