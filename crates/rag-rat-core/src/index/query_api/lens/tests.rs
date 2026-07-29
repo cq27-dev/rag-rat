@@ -1394,6 +1394,83 @@ fn a_short_name_fallback_counts_the_symbol_its_traversal_expanded_to() {
     assert_eq!(ambiguous.matched_symbols, 0);
 }
 
+/// A trait implemented twice: the only incoming edges the trait itself carries are `implements`
+/// and `references_type`, and the only ones its method carries are the `contains` edges from the
+/// two impl blocks. Nothing here is a call, which is what makes the fixture the counter-example.
+const NON_CALL_INBOUND_SOURCE: &str = r#"
+pub trait Runner { fn go(&self); }
+
+pub struct Alpha;
+pub struct Beta;
+
+impl Runner for Alpha { fn go(&self) {} }
+impl Runner for Beta { fn go(&self) {} }
+
+pub fn leaf() {}
+pub fn calls_leaf() { leaf(); }
+"#;
+
+/// PINS THE RELATIONSHIP BETWEEN A CALLER COUNT AND ITS DRILL-DOWN: subset, not equality. The file
+/// lanes count every in-scope edge landing on a symbol id; a hop traversal keeps only the call
+/// edge kinds. So a symbol whose inbound edges are all `implements`/`references_type`/`contains`
+/// reports callers and has no hops behind them, `matched_symbols` of 1 notwithstanding — a handle
+/// covering exactly one symbol is not what decides whether the two agree.
+///
+/// Pinned so the gap is not read as a handle-lane regression: it predates that lane and the
+/// qualified-name lane shows it identically. Closing it is a change to what the counts count, and
+/// this test is what would have to change with them.
+#[test]
+fn a_caller_count_spans_edge_kinds_a_hop_traversal_does_not() {
+    let (_temp, config) = rust_source_config(NON_CALL_INBOUND_SOURCE);
+    drop(IndexDatabase::rebuild(&config).unwrap());
+    let db = IndexDatabase::try_open_config_read_only(&config).unwrap().expect("read-only index");
+
+    let graph = db.lens_file_graph("src/lib.rs").unwrap().symbols;
+    let counted_callers = |name: &str, kind: &str| {
+        let row = graph
+            .iter()
+            .find(|symbol| symbol.name == name && symbol.kind == kind)
+            .unwrap_or_else(|| panic!("the fixture must index {kind} {name}"));
+        let callers = &row.callers;
+        (
+            row.logical_symbol_id.expect("an indexed row carries a handle"),
+            callers.exact + callers.syntactic + callers.name_only + callers.ambiguous,
+        )
+    };
+    let hops = |handle: i64| {
+        let answer = db
+            .lens_symbol_callers(&LensHopSelector::Handle(handle), 50)
+            .unwrap()
+            .expect("a handle from this checkout resolves");
+        (answer.callers.len() as i64, answer.matched_symbols)
+    };
+
+    let (runner, runner_counted) = counted_callers("Runner", "trait");
+    assert!(
+        runner_counted > 0,
+        "the impls must draw non-call edges at the trait: {runner_counted}"
+    );
+    assert_eq!(
+        hops(runner),
+        (0, 1),
+        "an `implements`/`references_type` inbound edge is counted as a caller and is not a hop"
+    );
+
+    // Same divergence one level down, where the counted edge is a `contains` from each impl block
+    // — so the count outrunning the hop list is not particular to the trait row.
+    let (go, go_counted) = counted_callers("go", "function");
+    assert!(
+        go_counted > 0,
+        "the impl blocks must draw `contains` edges at the method: {go_counted}"
+    );
+    assert_eq!(hops(go), (0, 2), "the two `go` bodies share a handle and neither is called");
+
+    // The control: where the inbound edge IS a call, the count and the drill-down agree.
+    let (leaf, leaf_counted) = counted_callers("leaf", "function");
+    assert_eq!(leaf_counted, 1);
+    assert_eq!(hops(leaf), (1, 1));
+}
+
 /// Both selectors read the symbol table through the connection's `files` view, so a sibling
 /// checkout's rows are invisible to them: its same-named symbol must not inflate the fallback's
 /// ambiguity report, and its handle must not resolve here. The active checkout keeps answering.

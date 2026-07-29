@@ -147,11 +147,17 @@ impl IndexDatabase {
     ///
     /// The handle lane traverses in `Exact` mode seeded on the logical symbol, which reduces both
     /// predicates to "an edge endpoint is a member of THIS logical symbol" — the qualified-name OR
-    /// arms that the other modes keep are exactly what re-collapses overloads, and dropping them
-    /// also lines the hop list up with the caller/fan-out counts `/api/file/symbols` and
-    /// `/api/file/graph` already show: those are counted per symbol id over resolved edges, and
-    /// these are the same edges over the handle's members — one and the same set whenever
-    /// `matched_symbols` is 1, which is every handle covering a single symbol.
+    /// arms that the other modes keep are exactly what re-collapses overloads. Dropping them takes
+    /// nothing off THIS symbol's list: an edge those arms add is either resolved to a DIFFERENT
+    /// symbol that shares the name — where it is already counted, on that symbol's row — or
+    /// resolved to nothing at all, matched through `target_qualified_name`, where no row counts it.
+    ///
+    /// The counts are still NOT this hop list. They count every in-scope edge kind reaching the
+    /// symbol id, a traversal keeps only the call kinds, so the hops are a SUBSET and the two
+    /// coincide only for a symbol whose incoming edges are all calls. A trait with two impls draws
+    /// `implements` and `references_type` edges and so reports callers with no hops behind them;
+    /// `matched_symbols` being 1 says nothing about that gap. Closing it means restricting the
+    /// counts' edge kinds, not widening the traversal.
     ///
     /// The qualified-name lane keeps the historical `Syntactic` default so an older client that
     /// sends no handle sees byte-identical hops; `matched_symbols` is how it learns that the name

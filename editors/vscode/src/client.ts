@@ -325,9 +325,9 @@ export class LensClient {
    * from the declaration, so editing a signature mints a new one on the next index pass while the
    * CodeLens already drawn in the gutter still carries the old — a 404 there means the row went
    * stale, not that the symbol is gone, and the same row supplied a name that still resolves.
-   * Answering wide (labelled as such by `resolved_by`) beats failing a click that worked before
-   * the handle lane existed. Retried only on 404: a 400 means this client built a malformed
-   * handle, and quietly widening the answer would hide the bug that produced it.
+   * Answering wide (and saying so, through `matched_symbols`) beats failing a click that worked
+   * before the handle lane existed. Retried only on 404: a 400 means this client built a
+   * malformed handle, and quietly widening the answer would hide the bug that produced it.
    */
   // `async` so a selector-less call REJECTS rather than throwing synchronously: the command
   // handler awaits this, and a synchronous throw would escape its error path.
