@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use rag_rat_base::language::Language;
 
 use super::documents;
-use super::layout::{ProjectLayout, marker_sites};
+use super::layout::{ProjectLayout, Trust, marker_sites};
 use crate::OracleTool;
 use crate::lsp::readiness::ReadinessPolicy;
 
@@ -220,8 +220,15 @@ impl LiveBackend {
                     ProjectScope::Enclosing =>
                         documents::enclosing_project_dir(root, &root.join(path), marker.file)
                             .is_some(),
-                    ProjectScope::Checkout =>
-                        self.session_resolves(root, &root.join(path), layout, marker),
+                    // Readiness, not resolution — [`Trust::Possible`] for the same reason as
+                    // the warm-up search below.
+                    ProjectScope::Checkout => self.session_resolves(
+                        root,
+                        &root.join(path),
+                        layout,
+                        marker,
+                        Trust::Possible,
+                    ),
                 }),
         }
     }
@@ -257,9 +264,16 @@ impl LiveBackend {
                     // filtering the first candidate would let a single stray file at the root
                     // declare the whole checkout unwarmable.
                     ProjectScope::Checkout if layout.is_empty() => None,
+                    // [`Trust::Possible`]: warming is where an unreadable database must NOT
+                    // condemn the checkout. Being wrong here costs a session that reports
+                    // `Warming` — which the watcher already reports once and backs off — whereas
+                    // refusing to warm reports the whole backend blocked, so nothing runs and the
+                    // checkout gets no live evidence at all. The per-file gate stays proven, so a
+                    // document warmed on a database this crate could not read is still not
+                    // resolved through it.
                     ProjectScope::Checkout =>
                         documents::find_document_where(root, self.languages, &|document| {
-                            self.session_resolves(root, document, layout, marker)
+                            self.session_resolves(root, document, layout, marker, Trust::Possible)
                         }),
                 }),
         }
@@ -304,19 +318,25 @@ impl LiveBackend {
         absolute: &Path,
         layout: &ProjectLayout,
         marker: ProjectMarker,
+        trust: Trust,
     ) -> bool {
         if layout.is_empty() {
             return false;
         }
         layout.sole_marker_dir().is_some()
-            || layout.discoverable_marker_dir(root, absolute, marker.file).is_some()
+            || layout.discoverable_marker_dir(root, absolute, marker.file, trust).is_some()
     }
 
     /// Whether this session can resolve `path` (repo-relative) — the live pass's per-file gate.
+    ///
+    /// [`Trust::Proven`], because this gate decides whether an answer gets PERSISTED. A database
+    /// this crate could not parse might still be one clangd loads, but if it is not, the file is
+    /// analysed with fallback flags and a cross-translation-unit call resolves to the callee's
+    /// header declaration — a wrong verdict rather than a missing one.
     pub fn session_can_resolve(&self, root: &Path, path: &str, layout: &ProjectLayout) -> bool {
         match self.project_marker {
             Some(marker) if marker.scope == ProjectScope::Checkout =>
-                self.session_resolves(root, &root.join(path), layout, marker),
+                self.session_resolves(root, &root.join(path), layout, marker, Trust::Proven),
             _ => true,
         }
     }

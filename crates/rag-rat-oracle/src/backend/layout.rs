@@ -17,7 +17,7 @@ use serde::{Deserialize, Deserializer};
 /// them per call meant walking the whole checkout several times per spawn (proving there is no
 /// SECOND database requires a full traversal), and the maintenance pass holds the repository write
 /// lock while that happens.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProjectLayout {
     /// Marker sites found in the checkout, capped at two — the only distinction drawn is
     /// "exactly one" versus "several". UNUSABLE sites are recorded too: whether global pinning is
@@ -31,14 +31,78 @@ pub struct ProjectLayout {
     /// while the maintenance pass holds the repository write lock. Scoped to the layout value
     /// rather than to the process: a re-resolved layout starts with an empty memo, so the
     /// staleness window is the one [`LAYOUT_MAX_AGE`] already bounds and no other.
-    usable_markers: RefCell<HashMap<PathBuf, bool>>,
+    usable_markers: RefCell<HashMap<PathBuf, MarkerVerdict>>,
+    /// Whether the scan that produced this layout saw EVERY database that could govern a file in
+    /// the checkout. False when it stopped early — the depth bound, a directory it could not read,
+    /// or a nested checkout whose own sources this checkout may still index.
+    ///
+    /// Pinning is the only question that needs this, and it needs it absolutely:
+    /// `--compile-commands-dir` is global, so "there is exactly one database" has to be a proof,
+    /// not an observation. A truncated scan can see one database and miss the one that actually
+    /// governs half the sources, and pinning then hands those files another project's defines and
+    /// include paths — a wrong definition, persisted. When the scan cannot prove it, the session
+    /// simply is not pinned and clangd's own per-file lookup decides, which is always correct by
+    /// construction.
+    complete: bool,
 }
 
-/// One marker location, and whether the file there describes a project the server can load.
+/// One marker location, and what reading the file there established.
 #[derive(Debug, Clone)]
 pub(super) struct MarkerSite {
     dir: PathBuf,
-    usable: bool,
+    verdict: MarkerVerdict,
+}
+
+/// What reading a marker file established about the project it describes.
+///
+/// Three states rather than a bool because the two questions asked of a database have OPPOSITE
+/// costs of being wrong, and a single "usable" flag cannot serve both. Deciding to pin the session
+/// to a database, or to resolve a file through one, is wrong at the cost of a WRONG VERDICT
+/// persisted as trusted evidence. Deciding a checkout has no warmable project is wrong at the cost
+/// of the backend never running at all. `Unknown` is what lets the first stay conservative while
+/// the second stays permissive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MarkerVerdict {
+    /// Parsed, and at least one entry yields a command line the server can use.
+    Loadable,
+    /// Parsed, and it describes no analysable translation unit — or carries a shape the server
+    /// rejects outright.
+    NotLoadable,
+    /// Could not be read as JSON at all, which says nothing either way: clangd's YAML reader
+    /// accepts comments, trailing commas, and block syntax that `serde_json` does not (#1016), and
+    /// a genuinely corrupt file is indistinguishable from those here.
+    Unknown,
+}
+
+/// How much a layout question demands of a database before counting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Trust {
+    /// Only a database PROVEN loadable counts — for every question whose wrong answer gets
+    /// persisted as evidence.
+    Proven,
+    /// A database that merely might load counts too — for warm-up, where being wrong costs a
+    /// session that reports `Warming` rather than a verdict that is wrong. Reporting the whole
+    /// checkout blocked because a database could not be parsed is the more expensive mistake:
+    /// nothing runs, and the checkout gets no live evidence at all.
+    Possible,
+}
+
+impl MarkerVerdict {
+    fn counts_under(self, trust: Trust) -> bool {
+        match trust {
+            Trust::Proven => self == Self::Loadable,
+            Trust::Possible => self != Self::NotLoadable,
+        }
+    }
+}
+
+impl Default for ProjectLayout {
+    /// An empty layout from no scan at all. `complete` is true because there is nothing to have
+    /// missed: a backend with no project marker never asks a layout question, and the test seams
+    /// that use this drive the branches explicitly.
+    fn default() -> Self {
+        Self { markers: Vec::new(), usable_markers: RefCell::default(), complete: true }
+    }
 }
 
 impl ProjectLayout {
@@ -47,10 +111,14 @@ impl ProjectLayout {
     /// The scan's verdicts seed the memo, so a file whose nearest database is one of the scanned
     /// sites reuses the verdict the scan already paid for, and the two routes cannot disagree
     /// about the same file within one layout.
-    pub(super) fn from_marker_sites(marker: &str, markers: Vec<MarkerSite>) -> Self {
-        let usable_markers: HashMap<PathBuf, bool> =
-            markers.iter().map(|site| (site.dir.join(marker), site.usable)).collect();
-        Self { markers, usable_markers: RefCell::new(usable_markers) }
+    pub(super) fn from_marker_sites(marker: &str, scan: MarkerScan) -> Self {
+        let usable_markers: HashMap<PathBuf, MarkerVerdict> =
+            scan.sites.iter().map(|site| (site.dir.join(marker), site.verdict)).collect();
+        Self {
+            markers: scan.sites,
+            usable_markers: RefCell::new(usable_markers),
+            complete: scan.complete,
+        }
     }
 
     /// The single database this session can point the server at.
@@ -61,8 +129,11 @@ impl ProjectLayout {
     /// broken one, where clangd would otherwise stop at their own nearer database and fall back.
     /// Both are wrong for those files — but only pinning also makes them look configured.
     pub(super) fn sole_marker_dir(&self) -> Option<&Path> {
+        if !self.complete {
+            return None;
+        }
         match self.markers.as_slice() {
-            [only] if only.usable => Some(&only.dir),
+            [only] if only.verdict == MarkerVerdict::Loadable => Some(&only.dir),
             _ => None,
         }
     }
@@ -80,15 +151,15 @@ impl ProjectLayout {
 
     /// Whether the marker file at `file` describes a project the server can load, answered from
     /// [`Self::usable_markers`] when this layout has already read it.
-    fn marker_is_usable(&self, file: &Path) -> bool {
+    fn marker_verdict(&self, file: &Path) -> MarkerVerdict {
         // Borrow only for the lookup: the miss path reads the file and then takes a write borrow.
         let memoized = self.usable_markers.borrow().get(file).copied();
-        if let Some(usable) = memoized {
-            return usable;
+        if let Some(verdict) = memoized {
+            return verdict;
         }
-        let usable = marker_file_is_usable(file);
-        self.usable_markers.borrow_mut().insert(file.to_path_buf(), usable);
-        usable
+        let verdict = read_marker_file(file);
+        self.usable_markers.borrow_mut().insert(file.to_path_buf(), verdict);
+        verdict
     }
 
     /// The marker directory the SERVER would find for `path` on its own — clangd searches an
@@ -105,6 +176,7 @@ impl ProjectLayout {
         root: &Path,
         path: &Path,
         marker: &str,
+        trust: Trust,
     ) -> Option<PathBuf> {
         let mut dir = path.parent()?;
         loop {
@@ -116,7 +188,7 @@ impl ProjectLayout {
                     // continue to a farther ancestor. Continuing here would declare the file
                     // configured by a database clangd never consults, and the live pass would then
                     // trust a fallback-flags answer.
-                    return self.marker_is_usable(&file).then_some(candidate);
+                    return self.marker_verdict(&file).counts_under(trust).then_some(candidate);
                 }
             }
             if dir == root {
@@ -150,7 +222,7 @@ fn is_searchable_for_marker(path: &Path, name: &str) -> bool {
 /// without `--compile-commands-dir` (measured: no progress at all, and calls resolve to header
 /// declarations). Accepting a checkout whose database the server cannot find would report it
 /// usable while it silently never warms.
-pub(super) fn marker_sites(root: &Path, marker: &str) -> Vec<MarkerSite> {
+pub(super) fn marker_sites(root: &Path, marker: &str) -> MarkerScan {
     let mut search = MarkerSearch {
         marker,
         // The scope the walk may not leave. A root that will not canonicalize is used as given:
@@ -159,9 +231,20 @@ pub(super) fn marker_sites(root: &Path, marker: &str) -> Vec<MarkerSite> {
         visited_links: HashSet::new(),
         recorded_markers: HashSet::new(),
         found: Vec::new(),
+        truncated: false,
     };
     search.descend(root, MARKER_SEARCH_MAX_DEPTH);
-    search.found
+    // Stopping at the two-site cap is not truncation: two databases already disqualify pinning, so
+    // nothing deeper could change the answer. Every OTHER early stop is, because it can hide the
+    // second database that would have.
+    let complete = !search.truncated || search.found.len() >= 2;
+    MarkerScan { sites: search.found, complete }
+}
+
+/// What one whole-checkout marker search found, and whether it got to look everywhere it needed to.
+pub(super) struct MarkerScan {
+    pub(super) sites: Vec<MarkerSite>,
+    pub(super) complete: bool,
 }
 
 /// How deep the marker search descends — a backstop for a tree that is merely very deep, not the
@@ -193,6 +276,9 @@ struct MarkerSearch<'a> {
     /// Marker sites, collected until there are two DISTINCT databases — the only distinction any
     /// caller draws is "exactly one" versus "several", and a monorepo can hold hundreds.
     found: Vec<MarkerSite>,
+    /// Whether the walk stopped somewhere short of seeing everything, so "exactly one database"
+    /// would be an observation rather than a proof. See [`ProjectLayout::complete`].
+    truncated: bool,
 }
 
 impl MarkerSearch<'_> {
@@ -202,12 +288,19 @@ impl MarkerSearch<'_> {
         }
         self.record_marker_in(dir);
         let Ok(entries) = std::fs::read_dir(dir) else {
+            // A directory that cannot be read may hold the database that would have disproved a
+            // sole one, so the layout can no longer be pinned on.
+            self.truncated = true;
             return;
         };
         let mut subdirectories: Vec<PathBuf> =
             entries.flatten().filter_map(|entry| self.searchable_subdirectory(&entry)).collect();
         subdirectories.sort();
         let Some(depth_left) = depth_left.checked_sub(1) else {
+            // The bound exists for a tree that is merely very deep, but a project nested past it is
+            // an ordinary monorepo layout — and its database is exactly the one whose absence would
+            // make pinning look safe when it is not.
+            self.truncated |= !subdirectories.is_empty();
             return;
         };
         for sub in subdirectories {
@@ -239,8 +332,8 @@ impl MarkerSearch<'_> {
         if !self.recorded_markers.insert(identity) {
             return;
         }
-        let usable = marker_file_is_usable(&candidate);
-        self.found.push(MarkerSite { dir: dir.to_path_buf(), usable });
+        let verdict = read_marker_file(&candidate);
+        self.found.push(MarkerSite { dir: dir.to_path_buf(), verdict });
     }
 
     /// The directory to descend into for `entry`, or `None` when it is not one this search may
@@ -267,6 +360,14 @@ impl MarkerSearch<'_> {
         // for the same reason, and by the same test — `.git` present, as either a file or a
         // directory. The search ROOT is exempt: it is entered directly, never through here.
         if path.join(".git").exists() {
+            // Its databases are not this checkout's, but its SOURCES may still be: the index
+            // walker descends an ordinary directory whatever `.git` file it contains, so a
+            // submodule's files can be indexed here while its database is invisible to this scan.
+            // Pinning the parent's database over them would analyse them under unrelated defines
+            // and include paths, so the scan reports itself incomplete instead. (Whether a nested
+            // checkout is inside the indexed corpus is a question this crate cannot answer — see
+            // #1008.)
+            self.truncated = true;
             return None;
         }
         // `file_type` describes the LINK, and on Linux it is answered from the readdir result where
@@ -298,7 +399,7 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// Whether a marker file actually describes a project the server can load. This is the read:
 /// every call opens and parses the file, so per-file callers go through
-/// [`ProjectLayout::marker_is_usable`] instead, which remembers the verdict.
+/// [`ProjectLayout::marker_verdict`] instead, which remembers the verdict.
 ///
 /// EVERY entry has to be complete, not just the first, because clangd rejects the WHOLE database
 /// when any single entry is malformed. Measured with clangd 19.1.2 on a database whose first entry
@@ -335,22 +436,34 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 /// The two cheap divergences are closed here instead: a UTF-8 BOM is skipped, and content after the
 /// closing bracket is ignored, both of which clangd accepts and neither of which says anything
 /// about whether the entries describe a loadable project.
-fn marker_file_is_usable(path: &Path) -> bool {
+fn read_marker_file(path: &Path) -> MarkerVerdict {
     let Ok(file) = std::fs::File::open(path) else {
-        return false;
+        return MarkerVerdict::Unknown;
     };
     // `serde_json`'s reader deserializer pulls ONE BYTE at a time — measured unbuffered, a 2 MB
     // database costs two million `read` syscalls — so the buffer in front of it is what makes this
     // a sequential read.
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
     if !skip_utf8_bom(&mut reader) {
-        return false;
+        return MarkerVerdict::Unknown;
     }
     // `Deserializer::from_reader` + `deserialize` rather than `serde_json::from_reader`, which also
     // calls `end()` and so rejects anything after the top-level array. clangd stops at the closing
     // bracket and never looks further, so trailing content must not condemn the database.
     let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
-    CompilationDatabase::deserialize(&mut deserializer).is_ok_and(|database| database.entries > 0)
+    match CompilationDatabase::deserialize(&mut deserializer) {
+        Ok(database) if database.entries > 0 => MarkerVerdict::Loadable,
+        Ok(_) => MarkerVerdict::NotLoadable,
+        // The error's CATEGORY separates the two failures. `Data` means the document parsed and its
+        // contents break the entry contract — the same thing the server refuses, so it is a
+        // positive finding. `Syntax`/`Eof`/`Io` mean it could not be read as JSON at all, which is
+        // not a finding about the project: clangd's YAML reader accepts syntax this does not, and a
+        // corrupt file is indistinguishable from that here.
+        Err(error) => match error.classify() {
+            serde_json::error::Category::Data => MarkerVerdict::NotLoadable,
+            _ => MarkerVerdict::Unknown,
+        },
+    }
 }
 
 /// Consume a leading UTF-8 BOM if there is one. `false` only when the file could not be read at
@@ -449,7 +562,11 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let (mut file, mut directory, mut invocation) = (false, false, false);
-        let mut configures_a_file = false;
+        // Tracked separately because clangd does not treat them as alternatives: measured, when an
+        // entry carries BOTH, `arguments` is used and `command` is ignored entirely — whichever
+        // order the keys appear in. So a good `command` beside an empty `arguments` configures
+        // nothing, and accepting either independently would call that entry usable.
+        let (mut command_configures, mut arguments_configure) = (false, None);
         while let Some(field) = map.next_key::<EntryField>()? {
             match field {
                 EntryField::File => {
@@ -463,11 +580,12 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
                 EntryField::Command => {
                     // A non-string scalar is not blank: clangd reads the node as text, so `null`,
                     // `7`, and `true` each become a one-word command line it parses happily.
-                    configures_a_file |= !map.next_value::<JsonScalar>()?.blank;
+                    command_configures = !map.next_value::<JsonScalar>()?.blank;
                     invocation = true;
                 },
                 EntryField::Arguments => {
-                    configures_a_file |= map.next_value::<JsonSequence>()?.carries_an_argument;
+                    arguments_configure =
+                        Some(map.next_value::<JsonSequence>()?.carries_an_argument);
                     invocation = true;
                 },
                 EntryField::Other => {
@@ -487,7 +605,9 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
         if !invocation {
             return Err(de::Error::custom("entry has neither `command` nor `arguments`"));
         }
-        Ok(CompilationEntry { configures_a_file })
+        Ok(CompilationEntry {
+            configures_a_file: arguments_configure.unwrap_or(command_configures),
+        })
     }
 }
 

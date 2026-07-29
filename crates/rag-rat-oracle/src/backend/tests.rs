@@ -791,61 +791,169 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
 }
 
 #[test]
-fn a_nested_checkouts_database_is_not_this_checkouts() {
-    // A linked worktree kept INSIDE the main checkout is the common case (this repo does it under
-    // `.claude/worktrees/`), and its `.git` is a FILE, so excluding the name `.git` never sees it.
-    // Counting the sibling's database would flip a working single-database checkout into
-    // multi-database mode — no `--compile-commands-dir`, and every source outside clangd's own
-    // ancestor/`build/` search stops being resolvable — purely because of a directory that belongs
-    // to a different checkout. The sibling is not hypothetical state either: `git worktree add`
-    // checks the base commit out there, so the main checkout's own database is reproduced inside
-    // it.
+fn a_nested_checkout_makes_the_layout_unprovable_rather_than_simply_smaller() {
+    // A linked worktree or submodule kept INSIDE the checkout (this repo does it under
+    // `.claude/worktrees/`) carries `.git` as a FILE, so excluding the NAME `.git` never sees it
+    // and the walk counts the sibling's database as this checkout's.
+    //
+    // Not descending is only half the answer, and the other half is the one that matters: the
+    // index walker DOES descend an ordinary directory whatever `.git` file it holds, so a
+    // submodule's sources can be indexed here while its database is invisible to this scan. Pinning
+    // the parent's database would then analyse those sources under unrelated defines and include
+    // paths — a wrong definition, persisted. Whether a nested checkout is inside the indexed corpus
+    // is not a question this crate can answer (#1008), so the scan reports itself INCOMPLETE and
+    // pinning is declined. clangd's own per-file lookup takes over, which is correct by
+    // construction.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-nested-worktree");
-    std::fs::create_dir_all(dir.join("out")).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-nested-checkout");
+    std::fs::create_dir_all(dir.join("build")).unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("out/compile_commands.json"), COMPDB).unwrap();
+    std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
 
-    // A linked worktree: a directory whose `.git` is a file, carrying its own database.
-    std::fs::create_dir_all(dir.join("worktrees/feature/build")).unwrap();
+    // Control FIRST: with no nested checkout the scan is complete, so this pins.
+    let layout = clangd.resolve_layout(&dir);
+    assert!(
+        clangd
+            .spawn_args(&["--background-index"], &layout)
+            .contains(&compdb_arg(&dir.join("build"))),
+        "a checkout with one database and nothing hidden is pinned",
+    );
+
+    // Now add a nested checkout. Its database must not be counted as a second database of THIS
+    // checkout — but its presence means the scan can no longer prove there is only one.
+    std::fs::create_dir_all(dir.join("worktrees/feature/out")).unwrap();
     std::fs::write(
         dir.join("worktrees/feature/.git"),
         "gitdir: /elsewhere/.git/worktrees/feature\n",
     )
     .unwrap();
-    std::fs::write(dir.join("worktrees/feature/build/compile_commands.json"), COMPDB).unwrap();
+    std::fs::write(dir.join("worktrees/feature/out/compile_commands.json"), COMPDB).unwrap();
 
-    let layout = clangd.resolve_layout(&dir);
-    assert!(
-        clangd.spawn_args(&["--background-index"], &layout).contains(&compdb_arg(&dir.join("out"))),
-        "a sibling checkout's database must not make this checkout multi-database",
-    );
-    assert!(
-        clangd.session_can_resolve(&dir, "src/main.c", &layout),
-        "and its sources stay resolvable through the pin",
-    );
-
-    // A nested clone or submodule is the same situation and excluded by the same test — `.git`
-    // present, here as a directory rather than a file.
-    std::fs::create_dir_all(dir.join("vendor/dep/.git")).unwrap();
-    std::fs::write(dir.join("vendor/dep/compile_commands.json"), COMPDB).unwrap();
-    let layout = clangd.resolve_layout(&dir);
-    assert!(
-        clangd.spawn_args(&["--background-index"], &layout).contains(&compdb_arg(&dir.join("out"))),
-        "a nested clone's database must not either",
-    );
-
-    // Control: an ordinary directory of this checkout is NOT a separate checkout, so a second
-    // database there still disqualifies pinning. Without this the assertions above would also pass
-    // for a walk that stopped finding anything at all.
-    std::fs::create_dir_all(dir.join("other/build")).unwrap();
-    std::fs::write(dir.join("other/build/compile_commands.json"), COMPDB).unwrap();
     let layout = clangd.resolve_layout(&dir);
     assert_eq!(
         clangd.spawn_args(&["--background-index"], &layout),
         vec![OsString::from("--background-index")],
-        "a second database in this checkout still counts",
+        "a hidden nested checkout makes global pinning unprovable, so it is declined",
+    );
+    // The file's own database is still in an ancestor `build/`, which clangd finds unaided — so
+    // declining to pin costs this file nothing.
+    assert!(
+        clangd.session_can_resolve(&dir, "src/main.c", &layout),
+        "clangd's own ancestor/build lookup still configures the file",
+    );
+}
+
+#[test]
+fn a_scan_that_could_not_look_everywhere_never_reports_a_sole_database() {
+    // The general invariant behind the nested-checkout case: `--compile-commands-dir` is GLOBAL, so
+    // "there is exactly one database" has to be a proof rather than an observation. Every way the
+    // walk can stop early — the depth bound here — can hide the database that governs half the
+    // sources, and pinning would then hand them another project's flags. A truncated scan therefore
+    // yields no sole database, whatever it happened to find.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-deep-tree");
+    std::fs::create_dir_all(dir.join("build")).unwrap();
+    std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
+
+    // A shallow database alone pins.
+    let layout = clangd.resolve_layout(&dir);
+    assert!(
+        clangd
+            .spawn_args(&["--background-index"], &layout)
+            .contains(&compdb_arg(&dir.join("build"))),
+        "the control must pin, or this test proves nothing about truncation",
+    );
+
+    // A tree deeper than the search bound: the walk stops with subdirectories left unexplored, so
+    // whether a second database exists down there is unknown — and unknown is not "exactly one".
+    let deep: std::path::PathBuf =
+        (0..40).fold(dir.join("nested"), |path, level| path.join(format!("l{level}")));
+    std::fs::create_dir_all(&deep).unwrap();
+
+    let layout = clangd.resolve_layout(&dir);
+    assert_eq!(
+        clangd.spawn_args(&["--background-index"], &layout),
+        vec![OsString::from("--background-index")],
+        "a scan that hit its depth bound cannot claim the database it found is the only one",
+    );
+}
+
+#[test]
+fn the_invocation_clangd_selects_is_the_one_that_must_configure_the_file() {
+    // `command` and `arguments` are not alternatives to be accepted independently. Measured with
+    // clangd 19.1.2: when an entry carries both, `arguments` is used and `command` is ignored
+    // ENTIRELY, whichever order the keys appear in — a good `command` beside an empty `arguments`
+    // yields `Failed to parse command line` and `--check` exits 3. Validating either field on its
+    // own would call that entry usable and let the checkout be pinned to a database that configures
+    // nothing.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-invocation-choice");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+
+    for database in [
+        r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","arguments":[]}]"#,
+        // Key order must not change the answer.
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":[],"command":"cc -c a.c"}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","arguments":[""]}]"#,
+    ] {
+        std::fs::write(dir.join("compile_commands.json"), database).unwrap();
+        assert!(
+            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            "`arguments` is what clangd uses, so {database} configures nothing",
+        );
+    }
+
+    // The converse: an empty `command` beside real `arguments` is fine, because the field clangd
+    // ignores is the empty one.
+    std::fs::write(
+        dir.join("compile_commands.json"),
+        r#"[{"directory":"/x","file":"/x/a.c","command":"","arguments":["cc","-c","a.c"]}]"#,
+    )
+    .unwrap();
+    assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+}
+
+#[test]
+fn a_database_this_crate_cannot_parse_is_not_trusted_but_does_not_block_the_backend() {
+    // The two questions asked of a database have OPPOSITE costs of being wrong, so one "usable"
+    // flag cannot serve both. Resolving a file through a database that turns out not to load
+    // persists a WRONG verdict; declaring the checkout unwarmable means the backend never runs and
+    // the checkout gets no live evidence at all.
+    //
+    // clangd reads compilation databases with clang's YAML reader, so it loads `#` comments,
+    // trailing commas, and block syntax that `serde_json` refuses (#1016). Such a file is therefore
+    // UNKNOWN rather than bad: it must not be pinned or resolved through, and it must not block.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-unreadable-db");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+    // Valid YAML that clangd loads and `serde_json` cannot parse.
+    std::fs::write(
+        dir.join("compile_commands.json"),
+        "[\n  # generated by hand\n  {\"directory\":\"/x\",\"file\":\"/x/a.c\",\"command\":\"cc \
+         -c a.c\"},\n]\n",
+    )
+    .unwrap();
+
+    let layout = clangd.resolve_layout(&dir);
+    assert!(
+        clangd.checkout_can_signal_readiness(&dir, &layout),
+        "a database this crate cannot read must not report the whole backend blocked",
+    );
+    assert_eq!(
+        clangd.spawn_args(&["--background-index"], &layout),
+        vec![OsString::from("--background-index")],
+        "…but it is not proof of anything either, so the session is not pinned to it",
+    );
+
+    // A database we CAN read and that describes nothing is a positive finding, not an unknown —
+    // it still blocks, which is what stops a session warming forever on an empty project.
+    std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
+    assert!(
+        !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+        "a database that parses and describes no translation unit is still refused",
     );
 }
 
