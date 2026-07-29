@@ -1687,3 +1687,103 @@ pub fn ensure_compatible_or_migrate(
         SchemaState::Newer | SchemaState::Dirty => anyhow::bail!("{}", current.message),
     }
 }
+
+/// Registering a migration takes six coordinated edits — the `MIGRATION_0NN_{ID,CHECKSUM,
+/// DESCRIPTION}` consts, the [`ADDITIVE_MIGRATIONS`] entry, [`LATEST_SCHEMA_VERSION`], and three
+/// separate recognizers in `migrations.rs` ([`known_version`], [`known_migration`],
+/// [`migration_checksum_mismatch`]) — and only the first two fail to compile when forgotten.
+///
+/// These tests make the remaining four mechanical by ranging over the shipped ladder itself, so a
+/// new migration is checked automatically. The `known_migration` arm is the one that is otherwise
+/// invisible: leave it out and `status` reports `Newer` while `current_version` still reads
+/// correctly, so a per-migration `current_version == LATEST_SCHEMA_VERSION` assertion passes and
+/// only a broad integration test notices.
+#[cfg(test)]
+mod migration_arming {
+    use super::*;
+
+    /// `(id, checksum)` for every migration this binary ships, in ladder order: the baseline (001,
+    /// applied by `apply_baseline` rather than the additive loop, but armed in the same three
+    /// recognizers) followed by [`ADDITIVE_MIGRATIONS`].
+    fn shipped_ladder() -> Vec<(&'static str, &'static str)> {
+        std::iter::once((MIGRATION_001_ID, MIGRATION_001_CHECKSUM))
+            .chain(ADDITIVE_MIGRATIONS.iter().map(|step| (step.id, step.checksum)))
+            .collect()
+    }
+
+    /// The ledger row `applied_migrations` would report for `id` at `checksum`.
+    fn ledger_row(id: &str, checksum: &str) -> AppliedMigration {
+        AppliedMigration {
+            id: id.to_string(),
+            applied_at_ms: 0,
+            checksum: checksum.to_string(),
+            description: String::new(),
+        }
+    }
+
+    /// The version [`known_version`] assigns to `id` on its own, or `None` when no arm claims it.
+    /// No migration maps to 0, so the `unwrap_or(0)` floor is an unambiguous "unarmed".
+    fn armed_version(id: &str) -> Option<u32> {
+        match known_version(&[ledger_row(id, "")]) {
+            0 => None,
+            version => Some(version),
+        }
+    }
+
+    #[test]
+    fn every_shipped_migration_has_a_known_version_arm() {
+        for (id, _) in shipped_ladder() {
+            assert!(
+                armed_version(id).is_some(),
+                "{id} has no `known_version` arm, so a store that applied it still reports the \
+                 version below it and every open re-runs the ladder",
+            );
+        }
+    }
+
+    #[test]
+    fn every_shipped_migration_is_a_known_migration() {
+        for (id, _) in shipped_ladder() {
+            assert!(
+                known_migration(id),
+                "{id} is missing from `known_migration`, so its own ledger row reads as written \
+                 by a future binary and `status` refuses the store as `Newer`",
+            );
+        }
+        // The dirty marker is not a migration and has no version or checksum arm, but it rides the
+        // same roster: drop it and a crashed migration's marker reads as `Newer` instead of
+        // `Dirty`, which names the wrong remedy.
+        assert!(known_migration(DIRTY_MIGRATION_ID), "the dirty marker stays a recognized id");
+    }
+
+    #[test]
+    fn every_shipped_migration_has_a_checksum_arm() {
+        for (id, checksum) in shipped_ladder() {
+            assert!(
+                !migration_checksum_mismatch(&ledger_row(id, checksum)),
+                "{id} at its shipped checksum must not read as tampered",
+            );
+            // The load-bearing direction: the `_ => false` catch-all silently accepts ANY checksum
+            // for an unarmed id, so a store whose migration body changed under it opens clean.
+            assert!(
+                migration_checksum_mismatch(&ledger_row(id, &format!("{checksum}-tampered"))),
+                "{id} has no `migration_checksum_mismatch` arm, so a changed migration body is \
+                 never detected",
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_ladder_covers_every_version_up_to_latest() {
+        let armed: Vec<u32> =
+            shipped_ladder().iter().filter_map(|(id, _)| armed_version(id)).collect();
+        // Comparing the whole sequence — not just its length or its maximum — is what makes a
+        // reused number, a gap, an out-of-order entry, and a forgotten `LATEST_SCHEMA_VERSION`
+        // bump all one failure.
+        assert_eq!(
+            armed,
+            (1..=LATEST_SCHEMA_VERSION).collect::<Vec<u32>>(),
+            "the shipped ladder must be 1..=LATEST_SCHEMA_VERSION in order, with no gaps or reuse",
+        );
+    }
+}
