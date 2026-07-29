@@ -2,7 +2,7 @@
 //! constructions, imports, impl headers, and dispatch facts.
 use tree_sitter::Node;
 
-use super::dispatch;
+use super::{binders, dispatch};
 use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
@@ -311,7 +311,7 @@ fn infer_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
             && let Some(type_node) = ancestor.child_by_field_name("type")
         {
             let type_text = node_text(type_node, text);
-            let cleaned = clean_rust_type_name(&type_text, &[])?;
+            let cleaned = clean_rust_type_name(&type_text, type_node, text)?;
             // Canonical against the IMPL's own module — `mod inner { impl Worker { … } }`
             // yields `inner::Worker`, matching the method's container-based scope path.
             return module_qualified_type_path(ancestor, &cleaned, text);
@@ -321,7 +321,7 @@ fn infer_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
     None
 }
 
-fn clean_rust_type_name(raw: &str, fn_generics: &[&str]) -> Option<String> {
+fn clean_rust_type_name(raw: &str, at: Node<'_>, text: &str) -> Option<String> {
     let s = raw.trim();
     // A raw-pointer TYPE is not a dereferenced expression: `*mut Worker` must decline here,
     // before the expression cleaner strips the `*` and the pointer masquerades as `Worker`.
@@ -359,12 +359,15 @@ fn clean_rust_type_name(raw: &str, fn_generics: &[&str]) -> Option<String> {
     if !first_char.is_ascii_uppercase() && type_str != "Self" {
         return None;
     }
-    if fn_generics.contains(&tail) {
+    // The binder question is asked of the POSITION, never of a list the caller assembled: an
+    // enclosing `impl`/`trait` binder is invisible from the node a caller happens to hold, and
+    // every list-passing caller guessed too narrowly.
+    if binders::binds_name(at, tail, text) {
         return None;
     }
     if let Some((prefix, _)) = type_str.rsplit_once("::") {
         let root = prefix.split("::").next().unwrap_or(prefix);
-        if fn_generics.contains(&root) {
+        if binders::binds_name(at, root, text) {
             return None;
         }
     }
@@ -396,20 +399,11 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
     }
     let function_node = function_node?;
 
-    let fn_generics = declared_generics(function_node, text);
-    let fn_generic_refs = fn_generics.iter().map(String::as_str).collect::<Vec<_>>();
-
     let mut child_on_path = call_node;
     let mut ancestor = call_node.parent();
     while let Some(node) = ancestor {
         if node.kind() == "block" {
-            match visible_let_binding(
-                node,
-                child_on_path.start_byte(),
-                recv,
-                text,
-                &fn_generic_refs,
-            ) {
+            match visible_let_binding(node, child_on_path.start_byte(), recv, text) {
                 VisibleBinding::Typed(type_name, binding_start) => {
                     // Scan from the BINDING'S block, not the whole function: an assignment can
                     // only affect this binding while it is in scope, and that scope is exactly
@@ -447,7 +441,7 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
                 return None;
             }
             let type_node = param.child_by_field_name("type")?;
-            let type_name = clean_rust_type_name(&node_text(type_node, text), &fn_generic_refs)?;
+            let type_name = clean_rust_type_name(&node_text(type_node, text), type_node, text)?;
             let type_name = canonical_receiver_type(type_name, type_node, text)?;
             if is_reassigned(function_node, param.start_byte(), call_start, recv, text) {
                 return None;
@@ -483,7 +477,6 @@ fn visible_let_binding(
     before_byte: usize,
     recv: &str,
     text: &str,
-    fn_generics: &[&str],
 ) -> VisibleBinding {
     let mut cursor = block.walk();
     let children = block
@@ -504,10 +497,10 @@ fn visible_let_binding(
             return VisibleBinding::Shadowed;
         }
         let type_name = if let Some(type_node) = child.child_by_field_name("type") {
-            clean_rust_type_name(&node_text(type_node, text), fn_generics)
+            clean_rust_type_name(&node_text(type_node, text), type_node, text)
                 .and_then(|type_name| canonical_receiver_type(type_name, type_node, text))
         } else {
-            constructor_owner(child.child_by_field_name("value"), text, fn_generics)
+            constructor_owner(child.child_by_field_name("value"), text)
         };
         return type_name
             .map(|type_name| VisibleBinding::Typed(type_name, child.start_byte()))
@@ -516,7 +509,7 @@ fn visible_let_binding(
     VisibleBinding::Missing
 }
 
-fn constructor_owner(value: Option<Node<'_>>, text: &str, fn_generics: &[&str]) -> Option<String> {
+fn constructor_owner(value: Option<Node<'_>>, text: &str) -> Option<String> {
     let value = value?;
     if value.kind() != "call_expression" {
         return None;
@@ -538,7 +531,7 @@ fn constructor_owner(value: Option<Node<'_>>, text: &str, fn_generics: &[&str]) 
     if !matches!(method_name, "new" | "default") {
         return None;
     }
-    let owner = clean_rust_type_name(type_part, fn_generics)?;
+    let owner = clean_rust_type_name(type_part, function, text)?;
     let owner_canonical = canonical_receiver_type(owner.clone(), value, text)?;
     match same_file_constructor_return(value, text, &owner_canonical, method_name) {
         CtorReturn::SelfLike => Some(owner_canonical),
@@ -584,7 +577,15 @@ fn same_file_constructor_return(node: Node<'_>, text: &str, owner: &str, ctor: &
                 "impl_item" => {
                     let Some(type_node) = child.child_by_field_name("type") else { continue };
                     let impl_type = node_text(type_node, text);
-                    if qn_tail(degeneric_path(&impl_type).trim()) != owner_tail {
+                    let impl_tail = qn_tail(degeneric_path(&impl_type).trim()).to_string();
+                    if impl_tail != owner_tail {
+                        continue;
+                    }
+                    // A BLANKET impl (`impl<Factory: Build> Build for Factory`) names its own
+                    // binder as the target, so its tail matches any owner spelled the same way.
+                    // Counting it as a candidate is how a real constructor gets outvoted into
+                    // `Opaque` and its hint dropped — it implements nothing this call constructs.
+                    if binders::binds_name(type_node, &impl_tail, text) {
                         continue;
                     }
                     let impl_canonical = module_qualified_type_path(child, &impl_type, text);
@@ -640,16 +641,12 @@ fn classify_constructor_return(
         if trimmed == "Self" {
             return Some(CtorReturn::SelfLike);
         }
-        // The declared return is read in the CONSTRUCTOR's scope, so it is checked against the
-        // binders in force THERE and nowhere else — `impl<T> Factory<T> { fn new<U>() -> U }`
-        // returns whatever the call site instantiates, and a module-level type spelled `U` must
-        // not be mistaken for it. The CALLER's binders are deliberately not consulted: they are
-        // not in scope at the declaration, so `fn test<Worker>(..)` calling a constructor that
-        // genuinely returns the concrete `Worker` must still get its hint.
-        let mut binders = declared_generics(impl_node, text);
-        binders.extend(declared_generics(item, text));
-        let binder_refs = binders.iter().map(String::as_str).collect::<Vec<_>>();
-        let Some(declared) = clean_rust_type_name(trimmed, &binder_refs) else {
+        // Anchored at the RETURN node, so the binders in force are the constructor's own impl
+        // and fn — `impl<T> Factory<T> { fn new<U>() -> U }` returns whatever the call site
+        // instantiates. The caller's binders are not in scope here and are not consulted, so
+        // `fn test<Worker>(..)` calling a constructor that genuinely returns the concrete
+        // `Worker` still gets its hint.
+        let Some(declared) = clean_rust_type_name(trimmed, return_node, text) else {
             return Some(CtorReturn::Opaque);
         };
         let Some(declared_canonical) = module_qualified_type_path(item, &declared, text) else {
@@ -761,25 +758,6 @@ fn scope_binds_name(scope: Node<'_>, name: &str, text: &str) -> bool {
         declaration.split(|ch: char| !ch.is_alphanumeric() && ch != '_').any(|part| part == name)
             && crate::index::edges::use_binds_name(declaration, name)
     })
-}
-
-/// The generic parameter names `node` itself BINDS (`impl<T> …`, `fn new<U>() …`). A type whose
-/// root names one of them is not a nameable type at all — it is whatever the call site
-/// instantiates — so every declared type read out of `node` is checked against this list.
-fn declared_generics(node: Node<'_>, text: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let Some(type_params) = node.child_by_field_name("type_parameters") else {
-        return names;
-    };
-    let mut cursor = type_params.walk();
-    for child in type_params.named_children(&mut cursor) {
-        if (child.kind() == "type_parameter" || child.kind() == "constrained_type_parameter")
-            && let Some(name) = child_name_text(child, text)
-        {
-            names.push(name);
-        }
-    }
-    names
 }
 
 /// Enclosing `mod` names of `node`, outermost first.
@@ -1001,6 +979,68 @@ mod receiver_type_hint_tests {
         "#;
         // The declared return type is visible in this file: the receiver is a Worker, not a
         // Factory — the naming convention must lose to the declaration.
+        assert_eq!(extract_call_hints(code), vec![None, Some("Worker".to_string())]);
+    }
+
+    /// A binder is in force at every position inside the item that declares it, so the binder
+    /// question is asked of the POSITION. These are the shapes where the enclosing item — not the
+    /// function the old code looked at — is what introduces the name.
+    #[test]
+    fn test_binders_from_every_enclosing_item_are_declined() {
+        // (source, how many call hints the fixture produces)
+        let cases = [
+            // The impl binds it; the function does not.
+            ("impl<Entry: Runs> Bag<Entry> { fn drive(&self, item: Entry) { item.run(); } }", 1),
+            // A `let` annotation under an impl binder.
+            ("impl<Entry> Bag<Entry> { fn drive(&self) { let v: Entry = make(); v.run(); } }", 2),
+            // A trait's default-method body sits under the TRAIT's binders.
+            ("trait Feeder<Entry> { fn feed(&self, e: Entry) { e.run(); } }", 1),
+            // A blanket impl binds its own Self type, so `self` names no concrete owner.
+            ("impl<X: Runs> Render for X { fn render(&self) { self.tick(); } }", 1),
+            // Nested: the binder comes from an impl two levels above the call.
+            (
+                "impl<Entry> Bag<Entry> { fn drive(&self) { if true { let v: Entry = make(); \
+                 v.run(); } } }",
+                2,
+            ),
+        ];
+        for (code, hints) in cases {
+            let got = extract_call_hints(code);
+            assert_eq!(got.len(), hints, "fixture shape changed for {code}");
+            assert!(
+                got.iter().all(Option::is_none),
+                "a generic binder must never be read as a concrete receiver type: {code} -> \
+                 {got:?}"
+            );
+        }
+    }
+
+    /// The flip side: a real type of the same shape, with no binder declaring it, still resolves.
+    #[test]
+    fn test_a_concrete_type_is_not_mistaken_for_a_binder() {
+        let code = r#"
+            struct Entry;
+            impl Bag { fn drive(&self, item: Entry) { item.run(); } }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![Some("Entry".to_string())]);
+    }
+
+    /// A blanket impl's target is its own binder, so its `new` is not a candidate constructor for
+    /// a same-spelled concrete owner — counting it would outvote the real one into `Opaque`.
+    #[test]
+    fn test_a_blanket_impl_does_not_outvote_the_real_constructor() {
+        let code = r#"
+            impl<Factory: Build> Build for Factory {
+                fn new() -> Factory { todo!() }
+            }
+            impl Factory {
+                fn new() -> Worker { todo!() }
+            }
+            fn test() {
+                let w = Factory::new();
+                w.run();
+            }
+        "#;
         assert_eq!(extract_call_hints(code), vec![None, Some("Worker".to_string())]);
     }
 
