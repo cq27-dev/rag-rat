@@ -34,7 +34,23 @@ pub(crate) fn produce_row_ops(
     let mut ops = Vec::new();
     let mut live: BTreeSet<String> = BTreeSet::new();
 
-    for (pk, cells) in apply::read_all_rows(tx, spec, repo_id)? {
+    for scanned in apply::read_all_rows(tx, spec, repo_id)? {
+        let (pk, cells) = match scanned {
+            apply::ScannedRow::Readable { pk, cells } => (pk, cells),
+            // The row exists and cannot be carried, so it is published as whatever it last was —
+            // but its identity MUST still count as live. Dropping it here instead would leave a
+            // published identity with no live row, which the loop below reads as a local delete and
+            // authors a `Remove` for: an unreadable cell on one device would then delete the row on
+            // every peer.
+            apply::ScannedRow::Unpublishable { pk } => {
+                live.insert(row_op::row_pk_string(&pk));
+                continue;
+            },
+            // No pk means no identity to keep alive, so this row is deliberately NOT added to
+            // `live`: whatever pk was published genuinely has no row carrying it any more, and a
+            // `Remove` for that identity is the same answer a delete would get.
+            apply::ScannedRow::Unaddressable => continue,
+        };
         let row_pk = row_op::row_pk_string(&pk);
         live.insert(row_pk.clone());
         let hash = row_op::cells_hash(&cells);
@@ -255,6 +271,116 @@ mod tests {
             ops[0].pk()[0],
             TypedValue::Text("A".to_string()),
             "the produced row belongs to the repo being synced",
+        );
+    }
+
+    /// A spec whose synced column is a `Bool`, plus its table — the one shape a STRICT schema can
+    /// leave unreadable (#1017).
+    const FLAGGED: TableSpec = TableSpec {
+        name: "t_flagged",
+        scope_id: "demo/1",
+        spec_version: 1,
+        pk: &[ColumnSpec::required("id", ValueType::Text)],
+        columns: &[ColumnSpec::required("flag", ValueType::Bool)],
+        local_columns: &[],
+        repo_column: None,
+    };
+
+    fn flagged_conn() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&c, &crate::test_hooks()).unwrap();
+        c.execute_batch("CREATE TABLE t_flagged(id TEXT PRIMARY KEY, flag INTEGER) STRICT;")
+            .unwrap();
+        c
+    }
+
+    fn flag_upsert(id: &str, flag: bool) -> RowOp {
+        RowOp::Upsert {
+            spec_version: 1,
+            table: "t_flagged".to_string(),
+            pk: vec![TypedValue::Text(id.to_string())],
+            cells: vec![Cell { column: "flag".to_string(), value: TypedValue::Bool(flag) }],
+        }
+    }
+
+    #[test]
+    fn a_row_that_cannot_be_read_is_neither_authored_nor_removed() {
+        // The trap: an unreadable row that is simply skipped disappears from the live set, and the
+        // published identity it leaves behind reads as a local delete — so one device's malformed
+        // cell would author a `Remove` that deletes the row on EVERY peer.
+        let mut c = flagged_conn();
+        let tx = c.transaction().unwrap();
+        apply_row_op(&tx, &FLAGGED, "repo", &flag_upsert("r1", true), OpMeta {
+            lamport: 1,
+            device: DeviceFingerprint::from_bytes([1; 32]),
+        })
+        .unwrap();
+        assert!(produce_row_ops(&tx, &FLAGGED, "repo", test_stream()).unwrap().is_empty());
+
+        // A raw local write puts the column outside the Bool domain STRICT cannot pin.
+        tx.execute("UPDATE t_flagged SET flag = 2 WHERE id = 'r1'", []).unwrap();
+        assert!(
+            produce_row_ops(&tx, &FLAGGED, "repo", test_stream()).unwrap().is_empty(),
+            "an unreadable row is not carried in an op — and above all is not deleted on peers",
+        );
+    }
+
+    #[test]
+    fn an_unreadable_row_does_not_stop_the_rest_of_the_table() {
+        // One bad row must not cost the pass: before #1017 the scan errored, taking every other
+        // row's op with it.
+        let mut c = flagged_conn();
+        let tx = c.transaction().unwrap();
+        tx.execute("INSERT INTO t_flagged(id, flag) VALUES ('bad', 2), ('good', 1)", []).unwrap();
+        let ops = produce_row_ops(&tx, &FLAGGED, "repo", test_stream()).unwrap();
+        assert_eq!(ops.len(), 1, "the readable row is still produced");
+        assert_eq!(ops[0].pk(), vec![TypedValue::Text("good".to_string())]);
+    }
+
+    #[test]
+    fn a_row_whose_pk_cannot_be_read_releases_the_identity_it_was_published_under() {
+        // The pk case is the other half, and it goes the other way: with no readable pk there is no
+        // identity to keep alive, so the pk that WAS published genuinely has no row carrying it —
+        // exactly what a delete means. Suppressing the `Remove` instead would leave peers holding a
+        // row this device can never speak about again.
+        const FLAG_PK: TableSpec = TableSpec {
+            name: "t_flag",
+            scope_id: "demo/1",
+            spec_version: 1,
+            pk: &[ColumnSpec::required("active", ValueType::Bool)],
+            columns: &[ColumnSpec::required("label", ValueType::Text)],
+            local_columns: &[],
+            repo_column: None,
+        };
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&c, &crate::test_hooks()).unwrap();
+        c.execute_batch("CREATE TABLE t_flag(active INTEGER PRIMARY KEY, label TEXT) STRICT;")
+            .unwrap();
+        let tx = c.transaction().unwrap();
+        apply_row_op(
+            &tx,
+            &FLAG_PK,
+            "repo",
+            &RowOp::Upsert {
+                spec_version: 1,
+                table: "t_flag".to_string(),
+                pk: vec![TypedValue::Bool(true)],
+                cells: vec![Cell {
+                    column: "label".to_string(),
+                    value: TypedValue::Text("on".into()),
+                }],
+            },
+            OpMeta { lamport: 1, device: DeviceFingerprint::from_bytes([1; 32]) },
+        )
+        .unwrap();
+        assert!(produce_row_ops(&tx, &FLAG_PK, "repo", test_stream()).unwrap().is_empty());
+
+        tx.execute("UPDATE t_flag SET active = 2", []).unwrap();
+        let ops = produce_row_ops(&tx, &FLAG_PK, "repo", test_stream()).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(&ops[0], RowOp::Remove { .. }),
+            "the published pk no longer names a live row, so it is a delete",
         );
     }
 

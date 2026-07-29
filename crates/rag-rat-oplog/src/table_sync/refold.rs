@@ -1112,6 +1112,67 @@ mod tests {
     }
 
     #[test]
+    fn a_row_this_binary_cannot_read_does_not_fail_the_refold_and_is_repaired_by_it() {
+        // #1017, and the reason it is severe: this pass runs at STORE OPEN, so an error here does
+        // not fail one replay — it fails the open, and `index --full` takes the same path, so there
+        // is no recovery. A `Bool` column outside 0/1 is the one cell a STRICT schema cannot rule
+        // out, and no registry lint can require the `CHECK (col IN (0, 1))` that would.
+        const BOOL_OLD: TableSpec = TableSpec {
+            name: "t_bool",
+            scope_id: "demo/1",
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("flag", ValueType::Bool)],
+            local_columns: &["later"],
+            repo_column: None,
+        };
+        const BOOL_NEW: TableSpec = TableSpec {
+            spec_version: 2,
+            columns: &[
+                ColumnSpec::required("flag", ValueType::Bool),
+                ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Null),
+            ],
+            local_columns: &[],
+            ..BOOL_OLD
+        };
+        let table = "CREATE TABLE t_bool(id TEXT PRIMARY KEY, flag INTEGER, later TEXT) STRICT;";
+
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute_batch(table).unwrap();
+        b.conn.execute_batch(table).unwrap();
+
+        // A authors r1 under the wider column set; B cannot project it and parks it.
+        a.conn.execute("INSERT INTO t_bool(id, flag, later) VALUES ('r1', 0, 'wide')", []).unwrap();
+        let entries = a.produce(&[BOOL_NEW], "repo");
+        assert_eq!(entries.len(), 1);
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(&[BOOL_OLD], "repo", &entries, &a.pubkey());
+        assert_eq!(b.pending_count(), 1);
+
+        // B's own copy of the row is outside the Bool domain — written raw, so it never went
+        // through the applier's typed cells.
+        b.conn.execute("INSERT INTO t_bool(id, flag, later) VALUES ('r1', 2, NULL)", []).unwrap();
+
+        assert!(
+            refold_stale_projections_against(&b.conn, &[BOOL_NEW]).unwrap(),
+            "the refold must complete — an error here is an index that never opens again",
+        );
+        let row: (i64, Option<String>) = b
+            .conn
+            .query_row("SELECT flag, later FROM t_bool WHERE id = 'r1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            row,
+            (0, Some("wide".to_string())),
+            "and the replayed winner rewrites the whole row, which is what repairs the bad cell",
+        );
+        assert_eq!(b.pending_count(), 0, "the entry is no longer outstanding");
+    }
+
+    #[test]
     fn redelivery_of_a_parked_entry_changes_nothing_and_keeps_its_mark() {
         // Redelivery cannot rescue a parked entry (it short-circuits on `entry_exists`) — which is
         // exactly why the mark has to survive it. If redelivery cleared the mark, the refold would
