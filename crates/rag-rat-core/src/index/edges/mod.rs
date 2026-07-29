@@ -578,22 +578,45 @@ pub(crate) fn degeneric_path(path: &str) -> String {
 /// `::`-segment and per-`::`-segment splitting is sound.
 /// Borrowed ⇔ the path needs no normalization — the hot rebuild path allocates nothing for the
 /// plain-scope majority.
+/// Peel `&`/`&mut`/`*const`/`*mut` off an owner segment. The impl scope KEEPS the wrapper — it is
+/// part of the impl's identity, since `impl Tr for W` and `impl Tr for &W` coexist — but the
+/// RECEIVER surface must not: a source-form target is always written `W::method`, and an autoref
+/// call site cannot tell which impl it lands in. Folding here is what lets `&W as Tr::method`
+/// still answer to `W::method`, and lets a call that could hit either decline as ambiguous.
+fn strip_receiver_wrappers(segment: &str) -> &str {
+    let mut rest = segment.trim();
+    loop {
+        let peeled = rest
+            .strip_prefix("*const ")
+            .or_else(|| rest.strip_prefix("*mut "))
+            .or_else(|| rest.strip_prefix('&'))
+            .unwrap_or(rest)
+            .trim_start();
+        let peeled = peeled.strip_prefix("mut ").unwrap_or(peeled).trim_start();
+        if peeled == rest {
+            return rest.trim_end();
+        }
+        rest = peeled;
+    }
+}
+
 pub(crate) fn normalized_scope_path<'a>(
     path: &'a str,
     language: Option<&str>,
 ) -> std::borrow::Cow<'a, str> {
-    if language != Some(Language::Rust.as_str()) || (!path.contains('<') && !path.contains(" as "))
+    if language != Some(Language::Rust.as_str())
+        || (!path.contains('<')
+            && !path.contains(" as ")
+            && !path.contains('&')
+            && !path.contains('*'))
     {
         return std::borrow::Cow::Borrowed(path);
     }
     let degeneric = degeneric_path(path);
-    if !degeneric.contains(" as ") {
-        return std::borrow::Cow::Owned(degeneric);
-    }
     std::borrow::Cow::Owned(
         degeneric
             .split("::")
-            .map(|segment| segment.split(" as ").next().unwrap_or(segment).trim_end())
+            .map(|segment| strip_receiver_wrappers(segment.split(" as ").next().unwrap_or(segment)))
             .collect::<Vec<_>>()
             .join("::"),
     )
