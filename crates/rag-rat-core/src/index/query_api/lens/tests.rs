@@ -1763,3 +1763,129 @@ fn indexed_config() -> (tempfile::TempDir, Config) {
     drop(IndexDatabase::rebuild(&config).unwrap());
     (temp, config)
 }
+
+#[test]
+fn per_file_answers_name_the_exact_bytes_they_were_computed_from() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), SOURCE).unwrap();
+    // Verbatim disk bytes: a UTF-8 BOM and CRLF endings. The client compares against this hash, so
+    // a rendering that drops the BOM or rewrites the line endings would disagree with every file
+    // of this shape forever — which is a worse failure than the skew the comparison exists to
+    // catch. The indexer stores `hex_sha256(fs::read(file))`, and this pins that it stays so.
+    let verbatim = b"\xef\xbb\xbfpub fn carriage_returns() {}\r\n".to_vec();
+    fs::write(root.join("src/verbatim.rs"), &verbatim).unwrap();
+    let mut config = Config::minimal_for_database(root.join("index.sqlite"), root.clone());
+    config.database_key_pinned = true;
+    config.targets = vec![ResolvedTarget {
+        name: "rust".into(),
+        language: Language::Rust,
+        directories: vec![PathBuf::from("src")],
+        include: vec!["**/*.rs".into()],
+        exclude: Vec::new(),
+        kind: TargetKind::Source,
+    }];
+    drop(IndexDatabase::rebuild(&config).unwrap());
+    let db = IndexDatabase::try_open_config_read_only(&config).unwrap().expect("read-only index");
+
+    for path in ["src/lib.rs", "src/verbatim.rs"] {
+        let expected = rag_rat_base::hash::hex_sha256(&fs::read(root.join(path)).unwrap());
+        assert_eq!(
+            db.lens_file_content_sha256(path).unwrap().as_deref(),
+            Some(expected.as_str()),
+            "{path} must be named by the hash of its raw bytes"
+        );
+    }
+    // The literal both sides are pinned to. The editor client hashes the same bytes and asserts
+    // the same string ("the client hashes what the server hashed, BOM and line endings included"),
+    // so a change to either encoding breaks a test here rather than silently withholding every
+    // surface for whole classes of file — the failure mode that is worse than the skew this
+    // compares for.
+    assert_eq!(
+        db.lens_file_content_sha256("src/verbatim.rs").unwrap().as_deref(),
+        Some("f4c30a8dded3c6fe777b5c1d5c8330604336808b8c9c9b7ff058325a3a7d591f"),
+        "the content hash a client can reproduce from the file's bytes alone"
+    );
+
+    // Every per-file endpoint carries the hash: one lane without it is one lane the client cannot
+    // gate, and a payload is only as trustworthy as its least-provenanced part.
+    let expected = rag_rat_base::hash::hex_sha256(&fs::read(root.join("src/lib.rs")).unwrap());
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let hashes = [
+        db.lens_file_answer("src/lib.rs", || db.lens_file_symbols("src/lib.rs"))
+            .unwrap()
+            .content_sha256,
+        db.lens_file_answer("src/lib.rs", || db.lens_file_graph("src/lib.rs"))
+            .unwrap()
+            .content_sha256,
+        db.lens_file_answer("src/lib.rs", || db.lens_file_memories("src/lib.rs"))
+            .unwrap()
+            .content_sha256,
+        db.lens_file_answer("src/lib.rs", || db.lens_file_coupling("src/lib.rs"))
+            .unwrap()
+            .content_sha256,
+        db.lens_file_answer("src/lib.rs", || db.lens_file_papertrail("src/lib.rs"))
+            .unwrap()
+            .content_sha256,
+        db.lens_file_answer("src/lib.rs", || {
+            db.lens_file_clones_with_cancel("src/lib.rs", 0.7, 100, &cancelled)
+        })
+        .unwrap()
+        .content_sha256,
+    ];
+    assert!(
+        hashes.iter().all(|hash| hash.as_deref() == Some(expected.as_str())),
+        "every lane names the same content: {hashes:?}"
+    );
+
+    // The hash is a sibling of the payload's own fields, not a nesting level: the client's lane
+    // shapes are unchanged apart from the new key.
+    let answer = db.lens_file_answer("src/lib.rs", || db.lens_file_symbols("src/lib.rs")).unwrap();
+    let json = serde_json::to_value(&answer).unwrap();
+    assert_eq!(json["content_sha256"], serde_json::Value::String(expected));
+    assert!(json["symbols"].as_array().is_some_and(|symbols| !symbols.is_empty()));
+
+    // A path the active scope does not hold anchors nothing, and says so rather than guessing.
+    let missing =
+        db.lens_file_answer("src/missing.rs", || db.lens_file_symbols("src/missing.rs")).unwrap();
+    assert_eq!(missing.content_sha256, None);
+    assert!(missing.answer.symbols.is_empty());
+}
+
+#[test]
+fn a_file_answer_and_its_content_hash_come_from_one_snapshot() {
+    let (_temp, config) = indexed_config();
+    let db = IndexDatabase::try_open_config_read_only(&config).unwrap().expect("read-only index");
+    let writer = rusqlite::Connection::open(&config.database).unwrap();
+    // `files` carries the content-digest triggers, whose scalar function every writer registers.
+    rag_rat_db::content_digest::register_content_digest_fold(&writer).unwrap();
+
+    // A reindex commits between the hash read and the answer read. Paired under one WAL snapshot
+    // the two still describe ONE revision; taken as independent statements they would not, and the
+    // client would be handed line anchors from one revision beside the content hash of another —
+    // which is exactly the release it must refuse.
+    let answer = db
+        .lens_file_answer("src/lib.rs", || {
+            writer
+                .execute("UPDATE files SET sha256 = ?1 WHERE path = 'src/lib.rs'", ["reindexed"])
+                .unwrap();
+            db.lens_file_content_sha256("src/lib.rs")
+        })
+        .unwrap();
+
+    assert_eq!(answer.content_sha256, answer.answer, "both reads describe one revision");
+    assert_ne!(
+        answer.content_sha256.as_deref(),
+        Some("reindexed"),
+        "the snapshot predates the concurrent commit"
+    );
+    // The commit did land — otherwise this test would pass without proving anything.
+    assert_eq!(
+        writer
+            .query_row("SELECT sha256 FROM files WHERE path = 'src/lib.rs'", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "reindexed"
+    );
+}

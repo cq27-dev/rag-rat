@@ -20,7 +20,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use rag_rat_base::config::Config;
 use rag_rat_core::IndexDatabase;
-use rag_rat_core::index::LensCloneGraphCache;
+use rag_rat_core::index::{LensCloneGraphCache, LensFileAnswer};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -382,7 +382,7 @@ async fn treemap(
 async fn file_clones(
     State(mut state): State<HttpState>,
     Query(query): Query<FileClonesQuery>,
-) -> Result<Json<rag_rat_core::index::LensFileClones>, ApiError> {
+) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileClones>>, ApiError> {
     let path = query.path.ok_or_else(|| ApiError::bad_query("missing query parameter `path`"))?;
     validate_relative_path(&path)?;
     let theta = query.theta.unwrap_or(DEFAULT_THETA);
@@ -403,7 +403,9 @@ async fn file_clones(
     state.options.timeout = remaining;
     run_db(state, move |db, _, cancelled| {
         let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_clones_with_cancel(&path, theta, min_tokens, cancelled)?)
+        Ok(db.lens_file_answer(&path, || {
+            db.lens_file_clones_with_cancel(&path, theta, min_tokens, cancelled)
+        })?)
     })
     .await
     .map(Json)
@@ -412,12 +414,12 @@ async fn file_clones(
 async fn file_symbols(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
-) -> Result<Json<rag_rat_core::index::LensFileSymbols>, ApiError> {
+) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileSymbols>>, ApiError> {
     let path = required_path(query.path)?;
     let case_insensitive = state.options.case_insensitive_paths;
     run_db(state, move |db, _, _| {
         let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_symbols(&path)?)
+        Ok(db.lens_file_answer(&path, || db.lens_file_symbols(&path))?)
     })
     .await
     .map(Json)
@@ -426,12 +428,12 @@ async fn file_symbols(
 async fn file_graph(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
-) -> Result<Json<rag_rat_core::index::LensFileGraph>, ApiError> {
+) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileGraph>>, ApiError> {
     let path = required_path(query.path)?;
     let case_insensitive = state.options.case_insensitive_paths;
     run_db(state, move |db, _, _| {
         let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_graph(&path)?)
+        Ok(db.lens_file_answer(&path, || db.lens_file_graph(&path))?)
     })
     .await
     .map(Json)
@@ -440,12 +442,12 @@ async fn file_graph(
 async fn file_coupling(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
-) -> Result<Json<rag_rat_core::index::LensFileCoupling>, ApiError> {
+) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileCoupling>>, ApiError> {
     let path = required_path(query.path)?;
     let case_insensitive = state.options.case_insensitive_paths;
     run_db(state, move |db, _, _| {
         let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_coupling(&path)?)
+        Ok(db.lens_file_answer(&path, || db.lens_file_coupling(&path))?)
     })
     .await
     .map(Json)
@@ -454,12 +456,12 @@ async fn file_coupling(
 async fn file_memories(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
-) -> Result<Json<rag_rat_core::index::LensFileMemories>, ApiError> {
+) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileMemories>>, ApiError> {
     let path = required_path(query.path)?;
     let case_insensitive = state.options.case_insensitive_paths;
     run_db(state, move |db, _, _| {
         let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_memories(&path)?)
+        Ok(db.lens_file_answer(&path, || db.lens_file_memories(&path))?)
     })
     .await
     .map(Json)
@@ -468,12 +470,12 @@ async fn file_memories(
 async fn file_papertrail(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
-) -> Result<Json<rag_rat_core::index::LensFilePapertrail>, ApiError> {
+) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFilePapertrail>>, ApiError> {
     let path = required_path(query.path)?;
     let case_insensitive = state.options.case_insensitive_paths;
     run_db(state, move |db, _, _| {
         let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_papertrail(&path)?)
+        Ok(db.lens_file_answer(&path, || db.lens_file_papertrail(&path))?)
     })
     .await
     .map(Json)

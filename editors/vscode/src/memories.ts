@@ -23,10 +23,10 @@ export class MemoryCodeLensProvider implements vscode.CodeLensProvider, vscode.D
 
   async provideCodeLenses(document: vscode.TextDocument): Promise<vscode.CodeLens[]> {
     const loaded = await this.store.dataFor(document);
-    const memories = loaded?.data.memories;
-    if (!loaded || !memories) {
+    if (loaded.kind !== 'answer') {
       return [];
     }
+    const memories = loaded.data.memories;
     const path = loaded.path;
     const byLine = new Map<number, FileMemory[]>();
     for (const m of memories) {
@@ -72,11 +72,7 @@ export async function showMemoriesQuickPick(
   // existed.
   const outcome = await documents.openPicked(picked.memory.id, path);
   if (outcome.kind !== 'ready') {
-    void vscode.window.showInformationMessage(
-      outcome.kind === 'absent'
-        ? 'That memory could not be opened — it may have been removed, or the lookup for this file failed.'
-        : 'The Lens server is not answering, so that memory cannot be opened.',
-    );
+    void vscode.window.showInformationMessage(MEMORY_PICK_MESSAGES[outcome.kind]);
     return;
   }
   const doc = await vscode.workspace.openTextDocument(outcome.uri);
@@ -124,9 +120,23 @@ function verdictSection(m: FileMemory): string[] {
 /** What opening a picked memory produced — see `MemoryDocProvider.openPicked`. */
 export type MemoryPick =
   | { kind: 'ready'; uri: vscode.Uri }
-  /** Not in the payload we got back. Deliberately NOT called "deleted" — see `openPicked`. */
-  | { kind: 'absent' }
+  /** The memory lane answered for this file and does not hold the id: it is gone from the index. */
+  | { kind: 'deleted' }
+  /** The memory lane did not answer, so neither its contents nor their absence mean anything. */
+  | { kind: 'stale' }
+  /** Nothing came back for this file at all. */
   | { kind: 'unavailable' };
+
+/**
+ * Each outcome says exactly what is known, and nothing more. "Removed" is a claim about the index
+ * that only a lane that actually answered can support; a lane that failed supports no claim in
+ * either direction, and saying so is more useful than a hedge covering both.
+ */
+const MEMORY_PICK_MESSAGES: Record<Exclude<MemoryPick['kind'], 'ready'>, string> = {
+  deleted: 'That memory is no longer in the index — it has been removed.',
+  stale: 'The memory lookup for this file did not answer, so that memory cannot be opened yet.',
+  unavailable: 'The Lens server is not answering, so that memory cannot be opened.',
+};
 
 /** Shown in place of a memory document while the server that produced it is unreachable. */
 const UNAVAILABLE_DOC = [
@@ -156,24 +166,31 @@ export class MemoryDocProvider implements vscode.TextDocumentContentProvider, vs
   /**
    * Open the memory `id` as it stands NOW, re-read from `path` after a picker resolved.
    *
-   * `absent` does NOT mean deleted, and the caller must not say that it does. `FileStore.data`
-   * merges five independently-settling lanes: when the memory lane alone fails it substitutes the
-   * previous value for up to a minute, and an empty list once that expires. So a memory missing
-   * here may have been removed from the index, or its lookup may simply have failed — and one
-   * present here may be up to a minute old. Only `undefined` from the store is authoritative, and
-   * only about the server as a whole. Telling a lane's answer from its fallback needs provenance
-   * the store does not yet expose — #1026.
+   * Nothing is rendered from the object the picker captured, so a memory the index no longer holds
+   * cannot be put back on screen as though it did — and nothing is rendered from a CARRIED memory
+   * lane either. `FileStore.data` merges five independently-settling lanes and substitutes a
+   * failed lane's previous value for up to a minute, which is right for surfaces that only render
+   * what is there. Opening a document is not that: it is a fresh claim that this is the memory as
+   * it stands, and a carried value cannot support one. Its absence cannot support the opposite
+   * claim either, which is why the two are separate outcomes.
    *
-   * What this DOES guarantee is that nothing is rendered from the object the picker captured, so a
-   * memory the index no longer holds cannot be put back on screen as though it did.
+   * This is also the answer to whether any surface should DISPLAY fallback provenance. A memory
+   * document is the one place where staleness is invisible — there is no line number to look wrong
+   * against — so annotating a carried render would be asking the reader to discount a claim the
+   * code should not have made. Refusing to make it is strictly better. Line-anchored surfaces need
+   * no annotation either: a carried lane there is gated on content agreement, so it either
+   * describes the bytes on screen or is withheld outright.
    */
   async openPicked(id: string, path: string): Promise<MemoryPick> {
     const data = await this.store.data(path);
     if (!data) {
       return { kind: 'unavailable' };
     }
+    if (data.lanes.memories !== 'current') {
+      return { kind: 'stale' };
+    }
     const memory = data.memories.find((candidate) => candidate.id === id);
-    return memory ? { kind: 'ready', uri: this.update(memory, path) } : { kind: 'absent' };
+    return memory ? { kind: 'ready', uri: this.update(memory, path) } : { kind: 'deleted' };
   }
 
   update(memory: FileMemory, path: string): vscode.Uri {
@@ -199,6 +216,12 @@ export class MemoryDocProvider implements vscode.TextDocumentContentProvider, vs
     await Promise.all([...byPath].map(async ([path, ids]) => {
       const data = await this.store.data(path);
       if (!data || this.epoch !== epoch) {
+        return;
+      }
+      // A carried or empty memory lane corrects nothing and proves nothing: re-rendering from it
+      // would re-present a minute-old body as confirmed, and treating its gaps as removals would
+      // report a dropped request as a deletion. Leave these documents until a lane answers.
+      if (data.lanes.memories !== 'current') {
         return;
       }
       const current = new Map(data.memories.map((memory) => [memory.id, memory]));

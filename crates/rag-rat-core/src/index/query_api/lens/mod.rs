@@ -21,8 +21,8 @@ pub use enrichments::{
     LensFilePapertrail, LensPapertrailRef,
 };
 pub use files::{
-    LensDispatchDetail, LensFileGraph, LensFileSymbolGraph, LensFileSymbols, LensGraphCallerCounts,
-    LensSymbol,
+    LensDispatchDetail, LensFileAnswer, LensFileGraph, LensFileSymbolGraph, LensFileSymbols,
+    LensGraphCallerCounts, LensSymbol,
 };
 pub use hops::{LensCallees, LensCallers, LensHopResolvedBy, LensHopSelector, LensSymbolHop};
 pub use status::{LensStatus, LensVersion};

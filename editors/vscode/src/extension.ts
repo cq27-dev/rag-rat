@@ -2,6 +2,7 @@
 // Everything here must stay runtime-neutral: vscode API + fetch only.
 import * as vscode from 'vscode';
 import { LensClient } from './client';
+import { DocumentDigests } from './content';
 import {
   associateHostedWorkspace,
   INDEXED_ROOT_ERROR,
@@ -29,6 +30,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const config = vscode.workspace.getConfiguration('rag-rat-lens');
   const resolver = new LensEndpointResolver(config, context.secrets);
   const client = new LensClient(resolver);
+  const digests = new DocumentDigests();
   const store = new FileStore(
     client,
     () => config.get<number>('cloneTheta', 0.9),
@@ -40,6 +42,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const endpoint = await resolver.resolve();
       return `${endpoint.baseUrl} ${endpoint.token ?? ''}`;
     },
+    (document) => digests.of(document),
   );
   const overlays = new LensOverlays();
   const diagnostics = new LensDiagnostics();
@@ -110,12 +113,18 @@ export function activate(context: vscode.ExtensionContext): void {
       // Present for a partially loaded file too — one lane can fail while the rest answer.
       logError(`overlays ${path}`, failure);
     }
-    if (!loaded) {
+    if (loaded.kind !== 'answer') {
       // A disconnect must clear hidden editors as they become visible. Epoch invalidation (an SSE
       // refresh racing an in-flight load) stays untouched and resolves on the next request. A
       // document that stopped being indexable mid-load — the buffer went dirty — is cleared
-      // outright: `dataFor` withheld the answer precisely so it could not be drawn.
-      if (store.shouldClearSignals(path) || store.pathOf(editor.document) !== path) {
+      // outright, and so is one whose answer describes another revision's bytes: `dataFor`
+      // withheld those precisely so they could not be drawn, and it says which of the two
+      // happened rather than leaving this to re-ask and be told about a different load.
+      if (
+        loaded.kind === 'other-content'
+        || store.shouldClearSignals(path)
+        || store.pathOf(editor.document) !== path
+      ) {
         overlays.clear(editor);
         diagnostics.clearUri(editor.document.uri);
       }
@@ -159,17 +168,20 @@ export function activate(context: vscode.ExtensionContext): void {
     // rename can dirty a document with no visible editor; leaving the record stale would make
     // every later keystroke re-run this for no effect.
     rendered.set(key, path);
-    if (!path) {
-      // Diagnostics are owned per URI and shown in the Problems panel whether the document is
-      // visible or not, so withholding has to reach them even when there is nothing to draw into.
+    const showing = vscode.window.visibleTextEditors.filter(
+      (editor) => editor.document.uri.toString() === key,
+    );
+    // Diagnostics are owned per URI and shown in the Problems panel whether the document is
+    // visible or not, so withholding has to reach them even when there is nothing to draw into.
+    // Both ways that happens: nothing may be shown for this document at all, and — the case a
+    // hidden tab makes — nothing will ASK whether it still may. `refreshEditor` is what re-runs
+    // the content gate, and it runs per visible editor, so a document with none keeps whatever
+    // the previous bytes produced until its tab is next selected. Down now, redrawn when it is.
+    if (!path || showing.length === 0) {
       diagnostics.clearUri(document.uri);
     }
     refreshViews();
-    await Promise.all(
-      vscode.window.visibleTextEditors
-        .filter((editor) => editor.document.uri.toString() === key)
-        .map((editor) => refreshEditor(editor)),
-    );
+    await Promise.all(showing.map((editor) => refreshEditor(editor)));
   }
 
   /** Drop cached index data. Fires no requests — refetching is the pipeline's job, after the gate. */
@@ -454,31 +466,34 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.registerTextDocumentContentProvider(MEMORY_DOC_SCHEME, memoryDocs),
     memoryDocs,
     vscode.window.onDidChangeActiveTextEditor((editor) => refreshEditor(editor)),
-    // Dirtiness decides whether a document has an indexed path at all, so a change that flips it
-    // has to redraw. Only the TRANSITION does work: a keystroke in an already-dirty buffer changes
-    // nothing about what may be shown, and redrawing per keystroke would clear and rebuild every
-    // decoration in the file for no reason. Reverting is a change too, so restoring the saved
-    // content restores its surfaces through this same path.
+    // Only a document something has already been drawn for can need redrawing; which changes do
+    // is `redrawAfterChange`.
     vscode.workspace.onDidChangeTextDocument((event) => {
       const key = event.document.uri.toString();
-      if (rendered.has(key) && store.pathOf(event.document) !== rendered.get(key)) {
+      if (
+        rendered.has(key)
+        && redrawAfterChange(
+          rendered.get(key),
+          store.pathOf(event.document),
+          event.contentChanges.length > 0,
+        )
+      ) {
         void redrawDocument(event.document);
       }
     }),
-    // Saving is deliberately NOT special-cased. The buffer is clean again, so the dirty gate
-    // reopens and the file's signals return from whatever the store last fetched — which may still
-    // describe the pre-save contents until the watcher reindexes and the version event repaints.
-    // Withholding across that window was tried and removed: no index-wide signal proves that THIS
-    // file was reindexed, so every variant either released too early or, when a fast watcher's
-    // version event beat the save callback, left the file silent forever. A bounded, self-
-    // correcting staleness window is the better failure. Closing it needs the server to report the
-    // content its answer was computed from — see #1021.
+    // Saving is deliberately NOT special-cased, and no longer needs to be. The buffer is clean
+    // again, so the dirty gate reopens — and the file's signals return only once the server's
+    // answer names the bytes now on disk. Index-wide signals were tried for this and removed: a
+    // version event proves the index MOVED, not that THIS file was reindexed, so every variant
+    // either released too early or left the file silent until an unrelated reindex. Comparing the
+    // content itself needs no such proxy.
     vscode.workspace.onDidCloseTextDocument((doc) => {
       diagnostics.clearUri(doc.uri);
       // What was drawn for a closed document is not a fact about the next one opened at that URI —
       // closing a dirty buffer discards the edits, so it reopens clean. Dropping it also keeps the
       // map from growing across a long session.
       rendered.delete(doc.uri.toString());
+      digests.forget(doc.uri);
       if (doc.uri.scheme === MEMORY_DOC_SCHEME) {
         memoryDocs.forget(doc.uri);
       }
@@ -509,6 +524,32 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {}
+
+/**
+ * Whether a change to a document that has already been drawn for has to redraw it.
+ *
+ * Two reasons, and the second is the one that is easy to miss:
+ *
+ * - `drawnPath` and `indexedPath` differ — WHAT MAY BE SHOWN changed. Dirtiness decides whether a
+ *   document has an indexed path at all, so a keystroke that dirties a clean buffer, and the revert
+ *   or undo that cleans it again, both land here. Only the transition does work: a keystroke in an
+ *   already-dirty buffer changes nothing about what may be shown, and redrawing per keystroke would
+ *   clear and rebuild every decoration in the file for no reason.
+ * - The document is still indexable and its CONTENT changed — the bytes moved under what is drawn.
+ *   VS Code reloads a clean buffer in place when the file changes underneath it, which is what a
+ *   branch switch, a rebase, or any out-of-band write looks like from here. The path is identical
+ *   before and after, so the first rule is blind to exactly the case the content gate exists for,
+ *   and nothing else notices either: a hosted server sitting on the previous revision emits no
+ *   index event. Without this the overlays and diagnostics stay anchored to the old bytes
+ *   indefinitely. Redrawing re-asks, and the gate takes them down.
+ */
+export function redrawAfterChange(
+  drawnPath: string | undefined,
+  indexedPath: string | undefined,
+  contentChanged: boolean,
+): boolean {
+  return indexedPath !== drawnPath || (indexedPath !== undefined && contentChanged);
+}
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) {

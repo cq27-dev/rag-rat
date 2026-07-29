@@ -177,6 +177,36 @@ export interface DecisionRecord {
   line: number | null;
 }
 
+/**
+ * What content a per-file answer was computed from. Three states, because the two ways a payload
+ * can carry no hash mean opposite things and a consumer acts differently on each:
+ *
+ * `sha256` — the `files.sha256` of the file's raw bytes at the revision the answer describes. A
+ * consumer that makes line-anchored claims compares it against the file it has open and stays
+ * quiet when they disagree.
+ *
+ * `absent` — the server answered and the ACTIVE SCOPE holds no such file (`content_sha256: null`).
+ * That is a fact about the index, not a missing field: whatever another lane is carrying forward
+ * for this path describes a file the index no longer holds.
+ *
+ * `unknown` — no comparison is possible, and it never means the contents disagree. A server
+ * predating the field lands here, as does one naming something this client cannot read as a file
+ * hash; the client then gates nothing, which is the behaviour it had before this field existed.
+ */
+export type LaneContent =
+  | { kind: 'sha256'; sha256: string }
+  | { kind: 'absent' }
+  | { kind: 'unknown' };
+
+/** No comparison is possible. Shared because it carries no per-answer state. */
+export const UNKNOWN_CONTENT: LaneContent = { kind: 'unknown' };
+
+/** One per-file answer, with the content it was computed from. */
+export interface FileAnswer<T> {
+  content: LaneContent;
+  value: T;
+}
+
 export interface VersionToken {
   generation: number;
   max_indexed_at_ms: number;
@@ -284,11 +314,17 @@ export class LensClient {
   version(): Promise<VersionToken> {
     return this.get('/api/version');
   }
-  async fileSymbols(path: string): Promise<FileSymbol[]> {
-    return (await this.get<{ symbols: FileSymbol[] }>('/api/file/symbols', { path })).symbols;
+  async fileSymbols(path: string): Promise<FileAnswer<FileSymbol[]>> {
+    const payload = await this.get<{ symbols: FileSymbol[] }>('/api/file/symbols', { path });
+    return { content: answerContentOf(payload), value: payload.symbols };
   }
-  async fileClones(path: string, theta?: number, minTokens?: number): Promise<CloneRegion[]> {
-    return (await this.fileClonesFull(path, theta, minTokens)).clone_regions;
+  async fileClones(
+    path: string,
+    theta?: number,
+    minTokens?: number,
+  ): Promise<FileAnswer<CloneRegion[]>> {
+    const answer = await this.fileClonesFull(path, theta, minTokens);
+    return { content: answer.content, value: answer.value.clone_regions };
   }
 
   async fileClonesFull(
@@ -296,7 +332,7 @@ export class LensClient {
     theta?: number,
     minTokens?: number,
     signal?: AbortSignal,
-  ): Promise<{ clone_regions: CloneRegion[]; clone_graph?: Record<string, unknown> }> {
+  ): Promise<FileAnswer<{ clone_regions: CloneRegion[]; clone_graph?: Record<string, unknown> }>> {
     const params: Record<string, string> = { path };
     if (theta != null) {
       params.theta = String(theta);
@@ -307,24 +343,42 @@ export class LensClient {
     // The clone payload is the drift-prone boundary (nullable max_similarity, arbitrary refine
     // JSON). Validate and coerce at the edge so a hosted server version can never crash the
     // rendering lanes with `undefined.toFixed`.
-    return validateFileClones(await this.get<unknown>('/api/file/clones', params, signal));
+    const payload = await this.get<unknown>('/api/file/clones', params, signal);
+    return { content: answerContentOf(payload), value: validateFileClones(payload) };
   }
-  async fileMemories(path: string, signal?: AbortSignal): Promise<FileMemory[]> {
-    return (await this.get<{ memories: FileMemory[] }>('/api/file/memories', { path }, signal))
-      .memories;
+  async fileMemories(path: string, signal?: AbortSignal): Promise<FileAnswer<FileMemory[]>> {
+    const payload = await this.get<{ memories: FileMemory[] }>(
+      '/api/file/memories',
+      { path },
+      signal,
+    );
+    return { content: answerContentOf(payload), value: payload.memories };
   }
-  async fileSymbolGraph(path: string, signal?: AbortSignal): Promise<SymbolGraph[]> {
-    return (await this.get<{ symbols: SymbolGraph[] }>('/api/file/graph', { path }, signal)).symbols;
+  async fileSymbolGraph(path: string, signal?: AbortSignal): Promise<FileAnswer<SymbolGraph[]>> {
+    const payload = await this.get<{ symbols: SymbolGraph[] }>('/api/file/graph', { path }, signal);
+    return { content: answerContentOf(payload), value: payload.symbols };
   }
-  async fileCoupling(path: string, signal?: AbortSignal): Promise<CouplingPartner[]> {
-    return (await this.get<{ coupling: CouplingPartner[] }>('/api/file/coupling', { path }, signal))
-      .coupling;
+  async fileCoupling(path: string, signal?: AbortSignal): Promise<FileAnswer<CouplingPartner[]>> {
+    const payload = await this.get<{ coupling: CouplingPartner[] }>(
+      '/api/file/coupling',
+      { path },
+      signal,
+    );
+    return { content: answerContentOf(payload), value: payload.coupling };
   }
   async filePapertrail(
     path: string,
     signal?: AbortSignal,
-  ): Promise<{ refs: PapertrailRef[]; decisions: DecisionRecord[] }> {
-    return this.get('/api/file/papertrail', { path }, signal);
+  ): Promise<FileAnswer<{ refs: PapertrailRef[]; decisions: DecisionRecord[] }>> {
+    const payload = await this.get<{ refs: PapertrailRef[]; decisions: DecisionRecord[] }>(
+      '/api/file/papertrail',
+      { path },
+      signal,
+    );
+    return {
+      content: answerContentOf(payload),
+      value: { refs: payload.refs, decisions: payload.decisions },
+    };
   }
   /**
    * Callers of ONE symbol. Sends the handle when the row carried one so overloads stay apart, and
@@ -459,6 +513,36 @@ function requestHeaders(endpoint: LensEndpoint, accept = 'application/json'): He
   return endpoint.token
     ? { Accept: accept, Authorization: `Bearer ${endpoint.token}` }
     : { Accept: accept };
+}
+
+/** The one shape `files.sha256` is rendered in: lower-hex over 32 bytes. */
+const HEX_SHA256 = /^[0-9a-f]{64}$/;
+
+/**
+ * What content a per-file payload names — see [`LaneContent`](LaneContent).
+ *
+ * The three cases are told apart by the KEY, not by the value alone: a payload without
+ * `content_sha256` comes from a server predating the field, while one carrying an explicit `null`
+ * is a current server saying the active scope holds no such file. Collapsing them would let a
+ * carried-forward lane outlive the index's own statement that the file is gone.
+ *
+ * Anything else a server might put there is read as `unknown` rather than as a hash. A value this
+ * client cannot compare would otherwise fail every comparison and silence the file permanently,
+ * where failing open only forgoes the gate.
+ */
+export function answerContentOf(payload: unknown): LaneContent {
+  if (!isRecord(payload) || !('content_sha256' in payload)) {
+    return UNKNOWN_CONTENT;
+  }
+  const named = payload.content_sha256;
+  if (named === null) {
+    return { kind: 'absent' };
+  }
+  if (typeof named !== 'string') {
+    return UNKNOWN_CONTENT;
+  }
+  const sha256 = named.toLowerCase();
+  return HEX_SHA256.test(sha256) ? { kind: 'sha256', sha256 } : UNKNOWN_CONTENT;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

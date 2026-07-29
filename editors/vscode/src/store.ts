@@ -2,15 +2,19 @@
 // CodeLens providers, sidebar views, hover, overlays, and diagnostics —
 // instead of each lane fetching its own copy of the same payload.
 import type * as vscode from 'vscode';
+import { UNKNOWN_CONTENT } from './client';
 import type {
   CloneRegion,
   CouplingPartner,
   DecisionRecord,
+  FileAnswer,
   FileMemory,
+  LaneContent,
   LensClient,
   PapertrailRef,
   SymbolGraph,
 } from './client';
+import type { DocumentDigest } from './content';
 
 export interface CloneGraphMeta {
   generation?: number;
@@ -21,8 +25,64 @@ export interface CloneGraphMeta {
   unavailable_reason?: string;
 }
 
+/**
+ * Where a lane's value in one payload came from.
+ *
+ * `current` — the lane's request answered in this load, so the value is what the server said.
+ * `carried` — the lane failed and its previous value was substituted for it.
+ * `empty` — the lane failed and nothing was left to stand in for it: no value recent enough to
+ * carry, or one carried from bytes the file no longer holds. The value is a placeholder, not an
+ * answer.
+ *
+ * Only `current` supports a claim about what the index does or does not hold. Without this a
+ * consumer cannot tell a lane's answer from its fallback: an empty memory list means either "the
+ * server said so" or "the lookup failed", and a memory present in one means either "it is there"
+ * or "it was there up to a minute ago".
+ */
+export type LaneOrigin = 'current' | 'carried' | 'empty';
+
+/**
+ * What one document's load produced — an answer, or the reason there is none.
+ *
+ * A bare `undefined` collapsed two states a consumer has to act on differently. "Nothing came
+ * back" is an outage or an ordinary race, and what is on screen may stand until a replacement
+ * arrives; "the answer describes other bytes" is a healthy server on another revision, and what is
+ * on screen is anchored to a file the editor no longer holds, so it has to come down NOW — and
+ * saying "offline" for it sends the reader after a problem that is not there.
+ *
+ * The distinction rides the RESULT rather than a follow-up store lookup for the same reason lane
+ * provenance rides the payload: a second question, asked after the first was answered, is answered
+ * from state that may have moved on. A reindex landing between the two turns a withheld payload
+ * back into an agreeing one, and the caller reports an outage for the healthy server this exists to
+ * avoid blaming. It also costs a second five-lane load on a server already failing.
+ */
+export type FileLoad =
+  | { kind: 'answer'; path: string; data: FileData }
+  /**
+   * The answer exists and was computed from bytes this document does not hold — see
+   * [`agreeingWithContent`](FileStore#agreeingWithContent).
+   */
+  | { kind: 'other-content' }
+  /** No answer: no indexed path, nothing served, or a premise that expired mid-load. */
+  | { kind: 'none' };
+
 export interface FileData {
   at: number;
+  /**
+   * Where each lane's value came from. Consumers that make claims about presence or absence
+   * consult it; consumers that merely render whatever is there ignore it.
+   */
+  lanes: Record<Lane, LaneOrigin>;
+  /**
+   * What content each lane's value was computed from — see [`LaneContent`](LaneContent).
+   *
+   * Line numbers only mean anything relative to the bytes they were computed over, and the index
+   * and the editor can sit on different ones: a branch switch leaves `repo_id` and `worktree_id`
+   * matching, so the server keeps answering — about the other revision. This is what lets a
+   * consumer notice, and it is per lane because the lanes settle independently and a carried-
+   * forward one describes whatever it described when it arrived.
+   */
+  laneContent: Record<Lane, LaneContent>;
   symbols: SymbolGraph[];
   clones: CloneRegion[];
   cloneGraph: CloneGraphMeta | null;
@@ -52,6 +112,8 @@ const FALLBACK_MAX_AGE_MS = 60_000;
 
 type Lane = 'symbols' | 'clones' | 'memories' | 'coupling' | 'papertrail';
 
+const LANES: readonly Lane[] = ['symbols', 'clones', 'memories', 'coupling', 'papertrail'];
+
 /** Everything known about one file. Kept in ONE entry so the parts cannot drift apart. */
 interface PathState {
   /** The most recent load's payload, served until `TTL_MS` elapses or the epoch moves. */
@@ -70,8 +132,46 @@ interface PathState {
   unusable?: boolean;
 }
 
-function laneValue<T>(lane: PromiseSettledResult<T>, fallback: T): T {
-  return lane.status === 'fulfilled' ? lane.value : fallback;
+function laneValue<T>(lane: PromiseSettledResult<FileAnswer<T>>, fallback: T): T {
+  return lane.status === 'fulfilled' ? lane.value.value : fallback;
+}
+
+/**
+ * Why the clone lane has nothing when a fallback was dropped for describing other bytes. The
+ * sidebar renders it verbatim, so it reads as a state of the answer rather than as a failure.
+ */
+const OTHER_CONTENT_REASON = 'answer describes other file content';
+
+/**
+ * `data` with one lane's value replaced by the placeholder that means "this lane says nothing",
+ * and its origin demoted to `empty` so no consumer reads the placeholder as an answer.
+ *
+ * Every lane's blank is the SAME one `load` uses when a lane fails with nothing left to carry, so
+ * the two ways a lane can end up saying nothing are indistinguishable downstream — which is the
+ * point: neither supports a claim.
+ */
+function withoutLane(data: FileData, lane: Lane): FileData {
+  const lanes: Record<Lane, LaneOrigin> = { ...data.lanes };
+  lanes[lane] = 'empty';
+  const laneContent: Record<Lane, LaneContent> = { ...data.laneContent };
+  laneContent[lane] = UNKNOWN_CONTENT;
+  const blanked: FileData = { ...data, lanes, laneContent };
+  switch (lane) {
+    case 'symbols':
+      return { ...blanked, symbols: [] };
+    case 'clones':
+      return {
+        ...blanked,
+        clones: [],
+        cloneGraph: { eligible: false, unavailable_reason: OTHER_CONTENT_REASON },
+      };
+    case 'memories':
+      return { ...blanked, memories: [] };
+    case 'coupling':
+      return { ...blanked, coupling: [] };
+    case 'papertrail':
+      return { ...blanked, refs: [], decisions: [] };
+  }
 }
 
 export class FileStore {
@@ -99,6 +199,14 @@ export class FileStore {
     private readonly documentPath: (document: vscode.TextDocument) => string | undefined,
     /** Which server is answering right now — see [`lastGoodEndpoint`](FileStore#lastGoodEndpoint). */
     private readonly endpoint: () => Promise<string>,
+    /**
+     * The content hash of what a document holds, with the version it was taken for, or
+     * `undefined` when it cannot be produced — see
+     * [`agreeingWithContent`](FileStore#agreeingWithContent).
+     */
+    private readonly documentContentHash: (
+      document: vscode.TextDocument,
+    ) => Promise<DocumentDigest | undefined>,
   ) {}
 
   /** The index moved: refetch everything, but keep each file's last payload as a fallback. */
@@ -173,32 +281,126 @@ export class FileStore {
   }
 
   /**
-   * Index data for a document, with the path it describes — or `undefined` when the document has
-   * no indexed path, the data is unavailable, or the document STOPPED describing that path while
-   * the request was in flight.
+   * Index data for a document, with the path it describes — or the reason there is none: see
+   * [`FileLoad`](FileLoad).
    *
-   * That last case is why this exists. Every consumer runs the same three steps: resolve a path,
-   * await the data, draw. Between step two and step three the premise can expire — the user types
-   * and the buffer goes dirty, or the workspace folder is replaced — and the answer that arrives
-   * describes a file that is no longer what the editor is showing. Drawing it puts line-anchored
-   * claims back on a buffer that was deliberately cleared moments earlier.
+   * The premise-expiry case is why this exists. Every consumer runs the same three steps: resolve a
+   * path, await the data, draw. Between step two and step three the premise can expire — the user
+   * types and the buffer goes dirty, or the workspace folder is replaced — and the answer that
+   * arrives describes a file that is no longer what the editor is showing. Drawing it puts
+   * line-anchored claims back on a buffer that was deliberately cleared moments earlier.
    *
    * Re-asking `pathOf` after the await is the whole check, but it has to happen in EVERY
    * consumer: overlays, diagnostics, both CodeLens providers, hovers, and the sidebar. Doing it
    * here is what stops that from being five independent chances to forget.
    */
-  async dataFor(
-    document: vscode.TextDocument,
-  ): Promise<{ path: string; data: FileData } | undefined> {
+  async dataFor(document: vscode.TextDocument): Promise<FileLoad> {
     const path = this.pathOf(document);
     if (!path) {
-      return undefined;
+      return { kind: 'none' };
     }
     const data = await this.data(path);
     if (!data || this.pathOf(document) !== path) {
+      return { kind: 'none' };
+    }
+    const agreed = await this.agreeingWithContent(document, data);
+    // Hashing is another await, and the same premise can expire across it. A document that stopped
+    // describing this path says nothing about content agreement, so it is `none` rather than a
+    // disagreement — the two are reported separately precisely so neither stands in for the other.
+    if (this.pathOf(document) !== path) {
+      return { kind: 'none' };
+    }
+    return agreed ? { kind: 'answer', path, data: agreed } : { kind: 'other-content' };
+  }
+
+  /**
+   * `data` narrowed to what was computed from the bytes `document` is showing, or `undefined` when
+   * the server's answer describes a different revision altogether.
+   *
+   * A hosted server and the local window can sit on different revisions of the same checkout: the
+   * window switches branch, the server keeps serving what it indexed, and `repo_id` /
+   * `worktree_id` both still match — so the association is valid while every line number in the
+   * payload belongs to other bytes. Revision equality is not an identity property and must not be
+   * bound to the association; disagreement here is normal and transient, so it suppresses rather
+   * than errors.
+   *
+   * Content, not revision, is what is compared. It is strictly stronger — it catches branch skew,
+   * an index that has not caught up, and an out-of-band edit with one mechanism — and it needs
+   * nothing host-specific, where comparing git heads would need an extension API that virtual and
+   * web workspaces do not have.
+   *
+   * What a disagreement means depends on WHERE the lane's value came from, which is why this reads
+   * `lanes` as well as `laneContent`:
+   *
+   * - A lane that ANSWERED (`current`) and names other bytes is evidence the file moved under the
+   *   answer, and that says nothing good about the lanes that agree — they may simply have been
+   *   read on the other side of the move. The whole payload is withheld.
+   * - A lane that ANSWERED and names NO FILE (`absent`) is the index stating it holds nothing for
+   *   this path. Its own value is empty and truthful, so it is served; what it invalidates is
+   *   every fallback beside it, which describes a file the index has since stopped holding. Those
+   *   are dropped whether or not their hash still matches the buffer — matching bytes say the
+   *   editor has not moved, not that the answer is still the index's.
+   * - A lane CARRIED forward from a previous load names whatever it named when it arrived. That is
+   *   the defined behaviour of the fallback, not a signal about the file, so it withholds only
+   *   ITSELF: the lane is blanked and its origin becomes `empty`, which is exactly what a consumer
+   *   needs to tell "no answer" from "answered with nothing". Withholding the payload instead
+   *   would let one dropped request blank every line-anchored surface for a whole fallback window
+   *   after a reindex — the outcome the carry-forward exists to prevent.
+   *
+   * Either way a carried value can never re-assert line anchors over bytes it was not computed
+   * from, which is what bounds the fallback.
+   *
+   * Fails OPEN when no comparison is possible — no lane named any content (a server predating the
+   * field), or this host cannot hash. Treating "cannot compare" as "disagrees" would silence every
+   * surface permanently, which is worse than the skew being guarded against. A digest that no
+   * longer describes the document is NOT that case: the buffer reloaded under the hash, so the
+   * comparison it would support is meaningless and the payload is withheld until the next load.
+   */
+  private async agreeingWithContent(
+    document: vscode.TextDocument,
+    data: FileData,
+  ): Promise<FileData | undefined> {
+    const answered = LANES.filter((lane) => data.lanes[lane] === 'current').map(
+      (lane) => data.laneContent[lane],
+    );
+    const claimed = new Set(
+      answered.flatMap((content) => (content.kind === 'sha256' ? [content.sha256] : [])),
+    );
+    const fallbacks = LANES.flatMap((lane) => {
+      const content = data.laneContent[lane];
+      return data.lanes[lane] === 'carried' && content.kind === 'sha256'
+        ? [{ lane, sha256: content.sha256 }]
+        : [];
+    });
+    if (answered.some((content) => content.kind === 'absent')) {
+      // Two lanes cannot both have answered truthfully if one names a file and the other names
+      // none, so a hash beside an absence means the index moved mid-load and neither can be
+      // trusted for this buffer.
+      if (claimed.size > 0) {
+        return undefined;
+      }
+      // EVERY fallback goes, not just the ones naming a hash: the disqualifier is that the index
+      // holds no such file, which is true of a carried value whatever it was computed from.
+      return LANES.filter((lane) => data.lanes[lane] === 'carried').reduce(withoutLane, data);
+    }
+    if (claimed.size === 0 && fallbacks.length === 0) {
+      return data;
+    }
+    const digest = await this.documentContentHash(document);
+    if (digest === undefined) {
+      return data;
+    }
+    if (digest.version !== document.version) {
       return undefined;
     }
-    return { path, data };
+    const current = digest.sha256;
+    if (claimed.size > 0 && !(claimed.size === 1 && claimed.has(current))) {
+      return undefined;
+    }
+    const outdated = fallbacks.filter((held) => held.sha256 !== current).map(({ lane }) => lane);
+    // A COPY: the store's cached payload keeps every lane, so a buffer that returns to the bytes a
+    // fallback describes gets it back rather than having it dropped for good.
+    return outdated.length === 0 ? data : outdated.reduce(withoutLane, data);
   }
 
   async data(path: string): Promise<FileData | undefined> {
@@ -289,12 +491,41 @@ export class FileStore {
       const now = Date.now();
       const previous = entry.lastGood;
       const arrivedAt = entry.laneAt ?? {};
+      const canCarry = (lane: Lane): boolean =>
+        previous !== undefined && now - (arrivedAt[lane] ?? 0) < FALLBACK_MAX_AGE_MS;
       const carried = <T>(lane: Lane, pick: (data: FileData) => T, empty: T): T =>
-        previous && now - (arrivedAt[lane] ?? 0) < FALLBACK_MAX_AGE_MS ? pick(previous) : empty;
-      const cloneLane = clones.status === 'fulfilled' ? clones.value : undefined;
-      const papertrailLane = papertrail.status === 'fulfilled' ? papertrail.value : undefined;
+        previous && canCarry(lane) ? pick(previous) : empty;
+      const origin = (lane: Lane, answered: boolean): LaneOrigin =>
+        answered ? 'current' : canCarry(lane) ? 'carried' : 'empty';
+      const cloneLane = clones.status === 'fulfilled' ? clones.value.value : undefined;
+      const papertrailLane =
+        papertrail.status === 'fulfilled' ? papertrail.value.value : undefined;
+      // A lane's content travels with its value, fallback included: a carried-forward value still
+      // describes the content it was computed from, and saying otherwise would let the fallback
+      // pass a content check it never earned.
+      const laneContent = <T>(
+        lane: Lane,
+        settled: PromiseSettledResult<FileAnswer<T>>,
+      ): LaneContent =>
+        settled.status === 'fulfilled'
+          ? settled.value.content
+          : carried(lane, (d) => d.laneContent[lane], UNKNOWN_CONTENT);
       const data: FileData = {
         at: now,
+        lanes: {
+          symbols: origin('symbols', symbols.status === 'fulfilled'),
+          clones: origin('clones', cloneLane !== undefined),
+          memories: origin('memories', memories.status === 'fulfilled'),
+          coupling: origin('coupling', coupling.status === 'fulfilled'),
+          papertrail: origin('papertrail', papertrailLane !== undefined),
+        },
+        laneContent: {
+          symbols: laneContent('symbols', symbols),
+          clones: laneContent('clones', clones),
+          memories: laneContent('memories', memories),
+          coupling: laneContent('coupling', coupling),
+          papertrail: laneContent('papertrail', papertrail),
+        },
         symbols: laneValue(symbols, carried('symbols', (d) => d.symbols, [])),
         clones: cloneLane ? cloneLane.clone_regions : carried('clones', (d) => d.clones, []),
         cloneGraph: cloneLane

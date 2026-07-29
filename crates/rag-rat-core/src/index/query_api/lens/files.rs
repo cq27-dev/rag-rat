@@ -12,6 +12,25 @@ use unicase::UniCase;
 use super::handles;
 use crate::index::IndexDatabase;
 
+/// One per-file lens answer, together with the content hash it was computed against.
+///
+/// The editor cannot tell a current answer from one indexed at a different revision: `repo_id` and
+/// `worktree_id` still match after a branch switch, so the association stays valid while every line
+/// number in the payload belongs to other bytes. Naming the content the answer describes lets the
+/// client compare it against the file it is looking at and stay quiet when they disagree — which
+/// catches branch skew, a lagging index, and an out-of-band edit with one mechanism, without asking
+/// the client for a git API that virtual and web workspaces do not have.
+///
+/// `content_sha256` is `None` when the active scope holds no such file; there is then no answer to
+/// anchor anywhere, so the payload is empty too.
+#[derive(Debug, Serialize)]
+pub struct LensFileAnswer<T> {
+    pub content_sha256: Option<String>,
+    /// Flattened, so the per-file wire shapes gain a sibling field rather than a nesting level.
+    #[serde(flatten)]
+    pub answer: T,
+}
+
 #[derive(Debug, Serialize)]
 pub struct LensFileSymbols {
     pub symbols: Vec<LensSymbol>,
@@ -169,6 +188,43 @@ impl IndexDatabase {
             }
         }
         Ok(None)
+    }
+
+    /// Read one per-file answer and the content hash `path` carried when it was computed, under
+    /// ONE deferred read snapshot.
+    ///
+    /// The pairing is the whole point, so it cannot be two independent reads. A reindex committing
+    /// between them would hand the client an answer anchored to one revision beside the hash of
+    /// another — and either ordering produces a wrong release: hash-then-answer can certify stale
+    /// anchors with a hash the buffer still matches, and answer-then-hash can certify fresh anchors
+    /// against a buffer that has not caught up. In WAL mode a deferred transaction pins one
+    /// point-in-time view for every statement inside it, which is exactly the guarantee the client
+    /// needs. The connection is read-only, so the transaction only ever rolls back on drop.
+    pub fn lens_file_answer<T>(
+        &self,
+        path: &str,
+        read: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<LensFileAnswer<T>> {
+        let snapshot = self.storage.connection().unchecked_transaction()?;
+        let content_sha256 = self.lens_file_content_sha256(path)?;
+        let answer = read()?;
+        drop(snapshot);
+        Ok(LensFileAnswer { content_sha256, answer })
+    }
+
+    /// The hex SHA-256 the index holds for `path` in the ACTIVE scope, or `None` when it holds no
+    /// such file. This is the hash of the file's raw bytes — the indexer stores
+    /// `hex_sha256(fs::read(file))` — so a client comparing against it must hash bytes too, not a
+    /// re-encoded or line-ending-normalized rendering of them.
+    pub fn lens_file_content_sha256(&self, path: &str) -> anyhow::Result<Option<String>> {
+        let sha256 = self
+            .storage
+            .connection()
+            .query_row("SELECT sha256 FROM files WHERE path = ?1 LIMIT 1", [path], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?;
+        Ok(sha256.flatten())
     }
 
     pub fn lens_file_symbols(&self, path: &str) -> anyhow::Result<LensFileSymbols> {

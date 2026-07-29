@@ -12,7 +12,7 @@ export class GraphHoverProvider implements vscode.HoverProvider {
     position: vscode.Position,
   ): Promise<vscode.Hover | undefined> {
     const loaded = await this.store.dataFor(document);
-    if (!loaded) {
+    if (loaded.kind !== 'answer') {
       return undefined;
     }
     const d = loaded.data;

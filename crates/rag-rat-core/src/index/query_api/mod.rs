@@ -53,8 +53,8 @@ pub use lens::clones::{
 };
 pub use lens::{
     LensCallees, LensCallers, LensChunkText, LensCloneGraphCache, LensCouplingPartner,
-    LensDecisionRecord, LensDispatchDetail, LensFileCoupling, LensFileGraph, LensFileMemories,
-    LensFileMemory, LensFilePapertrail, LensFileSymbolGraph, LensFileSymbols,
+    LensDecisionRecord, LensDispatchDetail, LensFileAnswer, LensFileCoupling, LensFileGraph,
+    LensFileMemories, LensFileMemory, LensFilePapertrail, LensFileSymbolGraph, LensFileSymbols,
     LensGraphCallerCounts, LensHopResolvedBy, LensHopSelector, LensPapertrailRef, LensStatus,
     LensSymbol, LensSymbolHop, LensTreemap, LensTreemapFile, LensVersion,
 };

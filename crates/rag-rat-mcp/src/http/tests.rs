@@ -444,12 +444,31 @@ pub fn handle(req: Req) {
     assert!(target["fan_in_score"].as_f64().unwrap() >= 2.0);
     assert!(target["dispatch"].as_array().unwrap().iter().any(|row| row["direction"] == "handled"));
 
+    // Every per-file route names the content its answer describes, as a sibling of the payload's
+    // own fields. The client compares this against the file it has open and stays quiet when they
+    // disagree, so a route that omitted it would be a lane with no way to be gated.
+    let content_sha256 =
+        rag_rat_base::hash::hex_sha256(&fs::read(root.join("src/lib.rs")).unwrap());
     let coupling = get_json(&app, "/api/file/coupling?path=src/lib.rs").await;
-    assert_eq!(coupling, serde_json::json!({"coupling": []}));
+    assert_eq!(coupling, serde_json::json!({"coupling": [], "content_sha256": content_sha256}));
     let memories = get_json(&app, "/api/file/memories?path=src/lib.rs").await;
-    assert_eq!(memories, serde_json::json!({"memories": []}));
+    assert_eq!(memories, serde_json::json!({"memories": [], "content_sha256": content_sha256}));
     let papertrail = get_json(&app, "/api/file/papertrail?path=src/lib.rs").await;
-    assert_eq!(papertrail, serde_json::json!({"refs": [], "decisions": []}));
+    assert_eq!(
+        papertrail,
+        serde_json::json!({"refs": [], "decisions": [], "content_sha256": content_sha256})
+    );
+    for route in ["/api/file/symbols", "/api/file/graph", "/api/file/clones"] {
+        let payload = get_json(&app, &format!("{route}?path=src/lib.rs")).await;
+        assert_eq!(payload["content_sha256"], serde_json::json!(content_sha256), "{route}");
+    }
+    // A path the index does not hold has no content to anchor to, and reports that rather than
+    // letting the client read the absence of a hash as agreement.
+    let unindexed = get_json(&app, "/api/file/memories?path=src/absent.rs").await;
+    assert_eq!(
+        unindexed,
+        serde_json::json!({"memories": [], "content_sha256": serde_json::Value::Null})
+    );
 
     let callers =
         get_json(&app, &format!("/api/symbol/callers?qname={target_qname}&limit=9999")).await;
@@ -706,7 +725,7 @@ async fn a_queued_clone_read_holds_no_database_worker() {
     drop(building);
     let Json(clones) =
         queued.await.expect("the queued clone read completes once the build releases the graph");
-    assert!(clones.clone_regions.is_empty(), "a one-function corpus has no clone regions");
+    assert!(clones.answer.clone_regions.is_empty(), "a one-function corpus has no clone regions");
     let _ = fs::remove_dir_all(root);
 }
 

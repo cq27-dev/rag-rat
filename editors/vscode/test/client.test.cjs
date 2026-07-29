@@ -65,6 +65,33 @@ async function loadSourceModule(file, mockVscode) {
 /** The store keys its per-lane fallbacks by which server answered; one stable identity by default. */
 const endpoint = async () => 'http://127.0.0.1:18120 owner-token';
 
+/** A per-file lane answer: the payload plus what the server computed it from. */
+const lane = (value, content = { kind: 'unknown' }) => ({ content, value });
+
+/** The content a lane names when the server computed it from these bytes. */
+const from = (sha256) => ({ kind: 'sha256', sha256 });
+
+/** The content a lane names when the server holds no such file: an explicit `content_sha256: null`. */
+const NO_FILE = { kind: 'absent' };
+
+/** What a server predating the field names: nothing to compare, which is not a disagreement. */
+const UNKNOWN_CONTENT = { kind: 'unknown' };
+
+/**
+ * A host that cannot hash the open document. The content gate then has nothing to compare and
+ * releases what it has — the behaviour these lane and fallback tests are about.
+ */
+const noDigest = async () => undefined;
+
+/** A digest of whatever `buffer` currently holds, taken for the version the document is at. */
+const digestOf = (buffer) => async (document) => ({
+  version: document.version,
+  sha256: buffer.sha256,
+});
+
+/** A merged store payload whose memory lane answered — the only origin that supports a claim. */
+const memoryPayload = (memories, origin = 'current') => ({ memories, lanes: { memories: origin } });
+
 function deferred() {
   let resolve;
   const promise = new Promise((done) => {
@@ -850,7 +877,7 @@ test('memory documents notify VS Code when cached content changes', async () => 
     verdict: null,
   };
   const provider = new MemoryDocProvider({
-    data: async (path) => path === 'src/lib.rs' ? { memories: [memory] } : undefined,
+    data: async (path) => (path === 'src/lib.rs' ? memoryPayload([memory]) : undefined),
   });
 
   const uri = provider.update(memory, 'src/lib.rs');
@@ -941,15 +968,15 @@ test('unknown memory verdict directions remain unknown', async () => {
 test('a slow clone lane does not discard the lanes that answered', async () => {
   const FileStore = await loadStore();
   const client = {
-    fileSymbolGraph: async () => [{ name: 'target' }],
+    fileSymbolGraph: async () => lane([{ name: 'target' }]),
     fileClonesFull: async () => {
       throw new Error('/api/file/clones timed out');
     },
-    fileMemories: async () => [{ title: 'Invariant', line: 3 }],
-    fileCoupling: async () => [{ path: 'src/other.rs' }],
-    filePapertrail: async () => ({ refs: [{ item_key: '5' }], decisions: [] }),
+    fileMemories: async () => lane([{ title: 'Invariant', line: 3 }]),
+    fileCoupling: async () => lane([{ path: 'src/other.rs' }]),
+    filePapertrail: async () => lane({ refs: [{ item_key: '5' }], decisions: [] }),
   };
-  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint);
+  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint, noDigest);
   store.setOnline(true);
 
   const data = await store.data('src/lib.rs');
@@ -970,16 +997,16 @@ test('a failed lane keeps its last value instead of reporting an empty one', asy
   const FileStore = await loadStore();
   let memoriesFail = false;
   const client = {
-    fileSymbolGraph: async () => [],
-    fileClonesFull: async () => ({ clone_regions: [], clone_graph: { eligible: true } }),
+    fileSymbolGraph: async () => lane([]),
+    fileClonesFull: async () => lane({ clone_regions: [], clone_graph: { eligible: true } }),
     fileMemories: async () => {
       if (memoriesFail) {
         throw new Error('/api/file/memories failed');
       }
-      return [{ title: 'Diverged memory', line: 3, verdict: 'diverged' }];
+      return lane([{ title: 'Diverged memory', line: 3, verdict: 'diverged' }]);
     },
-    fileCoupling: async () => [],
-    filePapertrail: async () => ({ refs: [], decisions: [] }),
+    fileCoupling: async () => lane([]),
+    filePapertrail: async () => lane({ refs: [], decisions: [] }),
   };
   let answering = 'http://127.0.0.1:18120 owner-token';
   const store = new FileStore(
@@ -988,6 +1015,7 @@ test('a failed lane keeps its last value instead of reporting an empty one', asy
     () => 100,
     () => 'src/lib.rs',
     async () => answering,
+    noDigest,
   );
   store.setOnline(true);
   assert.equal((await store.data('src/lib.rs')).memories.length, 1);
@@ -1012,11 +1040,11 @@ test('a load that spans two servers is reloaded, not merged', async () => {
   const FileStore = await loadStore();
   let served = 'first';
   const client = {
-    fileSymbolGraph: async () => [{ name: served }],
-    fileClonesFull: async () => ({ clone_regions: [], clone_graph: { eligible: true } }),
-    fileMemories: async () => [{ title: 'Memory', line: 1 }],
-    fileCoupling: async () => [],
-    filePapertrail: async () => ({ refs: [], decisions: [] }),
+    fileSymbolGraph: async () => lane([{ name: served }]),
+    fileClonesFull: async () => lane({ clone_regions: [], clone_graph: { eligible: true } }),
+    fileMemories: async () => lane([{ title: 'Memory', line: 1 }]),
+    fileCoupling: async () => lane([]),
+    filePapertrail: async () => lane({ refs: [], decisions: [] }),
   };
   // The client retries a failed lane against the replacement endpoint, so discovery re-pointing
   // mid-load can leave one repository's lanes beside another's. Identity is read before and after
@@ -1033,6 +1061,7 @@ test('a load that spans two servers is reloaded, not merged', async () => {
       served = identity;
       return identity;
     },
+    noDigest,
   );
   store.setOnline(true);
 
@@ -1052,11 +1081,11 @@ test('a load that spans two servers is reloaded, not merged', async () => {
 test('an unconfirmable endpoint drops the payload without failing the file', async (t) => {
   const FileStore = await loadStore();
   const client = {
-    fileSymbolGraph: async () => [{ name: 'target' }],
-    fileClonesFull: async () => ({ clone_regions: [], clone_graph: { eligible: true } }),
-    fileMemories: async () => [{ title: 'Memory', line: 1 }],
-    fileCoupling: async () => [],
-    filePapertrail: async () => ({ refs: [], decisions: [] }),
+    fileSymbolGraph: async () => lane([{ name: 'target' }]),
+    fileClonesFull: async () => lane({ clone_regions: [], clone_graph: { eligible: true } }),
+    fileMemories: async () => lane([{ title: 'Memory', line: 1 }]),
+    fileCoupling: async () => lane([]),
+    filePapertrail: async () => lane({ refs: [], decisions: [] }),
   };
   // Identity is read again after the lanes, and that read can fail on its own — the discovery file
   // is momentarily absent while `rag-rat mcp` restarts, which is the very event this survives.
@@ -1067,7 +1096,7 @@ test('an unconfirmable endpoint drops the payload without failing the file', asy
       throw new Error('no Lens discovery file found');
     }
     return 'one server';
-  });
+  }, noDigest);
   store.setOnline(true);
 
   assert.equal(await store.data('src/lib.rs'), undefined, 'an unconfirmed payload is not served');
@@ -1085,12 +1114,12 @@ test('an invalidation during the identity read is not overwritten', async () => 
   const client = {
     fileSymbolGraph: async () => {
       loads += 1;
-      return [{ name: `load-${loads}` }];
+      return lane([{ name: `load-${loads}` }]);
     },
-    fileClonesFull: async () => ({ clone_regions: [], clone_graph: { eligible: true } }),
+    fileClonesFull: async () => lane({ clone_regions: [], clone_graph: { eligible: true } }),
     fileMemories: async () => [],
-    fileCoupling: async () => [],
-    filePapertrail: async () => ({ refs: [], decisions: [] }),
+    fileCoupling: async () => lane([]),
+    filePapertrail: async () => lane({ refs: [], decisions: [] }),
   };
   const gate = deferred();
   let asked = 0;
@@ -1100,7 +1129,7 @@ test('an invalidation during the identity read is not overwritten', async () => 
       await gate.promise;
     }
     return 'one server';
-  });
+  }, noDigest);
   store.setOnline(true);
 
   const request = store.data('src/lib.rs');
@@ -1164,18 +1193,18 @@ test('a lane that keeps failing stops being carried forward', async (t) => {
   Date.now = () => clock;
   let memoriesFail = false;
   const client = {
-    fileSymbolGraph: async () => [],
-    fileClonesFull: async () => ({ clone_regions: [], clone_graph: { eligible: true } }),
+    fileSymbolGraph: async () => lane([]),
+    fileClonesFull: async () => lane({ clone_regions: [], clone_graph: { eligible: true } }),
     fileMemories: async () => {
       if (memoriesFail) {
         throw new Error('/api/file/memories failed');
       }
-      return [{ title: 'Memory', line: 3 }];
+      return lane([{ title: 'Memory', line: 3 }]);
     },
-    fileCoupling: async () => [],
-    filePapertrail: async () => ({ refs: [], decisions: [] }),
+    fileCoupling: async () => lane([]),
+    filePapertrail: async () => lane({ refs: [], decisions: [] }),
   };
-  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint);
+  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint, noDigest);
   store.setOnline(true);
   assert.equal((await store.data('src/lib.rs')).memories.length, 1);
 
@@ -1210,7 +1239,7 @@ test('an invalidation aborts the requests whose answers it discarded', async () 
     fileCoupling: record,
     filePapertrail: record,
   };
-  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint);
+  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint, noDigest);
   store.setOnline(true);
 
   void store.data('src/lib.rs');
@@ -1228,18 +1257,18 @@ test('tracked files are bounded so a long session cannot grow without limit', as
   const FileStore = await loadStore();
   let memoriesFail = false;
   const client = {
-    fileSymbolGraph: async () => [],
-    fileClonesFull: async () => ({ clone_regions: [], clone_graph: { eligible: true } }),
+    fileSymbolGraph: async () => lane([]),
+    fileClonesFull: async () => lane({ clone_regions: [], clone_graph: { eligible: true } }),
     fileMemories: async () => {
       if (memoriesFail) {
         throw new Error('/api/file/memories failed');
       }
-      return [{ title: 'Memory', line: 1 }];
+      return lane([{ title: 'Memory', line: 1 }]);
     },
-    fileCoupling: async () => [],
-    filePapertrail: async () => ({ refs: [], decisions: [] }),
+    fileCoupling: async () => lane([]),
+    filePapertrail: async () => lane({ refs: [], decisions: [] }),
   };
-  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint);
+  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint, noDigest);
   store.setOnline(true);
   assert.equal((await store.data('src/first.rs')).memories.length, 1);
 
@@ -1269,7 +1298,7 @@ test('a file whose every lane fails clears its signals', async () => {
     fileCoupling: failing,
     filePapertrail: failing,
   };
-  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint);
+  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint, noDigest);
   store.setOnline(true);
 
   assert.equal(await store.data('src/lib.rs'), undefined);
@@ -1291,7 +1320,7 @@ test('file store stays empty while the server is unreachable and drops in-flight
     fileCoupling: async () => pending[3].promise,
     filePapertrail: async () => pending[4].promise,
   };
-  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint);
+  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint, noDigest);
 
   assert.equal(store.shouldClearSignals('src/lib.rs'), true);
   assert.equal(await store.data('src/lib.rs'), undefined);
@@ -1310,11 +1339,11 @@ test('file store stays empty while the server is unreachable and drops in-flight
     true,
     'a hidden editor selected while offline must clear stale signals',
   );
-  pending[0].resolve([]);
-  pending[1].resolve({ clone_regions: [], clone_graph: null });
-  pending[2].resolve([]);
-  pending[3].resolve([]);
-  pending[4].resolve({ refs: [], decisions: [] });
+  pending[0].resolve(lane([]));
+  pending[1].resolve(lane({ clone_regions: [], clone_graph: null }));
+  pending[2].resolve(lane([]));
+  pending[3].resolve(lane([]));
+  pending[4].resolve(lane({ refs: [], decisions: [] }));
   assert.equal(await request, undefined, 'a disconnect invalidates an in-flight response');
   assert.equal(await store.data('src/lib.rs'), undefined);
   assert.equal(loads, 1, 'offline reads must not repopulate stale data');
@@ -1508,6 +1537,7 @@ test('data that arrives after its document went dirty is withheld, not drawn', a
     // The real resolver withholds a path for a dirty buffer; mirror that here.
     (doc) => (doc.isDirty ? undefined : 'src/lib.rs'),
     endpoint,
+    noDigest,
   );
   store.setOnline(true);
 
@@ -1519,15 +1549,15 @@ test('data that arrives after its document went dirty is withheld, not drawn', a
   assert.equal(pending.length, 5, 'all five lanes must be in flight');
   // The user types while they are.
   document.isDirty = true;
-  pending[0]({ symbols: [] });
-  pending[1]({ clone_regions: [], clone_graph: null });
-  pending[2]({ memories: [] });
-  pending[3]({ coupling: [] });
-  pending[4]({ refs: [], decisions: [] });
+  pending[0](lane([]));
+  pending[1](lane({ clone_regions: [], clone_graph: null }));
+  pending[2](lane([]));
+  pending[3](lane([]));
+  pending[4](lane({ refs: [], decisions: [] }));
 
   assert.equal(
-    await request,
-    undefined,
+    (await request).kind,
+    'none',
     'an answer for the saved file must not be drawn over the edited buffer',
   );
   // Saving restores it: the same cached payload is now legitimate again.
@@ -1540,6 +1570,7 @@ test('data that arrives after its document went dirty is withheld, not drawn', a
 function sidebarData(name) {
   return {
     at: 0,
+    lanes: lanesWith(),
     symbols: [],
     coupling: [],
     clones: [
@@ -1657,7 +1688,7 @@ test('a sidebar load that settles after a newer one cannot overwrite it', async 
       const name = document.uri.toString().split('/').pop();
       asked.push(name);
       await gates[name].promise;
-      return { path: `src/${name}`, data: sidebarData(name) };
+      return { kind: 'answer', path: `src/${name}`, data: sidebarData(name) };
     },
   });
 
@@ -1697,7 +1728,7 @@ test('a sidebar load settling between the editor moving and the event arriving i
     async dataFor(document) {
       const name = document.uri.toString().split('/').pop();
       await gate.promise;
-      return { path: `src/${name}`, data: sidebarData(name) };
+      return { kind: 'answer', path: `src/${name}`, data: sidebarData(name) };
     },
   });
 
@@ -1728,7 +1759,7 @@ test('a same-document sidebar load that settles last cannot put the older payloa
     async dataFor() {
       const load = started++;
       await gates[load].promise;
-      return { path: 'src/lib.rs', data: sidebarData(`load_${load}`) };
+      return { kind: 'answer', path: 'src/lib.rs', data: sidebarData(`load_${load}`) };
     },
   });
 
@@ -1762,10 +1793,10 @@ test('an invalidation while a sidebar load runs neither blanks the tree nor repu
       const started = epoch.value;
       await gate.current.promise;
       // What the real store does: a payload computed under a superseded epoch is not returned,
-      // and neither is one for a server that did not answer. The caller sees the same `undefined`.
+      // and neither is one for a server that did not answer. The caller sees the same `none`.
       return started === epoch.value && answer.name
-        ? { path: 'src/lib.rs', data: sidebarData(answer.name) }
-        : undefined;
+        ? { kind: 'answer', path: 'src/lib.rs', data: sidebarData(answer.name) }
+        : { kind: 'none' };
     },
   });
 
@@ -1809,7 +1840,7 @@ test('the sidebar shows a loading row before anything has asked it to load', asy
     dataEpoch: () => 0,
     sourceEpoch: () => 0,
     pathOf: () => 'src/lib.rs',
-    dataFor: async () => undefined,
+    dataFor: async () => ({ kind: 'none' }),
   });
 
   // The views exist from `registerSidebar` and are filled by the first pump. An empty tree in that
@@ -1829,7 +1860,7 @@ test('a document switch takes the previous file down before the new one loads', 
     async dataFor(document) {
       const name = document.uri.toString().split('/').pop();
       await gate.current.promise;
-      return { path: `src/${name}`, data: sidebarData(name) };
+      return { kind: 'answer', path: `src/${name}`, data: sidebarData(name) };
     },
   });
 
@@ -1864,7 +1895,7 @@ test('a data-source reset takes the previous tree down before the replacement ar
     pathOf: () => 'src/lib.rs',
     async dataFor() {
       await gate.current.promise;
-      return { path: 'src/lib.rs', data: sidebarData(answer.name) };
+      return { kind: 'answer', path: 'src/lib.rs', data: sidebarData(answer.name) };
     },
   });
 
@@ -1915,7 +1946,7 @@ test('a sidebar load that rejects is reported, not left as a spinner', async () 
       if (failing.now) {
         throw new Error('resolving the document path failed');
       }
-      return { path: 'src/lib.rs', data: sidebarData('lib') };
+      return { kind: 'answer', path: 'src/lib.rs', data: sidebarData('lib') };
     },
   });
 
@@ -1944,7 +1975,7 @@ test('a payload one view cannot render leaves all three views agreeing', async (
     sourceEpoch: () => 0,
     pathOf: () => 'src/lib.rs',
     async dataFor() {
-      return { path: 'src/lib.rs', data: answer.data };
+      return { kind: 'answer', path: 'src/lib.rs', data: answer.data };
     },
   });
 
@@ -2028,7 +2059,9 @@ test('a memory refresh in flight when the server drops cannot restore the withdr
   const store = {
     async data() {
       await gate.promise;
-      return { memories: [{ id: 'mem-1', title: 'Bound invariant', kind: 'Invariant', body: 'body' }] };
+      return memoryPayload([
+        { id: 'mem-1', title: 'Bound invariant', kind: 'Invariant', body: 'body' },
+      ]);
     },
   };
   const provider = new MemoryDocProvider(store);
@@ -2085,7 +2118,7 @@ test('a command captured before an outage cannot restore a withdrawn memory', as
   // Reachability is what lifts the withdrawal — not a refresh, which iterates nothing when no
   // memory documents are open and would leave the flag stuck forever.
   provider.restore();
-  answers.data = { memories: [memory] };
+  answers.data = memoryPayload([memory]);
   await provider.refresh();
   assert.match(provider.provideTextDocumentContent(uri), /the claim/);
 });
@@ -2107,7 +2140,7 @@ test('a withdrawal made with no documents open does not outlive the outage', asy
     workspace: {},
   };
   const { MemoryDocProvider } = await loadSourceModule('memories.ts', vscode);
-  const provider = new MemoryDocProvider({ async data() { return { memories: [] }; } });
+  const provider = new MemoryDocProvider({ async data() { return memoryPayload([]); } });
 
   // The server drops while nothing is open, so there is no source path for a refresh to walk.
   provider.withdraw();
@@ -2147,7 +2180,7 @@ test('a memory picked after the index moved is re-read, never rendered from the 
   const captured = { id: 'mem-1', title: 'Bound invariant', kind: 'Invariant', body: 'OLD body' };
 
   // The index moved while the picker sat open: same memory, revised body.
-  answers.data = { memories: [{ ...captured, body: 'NEW body' }] };
+  answers.data = memoryPayload([{ ...captured, body: 'NEW body' }]);
   const ready = await provider.openPicked(captured.id, 'src/lib.rs');
   assert.equal(ready.kind, 'ready');
   const rendered = provider.provideTextDocumentContent(ready.uri);
@@ -2155,12 +2188,19 @@ test('a memory picked after the index moved is re-read, never rendered from the 
   assert.doesNotMatch(rendered, /OLD body/, 'the captured copy must not be what gets rendered');
 
   // The memory was deleted while the picker sat open: rendering the capture would resurrect it.
-  answers.data = { memories: [] };
-  // "absent", not "deleted": a failed memory lane also produces an empty list, so the payload
-  // cannot distinguish the two and neither may the message.
-  assert.deepEqual(await provider.openPicked(captured.id, 'src/lib.rs'), { kind: 'absent' });
+  // The lane ANSWERED, so its emptiness is the index speaking and "removed" is sayable.
+  answers.data = memoryPayload([]);
+  assert.deepEqual(await provider.openPicked(captured.id, 'src/lib.rs'), { kind: 'deleted' });
 
-  // The server stopped answering: an outage is not a deletion.
+  // A carried memory lane holds the memory, but only because it held it up to a minute ago. That
+  // is not a statement about now, so it is not rendered as one — the stale-render case.
+  answers.data = memoryPayload([captured], 'carried');
+  assert.deepEqual(await provider.openPicked(captured.id, 'src/lib.rs'), { kind: 'stale' });
+  // And a lane whose fallback expired is empty for the same reason, which is not a deletion.
+  answers.data = memoryPayload([], 'empty');
+  assert.deepEqual(await provider.openPicked(captured.id, 'src/lib.rs'), { kind: 'stale' });
+
+  // The server stopped answering: an outage is not a deletion either.
   answers.data = undefined;
   assert.deepEqual(await provider.openPicked(captured.id, 'src/lib.rs'), { kind: 'unavailable' });
 });
@@ -2207,13 +2247,20 @@ test('the memory picker routes through the revalidating open, not the captured o
   assert.deepEqual(calls.update, [], 'the captured object must never be rendered directly');
   assert.equal(shown.length, 1);
 
-  // A memory deleted while the picker was open is reported, not opened.
+  // A memory deleted while the picker was open is reported, not opened — and now sayable as a
+  // removal, because only a lane that answered can produce this outcome.
   shown.length = 0;
-  documents.openPicked = async () => ({ kind: 'absent' });
+  documents.openPicked = async () => ({ kind: 'deleted' });
   await showMemoriesQuickPick([captured], 'src/lib.rs', documents);
   assert.equal(shown.length, 0, 'nothing to show for a memory that is gone');
-  assert.match(messages.at(-1), /may have been removed, or the lookup for this file failed/);
-  assert.doesNotMatch(messages.at(-1), /no longer in the index/, 'deletion must not be asserted');
+  assert.match(messages.at(-1), /no longer in the index/);
+
+  // A lane that did not answer says exactly that, instead of a hedge covering both cases.
+  documents.openPicked = async () => ({ kind: 'stale' });
+  await showMemoriesQuickPick([captured], 'src/lib.rs', documents);
+  assert.equal(shown.length, 0);
+  assert.match(messages.at(-1), /did not answer/);
+  assert.doesNotMatch(messages.at(-1), /removed/, 'a failed lookup is not a deletion');
 
   // An outage says so, rather than claiming the memory was deleted.
   documents.openPicked = async () => ({ kind: 'unavailable' });
@@ -2499,6 +2546,923 @@ test('the hover link dispatches show callers exactly as the lens does', async ()
     MarkdownString: class {
       constructor(value) {
         this.value = value ?? '';
+test('a document digest hashes the file bytes verbatim, once per version', async () => {
+  const crypto = require('node:crypto');
+  // A UTF-8 BOM and CRLF endings: both are part of what the index hashed, and both are absent
+  // from — or rewritten in — the decoded buffer text. Hashing the text instead would disagree
+  // with the server for every file of this shape, permanently.
+  const bytes = new TextEncoder().encode('﻿pub fn carriage_returns() {}\r\n');
+  const reads = [];
+  const vscode = {
+    window: { createOutputChannel: () => ({ appendLine() {}, show() {} }) },
+    workspace: {
+      fs: {
+        readFile: async (uri) => {
+          reads.push(uri.toString());
+          return bytes;
+        },
+      },
+    },
+  };
+  const { DocumentDigests } = await loadSourceModule('content.ts', vscode);
+  const digests = new DocumentDigests();
+  const uri = { toString: () => 'file:///repo/src/lib.rs' };
+  const document = { uri, version: 1 };
+  const expected = crypto.createHash('sha256').update(bytes).digest('hex');
+
+  assert.deepEqual(
+    await digests.of(document),
+    { version: 1, sha256: expected },
+    'the same hash space as `files.sha256`, named for the version it speaks for',
+  );
+  // One read and one hash per SAVE, not per refresh: a document's version moves on every content
+  // change, including the reload VS Code performs when a file changes underneath it.
+  assert.deepEqual(await digests.of(document), { version: 1, sha256: expected });
+  assert.equal(reads.length, 1, 'an unchanged version is answered from the digest already taken');
+
+  document.version = 2;
+  assert.deepEqual(await digests.of(document), { version: 2, sha256: expected });
+  assert.equal(reads.length, 2, 'a changed version re-reads rather than trusting the old digest');
+
+  digests.forget(uri);
+  assert.deepEqual(await digests.of(document), { version: 2, sha256: expected });
+  assert.equal(reads.length, 3);
+
+  // An unreadable file yields no comparison — never a mismatch, which would silence the surface.
+  vscode.workspace.fs.readFile = async () => {
+    throw new Error('EACCES');
+  };
+  document.version = 3;
+  assert.equal(await digests.of(document), undefined);
+});
+
+test('overlapping readers of one document version share a single read and hash', async () => {
+  const crypto = require('node:crypto');
+  const bytes = new TextEncoder().encode('pub fn shared() {}\n');
+  const reads = [];
+  const release = deferred();
+  const vscode = {
+    window: { createOutputChannel: () => ({ appendLine() {}, show() {} }) },
+    workspace: {
+      fs: {
+        readFile: async (uri) => {
+          reads.push(uri.toString());
+          await release.promise;
+          return bytes;
+        },
+      },
+    },
+  };
+  const { DocumentDigests } = await loadSourceModule('content.ts', vscode);
+  const digests = new DocumentDigests();
+  const document = { uri: { toString: () => 'file:///repo/src/lib.rs' }, version: 4 };
+
+  // The same document is asked about by its overlays, both CodeLens providers, the hover and three
+  // sidebar views, and it can be open in split editors at once — all inside one refresh. A cache
+  // that only holds FINISHED digests misses on every one of them, and on a remote workspace each
+  // miss is another network read of the whole file.
+  const readers = [digests.of(document), digests.of(document), digests.of(document)];
+  release.resolve();
+  const settled = await Promise.all(readers);
+
+  const expected = crypto.createHash('sha256').update(bytes).digest('hex');
+  for (const digest of settled) {
+    assert.deepEqual(digest, { version: 4, sha256: expected });
+  }
+  assert.equal(reads.length, 1, 'one read for the version, however many readers ask at once');
+});
+
+test('a digest names the version it was taken for, and is not remembered for another', async () => {
+  const crypto = require('node:crypto');
+  const before = new TextEncoder().encode('pub fn before() {}\n');
+  const after = new TextEncoder().encode('pub fn reloaded_from_disk() {}\n');
+  const served = { bytes: before };
+  const reads = [];
+  const document = { uri: { toString: () => 'file:///repo/src/lib.rs' }, version: 1 };
+  const vscode = {
+    window: { createOutputChannel: () => ({ appendLine() {}, show() {} }) },
+    workspace: {
+      fs: {
+        readFile: async () => {
+          reads.push(document.version);
+          // The file changed under a CLEAN buffer, so VS Code reloads it: the version moves while
+          // the document stays clean and keeps its path, which is the one way the premise this
+          // digest was taken under can expire without any other check noticing.
+          document.version = 2;
+          return served.bytes;
+        },
+      },
+    },
+  };
+  const { DocumentDigests } = await loadSourceModule('content.ts', vscode);
+  const digests = new DocumentDigests();
+
+  const digest = await digests.of(document);
+  assert.equal(digest.version, 1, 'the digest speaks for the version it was taken for, not for 2');
+  assert.equal(digest.sha256, crypto.createHash('sha256').update(before).digest('hex'));
+
+  // And it is not remembered under the version it never described: asking about the reloaded
+  // document must read the file again rather than certify it with the previous bytes.
+  served.bytes = after;
+  const reloaded = await digests.of(document);
+  assert.deepEqual(reads, [1, 2]);
+  assert.equal(reloaded.version, 2);
+  assert.equal(reloaded.sha256, crypto.createHash('sha256').update(after).digest('hex'));
+});
+
+test('a digest in flight when its document closes cannot be inherited by the next one', async () => {
+  const crypto = require('node:crypto');
+  const closed = new TextEncoder().encode('pub fn before_close() {}\n');
+  const reopened = new TextEncoder().encode('pub fn changed_while_closed() {}\n');
+  const served = { bytes: closed };
+  const reads = [];
+  const release = deferred();
+  const vscode = {
+    window: { createOutputChannel: () => ({ appendLine() {}, show() {} }) },
+    workspace: {
+      fs: {
+        readFile: async () => {
+          reads.push(served.bytes);
+          await release.promise;
+          return served.bytes;
+        },
+      },
+    },
+  };
+  const { DocumentDigests } = await loadSourceModule('content.ts', vscode);
+  const digests = new DocumentDigests();
+  const uri = { toString: () => 'file:///repo/src/lib.rs' };
+  const document = { uri, version: 1 };
+
+  // The document closes while its digest is being taken. A reopened document commonly starts at
+  // the version its predecessor had, so a completion that outlives the close would hand the new
+  // one the old file's hash — and the file may have changed in between.
+  const pending = digests.of(document);
+  digests.forget(uri);
+  release.resolve();
+  await pending;
+
+  served.bytes = reopened;
+  const fresh = await digests.of({ uri, version: 1 });
+  assert.equal(reads.length, 2, 'the reopened document is hashed, not answered from before close');
+  assert.equal(fresh.sha256, crypto.createHash('sha256').update(reopened).digest('hex'));
+});
+
+test('the digest agrees with the platform hash on every message shape', async () => {
+  const crypto = require('node:crypto');
+  const { sha256Hex } = await loadSourceModule('sha256.ts');
+  // The block boundary is where a hand-written SHA-256 goes wrong: 55 bytes is the last that fits
+  // its padding in one block, 56 forces a second, and 64/119/120 repeat that a block later.
+  for (const length of [0, 1, 3, 55, 56, 63, 64, 65, 119, 120, 127, 128, 1000, 5000]) {
+    const bytes = crypto.randomBytes(length);
+    assert.equal(
+      sha256Hex(new Uint8Array(bytes)),
+      crypto.createHash('sha256').update(bytes).digest('hex'),
+      `${length} bytes`,
+    );
+  }
+});
+
+test('a host without Web Crypto still produces a digest', async () => {
+  const crypto = require('node:crypto');
+  const bytes = new TextEncoder().encode('pub fn no_subtle() {}\n');
+  const vscode = {
+    window: { createOutputChannel: () => ({ appendLine() {}, show() {} }) },
+    workspace: { fs: { readFile: async () => bytes } },
+  };
+  const { DocumentDigests } = await loadSourceModule('content.ts', vscode);
+  // An extension host on Node 18 has no `globalThis.crypto`, and a browser host outside a secure
+  // context has no `crypto.subtle`. The content gate must be ON there too: a host that silently
+  // cannot hash keeps drawing another revision's line numbers with nothing to signal it.
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  Object.defineProperty(globalThis, 'crypto', { value: undefined, configurable: true });
+  try {
+    const digest = await new DocumentDigests().of({
+      uri: { toString: () => 'file:///repo/src/lib.rs' },
+      version: 1,
+    });
+    assert.equal(digest.sha256, crypto.createHash('sha256').update(bytes).digest('hex'));
+  } finally {
+    Object.defineProperty(globalThis, 'crypto', original);
+  }
+});
+
+/** Every lane naming the same content, so the whole payload describes one revision. */
+function clientNaming(content, overrides = {}) {
+  return {
+    fileSymbolGraph: async () => lane([{ name: 'target' }], content),
+    fileClonesFull: async () =>
+      lane({ clone_regions: [], clone_graph: { eligible: true } }, content),
+    fileMemories: async () => lane([{ title: 'Memory', line: 3 }], content),
+    fileCoupling: async () => lane([], content),
+    filePapertrail: async () => lane({ refs: [], decisions: [] }, content),
+    ...overrides,
+  };
+}
+
+const INDEXED_SHA = 'a'.repeat(64);
+const OTHER_SHA = 'b'.repeat(64);
+const document = () => ({ uri: { toString: () => 'file:///repo/src/lib.rs' }, version: 1 });
+
+test('line-anchored data is drawn when it names the bytes the buffer holds, and withheld when it does not', async () => {
+  const FileStore = await loadStore();
+  const buffer = { sha256: INDEXED_SHA };
+  const store = new FileStore(
+    clientNaming(from(INDEXED_SHA)),
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    digestOf(buffer),
+  );
+  store.setOnline(true);
+  const doc = document();
+
+  // The agreement path: this is the normal case, and gating it wrongly would silence everything.
+  const loaded = await store.dataFor(doc);
+  assert.equal(loaded.kind, 'answer');
+  assert.equal(loaded.path, 'src/lib.rs');
+  assert.equal(loaded.data.memories.length, 1);
+
+  // The window switches branch. `repo_id` and `worktree_id` still match, so the association is
+  // valid and the server keeps answering — about the revision it indexed, whose line numbers
+  // belong to other bytes.
+  buffer.sha256 = OTHER_SHA;
+  store.invalidate();
+  assert.equal(
+    (await store.dataFor(doc)).kind,
+    'other-content',
+    'an answer computed from other bytes must not be drawn over this one, and says why',
+  );
+
+  // The index catches up: the same mechanism releases it again, with no version event needed.
+  buffer.sha256 = INDEXED_SHA;
+  store.invalidate();
+  assert.equal((await store.dataFor(doc)).data.memories.length, 1);
+});
+
+test('one lane computed from other bytes withholds the whole payload', async () => {
+  const FileStore = await loadStore();
+  const store = new FileStore(
+    clientNaming(from(INDEXED_SHA), {
+      fileMemories: async () => lane([{ title: 'Memory', line: 3 }], from(OTHER_SHA)),
+    }),
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    digestOf({ sha256: INDEXED_SHA }),
+  );
+  store.setOnline(true);
+
+  // A lane that disagrees is evidence the file moved under the answer, which says nothing good
+  // about the lanes that happen to agree — they may simply have been read on the other side of it.
+  assert.equal((await store.dataFor(document())).kind, 'other-content');
+});
+
+test('a carried-forward lane keeps the content hash it was computed from', async () => {
+  const FileStore = await loadStore();
+  const served = { sha256: INDEXED_SHA, memoriesFail: false };
+  const client = clientNaming(from(INDEXED_SHA), {
+    fileSymbolGraph: async () => lane([{ name: 'target' }], from(served.sha256)),
+    fileClonesFull: async () =>
+      lane({ clone_regions: [], clone_graph: { eligible: true } }, from(served.sha256)),
+    fileMemories: async () => {
+      if (served.memoriesFail) {
+        throw new Error('/api/file/memories failed');
+      }
+      return lane([{ title: 'Memory', line: 3 }], from(served.sha256));
+    },
+    fileCoupling: async () => lane([], from(served.sha256)),
+    filePapertrail: async () => lane({ refs: [], decisions: [] }, from(served.sha256)),
+  });
+  const buffer = { sha256: INDEXED_SHA };
+  const store = new FileStore(
+    client,
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    digestOf(buffer),
+  );
+  store.setOnline(true);
+  assert.equal((await store.dataFor(document())).data.memories.length, 1);
+
+  // The file is edited and reindexed; the memory lane drops its request across that. Its carried
+  // value still describes the PREVIOUS bytes, so re-asserting its line-anchored warning over the
+  // new ones is exactly what the fallback must not be allowed to do.
+  served.memoriesFail = true;
+  served.sha256 = OTHER_SHA;
+  buffer.sha256 = OTHER_SHA;
+  store.invalidate();
+  const carried = await store.data('src/lib.rs');
+  assert.equal(carried.memories.length, 1, 'the fallback still stands in for the failed lane');
+  assert.deepEqual(
+    carried.laneContent.memories,
+    { kind: 'sha256', sha256: INDEXED_SHA },
+    'and still names the bytes it came from',
+  );
+
+  // Only THAT lane is dropped. A carried value naming old bytes is the defined behaviour of the
+  // fallback, not evidence the file moved under the lanes that did answer about it — withholding
+  // the payload over it would blank every line-anchored surface for the whole fallback window.
+  const gated = await store.dataFor(document());
+  assert.deepEqual(gated.data.memories, [], 'the stale fallback cannot re-anchor over these bytes');
+  assert.equal(gated.data.lanes.memories, 'empty', 'and says so, rather than claiming no memories');
+  assert.deepEqual(gated.data.laneContent.memories, { kind: 'unknown' });
+  assert.equal(gated.data.symbols.length, 1, 'a lane that answered about these bytes is still drawn');
+  assert.equal(gated.data.lanes.symbols, 'current');
+  assert.equal(gated.kind, 'answer', 'a blanked fallback is not a content disagreement');
+  // The cached payload is untouched, so nothing is lost for a later load or a reverted buffer.
+  assert.equal((await store.data('src/lib.rs')).memories.length, 1);
+
+  // The lane recovers and names the current bytes: the file is drawable again.
+  served.memoriesFail = false;
+  store.invalidate();
+  assert.equal((await store.dataFor(document())).data.memories.length, 1);
+});
+
+test('a carried lane is kept when it names the bytes the buffer still holds', async () => {
+  const FileStore = await loadStore();
+  const served = { memoriesFail: false };
+  const store = new FileStore(
+    clientNaming(from(INDEXED_SHA), {
+      fileMemories: async () => {
+        if (served.memoriesFail) {
+          throw new Error('/api/file/memories failed');
+        }
+        return lane([{ title: 'Memory', line: 3 }], from(INDEXED_SHA));
+      },
+    }),
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    digestOf({ sha256: INDEXED_SHA }),
+  );
+  store.setOnline(true);
+  assert.equal((await store.dataFor(document())).data.memories.length, 1);
+
+  // A reindex that did not change this file, or none at all: the carried value describes the bytes
+  // on screen, so its line anchors are still right and dropping it would lose real warnings.
+  served.memoriesFail = true;
+  store.invalidate();
+  const gated = await store.dataFor(document());
+  assert.equal(gated.data.memories.length, 1);
+  assert.equal(gated.data.lanes.memories, 'carried', 'kept, and still not an answer');
+});
+
+test('a carried clone lane naming other bytes is reported as unavailable, not as no clones', async () => {
+  const FileStore = await loadStore();
+  const served = { sha256: INDEXED_SHA, clonesFail: false };
+  const store = new FileStore(
+    {
+      fileSymbolGraph: async () => lane([{ name: 'target' }], from(served.sha256)),
+      fileClonesFull: async () => {
+        if (served.clonesFail) {
+          throw new Error('/api/file/clones timed out');
+        }
+        return lane(
+          { clone_regions: [{ class_id: 1, start_line: 4, partners: [] }], clone_graph: { eligible: true } },
+          from(served.sha256),
+        );
+      },
+      fileMemories: async () => lane([{ title: 'Memory', line: 3 }], from(served.sha256)),
+      fileCoupling: async () => lane([], from(served.sha256)),
+      filePapertrail: async () => lane({ refs: [], decisions: [] }, from(served.sha256)),
+    },
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    digestOf(served),
+  );
+  store.setOnline(true);
+  assert.equal((await store.dataFor(document())).data.clones.length, 1);
+
+  // The clone lane is the slow one — a repository-wide scan on a linked worktree — so it is the
+  // one most likely to be carrying an old answer when the file is saved and reindexed.
+  served.clonesFail = true;
+  served.sha256 = OTHER_SHA;
+  store.invalidate();
+  const gated = await store.dataFor(document());
+  assert.deepEqual(gated.data.clones, [], 'overlays cannot be painted from the previous revision');
+  assert.equal(gated.data.lanes.clones, 'empty');
+  assert.equal(gated.data.cloneGraph.eligible, false);
+  const { cloneGraphUnavailableReason } = await loadSourceModule('sidebar.ts', {
+    EventEmitter: class {},
+    ThemeColor: class {},
+    ThemeIcon: class {},
+    TreeItem: class {},
+    TreeItemCollapsibleState: { Expanded: 1, None: 0 },
+    window: { createOutputChannel: () => ({ appendLine() {}, show() {} }) },
+  });
+  assert.match(cloneGraphUnavailableReason(gated.data.cloneGraph), /other file content/);
+  assert.equal(gated.data.memories.length, 1, 'the memory lane answered about these bytes');
+});
+
+test('a payload that names no content, or a host that cannot hash it, is not withheld', async () => {
+  const FileStore = await loadStore();
+  // A server predating the content field says nothing, and a host without Web Crypto or a readable
+  // file produces nothing. Either way no comparison is possible — and "cannot compare" must not be
+  // read as "disagrees", which would silence every surface on that pairing permanently.
+  const silentServer = new FileStore(
+    clientNaming(UNKNOWN_CONTENT),
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    digestOf({ sha256: INDEXED_SHA }),
+  );
+  silentServer.setOnline(true);
+  assert.equal((await silentServer.dataFor(document())).path, 'src/lib.rs');
+
+  const silentHost = new FileStore(
+    clientNaming(from(INDEXED_SHA)),
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    noDigest,
+  );
+  silentHost.setOnline(true);
+  assert.equal((await silentHost.dataFor(document())).path, 'src/lib.rs');
+});
+
+test('a payload names its content by the key, so an absent field and an explicit null differ', async () => {
+  const { answerContentOf } = await loadClientModule();
+  // A server predating the field omits the key entirely; a current one that holds no such file
+  // sends `content_sha256: null`. Collapsing the two would let a fallback outlive the index's own
+  // statement that the file is gone, so they are told apart by the KEY, not by the value.
+  assert.deepEqual(answerContentOf({ memories: [] }), { kind: 'unknown' });
+  assert.deepEqual(answerContentOf({ memories: [], content_sha256: null }), { kind: 'absent' });
+  assert.deepEqual(answerContentOf({ content_sha256: INDEXED_SHA }), {
+    kind: 'sha256',
+    sha256: INDEXED_SHA,
+  });
+  assert.deepEqual(answerContentOf({ content_sha256: INDEXED_SHA.toUpperCase() }), {
+    kind: 'sha256',
+    sha256: INDEXED_SHA,
+  });
+  // Anything this client cannot read as a file hash fails OPEN. Read as a hash it would fail every
+  // comparison and silence the file for good, where forgoing the gate only forgoes the gate.
+  for (const named of ['', 'not-a-hash', 'a'.repeat(63), 'g'.repeat(64), 7, [], {}]) {
+    assert.deepEqual(answerContentOf({ content_sha256: named }), { kind: 'unknown' }, `${named}`);
+  }
+});
+
+test('a lane that answered with no file discards what the others are carrying', async (t) => {
+  const FileStore = await loadStore();
+  const realNow = Date.now;
+  t.after(() => {
+    Date.now = realNow;
+  });
+  let clock = realNow();
+  Date.now = () => clock;
+  const served = { content: from(INDEXED_SHA), memoriesFail: false };
+  const store = new FileStore(
+    {
+      fileSymbolGraph: async () => lane([{ name: 'target' }], served.content),
+      fileClonesFull: async () =>
+        lane({ clone_regions: [], clone_graph: { eligible: true } }, served.content),
+      fileMemories: async () => {
+        if (served.memoriesFail) {
+          throw new Error('/api/file/memories failed');
+        }
+        return lane([{ id: 'mem-1', title: 'Memory', line: 3 }], served.content);
+      },
+      fileCoupling: async () => lane([], served.content),
+      filePapertrail: async () => lane({ refs: [], decisions: [] }, served.content),
+    },
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    digestOf({ sha256: INDEXED_SHA }),
+  );
+  store.setOnline(true);
+  assert.equal((await store.dataFor(document())).data.memories.length, 1);
+
+  // The file leaves the index — deleted, or newly excluded — while the memory lane drops its
+  // request. The lanes that answered say so with an explicit absence; the carried one still names
+  // the bytes the buffer holds, so a hash comparison alone would happily wave it through.
+  served.memoriesFail = true;
+  served.content = NO_FILE;
+  clock += 1_000;
+  store.invalidate();
+  const gated = await store.dataFor(document());
+  assert.deepEqual(gated.data.memories, [], 'a lane the index has disowned cannot stand in');
+  assert.equal(gated.data.lanes.memories, 'empty', 'and says so, rather than claiming no memories');
+  assert.equal(gated.data.lanes.symbols, 'current', 'the lanes that answered are still served');
+
+  // A hash beside an absence means the index moved mid-load, and neither lane can be trusted for
+  // this buffer: the payload goes rather than being half believed.
+  const torn = new FileStore(
+    clientNaming(NO_FILE, {
+      fileSymbolGraph: async () => lane([{ name: 'target' }], from(INDEXED_SHA)),
+    }),
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    digestOf({ sha256: INDEXED_SHA }),
+  );
+  torn.setOnline(true);
+  assert.equal((await torn.dataFor(document())).kind, 'other-content');
+});
+
+test('a digest taken for another version of the buffer certifies nothing', async () => {
+  const FileStore = await loadStore();
+  const doc = document();
+  const store = new FileStore(
+    clientNaming(from(INDEXED_SHA)),
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    // The digest was taken before VS Code reloaded the buffer from disk — a clean document whose
+    // version moved and whose path did not. It still names the bytes the server answered about,
+    // so trusting it would draw that answer's line anchors over the newly loaded ones.
+    async () => ({ version: doc.version - 1, sha256: INDEXED_SHA }),
+  );
+  store.setOnline(true);
+
+  assert.equal((await store.dataFor(doc)).kind, 'other-content');
+});
+
+test('the store reports where each lane value came from', async (t) => {
+  const FileStore = await loadStore();
+  const realNow = Date.now;
+  t.after(() => {
+    Date.now = realNow;
+  });
+  let clock = realNow();
+  Date.now = () => clock;
+  let memoriesFail = false;
+  const client = {
+    fileSymbolGraph: async () => lane([]),
+    fileClonesFull: async () => lane({ clone_regions: [], clone_graph: { eligible: true } }),
+    fileMemories: async () => {
+      if (memoriesFail) {
+        throw new Error('/api/file/memories failed');
+      }
+      return lane([{ id: 'mem-1', title: 'Memory', line: 3 }]);
+    },
+    fileCoupling: async () => lane([]),
+    filePapertrail: async () => lane({ refs: [], decisions: [] }),
+  };
+  const store = new FileStore(client, () => 0.9, () => 100, () => 'src/lib.rs', endpoint, noDigest);
+  store.setOnline(true);
+
+  const fresh = await store.data('src/lib.rs');
+  assert.equal(fresh.lanes.memories, 'current', 'a lane that answered speaks for the index');
+  assert.equal(fresh.lanes.clones, 'current');
+
+  // The lane drops its request. The value is still served — clearing real warnings over one
+  // dropped request is the failure the fallback exists to prevent — but it is no longer an answer.
+  memoriesFail = true;
+  clock += 30_000;
+  store.invalidate();
+  const carriedLoad = await store.data('src/lib.rs');
+  assert.equal(carriedLoad.memories.length, 1);
+  assert.equal(carriedLoad.lanes.memories, 'carried');
+  assert.equal(carriedLoad.lanes.coupling, 'current', 'one lane failing says nothing about another');
+
+  // Past the bound there is nothing left to carry, and an empty list is not "no memories here".
+  clock += 40_000;
+  store.invalidate();
+  const expired = await store.data('src/lib.rs');
+  assert.deepEqual(expired.memories, []);
+  assert.equal(expired.lanes.memories, 'empty');
+
+  memoriesFail = false;
+  store.invalidate();
+  assert.equal((await store.data('src/lib.rs')).lanes.memories, 'current');
+});
+
+test('a memory refresh whose lane did not answer neither corrects nor deletes', async () => {
+  const vscode = {
+    EventEmitter: class {
+      fire() {}
+      get event() {
+        return () => ({ dispose() {} });
+      }
+      dispose() {}
+    },
+    Uri: { parse: (value) => ({ path: value.split(':')[1], toString: () => value }) },
+    Range: class {},
+    CodeLens: class {},
+    ViewColumn: { Beside: 2 },
+    window: {},
+    workspace: {},
+  };
+  const { MemoryDocProvider } = await loadSourceModule('memories.ts', vscode);
+  const answers = { data: undefined };
+  const provider = new MemoryDocProvider({
+    async data() {
+      return answers.data;
+    },
+  });
+  const memory = { id: 'mem-1', title: 'Bound invariant', kind: 'Invariant', body: 'first body' };
+  const uri = provider.update(memory, 'src/lib.rs');
+
+  // A carried lane holding a revised body is a minute-old claim, not a correction — rendering it
+  // would present it as confirmed on the one surface with no line number to look wrong against.
+  answers.data = memoryPayload([{ ...memory, body: 'second body' }], 'carried');
+  await provider.refresh();
+  assert.match(provider.provideTextDocumentContent(uri), /first body/);
+  assert.doesNotMatch(provider.provideTextDocumentContent(uri), /second body/);
+
+  // An expired lane is empty for the same reason, and dropping the document over it would report
+  // a failed lookup as a deletion.
+  answers.data = memoryPayload([], 'empty');
+  await provider.refresh();
+  assert.match(provider.provideTextDocumentContent(uri), /first body/);
+
+  // A lane that answered is what corrects the document, and what removes it.
+  answers.data = memoryPayload([{ ...memory, body: 'second body' }]);
+  await provider.refresh();
+  assert.match(provider.provideTextDocumentContent(uri), /second body/);
+
+  answers.data = memoryPayload([]);
+  await provider.refresh();
+  assert.equal(provider.provideTextDocumentContent(uri), 'memory not found');
+});
+/** One lane origin per lane, defaulting to the lane having answered. */
+const lanesWith = (overrides = {}) => ({
+  symbols: 'current',
+  clones: 'current',
+  memories: 'current',
+  coupling: 'current',
+  papertrail: 'current',
+  ...overrides,
+});
+
+test('a payload withheld for naming other content is not reported as an outage', async () => {
+  const answer = { load: { kind: 'other-content' } };
+  const indexed = { path: 'src/lib.rs' };
+  const harness = await sidebarHarness({
+    dataEpoch: () => 0,
+    sourceEpoch: () => 0,
+    pathOf: () => indexed.path,
+    dataFor: async () => answer.load,
+  });
+
+  // What content skew looks like from the pump: the load withholds, and the document still has a
+  // perfectly good repository path. Reading that pair as "lens server offline" sends the reader
+  // after a problem that is not there — the server is answering, about other bytes — for a state
+  // that clears itself as soon as the index catches up. The load says which of the two happened,
+  // so the pump never has to ask a second question whose answer may describe a different load.
+  harness.activate(sidebarEditor('lib.rs'));
+  await settle();
+  for (const view of ['cloneClasses', 'memories', 'papertrail']) {
+    assert.doesNotMatch(harness.shown(view), /offline/, view);
+    assert.match(harness.shown(view), /other file content/, view);
+  }
+
+  // A withheld payload with no content disagreement behind it is still an outage, and still says so.
+  answer.load = { kind: 'none' };
+  harness.refresh();
+  await settle();
+  assert.match(harness.shown('memories'), /lens server offline/);
+
+  // An unsaved buffer is neither: it has no indexed path at all.
+  indexed.path = undefined;
+  harness.refresh();
+  await settle();
+  assert.match(harness.shown('memories'), /open a file in the indexed repo/);
+});
+
+test('an empty lane that did not answer is reported unavailable, never as nothing here', async () => {
+  const payload = {
+    at: 0,
+    lanes: lanesWith(),
+    symbols: [],
+    coupling: [],
+    clones: [],
+    cloneGraph: { eligible: true },
+    memories: [],
+    refs: [],
+    decisions: [],
+  };
+  const harness = await sidebarHarness({
+    dataEpoch: () => 0,
+    sourceEpoch: () => 0,
+    pathOf: () => 'src/lib.rs',
+    dataFor: async () => ({ kind: 'answer', path: 'src/lib.rs', data: payload }),
+  });
+  const reload = async () => {
+    harness.refresh();
+    await settle();
+  };
+
+  // Every one of these views ends in a sentence about what the file HAS NOT got, and only a lane
+  // that answered can support one. A lane that failed renders as an empty list exactly like a lane
+  // that found nothing, so this is the one render where provenance has to be read.
+  harness.activate(sidebarEditor('lib.rs'));
+  await settle();
+  assert.match(harness.shown('cloneClasses'), /no actionable clones/);
+  assert.match(harness.shown('memories'), /no memories bound/);
+  assert.match(harness.shown('papertrail'), /no tracker items/);
+
+  for (const origin of ['carried', 'empty']) {
+    payload.lanes = lanesWith({ clones: origin, memories: origin, papertrail: origin });
+    await reload();
+    for (const view of ['cloneClasses', 'memories', 'papertrail']) {
+      assert.match(harness.shown(view), /unavailable/, `${view} ${origin}`);
+      assert.doesNotMatch(
+        harness.shown(view),
+        /no actionable clones|no memories bound|no tracker items/,
+        `${view} ${origin}`,
+      );
+    }
+  }
+
+  // A carried lane that DID find something still shows it: the value is real, and only the claim
+  // that there is nothing needs a lane that answered.
+  payload.lanes = lanesWith({ memories: 'carried' });
+  payload.memories = [{ id: 'mem-1', title: 'Bound invariant', kind: 'Invariant' }];
+  await reload();
+  assert.match(harness.shown('memories'), /Bound invariant/);
+});
+
+test('a clean document reloaded under what is drawn for it redraws', async () => {
+  const { redrawAfterChange } = await loadSourceModule('extension.ts', {
+    window: { createOutputChannel: () => ({ appendLine() {}, show() {} }) },
+    TreeItem: class {},
+    TreeItemCollapsibleState: { Expanded: 1, None: 0 },
+    EventEmitter: class {},
+    ThemeColor: class {},
+    ThemeIcon: class {},
+    Uri: { parse: (value) => ({ toString: () => value }) },
+  });
+
+  // The case a dirtiness comparison alone cannot see. VS Code reloads a CLEAN buffer in place when
+  // the file changes underneath it — a branch switch, a rebase, an out-of-band write — and the
+  // indexed path reads the same before and after, so nothing about the PATH says anything moved. A
+  // hosted server on the previous revision emits no index event either, so without this the
+  // overlays and diagnostics stand on the old bytes indefinitely and the content gate, which is
+  // the whole point of asking again, never runs.
+  assert.equal(redrawAfterChange('src/lib.rs', 'src/lib.rs', true), true);
+
+  // Dirtiness transitions, which decide whether the document has an indexed path at all.
+  assert.equal(redrawAfterChange('src/lib.rs', undefined, true), true, 'first keystroke');
+  assert.equal(redrawAfterChange(undefined, 'src/lib.rs', true), true, 'reverted to saved');
+
+  // And what must NOT redraw: a keystroke in an already-dirty buffer changes nothing about what
+  // may be shown, and rebuilding every decoration per keystroke is the cost this avoids.
+  assert.equal(redrawAfterChange(undefined, undefined, true), false, 'still dirty');
+  // A change event carrying no content change says only that something about the document moved.
+  assert.equal(redrawAfterChange('src/lib.rs', 'src/lib.rs', false), false);
+});
+
+test('the client hashes what the server hashed, BOM and line endings included', async () => {
+  const crypto = require('node:crypto');
+  // The one shared vector: `﻿pub fn carriage_returns() {}\r\n` on disk. The Rust side pins
+  // that `files.sha256` is exactly this for those bytes
+  // (`per_file_answers_name_the_exact_bytes_they_were_computed_from`); this pins that the client
+  // arrives at the same string from the same bytes, and that the payload is RELEASED when it does.
+  // Agreement is the path that matters most: a silent disagreement withholds every surface for
+  // whole classes of file permanently, which is worse than the skew being guarded against.
+  const AGREED_SHA = 'f4c30a8dded3c6fe777b5c1d5c8330604336808b8c9c9b7ff058325a3a7d591f';
+  const bytes = new TextEncoder().encode('﻿pub fn carriage_returns() {}\r\n');
+  assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'), AGREED_SHA);
+
+  const { DocumentDigests } = await loadSourceModule('content.ts', {
+    window: { createOutputChannel: () => ({ appendLine() {}, show() {} }) },
+    workspace: { fs: { readFile: async () => bytes } },
+  });
+  const document = { uri: { toString: () => 'file:///repo/src/verbatim.rs' }, version: 1 };
+  const digests = new DocumentDigests();
+  assert.deepEqual(await digests.of(document), { version: 1, sha256: AGREED_SHA });
+
+  // End to end through the gate: a server naming the hash the index computed for these bytes
+  // releases its payload, on a host with Web Crypto and on one without.
+  const FileStore = await loadStore();
+  for (const subtle of [globalThis.crypto, undefined]) {
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+    Object.defineProperty(globalThis, 'crypto', { value: subtle, configurable: true });
+    try {
+      const store = new FileStore(
+        clientNaming(from(AGREED_SHA)),
+        () => 0.9,
+        () => 100,
+        () => 'src/verbatim.rs',
+        endpoint,
+        (doc) => digests.of(doc),
+      );
+      store.setOnline(true);
+      const loaded = await store.dataFor({ ...document, version: 1 });
+      assert.equal(loaded.kind, 'answer', `subtle=${Boolean(subtle)}`);
+      assert.equal(loaded.data.memories.length, 1);
+    } finally {
+      Object.defineProperty(globalThis, 'crypto', original);
+    }
+  }
+});
+
+/**
+ * The extension's entry point activated against a fake host: one workspace folder, a hosted Lens
+ * server reached through a stubbed `fetch`, and a window whose visible editors and on-disk bytes
+ * the test controls.
+ *
+ * Everything below `activate` is the real thing — the resolver, the store, the content digests, the
+ * diagnostics collection — because what these tests are about is the WIRING between them: which
+ * host event reaches which surface, which no unit of any one of them can answer.
+ */
+async function extensionHarness(options = {}) {
+  const crypto = require('node:crypto');
+  const BASE = 'http://127.0.0.1:18131';
+  const REPO_ID = 'repo-1';
+  const disk = new Map();
+  /** The bytes the server's answers are computed from — moved independently of `disk`. */
+  let indexed = '';
+  const bytesOf = (text) => new TextEncoder().encode(text);
+  const shaOf = (text) => crypto.createHash('sha256').update(bytesOf(text)).digest('hex');
+
+  const uri = (uriPath) => ({
+    scheme: 'file',
+    authority: '',
+    path: uriPath,
+    toString: () => `file://${uriPath}`,
+    with: ({ path: replacement }) => uri(replacement),
+  });
+  const folder = { uri: uri('/repo') };
+
+  /** The Problems panel: per-URI, and deliberately not keyed on any editor. */
+  const problems = new Map();
+  const visible = [];
+  const changeListeners = [];
+  const logged = [];
+
+  const secrets = new Map([
+    [
+      `rag-rat-lens.serverRepo:${encodeURIComponent(BASE)}:${encodeURIComponent('file:///repo')}`,
+      JSON.stringify({ repoId: REPO_ID, worktreeId: '' }),
+    ],
+    [`rag-rat-lens.serverToken:${encodeURIComponent(BASE)}`, 'owner-token'],
+  ]);
+
+  const answer = (body) => () => ({ ...body, content_sha256: shaOf(indexed) });
+  const routes = {
+    '/api/status': () => ({
+      repo_id: REPO_ID,
+      worktree_id: '',
+      indexed_root: '',
+      case_insensitive_paths: false,
+      live_file_count: 1,
+      live_files_generation: 1,
+      indexed_head: 'abcdef1234567890',
+    }),
+    '/api/file/graph': answer({ symbols: [] }),
+    '/api/file/clones': answer({ clone_regions: [], clone_graph: null }),
+    '/api/file/memories': answer({ memories: options.memories ?? [] }),
+    '/api/file/coupling': answer({ coupling: [] }),
+    '/api/file/papertrail': answer({ refs: [], decisions: [] }),
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    // The event stream stays open for the life of the harness. It must neither deliver a version
+    // nor fail: either one starts a reload, and a reload legitimately drops every hidden
+    // document's diagnostics — which is the very thing these tests must not have done for them.
+    if (url.pathname === '/api/events') {
+      return await new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    }
+    const route = routes[url.pathname];
+    if (!route) {
+      return new Response('not found', { status: 404 });
+    }
+    return new Response(JSON.stringify(route()), {
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  const vscode = {
+    EventEmitter: class {
+      fire() {}
+      dispose() {}
+      get event() {
+        return () => ({ dispose() {} });
+      }
+    },
+    ThemeColor: class {},
+    ThemeIcon: class {
+      constructor(id) {
+        this.id = id;
+      }
+    },
+    TreeItem: class {
+      constructor(label) {
+        this.label = label;
+      }
+    },
+    TreeItemCollapsibleState: { Expanded: 1, None: 0 },
+    MarkdownString: class {
+      constructor(value = '') {
+        this.value = value;
       }
       appendMarkdown(text) {
         this.value += text;
@@ -2721,4 +3685,236 @@ test('a click on a lens whose symbol was reindexed says so instead of failing th
   failure = new TypeError('fetch failed');
   await assert.rejects(showCallers({ id: null, qname: 'src/lib.rs::run' }, 'run'), /fetch failed/);
   assert.equal(warnings.length, 1);
+    Range: class {
+      constructor(startLine, startCharacter, endLine, endCharacter) {
+        Object.assign(this, { startLine, startCharacter, endLine, endCharacter });
+      }
+    },
+    Position: class {
+      constructor(line, character) {
+        Object.assign(this, { line, character });
+      }
+    },
+    Diagnostic: class {
+      constructor(range, message, severity) {
+        Object.assign(this, { range, message, severity });
+      }
+    },
+    DiagnosticSeverity: { Warning: 1, Information: 3 },
+    StatusBarAlignment: { Left: 1 },
+    ConfigurationTarget: { Global: 1 },
+    OverviewRulerLane: { Left: 1 },
+    ViewColumn: { Beside: -2 },
+    Uri: {
+      parse: (value) => ({ toString: () => value }),
+      joinPath: (base, ...segments) => uri(path.posix.resolve(base.path, ...segments)),
+    },
+    languages: {
+      createDiagnosticCollection: () => ({
+        set: (target, list) => problems.set(target.toString(), { uri: target, list }),
+        delete: (target) => problems.delete(target.toString()),
+        forEach: (visit) => {
+          for (const entry of [...problems.values()]) {
+            visit(entry.uri);
+          }
+        },
+        clear: () => problems.clear(),
+        dispose: () => problems.clear(),
+      }),
+      registerCodeLensProvider: () => ({ dispose() {} }),
+      registerHoverProvider: () => ({ dispose() {} }),
+    },
+    commands: {
+      registerCommand: () => ({ dispose() {} }),
+      executeCommand: async () => undefined,
+    },
+    env: { openExternal: async () => true },
+    window: {
+      get activeTextEditor() {
+        return visible[0];
+      },
+      get visibleTextEditors() {
+        return visible;
+      },
+      createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
+      createOutputChannel: () => ({
+        appendLine: (line) => logged.push(line),
+        show() {},
+      }),
+      createTextEditorDecorationType: () => ({ dispose() {} }),
+      registerTreeDataProvider: () => ({ dispose() {} }),
+      onDidChangeActiveTextEditor: () => ({ dispose() {} }),
+      showTextDocument: async () => undefined,
+      showInformationMessage: async () => undefined,
+      showErrorMessage: async () => undefined,
+      showInputBox: async () => undefined,
+      showQuickPick: async () => undefined,
+    },
+    workspace: {
+      workspaceFolders: [folder],
+      isTrusted: true,
+      getConfiguration: () => ({
+        get: (_key, fallback) => fallback,
+        inspect: (key) => (key === 'serverUrl' ? { globalValue: BASE } : undefined),
+        update: async () => undefined,
+      }),
+      getWorkspaceFolder: (target) => (target.path.startsWith('/repo/') ? folder : undefined),
+      fs: {
+        readFile: async (target) => {
+          const text = disk.get(target.path);
+          if (text === undefined) {
+            throw new Error(`no such file ${target.path}`);
+          }
+          return bytesOf(text);
+        },
+        stat: async () => {
+          throw new Error('no such file');
+        },
+      },
+      onDidChangeTextDocument: (listener) => {
+        changeListeners.push(listener);
+        return { dispose() {} };
+      },
+      onDidCloseTextDocument: () => ({ dispose() {} }),
+      onDidChangeConfiguration: () => ({ dispose() {} }),
+      onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
+      registerTextDocumentContentProvider: () => ({ dispose() {} }),
+      openTextDocument: async () => ({}),
+      asRelativePath: (value) => value,
+    },
+  };
+
+  const { activate } = await loadSourceModule('extension.ts', vscode);
+  const context = {
+    subscriptions: [],
+    secrets: {
+      get: async (key) => secrets.get(key),
+      store: async (key, value) => void secrets.set(key, value),
+      delete: async (key) => void secrets.delete(key),
+    },
+  };
+
+  async function until(predicate, what) {
+    for (let tick = 0; tick < 500; tick += 1) {
+      if (predicate()) {
+        return;
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.fail(`timed out waiting for ${what}\n${logged.join('\n')}`);
+  }
+
+  return {
+    /** Open `text` at `uriPath` and index the same bytes: server and editor start in agreement. */
+    open(uriPath, text) {
+      disk.set(uriPath, text);
+      indexed = text;
+      return {
+        uri: uri(uriPath),
+        version: 1,
+        isDirty: false,
+        get lineCount() {
+          return (disk.get(uriPath) ?? '').split('\n').length;
+        },
+        lineAt: (line) => ({ text: (disk.get(uriPath) ?? '').split('\n')[line] ?? '' }),
+      };
+    },
+    /** Put `document` in a visible editor, or take it back to a background tab. */
+    show(document) {
+      visible.push({ document, setDecorations() {} });
+    },
+    hide(document) {
+      const at = visible.findIndex((editor) => editor.document === document);
+      visible.splice(at, 1);
+    },
+    /** The file changes on disk under a clean buffer, as a branch switch or rebase does. */
+    reload(document, text) {
+      disk.set(document.uri.path, text);
+      document.version += 1;
+    },
+    activate: () => activate(context),
+    /** Deliver a content change for `document`, as the host does after reloading it. */
+    async change(document) {
+      for (const listener of changeListeners) {
+        listener({ document, contentChanges: [{}] });
+      }
+      await settle();
+      await settle();
+    },
+    /** What the Problems panel holds for one URI — the surface no editor has to be showing. */
+    problems: (key) => problems.get(key)?.list ?? [],
+    until,
+    dispose() {
+      for (const subscription of context.subscriptions) {
+        subscription.dispose?.();
+      }
+      globalThis.fetch = originalFetch;
+    },
+  };
+}
+
+test('a hidden document reloaded underneath loses the diagnostics nothing will re-ask about', async () => {
+  const harness = await extensionHarness({
+    memories: [
+      { id: 'mem-1', title: 'Bound invariant', kind: 'Invariant', line: 2, verdict: 'diverged', verdict_direction: 'code_ahead' },
+    ],
+  });
+  const key = 'file:///repo/src/lib.rs';
+  try {
+    const document = harness.open('/repo/src/lib.rs', 'fn one() {}\nfn two() {}\n');
+    harness.show(document);
+    harness.activate();
+    await harness.until(
+      () => harness.problems(key).length === 1,
+      'the memory warning to reach the Problems panel',
+    );
+
+    // The tab goes to the background. The document is still OPEN — its Problems entries stay in
+    // the panel — but no editor is showing it.
+    harness.hide(document);
+    // The file changes underneath the clean buffer and VS Code reloads it in place: same path, new
+    // bytes. A server sitting on the previous revision emits no index event, so this change is the
+    // only thing that says anything moved.
+    harness.reload(document, 'fn renamed() {}\n');
+    await harness.change(document);
+
+    // `refreshEditor` is what re-runs the content gate, and it runs per VISIBLE editor — there is
+    // none, so nothing will ask whether the warning still describes line 2. It has to come down
+    // here rather than sit in the panel, pointing at unrelated code, until the tab is selected.
+    assert.deepEqual(
+      harness.problems(key),
+      [],
+      'a hidden document\'s diagnostics must not survive its bytes',
+    );
+  } finally {
+    harness.dispose();
+  }
+});
+
+test('a visible document reloaded underneath keeps being asked, and the gate answers', async () => {
+  const harness = await extensionHarness({
+    memories: [
+      { id: 'mem-1', title: 'Bound invariant', kind: 'Invariant', line: 2, verdict: 'diverged', verdict_direction: 'code_ahead' },
+    ],
+  });
+  const key = 'file:///repo/src/lib.rs';
+  try {
+    const document = harness.open('/repo/src/lib.rs', 'fn one() {}\nfn two() {}\n');
+    harness.show(document);
+    harness.activate();
+    await harness.until(
+      () => harness.problems(key).length === 1,
+      'the memory warning to reach the Problems panel',
+    );
+
+    // Same reload, tab still showing: the redraw re-drives the editor, the content gate finds the
+    // server's answer describes bytes the buffer no longer holds, and it withholds them. The two
+    // routes to an empty panel are different mechanisms, and both have to work.
+    harness.reload(document, 'fn renamed() {}\n');
+    await harness.change(document);
+
+    assert.deepEqual(harness.problems(key), [], 'the gate must take a stale warning down');
+  } finally {
+    harness.dispose();
+  }
 });

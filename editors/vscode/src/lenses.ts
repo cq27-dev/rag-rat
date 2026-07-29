@@ -185,7 +185,7 @@ export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Dispo
 
   async provideCodeLenses(document: vscode.TextDocument): Promise<vscode.CodeLens[]> {
     const loaded = await this.store.dataFor(document);
-    if (!loaded) {
+    if (loaded.kind !== 'answer') {
       return [];
     }
     const d = loaded.data;

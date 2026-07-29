@@ -693,3 +693,58 @@ fn a_branch_target_survives_an_overlay_root_spelled_with_a_parent_component() {
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);
 }
+
+#[test]
+fn lens_content_hash_follows_the_active_checkout_not_main() {
+    // The hash is what an editor compares its own file against before it draws line-anchored
+    // signals. Served from the base scope while a linked worktree is active, it would name main's
+    // bytes — so a branch checkout whose file genuinely matches its own index would be told it
+    // disagrees and go silent, and one that does NOT match main would be told it agrees.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn branch_fn() {}\n").unwrap();
+    fs::write(linked.join("src/only_on_branch.rs"), "pub fn branch_only() {}\n").unwrap();
+    run_git(&linked, &["add", "-A"]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    let hash_of = |root: &Path, path: &str| {
+        rag_rat_base::hash::hex_sha256(&fs::read(root.join(path)).unwrap())
+    };
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        db.lens_file_content_sha256("src/a.rs").unwrap(),
+        Some(hash_of(&linked, "src/a.rs")),
+        "the overlay scope names the linked checkout's bytes"
+    );
+    assert_eq!(
+        db.lens_file_content_sha256("src/only_on_branch.rs").unwrap(),
+        Some(hash_of(&linked, "src/only_on_branch.rs")),
+        "a file only the branch has is still named by its own content"
+    );
+
+    set_base_scope(&mut db, &main);
+    assert_eq!(
+        db.lens_file_content_sha256("src/a.rs").unwrap(),
+        Some(hash_of(&main, "src/a.rs")),
+        "the base scope names main's bytes, and the two must not be interchangeable"
+    );
+    assert_eq!(
+        db.lens_file_content_sha256("src/only_on_branch.rs").unwrap(),
+        None,
+        "a branch-only file is absent from the base scope, not silently named by another row"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}

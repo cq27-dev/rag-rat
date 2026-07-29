@@ -5,7 +5,7 @@
 import * as vscode from 'vscode';
 import type { CloneRegion, DecisionRecord, PapertrailRef } from './client';
 import { logError } from './output';
-import type { FileData, FileStore } from './store';
+import type { FileData, FileStore, LaneOrigin } from './store';
 
 class Item extends vscode.TreeItem {
   constructor(
@@ -54,6 +54,11 @@ type SidebarState =
   | { kind: 'offline' }
   /** The load itself failed. Distinct from `offline`: nothing was learned about the server. */
   | { kind: 'failed' }
+  /**
+   * The server answered about other bytes than the file holds. Distinct from `offline`: the server
+   * is healthy and the association is valid, and only the revisions differ.
+   */
+  | { kind: 'other-content' }
   | { kind: 'file'; path: string; data: FileData };
 
 type SidebarMessage = Exclude<SidebarState, { kind: 'file' }>;
@@ -71,6 +76,14 @@ function messageItem(state: SidebarMessage): Item {
       return new Item('lens data unavailable', {
         description: 'see the rag-rat Lens log',
         icon: new vscode.ThemeIcon('warning', new vscode.ThemeColor('editorWarning.foreground')),
+      });
+    case 'other-content':
+      // Not an outage, and saying so would send the reader after a problem that is not there. A
+      // branch switch or a save the index has not caught up with looks exactly like this, and the
+      // server answering it is perfectly healthy — the state clears itself.
+      return new Item('index describes other file content', {
+        description: 'signals return once it catches up',
+        icon: new vscode.ThemeIcon('sync'),
       });
     default: {
       // Adding a state without a row is a compile error, not a blank tree at runtime.
@@ -216,7 +229,11 @@ class SidebarPump {
       this.publish({ kind: 'failed' });
       return;
     }
-    if (!settled.loaded) {
+    if (settled.loaded.kind === 'other-content') {
+      this.publish({ kind: 'other-content' });
+      return;
+    }
+    if (settled.loaded.kind === 'none') {
       // Distinguish "nothing to show for this buffer" from "the server did not answer": an
       // unsaved buffer has no indexed path, and reporting that as an outage would be wrong.
       this.publish(
@@ -254,6 +271,30 @@ class SidebarPump {
   }
 }
 
+/**
+ * The item that stands in for an absence claim when the lane that would support it did not answer,
+ * or `undefined` when it did and the claim may be made.
+ *
+ * Every one of these views ends in a sentence about what the file HAS NOT got — no memories, no
+ * clones, no tracker items — and only a lane that answered can support one. A lane that failed
+ * carries its previous value, or nothing at all once that expires, and both render as an empty
+ * list; drawing "no memories bound to this file" over that turns a dropped request into a fact
+ * about the repository. The empty state is where a lane's provenance HAS to be read, because it is
+ * the only render where the value and the placeholder look identical.
+ *
+ * A `carried` lane is not enough either. Its value describes what the index held when it arrived,
+ * so it can show what it found — a non-empty list is still real — but it cannot speak for what the
+ * index holds now, which is what an absence claim asserts.
+ */
+function unansweredLane(origin: LaneOrigin, subject: string): Item | undefined {
+  return origin === 'current'
+    ? undefined
+    : new Item(`${subject} unavailable`, {
+        description: 'the lookup for this file did not answer',
+        icon: new vscode.ThemeIcon('warning', new vscode.ThemeColor('editorWarning.foreground')),
+      });
+}
+
 export class CloneClassesView extends FileView {
   protected roots(path: string, data: FileData): Item[] {
     const out: Item[] = [];
@@ -279,7 +320,10 @@ export class CloneClassesView extends FileView {
     }
     const regions = data.clones;
     if (!regions.length) {
-      out.push(new Item('no actionable clones in this file', { icon: new vscode.ThemeIcon('check') }));
+      out.push(
+        unansweredLane(data.lanes.clones, 'clone data')
+          ?? new Item('no actionable clones in this file', { icon: new vscode.ThemeIcon('check') }),
+      );
       return out;
     }
     const byClass = new Map<number | null, CloneRegion[]>();
@@ -346,7 +390,10 @@ export class MemoriesView extends FileView {
   protected roots(path: string, data: FileData): Item[] {
     const memories = data.memories;
     if (!memories.length) {
-      return [new Item('no memories bound to this file', { icon: new vscode.ThemeIcon('check') })];
+      return [
+        unansweredLane(data.lanes.memories, 'memories')
+          ?? new Item('no memories bound to this file', { icon: new vscode.ThemeIcon('check') }),
+      ];
     }
     return memories.map((m) => {
       const diverged = m.verdict === 'diverged';
@@ -407,7 +454,12 @@ export class PapertrailView extends FileView {
       }
     }
     if (!out.length) {
-      return [new Item('no tracker items reference this file', { icon: new vscode.ThemeIcon('check') })];
+      return [
+        unansweredLane(data.lanes.papertrail, 'tracker items')
+          ?? new Item('no tracker items reference this file', {
+            icon: new vscode.ThemeIcon('check'),
+          }),
+      ];
     }
     return out;
   }
