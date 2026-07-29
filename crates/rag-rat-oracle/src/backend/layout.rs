@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
+use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 /// What a live backend learned about a checkout's projects, resolved ONCE per session.
@@ -337,65 +337,163 @@ struct CompilationDatabase {
 /// "arguments"`) and falls back to generic flags for the whole checkout, so an entry naming only a
 /// file is not a usable database however well-formed its JSON is.
 ///
-/// The invocation's TYPE is checked, not just its presence: measured with clangd 19.1.2, a
-/// `"command"` that is not a string is rejected with `Expected string as value`, and an
-/// `"arguments"` that is not an array with `Expected sequence as value` — each discarding the whole
-/// database, exactly like a missing key. Which of the two forms is present is checked in
-/// [`CompilationDatabaseVisitor`], because either satisfies the format.
+/// The SHAPE of each value is checked, not just the key's presence, because clangd reads a
+/// compilation database with clang's YAML/JSON reader and rejects the whole file on a shape it does
+/// not expect. Measured against clangd 19.1.2, the rule it applies is:
 ///
-/// `file` and `directory` are deliberately presence-only. clangd COERCES them: the same version
-/// loads `"directory": 7` and runs the command in a directory literally named `7`. Requiring a
-/// string there would reject databases the server accepts — a false negative that silently costs a
-/// checkout its live evidence, which is worse than the malformed input it would catch.
+/// - every field must be a SCALAR node, and which kind does not matter — `"directory": 7`,
+///   `"command": null`, and `"command": true` all load, the value simply being read as text;
+/// - except `arguments`, which must be a SEQUENCE — `null`, a number, and an object are each
+///   rejected with `Expected sequence as value`, and its elements are not themselves type-checked;
+/// - a composite where a scalar belongs (`"command": []`, `"directory": {}`) is rejected with
+///   `Expected string as value`.
 ///
-/// Every payload is discarded while parsing, so nothing here allocates per entry.
+/// So the check accepts any scalar and refuses only the composite shapes. Being stricter would be
+/// a false negative — rejecting a database the server loads silently costs a checkout its live
+/// evidence, which is worse than the malformed input it would catch — and being looser lets a
+/// database clangd discards look usable, which is how a fallback-flags answer gets persisted as
+/// trusted evidence.
+///
+/// Presence is tracked separately from value, because serde's `Option` collapses "key absent" and
+/// "key present and null" into `None` — and those differ here: `"arguments": null` is a PRESENT
+/// arguments field of the wrong shape, which clangd rejects, while an absent one is satisfied by
+/// `command`. Every payload is discarded, so nothing allocates per entry.
+struct CompilationEntry;
+
+/// The entry fields whose shape is constrained. `Other` is every extra key a generator emits
+/// (`output`, and whatever else) — read and discarded, since clangd ignores them too.
 #[derive(Deserialize)]
-struct CompilationEntry {
-    #[allow(dead_code)]
-    file: IgnoredAny,
-    #[allow(dead_code)]
-    directory: IgnoredAny,
-    command: Option<JsonString>,
-    arguments: Option<JsonArray>,
+#[serde(field_identifier, rename_all = "lowercase")]
+enum EntryField {
+    File,
+    Directory,
+    Command,
+    Arguments,
+    #[serde(other)]
+    Other,
 }
 
-/// A JSON string whose CONTENT is discarded — the type is the whole check. Deserializing into
-/// `String` would allocate once per entry across a database with hundreds of thousands of them.
-struct JsonString;
-
-impl<'de> Deserialize<'de> for JsonString {
+impl<'de> Deserialize<'de> for CompilationEntry {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_str(JsonScalarVisitor)
+        deserializer.deserialize_map(CompilationEntryVisitor)
+    }
+}
+
+struct CompilationEntryVisitor;
+
+impl<'de> Visitor<'de> for CompilationEntryVisitor {
+    type Value = CompilationEntry;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a compilation database entry")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let (mut file, mut directory, mut invocation) = (false, false, false);
+        while let Some(field) = map.next_key::<EntryField>()? {
+            match field {
+                EntryField::File => {
+                    map.next_value::<JsonScalar>()?;
+                    file = true;
+                },
+                EntryField::Directory => {
+                    map.next_value::<JsonScalar>()?;
+                    directory = true;
+                },
+                EntryField::Command => {
+                    map.next_value::<JsonScalar>()?;
+                    invocation = true;
+                },
+                EntryField::Arguments => {
+                    map.next_value::<JsonSequence>()?;
+                    invocation = true;
+                },
+                EntryField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                },
+            }
+        }
+        // The same three the server reports: `Missing key: "file"`, `Missing key: "directory"`, and
+        // `Missing key: "command" or "arguments"`.
+        if !file {
+            return Err(de::Error::missing_field("file"));
+        }
+        if !directory {
+            return Err(de::Error::missing_field("directory"));
+        }
+        if !invocation {
+            return Err(de::Error::custom("entry has neither `command` nor `arguments`"));
+        }
+        Ok(CompilationEntry)
+    }
+}
+
+/// Any JSON scalar — string, number, boolean, or null — with the value discarded. Composites are
+/// refused by leaving `visit_seq`/`visit_map` to the erroring defaults.
+struct JsonScalar;
+
+impl<'de> Deserialize<'de> for JsonScalar {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(JsonScalarVisitor)
     }
 }
 
 struct JsonScalarVisitor;
 
 impl<'de> Visitor<'de> for JsonScalarVisitor {
-    type Value = JsonString;
+    type Value = JsonScalar;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a compile command as a string")
+        formatter.write_str("a string, number, boolean, or null")
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(JsonScalar)
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(JsonScalar)
+    }
+
+    fn visit_i128<E: de::Error>(self, _: i128) -> Result<Self::Value, E> {
+        Ok(JsonScalar)
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(JsonScalar)
+    }
+
+    fn visit_u128<E: de::Error>(self, _: u128) -> Result<Self::Value, E> {
+        Ok(JsonScalar)
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(JsonScalar)
     }
 
     fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
-        Ok(JsonString)
+        Ok(JsonScalar)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(JsonScalar)
     }
 }
 
-/// A JSON array whose ELEMENTS are discarded — as with [`JsonString`], only the type is checked.
-struct JsonArray;
+/// A JSON array whose ELEMENTS are discarded — only the shape is checked, matching clangd, which
+/// does not type-check the elements either.
+struct JsonSequence;
 
-impl<'de> Deserialize<'de> for JsonArray {
+impl<'de> Deserialize<'de> for JsonSequence {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_seq(JsonArrayVisitor)
+        deserializer.deserialize_seq(JsonSequenceVisitor)
     }
 }
 
-struct JsonArrayVisitor;
+struct JsonSequenceVisitor;
 
-impl<'de> Visitor<'de> for JsonArrayVisitor {
-    type Value = JsonArray;
+impl<'de> Visitor<'de> for JsonSequenceVisitor {
+    type Value = JsonSequence;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("compile arguments as an array")
@@ -405,7 +503,7 @@ impl<'de> Visitor<'de> for JsonArrayVisitor {
         // An EMPTY array is accepted on purpose: clangd loads such a database rather than
         // rejecting it, and this check exists to agree with the server, not to improve on it.
         while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(JsonArray)
+        Ok(JsonSequence)
     }
 }
 
@@ -429,12 +527,9 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut entries = 0usize;
-        // The first incomplete entry ends the read: clangd would reject the database at that point
-        // too, so there is nothing later in the file that could redeem it.
-        while let Some(entry) = seq.next_element::<CompilationEntry>()? {
-            if entry.command.is_none() && entry.arguments.is_none() {
-                return Err(de::Error::custom("entry has neither `command` nor `arguments`"));
-            }
+        // The first entry `CompilationEntry` rejects ends the read: clangd would refuse the
+        // database at that point too, so nothing later in the file could redeem it.
+        while seq.next_element::<CompilationEntry>()?.is_some() {
             entries += 1;
         }
         Ok(CompilationDatabase { entries })

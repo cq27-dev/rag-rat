@@ -585,25 +585,42 @@ fn one_malformed_entry_anywhere_makes_the_whole_database_unusable() {
 }
 
 #[test]
-fn the_invocations_json_type_is_checked_exactly_where_clangd_checks_it() {
-    // A present-but-wrong-typed invocation discards the whole database exactly like a missing key,
-    // so presence alone is not enough. Measured with clangd 19.1.2: `"command"` as an array gives
-    // `Expected string as value`, `"arguments"` as a string gives `Expected sequence as value`,
-    // and both fall back to generic flags for every file.
+fn an_entrys_shape_is_judged_the_way_clangd_judges_it() {
+    // clangd reads a compilation database with clang's YAML/JSON reader, so the rule is about node
+    // SHAPE, not JSON type: every field must be a scalar (of any kind), except `arguments`, which
+    // must be a sequence. Both halves of that matter and both are easy to get wrong —
     //
-    // The path fields are the other half of the same discipline: clangd COERCES them (the same
-    // version loads `"directory": 7` and runs the command in a directory named `7`), so requiring
-    // strings there would reject a database the server accepts — a false negative costs a checkout
-    // its live evidence, which is worse than the malformed input it would catch. This check agrees
-    // with the server rather than improving on it, in both directions.
+    //   too strict → a database the server loads is reported unusable, and the checkout silently
+    //   loses all live evidence;
+    //   too loose  → a database the server DISCARDS looks usable, the session is pinned to it, and
+    //   a fallback-flags answer resolving a cross-unit call to a header declaration is persisted
+    //   as trusted evidence.
+    //
+    // Every case below was measured against clangd 19.1.2 with `--check` and
+    // `--compile-commands-dir`; `Compile command from CDB` means loaded, `Failed to load
+    // compilation database` / `Generic fallback command` means the whole file was discarded.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
     let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-entry-types");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
 
+    // `Expected sequence as value` / `Expected string as value` / `Missing key: …`.
     let rejected = [
+        // A composite where a scalar belongs.
         r#"[{"directory":"/x","file":"/x/a.c","command":["cc","-c","a.c"]}]"#,
+        r#"[{"directory":"/x","file":[],"command":"cc -c a.c"}]"#,
+        r#"[{"directory":{},"file":"/x/a.c","command":"cc -c a.c"}]"#,
+        // `arguments` present but not a sequence. `null` is the trap: it is a PRESENT field of the
+        // wrong shape, which clangd rejects, and serde's `Option` would fold it into "absent" and
+        // let the entry pass on its `command` alone.
+        r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","arguments":null}]"#,
         r#"[{"directory":"/x","file":"/x/a.c","arguments":"cc -c a.c"}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":7}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":{}}]"#,
+        // Required keys absent.
+        r#"[{"directory":"/x","command":"cc -c a.c"}]"#,
+        r#"[{"file":"/x/a.c","command":"cc -c a.c"}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c"}]"#,
     ];
     for database in rejected {
         std::fs::write(dir.join("compile_commands.json"), database).unwrap();
@@ -614,14 +631,23 @@ fn the_invocations_json_type_is_checked_exactly_where_clangd_checks_it() {
     }
 
     let accepted = [
-        // Each invocation in its own correct form, including an empty argument list, which clangd
-        // loads rather than rejecting.
+        // Each invocation in its own correct form, including an empty argument list.
         r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c"}]"#,
         r#"[{"directory":"/x","file":"/x/a.c","arguments":["cc","-c","a.c"]}]"#,
         r#"[{"directory":"/x","file":"/x/a.c","arguments":[]}]"#,
-        // Coerced path fields: clangd loads these, so this check must not be stricter.
+        // Any scalar is a scalar. clangd reads the node as text and never checks what kind it was:
+        // it loads `"directory": 7` and runs the command in a directory literally named `7`, and
+        // takes `"command": null` as the command string. Refusing these would be the false
+        // negative above, so they are pinned as ACCEPTED rather than tightened "for consistency".
         r#"[{"directory":7,"file":"/x/a.c","command":"cc -c a.c"}]"#,
         r#"[{"directory":"/x","file":7,"command":"cc -c a.c"}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","command":null}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","command":7}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","command":true}]"#,
+        // Elements of `arguments` are not type-checked by the server either.
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":[7,8]}]"#,
+        // An unknown key is read and discarded, as clangd does with `output`.
+        r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","output":"a.o"}]"#,
     ];
     for database in accepted {
         std::fs::write(dir.join("compile_commands.json"), database).unwrap();
