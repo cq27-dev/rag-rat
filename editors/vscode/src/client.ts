@@ -25,6 +25,22 @@ export interface SymbolSelector {
   qname: string | null;
 }
 
+/**
+ * The `/api/symbol/callers` envelope, kept whole rather than unwrapped to `callers`: the server
+ * says which selector it answered by and how many symbols that selector covered, and a reader
+ * shown the union of two overloads' callers has to be told that is what it is.
+ *
+ * Both fields are OPTIONAL because the server and this extension version independently — a server
+ * built before the hop routes took a handle sends neither, and absence must read as "this server
+ * cannot say", never as an assumed `'id'`.
+ */
+export interface SymbolCallers {
+  callers: unknown[];
+  resolved_by?: 'id' | 'ref';
+  /** Symbols the selector expanded to; `> 1` on the `ref` lane means `callers` is their union. */
+  matched_symbols?: number;
+}
+
 export interface FileSymbol {
   /** Opaque `sym_<hex>` symbol handle — pass it back verbatim; never parse it as a number. */
   id: string | null;
@@ -257,9 +273,12 @@ export class LensClient {
   /**
    * Callers of ONE symbol. Sends the handle when the row carried one so overloads stay apart, and
    * falls back to the qualified name only when it did not — the server then answers with every
-   * symbol of that name, which is the older, ambiguous behaviour.
+   * symbol of that name, which is the older, ambiguous behaviour. The whole envelope is returned
+   * so the caller can say which of the two it got.
    */
-  async symbolCallers(selector: SymbolSelector, limit = 50): Promise<unknown[]> {
+  // `async` so a selector-less call REJECTS rather than throwing synchronously: the command
+  // handler awaits this, and a synchronous throw would escape its error path.
+  async symbolCallers(selector: SymbolSelector, limit = 50): Promise<SymbolCallers> {
     const params: Record<string, string> = { limit: String(limit) };
     if (selector.id) {
       params.id = selector.id;
@@ -268,7 +287,7 @@ export class LensClient {
     } else {
       throw new Error('symbolCallers needs a symbol handle or a qualified name');
     }
-    return (await this.get<{ callers: unknown[] }>('/api/symbol/callers', params)).callers;
+    return this.get<SymbolCallers>('/api/symbol/callers', params);
   }
 
   async watchVersions(signal: AbortSignal, onVersion: (version: VersionToken) => void): Promise<void> {

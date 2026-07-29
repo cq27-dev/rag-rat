@@ -543,8 +543,14 @@ const UNKNOWN_SYMBOL_HANDLE: &str = "unknown symbol handle";
 /// 400 would break call navigation on every such install. It is a documented fallback rather than
 /// an equal alternative — a qualified name is shared by every overload in a file, so the answer is
 /// their union, which the response says out loud via `resolved_by` / `matched_symbols`.
+///
+/// A request that CARRIES `id` is answered by the handle lane or not at all — an empty or
+/// malformed handle is a 400, never a fall-through to `qname`. The two lanes answer different
+/// questions, so degrading between them silently is the failure this route exists to remove: a
+/// client that meant one overload would get the union of every symbol sharing its name back,
+/// under a `resolved_by` it never asked for and has no reason to re-read.
 fn hop_selector(query: &SymbolHopQuery) -> Result<rag_rat_core::index::LensHopSelector, ApiError> {
-    if let Some(id) = query.id.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(id) = query.id.as_deref() {
         return rag_rat_base::serde_big_id::parse_sym_handle(id)
             .map(rag_rat_core::index::LensHopSelector::Handle)
             .ok_or_else(|| ApiError::bad_query("`id` must be a `sym_<hex>` symbol handle"));

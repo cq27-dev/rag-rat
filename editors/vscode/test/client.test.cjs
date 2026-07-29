@@ -2292,6 +2292,63 @@ test('caller requests prefer the symbol handle and fall back to the qualified na
 
   await assert.rejects(client.symbolCallers({ id: null, qname: null }), /handle or a qualified name/);
   assert.equal(requests.length, 2, 'a selector-less request must never reach the server');
+
+  // The envelope reaches the caller whole: unwrapping to `callers` here would throw away the
+  // server's own statement of how many symbols it answered for.
+  const answer = await client.symbolCallers({ id: 'sym_2029231588695800bf', qname: null });
+  assert.deepEqual(answer, { callers: [], resolved_by: 'id', matched_symbols: 1 });
+});
+
+test('the caller quick pick says when its rows are a union rather than one symbol', async () => {
+  const quickPicks = [];
+  const vscode = {
+    EventEmitter: class {
+      constructor() {
+        this.event = () => ({ dispose() {} });
+      }
+      fire() {}
+      dispose() {}
+    },
+    window: {
+      showQuickPick: async (_items, options) => {
+        quickPicks.push(options.placeHolder);
+        return undefined;
+      },
+    },
+    workspace: { registerTextDocumentContentProvider: () => ({ dispose() {} }) },
+    commands: { registerCommand: () => ({ dispose() {} }), executeCommand: async () => undefined },
+  };
+  const registered = new Map();
+  vscode.commands.registerCommand = (id, handler) => {
+    registered.set(id, handler);
+    return { dispose() {} };
+  };
+  const { registerSignalCommands, callersPlaceholder } = await loadSourceModule('lenses.ts', vscode);
+
+  let answer;
+  registerSignalCommands({ subscriptions: [] }, { symbolCallers: async () => answer });
+  const showCallers = registered.get('rag-rat-lens.showCallers');
+  const selector = { id: null, qname: 'src/lib.rs::run' };
+
+  // The qualified name covered both overloads, so these rows belong to two different functions.
+  // Reporting them as "callers of run" would state a narrower claim than the answer supports.
+  answer = { callers: [{}, {}], resolved_by: 'ref', matched_symbols: 2 };
+  await showCallers(selector, 'run');
+  assert.equal(quickPicks.at(-1), '2 callers of 2 symbols named run');
+
+  // Resolved by handle: the rows really are one symbol's.
+  answer = { callers: [{}], resolved_by: 'id', matched_symbols: 1 };
+  await showCallers({ id: 'sym_alpha', qname: 'src/lib.rs::run' }, 'run');
+  assert.equal(quickPicks.at(-1), '1 callers of run');
+
+  // Nothing indexed carries the name: the rows came from unresolved call sites alone, so calling
+  // them that symbol's callers would invent a symbol.
+  answer = { callers: [], resolved_by: 'ref', matched_symbols: 0 };
+  await showCallers(selector, 'run');
+  assert.equal(quickPicks.at(-1), '0 callers by name — nothing indexed is named run');
+
+  // A server too old to report either field says nothing, and neither do we.
+  assert.equal(callersPlaceholder('run', 3, {}), '3 callers of run');
 });
 
 test('each overload lens carries its own symbol handle', async () => {
@@ -2390,11 +2447,16 @@ test('the hover link dispatches show callers exactly as the lens does', async ()
     fan_in_bucket: 'low',
     dispatch: [],
   });
+  // The last row is what a server built before the handle existed sends: no `id` FIELD at all,
+  // rather than a null one.
+  const legacy = row(null, 'src/lib.rs::legacy', 25);
+  delete legacy.id;
   const symbols = [
     row('sym_alpha', 'src/lib.rs::run', 9),
     row('sym_beta', 'src/lib.rs::run', 13),
     row(null, 'src/lib.rs::only_named', 17),
     row(null, null, 21),
+    legacy,
   ];
   const provider = new GraphHoverProvider({ dataFor: async () => ({ data: { symbols } }) });
   const commandArguments = async (line) => {
@@ -2414,4 +2476,8 @@ test('the hover link dispatches show callers exactly as the lens does', async ()
     'run',
   ]);
   assert.equal(await commandArguments(21), undefined);
+  // An absent `id` must be normalized to null before the tuple is serialized: JSON drops an
+  // `undefined` field, so the hover would otherwise ship a selector one key short of the one the
+  // CodeLens dispatches — a shape difference no typecheck can see across a `command:` URI.
+  assert.deepEqual(await commandArguments(25), [{ id: null, qname: 'src/lib.rs::legacy' }, 'run']);
 });

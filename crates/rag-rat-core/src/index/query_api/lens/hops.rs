@@ -40,10 +40,13 @@ pub enum LensHopResolvedBy {
 pub struct LensCallers {
     pub callers: Vec<LensSymbolHop>,
     pub resolved_by: LensHopResolvedBy,
-    /// Active-scope symbols the selector expanded to: the logical symbol's members on the handle
-    /// lane (always one thing), and on the fallback lane every symbol the traversal seeds from the
-    /// name — by qualified name, or by short name while that short name is unambiguous. Zero
-    /// therefore means the name expanded to no symbol at all, never that the answer is unknown.
+    /// Active-scope symbols the selector expanded to. Read it against `resolved_by`, because the
+    /// two lanes count different things: on the handle lane it is the logical symbol's member
+    /// rows (its cfg variants — one symbol for almost every symbol, and always ONE logical
+    /// symbol, so it never signals ambiguity there), and on the fallback lane it is every symbol
+    /// the traversal seeds from the name — by qualified name, or by short name while that short
+    /// name is unambiguous — so `> 1` there says the hops are a union. Zero therefore means the
+    /// name expanded to no symbol at all, never that the answer is unknown.
     pub matched_symbols: u64,
 }
 
@@ -183,7 +186,9 @@ fn logical_symbol_in_scope(
 ) -> anyhow::Result<Option<(String, u64)>> {
     let row = conn
         .query_row(
-            "SELECT COALESCE(MIN(qn.value), ''), COUNT(*)
+            // Short name as the second-choice seed: `qualified_name_id` is nullable, and a seed of
+            // `''` leaves the traversal's query log naming nothing at all.
+            "SELECT COALESCE(MIN(qn.value), MIN(symbols.name), ''), COUNT(*)
              FROM logical_symbol_members member
              JOIN symbols ON symbols.id = member.symbol_id
              JOIN files ON files.id = symbols.file_id

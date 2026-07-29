@@ -9,6 +9,7 @@ import type {
   DecisionRecord,
   LensClient,
   PapertrailRef,
+  SymbolCallers,
   SymbolGraph,
   SymbolSelector,
 } from './client';
@@ -98,13 +99,42 @@ function openDoc(title: string, markdown: string): Thenable<void> {
  * row's name instead of its handle answers for every overload sharing that name rather than for
  * the row the reader is looking at. `undefined` = the row names no symbol the server can resolve,
  * so the surface must offer no link at all.
+ *
+ * Both fields are normalized to `null` because the hover's half of this contract is a JSON
+ * `command:` URI, which drops an `undefined` field entirely — a server that omits `id` would
+ * otherwise have the two surfaces build tuples that differ in shape while behaving alike, which is
+ * exactly the drift an untyped boundary hides.
  */
 export function callerCommandArguments(
   symbol: SymbolGraph,
 ): [SymbolSelector, string] | undefined {
   return symbol.id || symbol.qname
-    ? [{ id: symbol.id, qname: symbol.qname }, symbol.name]
+    ? [{ id: symbol.id ?? null, qname: symbol.qname ?? null }, symbol.name]
     : undefined;
+}
+
+/**
+ * What the caller quick pick says it is showing.
+ *
+ * The rows are the callers of ONE symbol only when the server resolved the request by handle. On
+ * the qualified-name fallback they are the union over every symbol of that name, and `0` matched
+ * symbols means the name named nothing indexed and the rows came from unresolved call sites alone.
+ * Rendering all three as `N callers of foo` states the narrow claim while showing the wide answer.
+ * A server that reports neither field says nothing, so neither do we.
+ */
+export function callersPlaceholder(
+  name: string,
+  rowCount: number,
+  answer: Pick<SymbolCallers, 'resolved_by' | 'matched_symbols'>,
+): string {
+  const matched = answer.resolved_by === 'ref' ? answer.matched_symbols : undefined;
+  if (matched === 0) {
+    return `${rowCount} callers by name — nothing indexed is named ${name}`;
+  }
+  if (matched !== undefined && matched > 1) {
+    return `${rowCount} callers of ${matched} symbols named ${name}`;
+  }
+  return `${rowCount} callers of ${name}`;
 }
 
 export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Disposable {
@@ -250,7 +280,8 @@ export function registerSignalCommands(
     vscode.workspace.registerTextDocumentContentProvider(DOC_SCHEME, (lensDocs = new LensDocProvider())),
 
     vscode.commands.registerCommand('rag-rat-lens.showCallers', async (selector: SymbolSelector, name: string) => {
-      const rows = (await client.symbolCallers(selector)) as CallerRow[];
+      const answer = await client.symbolCallers(selector);
+      const rows = answer.callers as CallerRow[];
       const picked = await vscode.window.showQuickPick(
         rows.map((r) => ({
           label: `$(symbol-method) ${r.name}`,
@@ -258,7 +289,7 @@ export function registerSignalCommands(
           detail: `${r.path}:${r.source_start_line}`,
           row: r,
         })),
-        { placeHolder: `${rows.length} callers of ${name}` },
+        { placeHolder: callersPlaceholder(name, rows.length, answer) },
       );
       if (picked) {
         await openLocation(picked.row.path, picked.row.source_start_line);

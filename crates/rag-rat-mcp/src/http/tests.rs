@@ -343,9 +343,11 @@ async fn new_routes_reject_missing_or_invalid_parameters() {
         "/api/file/papertrail",
         "/api/symbol/callers",
         "/api/symbol/callees?qname=",
-        // An empty `id` falls through to the qualified name, which is also absent.
+        // A present `id` is a handle or an error; none of these is a `sym_<hex>` handle, and none
+        // may be read as a name instead. The lane-swap this refuses is covered end to end, with a
+        // resolvable `qname` alongside, in
+        // `hop_routes_prefer_the_symbol_handle_over_the_shared_qualified_name`.
         "/api/symbol/callers?id=",
-        // Neither is a `sym_<hex>` handle, and neither may be read as one.
         "/api/symbol/callers?id=12345",
         "/api/symbol/callees?id=sym_zzz",
         "/api/chunk/text",
@@ -802,6 +804,28 @@ async fn hop_routes_prefer_the_symbol_handle_over_the_shared_qualified_name() {
             .await;
     assert_eq!(hop_names(&both["callers"]), ["calls_alpha"]);
     assert_eq!(both["resolved_by"], "id");
+
+    // A request that CARRIES `id` is answered by the handle lane or refused. Degrading a bad
+    // handle to the qualified name beside it would hand back the union of both overloads to a
+    // client that asked for one — the very answer this route exists to stop giving.
+    for id in ["", "12345", "sym_zzz"] {
+        for route in ["callers", "callees"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/symbol/{route}?id={id}&qname=src/lib.rs::run"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "id={id:?} route={route}");
+            assert_eq!(
+                json_body(response).await["error"],
+                "`id` must be a `sym_<hex>` symbol handle"
+            );
+        }
+    }
 
     // A well-formed handle naming nothing here is a 404, not an empty caller list.
     for route in ["callers", "callees"] {
