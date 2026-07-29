@@ -395,6 +395,9 @@ struct GraphReindexFile {
     path: String,
     language: Language,
     kind: TargetKind,
+    /// Digest of the text that produced this row — the graph heal's proof that the bytes it read
+    /// from the active checkout are this row's own (rows span every commit/worktree scope).
+    sha256: String,
 }
 
 #[derive(Debug)]

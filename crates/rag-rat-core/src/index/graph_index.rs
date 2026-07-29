@@ -1635,27 +1635,6 @@ impl IndexDatabase {
         };
         self.storage.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| -> anyhow::Result<()> {
-            // Scope the wipe to the ACTIVE REPO's edges (A3): `graph_index_version` is per-repo, so
-            // a stale/missing version for repo A must not wipe repo B's edges in a
-            // consolidated DB. An edge belongs to its `source_file_id`'s repo;
-            // `source_file_id` is always set (its FK is `ON DELETE CASCADE`, every edge
-            // is inserted with a file id), so this removes exactly this repo's edges —
-            // the same set the repopulate below (over the repo-scoped `files`
-            // view) re-derives. Within the repo this matches the prior wholesale behavior; only
-            // sibling repos are now spared.
-            // The `generation` predicate (A6) makes the sentence above literally true: the wipe
-            // removes exactly the set the repopulate re-derives (the ACTIVE generation's edges).
-            // Without it, a heal would also wipe a superseded generation's edges (merely early gc)
-            // — and, in the rare concurrent case of a version-bump heal racing another
-            // connection's staged rebuild, the STAGED generation's edges, which nothing would
-            // re-resolve.
-            self.storage.connection().execute(
-                "DELETE FROM edges_data
-                  WHERE source_file_id IN (
-                      SELECT id FROM main.files WHERE repo_id = ?1 AND generation = ?2
-                  )",
-                params![self.active_repo_id, self.active_generation],
-            )?;
             // Repopulate the per-package import scope BEFORE re-resolving (#61). A bare
             // version-bump re-resolve would re-derive `import_scope_*` on the new edges
             // but read an empty `packages` table (V022 only ADDED the column; it did not
@@ -1666,25 +1645,43 @@ impl IndexDatabase {
             // package at load time (`load_package_roots_into_scope`) from those rows.
             self.refresh_packages(&root)?;
             let files = self.graph_reindex_files()?;
-            // Files whose persisted scope could NOT be refreshed to the current key shape. A
-            // heal repopulates the whole repo+generation edge set, so it walks rows belonging to
-            // sibling commits/worktrees too — their paths need not exist under THIS root, and a
-            // row can outlive its file between an edit and the next index pass. None of that is
-            // a heal failure: extraction already emits the new shape, so each such file re-lands
-            // its scope the next time it is indexed. Failing the open instead would brick every
-            // subsequent open on an index that merely holds one unreadable or edited path.
+            // The heal walks the repo+generation's WHOLE file set (A3 + A6 scope it to this
+            // repo's live generation), which spans every commit/worktree scope — but it has
+            // exactly ONE checkout to read from. So each row is re-derived only from bytes
+            // PROVEN to be its own: `files.sha256` is the digest of the very text that produced
+            // the row, so a match means this checkout holds that file's indexed content, whoever
+            // else shares the path. Everything else — a sibling worktree whose copy differs, a
+            // path absent from this checkout, a file edited since it was indexed — keeps the
+            // graph and scopes it already has. Re-deriving those from the active root instead
+            // would stamp this checkout's graph onto another scope's rows; failing the open over
+            // them would brick every later open, since this runs ON the open path.
+            //
+            // A skipped row is then STALE, and stays stale: `graph_index_version` is per-repo and
+            // is stamped below regardless, so this heal never revisits it, and no later pass
+            // re-extracts a file whose content did not change. For a sibling worktree row that
+            // diverges from the active checkout, that can be indefinite. Accepted here because
+            // the alternative on this code path is worse — pre-digest-gate, such a row was wiped
+            // and rebuilt from the WRONG checkout's bytes — and because a lagging row degrades
+            // (it carries the older extractor's facts) rather than answering wrongly. Making the
+            // heal resumable per row, so a later pass can finish what this one could not vouch
+            // for, is #1014.
+            let mut unverified = 0usize;
             let mut unrefreshed = 0usize;
             for file in files {
                 let full_path = root.join(&file.path);
-                let needs_scope_refresh = !logical_current && file.language == Language::Rust;
                 let Ok(text) = fs::read_to_string(full_path) else {
-                    unrefreshed += usize::from(needs_scope_refresh);
+                    unverified += 1;
                     continue;
                 };
+                if rag_rat_base::hash::hex_sha256(text.as_bytes()) != file.sha256 {
+                    unverified += 1;
+                    continue;
+                }
                 // Above the parse limit there are no persisted symbols to refresh at all
                 // (`prepare_index_content_from_text` skips the same bound), so the scope shape
                 // is vacuously current for this file.
-                if needs_scope_refresh
+                if !logical_current
+                    && file.language == Language::Rust
                     && text.len() <= edges::MAX_GRAPH_PARSE_BYTES
                     && !self.refresh_symbol_scopes(file.id, Path::new(&file.path), &text)?
                 {
@@ -1696,6 +1693,17 @@ impl IndexDatabase {
                 {
                     continue;
                 }
+                // Wipe exactly the row being re-derived, immediately before re-deriving it.
+                // A repo-wide DELETE up front is what turned an unreadable or diverged row into
+                // silent edge LOSS: nothing repopulates a row this loop skips. Per-row, the wipe
+                // removes precisely the set the insert below replaces, and a skipped row keeps
+                // the edges it already has — which `resolve_edges` will NOT revisit on a scoped
+                // open (it writes only rows the connection's `files` view admits), so leaving
+                // them in place is the difference between stale and absent.
+                self.storage
+                    .connection()
+                    .prepare_cached("DELETE FROM edges_data WHERE source_file_id = ?1")?
+                    .execute([file.id])?;
                 edges::index_file_edges(
                     self.storage.connection(),
                     file.id,
@@ -1704,11 +1712,12 @@ impl IndexDatabase {
                     &text,
                 )?;
             }
-            if unrefreshed > 0 {
+            if unverified > 0 || unrefreshed > 0 {
                 tracing::warn!(
-                    files = unrefreshed,
-                    "graph heal could not refresh symbol scopes for every Rust file; their \
-                     logical grouping stays on the previous key shape until they are reindexed"
+                    unverified,
+                    unrefreshed,
+                    "graph heal skipped file rows this checkout could not vouch for; their graph \
+                     stays on the previous extraction and this heal will not revisit them (#1014)"
                 );
             }
             self.resolve_edges()?;
@@ -1737,8 +1746,9 @@ impl IndexDatabase {
     }
 
     /// Refresh symbol fields whose extraction semantics changed without rewriting chunks or
-    /// embeddings. Version 2 changes Rust impl scope shape (`Type as Trait`), and logical
-    /// regrouping is only correct after persisted symbols carry that new scope.
+    /// embeddings. Version 2 gives a Rust trait impl a trait-qualified scope
+    /// (`Type as std.fmt.Display`), and logical regrouping is only correct after persisted
+    /// symbols carry that new scope.
     ///
     /// Returns whether EVERY persisted symbol of the file was refreshed. Rows are matched on
     /// their exact byte span, so a file edited since it was indexed matches only the symbols
@@ -1779,7 +1789,7 @@ impl IndexDatabase {
         // tombstones (`mark_file_deleted`) carry `language='unknown', kind='deleted'` — neither
         // parses, so letting one through would turn every open into a hard error.
         let mut stmt = self.storage.connection().prepare(
-            "SELECT id, path, language, kind
+            "SELECT id, path, language, kind, sha256
                  FROM main.files
                  WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
                  ORDER BY path",
@@ -1787,11 +1797,17 @@ impl IndexDatabase {
         let rows = stmt.query_map(params![self.active_repo_id, self.active_generation], |row| {
             let language: String = row.get(2)?;
             let kind: String = row.get(3)?;
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, language, kind))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                language,
+                kind,
+                row.get::<_, String>(4)?,
+            ))
         })?;
         let mut files = Vec::new();
         for row in rows {
-            let (id, path, language, kind) = row?;
+            let (id, path, language, kind, sha256) = row?;
             // A marker row this build cannot name is a row to LEAVE ALONE, not a reason to fail
             // the open. `ensure_graph_index_current` is on the open path, so an unparseable
             // language/kind here would wedge the database for every later open too.
@@ -1801,7 +1817,7 @@ impl IndexDatabase {
                 tracing::warn!(path = %path, "skipping unrecognized file row during graph heal");
                 continue;
             };
-            files.push(GraphReindexFile { id, path, language, kind });
+            files.push(GraphReindexFile { id, path, language, kind, sha256 });
         }
         Ok(files)
     }
