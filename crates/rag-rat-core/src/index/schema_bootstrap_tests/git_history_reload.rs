@@ -1,10 +1,25 @@
 use super::*;
 
+/// The two-commit git-history fixture: its scratch guard, the repo root, and the `Config`.
+///
+/// The returned root is the spelling the `Config` CARRIES, not the raw scratch path. Fixture
+/// `Config`s canonicalize their root exactly as `Config::load` does, so where the system temp is
+/// reached through a symlink (macOS `/var` → `/private/var`) or an 8.3 alias (Windows `RUNNER~1`)
+/// the scratch path is a second, non-canonical name for the same directory. The git-history
+/// cursor/plan helpers below (`prepare_plan`, `apply_prepared_deferring_cursors`,
+/// `is_history_current`) resolve the repo scope from the root they are handed, so a test driving
+/// them through the scratch spelling asks about a root the index never recorded (#1027).
+fn git_history_fixture() -> (ScratchRoot, PathBuf, Config) {
+    let scratch = unique_temp_root();
+    let _ = fs::remove_dir_all(&scratch);
+    let config = git_history_test_config(&scratch);
+    let root = config.root.clone();
+    (scratch, root, config)
+}
+
 #[test]
 fn git_history_appends_after_a_new_commit() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     let before = db.status(&config.database).unwrap().git_history.commit_count;
@@ -38,9 +53,7 @@ fn git_history_appends_after_a_new_commit() {
 
 #[test]
 fn git_history_append_rebuilds_desynced_commit_fts() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     let repo_id = db.active_repo_id.clone();
@@ -78,9 +91,7 @@ fn git_history_append_rebuilds_desynced_commit_fts() {
 
 #[test]
 fn history_import_materializes_coupling_and_bumps_lens_once() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
 
@@ -233,9 +244,7 @@ fn history_import_materializes_coupling_and_bumps_lens_once() {
 
 #[test]
 fn git_history_falls_back_when_append_rows_are_already_present() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     let before = db.status(&config.database).unwrap().git_history.commit_count;
@@ -273,9 +282,7 @@ fn git_history_falls_back_when_append_rows_are_already_present() {
 
 #[test]
 fn git_history_append_plan_falls_back_for_non_git_or_other_root() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
@@ -332,9 +339,7 @@ fn git_history_prepare_plan_fails_closed_on_incomplete_or_shallow_cursors() {
         CursorCase::CompleteFalse,
         CursorCase::CompleteBad,
     ] {
-        let root = unique_temp_root();
-        let _ = fs::remove_dir_all(&root);
-        let config = git_history_test_config(&root);
+        let (_scratch, root, config) = git_history_fixture();
         let db = IndexDatabase::rebuild(&config).unwrap();
         match case {
             CursorCase::MissingHead => {
@@ -431,9 +436,7 @@ fn git_history_prepare_plan_fails_closed_on_incomplete_or_shallow_cursors() {
 
 #[test]
 fn incomplete_git_history_cursor_forces_full_reload_before_fast_forward_append() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     let before = db.status(&config.database).unwrap().git_history.commit_count;
@@ -472,9 +475,7 @@ fn incomplete_git_history_cursor_forces_full_reload_before_fast_forward_append()
 
 #[test]
 fn stale_prepared_append_is_noop_after_another_pass_catches_up() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
@@ -505,9 +506,7 @@ fn stale_prepared_append_is_noop_after_another_pass_catches_up() {
 
 #[test]
 fn stale_prepared_append_clears_when_root_loses_git_dir() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
@@ -543,9 +542,7 @@ fn stale_prepared_append_clears_when_root_loses_git_dir() {
 
 #[test]
 fn stale_prepared_append_is_noop_when_db_cursor_is_ahead() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
@@ -645,9 +642,7 @@ fn git_history_append_records_new_head_for_out_of_scope_fast_forward_commit() {
 
 #[test]
 fn git_history_append_reports_commit_fts_prepare_errors() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
@@ -672,9 +667,7 @@ fn git_history_append_reports_commit_fts_prepare_errors() {
 
 #[test]
 fn repo_generation_file_count_reports_sql_errors() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
     let db = IndexDatabase::rebuild(&config).unwrap();
     db.storage.connection().execute("DROP TABLE main.files", []).unwrap();
     let err = db.repo_generation_file_count(true).expect_err("missing files table must error");
@@ -685,9 +678,7 @@ fn repo_generation_file_count_reports_sql_errors() {
 
 #[test]
 fn repo_generation_file_count_ignores_foreign_worktree_overlays() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
     let db = IndexDatabase::rebuild(&config).unwrap();
     let scoped = db.indexed_file_count().unwrap();
     assert_eq!(db.repo_generation_file_count(true).unwrap(), scoped);
@@ -746,9 +737,7 @@ fn repo_generation_file_count_ignores_foreign_worktree_overlays() {
 
 #[test]
 fn discovered_empty_active_commit_does_not_promote_changed_mode() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
     let db = IndexDatabase::rebuild(&config).unwrap();
     assert!(db.indexed_file_count().unwrap() > 0);
 
@@ -791,9 +780,7 @@ fn discovered_empty_active_commit_does_not_promote_changed_mode() {
 
 #[test]
 fn changed_mode_discovers_when_target_fingerprint_is_stale() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
     fs::create_dir_all(root.join("examples")).unwrap();
     fs::write(root.join("examples/guide.md"), "# Guide\nnew target token\n").unwrap();
     run_git(&root, &["add", "."]);
@@ -846,9 +833,7 @@ fn changed_mode_discovers_when_target_fingerprint_is_stale() {
 
 #[test]
 fn base_scope_marker_is_absent_without_commit_or_worktree_scope() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
     let mut db = IndexDatabase::rebuild(&config).unwrap();
     db.active_commit_sha.clear();
     db.active_worktree_id.clear();
@@ -867,9 +852,7 @@ fn base_scope_marker_is_absent_without_commit_or_worktree_scope() {
 
 #[test]
 fn watch_shutdown_marker_clear_is_idempotent() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     assert!(
@@ -890,9 +873,7 @@ fn watch_shutdown_marker_clear_is_idempotent() {
 
 #[test]
 fn git_history_appends_after_a_merge_commit() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     let before = db.status(&config.database).unwrap().git_history.commit_count;
@@ -924,9 +905,7 @@ fn git_history_appends_after_a_merge_commit() {
 
 #[test]
 fn git_history_appends_after_a_squash_commit() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     let before = db.status(&config.database).unwrap().git_history.commit_count;
@@ -959,9 +938,7 @@ fn git_history_appends_after_a_squash_commit() {
 
 #[test]
 fn git_history_reloads_after_a_history_rewrite() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     let before = db.status(&config.database).unwrap().git_history.commit_count;
@@ -984,9 +961,7 @@ fn git_history_reloads_after_a_history_rewrite() {
 
 #[test]
 fn git_history_reloads_after_a_non_fast_forward_branch_switch() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     insert_sentinel_commit(&db);
@@ -1007,9 +982,7 @@ fn git_history_reloads_after_a_non_fast_forward_branch_switch() {
 
 #[test]
 fn git_history_reloads_after_squashing_indexed_commits() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     let before = db.status(&config.database).unwrap().git_history.commit_count;
@@ -1097,9 +1070,7 @@ fn git_history_reload_is_not_skipped_on_a_shallow_clone() {
 
 #[test]
 fn idle_discover_sweep_does_not_rewrite_indexed_at_ms() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
     // Stamp a non-numeric sentinel so any spurious timestamp write is unmistakable. Under the
@@ -1141,9 +1112,7 @@ fn idle_discover_sweep_does_not_rewrite_indexed_at_ms() {
 
 #[test]
 fn index_discover_reporting_flags_content_changes() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    let config = git_history_test_config(&root);
+    let (_scratch, root, config) = git_history_fixture();
     IndexDatabase::rebuild(&config).unwrap();
 
     // No change → reports false, so the watch loop skips the reconcile / memory-validate tail.

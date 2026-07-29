@@ -427,14 +427,15 @@ fn worktree_overlay_reads_uncommitted_linked_edit_not_head() {
 /// binding `rag-rat init` produces for a repo with no conventional source subdirectory. A
 /// `src`-only binding never walks a checkout-root `.cache/`, so it says nothing about the floor.
 fn whole_root_c_config(root: PathBuf) -> Config {
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: config_root.join(".rag-rat/index.sqlite"),
+        root: config_root,
         targets: vec![ResolvedTarget {
             name: Language::C.as_str().to_string(),
             language: Language::C,

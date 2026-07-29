@@ -61,7 +61,7 @@ pub fn bench_config(subdir: &str) -> (Config, rag_rat_base::test_scratch::Scratc
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: corpus_dir(),
+        root: rag_rat_base::test_scratch::canonical_config_root(corpus_dir()),
         database: scratch.join("bench.sqlite"),
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),

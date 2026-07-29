@@ -672,6 +672,10 @@ fn orientation_pins_the_fork_repo_over_a_shared_root_sibling() {
     // Index the fork under a PINNED id (records root → fork-pin).
     let mut config = source_config(root.clone(), Language::Rust);
     config.repo_id_override = Some("fork-pin".to_string());
+    // The owner mirror matches the recorded root against the queried one, and the fixture
+    // canonicalizes its root like `Config::load` — so the identity/orientation calls below must be
+    // driven through `config.root`, not the raw scratch spelling of the same directory (#1027).
+    let root = config.root.clone();
     let db = IndexDatabase::rebuild(&config).unwrap();
     assert_eq!(db.active_repo_id, "fork-pin", "the fork indexes under its pinned id");
 

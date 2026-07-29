@@ -670,14 +670,15 @@ mod tests {
             "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n",
         )
         .unwrap();
+        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.to_path_buf(),
-            database: root.join(".rag-rat/index.sqlite"),
+            database: config_root.join(".rag-rat/index.sqlite"),
+            root: config_root,
             targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
                 language: rag_rat_base::language::Language::Rust,
@@ -783,15 +784,16 @@ mod tests {
             "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n",
         )
         .unwrap();
-        let db_path = root.join(".rag-rat/index.sqlite");
+        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
+        let db_path = config_root.join(".rag-rat/index.sqlite");
         let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.to_path_buf(),
             database: db_path.clone(),
+            root: config_root,
             targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
                 language: rag_rat_base::language::Language::Rust,
@@ -851,14 +853,15 @@ mod tests {
              } }\n",
         )
         .unwrap();
+        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.to_path_buf(),
-            database: root.join(".rag-rat/index.sqlite"),
+            database: config_root.join(".rag-rat/index.sqlite"),
+            root: config_root,
             targets: vec![rag_rat_base::config::ResolvedTarget {
                 name: "rust".to_string(),
                 language: rag_rat_base::language::Language::Rust,
@@ -952,14 +955,15 @@ mod tests {
             exclude: Vec::new(),
             kind: rag_rat_base::config::TargetKind::Source,
         };
+        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = rag_rat_base::config::Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.to_path_buf(),
-            database: root.join(".rag-rat/index.sqlite"),
+            database: config_root.join(".rag-rat/index.sqlite"),
+            root: config_root,
             targets: vec![
                 target("rust", rag_rat_base::language::Language::Rust, "src"),
                 target("python", rag_rat_base::language::Language::Python, "py"),

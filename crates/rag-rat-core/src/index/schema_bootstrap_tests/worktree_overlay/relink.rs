@@ -337,6 +337,11 @@ fn a_body_only_base_edit_pass_relinks_without_a_rebuild() {
     run_git(&main, &["add", "."]);
     run_git(&main, &["commit", "-q", "-m", "base"]);
     let config = source_config(main.clone(), Language::Rust);
+    // Supply paths spelled from the root the `Config` carries: the fixture canonicalizes it like
+    // `Config::load`, so the scratch spelling is a second, non-canonical name for the same
+    // directory wherever temp is symlinked. This test is about the relink tail, not about
+    // `index --paths`' non-canonical-spelling retry (#1027).
+    let main = config.root.clone();
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
 

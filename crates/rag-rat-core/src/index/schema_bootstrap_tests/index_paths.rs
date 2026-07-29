@@ -1201,7 +1201,13 @@ fn index_paths_tombstones_a_regular_file_replaced_by_a_symlink() {
     // to true — the exact case a sha/is_file check would mis-treat as "restored").
     fs::remove_file(root.join("src/a.rs")).unwrap();
     std::os::unix::fs::symlink(root.join("src/b.rs"), root.join("src/a.rs")).unwrap();
-    let db = IndexDatabase::index_paths(&config, &[root.join("src/a.rs")]).unwrap();
+    // Supply the path spelled from `config.root`: the fixture canonicalizes its root like
+    // `Config::load`, and a supplied path spelled from the raw scratch root is a DIFFERENT
+    // (non-canonical) name for the same file wherever temp is symlinked. `index --paths`
+    // re-resolves such a path by canonicalizing it, which for a symlink leaf follows to its
+    // TARGET — so the raw spelling would silently supply `src/b.rs` and this test would stop
+    // exercising the tombstone path at all (#1027).
+    let db = IndexDatabase::index_paths(&config, &[config.root.join("src/a.rs")]).unwrap();
 
     assert_eq!(
         db.indexed_file_count().unwrap(),
@@ -1283,7 +1289,10 @@ fn index_paths_tombstones_a_regular_file_replaced_by_an_escaping_symlink() {
     fs::remove_file(root.join("src/a.rs")).unwrap();
     std::os::unix::fs::symlink(outside.join("evil.rs"), root.join("src/a.rs")).unwrap();
 
-    let db = IndexDatabase::index_paths(&config, &[root.join("src/a.rs")]).unwrap();
+    // Spelled from `config.root` for the same reason as the in-repo symlink case above: the raw
+    // scratch spelling would be re-resolved by following the symlink LEAF, landing outside the
+    // root, and the path would be dropped before the deletion branch ran (#1027).
+    let db = IndexDatabase::index_paths(&config, &[config.root.join("src/a.rs")]).unwrap();
     // Count 1 proves BOTH: a.rs's stale row is tombstoned AND the external evil.rs is not indexed
     // (an external read would have reindexed src/a.rs, keeping the count at 2).
     assert_eq!(

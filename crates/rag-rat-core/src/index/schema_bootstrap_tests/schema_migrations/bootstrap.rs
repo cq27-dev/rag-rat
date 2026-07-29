@@ -7,14 +7,15 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
     let docs = root.join("docs");
     fs::create_dir_all(&docs).unwrap();
 
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: config_root.join(".rag-rat/index.sqlite"),
+        root: config_root,
         targets: vec![ResolvedTarget {
             name: "markdown".to_string(),
             language: Language::Markdown,

@@ -75,14 +75,15 @@ fn placement_counters() -> WatchPlacementCounters {
 /// the real-watcher placement tests share so they can call `watch_created_dirs` (which needs a
 /// `&Config` for the target-relation gate, #332).
 fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> Config {
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.to_path_buf(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: config_root.join(".rag-rat/index.sqlite"),
+        root: config_root,
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
             language: Language::Rust,
@@ -2302,14 +2303,15 @@ fn event_is_relevant_skips_gitignored_paths_consistently_with_walker() {
     std::fs::create_dir_all(root.join("crates")).unwrap();
     std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
 
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: config_root.join(".rag-rat/index.sqlite"),
+        root: config_root,
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
             language: Language::Rust,
@@ -2328,6 +2330,11 @@ fn event_is_relevant_skips_gitignored_paths_consistently_with_walker() {
         source_root_reanchored_from: None,
         allow_empty: false,
     };
+    // The classifier matches an event by stripping `config.root` off its path, and the
+    // fixture Config canonicalizes that root — so spell the fixture's paths and ignore
+    // rules through the SAME root, exactly as the live watcher (which subscribes under
+    // `config.root`) delivers them (#1027).
+    let root = config.root.clone();
     let ignore = IgnoreMatcher::compile(&root, &[]);
 
     // A real source edit under the target fires.
@@ -2369,14 +2376,15 @@ fn gitignore_edit_is_relevant_and_recompile_reflects_new_rules() {
     // Initially nothing is gitignored.
     std::fs::write(root.join(".gitignore"), "").unwrap();
 
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: config_root.join(".rag-rat/index.sqlite"),
+        root: config_root,
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
             language: Language::Rust,
@@ -2396,6 +2404,11 @@ fn gitignore_edit_is_relevant_and_recompile_reflects_new_rules() {
         allow_empty: false,
     };
 
+    // The classifier matches an event by stripping `config.root` off its path, and the
+    // fixture Config canonicalizes that root — so spell the fixture's paths and ignore
+    // rules through the SAME root, exactly as the live watcher (which subscribes under
+    // `config.root`) delivers them (#1027).
+    let root = config.root.clone();
     let ignore = IgnoreMatcher::compile(&root, &[]);
     let secret = root.join("crates/secret.rs");
     // Before the rule edit: a normal source edit fires.

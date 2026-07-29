@@ -420,14 +420,15 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
         run_git(&root, &["commit", "-m", "Iterate hot module"]);
     }
 
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: config_root.join(".rag-rat/index.sqlite"),
+        root: config_root,
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
             language: Language::Rust,
@@ -510,14 +511,15 @@ fn repo_clusters_groups_cotouched_files() {
         run_git(&root, &["commit", "-m", "Iterate sync modules"]);
     }
 
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: config_root.join(".rag-rat/index.sqlite"),
+        root: config_root,
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
             language: Language::Rust,

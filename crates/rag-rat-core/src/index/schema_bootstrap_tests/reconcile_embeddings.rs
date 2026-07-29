@@ -730,14 +730,15 @@ fn policy_skip_summary_recomputes_exactly_for_a_non_default_char_cap() {
     let big =
         "// generated data line with sufficient length to matter for the cap xxxxx\n".repeat(80);
     fs::write(root.join("gen/bindings.rs"), &big).unwrap();
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: config_root.join(".rag-rat/index.sqlite"),
+        root: config_root,
         targets: vec![ResolvedTarget {
             name: "generated".to_string(),
             language: Language::Rust,
@@ -980,14 +981,15 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-m", "Refresh beta docs"]);
 
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: config_root.join(".rag-rat/index.sqlite"),
+        root: config_root,
         targets: vec![
             ResolvedTarget {
                 name: "markdown".to_string(),

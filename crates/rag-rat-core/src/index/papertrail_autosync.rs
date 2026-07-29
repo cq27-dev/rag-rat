@@ -668,14 +668,15 @@ mod tests {
     }
 
     fn test_config(root: &Path) -> Config {
+        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.to_path_buf(),
-            database: root.join("db/index.sqlite"),
+            database: config_root.join("db/index.sqlite"),
+            root: config_root,
             targets: Vec::new(),
             llm: Default::default(),
             watch: Default::default(),

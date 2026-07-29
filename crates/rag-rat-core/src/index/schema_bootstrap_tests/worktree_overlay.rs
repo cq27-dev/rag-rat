@@ -1,5 +1,6 @@
 use super::*;
 
+mod config_root;
 mod delta_refresh;
 mod lens_handles;
 mod lifecycle;

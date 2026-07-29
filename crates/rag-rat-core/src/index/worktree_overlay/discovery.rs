@@ -52,30 +52,56 @@ pub struct WorktreeOverlayReport {
 /// equivalent of `config.root`. The subdir is derived from the BASE workdir (both worktrees share
 /// the same layout); the linked root is the linked WORKDIR joined with that subdir — NOT the raw
 /// `linked_path`, which may be a subdir of the checkout (e.g. `--worktree .` from `/wt/src`) or the
-/// git dir (a hook). Falls back to the linked workdir / `linked_path` when the subdir can't be
-/// derived. Shared by the delta computation (path rebasing) and the read step (source root) so the
-/// two can't drift (#219 review).
+/// git dir (a hook). Shared by the delta computation (path rebasing) and the read step (source
+/// root) so the two can't drift (#219 review).
+///
+/// BOTH sides of the strip are canonicalized first. `Config::load` guarantees a canonical root, but
+/// gix's `workdir()` makes no such promise, and a `Config` assembled in-process (a fixture, an
+/// embedding caller) can carry any spelling of the root — a symlinked `$PWD`, macOS's `/var` for
+/// `/private/var`, a Windows 8.3 name. Normalizing here is a no-op for a root that already holds
+/// the invariant and repairs one that does not.
+///
+/// ERRORS rather than falling back when the subdir still cannot be derived (#1027). The former
+/// fallback — an empty subdir, the linked workdir as the source root — makes the whole refresh
+/// scope the repo root instead of the config root: every candidate path keeps a `crate/` prefix
+/// the targets don't match, the delta comes out empty, nothing is written, no client is
+/// invalidated, and `index_worktree_overlay` still returns `Ok(())`. A caller cannot tell that
+/// from a genuinely unchanged worktree, which is what made the original report expensive to
+/// localize. There is no correct scope to fall back to here, so say so.
 fn linked_config_subdir_and_root(
     config_root: &Path,
     base_repo: &gix::Repository,
     linked_repo: &gix::Repository,
     linked_path: &Path,
-) -> (PathBuf, PathBuf) {
+) -> anyhow::Result<(PathBuf, PathBuf)> {
     let linked_workdir =
         linked_repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| linked_path.to_path_buf());
-    // `config.root` is canonicalized (by `Config::load`'s `normalize_existing_dir`), but gix's
-    // `workdir()` may not be; canonicalize the base workdir so the subdir prefix strips cleanly.
-    let config_subdir = base_repo
-        .workdir()
-        .map(|base_workdir| {
-            base_workdir.canonicalize().unwrap_or_else(|_| base_workdir.to_path_buf())
-        })
-        .and_then(|base_workdir| {
-            config_root.strip_prefix(&base_workdir).ok().map(Path::to_path_buf)
-        })
-        .unwrap_or_default();
+    let base_workdir = base_repo.workdir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot scope a worktree overlay for {}: its repository has no working tree",
+            config_root.display(),
+        )
+    })?;
+    let base_workdir = canonical_or_raw(base_workdir);
+    let config_subdir = canonical_or_raw(config_root)
+        .strip_prefix(&base_workdir)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "cannot scope a worktree overlay: the index root {} does not resolve to a path \
+                 inside its repository's working tree {}",
+                config_root.display(),
+                base_workdir.display(),
+            )
+        })?
+        .to_path_buf();
     let linked_config_root = linked_workdir.join(&config_subdir);
-    (config_subdir, linked_config_root)
+    Ok((config_subdir, linked_config_root))
+}
+
+/// `path` canonicalized, or `path` itself when it cannot be resolved (a vanished directory) — the
+/// caller then fails on the strip rather than on the canonicalization.
+fn canonical_or_raw(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub(crate) fn linked_source_root(
@@ -84,7 +110,7 @@ pub(crate) fn linked_source_root(
 ) -> anyhow::Result<PathBuf> {
     let base_repo = rag_rat_base::repo_discover::discover_repo(config_root)?;
     let linked_repo = rag_rat_base::repo_discover::discover_repo(linked_path)?;
-    Ok(linked_config_subdir_and_root(config_root, &base_repo, &linked_repo, linked_path).1)
+    Ok(linked_config_subdir_and_root(config_root, &base_repo, &linked_repo, linked_path)?.1)
 }
 
 /// A linked-worktree overlay's resolved identity plus the opened repositories it was resolved
@@ -119,7 +145,7 @@ pub(super) fn resolve_overlay_scope(
     let base_repo = rag_rat_base::repo_discover::discover_repo(&config.root)?;
     let linked_repo = rag_rat_base::repo_discover::discover_repo(linked_path)?;
     let (config_subdir, source_root) =
-        linked_config_subdir_and_root(&config.root, &base_repo, &linked_repo, linked_path);
+        linked_config_subdir_and_root(&config.root, &base_repo, &linked_repo, linked_path)?;
     Ok(Some(ResolvedOverlayScope {
         base_sha,
         worktree_id,

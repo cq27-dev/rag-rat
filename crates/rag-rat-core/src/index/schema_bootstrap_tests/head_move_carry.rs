@@ -8,9 +8,16 @@ use rag_rat_base::hash::hex_sha256;
 
 use super::*;
 
-/// A repo with two committed rust files, returning `(root, config)`. `keep.rs` stays unchanged
-/// across every HEAD move in these tests; `edit.rs` is the file the moves modify.
-fn head_move_repo(tag: &str) -> (ScratchRoot, Config) {
+/// A repo with two committed rust files, returning `(scratch guard, root, config)`. `keep.rs`
+/// stays unchanged across every HEAD move in these tests; `edit.rs` is the file the moves modify.
+///
+/// The root is the spelling the `Config` CARRIES, not the raw scratch path: fixture `Config`s
+/// canonicalize their root exactly as `Config::load` does, so on a filesystem where the system
+/// temp is reached through a symlink (macOS `/var` → `/private/var`) or an 8.3 alias (Windows
+/// `RUNNER~1`) the scratch path is a second, non-canonical name for the same directory. Carry-mode
+/// discovery keys its scopes off the recorded root, so a test that drives it — or asserts against
+/// it — through the scratch spelling is comparing with a root the index never stored (#1027).
+fn head_move_repo(tag: &str) -> (ScratchRoot, PathBuf, Config) {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -24,7 +31,8 @@ fn head_move_repo(tag: &str) -> (ScratchRoot, Config) {
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-q", "-m", "seed"]);
     let config = source_config(root.clone(), Language::Rust);
-    (root, config)
+    let config_root = config.root.clone();
+    (root, config_root, config)
 }
 
 /// The raw `main.files` rows `(id, commit_sha, sha256)` for `path` in the ACTIVE repo's base
@@ -117,7 +125,7 @@ fn scope_row_modified_at_ms_reads_the_scoped_disk_mtime() {
 
 #[test]
 fn a_head_move_carries_unchanged_rows_and_rederives_only_the_diff() {
-    let (root, config) = head_move_repo("carry");
+    let (_scratch, root, config) = head_move_repo("carry");
     let db = IndexDatabase::rebuild(&config).unwrap();
     let old_head = head_sha(&root);
     let keep_id = active_row_id(&db, "src/keep.rs").expect("keep.rs indexed");
@@ -181,7 +189,7 @@ fn a_head_move_carries_unchanged_rows_and_rederives_only_the_diff() {
 
 #[test]
 fn a_branch_switch_back_carries_everything_with_no_rederive() {
-    let (root, config) = head_move_repo("swback");
+    let (_scratch, root, config) = head_move_repo("swback");
     let db = IndexDatabase::rebuild(&config).unwrap();
     let main_head = head_sha(&root);
     let keep_id = active_row_id(&db, "src/keep.rs").unwrap();
@@ -221,7 +229,7 @@ fn a_branch_switch_back_carries_everything_with_no_rederive() {
 
 #[test]
 fn carry_requires_matching_language_and_kind() {
-    let (root, config) = head_move_repo("drift");
+    let (_scratch, root, config) = head_move_repo("drift");
     let db = IndexDatabase::rebuild(&config).unwrap();
     // A forged retained row at a stale commit whose sha256 matches the file about to appear,
     // but under a different language — the target-drift twin of discovery's sha check. Carry
@@ -271,7 +279,7 @@ fn carry_requires_matching_language_and_kind() {
 
 #[test]
 fn dirty_paths_keep_their_overlay_and_are_not_carried() {
-    let (root, config) = head_move_repo("dirty");
+    let (_scratch, root, config) = head_move_repo("dirty");
     let db = IndexDatabase::rebuild(&config).unwrap();
     let old_head = head_sha(&root);
     drop(db);
@@ -319,7 +327,7 @@ fn a_pull_after_a_branch_round_trip_still_carries_despite_stale_higher_id_rows()
     // main → feat (edit.rs re-derived there, HIGHER row id) → main → commit on main. The pull's
     // carry must adopt the OLD-main row that matches disk, not give up because the stale feat
     // row (higher id, different sha) shadows it for the same path.
-    let (root, config) = head_move_repo("multiret");
+    let (_scratch, root, config) = head_move_repo("multiret");
     let db = IndexDatabase::rebuild(&config).unwrap();
     let keep_id = active_row_id(&db, "src/keep.rs").unwrap();
     let edit_id = active_row_id(&db, "src/edit.rs").unwrap();
@@ -368,7 +376,7 @@ fn discovery_status_surfaces_a_pending_carry_instead_of_reporting_clean() {
     // carry-only scope must not read as "everything indexed": the scope view misses the rows
     // until a discover pass applies the re-stamps, so status reports the pending carry and
     // names the remedy.
-    let (root, config) = head_move_repo("status");
+    let (_scratch, root, config) = head_move_repo("status");
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
 
@@ -396,7 +404,7 @@ fn an_untracked_recreation_of_old_content_is_not_carried_into_the_committed_scop
     // retained row on sha — but the committed tree at the new HEAD does not contain it, and
     // committed rows are shared with every linked worktree's base view. It must be indexed as
     // this worktree's OVERLAY row, never re-stamped into the committed scope.
-    let (root, config) = head_move_repo("untracked");
+    let (_scratch, root, config) = head_move_repo("untracked");
     let db = IndexDatabase::rebuild(&config).unwrap();
     let old_head = head_sha(&root);
     drop(db);
@@ -438,7 +446,7 @@ fn a_dirty_revert_to_old_content_is_not_carried_into_the_committed_scope() {
     // to the OLD commit's bytes without committing. The path is dirty, so its true committed
     // content at the new HEAD is the edited version — the old-content retained row must not be
     // re-stamped as committed; the dirty bytes belong to the overlay scope.
-    let (root, config) = head_move_repo("dirtyrevert");
+    let (_scratch, root, config) = head_move_repo("dirtyrevert");
     let db = IndexDatabase::rebuild(&config).unwrap();
     drop(db);
 

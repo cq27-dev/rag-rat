@@ -8,6 +8,7 @@ use rag_rat_base::embedding_models::{
     FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID, HASH_EMBEDDING_DIM,
     HASH_MODEL_ID,
 };
+use rag_rat_base::test_scratch;
 
 use super::*;
 
@@ -71,14 +72,15 @@ fn git_history_targets() -> Vec<ResolvedTarget> {
 }
 
 fn rag_rat_config(root: &Path) -> Config {
+    let root = test_scratch::canonical_config_root(root);
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
+        root,
         targets: git_history_targets(),
         llm: Default::default(),
         watch: Default::default(),
@@ -229,14 +231,15 @@ fn markdown_config(text: &str) -> (ScratchRoot, Config) {
 }
 
 fn markdown_config_for_root(root: PathBuf) -> Config {
+    let root = test_scratch::canonical_config_root(root);
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
+        root,
         targets: vec![ResolvedTarget {
             name: "markdown".to_string(),
             language: Language::Markdown,
@@ -388,14 +391,15 @@ fn source_config(root: PathBuf, language: Language) -> Config {
 /// `source_config` for a layout that isn't `src/` — SwiftPM puts first-party code under `Sources/`
 /// and its test targets under `Tests/`.
 fn source_config_dirs(root: PathBuf, language: Language, dirs: &[&str]) -> Config {
+    let root = test_scratch::canonical_config_root(root);
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
+        root,
         targets: vec![ResolvedTarget {
             name: language.as_str().to_string(),
             language,
@@ -779,14 +783,15 @@ fn git_fixture_for_overlay_tests() -> (ScratchRoot, Config) {
     fs::write(root.join("src/extra.rs"), "pub fn extra() -> i32 { 2 }\n").unwrap();
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-m", "init"]);
+    let canonical_root = test_scratch::canonical_config_root(root.to_path_buf());
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: canonical_root.join(".rag-rat/index.sqlite"),
+        root: canonical_root,
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
             language: Language::Rust,
@@ -913,14 +918,15 @@ fn write_four_renamed_clones(root: &Path) -> IndexDatabase {
 /// shared with tests that write their own four-member variant (e.g. the #275 differing-callee
 /// fixture) before rebuilding.
 fn four_clone_config(root: &Path) -> Config {
+    let root = test_scratch::canonical_config_root(root);
     Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
+        root,
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
             language: Language::Rust,

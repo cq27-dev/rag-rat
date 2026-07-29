@@ -1124,7 +1124,12 @@ fn concurrent_create_or_migrate_applies_the_schema_exactly_once() {
 /// with the pointer, and the retry publishes files + history together.
 #[test]
 fn a_tail_failure_leaves_git_meta_and_history_cursors_on_the_old_state() {
-    let (root, config) = generation_fixture(&[("a.rs", "pub fn a() -> u32 { 1 }\n")]);
+    let (_scratch, config) = generation_fixture(&[("a.rs", "pub fn a() -> u32 { 1 }\n")]);
+    // Drive production calls and assertions through the root the `Config` carries: the fixture
+    // canonicalizes it exactly as `Config::load` does, so the scratch spelling is a SECOND,
+    // non-canonical name for the same directory wherever the system temp is reached through a
+    // symlink or an 8.3 alias (#1027).
+    let root = config.root.clone();
     IndexDatabase::rebuild(&config).unwrap();
     let db_path = config.database.clone();
     let repo_id = resolve_repo_id(&db_path, &root);
@@ -1279,7 +1284,12 @@ fn gc_reclaims_abandoned_staged_generations_from_failed_rebuilds() {
 /// the new root together with the flip.
 #[test]
 fn a_tail_failure_leaves_source_root_on_the_old_checkout() {
-    let (root, config) = generation_fixture(&[("a.rs", "pub fn a() -> u32 { 1 }\n")]);
+    let (_scratch, config) = generation_fixture(&[("a.rs", "pub fn a() -> u32 { 1 }\n")]);
+    // Drive production calls and assertions through the root the `Config` carries: the fixture
+    // canonicalizes it exactly as `Config::load` does, so the scratch spelling is a SECOND,
+    // non-canonical name for the same directory wherever the system temp is reached through a
+    // symlink or an 8.3 alias (#1027).
+    let root = config.root.clone();
     IndexDatabase::rebuild(&config).unwrap();
     let db_path = config.database.clone();
     let repo_id = resolve_repo_id(&db_path, &root);
@@ -1295,7 +1305,7 @@ fn a_tail_failure_leaves_source_root_on_the_old_checkout() {
     let _ = fs::remove_dir_all(&root2);
     run_git(&root, &["clone", "-q", ".", root2.to_str().unwrap()]);
     let mut config2 = config.clone();
-    config2.root = root2.clone();
+    config2.root = test_scratch::canonical_config_root(root2.clone());
 
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1319,7 +1329,7 @@ fn a_tail_failure_leaves_source_root_on_the_old_checkout() {
     IndexDatabase::rebuild(&config2).unwrap();
     assert_eq!(
         persisted_root(&db_path).as_deref(),
-        Some(root2.display().to_string().as_str()),
+        Some(config2.root.display().to_string().as_str()),
         "the retry publishes the new root together with the flip"
     );
 

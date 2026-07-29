@@ -128,14 +128,15 @@ mod tests {
     use crate::config::{Config, LogConfig};
 
     fn test_config(dir: &std::path::Path, enabled: bool) -> Config {
+        let config_root = crate::test_scratch::canonical_config_root(dir.to_path_buf());
         Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: dir.to_path_buf(),
-            database: dir.join(".rag-rat/index.sqlite"),
+            database: config_root.join(".rag-rat/index.sqlite"),
+            root: config_root,
             targets: Vec::new(),
             llm: Default::default(),
             watch: Default::default(),

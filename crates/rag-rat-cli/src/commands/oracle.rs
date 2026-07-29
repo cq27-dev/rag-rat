@@ -487,14 +487,15 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n")
             .unwrap();
+        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = Config {
             trackers: Vec::new(),
             papertrail: Default::default(),
             sync: Default::default(),
             repo_id_override: None,
             database_key_pinned: true,
-            root: root.to_path_buf(),
-            database: root.join(".rag-rat/index.sqlite"),
+            database: config_root.join(".rag-rat/index.sqlite"),
+            root: config_root,
             targets: vec![ResolvedTarget {
                 name: "rust".to_string(),
                 language: Language::Rust,

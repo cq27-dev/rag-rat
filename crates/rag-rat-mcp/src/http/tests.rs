@@ -991,7 +991,9 @@ fn test_config() -> (PathBuf, Config) {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut config = Config::minimal_for_database(root.join("index.sqlite"), root.clone());
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.clone());
+    let mut config =
+        Config::minimal_for_database(config_root.join("index.sqlite"), config_root.clone());
     config.database_key_pinned = true;
     config.targets = vec![ResolvedTarget {
         name: "rust".into(),

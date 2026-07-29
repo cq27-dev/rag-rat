@@ -1750,7 +1750,9 @@ fn indexed_config() -> (tempfile::TempDir, Config) {
     fs::write(root.join(UNICODE_PATH), UNICODE_SOURCE).unwrap();
     fs::write(root.join(FOLDED_PATH), FOLDED_SOURCE).unwrap();
     fs::write(root.join(COMPOSED_PATH), COMPOSED_SOURCE).unwrap();
-    let mut config = Config::minimal_for_database(root.join("index.sqlite"), root);
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root);
+    let mut config =
+        Config::minimal_for_database(config_root.join("index.sqlite"), config_root.clone());
     config.database_key_pinned = true;
     config.targets = vec![ResolvedTarget {
         name: "rust".into(),

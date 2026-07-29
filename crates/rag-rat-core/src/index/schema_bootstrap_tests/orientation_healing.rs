@@ -163,14 +163,15 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-m", "init"]);
 
+    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
-        database: root.join(".rag-rat/index.sqlite"),
+        database: config_root.join(".rag-rat/index.sqlite"),
+        root: config_root,
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
             language: Language::Rust,
