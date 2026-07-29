@@ -8,6 +8,7 @@ use rag_rat_base::language::Language;
 
 use super::documents;
 use super::layout::{ProjectLayout, Trust, marker_sites};
+use super::scope::CheckoutScope;
 use crate::OracleTool;
 use crate::lsp::readiness::ReadinessPolicy;
 
@@ -179,7 +180,7 @@ impl LiveBackend {
     }
 
     /// Resolve this checkout's project layout — the one filesystem scan a session performs.
-    pub fn resolve_layout(&self, root: &Path) -> ProjectLayout {
+    pub fn resolve_layout(&self, checkout: &CheckoutScope<'_>) -> ProjectLayout {
         let Some(marker) = self.project_marker else {
             return ProjectLayout::default();
         };
@@ -188,7 +189,7 @@ impl LiveBackend {
             // and needs no precomputed set.
             ProjectScope::Enclosing => ProjectLayout::default(),
             ProjectScope::Checkout =>
-                ProjectLayout::from_marker_sites(marker.file, marker_sites(root, marker.file)),
+                ProjectLayout::from_marker_sites(marker.file, marker_sites(checkout, marker.file)),
         }
     }
 
@@ -202,7 +203,7 @@ impl LiveBackend {
     /// and it stays `Warming` while a file that IS in a project would have warmed it.
     pub(crate) fn open_signals_readiness(
         &self,
-        root: &Path,
+        checkout: &CheckoutScope<'_>,
         path: &str,
         layout: &ProjectLayout,
     ) -> bool {
@@ -217,14 +218,17 @@ impl LiveBackend {
             ReadinessPolicy::ServerStatus => true,
             ReadinessPolicy::WorkDoneProgress =>
                 self.project_marker.is_some_and(|marker| match marker.scope {
-                    ProjectScope::Enclosing =>
-                        documents::enclosing_project_dir(root, &root.join(path), marker.file)
-                            .is_some(),
+                    ProjectScope::Enclosing => documents::enclosing_project_dir(
+                        checkout,
+                        &checkout.root().join(path),
+                        marker.file,
+                    )
+                    .is_some(),
                     // Readiness, not resolution — [`Trust::Possible`] for the same reason as
                     // the warm-up search below.
                     ProjectScope::Checkout => self.session_resolves(
-                        root,
-                        &root.join(path),
+                        checkout,
+                        &checkout.root().join(path),
                         layout,
                         marker,
                         Trust::Possible,
@@ -245,14 +249,19 @@ impl LiveBackend {
     /// `None` means the checkout contains no project this backend could ever warm on, which is
     /// also what makes its `prerequisite_blocked` gate fire — the two answer the same question, so
     /// they cannot disagree.
-    pub(crate) fn warmup_document(&self, root: &Path, layout: &ProjectLayout) -> Option<PathBuf> {
+    pub(crate) fn warmup_document(
+        &self,
+        checkout: &CheckoutScope<'_>,
+        layout: &ProjectLayout,
+    ) -> Option<PathBuf> {
         match self.readiness {
             // Session-level quiescence needs no document.
             ReadinessPolicy::ServerStatus => None,
             ReadinessPolicy::WorkDoneProgress =>
                 self.project_marker.and_then(|marker| match marker.scope {
                     ProjectScope::Enclosing => documents::find_document_in_project(
-                        root,
+                        checkout,
+                        checkout.root(),
                         self.languages,
                         marker.file,
                         false,
@@ -271,10 +280,20 @@ impl LiveBackend {
                     // checkout gets no live evidence at all. The per-file gate stays proven, so a
                     // document warmed on a database this crate could not read is still not
                     // resolved through it.
-                    ProjectScope::Checkout =>
-                        documents::find_document_where(root, self.languages, &|document| {
-                            self.session_resolves(root, document, layout, marker, Trust::Possible)
-                        }),
+                    ProjectScope::Checkout => documents::find_document_where(
+                        checkout,
+                        checkout.root(),
+                        self.languages,
+                        &|document| {
+                            self.session_resolves(
+                                checkout,
+                                document,
+                                layout,
+                                marker,
+                                Trust::Possible,
+                            )
+                        },
+                    ),
                 }),
         }
     }
@@ -314,7 +333,7 @@ impl LiveBackend {
     /// verdict, not a missing one, so such documents are skipped rather than resolved.
     fn session_resolves(
         &self,
-        root: &Path,
+        checkout: &CheckoutScope<'_>,
         absolute: &Path,
         layout: &ProjectLayout,
         marker: ProjectMarker,
@@ -324,7 +343,7 @@ impl LiveBackend {
             return false;
         }
         layout.sole_marker_dir().is_some()
-            || layout.discoverable_marker_dir(root, absolute, marker.file, trust).is_some()
+            || layout.discoverable_marker_dir(checkout, absolute, marker.file, trust).is_some()
     }
 
     /// Whether this session can resolve `path` (repo-relative) — the live pass's per-file gate.
@@ -333,20 +352,34 @@ impl LiveBackend {
     /// this crate could not parse might still be one clangd loads, but if it is not, the file is
     /// analysed with fallback flags and a cross-translation-unit call resolves to the callee's
     /// header declaration — a wrong verdict rather than a missing one.
-    pub fn session_can_resolve(&self, root: &Path, path: &str, layout: &ProjectLayout) -> bool {
+    pub fn session_can_resolve(
+        &self,
+        checkout: &CheckoutScope<'_>,
+        path: &str,
+        layout: &ProjectLayout,
+    ) -> bool {
         match self.project_marker {
-            Some(marker) if marker.scope == ProjectScope::Checkout =>
-                self.session_resolves(root, &root.join(path), layout, marker, Trust::Proven),
+            Some(marker) if marker.scope == ProjectScope::Checkout => self.session_resolves(
+                checkout,
+                &checkout.root().join(path),
+                layout,
+                marker,
+                Trust::Proven,
+            ),
             _ => true,
         }
     }
 
     /// Whether this checkout can ever produce a readiness signal for this backend. Backs the
     /// manifest's prerequisite gate.
-    pub fn checkout_can_signal_readiness(&self, root: &Path, layout: &ProjectLayout) -> bool {
+    pub fn checkout_can_signal_readiness(
+        &self,
+        checkout: &CheckoutScope<'_>,
+        layout: &ProjectLayout,
+    ) -> bool {
         match self.readiness {
             ReadinessPolicy::ServerStatus => true,
-            ReadinessPolicy::WorkDoneProgress => self.warmup_document(root, layout).is_some(),
+            ReadinessPolicy::WorkDoneProgress => self.warmup_document(checkout, layout).is_some(),
         }
     }
 }

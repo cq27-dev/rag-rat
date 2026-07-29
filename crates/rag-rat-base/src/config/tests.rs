@@ -2814,6 +2814,133 @@ fn rejects_unknown_language() {
     assert!(err.to_string().contains("unknown language"));
 }
 
+/// A target directory that escapes `[index] root` is refused at load, not at index time.
+///
+/// `push_target` only ever proved the directory EXISTS, so `../shared` was accepted here and then
+/// failed the whole index run in `collect_index_files`, whose `strip_prefix(&config.root)` reports
+/// a bare `prefix not found` naming nothing. The containment check moves that failure to the point
+/// the mistake was made, and it is what lets the live oracle treat "under the index root" as the
+/// corpus boundary rather than as a convention (#1008).
+#[test]
+fn rejects_a_target_directory_that_escapes_the_index_root() {
+    let dir = scratch("target-escapes-root");
+    let root = dir.join("repo");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("shared")).unwrap();
+    let simple = BTreeMap::from([("rust".to_string(), vec!["../shared".to_string()])]);
+
+    let err = config::resolve_targets(&root, simple, Vec::new()).unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("../shared"), "names the offending directory: {message}");
+    assert!(message.contains("[index] root"), "names the remedy: {message}");
+}
+
+/// The other escape shape, and the reason the check cannot be a `..`-count: `Path::join` DISCARDS
+/// the root entirely for an absolute argument, so an absolute directory never had to traverse
+/// upward to leave the root.
+#[test]
+fn rejects_an_absolute_target_directory_outside_the_index_root() {
+    let dir = scratch("absolute-target-outside-root");
+    let root = dir.join("repo");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let outside = dir.join("shared");
+    std::fs::create_dir_all(&outside).unwrap();
+    let simple =
+        BTreeMap::from([("rust".to_string(), vec![outside.to_string_lossy().into_owned()])]);
+
+    let err = config::resolve_targets(&root, simple, Vec::new()).unwrap_err();
+
+    assert!(err.to_string().contains("[index] root"), "names the remedy: {err}");
+}
+
+/// Containment is judged LEXICALLY, so a root the operator spelled through a symlink still accepts
+/// the directories under it. Canonicalizing instead would make the verdict depend on how the root
+/// was spelled rather than on what the config says.
+#[test]
+fn accepts_a_contained_target_under_a_root_spelled_through_a_symlink() {
+    let dir = scratch("symlinked-root-target");
+    let real = dir.join("real-repo");
+    std::fs::create_dir_all(real.join("src")).unwrap();
+    let linked = dir.join("linked-repo");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    #[cfg(not(unix))]
+    std::os::windows::fs::symlink_dir(&real, &linked).unwrap();
+    let simple = BTreeMap::from([("rust".to_string(), vec!["src".to_string()])]);
+
+    let targets = config::resolve_targets(&linked, simple, Vec::new()).unwrap();
+
+    assert_eq!(
+        targets.len(),
+        1,
+        "a contained directory is not refused by the spelling of the root"
+    );
+}
+
+/// Containment normalizes BOTH operands, because a root can itself carry `..`.
+///
+/// `for_linked_worktree_overlay` builds its root as `workdir.join([index] root)` without
+/// canonicalizing, unlike the main load path. Comparing a normalized target path against an
+/// unnormalized root rejected every genuinely contained target — and on that path the failure is
+/// silent (the caller swallows the error and falls back to base targets), so a branch's added
+/// targets would simply disappear from its overlay.
+#[test]
+fn a_root_spelled_with_a_parent_component_still_contains_its_targets() {
+    let dir = scratch("root-with-parent-component");
+    let root = dir.join("repo");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let spelled = root.join("sub").join("..");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    let simple = BTreeMap::from([("rust".to_string(), vec!["src".to_string()])]);
+
+    let targets = config::resolve_targets(&spelled, simple, Vec::new()).unwrap();
+
+    assert_eq!(targets.len(), 1, "the root's spelling must not reject its own directories");
+    assert_eq!(targets[0].directories, vec![PathBuf::from("src")]);
+}
+
+/// `ResolvedTarget.directories` are root-relative by contract, so an absolute directory inside the
+/// root is stored in its contained form.
+///
+/// An absolute directory satisfies every `root.join(directory)` (it wins outright) but can never
+/// prefix-match a root-relative path, so such a target was walked and indexed while every predicate
+/// over it — `target_for_path`, and the live oracle's corpus — reported its files as belonging to
+/// no target at all.
+#[test]
+fn an_absolute_target_directory_inside_the_root_is_stored_root_relative() {
+    let dir = scratch("absolute-target-inside-root");
+    let root = dir.join("repo");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let absolute = root.join("src").to_string_lossy().into_owned();
+    let simple = BTreeMap::from([("rust".to_string(), vec![absolute])]);
+
+    let targets = config::resolve_targets(&root, simple, Vec::new()).unwrap();
+
+    assert_eq!(
+        targets[0].directories,
+        vec![PathBuf::from("src")],
+        "stored root-relative, so prefix-matching against a root-relative path works",
+    );
+}
+
+/// A whole-root binding keeps its `.` spelling.
+///
+/// `ensure_checkout_matches_corpus` compares the stored directory strings LITERALLY against a
+/// corpus profile's declared bindings, and the shipped profiles spell the whole-root binding `.`
+/// (`linux-kernel` is `{ c = ["."] }`). Relativizing it to the empty path would make
+/// `oracle report --corpus <id>` reject a checkout indexed exactly as its own profile specifies.
+#[test]
+fn a_whole_root_target_keeps_its_dot_spelling() {
+    let dir = scratch("dot-target-spelling");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let simple = BTreeMap::from([("rust".to_string(), vec![".".to_string()])]);
+
+    let targets = config::resolve_targets(&dir, simple, Vec::new()).unwrap();
+
+    assert_eq!(targets[0].directories, vec![PathBuf::from(".")]);
+}
+
 #[test]
 fn log_config_defaults_off() {
     let raw: RawConfig = toml::from_str("").unwrap();
@@ -3006,5 +3133,50 @@ fn target_directories_deduplicates_across_targets() {
         dirs,
         vec![PathBuf::from("src"), PathBuf::from("extra"), PathBuf::from("docs")],
         "shared dirs appear once in stable order"
+    );
+}
+
+/// A `..` that follows a SYMLINK does not mean what the path text says, and containment has to
+/// notice. With `link -> <outside>`, the directory `link/../src` that `is_dir()` validates is
+/// `<outside>/src` — collapsing textually would yield `<root>/src`, accepting a directory nothing
+/// looked at and storing a relative path naming a different tree for the walk to index.
+#[cfg(unix)]
+#[test]
+fn a_parent_component_after_a_symlink_is_judged_against_the_filesystem() {
+    let dir = scratch("parent-after-symlink");
+    let root = dir.join("repo");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let outside = dir.join("outside");
+    std::fs::create_dir_all(outside.join("src")).unwrap();
+    std::os::unix::fs::symlink(outside.join("project"), root.join("link")).unwrap();
+    std::fs::create_dir_all(outside.join("project")).unwrap();
+    let simple = BTreeMap::from([("rust".to_string(), vec!["link/../src".to_string()])]);
+
+    let err = config::resolve_targets(&root, simple, Vec::new()).unwrap_err();
+
+    assert!(
+        err.to_string().contains("[index] root"),
+        "the directory that was validated lies outside the root: {err}",
+    );
+}
+
+/// A target directory that is itself a symlink keeps its CONFIGURED spelling. The indexing walk
+/// enters it with `is_dir()` and yields paths under that spelling, so rewriting the stored value to
+/// the link's destination would leave every predicate over the target unable to match its own
+/// files.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_target_directory_keeps_its_configured_spelling() {
+    let dir = scratch("symlinked-target-spelling");
+    std::fs::create_dir_all(dir.join("real_sources")).unwrap();
+    std::os::unix::fs::symlink(dir.join("real_sources"), dir.join("src")).unwrap();
+    let simple = BTreeMap::from([("rust".to_string(), vec!["src".to_string()])]);
+
+    let targets = config::resolve_targets(&dir, simple, Vec::new()).unwrap();
+
+    assert_eq!(
+        targets[0].directories,
+        vec![PathBuf::from("src")],
+        "stored as configured, because that is the spelling the walk produces",
     );
 }

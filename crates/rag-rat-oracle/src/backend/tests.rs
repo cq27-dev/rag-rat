@@ -9,6 +9,550 @@ use rag_rat_base::language::Language;
 use super::documents::enclosing_project_dir;
 use super::registry::LiveBackend;
 use crate::OracleTool;
+use crate::test_support::every_path_scope as scope;
+
+/// A compilation database naming `files`, written at `dir/relative`.
+fn write_database(dir: &Path, relative: &str, files: &[&str]) {
+    let entries: Vec<String> = files
+        .iter()
+        .map(|file| {
+            let absolute = dir.join(file);
+            format!(
+                r#"{{"directory":{},"file":{},"command":"cc -c {}"}}"#,
+                serde_json::to_string(&dir.to_string_lossy()).unwrap(),
+                serde_json::to_string(&absolute.to_string_lossy()).unwrap(),
+                file
+            )
+        })
+        .collect();
+    let path = dir.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, format!("[{}]", entries.join(","))).unwrap();
+}
+
+/// The #1008 case is distinguishable from every other reason for not pinning, so the watcher can
+/// give an operator the remedy that fits: a database that does not cover the indexed sources needs
+/// regenerating (or the tree it describes needs binding), which is nothing like the advice for a
+/// checkout that simply holds several databases.
+#[test]
+fn a_database_that_governs_nothing_is_reported_apart_from_the_other_reasons() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-governs-nothing-reported");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("third_party")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&dir, "build/compile_commands.json", &["third_party/dep.c"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+
+    assert!(
+        clangd.resolve_layout(&scope).has_database_governing_nothing_indexed(),
+        "a loadable database describing nothing indexed is the case worth naming",
+    );
+
+    // Several databases is a DIFFERENT problem with different advice, and must not be reported as
+    // this one.
+    write_database(&dir, "other/compile_commands.json", &["src/main.c"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+    assert!(
+        !clangd.resolve_layout(&scope).has_database_governing_nothing_indexed(),
+        "two databases is the multi-database case, whatever either one governs",
+    );
+}
+
+/// A checkout whose database governs nothing it indexes is BLOCKED, and the block says so.
+///
+/// This is the primary #1008 shape, and its reporting had to move. Such a database counts for
+/// neither trust level, so no document can warm the session — the checkout blocks before any
+/// session exists, which means a message carried on the pass report could never reach it. The
+/// generic prerequisite wording is worse than silence here: it tells an operator who HAS a
+/// compilation database that none was found, and sends them to generate one.
+#[test]
+fn a_checkout_whose_database_governs_nothing_is_blocked_with_the_reason() {
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-blocked-governs-nothing");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("third_party")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&dir, "build/compile_commands.json", &["third_party/dep.c"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+
+    let hint = crate::ToolManifest::for_tool(OracleTool::ClangdLsp)
+        .prerequisite_blocked_with(&scope, None)
+        .expect("a database governing nothing indexed blocks the backend");
+
+    assert!(
+        hint.contains("names no file this checkout indexes"),
+        "the block must name the real cause, not deny the database exists: {hint}",
+    );
+    assert!(
+        !hint.contains("found no compile_commands.json project"),
+        "the generic wording sends an operator who HAS a database after the wrong problem: {hint}",
+    );
+}
+
+/// `"file": ""` is a path this reader READ and found empty — a known non-governing entry — not one
+/// it could not reconstruct. Collapsing the two would let a database naming no translation unit
+/// count as `Governs::Unknown`, which warm-up accepts, so a checkout would warm a session that then
+/// skips every one of its sources.
+#[test]
+fn an_empty_file_string_is_known_non_governance_not_an_unreadable_path() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-empty-file-string");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    std::fs::write(
+        dir.join("compile_commands.json"),
+        r#"[{"directory":"/x","file":"","command":"cc -c a.c"}]"#,
+    )
+    .unwrap();
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+    let layout = clangd.resolve_layout(&scope);
+
+    assert!(layout.sole_marker_dir().is_none(), "it names no translation unit, so nothing pins");
+    assert!(
+        layout.has_database_governing_nothing_indexed(),
+        "the answer is known — an empty path is a path this reader read, not one it could not",
+    );
+    assert!(
+        !clangd.checkout_can_signal_readiness(&scope, &layout),
+        "and warm-up must not accept it either — the answer is known, not unknown",
+    );
+}
+
+/// A database generated through a SYMLINKED spelling of the checkout still governs it.
+///
+/// The configured root is canonicalized at load, but a build run through the symlink writes entry
+/// paths under the alias. Judging those lexically alone finds nothing in the corpus, and the
+/// checkout's only database would be declared to govern nothing — withdrawing the pin from a setup
+/// that works today. The parent is resolved once and memoized, so the cost lands only where the
+/// literal spelling already failed.
+#[test]
+fn a_database_written_through_a_symlinked_root_still_governs_the_checkout() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-aliased-root");
+    let real = dir.join("real");
+    std::fs::create_dir_all(real.join("src")).unwrap();
+    std::fs::write(real.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    let alias = dir.join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    #[cfg(not(unix))]
+    std::os::windows::fs::symlink_dir(&real, &alias).unwrap();
+    // The database names its entries through the ALIAS, as a build run from there would.
+    write_database(&alias, "build/compile_commands.json", &["src/main.c"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&real, &["src"]);
+    let scope = super::CheckoutScope::resolve(&real, &corpus);
+
+    assert!(
+        clangd.resolve_layout(&scope).sole_marker_dir().is_some(),
+        "the aliased entry names the same file the checkout indexes",
+    );
+}
+
+/// Widening the per-file walk to the ceiling means "an ancestor holds a database" no longer implies
+/// "that database is about this file's project" — so governance gates that walk too.
+///
+/// With a subdirectory `[index] root`, a database at the checkout top describing only an unindexed
+/// sibling tree is now reachable from a first-party file. Resolving through it would let clangd
+/// infer commands from that project's entries and persist definitions produced under unrelated
+/// flags, which is precisely what the pin gate exists to prevent.
+#[test]
+fn an_ancestor_database_that_governs_nothing_does_not_configure_a_file() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-ancestor-governs-nothing");
+    let checkout = dir.join("repo");
+    std::fs::create_dir_all(checkout.join("sub/src")).unwrap();
+    std::fs::create_dir_all(checkout.join("other")).unwrap();
+    rag_rat_base::test_git::run(&checkout, &["init"]);
+    std::fs::write(checkout.join("sub/src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    std::fs::write(checkout.join("other/dep.c"), "int dep(void) { return 1; }\n").unwrap();
+    // The checkout's only database describes the sibling tree, which this checkout does not index.
+    write_database(&checkout, "compile_commands.json", &["other/dep.c"]);
+    let root = checkout.join("sub");
+    let corpus = crate::test_support::PrefixCorpus::new(&root, &["src"]);
+    let scope = super::CheckoutScope::resolve(&root, &corpus);
+    let layout = clangd.resolve_layout(&scope);
+
+    assert!(layout.sole_marker_dir().is_none(), "it governs nothing indexed, so nothing is pinned");
+    assert!(
+        !clangd.session_can_resolve(&scope, "src/main.c", &layout),
+        "and the per-file walk must not accept it either, merely for being an ancestor",
+    );
+}
+
+/// An entry that configures nothing cannot qualify a database as governing the corpus.
+///
+/// Loadability and governance are counted independently, so without this a database whose only
+/// indexed entry has an empty invocation — while a vendored entry carries a real command — would be
+/// `Loadable` AND count as governing, and get pinned for a file clangd cannot configure.
+#[test]
+fn an_entry_that_configures_nothing_does_not_qualify_the_database() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-degenerate-indexed-entry");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("third_party")).unwrap();
+    std::fs::create_dir_all(dir.join("build")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    let root = dir.canonicalize().unwrap();
+    let database = format!(
+        r#"[{{"directory":{d},"file":{indexed},"command":""}},
+           {{"directory":{d},"file":{vendored},"command":"cc -c dep.c"}}]"#,
+        d = serde_json::to_string(&root.to_string_lossy()).unwrap(),
+        indexed = serde_json::to_string(&root.join("src/main.c").to_string_lossy()).unwrap(),
+        vendored =
+            serde_json::to_string(&root.join("third_party/dep.c").to_string_lossy()).unwrap(),
+    );
+    std::fs::write(dir.join("build/compile_commands.json"), database).unwrap();
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+
+    assert!(
+        clangd.resolve_layout(&scope).sole_marker_dir().is_none(),
+        "the one entry naming an indexed file configures nothing, so the database describes \
+         nothing this checkout can actually analyse",
+    );
+}
+
+/// One first-party entry is enough. The threshold is ANY, not most — a real database mixes
+/// vendored and first-party translation units freely, and clangd's inference from a sibling entry
+/// is correct WITHIN a project. What #1008 is about is the sibling belonging to a different
+/// project, not that inference happened.
+#[test]
+fn a_database_naming_one_indexed_file_among_vendored_ones_is_pinned() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-mixed-database");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("third_party/foo")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&dir, "build/compile_commands.json", &[
+        "third_party/foo/a.c",
+        "third_party/foo/b.c",
+        "src/main.c",
+    ]);
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+
+    assert_eq!(
+        clangd.resolve_layout(&scope).sole_marker_dir(),
+        Some(dir.canonicalize().unwrap().join("build").as_path()),
+        "one indexed entry qualifies the database, wherever it sits in the list",
+    );
+}
+
+/// Entries carrying ABSOLUTE paths are resolved as given. A database committed from another
+/// machine names paths that resolve nowhere in this checkout, so it governs nothing and is not
+/// pinned — deliberately, since its include paths are wrong for this machine too.
+#[test]
+fn an_absolute_path_database_governs_only_when_its_paths_land_in_this_checkout() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-absolute-paths");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    // `write_database` already emits absolute `file` paths rooted at the fixture.
+    write_database(&dir, "build/compile_commands.json", &["src/main.c"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+    assert!(
+        clangd.resolve_layout(&scope).sole_marker_dir().is_some(),
+        "absolute paths that land inside the checkout govern it",
+    );
+
+    // The same database as another machine wrote it.
+    std::fs::write(
+        dir.join("build/compile_commands.json"),
+        r#"[{"directory":"/build/agent/out","file":"/build/agent/src/main.c","command":"cc -c main.c"}]"#,
+    )
+    .unwrap();
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+
+    assert!(
+        clangd.resolve_layout(&scope).sole_marker_dir().is_none(),
+        "paths from another machine name nothing this checkout indexes",
+    );
+}
+
+/// A symlinked build directory pointing at a SIBLING of the index root is followed: it is still
+/// inside the checkout, and the database behind it is genuinely this checkout's.
+///
+/// The containment bound used to be the index root, so `sub/build -> ../out` pointed "out of
+/// scope" and the database was never seen. The bound is the checkout now, which is what makes this
+/// ordinary layout work while still refusing a link that leaves the checkout entirely.
+#[test]
+fn a_symlinked_build_directory_inside_the_checkout_is_followed() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-symlink-sibling");
+    let checkout = dir.join("repo");
+    std::fs::create_dir_all(checkout.join("sub/src")).unwrap();
+    std::fs::create_dir_all(checkout.join("out")).unwrap();
+    rag_rat_base::test_git::run(&checkout, &["init"]);
+    std::fs::write(checkout.join("sub/src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&checkout, "out/compile_commands.json", &["sub/src/main.c"]);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../out", checkout.join("sub/build")).unwrap();
+    #[cfg(not(unix))]
+    std::os::windows::fs::symlink_dir(checkout.join("out"), checkout.join("sub/build")).unwrap();
+    let root = checkout.join("sub");
+    let corpus = crate::test_support::PrefixCorpus::new(&root, &["src"]);
+    let scope = super::CheckoutScope::resolve(&root, &corpus);
+
+    assert!(
+        clangd.resolve_layout(&scope).sole_marker_dir().is_some(),
+        "a link to a sibling of the index root stays inside the checkout",
+    );
+}
+
+/// Outside a git checkout nothing widens: the ceiling is the configured root, and every answer is
+/// the one the pre-ceiling code gave.
+#[test]
+fn a_non_git_checkout_behaves_exactly_as_before() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-non-git");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&dir, "compile_commands.json", &["src/main.c"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+
+    assert_eq!(scope.ceiling(), scope.root(), "no checkout ⇒ no widening");
+    assert_eq!(
+        clangd.resolve_layout(&scope).sole_marker_dir(),
+        Some(dir.canonicalize().unwrap().as_path()),
+    );
+}
+
+/// A checkout whose indexed sources live only under a HIDDEN directory can still warm a session.
+///
+/// The warm-up document search excluded every dot-directory, so such a checkout had a usable
+/// database and no findable document, and the prerequisite gate reported the backend `Blocked` for
+/// a configuration that would have worked (#1011). The indexed corpus is the authority on where
+/// this checkout's sources are; the search now asks it instead of guessing from the name.
+#[test]
+fn sources_under_a_hidden_directory_can_warm_the_session() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-hidden-sources");
+    std::fs::create_dir_all(dir.join(".cache/generated")).unwrap();
+    std::fs::write(dir.join(".cache/generated/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&dir, "build/compile_commands.json", &[".cache/generated/main.c"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &[".cache/generated"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+    let layout = clangd.resolve_layout(&scope);
+
+    assert_eq!(
+        clangd.warmup_document(&scope, &layout),
+        Some(dir.canonicalize().unwrap().join(".cache/generated/main.c")),
+        "a hidden directory the checkout indexes is an ordinary source location",
+    );
+    assert!(clangd.checkout_can_signal_readiness(&scope, &layout), "so it is not blocked");
+}
+
+/// The blanket dot-rule was right about tooling state, and dropping it must not lose that: a
+/// document is refused because the checkout does not index it, not because of its name.
+#[test]
+fn a_document_the_checkout_does_not_index_is_never_warmed_on() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-unindexed-documents");
+    std::fs::create_dir_all(dir.join(".cache/clangd")).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    // Source-shaped files inside a machine-written tree, and one real source.
+    std::fs::write(dir.join(".cache/clangd/stale.c"), "int stale(void) { return 0; }\n").unwrap();
+    std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&dir, "build/compile_commands.json", &["src/main.c"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+    let layout = clangd.resolve_layout(&scope);
+
+    assert_eq!(
+        clangd.warmup_document(&scope, &layout),
+        Some(dir.canonicalize().unwrap().join("src/main.c")),
+        "the indexed source is chosen, never the one under clangd's own index",
+    );
+}
+
+/// A database that describes only files this checkout does NOT index is never pinned.
+///
+/// `--compile-commands-dir` is global, so pinning a vendored subtree's database hands first-party
+/// sources that project's `-D` and include flags — a different preprocessor branch, and so a
+/// different definition, persisted as trusted evidence (#1008).
+#[test]
+fn a_database_governing_nothing_indexed_is_not_pinned() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-governs-nothing");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("third_party/foo")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    std::fs::write(dir.join("third_party/foo/dep.c"), "int dep(void) { return 1; }\n").unwrap();
+    write_database(&dir, "third_party/foo/compile_commands.json", &["third_party/foo/dep.c"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+
+    let layout = clangd.resolve_layout(&scope);
+
+    assert!(
+        layout.sole_marker_dir().is_none(),
+        "the only database describes nothing this checkout indexes, so it must not be forced on \
+         the whole checkout",
+    );
+}
+
+/// The mainstream layout stays pinned: an out-of-tree build directory holds the database, and the
+/// sources it names are the indexed ones.
+///
+/// This is the regression guard for the tempting wrong predicate. Testing corpus membership of the
+/// DATABASE'S OWN LOCATION would fail here — `build` is in the indexing floor and gitignored
+/// besides, so a `build/compile_commands.json` is never in the corpus of any repo, and pinning
+/// would be withdrawn from essentially every real single-database checkout.
+#[test]
+fn a_build_directory_database_governing_indexed_sources_is_pinned() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-build-dir-governs");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&dir, "build/compile_commands.json", &["src/main.c"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+
+    // Pin the premise, so this cannot pass for the wrong reason: the database's own location is
+    // NOT in the corpus, and the predicate must not care.
+    assert!(
+        !crate::backend::IndexedCorpus::indexes_file(
+            scope.corpus(),
+            &dir.join("build/compile_commands.json")
+        ),
+        "the database file itself is outside the corpus, as it is in every real repo",
+    );
+
+    let layout = clangd.resolve_layout(&scope);
+
+    assert_eq!(
+        layout.sole_marker_dir(),
+        Some(dir.canonicalize().unwrap().join("build").as_path()),
+        "it governs `src/`, which this checkout indexes",
+    );
+}
+
+/// A database ABOVE `[index] root` still governs the sources under it, and clangd finds it for them
+/// by its own ancestor search — so the layout has to see it too.
+///
+/// The marker walk was bounded below by the index root, so a `compile_commands.json` at the
+/// worktree top was invisible: the layout came back empty and the backend reported the checkout
+/// `Blocked` for a configuration it could have served (#1008).
+#[test]
+fn a_database_above_the_index_root_is_found_by_the_ancestor_leg() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-db-above-index-root");
+    let checkout = dir.join("repo");
+    std::fs::create_dir_all(checkout.join("sub/src")).unwrap();
+    rag_rat_base::test_git::run(&checkout, &["init"]);
+    std::fs::write(checkout.join("compile_commands.json"), COMPDB).unwrap();
+    std::fs::write(checkout.join("sub/src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    let root = checkout.join("sub");
+
+    let layout = clangd.resolve_layout(&scope(&root));
+
+    assert_eq!(
+        layout.sole_marker_dir(),
+        Some(checkout.canonicalize().unwrap().as_path()),
+        "the ancestor leg reaches the checkout top",
+    );
+    assert!(
+        clangd.checkout_can_signal_readiness(&scope(&root), &layout),
+        "and the checkout is no longer reported blocked",
+    );
+}
+
+/// The per-file discovery walk stops at the CEILING, not at the index root — it exists to mirror
+/// clangd's own ancestor search, and clangd has no notion of an index root.
+#[test]
+fn a_file_resolves_through_a_database_above_the_index_root() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-resolve-above-root");
+    let checkout = dir.join("repo");
+    std::fs::create_dir_all(checkout.join("sub/src")).unwrap();
+    std::fs::create_dir_all(checkout.join("sub/other")).unwrap();
+    rag_rat_base::test_git::run(&checkout, &["init"]);
+    std::fs::write(checkout.join("compile_commands.json"), COMPDB).unwrap();
+    // A second database keeps the session UNPINNED, so the per-file discovery walk is what decides
+    // — which is the path this test is about. It sits INSIDE the index root on purpose: a database
+    // in a sibling subtree of the root is not searched at all, because it can govern no indexed
+    // source (see `ProjectLayout::complete`), so it would not disqualify pinning.
+    std::fs::write(checkout.join("sub/other/compile_commands.json"), COMPDB).unwrap();
+    std::fs::write(checkout.join("sub/src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    let root = checkout.join("sub");
+    let scope = scope(&root);
+    let layout = clangd.resolve_layout(&scope);
+
+    assert!(layout.sole_marker_dir().is_none(), "two databases ⇒ nothing is pinned");
+    assert!(
+        clangd.session_can_resolve(&scope, "src/main.c", &layout),
+        "the file's own ancestor chain reaches the database above the index root",
+    );
+}
+
+/// The ceiling is the enclosing CHECKOUT, not the configured root.
+///
+/// `[index] root` may legitimately sit below the checkout root, and clangd searches a file's
+/// ancestors without any notion of an index root. When the two were the same path, a
+/// `compile_commands.json` at the worktree top was invisible and the backend reported `Blocked`
+/// for a checkout it could have served (#1008).
+#[test]
+fn the_ceiling_is_the_enclosing_checkout_not_the_index_root() {
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("scope-ceiling-subdir");
+    let checkout = dir.join("repo");
+    std::fs::create_dir_all(checkout.join("sub")).unwrap();
+    rag_rat_base::test_git::run(&checkout, &["init"]);
+    let root = checkout.join("sub");
+
+    let scope = scope(&root);
+
+    assert_eq!(scope.ceiling(), checkout.canonicalize().unwrap(), "the ceiling is the checkout");
+    assert_eq!(scope.root(), root.canonicalize().unwrap(), "the root is left where it was");
+}
+
+/// Outside a git checkout there is no boundary but the configured one, and inventing a wider one
+/// would let a walk wander into unrelated trees.
+#[test]
+fn a_root_outside_a_git_checkout_is_its_own_ceiling() {
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("scope-ceiling-no-git");
+    std::fs::create_dir_all(dir.join("plain")).unwrap();
+    let root = dir.join("plain");
+
+    let scope = scope(&root);
+
+    assert_eq!(scope.ceiling(), scope.root(), "no checkout ⇒ the root is the ceiling");
+}
+
+/// A scope resolved inside a LINKED worktree gets that worktree as its ceiling, never the main
+/// checkout. Each linked worktree is a different source tree, so a ceiling pointing at main would
+/// admit databases and ancestors belonging to another checkout entirely — and it is the property
+/// per-checkout live sessions (#1010) will need, pinned now so it cannot regress before then.
+#[test]
+fn a_linked_worktree_is_its_own_ceiling_not_the_main_checkout() {
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("scope-ceiling-linked");
+    let main = dir.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    rag_rat_base::test_git::run(&main, &["init"]);
+    std::fs::write(main.join("seed.txt"), "seed\n").unwrap();
+    rag_rat_base::test_git::run(&main, &["add", "."]);
+    rag_rat_base::test_git::run(&main, &["commit", "-m", "seed"]);
+    let linked = dir.join("linked");
+    rag_rat_base::test_git::run(&main, &[
+        "worktree",
+        "add",
+        linked.to_str().unwrap(),
+        "-b",
+        "branch",
+    ]);
+
+    let scope = scope(&linked);
+
+    assert_eq!(
+        scope.ceiling(),
+        linked.canonicalize().unwrap(),
+        "a linked worktree is its own checkout, not a subdirectory of main",
+    );
+}
 
 #[test]
 fn live_backends_are_exactly_the_non_batch_tools() {
@@ -108,12 +652,12 @@ fn enclosing_tsconfig_walks_up_to_the_nearest_project_and_stops_at_the_root() {
     std::fs::write(dir.join("packages/app/tsconfig.json"), "{}").unwrap();
 
     assert_eq!(
-        enclosing_project_dir(&dir, &dir.join("packages/app/src/main.ts"), "tsconfig.json"),
+        enclosing_project_dir(&scope(&dir), &dir.join("packages/app/src/main.ts"), "tsconfig.json"),
         Some(dir.join("packages/app")),
         "the nearest enclosing project wins",
     );
     assert_eq!(
-        enclosing_project_dir(&dir, &dir.join("scripts/tool.ts"), "tsconfig.json"),
+        enclosing_project_dir(&scope(&dir), &dir.join("scripts/tool.ts"), "tsconfig.json"),
         None,
         "a file under no project has none",
     );
@@ -128,31 +672,50 @@ fn a_warmup_document_is_found_at_any_depth_and_only_inside_a_project() {
     std::fs::create_dir_all(dir.join("scripts")).unwrap();
     std::fs::write(dir.join("scripts/tool.ts"), "export function x() {}\n").unwrap();
     assert_eq!(
-        ts.warmup_document(&dir, &ts.resolve_layout(&dir)),
+        ts.warmup_document(&scope(&dir), &ts.resolve_layout(&scope(&dir))),
         None,
         "a TypeScript file outside every project is not a warm-up document",
     );
-    assert!(!ts.checkout_can_signal_readiness(&dir, &ts.resolve_layout(&dir)));
+    assert!(!ts.checkout_can_signal_readiness(&scope(&dir), &ts.resolve_layout(&scope(&dir))));
 
     write_project(&dir, "services/teams/foo/web");
     assert_eq!(
-        ts.warmup_document(&dir, &ts.resolve_layout(&dir)),
+        ts.warmup_document(&scope(&dir), &ts.resolve_layout(&scope(&dir))),
         Some(dir.join("services/teams/foo/web/main.ts")),
         "a deeply nested project is still found",
     );
-    assert!(ts.checkout_can_signal_readiness(&dir, &ts.resolve_layout(&dir)));
+    assert!(ts.checkout_can_signal_readiness(&scope(&dir), &ts.resolve_layout(&scope(&dir))));
 }
 
 #[test]
-fn the_warmup_search_ignores_vendored_and_vcs_directories() {
-    // `node_modules` ships thousands of tsconfigs describing DEPENDENCIES. Warming on one
-    // would report the checkout usable while none of ITS files ever resolve.
+fn the_warmup_search_refuses_a_document_the_checkout_does_not_index() {
+    // `node_modules` ships thousands of tsconfigs describing DEPENDENCIES. Warming on one would
+    // report the checkout usable while none of ITS files ever resolve.
+    //
+    // The test supplies a REAL corpus rather than the permissive one: the refusal is now the
+    // corpus's, not a directory-name test's, so a corpus that claimed everything would assert
+    // nothing. That is the point of the change — the indexer's own answer decides, so the warm-up
+    // search cannot disagree with what the pass will actually resolve.
     let ts = LiveBackend::for_tool(OracleTool::TsLsp).unwrap();
     let dir = rag_rat_base::test_scratch::ScratchDir::new("ts-lsp-vendored-warmup");
     write_project(&dir, "node_modules/some-dep");
     write_project(&dir, ".cache/tooling");
-    assert_eq!(ts.warmup_document(&dir, &ts.resolve_layout(&dir)), None);
-    assert!(!ts.checkout_can_signal_readiness(&dir, &ts.resolve_layout(&dir)));
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+
+    assert_eq!(ts.warmup_document(&scope, &ts.resolve_layout(&scope)), None);
+    assert!(!ts.checkout_can_signal_readiness(&scope, &ts.resolve_layout(&scope)));
+
+    // And a hidden directory this checkout DOES index is an ordinary source location — the case the
+    // blanket dot-rule got wrong (#1011).
+    write_project(&dir, ".cache/generated");
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &[".cache/generated"]);
+    let scope = super::CheckoutScope::resolve(&dir, &corpus);
+
+    assert_eq!(
+        ts.warmup_document(&scope, &ts.resolve_layout(&scope)),
+        Some(dir.canonicalize().unwrap().join(".cache/generated/main.ts")),
+    );
 }
 
 #[test]
@@ -161,13 +724,13 @@ fn a_server_status_backend_needs_no_warmup_document_and_is_never_blocked_on_one(
     // and must not leak into the other backend's gating.
     let rust = LiveBackend::for_tool(OracleTool::RaLsp).unwrap();
     let dir = rag_rat_base::test_scratch::ScratchDir::new("ra-lsp-warmup-doc");
-    assert_eq!(rust.warmup_document(&dir, &rust.resolve_layout(&dir)), None);
+    assert_eq!(rust.warmup_document(&scope(&dir), &rust.resolve_layout(&scope(&dir))), None);
     assert!(
-        rust.checkout_can_signal_readiness(&dir, &rust.resolve_layout(&dir)),
+        rust.checkout_can_signal_readiness(&scope(&dir), &rust.resolve_layout(&scope(&dir))),
         "an empty checkout still signals"
     );
     assert!(
-        rust.open_signals_readiness(&dir, "src/lib.rs", &rust.resolve_layout(&dir)),
+        rust.open_signals_readiness(&scope(&dir), "src/lib.rs", &rust.resolve_layout(&scope(&dir))),
         "any document will do"
     );
     assert!(rust.project_marker.is_none(), "session-level readiness needs no project");
@@ -208,27 +771,37 @@ fn a_backends_project_marker_is_the_file_its_prerequisite_looks_for() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
     assert_eq!(clangd.project_marker.map(|m| m.file), Some("compile_commands.json"));
     assert!(
-        !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+        !clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         "no compdb ⇒ no signal possible"
     );
 
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
     assert!(
-        !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+        !clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         "sources alone are not a project"
     );
     std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
     assert_eq!(
-        clangd.warmup_document(&dir, &clangd.resolve_layout(&dir)),
+        clangd.warmup_document(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         Some(dir.join("src/main.c"))
     );
-    assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+    assert!(
+        clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir)))
+    );
     // The two live backends' project markers can coexist in one checkout, so a document
     // qualifies only if THIS backend could open it — not merely because a project contains it.
-    assert!(clangd.open_signals_readiness(&dir, "src/main.c", &clangd.resolve_layout(&dir)));
+    assert!(clangd.open_signals_readiness(
+        &scope(&dir),
+        "src/main.c",
+        &clangd.resolve_layout(&scope(&dir))
+    ));
     assert!(
-        !clangd.open_signals_readiness(&dir, "src/app.ts", &clangd.resolve_layout(&dir)),
+        !clangd.open_signals_readiness(
+            &scope(&dir),
+            "src/app.ts",
+            &clangd.resolve_layout(&scope(&dir))
+        ),
         "another language's file is not a clangd warm-up document, project or not",
     );
 }
@@ -246,21 +819,25 @@ fn an_out_of_tree_compilation_database_still_counts_as_a_project() {
     std::fs::create_dir_all(dir.join("build")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
     assert!(
-        !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+        !clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         "sources with no compdb anywhere"
     );
 
     std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
     assert!(
-        clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+        clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         "a compdb ANYWHERE in the checkout makes the backend usable",
     );
     assert_eq!(
-        clangd.warmup_document(&dir, &clangd.resolve_layout(&dir)),
+        clangd.warmup_document(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         Some(dir.join("src/main.c"))
     );
     assert!(
-        clangd.open_signals_readiness(&dir, "src/main.c", &clangd.resolve_layout(&dir)),
+        clangd.open_signals_readiness(
+            &scope(&dir),
+            "src/main.c",
+            &clangd.resolve_layout(&scope(&dir))
+        ),
         "a source with no ancestor compdb still warms clangd",
     );
 }
@@ -276,7 +853,7 @@ fn clangd_is_told_where_a_compilation_database_it_could_not_find_lives() {
     std::fs::create_dir_all(dir.join("out")).unwrap();
     std::fs::write(dir.join("out/compile_commands.json"), COMPDB).unwrap();
 
-    let args = clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&dir));
+    let args = clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&dir)));
     assert_eq!(args[0], "--background-index", "the static argv comes first");
     assert!(
         args.contains(&compdb_arg(&dir.join("out"))),
@@ -299,14 +876,14 @@ fn a_file_whose_database_the_session_cannot_reach_is_not_resolvable() {
     std::fs::write(dir.join("proj-b/out/compile_commands.json"), COMPDB).unwrap();
     std::fs::write(dir.join("proj-a/main.c"), "int a(void){return 0;}\n").unwrap();
     std::fs::write(dir.join("proj-b/main.c"), "int b(void){return 0;}\n").unwrap();
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
 
     assert!(
-        clangd.session_can_resolve(&dir, "proj-a/main.c", &layout),
+        clangd.session_can_resolve(&scope(&dir), "proj-a/main.c", &layout),
         "clangd finds proj-a's database beside it",
     );
     assert!(
-        !clangd.session_can_resolve(&dir, "proj-b/main.c", &layout),
+        !clangd.session_can_resolve(&scope(&dir), "proj-b/main.c", &layout),
         "proj-b's database is somewhere clangd will not look, and nothing points it there",
     );
 
@@ -317,8 +894,8 @@ fn a_file_whose_database_the_session_cannot_reach_is_not_resolvable() {
     std::fs::create_dir_all(single.join("src")).unwrap();
     std::fs::write(single.join("out/compile_commands.json"), COMPDB).unwrap();
     std::fs::write(single.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
-    let single_layout = clangd.resolve_layout(&single);
-    assert!(clangd.session_can_resolve(&single, "src/main.c", &single_layout));
+    let single_layout = clangd.resolve_layout(&scope(&single));
+    assert!(clangd.session_can_resolve(&scope(&single), "src/main.c", &single_layout));
 }
 
 #[test]
@@ -333,25 +910,30 @@ fn a_re_resolved_layout_reports_when_the_pinned_database_changed() {
     let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-relayout");
     std::fs::create_dir_all(dir.join("build")).unwrap();
     std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
-    let pinned = clangd.resolve_layout(&dir);
-    assert!(pinned.pins_same_database_as(&clangd.resolve_layout(&dir)), "unchanged checkout");
+    let pinned = clangd.resolve_layout(&scope(&dir));
+    assert!(
+        pinned.pins_same_database_as(&clangd.resolve_layout(&scope(&dir))),
+        "unchanged checkout"
+    );
 
     // A SECOND database appears: the checkout no longer pins one, so the session must go.
     std::fs::create_dir_all(dir.join("other/build")).unwrap();
     std::fs::write(dir.join("other/build/compile_commands.json"), COMPDB).unwrap();
     assert!(
-        !pinned.pins_same_database_as(&clangd.resolve_layout(&dir)),
+        !pinned.pins_same_database_as(&clangd.resolve_layout(&scope(&dir))),
         "a database added mid-session must invalidate a pinned layout",
     );
 
     // And the losing direction: the sole database is removed.
     std::fs::remove_file(dir.join("other/build/compile_commands.json")).unwrap();
     std::fs::remove_file(dir.join("build/compile_commands.json")).unwrap();
-    assert!(!pinned.pins_same_database_as(&clangd.resolve_layout(&dir)));
+    assert!(!pinned.pins_same_database_as(&clangd.resolve_layout(&scope(&dir))));
 
     // A backend with no project marker pins nothing and never goes stale.
     let rust = LiveBackend::for_tool(OracleTool::RaLsp).unwrap();
-    assert!(rust.resolve_layout(&dir).pins_same_database_as(&rust.resolve_layout(&dir)));
+    assert!(
+        rust.resolve_layout(&scope(&dir)).pins_same_database_as(&rust.resolve_layout(&scope(&dir)))
+    );
 }
 
 #[test]
@@ -369,18 +951,18 @@ fn a_nearer_empty_database_does_not_make_a_file_configured() {
         std::fs::write(dir.join(project).join("build/compile_commands.json"), COMPDB).unwrap();
         std::fs::write(dir.join(project).join("main.c"), "int f(void){return 0;}\n").unwrap();
     }
-    let layout = clangd.resolve_layout(&dir);
-    assert!(clangd.session_can_resolve(&dir, "hollow/main.c", &layout));
+    let layout = clangd.resolve_layout(&scope(&dir));
+    assert!(clangd.session_can_resolve(&scope(&dir), "hollow/main.c", &layout));
 
     // Hollow out the nearer database; the file is no longer configured, while its sibling
     // project is untouched.
     std::fs::write(dir.join("hollow/build/compile_commands.json"), "[]").unwrap();
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
-        !clangd.session_can_resolve(&dir, "hollow/main.c", &layout),
+        !clangd.session_can_resolve(&scope(&dir), "hollow/main.c", &layout),
         "an empty nearest database configures nothing",
     );
-    assert!(clangd.session_can_resolve(&dir, "good/main.c", &layout));
+    assert!(clangd.session_can_resolve(&scope(&dir), "good/main.c", &layout));
 }
 
 #[test]
@@ -400,17 +982,21 @@ fn a_databases_usability_is_read_once_per_layout() {
         std::fs::write(dir.join(project).join("build/compile_commands.json"), COMPDB).unwrap();
         std::fs::write(dir.join(project).join("main.c"), "int f(void){return 0;}\n").unwrap();
     }
-    let layout = clangd.resolve_layout(&dir);
-    assert!(clangd.session_can_resolve(&dir, "proj-a/main.c", &layout));
+    let layout = clangd.resolve_layout(&scope(&dir));
+    assert!(clangd.session_can_resolve(&scope(&dir), "proj-a/main.c", &layout));
 
     std::fs::write(dir.join("proj-a/build/compile_commands.json"), "[]").unwrap();
     assert!(
-        clangd.session_can_resolve(&dir, "proj-a/main.c", &layout),
+        clangd.session_can_resolve(&scope(&dir), "proj-a/main.c", &layout),
         "the answer must come from the memo, not from a second read of the database",
     );
     // The memo lives on the layout value, so a re-resolved layout sees the change — that is
     // what keeps LAYOUT_MAX_AGE the only staleness window this introduces.
-    assert!(!clangd.session_can_resolve(&dir, "proj-a/main.c", &clangd.resolve_layout(&dir)));
+    assert!(!clangd.session_can_resolve(
+        &scope(&dir),
+        "proj-a/main.c",
+        &clangd.resolve_layout(&scope(&dir))
+    ));
 }
 
 #[test]
@@ -428,23 +1014,23 @@ fn a_broken_second_database_still_disqualifies_global_pinning() {
     std::fs::write(dir.join("sub/main.c"), "int s(void){return 0;}\n").unwrap();
     std::fs::write(dir.join("root.c"), "int r(void){return 0;}\n").unwrap();
 
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
         clangd.spawn_args(&["--background-index"], &layout),
         vec![OsString::from("--background-index")],
         "a second database disqualifies pinning even when it is unusable",
     );
-    assert!(clangd.session_can_resolve(&dir, "root.c", &layout));
+    assert!(clangd.session_can_resolve(&scope(&dir), "root.c", &layout));
     assert!(
-        !clangd.session_can_resolve(&dir, "sub/main.c", &layout),
+        !clangd.session_can_resolve(&scope(&dir), "sub/main.c", &layout),
         "files of the broken project are not resolvable by either route",
     );
 
     // Remove the broken one and the checkout is genuinely single-database again.
     std::fs::remove_file(dir.join("sub/build/compile_commands.json")).unwrap();
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert!(clangd.spawn_args(&["--background-index"], &layout).contains(&compdb_arg(&dir)));
-    assert!(clangd.session_can_resolve(&dir, "sub/main.c", &layout));
+    assert!(clangd.session_can_resolve(&scope(&dir), "sub/main.c", &layout));
 }
 
 #[test]
@@ -463,7 +1049,8 @@ fn an_entry_missing_a_required_field_is_not_a_usable_database() {
     for entry in incomplete {
         std::fs::write(dir.join("compile_commands.json"), entry).unwrap();
         assert!(
-            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            !clangd
+                .checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
             "{entry} is missing a field clangd requires",
         );
     }
@@ -474,7 +1061,8 @@ fn an_entry_missing_a_required_field_is_not_a_usable_database() {
     ] {
         std::fs::write(dir.join("compile_commands.json"), complete).unwrap();
         assert!(
-            clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            clangd
+                .checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
             "{complete} is a usable database",
         );
     }
@@ -495,15 +1083,18 @@ fn the_nearest_database_decides_even_when_it_is_unusable() {
     std::fs::write(dir.join("elsewhere/build/compile_commands.json"), COMPDB).unwrap();
     std::fs::create_dir_all(dir.join("sub/build")).unwrap();
     std::fs::write(dir.join("sub/main.c"), "int s(void){return 0;}\n").unwrap();
-    let layout = clangd.resolve_layout(&dir);
-    assert!(clangd.session_can_resolve(&dir, "sub/main.c", &layout), "falls back to the root");
+    let layout = clangd.resolve_layout(&scope(&dir));
+    assert!(
+        clangd.session_can_resolve(&scope(&dir), "sub/main.c", &layout),
+        "falls back to the root"
+    );
 
     // Now `sub` has its own EMPTY database. clangd stops there, so the file is not configured
     // — even though the root database above it is perfectly good.
     std::fs::write(dir.join("sub/build/compile_commands.json"), "[]").unwrap();
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
-        !clangd.session_can_resolve(&dir, "sub/main.c", &layout),
+        !clangd.session_can_resolve(&scope(&dir), "sub/main.c", &layout),
         "an unusable NEARER database means fallback flags, not the ancestor's database",
     );
 }
@@ -522,12 +1113,15 @@ fn a_database_is_parsed_not_pattern_matched() {
     for hollow in hollows {
         std::fs::write(dir.join("compile_commands.json"), hollow).unwrap();
         assert!(
-            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            !clangd
+                .checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
             "{hollow} names no translation unit",
         );
     }
     std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
-    assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+    assert!(
+        clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir)))
+    );
 
     // An entry that puts a large `arguments` array before `file` is still valid — a fixed-size
     // byte window over a prefix of the file would have rejected it.
@@ -538,7 +1132,7 @@ fn a_database_is_parsed_not_pattern_matched() {
     assert!(bulky.len() > 512 * 1024, "the fixture must exceed a small scan window");
     std::fs::write(dir.join("compile_commands.json"), &bulky).unwrap();
     assert!(
-        clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+        clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         "a valid database must not be rejected for putting `file` late in a big entry",
     );
 }
@@ -572,7 +1166,8 @@ fn one_malformed_entry_anywhere_makes_the_whole_database_unusable() {
     for database in &rejected {
         std::fs::write(dir.join("compile_commands.json"), database).unwrap();
         assert!(
-            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            !clangd
+                .checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
             "clangd refuses to load {database}, so it configures nothing",
         );
     }
@@ -581,7 +1176,9 @@ fn one_malformed_entry_anywhere_makes_the_whole_database_unusable() {
     let accepted =
         format!(r#"[{GOOD},{{"directory":"/x","file":"/x/b.c","command":"cc -c b.c"}}]"#);
     std::fs::write(dir.join("compile_commands.json"), &accepted).unwrap();
-    assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+    assert!(
+        clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir)))
+    );
 }
 
 #[test]
@@ -638,7 +1235,8 @@ fn an_entrys_shape_is_judged_the_way_clangd_judges_it() {
     for database in rejected {
         std::fs::write(dir.join("compile_commands.json"), database).unwrap();
         assert!(
-            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            !clangd
+                .checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
             "clangd refuses to load {database}, so it configures nothing",
         );
     }
@@ -674,7 +1272,8 @@ fn an_entrys_shape_is_judged_the_way_clangd_judges_it() {
     for database in accepted {
         std::fs::write(dir.join("compile_commands.json"), database).unwrap();
         assert!(
-            clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            clangd
+                .checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
             "clangd loads {database}, so this check must not refuse it",
         );
     }
@@ -717,12 +1316,30 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     drop(database);
 
     let started = std::time::Instant::now();
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     let elapsed = started.elapsed();
     assert!(layout.sole_marker_dir().is_some(), "a large database is still a usable one");
     assert!(
         elapsed < Duration::from_secs(30),
         "validating one large compilation database took {elapsed:?}",
+    );
+
+    // The governance answer comes from the SAME pass — there is no second read of the file — and
+    // this is its worst case: a corpus that matches nothing means every entry is captured and
+    // tested, with no short-circuit. That is the direction the vendored case takes, so it is the
+    // one worth budgeting; the mainstream case qualifies on entry one and never gets here.
+    let nothing_indexed = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let scope = super::CheckoutScope::resolve(&dir, &nothing_indexed);
+    let started = std::time::Instant::now();
+    let layout = clangd.resolve_layout(&scope);
+    let elapsed = started.elapsed();
+    assert!(
+        layout.sole_marker_dir().is_none(),
+        "its entries name another machine's tree, so it governs nothing here",
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "testing every entry against the corpus took {elapsed:?}",
     );
 }
 
@@ -741,7 +1358,9 @@ fn a_symlinked_build_directory_is_still_searched() {
     #[cfg(windows)]
     std::os::windows::fs::symlink_dir(dir.join("cmake-build-debug"), dir.join("build")).unwrap();
 
-    assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+    assert!(
+        clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir)))
+    );
 }
 
 #[cfg(unix)]
@@ -760,7 +1379,7 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
     std::os::unix::fs::symlink(dir.join("out"), dir.join("current-build")).unwrap();
 
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     let args = clangd.spawn_args(&["--background-index"], &layout);
     assert!(
         args.contains(&compdb_arg(&dir.join("out")))
@@ -768,7 +1387,7 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
         "either path reaches the one database, but the session must be pointed at it: {args:?}",
     );
     assert!(
-        clangd.session_can_resolve(&dir, "src/main.c", &layout),
+        clangd.session_can_resolve(&scope(&dir), "src/main.c", &layout),
         "a source clangd could not find the database for is resolvable only because we pin it",
     );
 
@@ -776,7 +1395,7 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
     // projects do not.
     std::fs::create_dir_all(dir.join("other/build")).unwrap();
     std::fs::write(dir.join("other/build/compile_commands.json"), COMPDB).unwrap();
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
         clangd.spawn_args(&["--background-index"], &layout),
         vec![OsString::from("--background-index")],
@@ -785,7 +1404,7 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
     // Including when the second one is unusable — it is what clangd would load for its own
     // project's files, so pinning the working one would hand them the wrong flags.
     std::fs::write(dir.join("other/build/compile_commands.json"), "[]").unwrap();
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
         clangd.spawn_args(&["--background-index"], &layout),
         vec![OsString::from("--background-index")],
@@ -815,7 +1434,7 @@ fn a_nested_checkout_makes_the_layout_unprovable_rather_than_simply_smaller() {
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
 
     // Control FIRST: with no nested checkout the scan is complete, so this pins.
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
         clangd
             .spawn_args(&["--background-index"], &layout)
@@ -833,7 +1452,7 @@ fn a_nested_checkout_makes_the_layout_unprovable_rather_than_simply_smaller() {
     .unwrap();
     std::fs::write(dir.join("worktrees/feature/out/compile_commands.json"), COMPDB).unwrap();
 
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
         clangd.spawn_args(&["--background-index"], &layout),
         vec![OsString::from("--background-index")],
@@ -842,7 +1461,7 @@ fn a_nested_checkout_makes_the_layout_unprovable_rather_than_simply_smaller() {
     // The file's own database is still in an ancestor `build/`, which clangd finds unaided — so
     // declining to pin costs this file nothing.
     assert!(
-        clangd.session_can_resolve(&dir, "src/main.c", &layout),
+        clangd.session_can_resolve(&scope(&dir), "src/main.c", &layout),
         "clangd's own ancestor/build lookup still configures the file",
     );
 }
@@ -860,7 +1479,7 @@ fn a_scan_that_could_not_look_everywhere_never_reports_a_sole_database() {
     std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
 
     // A shallow database alone pins.
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
         clangd
             .spawn_args(&["--background-index"], &layout)
@@ -874,11 +1493,137 @@ fn a_scan_that_could_not_look_everywhere_never_reports_a_sole_database() {
         (0..40).fold(dir.join("nested"), |path, level| path.join(format!("l{level}")));
     std::fs::create_dir_all(&deep).unwrap();
 
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
         clangd.spawn_args(&["--background-index"], &layout),
         vec![OsString::from("--background-index")],
         "a scan that hit its depth bound cannot claim the database it found is the only one",
+    );
+}
+
+/// The ancestor leg never climbs ABOVE the checkout, including when the index root is already the
+/// checkout top — the common case, where there is nothing to climb at all.
+#[test]
+fn the_ancestor_leg_never_leaves_the_checkout() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-climb-stops-at-checkout");
+    let checkout = dir.join("repo");
+    std::fs::create_dir_all(checkout.join("src")).unwrap();
+    rag_rat_base::test_git::run(&checkout, &["init"]);
+    std::fs::write(checkout.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&checkout, "build/compile_commands.json", &["src/main.c"]);
+    // A database OUTSIDE the checkout, on the path the climb would take if it did not stop.
+    write_database(&dir, "compile_commands.json", &["src/main.c"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&checkout, &["src"]);
+    let scope = super::CheckoutScope::resolve(&checkout, &corpus);
+
+    assert_eq!(
+        clangd.resolve_layout(&scope).sole_marker_dir(),
+        Some(checkout.canonicalize().unwrap().join("build").as_path()),
+        "a database above the checkout is not this checkout's, and must not disqualify the pin",
+    );
+}
+
+/// The nested-checkout case against a REAL linked worktree, not a synthetic `.git` file.
+///
+/// This repo keeps its own linked worktrees under `.claude/worktrees/`, so a checkout containing
+/// another checkout is the ordinary case here, not an exotic one. `git worktree add` writes `.git`
+/// as a FILE, which is exactly what a name-based exclusion cannot see — and the sibling carries its
+/// own database, which must never be adopted as this checkout's.
+///
+/// The main checkout and the linked worktree share one database in this repository's model, so the
+/// scan's answer has to hold from either side: the main checkout declines to pin because it can no
+/// longer prove there is one database, and the linked worktree resolves its OWN layout with its own
+/// ceiling.
+#[test]
+fn a_real_linked_worktree_inside_the_checkout_is_not_this_checkouts_project() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-real-linked-worktree");
+    let main = dir.join("main");
+    std::fs::create_dir_all(main.join("src")).unwrap();
+    rag_rat_base::test_git::run(&main, &["init"]);
+    std::fs::write(main.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&main, "build/compile_commands.json", &["src/main.c"]);
+    rag_rat_base::test_git::run(&main, &["add", "."]);
+    rag_rat_base::test_git::run(&main, &["commit", "-m", "seed"]);
+    let corpus = crate::test_support::PrefixCorpus::new(&main, &["src"]);
+
+    // Control FIRST: with no nested checkout this pins, or the assertion below proves nothing.
+    let scope = super::CheckoutScope::resolve(&main, &corpus);
+    assert_eq!(
+        clangd.resolve_layout(&scope).sole_marker_dir(),
+        Some(main.canonicalize().unwrap().join("build").as_path()),
+        "one database and nothing nested ⇒ pinned",
+    );
+
+    // A linked worktree INSIDE the main checkout, carrying its own database.
+    let linked = main.join(".claude/worktrees/feature");
+    std::fs::create_dir_all(main.join(".claude/worktrees")).unwrap();
+    rag_rat_base::test_git::run(&main, &[
+        "worktree",
+        "add",
+        linked.to_str().unwrap(),
+        "-b",
+        "feature",
+    ]);
+    write_database(&linked, "build/compile_commands.json", &["src/main.c"]);
+
+    let scope = super::CheckoutScope::resolve(&main, &corpus);
+    assert!(
+        clangd.resolve_layout(&scope).sole_marker_dir().is_none(),
+        "a nested checkout's `.git` is a FILE — the scan can no longer prove this checkout has \
+         exactly one database, so it declines to pin rather than adopting the sibling's",
+    );
+
+    // From the linked worktree's own side, the ceiling is that worktree — never the main checkout
+    // it happens to sit inside.
+    let linked_corpus = crate::test_support::PrefixCorpus::new(&linked, &["src"]);
+    let linked_scope = super::CheckoutScope::resolve(&linked, &linked_corpus);
+    assert_eq!(
+        linked_scope.ceiling(),
+        linked.canonicalize().unwrap(),
+        "the linked worktree is its own checkout, not a subdirectory of main",
+    );
+    assert_eq!(
+        clangd.resolve_layout(&linked_scope).sole_marker_dir(),
+        Some(linked.canonicalize().unwrap().join("build").as_path()),
+        "and it resolves its own database, not main's",
+    );
+}
+
+/// What the scan proves is now "every database that could GOVERN an indexed file", not "every
+/// database under the root" — and both halves of that need pinning, or the redefinition lives only
+/// in a comment.
+#[test]
+fn completeness_covers_the_ancestor_chain_and_ignores_sibling_subtrees() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-completeness-scope");
+    let checkout = dir.join("repo");
+    std::fs::create_dir_all(checkout.join("sub/src")).unwrap();
+    std::fs::create_dir_all(checkout.join("elsewhere/deep")).unwrap();
+    rag_rat_base::test_git::run(&checkout, &["init"]);
+    std::fs::write(checkout.join("sub/src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&checkout, "sub/build/compile_commands.json", &["sub/src/main.c"]);
+    let root = checkout.join("sub");
+    let corpus = crate::test_support::PrefixCorpus::new(&root, &["src"]);
+
+    // A database in a SIBLING subtree of the index root neither counts nor spoils the proof: no
+    // indexed file lies under it, so it cannot be the one that governs half the sources.
+    write_database(&checkout, "elsewhere/deep/compile_commands.json", &["elsewhere/deep/x.c"]);
+    let scope = super::CheckoutScope::resolve(&root, &corpus);
+    assert_eq!(
+        clangd.resolve_layout(&scope).sole_marker_dir(),
+        Some(root.canonicalize().unwrap().join("build").as_path()),
+        "a sibling subtree of the index root is outside the question being asked",
+    );
+
+    // One on the ANCESTOR chain is a different matter: it governs the indexed sources, so it is
+    // found, counted, and the checkout therefore has two — which disqualifies pinning.
+    write_database(&checkout, "compile_commands.json", &["sub/src/main.c"]);
+    let scope = super::CheckoutScope::resolve(&root, &corpus);
+    assert!(
+        clangd.resolve_layout(&scope).sole_marker_dir().is_none(),
+        "the ancestor chain is searched, so this checkout has two databases, not one",
     );
 }
 
@@ -903,7 +1648,8 @@ fn the_invocation_clangd_selects_is_the_one_that_must_configure_the_file() {
     ] {
         std::fs::write(dir.join("compile_commands.json"), database).unwrap();
         assert!(
-            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            !clangd
+                .checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
             "`arguments` is what clangd uses, so {database} configures nothing",
         );
     }
@@ -915,7 +1661,9 @@ fn the_invocation_clangd_selects_is_the_one_that_must_configure_the_file() {
         r#"[{"directory":"/x","file":"/x/a.c","command":"","arguments":["cc","-c","a.c"]}]"#,
     )
     .unwrap();
-    assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+    assert!(
+        clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir)))
+    );
 }
 
 #[test]
@@ -940,18 +1688,18 @@ fn a_key_outside_the_modelled_format_is_uncertainty_rather_than_acceptance() {
     )
     .unwrap();
 
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
         clangd.spawn_args(&["--background-index"], &layout),
         vec![OsString::from("--background-index")],
         "a database clangd would refuse must not be pinned",
     );
     assert!(
-        !clangd.session_can_resolve(&dir, "src/main.c", &layout),
+        !clangd.session_can_resolve(&scope(&dir), "src/main.c", &layout),
         "…nor may a file be resolved through it, which is how fallback flags get persisted",
     );
     assert!(
-        clangd.checkout_can_signal_readiness(&dir, &layout),
+        clangd.checkout_can_signal_readiness(&scope(&dir), &layout),
         "…but an unrecognised key is not proof the checkout has no project either",
     );
 
@@ -961,7 +1709,7 @@ fn a_key_outside_the_modelled_format_is_uncertainty_rather_than_acceptance() {
         r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","output":"a.o"}]"#,
     )
     .unwrap();
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
         clangd
             .spawn_args(&["--background-index"], &layout)
@@ -993,9 +1741,9 @@ fn a_database_this_crate_cannot_parse_is_not_trusted_but_does_not_block_the_back
     )
     .unwrap();
 
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
-        clangd.checkout_can_signal_readiness(&dir, &layout),
+        clangd.checkout_can_signal_readiness(&scope(&dir), &layout),
         "a database this crate cannot read must not report the whole backend blocked",
     );
     assert_eq!(
@@ -1008,7 +1756,7 @@ fn a_database_this_crate_cannot_parse_is_not_trusted_but_does_not_block_the_back
     // it still blocks, which is what stops a session warming forever on an empty project.
     std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
     assert!(
-        !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+        !clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         "a database that parses and describes no translation unit is still refused",
     );
 }
@@ -1031,7 +1779,8 @@ fn a_database_clangd_can_read_is_not_refused_over_a_bom_or_trailing_bytes() {
     ] {
         std::fs::write(dir.join("compile_commands.json"), &database).unwrap();
         assert!(
-            clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            clangd
+                .checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
             "clangd loads a database with {label}, so this check must not refuse it",
         );
     }
@@ -1041,7 +1790,8 @@ fn a_database_clangd_can_read_is_not_refused_over_a_bom_or_trailing_bytes() {
     for database in ["\u{feff}[]", "\u{feff}[{\"file\":\"/x/a.c\"}]"] {
         std::fs::write(dir.join("compile_commands.json"), database).unwrap();
         assert!(
-            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            !clangd
+                .checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
             "a BOM does not excuse {database}",
         );
     }
@@ -1068,7 +1818,7 @@ fn the_marker_search_does_not_follow_a_symlink_out_of_the_checkout() {
     // The escape: a link to a tree that holds its own database.
     std::os::unix::fs::symlink(outside.path(), dir.join("sdk")).unwrap();
 
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
         clangd
             .spawn_args(&["--background-index"], &layout)
@@ -1080,7 +1830,7 @@ fn the_marker_search_does_not_follow_a_symlink_out_of_the_checkout() {
     // pinning — so the assertion above cannot pass by the walk simply never descending.
     std::fs::create_dir_all(dir.join("inside/build")).unwrap();
     std::fs::write(dir.join("inside/build/compile_commands.json"), COMPDB).unwrap();
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
         clangd.spawn_args(&["--background-index"], &layout),
         vec![OsString::from("--background-index")],
@@ -1098,7 +1848,7 @@ fn a_symlink_cycle_cannot_hang_the_marker_search() {
     std::fs::create_dir_all(dir.join("nested")).unwrap();
     std::os::unix::fs::symlink(dir.path(), dir.join("nested/loop")).unwrap();
     // Terminates; the checkout has no database, so it reports none.
-    assert!(clangd.resolve_layout(&dir).sole_marker_dir().is_none());
+    assert!(clangd.resolve_layout(&scope(&dir)).sole_marker_dir().is_none());
 }
 
 #[cfg(unix)]
@@ -1123,7 +1873,7 @@ fn two_symlink_cycles_cannot_make_the_marker_search_explode() {
     let root = dir.path().to_path_buf();
     let (done, resolved) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let pinned = clangd.resolve_layout(&root).sole_marker_dir().map(Path::to_path_buf);
+        let pinned = clangd.resolve_layout(&scope(&root)).sole_marker_dir().map(Path::to_path_buf);
         let _ = done.send(pinned);
     });
     let pinned = resolved
@@ -1146,7 +1896,7 @@ fn a_hidden_build_under_dot_cache_is_still_a_database() {
     std::fs::write(dir.join(".cache/clangd/compile_commands.json"), COMPDB).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
 
-    let layout = clangd.resolve_layout(&dir);
+    let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
         layout.sole_marker_dir(),
         Some(dir.join(".cache/cmake-build").as_path()),
@@ -1164,10 +1914,14 @@ fn an_empty_compilation_database_is_not_a_project() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void){return 0;}\n").unwrap();
     std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
-    assert!(!clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+    assert!(
+        !clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir)))
+    );
 
     std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
-    assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+    assert!(
+        clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir)))
+    );
 }
 
 #[test]
@@ -1182,15 +1936,17 @@ fn a_hidden_build_directory_still_counts_as_a_compilation_database() {
     std::fs::write(dir.join(".build/compile_commands.json"), COMPDB).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void){return 0;}\n").unwrap();
 
-    assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+    assert!(
+        clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir)))
+    );
     assert!(
         clangd
-            .spawn_args(&["--background-index"], &clangd.resolve_layout(&dir))
+            .spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&dir)))
             .contains(&compdb_arg(&dir.join(".build"))),
     );
     // The warm-up document still comes from the visible tree.
     assert_eq!(
-        clangd.warmup_document(&dir, &clangd.resolve_layout(&dir)),
+        clangd.warmup_document(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         Some(dir.join("src/main.c"))
     );
 }
@@ -1212,7 +1968,7 @@ fn a_vendored_or_vcs_database_is_never_mistaken_for_the_checkouts_own() {
 
     assert!(
         clangd
-            .spawn_args(&["--background-index"], &clangd.resolve_layout(&dir))
+            .spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&dir)))
             .contains(&OsString::from(format!("--compile-commands-dir={}", dir.display()))),
         "the checkout's own database is still the single unambiguous one",
     );
@@ -1234,18 +1990,26 @@ fn several_compilation_databases_are_left_to_the_servers_own_per_file_lookup() {
         std::fs::write(dir.join(project).join("main.c"), "int main(void){return 0;}\n").unwrap();
     }
     assert_eq!(
-        clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&dir)),
+        clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&dir))),
         vec![OsString::from("--background-index")],
         "no database may be forced globally when several exist",
     );
     // Each project's own file is still fine: clangd finds `<dir>/build/` beside it.
-    assert!(clangd.open_signals_readiness(&dir, "proj-a/main.c", &clangd.resolve_layout(&dir)));
+    assert!(clangd.open_signals_readiness(
+        &scope(&dir),
+        "proj-a/main.c",
+        &clangd.resolve_layout(&scope(&dir))
+    ));
     // A file belonging to no project is not a usable warm-up document here, because nothing
     // points the session at a database on its behalf.
     std::fs::write(dir.join("stray.c"), "int stray(void){return 0;}\n").unwrap();
-    assert!(!clangd.open_signals_readiness(&dir, "stray.c", &clangd.resolve_layout(&dir)));
+    assert!(!clangd.open_signals_readiness(
+        &scope(&dir),
+        "stray.c",
+        &clangd.resolve_layout(&scope(&dir))
+    ));
     assert!(
-        clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+        clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         "the per-project files remain warmable, so the backend is not blocked",
     );
 }
@@ -1257,17 +2021,18 @@ fn a_backend_with_no_checkout_scoped_marker_gets_only_its_static_argv() {
     let dir = rag_rat_base::test_scratch::ScratchDir::new("static-argv");
     std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
     let ts = LiveBackend::for_tool(OracleTool::TsLsp).unwrap();
-    assert_eq!(ts.spawn_args(&["--stdio"], &ts.resolve_layout(&dir)), vec![OsString::from(
-        "--stdio"
-    )]);
+    assert_eq!(ts.spawn_args(&["--stdio"], &ts.resolve_layout(&scope(&dir))), vec![
+        OsString::from("--stdio")
+    ]);
     let rust = LiveBackend::for_tool(OracleTool::RaLsp).unwrap();
-    assert!(rust.spawn_args(&[], &rust.resolve_layout(&dir)).is_empty());
+    assert!(rust.spawn_args(&[], &rust.resolve_layout(&scope(&dir))).is_empty());
     // And with no database anywhere, clangd gets no directory to point at either.
     let empty = rag_rat_base::test_scratch::ScratchDir::new("static-argv-empty");
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    assert_eq!(clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&empty)), vec![
-        OsString::from("--background-index")
-    ],);
+    assert_eq!(
+        clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&empty))),
+        vec![OsString::from("--background-index")],
+    );
 }
 
 #[test]
@@ -1282,11 +2047,11 @@ fn a_typescript_project_still_has_to_enclose_its_documents() {
     std::fs::write(dir.join("src/main.ts"), "export const x = 1;\n").unwrap();
     std::fs::write(dir.join("config/tsconfig.json"), "{}").unwrap();
     assert!(
-        !ts.open_signals_readiness(&dir, "src/main.ts", &ts.resolve_layout(&dir)),
+        !ts.open_signals_readiness(&scope(&dir), "src/main.ts", &ts.resolve_layout(&scope(&dir))),
         "a config in a SIBLING directory governs nothing under src/",
     );
     assert_eq!(
-        ts.warmup_document(&dir, &ts.resolve_layout(&dir)),
+        ts.warmup_document(&scope(&dir), &ts.resolve_layout(&scope(&dir))),
         None,
         "and there is nothing to warm on"
     );

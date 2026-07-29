@@ -138,6 +138,12 @@ pub enum ConfigError {
     DuplicateTarget(String),
     #[error("configured directory does not exist: {0}")]
     MissingDirectory(PathBuf),
+    #[error(
+        "configured directory `{0}` lies outside `[index] root` — every indexed file must sit \
+         under the root, and one that doesn't fails the index run itself. Raise `[index] root` to \
+         the directory that encloses both, or drop this target"
+    )]
+    TargetOutsideRoot(PathBuf),
     #[error("[log] `level` must be one of off|error|warn|info|debug|trace (got `{0}`)")]
     UnknownLogLevel(String),
     #[error("[log] `format` must be `text` or `json` (got `{0}`)")]

@@ -54,7 +54,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 use url::Url;
 
-use super::backend::{self, LiveBackend, ProjectLayout};
+use super::backend::{self, CheckoutScope, LiveBackend, ProjectLayout};
 use super::lsp::client::LspClient;
 use super::lsp::position::LineIndex;
 use super::store::{self, EdgeOracleRow};
@@ -116,14 +116,14 @@ struct SpawnPreflight {
 fn resolve_preflight(
     backend: &LiveBackend,
     manifest: &ToolManifest,
-    checkout_root: &Path,
+    checkout: &CheckoutScope<'_>,
     availability: ToolAvailability,
 ) -> Result<SpawnPreflight, LiveSpawnBlocked> {
     let ToolAvailability::Available { version, .. } = availability else {
         return Err(LiveSpawnBlocked::Unavailable);
     };
-    let layout = backend.resolve_layout(checkout_root);
-    match manifest.prerequisite_blocked_with(checkout_root, Some(&layout)) {
+    let layout = backend.resolve_layout(checkout);
+    match manifest.prerequisite_blocked_with(checkout, Some(&layout)) {
         Some(hint) => Err(LiveSpawnBlocked::Prerequisite(hint)),
         None => Ok(SpawnPreflight { version, layout }),
     }
@@ -148,32 +148,28 @@ pub(crate) struct InjectedSession<'a> {
 }
 
 impl LiveOracleSession {
-    /// Probe `tool`'s language server and spawn the resident client for `checkout_root`.
+    /// Probe `tool`'s language server and spawn the resident client for `checkout`.
     ///
     /// Never an error and never a failed pass — the same degrade-quietly UX as a missing embedding
     /// model or batch tool — but the two ways it can decline are reported separately so a
     /// permanent configuration problem does not masquerade as a transient one. The version is
     /// RE-probed at every spawn so `tool_version` always names the binary this session's verdicts
     /// came from.
-    pub fn spawn(tool: OracleTool, checkout_root: &Path) -> Result<Self, LiveSpawnBlocked> {
+    pub fn spawn(tool: OracleTool, checkout: &CheckoutScope<'_>) -> Result<Self, LiveSpawnBlocked> {
         let Some(backend) = LiveBackend::for_tool(tool) else {
             return Err(LiveSpawnBlocked::Unavailable);
         };
         let manifest = ToolManifest::for_tool(tool);
         // The probe is this call's ARGUMENT, so the checkout walk inside can never precede it.
-        let SpawnPreflight { version, layout } = resolve_preflight(
-            &backend,
-            &manifest,
-            checkout_root,
-            manifest.probe_in(checkout_root),
-        )?;
-        let Some(root_uri) = root_uri_for(checkout_root) else {
+        let SpawnPreflight { version, layout } =
+            resolve_preflight(&backend, &manifest, checkout, manifest.probe_in(checkout.root()))?;
+        let Some(root_uri) = root_uri_for(checkout.root()) else {
             return Err(LiveSpawnBlocked::Unavailable);
         };
         let mut client = LspClient::spawn(
             manifest.program,
             &backend.spawn_args(manifest.live_args, &layout),
-            checkout_root,
+            checkout.root(),
             backend.readiness,
         )
         .map_err(|_| LiveSpawnBlocked::Unavailable)?;
@@ -289,7 +285,7 @@ impl LiveOracleSession {
     /// notifications are enough: the server loads in the background, its progress cycle latches
     /// the session ready, and the NEXT pass resolves the deferred worklist normally. Closing the
     /// document immediately does not cancel the load.
-    fn trigger_warmup_open(&mut self, checkout_root: &Path, worklist: &[String]) {
+    fn trigger_warmup_open(&mut self, checkout: &CheckoutScope<'_>, worklist: &[String]) {
         let open_document = |absolute: &Path| {
             let text = std::fs::read_to_string(absolute).ok()?;
             let uri: String = Url::from_file_path(absolute).ok()?.into();
@@ -298,11 +294,11 @@ impl LiveOracleSession {
         };
         let opened = worklist
             .iter()
-            .filter(|path| self.backend.open_signals_readiness(checkout_root, path, &self.layout))
-            .find_map(|path| open_document(&checkout_root.join(path)))
+            .filter(|path| self.backend.open_signals_readiness(checkout, path, &self.layout))
+            .find_map(|path| open_document(&checkout.root().join(path)))
             .or_else(|| {
                 self.backend
-                    .warmup_document(checkout_root, &self.layout)
+                    .warmup_document(checkout, &self.layout)
                     .as_deref()
                     .and_then(open_document)
             });
@@ -319,8 +315,8 @@ impl LiveOracleSession {
     }
 
     /// Whether this session can configure `path` (repo-relative) well enough to trust its answers.
-    fn can_resolve_path(&self, checkout_root: &Path, path: &str) -> bool {
-        self.backend.session_can_resolve(checkout_root, path, &self.layout)
+    fn can_resolve_path(&self, checkout: &CheckoutScope<'_>, path: &str) -> bool {
+        self.backend.session_can_resolve(checkout, path, &self.layout)
     }
 
     /// Re-resolve the checkout's project layout if the cached one has aged out, and report
@@ -329,17 +325,22 @@ impl LiveOracleSession {
     /// `false` means the checkout now pins a DIFFERENT database (one appeared, moved, or was
     /// removed). That cannot be corrected in place: the server was spawned with an argv derived
     /// from the old layout, so the session has to be replaced.
-    fn layout_still_holds(&mut self, checkout_root: &Path) -> bool {
+    fn layout_still_holds(&mut self, checkout: &CheckoutScope<'_>) -> bool {
         if self.layout_resolved_at.elapsed() < backend::LAYOUT_MAX_AGE {
             return true;
         }
-        let fresh = self.backend.resolve_layout(checkout_root);
+        let fresh = self.backend.resolve_layout(checkout);
         self.layout_resolved_at = Instant::now();
         if !fresh.pins_same_database_as(&self.layout) {
             return false;
         }
         self.layout = fresh;
         true
+    }
+
+    /// Whether the checkout's sole database was declined for describing nothing indexed.
+    fn layout_governs_nothing_indexed(&self) -> bool {
+        self.layout.has_database_governing_nothing_indexed()
     }
 
     /// Test barrier: one synchronous round trip. The transport is FIFO, so a returned response
@@ -356,9 +357,10 @@ pub struct LivePassInput<'a> {
     /// The active checkout the just-reindexed files (and their edge candidates) are scoped to.
     pub commit_sha: &'a str,
     pub worktree_id: &'a str,
-    /// The checkout root: `url::Url` converts each document path, and target bytes are read from
-    /// `checkout_root/path`.
-    pub checkout_root: &'a Path,
+    /// What this pass may look at: the configured root each document path is joined onto, the
+    /// enclosing checkout, and the corpus. Carried as one value rather than a bare root so a
+    /// caller cannot hand the pass a root the scope was not resolved for.
+    pub scope: &'a CheckoutScope<'a>,
     /// Repo-relative paths the pass may resolve (the maintenance pass's changed set plus any
     /// backlog), RUST files only — the ra-lsp backend's language. Processed in order; whatever
     /// the request budget doesn't cover rides `LivePassReport::unfinished_paths`.
@@ -430,6 +432,10 @@ pub struct LivePassReport {
     /// Whether prior-version live verdicts were migrated to the session's `tool_version` (a
     /// `rust-analyzer` upgrade detected at spawn).
     pub version_migrated: bool,
+    /// Whether this checkout holds a compilation database that was NOT pinned because it names no
+    /// file the checkout indexes. Reported so a pass that skipped everything can say WHY in terms
+    /// the operator can act on, rather than leaving them with the generic multi-database advice.
+    pub database_governs_nothing: bool,
     /// Worklist paths the request budget didn't reach — the caller's backlog into the next pass.
     #[serde(skip)]
     pub unfinished_paths: Vec<String>,
@@ -463,7 +469,7 @@ pub fn live_oracle_pass(
     // never reach this check, so a database removed during warm-up would leave it warming forever
     // with no way back. End the pass instead and let the watcher replace the session — its argv
     // was derived from the old layout, so it cannot be corrected in place.
-    if !session.layout_still_holds(input.checkout_root) {
+    if !session.layout_still_holds(input.scope) {
         report.unfinished_paths = input.worklist.to_vec();
         report.abort = Some(LivePassAbort::LayoutChanged);
         report.status =
@@ -476,7 +482,7 @@ pub fn live_oracle_pass(
             // A backend whose readiness signal only fires for an open document can never report
             // ready while the pass declines to open one. Break that deadlock without blocking.
             if session.needs_warmup_open() {
-                session.trigger_warmup_open(input.checkout_root, input.worklist);
+                session.trigger_warmup_open(input.scope, input.worklist);
             }
             report.unfinished_paths = input.worklist.to_vec();
             report.status = "Warming".to_string();
@@ -489,6 +495,7 @@ pub fn live_oracle_pass(
             return Ok(report);
         },
     }
+    report.database_governs_nothing = session.layout_governs_nothing_indexed();
     let tool = session.tool();
     // The batch tool whose monikers live copies (rust-analyzer for ra-lsp, scip-typescript for
     // ts-lsp) — always `Some` for a live tool; the join is vacuous without it.
@@ -576,7 +583,7 @@ pub fn live_oracle_pass(
         // resolve, and do NOT defer: retrying cannot help until the checkout's layout changes.
         // RETAINED for the caller instead, so the layout change that makes the file resolvable can
         // bring it back — without a backlog entry that would schedule passes able only to re-skip.
-        if !session.can_resolve_path(input.checkout_root, path) {
+        if !session.can_resolve_path(input.scope, path) {
             report.skipped_unconfigured += callees.len() as u64;
             report.skipped_unconfigured_paths.push(path.clone());
             continue;
@@ -608,7 +615,7 @@ pub fn live_oracle_pass(
         // Callsite drift gate: the server resolves the DIRTY disk bytes, so those bytes must
         // still hash to the indexed `file_sha` the candidates were built from — a mid-pass edit
         // makes the indexed callee ranges point at the wrong content. Skip, never mis-resolve.
-        let Ok(bytes) = std::fs::read(input.checkout_root.join(path)) else {
+        let Ok(bytes) = std::fs::read(input.scope.root().join(path)) else {
             report.skipped_drifted += callees.len() as u64;
             report.unfinished_paths.push(path.clone());
             continue;
@@ -662,7 +669,7 @@ pub fn live_oracle_pass(
 
         // Platform-aware file URL conversion handles drive/UNC/verbatim prefixes and percent
         // encoding; hand-joining the root and DB path repeatedly produced malformed URIs.
-        let uri: String = Url::from_file_path(input.checkout_root.join(path))
+        let uri: String = Url::from_file_path(input.scope.root().join(path))
             .map_err(|()| anyhow::anyhow!("cannot convert live-oracle document path to file URL"))?
             .into();
         let starts: Vec<usize> =
@@ -699,7 +706,7 @@ pub fn live_oracle_pass(
         // the server resolved the didOpen snapshot, and writing it against an already-changed disk
         // file would look current until the queued reindex catches up (or forever if its event was
         // missed).
-        if std::fs::read(input.checkout_root.join(path))
+        if std::fs::read(input.scope.root().join(path))
             .ok()
             .is_none_or(|current| hex_sha256(&current) != callees[0].file_sha)
         {
@@ -730,7 +737,7 @@ pub fn live_oracle_pass(
             // disk bytes, so those must still be the indexed bytes the symbol spans came from.
             let def_disk = def_bytes
                 .entry(def_path.clone())
-                .or_insert_with(|| std::fs::read(input.checkout_root.join(&def_path)).ok())
+                .or_insert_with(|| std::fs::read(input.scope.root().join(&def_path)).ok())
                 .clone();
             let Some(def_disk) = def_disk else {
                 report.skipped_drifted += 1;
@@ -1001,7 +1008,13 @@ mod tests {
             };
 
             assert_eq!(
-                resolve_preflight(&backend, &manifest, root, blocked).err(),
+                resolve_preflight(
+                    &backend,
+                    &manifest,
+                    &crate::test_support::every_path_scope(root),
+                    blocked
+                )
+                .err(),
                 Some(LiveSpawnBlocked::Unavailable),
                 "an absent {tool:?} outranks the checkout prerequisite it makes moot",
             );
@@ -1016,7 +1029,12 @@ mod tests {
                 program: manifest.program.to_string(),
                 version: version.to_string(),
             };
-            match resolve_preflight(&backend, &manifest, root, available) {
+            match resolve_preflight(
+                &backend,
+                &manifest,
+                &crate::test_support::every_path_scope(root),
+                available,
+            ) {
                 Err(LiveSpawnBlocked::Prerequisite(hint)) => {
                     assert!(hint.contains(marker), "the {tool:?} hint names the fix: {hint}");
                 },

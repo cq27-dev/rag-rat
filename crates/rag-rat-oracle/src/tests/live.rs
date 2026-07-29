@@ -67,7 +67,7 @@ fn pass_input<'a>(h: &'a Harness, worklist: &'a [String], max_requests: u64) -> 
     LivePassInput {
         commit_sha: COMMIT,
         worktree_id: WORKTREE,
-        checkout_root: h.root(),
+        scope: h.scope(),
         worklist,
         max_requests,
         started_at_ms: 1_000,
@@ -1448,7 +1448,7 @@ mod clangd {
     fn clangd_layout(h: &Harness) -> ProjectLayout {
         LiveBackend::for_tool(OracleTool::ClangdLsp)
             .expect("a live backend")
-            .resolve_layout(h.root())
+            .resolve_layout(h.scope())
     }
 
     /// A clangd-backed session over a fake server that reports a completed index cycle alongside

@@ -423,19 +423,80 @@ fn push_target(
     root: &Path,
     names: &mut BTreeSet<String>,
     targets: &mut Vec<ResolvedTarget>,
-    target: ResolvedTarget,
+    mut target: ResolvedTarget,
 ) -> Result<(), ConfigError> {
     if !names.insert(target.name.clone()) {
         return Err(ConfigError::DuplicateTarget(target.name));
     }
+    let mut root_relative = Vec::with_capacity(target.directories.len());
     for directory in &target.directories {
         let full_path = root.join(directory);
         if !full_path.is_dir() {
             return Err(ConfigError::MissingDirectory(directory.clone()));
         }
+        let Some(contained) = root_relative_within(root, &full_path) else {
+            return Err(ConfigError::TargetOutsideRoot(directory.clone()));
+        };
+        // The ROOT itself keeps its `.` spelling rather than relativizing to the empty path. The
+        // stored strings are compared literally against a corpus profile's declared bindings
+        // (`ensure_checkout_matches_corpus`), and the shipped profiles spell the whole-root binding
+        // `.` — rewriting it would make `oracle report --corpus <id>` reject a checkout indexed
+        // exactly as its own profile specifies.
+        root_relative.push(if contained.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            contained
+        });
     }
+    // `ResolvedTarget.directories` are ROOT-RELATIVE by contract — every consumer joins them onto a
+    // root or prefix-matches a root-relative path against them. An absolute directory satisfies the
+    // join (it wins outright) but can never prefix-match, so a target configured absolutely would
+    // be walked and indexed while every predicate over it — `target_for_path`, and the live
+    // oracle's corpus — reported its files as belonging to no target. Storing the contained
+    // form is what makes the contract true rather than merely documented.
+    target.directories = root_relative;
     targets.push(target);
     Ok(())
+}
+
+/// Whether `path` lies under `root`, judged on the path text alone.
+///
+/// LEXICAL, never `canonicalize`. Existence is already established by the caller, and resolving
+/// links would make containment depend on how the operator spelled the root rather than on what
+/// the config says — a root reached through a symlink would start refusing its own directories.
+///
+/// Collapsing `..` first is the whole point: `Path::starts_with` compares components, so the
+/// uncollapsed `<root>/../shared` "starts with" `<root>` and every upward escape would pass. An
+/// absolute directory needs no collapsing to escape at all — `Path::join` discards the root for
+/// one — which is why this tests the JOINED path rather than counting `..` in the configured one.
+fn root_relative_within(root: &Path, path: &Path) -> Option<PathBuf> {
+    // TWO questions, deliberately answered by different means.
+    //
+    // The stored value is LEXICAL, because it must match the spelling the indexing walk produces.
+    // `walk_target` joins the configured directory onto the root and enters it with `is_dir()`,
+    // which follows links — so a target spelled `src` where `src -> real_sources` yields paths
+    // under `src/`, and rewriting the stored directory to `real_sources` would leave every
+    // predicate over it (`target_for_path`, the live oracle's corpus) unable to match the very
+    // files it indexed.
+    //
+    // CONTAINMENT is checked against the filesystem as well, because the textual collapse lies
+    // about a `..` that follows a symlink: with `link -> /outside/project`, the directory
+    // `link/../src` that `is_dir()` just validated is `/outside/src`, while collapsing
+    // textually yields `<root>/src`. Accepting that would validate one directory and store a
+    // path naming another, and indexing would silently walk a tree nobody checked.
+    let relative = crate::paths::lexically_normalized(path)?
+        .strip_prefix(crate::paths::lexically_normalized(root)?)
+        .ok()?
+        .to_path_buf();
+    // When both resolve, the filesystem has the final say on containment. When either does not — a
+    // root the caller has not created, a directory racing a delete — the textual answer is all
+    // there is, and it is the one this function gave before.
+    if let (Ok(canonical_root), Ok(canonical_path)) = (root.canonicalize(), path.canonicalize())
+        && !canonical_path.starts_with(&canonical_root)
+    {
+        return None;
+    }
+    Some(relative)
 }
 
 /// Re-anchor a **linked** worktree's `root` to the equivalent path under the **main** worktree, so

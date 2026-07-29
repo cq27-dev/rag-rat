@@ -623,3 +623,73 @@ fn worktree_overlay_query_routing_selects_scope() {
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);
 }
+
+#[test]
+fn a_branch_target_survives_an_overlay_root_spelled_with_a_parent_component() {
+    // Target containment is enforced at config load, and `for_linked_worktree_overlay` is the one
+    // caller that resolves targets against a NON-canonical root: it builds
+    // `workdir.join([index] root)` directly, unlike the main load path. A containment check that
+    // normalized only the joined target path and compared it against the raw root rejected every
+    // genuinely contained directory — and this caller swallows the error and falls back to the base
+    // config's targets, so the branch's own targets vanish with no diagnostic at all.
+    //
+    // The shared-database shape matters here, which is why this is not just a `resolve_targets`
+    // unit test: the branch-only target must be indexed into the LINKED checkout's overlay scope,
+    // and the base checkout must neither gain those rows nor lose its own.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/base.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // The branch adds a target directory main does not have, and spells its own `[index] root`
+    // with a `..` component — legal, and not canonicalized on this path.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::create_dir_all(linked.join("extra")).unwrap();
+    fs::create_dir_all(linked.join("nested")).unwrap();
+    fs::write(linked.join("extra/branch_only.rs"), "pub fn branch_only_fn() {}\n").unwrap();
+    fs::write(
+        linked.join("rag-rat.toml"),
+        "[index]\nroot = \"nested/..\"\ndatabase = \
+         \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = [\"src\", \"extra\"]\n",
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch target"]);
+
+    // The overlay config must carry the BRANCH's targets. Falling back to the base config's here is
+    // the silent failure this guards.
+    let overlay_config = config.for_linked_worktree_overlay(&linked);
+    let overlay_dirs: Vec<_> =
+        overlay_config.targets.iter().flat_map(|t| t.directories.iter()).collect();
+    assert!(
+        overlay_dirs.iter().any(|dir| dir.as_path() == Path::new("extra")),
+        "the branch's own target survived a root spelled with `..`: {overlay_dirs:?}",
+    );
+
+    db.index_worktree_overlay(&overlay_config, &linked, &mut |_| {}).unwrap();
+    assert!(
+        names_in_scope(&db, "extra/branch_only.rs").contains(&"branch_only_fn".to_string()),
+        "the branch-only target is indexed into the linked checkout's overlay scope",
+    );
+
+    // Sibling isolation: the base checkout keeps its own rows and gains none of the branch's.
+    set_base_scope(&mut db, &main);
+    assert!(
+        names_in_scope(&db, "src/base.rs").contains(&"base_fn".to_string()),
+        "the base checkout's own rows are preserved",
+    );
+    assert!(
+        !path_in_scope(&db, "extra/branch_only.rs"),
+        "a branch-only target must not become visible in the base scope",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}

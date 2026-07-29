@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use auto_run::{AutoRunDecision, AutoRunInputs, auto_run_decision};
-pub use backend::LiveBackend;
+pub use backend::{CheckoutScope, IndexedCorpus, LiveBackend};
 pub use corpus::{
     HealthViolation, check_corpus_health, corpora_for_tier, corpus_by_id, load_corpora,
 };
@@ -333,7 +333,7 @@ pub fn produce_scip_with_tool(
     };
     // Tool-specific prerequisite (scip-clang needs a compile_commands.json at the root). Missing →
     // Blocked + hint, exit 0 — never a subprocess error (#71).
-    if let Some(hint) = manifest.prerequisite_blocked(checkout_root) {
+    if let Some(hint) = manifest.batch_prerequisite_blocked(checkout_root) {
         return Ok(ScipProduction::Blocked {
             tool: tool.as_db_str().to_string(),
             program: manifest.program.to_string(),

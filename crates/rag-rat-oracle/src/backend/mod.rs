@@ -14,8 +14,10 @@
 mod documents;
 mod layout;
 mod registry;
+mod scope;
 #[cfg(test)]
 mod tests;
 
 pub use layout::{LAYOUT_MAX_AGE, ProjectLayout};
 pub use registry::LiveBackend;
+pub use scope::{CheckoutScope, IndexedCorpus};

@@ -4,7 +4,7 @@
 //! memory-relocation tests, so it is NOT `#[cfg(test)]` — the gate does not propagate cross-crate.
 //! Not part of the semver-stable API surface.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ::protobuf::{EnumOrUnknown, Message};
 use ::scip::types::{Document, Index, Occurrence, PositionEncoding};
@@ -38,6 +38,9 @@ pub struct EdgeContentKey {
 /// A test corpus written to a temp checkout + an index DB seeded to match.
 pub struct Harness {
     pub conn: Connection,
+    /// Built on first use and reused, because a `LivePassInput` borrows it: a per-call temporary
+    /// would not outlive the input it is handed to.
+    scope: std::sync::OnceLock<crate::backend::CheckoutScope<'static>>,
     // Fields drop in declaration order: close SQLite before removing its directory on Windows.
     root: ScratchDir,
 }
@@ -58,7 +61,7 @@ impl Harness {
         // hook-using migration runs over empty tables, so the harness stays engine-free.
         schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
         let root = ScratchDir::new("oracle");
-        Harness { conn, root }
+        Harness { conn, scope: std::sync::OnceLock::new(), root }
     }
 
     /// Write a source file to the checkout and insert its `files` row, returning the file id. The
@@ -260,6 +263,12 @@ impl Harness {
 
     pub fn root(&self) -> &Path {
         self.root.path()
+    }
+
+    /// The checkout scope over this harness's root, with a corpus that claims every path — these
+    /// tests are about the live pass, not about which files a checkout owns.
+    pub fn scope(&self) -> &crate::backend::CheckoutScope<'static> {
+        self.scope.get_or_init(|| crate::test_support::every_path_scope(self.root()))
     }
 
     /// Insert a `files` row in an explicit `(commit_sha, worktree_id)` scope (no checkout write —
@@ -479,4 +488,66 @@ pub fn move_target_with_edit(h: &Harness, old_file: i64, new_kind: &str) -> i64 
     h.add_chunk(moved, "moved.rs::target", "fn target(changed: u32) {}\n");
     h.add_logical_symbol(2002, "moved.rs", "target", "moved.rs::target", sym);
     sym
+}
+
+/// A checkout scope over `dir` whose corpus claims every path.
+///
+/// Most layout and manifest tests are about the marker/document SEARCH or the prerequisite gate,
+/// not about which files a checkout owns; a corpus that refused anything would make them pass or
+/// fail for a reason they are not testing. Tests that ARE about ownership build their own corpus.
+pub fn every_path_scope(dir: &Path) -> crate::backend::CheckoutScope<'static> {
+    struct EveryPath;
+
+    impl crate::backend::IndexedCorpus for EveryPath {
+        fn indexes_file(&self, _absolute: &Path) -> bool {
+            true
+        }
+
+        fn may_hold_indexed_files(&self, _dir: &Path) -> bool {
+            true
+        }
+    }
+
+    static EVERY_PATH: EveryPath = EveryPath;
+    crate::backend::CheckoutScope::resolve(dir, &EVERY_PATH)
+}
+
+/// A corpus that indexes exactly the files under the given root-relative prefixes.
+///
+/// The governance tests are about which files a checkout OWNS, so they cannot use
+/// [`every_path_scope`] — a corpus that claims everything would make a vendored database look like
+/// it governs first-party source, which is the exact confusion #1008 is about.
+pub struct PrefixCorpus {
+    root: PathBuf,
+    indexed: Vec<PathBuf>,
+}
+
+impl PrefixCorpus {
+    pub fn new(root: &Path, indexed: &[&str]) -> Self {
+        Self {
+            root: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            indexed: indexed.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    fn under_an_indexed_prefix(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        self.indexed.iter().any(|prefix| relative.starts_with(prefix))
+    }
+}
+
+impl crate::backend::IndexedCorpus for PrefixCorpus {
+    fn indexes_file(&self, absolute: &Path) -> bool {
+        self.under_an_indexed_prefix(absolute)
+    }
+
+    fn may_hold_indexed_files(&self, dir: &Path) -> bool {
+        // A directory counts when it is under an indexed prefix OR could still contain one.
+        self.under_an_indexed_prefix(dir)
+            || dir.strip_prefix(&self.root).is_ok_and(|relative| {
+                self.indexed.iter().any(|prefix| prefix.starts_with(relative))
+            })
+    }
 }

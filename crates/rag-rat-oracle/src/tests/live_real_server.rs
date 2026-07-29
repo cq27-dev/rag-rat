@@ -89,13 +89,13 @@ fn real_typescript_server_warms_before_it_resolves_an_imported_callee() {
     let call = MAIN_TS.rfind("greet").expect("the call site");
     let edge = h.add_edge(src, "greet", call, call + "greet".len(), "NameOnly", None);
 
-    let mut session = LiveOracleSession::spawn(crate::OracleTool::TsLsp, h.root())
+    let mut session = LiveOracleSession::spawn(crate::OracleTool::TsLsp, h.scope())
         .expect("typescript-language-server must be on PATH for this test");
     let worklist = vec!["src/main.ts".to_string()];
     let input = LivePassInput {
         commit_sha: COMMIT,
         worktree_id: WORKTREE,
-        checkout_root: h.root(),
+        scope: h.scope(),
         worklist: &worklist,
         max_requests: 100,
         started_at_ms: 1_000,
@@ -169,13 +169,13 @@ fn a_file_its_ancestor_config_excludes_still_warms_the_server() {
     let call = MAIN_TS.rfind("greet").expect("the call site");
     let edge = h.add_edge(src, "greet", call, call + "greet".len(), "NameOnly", None);
 
-    let mut session = LiveOracleSession::spawn(crate::OracleTool::TsLsp, h.root())
+    let mut session = LiveOracleSession::spawn(crate::OracleTool::TsLsp, h.scope())
         .expect("an excluded file still lives under a config, so the backend is not blocked");
     let worklist = vec!["scripts/main.ts".to_string()];
     let input = LivePassInput {
         commit_sha: COMMIT,
         worktree_id: WORKTREE,
-        checkout_root: h.root(),
+        scope: h.scope(),
         worklist: &worklist,
         max_requests: 100,
         started_at_ms: 1_000,
@@ -249,13 +249,13 @@ fn real_clangd_resolves_a_call_into_another_translation_unit() {
     let header = h.add_file("src/lib.h", C_LIB_H);
     let declaration = h.add_symbol(header, "greet", 0, C_LIB_H.len());
 
-    let mut session = LiveOracleSession::spawn(crate::OracleTool::ClangdLsp, h.root())
+    let mut session = LiveOracleSession::spawn(crate::OracleTool::ClangdLsp, h.scope())
         .expect("clangd must be on PATH for this test");
     let worklist = vec!["src/main.c".to_string()];
     let input = LivePassInput {
         commit_sha: COMMIT,
         worktree_id: WORKTREE,
-        checkout_root: h.root(),
+        scope: h.scope(),
         worklist: &worklist,
         max_requests: 100,
         started_at_ms: 1_000,

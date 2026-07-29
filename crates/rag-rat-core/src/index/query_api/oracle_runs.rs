@@ -99,23 +99,49 @@ impl IndexDatabase {
     pub fn run_live_oracle_pass(
         &self,
         session: &mut rag_rat_oracle::LiveOracleSession,
+        scope: &rag_rat_oracle::CheckoutScope<'_>,
         worklist: &[String],
         max_requests: u64,
         started_at_ms: i64,
     ) -> anyhow::Result<rag_rat_oracle::LivePassReport> {
-        let Some(root) = self.storage.source_root() else {
+        // `scope.root()` is authoritative for where this pass reads and opens documents: the
+        // session's server was spawned with that directory as its working directory and `rootUri`,
+        // so joining paths onto anything else would hand it URIs outside its own initialized
+        // workspace. `source_root` answers a different question — where the indexed ROWS came from
+        // — and it is checked rather than used.
+        let Some(indexed_root) = self.storage.source_root() else {
             anyhow::bail!(
                 "index has no source_root metadata; rebuild required for the live oracle pass"
             );
         };
-        let root = root.to_path_buf();
+        // The two disagreeing means the rows describe a different checkout than the session is
+        // serving (an index carried to a new path, a root reconfigured since the last build). A
+        // per-pass freshness patch cannot reconcile that: it would write verdicts keyed to these
+        // rows from a server reading other files. Say so rather than patching the wrong checkout.
+        //
+        // NOTE for per-checkout live sessions (#1010): `source_root` is the MAIN checkout's root in
+        // the shared-database model, so a pass scoped to a linked worktree trips this by
+        // construction. The predicate is right — the rows a pass patches must belong to the
+        // checkout its server reads — but the implementation encodes the single-checkout
+        // assumption. The rows are already keyed by `worktree_id`; this comparison has to
+        // become worktree-aware alongside that work.
+        let indexed_root =
+            indexed_root.canonicalize().unwrap_or_else(|_| indexed_root.to_path_buf());
+        if indexed_root != scope.root() {
+            anyhow::bail!(
+                "the index was built from {} but the live oracle is scoped to {}; reindex before \
+                 the live oracle can patch these rows",
+                indexed_root.display(),
+                scope.root().display(),
+            );
+        }
         rag_rat_oracle::live_oracle_pass(
             self.storage.connection(),
             session,
             &rag_rat_oracle::LivePassInput {
                 commit_sha: &self.active_commit_sha,
                 worktree_id: &self.active_worktree_id,
-                checkout_root: &root,
+                scope,
                 worklist,
                 max_requests,
                 started_at_ms,
@@ -275,7 +301,11 @@ impl IndexDatabase {
     pub fn probe_oracle_tool(&self, tool: OracleTool) -> rag_rat_oracle::ToolAvailability {
         let manifest = ToolManifest::for_tool(tool);
         match &self.config {
-            Some(config) => manifest.probe_runnable_in(&config.root),
+            Some(config) => {
+                let corpus = crate::index::corpus::ConfiguredCorpus::new(config);
+                let scope = rag_rat_oracle::CheckoutScope::resolve(&config.root, &corpus);
+                manifest.probe_runnable_in(&scope)
+            },
             // No checkout root to evaluate prerequisites against; report installedness only.
             None => manifest.probe(),
         }

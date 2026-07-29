@@ -1,6 +1,7 @@
 //! Discovery: compare configured targets against the index to find
 //! indexed/unindexed/changed/removed files.
 
+use rag_rat_base::config::ResolvedTarget;
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::paths::path_string;
 
@@ -217,15 +218,29 @@ pub(crate) fn target_for_path(
     config: &Config,
     relative_path: &Path,
 ) -> Option<(Language, TargetKind)> {
+    let mut targets = config.targets.iter().collect::<Vec<_>>();
+    targets.sort_by_key(|target| target.index_precedence());
+    target_claims_path(&targets, relative_path)
+}
+
+/// Which target claims `relative_path`, over targets ALREADY sorted by
+/// [`ResolvedTarget::index_precedence`].
+///
+/// Split from [`target_for_path`] so a caller that asks this question many times pays for the sort
+/// once. The indexing walk asks it once per file and can afford to sort per call; the live
+/// oracle's governance read asks it once per compilation-database entry, and a large database
+/// carries 120k of them while the maintenance pass holds the repository write lock.
+pub(crate) fn target_claims_path(
+    targets: &[&ResolvedTarget],
+    relative_path: &Path,
+) -> Option<(Language, TargetKind)> {
     let relative = path_string(relative_path);
     // Skip extensionless / non-code files early; the per-target check below decides language by
     // which target CLAIMS the extension, so a `.h` lands on a `cpp` binding (as C++) or a `c`
     // binding (as C) — bare `from_path` detection would force every `.h` to C and starve C++
     // header resolution.
     relative_path.extension().and_then(|ext| ext.to_str())?;
-    let mut targets = config.targets.iter().collect::<Vec<_>>();
-    targets.sort_by_key(|target| target.index_precedence());
-    targets.into_iter().find_map(|target| {
+    targets.iter().find_map(|target| {
         if !target.language.claims_path(relative_path) {
             return None;
         }

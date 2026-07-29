@@ -16,6 +16,7 @@ pub mod remove;
 mod adoption_hints;
 pub(crate) mod change_coupling;
 pub(crate) mod chunk_text_store;
+pub(crate) mod corpus;
 mod discovery;
 mod file_index;
 mod file_rows;

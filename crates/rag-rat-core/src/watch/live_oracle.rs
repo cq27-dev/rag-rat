@@ -157,10 +157,35 @@ impl LiveOracleTail {
             return;
         }
         let mut budget = config.oracle.live.max_requests_per_pass;
+        let scope = LiveScope { config, corpus: std::cell::OnceCell::new() };
         for index in claim_order(self.backends.len(), self.first_claim) {
-            self.backends[index].on_pass(db, config, changed_paths, &mut budget);
+            self.backends[index].on_pass(db, config, &scope, changed_paths, &mut budget);
         }
         self.first_claim = self.first_claim.wrapping_add(1);
+    }
+}
+
+/// The live stage's checkout scope, whose corpus is built on FIRST USE.
+///
+/// [`crate::index::corpus::ConfiguredCorpus`] compiles the ignore matcher, which discovers nested
+/// `.gitignore` files along every configured target tree. That is real work, and the maintenance
+/// pass holds the repository write lock while it happens — but most passes have no live work at all
+/// (no changed path in a live language, no backlog), and those must not pay for it. Building it
+/// eagerly made every watcher event, however small, walk the target trees before deciding there was
+/// nothing to do.
+///
+/// Shared by every backend in the pass, so a mixed-language checkout compiles it once rather than
+/// once per resident server.
+struct LiveScope<'a> {
+    config: &'a Config,
+    corpus: std::cell::OnceCell<crate::index::corpus::ConfiguredCorpus<'a>>,
+}
+
+impl LiveScope<'_> {
+    fn resolve(&self) -> rag_rat_oracle::CheckoutScope<'_> {
+        let corpus =
+            self.corpus.get_or_init(|| crate::index::corpus::ConfiguredCorpus::new(self.config));
+        rag_rat_oracle::CheckoutScope::resolve(&self.config.root, corpus)
     }
 }
 
@@ -275,6 +300,28 @@ impl LiveBackendTail {
             return;
         }
         self.unconfigured_reported = true;
+        // The two causes have DIFFERENT remedies, and the generic one sends an operator whose
+        // database simply does not cover their sources after the wrong problem entirely.
+        //
+        // A checkout that ALREADY governs nothing at spawn never reaches here — it blocks on the
+        // prerequisite instead, which carries this same remedy (`prerequisite_blocked_with`). What
+        // this branch covers is the decay: a checkout that warmed on several databases and has
+        // since been reduced to one that governs nothing, where the session is still alive because
+        // the pinned database did not change (both layouts pin none).
+        if report.database_governs_nothing {
+            tracing::warn!(
+                target: "rag_rat_core::watch",
+                tool = self.backend.tool.as_db_str(),
+                skipped = report.skipped_unconfigured,
+                "live oracle: this checkout's compilation database names no file this checkout \
+                 indexes, so it is not pinned for the server — forcing it on first-party sources \
+                 would analyse them under another project's defines and include paths, which \
+                 resolves calls to the wrong definition. Regenerate the database so it covers the \
+                 indexed sources, or bind the tree it does describe in `[target_bindings]` if it \
+                 is meant to be indexed."
+            );
+            return;
+        }
         tracing::warn!(
             target: "rag_rat_core::watch",
             tool = self.backend.tool.as_db_str(),
@@ -310,6 +357,7 @@ impl LiveBackendTail {
         &mut self,
         db: &IndexDatabase,
         config: &Config,
+        scope: &LiveScope<'_>,
         changed_paths: Option<&BTreeSet<String>>,
         budget: &mut u64,
     ) {
@@ -352,6 +400,9 @@ impl LiveBackendTail {
         if !config.targets.iter().any(|target| self.backend.resolves_language(target.language)) {
             return;
         }
+        // Past every cheap gate, so this pass really is going to talk to a server: NOW the corpus
+        // is worth compiling.
+        let scope = &scope.resolve();
 
         // Spawn the session lazily on the first eligible pass. A decline leaves the work in the
         // backlog for a later pass — the same degrade-quietly UX as a missing embedding model.
@@ -360,7 +411,7 @@ impl LiveBackendTail {
                 self.backlog = worklist;
                 return;
             }
-            match LiveOracleSession::spawn(self.backend.tool, &config.root) {
+            match LiveOracleSession::spawn(self.backend.tool, scope) {
                 Ok(session) => {
                     self.session = Some(session);
                     self.lifecycle.on_spawned(now);
@@ -390,7 +441,7 @@ impl LiveBackendTail {
         // A session exists, so whatever blocked earlier is resolved; report it again if it returns.
         self.prerequisite_reported = false;
 
-        let result = db.run_live_oracle_pass(session, &worklist, *budget, started_at_ms);
+        let result = db.run_live_oracle_pass(session, scope, &worklist, *budget, started_at_ms);
         // Count idleness from completion: a request batch longer than the idle window must not
         // force an immediate shutdown and cold respawn.
         self.lifecycle.on_session_used(Instant::now());

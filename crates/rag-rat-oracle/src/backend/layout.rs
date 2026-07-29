@@ -10,6 +10,8 @@ use std::time::Duration;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+use super::scope::CheckoutScope;
+
 /// What a live backend learned about a checkout's projects, resolved ONCE per session.
 ///
 /// Every question the backend asks about layout — is this checkout usable, which database does the
@@ -31,10 +33,28 @@ pub struct ProjectLayout {
     /// while the maintenance pass holds the repository write lock. Scoped to the layout value
     /// rather than to the process: a re-resolved layout starts with an empty memo, so the
     /// staleness window is the one [`LAYOUT_MAX_AGE`] already bounds and no other.
-    usable_markers: RefCell<HashMap<PathBuf, MarkerVerdict>>,
-    /// Whether the scan that produced this layout saw EVERY database that could govern a file in
-    /// the checkout. False when it stopped early — the depth bound, a directory it could not read,
-    /// or a nested checkout whose own sources this checkout may still index.
+    usable_markers: RefCell<HashMap<PathBuf, MarkerReading>>,
+    /// Whether the scan that produced this layout saw every database WHERE IT LOOKED. False when
+    /// it stopped early — the depth bound, a directory it could not read, or a nested checkout
+    /// whose own sources this checkout may still index.
+    ///
+    /// Where it looks is the index root's subtree, plus the ancestor chain up to the checkout
+    /// ceiling (each ancestor and its `build/`, the set clangd itself searches). It is tempting to
+    /// state this as "every database that could GOVERN an indexed file", and that would be wrong:
+    /// governance is a property of a database's ENTRIES, and this crate's whole premise is that a
+    /// database's LOCATION says nothing about what it describes — an out-of-tree build puts it
+    /// somewhere unrelated to the sources it configures. Target containment bounds where indexed
+    /// SOURCES live; it does not bound where a database describing them may sit.
+    ///
+    /// So the known miss is a database outside the index root's subtree and off the ancestor chain
+    /// — `<checkout>/out/compile_commands.json` with `[index] root = <checkout>/sub`, say — which
+    /// may well govern `sub/`'s sources. Such a database is invisible here, exactly as it was
+    /// before the ancestor leg existed. The consequence is bounded but real: with no other
+    /// database the checkout reports blocked, and with one the scan can pin it while a
+    /// governing database exists elsewhere. Widening the descent to the ceiling would close it
+    /// at the cost of walking the whole worktree under the repository write lock for precisely
+    /// the configuration a subdirectory root was chosen to narrow — so the claim is kept
+    /// honest instead.
     ///
     /// Pinning is the only question that needs this, and it needs it absolutely:
     /// `--compile-commands-dir` is global, so "there is exactly one database" has to be a proof,
@@ -50,7 +70,7 @@ pub struct ProjectLayout {
 #[derive(Debug, Clone)]
 pub(super) struct MarkerSite {
     dir: PathBuf,
-    verdict: MarkerVerdict,
+    reading: MarkerReading,
 }
 
 /// What reading a marker file established about the project it describes.
@@ -72,6 +92,31 @@ pub(super) enum MarkerVerdict {
     /// accepts comments, trailing commas, and block syntax that `serde_json` does not (#1016), and
     /// a genuinely corrupt file is indistinguishable from those here.
     Unknown,
+}
+
+/// Whether a compilation database describes anything this checkout indexes — the question that
+/// decides whether forcing it on the WHOLE checkout is safe.
+///
+/// Three states for the same reason [`MarkerVerdict`] has three: a database this crate could not
+/// read named nothing it could test, which is not the same finding as one whose entries were all
+/// read and named nothing indexed. They are kept apart because a future reader accepting more
+/// syntax (#1016) will produce far fewer unreadable files, and the two must not have silently
+/// merged by then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Governs {
+    /// An entry named a file in the indexed corpus.
+    IndexedSource,
+    /// The whole database was read, and no entry named one.
+    NothingIndexed,
+    /// It could not be read, so it named nothing this crate could test.
+    Unknown,
+}
+
+/// What ONE read of a marker file established, from one streaming pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MarkerReading {
+    verdict: MarkerVerdict,
+    governs: Governs,
 }
 
 /// How much a layout question demands of a database before counting it.
@@ -96,6 +141,18 @@ impl MarkerVerdict {
     }
 }
 
+impl Governs {
+    /// The governance half of the same question [`MarkerVerdict::counts_under`] answers, biased the
+    /// same way: `Unknown` counts for warm-up (refusing to warm costs the whole backend) and does
+    /// not count where the answer gets persisted.
+    fn counts_under(self, trust: Trust) -> bool {
+        match trust {
+            Trust::Proven => self == Self::IndexedSource,
+            Trust::Possible => self != Self::NothingIndexed,
+        }
+    }
+}
+
 impl Default for ProjectLayout {
     /// An empty layout from no scan at all. `complete` is true because there is nothing to have
     /// missed: a backend with no project marker never asks a layout question, and the test seams
@@ -112,8 +169,8 @@ impl ProjectLayout {
     /// sites reuses the verdict the scan already paid for, and the two routes cannot disagree
     /// about the same file within one layout.
     pub(super) fn from_marker_sites(marker: &str, scan: MarkerScan) -> Self {
-        let usable_markers: HashMap<PathBuf, MarkerVerdict> =
-            scan.sites.iter().map(|site| (site.dir.join(marker), site.verdict)).collect();
+        let usable_markers: HashMap<PathBuf, MarkerReading> =
+            scan.sites.iter().map(|site| (site.dir.join(marker), site.reading)).collect();
         Self {
             markers: scan.sites,
             usable_markers: RefCell::new(usable_markers),
@@ -133,9 +190,26 @@ impl ProjectLayout {
             return None;
         }
         match self.markers.as_slice() {
-            [only] if only.verdict == MarkerVerdict::Loadable => Some(&only.dir),
+            [only]
+                if only.reading.verdict == MarkerVerdict::Loadable
+                    && only.reading.governs == Governs::IndexedSource =>
+                Some(&only.dir),
             _ => None,
         }
+    }
+
+    /// Whether this checkout holds a database that would have been pinned but for describing
+    /// nothing the checkout indexes — the #1008 case, and the one whose remedy is specific enough
+    /// to be worth saying out loud. Every other reason for declining to pin (several databases, an
+    /// unreadable one, a truncated scan) already has its own operator-facing wording.
+    pub fn has_database_governing_nothing_indexed(&self) -> bool {
+        self.complete
+            && matches!(
+                self.markers.as_slice(),
+                [only]
+                    if only.reading.verdict == MarkerVerdict::Loadable
+                        && only.reading.governs == Governs::NothingIndexed
+            )
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -151,15 +225,15 @@ impl ProjectLayout {
 
     /// Whether the marker file at `file` describes a project the server can load, answered from
     /// [`Self::usable_markers`] when this layout has already read it.
-    fn marker_verdict(&self, file: &Path) -> MarkerVerdict {
+    fn marker_reading(&self, file: &Path, checkout: &CheckoutScope<'_>) -> MarkerReading {
         // Borrow only for the lookup: the miss path reads the file and then takes a write borrow.
         let memoized = self.usable_markers.borrow().get(file).copied();
-        if let Some(verdict) = memoized {
-            return verdict;
+        if let Some(reading) = memoized {
+            return reading;
         }
-        let verdict = read_marker_file(file);
-        self.usable_markers.borrow_mut().insert(file.to_path_buf(), verdict);
-        verdict
+        let reading = read_marker_file(file, checkout);
+        self.usable_markers.borrow_mut().insert(file.to_path_buf(), reading);
+        reading
     }
 
     /// The marker directory the SERVER would find for `path` on its own — clangd searches an
@@ -173,11 +247,15 @@ impl ProjectLayout {
     /// gets persisted.
     pub(super) fn discoverable_marker_dir(
         &self,
-        root: &Path,
+        checkout: &CheckoutScope<'_>,
         path: &Path,
         marker: &str,
         trust: Trust,
     ) -> Option<PathBuf> {
+        // The CEILING, not the index root: this walk exists to mirror clangd's own ancestor
+        // search, and clangd has no notion of an index root. Stopping at a subdirectory root
+        // declared a file unconfigurable over a database clangd would have found for it.
+        let ceiling = checkout.ceiling();
         let mut dir = path.parent()?;
         loop {
             for candidate in [dir.to_path_buf(), dir.join("build")] {
@@ -188,10 +266,21 @@ impl ProjectLayout {
                     // continue to a farther ancestor. Continuing here would declare the file
                     // configured by a database clangd never consults, and the live pass would then
                     // trust a fallback-flags answer.
-                    return self.marker_verdict(&file).counts_under(trust).then_some(candidate);
+                    // Governance applies HERE too, not only to the global pin. The walk now
+                    // reaches the checkout ceiling rather than stopping at the index root, so
+                    // "this database encloses the file" no longer implies "this database is about
+                    // the file's project": with a subdirectory `[index] root`, an ancestor database
+                    // describing only an unindexed sibling tree is reachable, and resolving a file
+                    // through it persists definitions produced under another project's flags — the
+                    // exact corruption the pin gate exists to prevent. The reading is memoized, so
+                    // this costs no extra parse.
+                    let reading = self.marker_reading(&file, checkout);
+                    return (reading.verdict.counts_under(trust)
+                        && reading.governs.counts_under(trust))
+                    .then_some(candidate);
                 }
             }
-            if dir == root {
+            if dir == ceiling {
                 return None;
             }
             dir = dir.parent()?;
@@ -222,18 +311,22 @@ fn is_searchable_for_marker(path: &Path, name: &str) -> bool {
 /// without `--compile-commands-dir` (measured: no progress at all, and calls resolve to header
 /// declarations). Accepting a checkout whose database the server cannot find would report it
 /// usable while it silently never warms.
-pub(super) fn marker_sites(root: &Path, marker: &str) -> MarkerScan {
+pub(super) fn marker_sites(checkout: &CheckoutScope<'_>, marker: &str) -> MarkerScan {
+    let root = checkout.root();
     let mut search = MarkerSearch {
         marker,
-        // The scope the walk may not leave. A root that will not canonicalize is used as given:
-        // the containment check then simply admits less, which is the safe direction.
-        scope: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+        checkout,
+        // The bound the walk may not leave — the enclosing CHECKOUT. A link into another part of
+        // the same checkout points at a database that is genuinely this checkout's; only leaving
+        // the checkout entirely is out of bounds. Already canonical (`CheckoutScope::resolve`).
+        scope: checkout.ceiling().to_path_buf(),
         visited_links: HashSet::new(),
         recorded_markers: HashSet::new(),
         found: Vec::new(),
         truncated: false,
     };
     search.descend(root, MARKER_SEARCH_MAX_DEPTH);
+    search.climb_to_ceiling(root, checkout.ceiling());
     // Stopping at the two-site cap is not truncation: two databases already disqualify pinning, so
     // nothing deeper could change the answer. Every OTHER early stop is, because it can hide the
     // second database that would have.
@@ -269,6 +362,9 @@ const MARKER_SEARCH_MAX_DEPTH: u32 = 24;
 /// files it has already visited, and the sites found so far.
 struct MarkerSearch<'a> {
     marker: &'a str,
+    /// What this checkout is: the corpus each database's entries are tested against, and the
+    /// ceiling the walk may not leave.
+    checkout: &'a CheckoutScope<'a>,
     /// The canonical checkout root the walk may not leave. Following directory symlinks is what
     /// makes a symlinked `build/` discoverable, but a link like `sdk -> /opt/sdk` or
     /// `external -> ..` points OUT of the checkout: without this the walk would recurse through an
@@ -293,6 +389,46 @@ struct MarkerSearch<'a> {
 }
 
 impl MarkerSearch<'_> {
+    /// Record the databases on the chain from `root` up to `ceiling` — each ancestor directory and
+    /// its `build/` subdirectory, which is exactly the set clangd searches for an opened file.
+    ///
+    /// [`Self::descend`] covers everything at or below the index root; this covers what sits ABOVE
+    /// it and still governs it, which a subdirectory `[index] root` otherwise hides. It is O(depth)
+    /// `exists()` calls rather than a traversal, deliberately: widening the DESCENT to the whole
+    /// checkout would walk every sibling of the index root under the repository write lock, and buy
+    /// nothing — a database outside the index root that is not an ancestor governs no indexed
+    /// source, because config load refuses a target directory that escapes the root.
+    ///
+    /// Re-recording the root's own database is harmless: [`Self::record_marker_in`] keys on the
+    /// marker file's canonical path, so a site both legs reach counts once.
+    fn climb_to_ceiling(&mut self, root: &Path, ceiling: &Path) {
+        // Nothing to climb when the index root IS the checkout — and this is not merely an
+        // optimisation. The loop below records a directory before testing whether it has reached
+        // the ceiling, so without this guard an index root already at the checkout top would step
+        // straight past it and walk to the filesystem root, counting databases from outside the
+        // checkout entirely. `root == ceiling` is the COMMON case, and a linked worktree nested
+        // inside another checkout is where it does damage: the walk climbs out of the worktree and
+        // adopts the enclosing checkout's database as a second one.
+        //
+        // With `root` a strict descendant of `ceiling`, the walk is guaranteed to reach `ceiling`
+        // before running off the top.
+        if root == ceiling || !root.starts_with(ceiling) {
+            return;
+        }
+        let mut dir = root;
+        while let Some(parent) = dir.parent() {
+            if self.found.len() >= 2 {
+                return;
+            }
+            self.record_marker_in(parent);
+            self.record_marker_in(&parent.join("build"));
+            if parent == ceiling {
+                return;
+            }
+            dir = parent;
+        }
+    }
+
     fn descend(&mut self, dir: &Path, depth_left: u32) {
         if self.found.len() >= 2 {
             return;
@@ -353,8 +489,8 @@ impl MarkerSearch<'_> {
         if !self.recorded_markers.insert(identity) {
             return;
         }
-        let verdict = read_marker_file(&candidate);
-        self.found.push(MarkerSite { dir: dir.to_path_buf(), verdict });
+        let reading = read_marker_file(&candidate, self.checkout);
+        self.found.push(MarkerSite { dir: dir.to_path_buf(), reading });
     }
 
     /// What this search does with one ENUMERATED entry, error included.
@@ -490,36 +626,52 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 /// The two cheap divergences are closed here instead: a UTF-8 BOM is skipped, and content after the
 /// closing bracket is ignored, both of which clangd accepts and neither of which says anything
 /// about whether the entries describe a loadable project.
-fn read_marker_file(path: &Path) -> MarkerVerdict {
+fn read_marker_file(path: &Path, checkout: &CheckoutScope<'_>) -> MarkerReading {
+    let unreadable = MarkerReading { verdict: MarkerVerdict::Unknown, governs: Governs::Unknown };
     let Ok(file) = std::fs::File::open(path) else {
-        return MarkerVerdict::Unknown;
+        return unreadable;
     };
     // `serde_json`'s reader deserializer pulls ONE BYTE at a time — measured unbuffered, a 2 MB
     // database costs two million `read` syscalls — so the buffer in front of it is what makes this
     // a sequential read.
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
     if !skip_utf8_bom(&mut reader) {
-        return MarkerVerdict::Unknown;
+        return unreadable;
     }
     // `Deserializer::from_reader` + `deserialize` rather than `serde_json::from_reader`, which also
     // calls `end()` and so rejects anything after the top-level array. clangd stops at the closing
     // bracket and never looks further, so trailing content must not condemn the database.
     let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
-    match CompilationDatabase::deserialize(&mut deserializer) {
+    let read = de::DeserializeSeed::deserialize(DatabaseSeed(checkout.corpus()), &mut deserializer);
+    // Governance is a property of the ENTRIES, so it is only knowable when they parsed. A database
+    // whose shape was rejected says nothing either way.
+    let governs = |database: &CompilationDatabase| match database {
+        d if d.governs_indexed => Governs::IndexedSource,
+        // "Could not be read" is not "names nothing indexed": clangd accepts a non-string `file`
+        // and reads it as text, so such a database may well govern the corpus — this reader simply
+        // cannot say. Scoring it as a negative would refuse warm-up for a checkout that works.
+        d if d.governs_unknown => Governs::Unknown,
+        _ => Governs::NothingIndexed,
+    };
+    match read {
         // Checked BEFORE the entry count: clangd refuses the file over an unrecognised key however
         // many good entries sit beside it, so counting them would be reading a database that will
         // not load as proof that it will.
-        Ok(database) if database.unmodelled_key => MarkerVerdict::Unknown,
-        Ok(database) if database.entries > 0 => MarkerVerdict::Loadable,
-        Ok(_) => MarkerVerdict::NotLoadable,
+        Ok(database) if database.unmodelled_key =>
+            MarkerReading { verdict: MarkerVerdict::Unknown, governs: governs(&database) },
+        Ok(database) if database.entries > 0 =>
+            MarkerReading { verdict: MarkerVerdict::Loadable, governs: governs(&database) },
+        Ok(database) =>
+            MarkerReading { verdict: MarkerVerdict::NotLoadable, governs: governs(&database) },
         // The error's CATEGORY separates the two failures. `Data` means the document parsed and its
         // contents break the entry contract — the same thing the server refuses, so it is a
         // positive finding. `Syntax`/`Eof`/`Io` mean it could not be read as JSON at all, which is
         // not a finding about the project: clangd's YAML reader accepts syntax this does not, and a
         // corrupt file is indistinguishable from that here.
         Err(error) => match error.classify() {
-            serde_json::error::Category::Data => MarkerVerdict::NotLoadable,
-            _ => MarkerVerdict::Unknown,
+            serde_json::error::Category::Data =>
+                MarkerReading { verdict: MarkerVerdict::NotLoadable, governs: Governs::Unknown },
+            _ => unreadable,
         },
     }
 }
@@ -548,6 +700,11 @@ fn skip_utf8_bom(reader: &mut impl std::io::BufRead) -> bool {
 /// that each one carries what the format requires.
 struct CompilationDatabase {
     entries: usize,
+    /// Whether any entry named a file the checkout indexes. See [`Governs`].
+    governs_indexed: bool,
+    /// Whether any entry named a `file` this reader could not read as text, leaving governance
+    /// unprovable rather than disproved.
+    governs_unknown: bool,
     /// Whether any entry carried a key outside the modelled format. One is enough: clangd refuses
     /// the whole file over it, so no other entry can redeem the database.
     unmodelled_key: bool,
@@ -591,6 +748,12 @@ struct CompilationDatabase {
 struct CompilationEntry {
     /// Whether this entry yields a command line clangd can parse.
     configures_a_file: bool,
+    /// Whether the entry named a `file` whose text this reader could not capture — a non-string
+    /// scalar, which clangd reads as its literal rendering and accepts. The path is then
+    /// unknowable here, which is NOT the same finding as an entry naming a file outside the
+    /// corpus: it makes the database's governance [`Governs::Unknown`] rather than
+    /// `NothingIndexed`, so warm-up stays permissive while pinning still declines.
+    file_text_unavailable: bool,
     /// Whether it carried a key outside the format this crate models, which makes the whole
     /// database's fate unknowable here — see [`EntryField::Unmodelled`].
     unmodelled_key: bool,
@@ -612,21 +775,94 @@ enum EntryField {
 
 impl<'de> Deserialize<'de> for CompilationEntry {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_map(CompilationEntryVisitor)
+        deserializer.deserialize_map(CompilationEntryVisitor(None))
     }
 }
 
-struct CompilationEntryVisitor;
+/// The `file` and `directory` of the entry being read, in buffers REUSED across entries.
+#[derive(Default)]
+struct EntryPaths {
+    file: String,
+    directory: String,
+    /// Canonical spellings of entry parent directories whose literal form did not land in the
+    /// corpus, memoized for the whole read.
+    ///
+    /// A checkout reached through a symlink has its database generated under the ALIAS spelling
+    /// while the configured root is canonical, so no entry matches lexically and the checkout's
+    /// only database would be judged to govern nothing — withdrawing the pin from a setup that
+    /// works. Resolving is a syscall, so it happens only after the lexical test fails, and once
+    /// per distinct parent: an aliased database aliases every entry the same way.
+    canonical_parents: HashMap<PathBuf, Option<PathBuf>>,
+}
 
-impl<'de> Visitor<'de> for CompilationEntryVisitor {
+impl EntryPaths {
+    /// Whether this entry names a file the checkout indexes.
+    ///
+    /// The entry's `file` is resolved the way the format defines it — absolute as given, otherwise
+    /// joined onto `directory` — then normalized LEXICALLY. Never `canonicalize`: that would be a
+    /// syscall per entry, and it fails outright for a file that no longer exists, which is ordinary
+    /// for a database written before the last edit.
+    fn names_indexed_file(&mut self, corpus: &dyn super::IndexedCorpus) -> bool {
+        if self.file.is_empty() {
+            return false;
+        }
+        let lexical = {
+            let file = Path::new(&self.file);
+            let absolute = if file.is_absolute() {
+                file.to_path_buf()
+            } else {
+                Path::new(&self.directory).join(file)
+            };
+            match rag_rat_base::paths::lexically_normalized(&absolute) {
+                Some(path) => path,
+                None => return false,
+            }
+        };
+        if corpus.indexes_file(&lexical) {
+            return true;
+        }
+        // The literal spelling is not in the corpus. Before concluding the database does not govern
+        // it, resolve the parent once: the path may name the same file through a symlinked root.
+        let (Some(parent), Some(name)) = (lexical.parent(), lexical.file_name()) else {
+            return false;
+        };
+        let resolved = self
+            .canonical_parents
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| parent.canonicalize().ok());
+        resolved.as_ref().is_some_and(|dir| corpus.indexes_file(&dir.join(name)))
+    }
+}
+
+/// Reads one entry, capturing its paths when the caller still needs them.
+struct EntrySeed<'a>(&'a mut EntryPaths);
+
+impl<'de> de::DeserializeSeed<'de> for EntrySeed<'_> {
+    type Value = CompilationEntry;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(CompilationEntryVisitor(Some(self.0)))
+    }
+}
+
+struct CompilationEntryVisitor<'a>(Option<&'a mut EntryPaths>);
+
+impl<'de> Visitor<'de> for CompilationEntryVisitor<'_> {
     type Value = CompilationEntry;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a compilation database entry")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(mut self, mut map: A) -> Result<Self::Value, A::Error> {
+        // A fresh entry: whatever the previous one left in the buffers must not be read as this
+        // one's, since either key may be absent here.
+        if let Some(paths) = self.0.as_deref_mut() {
+            paths.file.clear();
+            paths.directory.clear();
+        }
         let (mut file, mut directory, mut invocation) = (false, false, false);
+        let mut file_is_text = false;
         // Tracked separately because clangd does not treat them as alternatives: measured, when an
         // entry carries BOTH, `arguments` is used and `command` is ignored entirely — whichever
         // order the keys appear in. So a good `command` beside an empty `arguments` configures
@@ -636,11 +872,21 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
         while let Some(field) = map.next_key::<EntryField>()? {
             match field {
                 EntryField::File => {
-                    map.next_value::<JsonScalar>()?;
+                    file_is_text = match self.0.as_deref_mut() {
+                        Some(paths) => map.next_value_seed(ScalarInto(&mut paths.file))?.is_string,
+                        None => map.next_value::<JsonScalar>()?.is_string,
+                    };
                     file = true;
                 },
                 EntryField::Directory => {
-                    map.next_value::<JsonScalar>()?;
+                    match self.0.as_deref_mut() {
+                        Some(paths) => {
+                            map.next_value_seed(ScalarInto(&mut paths.directory))?;
+                        },
+                        None => {
+                            map.next_value::<JsonScalar>()?;
+                        },
+                    }
                     directory = true;
                 },
                 EntryField::Command => {
@@ -685,8 +931,15 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
         if !invocation {
             return Err(de::Error::custom("entry has neither `command` nor `arguments`"));
         }
+        // Unknowable ONLY when the node was not a string. `"file": ""` is a path this reader read
+        // and found empty — a known non-governing entry — while `"file": 7` is one clangd renders
+        // as its literal text and accepts but this reader cannot reconstruct. Collapsing the two
+        // would let a database naming no translation unit count as `Governs::Unknown`, which
+        // warm-up accepts, so the checkout would warm a session that then skips every source.
+        let file_text_unavailable = self.0.is_some() && !file_is_text;
         Ok(CompilationEntry {
             configures_a_file: arguments_configure.unwrap_or(command_configures),
+            file_text_unavailable,
             unmodelled_key,
         })
     }
@@ -700,17 +953,50 @@ struct JsonScalar {
     /// Whether the scalar renders as blank text. Only a string can: clangd reads any other scalar
     /// as its literal text (`null`, `7`, `true`), which is a perfectly good command word.
     blank: bool,
+    /// Whether the node was a STRING, and so whether a capture buffer now holds its text. A
+    /// non-string scalar leaves the buffer empty for a different reason than `""` does: the first
+    /// is a path this reader cannot render, the second is a path it read and found empty.
+    is_string: bool,
 }
 
 impl<'de> Deserialize<'de> for JsonScalar {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(JsonScalarVisitor)
+        deserializer.deserialize_any(JsonScalarVisitor(None))
     }
 }
 
-struct JsonScalarVisitor;
+/// Captures a scalar's text into an existing buffer, REUSING its capacity.
+///
+/// A seed rather than a `String` value so the governance read allocates nothing per entry: a
+/// 120k-entry database would otherwise mint and drop two strings per entry while the maintenance
+/// pass holds the repository write lock.
+struct ScalarInto<'a>(&'a mut String);
 
-impl<'de> Visitor<'de> for JsonScalarVisitor {
+impl<'de> de::DeserializeSeed<'de> for ScalarInto<'_> {
+    type Value = JsonScalar;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(JsonScalarVisitor(Some(self.0)))
+    }
+}
+
+struct JsonScalarVisitor<'a>(Option<&'a mut String>);
+
+impl JsonScalarVisitor<'_> {
+    /// Record the scalar's text when a caller asked for it. A NON-string scalar clears the buffer
+    /// rather than leaving the previous entry's value in it: clangd reads such a node as its
+    /// literal rendering (`null`, `7`), which is never a path worth testing against the corpus.
+    fn capture(self, text: Option<&str>) {
+        if let Some(buffer) = self.0 {
+            buffer.clear();
+            if let Some(text) = text {
+                buffer.push_str(text);
+            }
+        }
+    }
+}
+
+impl<'de> Visitor<'de> for JsonScalarVisitor<'_> {
     type Value = JsonScalar;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -718,35 +1004,44 @@ impl<'de> Visitor<'de> for JsonScalarVisitor {
     }
 
     fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
-        Ok(JsonScalar { blank: false })
+        self.capture(None);
+        Ok(JsonScalar { blank: false, is_string: false })
     }
 
     fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
-        Ok(JsonScalar { blank: false })
+        self.capture(None);
+        Ok(JsonScalar { blank: false, is_string: false })
     }
 
     fn visit_i128<E: de::Error>(self, _: i128) -> Result<Self::Value, E> {
-        Ok(JsonScalar { blank: false })
+        self.capture(None);
+        Ok(JsonScalar { blank: false, is_string: false })
     }
 
     fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
-        Ok(JsonScalar { blank: false })
+        self.capture(None);
+        Ok(JsonScalar { blank: false, is_string: false })
     }
 
     fn visit_u128<E: de::Error>(self, _: u128) -> Result<Self::Value, E> {
-        Ok(JsonScalar { blank: false })
+        self.capture(None);
+        Ok(JsonScalar { blank: false, is_string: false })
     }
 
     fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
-        Ok(JsonScalar { blank: false })
+        self.capture(None);
+        Ok(JsonScalar { blank: false, is_string: false })
     }
 
     fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
-        Ok(JsonScalar { blank: text.trim().is_empty() })
+        let blank = text.trim().is_empty();
+        self.capture(Some(text));
+        Ok(JsonScalar { blank, is_string: true })
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(JsonScalar { blank: false })
+        self.capture(None);
+        Ok(JsonScalar { blank: false, is_string: false })
     }
 }
 
@@ -784,18 +1079,23 @@ impl<'de> Visitor<'de> for JsonSequenceVisitor {
     }
 }
 
-impl<'de> Deserialize<'de> for CompilationDatabase {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_seq(CompilationDatabaseVisitor)
+/// Reads a database, testing each entry's file against the corpus until one qualifies.
+struct DatabaseSeed<'a>(&'a dyn super::IndexedCorpus);
+
+impl<'de> de::DeserializeSeed<'de> for DatabaseSeed<'_> {
+    type Value = CompilationDatabase;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(CompilationDatabaseVisitor(self.0))
     }
 }
 
 /// Reads the top-level array one entry at a time. A hand-written visitor rather than a
 /// `Vec<CompilationEntry>` so that neither the entries nor their payloads are ever collected:
 /// a real database is tens of megabytes, and nothing here needs to outlive the check.
-struct CompilationDatabaseVisitor;
+struct CompilationDatabaseVisitor<'a>(&'a dyn super::IndexedCorpus);
 
-impl<'de> Visitor<'de> for CompilationDatabaseVisitor {
+impl<'de> Visitor<'de> for CompilationDatabaseVisitor<'_> {
     type Value = CompilationDatabase;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -805,17 +1105,53 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor {
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut entries = 0usize;
         let mut unmodelled_key = false;
+        let mut governs_indexed = false;
+        let mut governs_unknown = false;
+        // Reused across every entry, so the read allocates nothing in proportion to the file.
+        let mut paths = EntryPaths::default();
         // The first entry `CompilationEntry` rejects ends the read: clangd would refuse the
         // database at that point too, so nothing later in the file could redeem it. An entry with
         // an EMPTY invocation is not such a rejection — it simply does not count, because it
         // configures no file while leaving the rest of the database working.
-        while let Some(entry) = seq.next_element::<CompilationEntry>()? {
+        loop {
+            // Once one entry has qualified, the question is answered and the rest of the file is
+            // read with the plain payload-discarding visitor — no capture, no corpus calls. That
+            // is the mainstream case, where the very first entry names an indexed source; the
+            // whole-file walk falls only on a database that governs nothing, which is the answer
+            // being caught and is a vendored project's small database.
+            let entry = if governs_indexed {
+                seq.next_element::<CompilationEntry>()?
+            } else {
+                seq.next_element_seed(EntrySeed(&mut paths))?
+            };
+            let Some(entry) = entry else {
+                break;
+            };
             if entry.configures_a_file {
                 entries += 1;
             }
             unmodelled_key |= entry.unmodelled_key;
+            // `configures_a_file` is required, not incidental: an entry whose selected invocation
+            // is empty names a file clangd cannot analyse at all, so it is no evidence that this
+            // database describes anything the checkout indexes. Without the gate, a database whose
+            // only indexed entry is degenerate — while some vendored entry carries a real command —
+            // would be `Loadable` AND count as governing, and get pinned for a file it cannot
+            // configure.
+            if !governs_indexed {
+                if entry.configures_a_file && paths.names_indexed_file(self.0) {
+                    governs_indexed = true;
+                } else if entry.file_text_unavailable && entry.configures_a_file {
+                    // Its path could not be read, so this entry is no evidence either way — but
+                    // only an entry that configures SOMETHING could have been evidence in the first
+                    // place. Without that second condition a degenerate entry with an unreadable
+                    // path makes the whole database `Unknown`, which `Trust::Possible` accepts: the
+                    // backend then warms on a database whose every indexed source `Trust::Proven`
+                    // goes on to skip.
+                    governs_unknown = true;
+                }
+            }
         }
-        Ok(CompilationDatabase { entries, unmodelled_key })
+        Ok(CompilationDatabase { entries, unmodelled_key, governs_indexed, governs_unknown })
     }
 }
 
@@ -823,11 +1159,13 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor {
 mod tests {
     use super::*;
 
-    /// A `MarkerSearch` over `root`, in the state `marker_sites` builds one.
-    fn search_over(root: &Path) -> MarkerSearch<'static> {
+    /// A `MarkerSearch` over `checkout`, in the state `marker_sites` builds one. The scope is the
+    /// caller's because the search borrows it.
+    fn search_over<'a>(checkout: &'a CheckoutScope<'a>) -> MarkerSearch<'a> {
         MarkerSearch {
             marker: "compile_commands.json",
-            scope: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            checkout,
+            scope: checkout.ceiling().to_path_buf(),
             visited_links: HashSet::new(),
             recorded_markers: HashSet::new(),
             found: Vec::new(),
@@ -842,7 +1180,8 @@ mod tests {
         // scan claiming completeness it does not have, and `sole_marker_dir` would then pin the one
         // database it did see over files the missed one governs.
         let dir = rag_rat_base::test_scratch::ScratchDir::new("marker-entry-error");
-        let mut search = search_over(&dir);
+        let checkout = crate::test_support::every_path_scope(&dir);
+        let mut search = search_over(&checkout);
 
         let step = search.step_for_entry(Err(std::io::Error::other("enumeration failed")));
         assert!(matches!(step, Step::Indeterminate), "an unreadable entry is not a decision");
@@ -853,7 +1192,8 @@ mod tests {
         std::fs::create_dir_all(dir.join("build")).unwrap();
         std::fs::write(dir.join("build/compile_commands.json"), "[]").unwrap();
         assert!(
-            marker_sites(&dir, "compile_commands.json").complete,
+            marker_sites(&crate::test_support::every_path_scope(&dir), "compile_commands.json")
+                .complete,
             "a checkout the walk read end to end is complete",
         );
     }
