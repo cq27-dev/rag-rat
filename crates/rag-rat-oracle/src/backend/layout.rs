@@ -256,6 +256,19 @@ impl MarkerSearch<'_> {
         if !path.is_dir() {
             return None;
         }
+        // A directory that is ITSELF a checkout belongs to that checkout, not this one. The common
+        // case is a linked worktree kept inside the main checkout (`git worktree add
+        // worktrees/feature`, or this repo's own `.claude/worktrees/<name>`), whose `.git` is a
+        // FILE — so the name-based exclusion above never sees it, and the walk would count the
+        // sibling's `compile_commands.json` as this checkout's. That flips a working
+        // single-database checkout into multi-database mode: `sole_marker_dir` returns `None`,
+        // `--compile-commands-dir` is dropped, and every source outside clangd's own
+        // ancestor/`build/` search stops being resolvable. A nested clone or submodule is excluded
+        // for the same reason, and by the same test — `.git` present, as either a file or a
+        // directory. The search ROOT is exempt: it is entered directly, never through here.
+        if path.join(".git").exists() {
+            return None;
+        }
         // `file_type` describes the LINK, and on Linux it is answered from the readdir result where
         // the filesystem reports it — so ordinary directories cost nothing here and only the rare
         // symlink is canonicalized. An ordinary subdirectory cannot leave the checkout, so only a
@@ -314,6 +327,14 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 /// 0.3s in a release build. The memo on [`ProjectLayout`] is what keeps it to once per marker file
 /// per layout rather than once per worklist path, which matters because this runs while the
 /// maintenance pass holds the repository write lock.
+///
+/// SYNTAX is where this is knowingly narrower than the server. clangd reads the file with clang's
+/// YAML reader, and YAML is a superset of JSON, so it also loads databases carrying `#` comments,
+/// trailing commas, or pure YAML block syntax — all of which `serde_json` refuses (see #1016).
+/// Matching that needs a streaming YAML parser, which is a dependency decision rather than a patch.
+/// The two cheap divergences are closed here instead: a UTF-8 BOM is skipped, and content after the
+/// closing bracket is ignored, both of which clangd accepts and neither of which says anything
+/// about whether the entries describe a loadable project.
 fn marker_file_is_usable(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
@@ -321,9 +342,35 @@ fn marker_file_is_usable(path: &Path) -> bool {
     // `serde_json`'s reader deserializer pulls ONE BYTE at a time — measured unbuffered, a 2 MB
     // database costs two million `read` syscalls — so the buffer in front of it is what makes this
     // a sequential read.
-    let reader = std::io::BufReader::with_capacity(64 * 1024, file);
-    serde_json::from_reader::<_, CompilationDatabase>(reader)
-        .is_ok_and(|database| database.entries > 0)
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    if !skip_utf8_bom(&mut reader) {
+        return false;
+    }
+    // `Deserializer::from_reader` + `deserialize` rather than `serde_json::from_reader`, which also
+    // calls `end()` and so rejects anything after the top-level array. clangd stops at the closing
+    // bracket and never looks further, so trailing content must not condemn the database.
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
+    CompilationDatabase::deserialize(&mut deserializer).is_ok_and(|database| database.entries > 0)
+}
+
+/// Consume a leading UTF-8 BOM if there is one. `false` only when the file could not be read at
+/// all; a file with no BOM is left exactly where it was.
+///
+/// clangd loads a database that starts with one (measured), and a generator on Windows can easily
+/// emit it, but `serde_json` reports it as a syntax error — so without this a perfectly good
+/// database is reported unusable and the checkout silently loses its live evidence.
+fn skip_utf8_bom(reader: &mut impl std::io::BufRead) -> bool {
+    const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+    // The buffer is far larger than three bytes, so one fill sees the whole prefix.
+    match reader.fill_buf() {
+        Ok(buffer) => {
+            if buffer.starts_with(BOM) {
+                reader.consume(BOM.len());
+            }
+            true
+        },
+        Err(_) => false,
+    }
 }
 
 /// A compilation database, read for its SHAPE alone: how many entries it holds, having checked

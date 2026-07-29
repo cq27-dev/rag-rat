@@ -771,6 +771,99 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
     );
 }
 
+#[test]
+fn a_nested_checkouts_database_is_not_this_checkouts() {
+    // A linked worktree kept INSIDE the main checkout is the common case (this repo does it under
+    // `.claude/worktrees/`), and its `.git` is a FILE, so excluding the name `.git` never sees it.
+    // Counting the sibling's database would flip a working single-database checkout into
+    // multi-database mode — no `--compile-commands-dir`, and every source outside clangd's own
+    // ancestor/`build/` search stops being resolvable — purely because of a directory that belongs
+    // to a different checkout. The sibling is not hypothetical state either: `git worktree add`
+    // checks the base commit out there, so the main checkout's own database is reproduced inside
+    // it.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-nested-worktree");
+    std::fs::create_dir_all(dir.join("out")).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("out/compile_commands.json"), COMPDB).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+
+    // A linked worktree: a directory whose `.git` is a file, carrying its own database.
+    std::fs::create_dir_all(dir.join("worktrees/feature/build")).unwrap();
+    std::fs::write(
+        dir.join("worktrees/feature/.git"),
+        "gitdir: /elsewhere/.git/worktrees/feature\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("worktrees/feature/build/compile_commands.json"), COMPDB).unwrap();
+
+    let layout = clangd.resolve_layout(&dir);
+    assert!(
+        clangd.spawn_args(&["--background-index"], &layout).contains(&compdb_arg(&dir.join("out"))),
+        "a sibling checkout's database must not make this checkout multi-database",
+    );
+    assert!(
+        clangd.session_can_resolve(&dir, "src/main.c", &layout),
+        "and its sources stay resolvable through the pin",
+    );
+
+    // A nested clone or submodule is the same situation and excluded by the same test — `.git`
+    // present, here as a directory rather than a file.
+    std::fs::create_dir_all(dir.join("vendor/dep/.git")).unwrap();
+    std::fs::write(dir.join("vendor/dep/compile_commands.json"), COMPDB).unwrap();
+    let layout = clangd.resolve_layout(&dir);
+    assert!(
+        clangd.spawn_args(&["--background-index"], &layout).contains(&compdb_arg(&dir.join("out"))),
+        "a nested clone's database must not either",
+    );
+
+    // Control: an ordinary directory of this checkout is NOT a separate checkout, so a second
+    // database there still disqualifies pinning. Without this the assertions above would also pass
+    // for a walk that stopped finding anything at all.
+    std::fs::create_dir_all(dir.join("other/build")).unwrap();
+    std::fs::write(dir.join("other/build/compile_commands.json"), COMPDB).unwrap();
+    let layout = clangd.resolve_layout(&dir);
+    assert_eq!(
+        clangd.spawn_args(&["--background-index"], &layout),
+        vec![OsString::from("--background-index")],
+        "a second database in this checkout still counts",
+    );
+}
+
+#[test]
+fn a_database_clangd_can_read_is_not_refused_over_a_bom_or_trailing_bytes() {
+    // Both are accepted by clangd (measured) and rejected by `serde_json`, so without handling
+    // them a perfectly good database is reported unusable and the checkout silently loses all live
+    // evidence — the expensive direction to be wrong in. A BOM is what a generator on Windows can
+    // emit; trailing bytes are what a hand-edited file can end up with.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-db-syntax");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+
+    for (label, database) in [
+        ("a UTF-8 BOM", format!("\u{feff}{COMPDB}")),
+        ("trailing bytes", format!("{COMPDB}\n// generated\n")),
+        ("a BOM and trailing bytes", format!("\u{feff}{COMPDB}\n")),
+    ] {
+        std::fs::write(dir.join("compile_commands.json"), &database).unwrap();
+        assert!(
+            clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            "clangd loads a database with {label}, so this check must not refuse it",
+        );
+    }
+
+    // The prefix must not become a way to smuggle a hollow database past the check: what follows
+    // it is still validated.
+    for database in ["\u{feff}[]", "\u{feff}[{\"file\":\"/x/a.c\"}]"] {
+        std::fs::write(dir.join("compile_commands.json"), database).unwrap();
+        assert!(
+            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            "a BOM does not excuse {database}",
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn the_marker_search_does_not_follow_a_symlink_out_of_the_checkout() {
