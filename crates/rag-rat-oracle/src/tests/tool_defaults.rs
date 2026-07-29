@@ -80,3 +80,53 @@ fn live_tools_are_gated_out_of_the_batch_paths() {
         }
     }
 }
+
+/// Sorting by declared `Authority` reproduces the batch-first order the read-side merge sites used
+/// to get from `!batch_capable()`, and every canonical tool precedes every patch tool.
+///
+/// This is the behaviour-preservation pin for splitting that one predicate into three. It does NOT
+/// assert that authority and `batch_capable` agree tool-for-tool — they are independent questions
+/// that merely coincide today, and a whole-checkout LSP sweep would separate them. What must hold
+/// is the ORDER the merge sites depend on.
+#[test]
+fn sorting_by_authority_reproduces_the_batch_first_merge_order() {
+    let mut by_authority = OracleTool::ALL.to_vec();
+    by_authority.sort_by_key(|tool| tool.authority());
+
+    let mut by_old_predicate = OracleTool::ALL.to_vec();
+    by_old_predicate.sort_by_key(|tool| !tool.batch_capable());
+
+    assert_eq!(
+        by_authority, by_old_predicate,
+        "the declared authority must order the merge sites exactly as the predicate did",
+    );
+
+    let last_canonical = by_authority
+        .iter()
+        .rposition(|tool| tool.authority() == Authority::Canonical)
+        .expect("some tool is canonical");
+    assert!(
+        by_authority[..=last_canonical].iter().all(|tool| tool.authority() == Authority::Canonical),
+        "no patch tool may sort before a canonical one — that is the whole guarantee",
+    );
+}
+
+/// Coverage and authority are DECLARED, so every tool has an answer and a new variant cannot
+/// inherit one. The exhaustive matches make that a compile error; this pins that they are also
+/// reachable and that today every whole-checkout tool is canonical.
+///
+/// The pairing is asserted as a fact about TODAY, not a rule: a whole-checkout LSP sweep would be
+/// `WholeCheckout` + `Patch`, and this test should then be updated rather than treated as a veto.
+#[test]
+fn every_tool_declares_its_coverage_and_authority() {
+    for &tool in OracleTool::ALL {
+        let (coverage, authority) = (tool.coverage(), tool.authority());
+        assert_eq!(
+            coverage == Coverage::WholeCheckout,
+            authority == Authority::Canonical,
+            "{} pairs coverage {coverage:?} with authority {authority:?}; if that is intentional, \
+             update this test — it records today's coincidence, not a constraint",
+            tool.as_db_str(),
+        );
+    }
+}

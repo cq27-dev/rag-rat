@@ -277,8 +277,8 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
         // e.g. scip-python installed but no Python target: it would index nothing, fail,
         // the error would be swallowed with no `oracle_runs` row recorded, and the loop
         // would retry the doomed run every poll.
-        let configured_languages: std::collections::HashSet<&str> =
-            config.targets.iter().map(|target| target.language.as_str()).collect();
+        let configured_languages: std::collections::HashSet<_> =
+            config.targets.iter().map(|target| target.language).collect();
         for &tool in OracleTool::ALL {
             // Live-only backends (`ra-lsp`) are driven by the watcher, never by the batch
             // auto-run loop (#534).

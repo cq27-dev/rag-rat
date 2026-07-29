@@ -418,12 +418,12 @@ impl IndexDatabase {
             return Ok(None);
         }
         let mut effects: Option<std::collections::HashMap<i64, EdgeOracleEffect>> = None;
-        // BATCH tools first (#534): batch verdict sets are disjoint across languages, but a live
-        // tool (`ra-lsp`) overlaps its batch counterpart on the same Rust edges. The batch pass
-        // is canonical, so first-writer-wins per edge_id gives batch-wins-on-overlap —
-        // deterministically, not via ALL's declaration order.
+        // CANONICAL tools first (#534): canonical verdict sets are disjoint across languages, but a
+        // patch tool (`ra-lsp`) overlaps its canonical counterpart on the same Rust edges. So
+        // first-writer-wins per edge_id gives batch-wins-on-overlap — deterministically, off the
+        // declared authority rather than `ALL`'s declaration order.
         let mut tools = rag_rat_oracle::OracleTool::ALL.to_vec();
-        tools.sort_by_key(|tool| !tool.batch_capable());
+        tools.sort_by_key(|tool| tool.authority());
         for tool in tools {
             let Some(version) = self.latest_oracle_run_version(tool)? else {
                 continue;

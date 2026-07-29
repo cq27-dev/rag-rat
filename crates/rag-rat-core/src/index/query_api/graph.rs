@@ -103,8 +103,8 @@ impl IndexDatabase {
             // No oracle run for this checkout — nothing to surface, all hops stay heuristic.
             return Ok(false);
         }
-        // Stable sort: batch tools (`batch_capable`) first, preserving their ALL order.
-        runs.sort_by_key(|(tool, _)| !tool.batch_capable());
+        // Stable sort by declared AUTHORITY: canonical tools first, preserving their ALL order.
+        runs.sort_by_key(|(tool, _)| tool.authority());
         let edge_ids = hops.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
         let mut verdicts = std::collections::HashMap::new();
         for (tool, tool_version) in &runs {
@@ -490,8 +490,8 @@ impl IndexDatabase {
             &self.active_commit_sha,
             &self.active_worktree_id,
         )?;
-        // Stable sort: batch tools (`batch_capable`) first, preserving their ALL order.
-        runs.sort_by_key(|(tool, _)| !tool.batch_capable());
+        // Stable sort by declared AUTHORITY: canonical tools first, preserving their ALL order.
+        runs.sort_by_key(|(tool, _)| tool.authority());
         let mut summary = rag_rat_query::graph::CompareGraphScipSummary::default();
         let mut contradictions = Vec::new();
         // Edge ids already reported as contradicted (batch-first dedupe, #534).
@@ -517,10 +517,10 @@ impl IndexDatabase {
         // Batch-wins precedence (#534): reserve EVERY edge a batch tool has a verdict on (any
         // kind — Confirm/Upgrade/ResolvedExternal/Contradict) BEFORE emitting any live
         // contradiction. `runs` is sorted batch-first, so by the time a live tool is examined
-        // `batch_covered` holds all batch-covered edges. A live `Contradict` on a batch-covered
+        // `canonical_covered` holds all batch-covered edges. A live `Contradict` on a batch-covered
         // edge is suppressed: the batch pass is canonical, so surfacing a live disagreement the
         // authoritative tool doesn't share would be a false "compiler disagrees with the graph".
-        let mut batch_covered = std::collections::HashSet::new();
+        let mut canonical_covered = std::collections::HashSet::new();
         for (tool, version) in &runs {
             let comparisons = rag_rat_oracle::current_oracle_comparisons(
                 conn,
@@ -530,12 +530,12 @@ impl IndexDatabase {
                 &self.active_worktree_id,
             )?;
             summary.verdicts_examined += u64::try_from(comparisons.len()).unwrap_or(u64::MAX);
-            let is_batch = tool.batch_capable();
+            let is_canonical = tool.authority() == rag_rat_oracle::Authority::Canonical;
             for comparison in comparisons {
-                if is_batch {
-                    batch_covered.insert(comparison.edge_id);
-                } else if batch_covered.contains(&comparison.edge_id) {
-                    // A batch tool already spoke for this edge — its verdict wins.
+                if is_canonical {
+                    canonical_covered.insert(comparison.edge_id);
+                } else if canonical_covered.contains(&comparison.edge_id) {
+                    // A canonical tool already spoke for this edge — its verdict wins.
                     continue;
                 }
                 if comparison.kind != rag_rat_oracle::OracleResolutionKind::Contradict {

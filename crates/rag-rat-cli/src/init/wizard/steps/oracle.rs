@@ -27,10 +27,10 @@ pub(super) fn render_oracle(f: &mut Frame, area: Rect, state: &WizardState) {
         chunks[0],
     );
 
-    let detected: Vec<&str> = Language::all()
+    let detected: Vec<Language> = Language::all()
         .iter()
-        .filter(|&&l| state.scan.language_counts().get(&l).copied().unwrap_or(0) > 0)
-        .map(|&l| l.as_str())
+        .copied()
+        .filter(|l| state.scan.language_counts().get(l).copied().unwrap_or(0) > 0)
         .collect();
 
     let mut lines = vec![
@@ -72,7 +72,13 @@ pub(super) fn render_oracle(f: &mut Frame, area: Rect, state: &WizardState) {
             .replace("ScipJava", "scip-java");
         lines.push(Line::from(vec![
             Span::styled(format!(" {} {} ", if relevant { "▶" } else { " " }, name), style),
-            Span::styled(format!("— {}", m.languages.join(", ")), theme::muted()),
+            Span::styled(
+                format!(
+                    "— {}",
+                    m.languages.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+                theme::muted(),
+            ),
         ]));
     }
     f.render_widget(
@@ -106,10 +112,10 @@ pub(super) fn handle_oracle(key: KeyEvent, state: &mut WizardState) -> Outcome {
 }
 
 fn tools_for_scan(state: &WizardState) -> Vec<OracleTool> {
-    let detected: Vec<&str> = Language::all()
+    let detected: Vec<Language> = Language::all()
         .iter()
-        .filter(|&&l| state.scan.language_counts().get(&l).copied().unwrap_or(0) > 0)
-        .map(|&l| l.as_str())
+        .copied()
+        .filter(|l| state.scan.language_counts().get(l).copied().unwrap_or(0) > 0)
         .collect();
     OracleTool::ALL
         .iter()

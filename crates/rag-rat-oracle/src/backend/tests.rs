@@ -583,7 +583,7 @@ fn every_live_backend_copies_monikers_from_a_batch_tool_for_its_own_language() {
         let batch_languages = crate::ToolManifest::for_tool(source).languages;
         for language in backend.languages {
             assert!(
-                batch_languages.contains(&language.as_str()),
+                batch_languages.contains(language),
                 "{} resolves {language} but copies monikers from {}, which indexes \
                  {batch_languages:?}",
                 backend.tool.as_db_str(),

@@ -11,6 +11,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use rag_rat_base::language::Language;
 use serde::Serialize;
 
 use super::OracleTool;
@@ -29,8 +30,12 @@ pub struct ToolManifest {
     /// to the registry entry, not the client. Empty for batch tools, which build their whole
     /// invocation in [`ToolManifest::scip_command`].
     pub live_args: &'static [&'static str],
-    /// Languages this backend resolves, for status/diagnostics.
-    pub languages: &'static [&'static str],
+    /// Languages this backend resolves, for status/diagnostics and for gating the auto-run loop.
+    ///
+    /// The SAME encoding `LiveBackend::languages` and `ResolvedTarget.language` use. It was once a
+    /// list of lowercase registry tokens, which meant every consumer round-tripped through
+    /// `Language::as_str()` and a test had to reconcile the two spellings.
+    pub languages: &'static [Language],
     /// A one-line install hint surfaced when the tool is absent (the `Blocked` UX).
     pub install_hint: &'static str,
 }
@@ -60,7 +65,7 @@ impl ToolManifest {
                 tool,
                 program: "rust-analyzer",
                 live_args: &[],
-                languages: &["rust"],
+                languages: &[Language::Rust],
                 install_hint: "rust-analyzer not found on PATH. Install it (e.g. `rustup \
                                component add rust-analyzer`) or pass a pre-built index with \
                                `--scip <path>`.",
@@ -69,7 +74,7 @@ impl ToolManifest {
                 tool,
                 program: "scip-clang",
                 live_args: &[],
-                languages: &["c", "cpp"],
+                languages: &[Language::C, Language::Cpp],
                 install_hint: "scip-clang not found on PATH. Install it from \
                                github.com/sourcegraph/scip-clang and generate a \
                                compile_commands.json for the checkout (e.g. `bear -- make`, CMake \
@@ -81,7 +86,7 @@ impl ToolManifest {
                 tool,
                 program: "scip-python",
                 live_args: &[],
-                languages: &["python"],
+                languages: &[Language::Python],
                 install_hint: "scip-python not found on PATH. Install it (e.g. `npm install -g \
                                @sourcegraph/scip-python`) AND install the project's dependencies \
                                (e.g. into a virtualenv) so imports resolve, or pass a pre-built \
@@ -91,7 +96,7 @@ impl ToolManifest {
                 tool,
                 program: "scip-typescript",
                 live_args: &[],
-                languages: &["typescript"],
+                languages: &[Language::TypeScript],
                 install_hint: "scip-typescript not found on PATH. Install it (e.g. `npm install \
                                -g @sourcegraph/scip-typescript`) AND install the project's \
                                dependencies (`npm install`) so cross-package references resolve, \
@@ -104,7 +109,7 @@ impl ToolManifest {
                 tool,
                 program: "scip-java",
                 live_args: &[],
-                languages: &["kotlin"],
+                languages: &[Language::Kotlin],
                 install_hint: "scip-java not found on PATH. Install it (e.g. `cs install \
                                --contrib scip-java`, needs a JVM) — it indexes Kotlin through the \
                                project's Gradle build (Maven Kotlin is unsupported), so the build \
@@ -117,7 +122,7 @@ impl ToolManifest {
                 tool,
                 program: "rust-analyzer",
                 live_args: &[],
-                languages: &["rust"],
+                languages: &[Language::Rust],
                 install_hint: "rust-analyzer not found on PATH. Install it (e.g. `rustup \
                                component add rust-analyzer`) so the live oracle (`[oracle.live] \
                                enabled`) can spawn it as a language server.",
@@ -129,7 +134,7 @@ impl ToolManifest {
                 tool,
                 program: "typescript-language-server",
                 live_args: &["--stdio"],
-                languages: &["typescript"],
+                languages: &[Language::TypeScript],
                 install_hint: "typescript-language-server not found on PATH. Install it (e.g. \
                                `npm install -g typescript-language-server typescript`) so the \
                                live oracle (`[oracle.live] enabled`) can spawn it as a language \
@@ -146,7 +151,7 @@ impl ToolManifest {
                 tool,
                 program: "clangd",
                 live_args: &["--background-index"],
-                languages: &["c", "cpp"],
+                languages: &[Language::C, Language::Cpp],
                 install_hint: "clangd not found on PATH. Install it (e.g. `apt install clangd`, \
                                or a release from github.com/clangd/clangd) so the live oracle \
                                (`[oracle.live] enabled`) can spawn it as a language server.",
@@ -291,7 +296,18 @@ impl ToolManifest {
             // server. `checkout_can_signal_readiness` is the same search the warm-up uses, so the
             // gate and the warm-up cannot disagree.
             OracleTool::ClangdLsp | OracleTool::TsLsp => {
-                let backend = super::backend::LiveBackend::for_tool(self.tool)?;
+                // `None` from this function means READY, so a missing registry entry must NOT
+                // short-circuit with `?`: a progress-signalled tool with no `LiveBackend` would
+                // then report the checkout ready and the driver would spawn a server it has no
+                // argv, readiness policy, or language set for. Absent means blocked, and says so.
+                let Some(backend) = super::backend::LiveBackend::for_tool(self.tool) else {
+                    return Some(format!(
+                        "{} is registered as a live backend but has no `LiveBackend` entry, so \
+                         the oracle has no argv, readiness policy, or language set for it. This \
+                         is a registry gap, not a checkout problem.",
+                        self.tool.as_db_str(),
+                    ));
+                };
                 let resolved;
                 let layout = match layout {
                     Some(layout) => layout,
@@ -578,7 +594,7 @@ mod tests {
             tool: OracleTool::ScipClang,
             program: "cargo",
             live_args: &[],
-            languages: &["c"],
+            languages: &[Language::C],
             install_hint: "install hint",
         };
         assert!(
@@ -616,7 +632,7 @@ mod tests {
             tool: OracleTool::ScipClang,
             program: "rag-rat-no-such-tool-xyzzy",
             live_args: &[],
-            languages: &["c"],
+            languages: &[Language::C],
             install_hint: "install scip-clang",
         };
         match absent.probe_runnable_in(&crate::test_support::every_path_scope(&dir)) {
@@ -633,7 +649,7 @@ mod tests {
         let manifest = ToolManifest::for_tool(OracleTool::ClangdLsp);
         assert_eq!(manifest.program, "clangd");
         assert_eq!(manifest.live_args, ["--background-index"]);
-        assert_eq!(manifest.languages, ["c", "cpp"], "one server, both dialects");
+        assert_eq!(manifest.languages, [Language::C, Language::Cpp], "one server, both dialects");
 
         // The compilation database is what clangd builds that index from — the same file the
         // batch scip-clang backend requires, for its own reasons.

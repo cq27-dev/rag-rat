@@ -333,7 +333,6 @@ mod tests {
             oracle_only_calls: 4,
             covered_calls: 16,
             skipped_drifted: 5,
-            skipped_local: 0,
             no_occurrence: 0,
             rows_written: 13,
             monikers_written: monikers,

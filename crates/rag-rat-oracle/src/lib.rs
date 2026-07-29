@@ -768,11 +768,59 @@ impl OracleTool {
         value.parse().ok()
     }
 
-    /// Whether this tool produces/consumes whole-checkout `.scip` indexes — the batch paths:
-    /// `oracle run`, the background auto-run loop, the init-wizard tool listing, and
-    /// [`produce_scip_with_tool`]. `false` ONLY for the live LSP tools, which write per-pass
-    /// verdicts from the watcher and have no `scip_command`; every batch driver must skip them
-    /// rather than try to invoke them as indexers.
+    /// How much of the checkout one of this tool's runs speaks for.
+    ///
+    /// DECLARED per tool rather than derived from [`Self::batch_capable`], because the two are
+    /// independent questions that only happen to coincide today. Coverage is what gives
+    /// `oracle_runs.tool_version` its opposite meanings — a whole-checkout run treats a version
+    /// bump as *discard* (`clear_edge_oracle_for_tool` is `(tool, tool_version)`-scoped) while a
+    /// changed-paths run treats it as *copy-forward* (`migrate_live_verdicts_to_version`). A future
+    /// whole-checkout LSP sweep would be `WholeCheckout` on a tool that is not `batch_capable`, and
+    /// deriving this from the driver kind is what would make that unrepresentable.
+    ///
+    /// The match is exhaustive on purpose: a new tool must state its coverage rather than inherit a
+    /// default.
+    pub fn coverage(self) -> Coverage {
+        match self {
+            Self::RustAnalyzer
+            | Self::ScipClang
+            | Self::ScipPython
+            | Self::ScipTypescript
+            | Self::ScipJava => Coverage::WholeCheckout,
+            Self::RaLsp | Self::TsLsp | Self::ClangdLsp => Coverage::ChangedPaths,
+        }
+    }
+
+    /// Whose verdict stands when two tools speak for the SAME edge.
+    ///
+    /// Batch verdict sets are disjoint across languages, but a live tool overlaps its batch
+    /// counterpart on the same edges — so every read-side merge needs a total order, and it must
+    /// not be `ALL`'s declaration order. Sorting by this and taking first-writer-wins gives
+    /// batch-wins-on-overlap deterministically.
+    ///
+    /// DECLARED per tool, and exhaustively, for the same reason as [`Self::coverage`]: read-side
+    /// authority is not the same question as whether a batch driver can invoke the tool, and a new
+    /// tool must state its answer. Deriving it from [`Self::batch_capable`] is how a merge site
+    /// ends up silently ordering a new backend by accident.
+    pub fn authority(self) -> Authority {
+        match self {
+            Self::RustAnalyzer
+            | Self::ScipClang
+            | Self::ScipPython
+            | Self::ScipTypescript
+            | Self::ScipJava => Authority::Canonical,
+            Self::RaLsp | Self::TsLsp | Self::ClangdLsp => Authority::Patch,
+        }
+    }
+
+    /// Whether a BATCH DRIVER can invoke this tool as an indexer — `oracle run`, the background
+    /// auto-run loop, the init-wizard tool listing, and [`produce_scip_with_tool`]. `false` ONLY
+    /// for the live LSP tools, which write per-pass verdicts from the watcher and have no
+    /// `scip_command`.
+    ///
+    /// This is DISPATCH ONLY. It used to answer read-side precedence and run coverage as well;
+    /// those are [`Self::authority`] and [`Self::coverage`] now, because a tool can be a
+    /// whole-checkout measurement without being a `.scip` producer.
     pub fn batch_capable(self) -> bool {
         !matches!(self, Self::RaLsp | Self::TsLsp | Self::ClangdLsp)
     }
@@ -862,6 +910,26 @@ impl OracleResolutionKind {
     }
 }
 
+/// How much of the checkout one run of a backend speaks for. See [`OracleTool::coverage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// The run measures the whole checkout: absent verdicts are a statement, and a `tool_version`
+    /// bump discards the previous set.
+    WholeCheckout,
+    /// The run patches the paths that changed: absent verdicts mean "not visited yet", and a
+    /// `tool_version` bump carries the previous set forward.
+    ChangedPaths,
+}
+
+/// Whose verdict stands when two backends speak for the same edge. `Canonical` sorts FIRST, so
+/// `sort_by_key(|tool| tool.authority())` plus first-writer-wins is batch-wins-on-overlap.
+/// See [`OracleTool::authority`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Authority {
+    Canonical,
+    Patch,
+}
+
 /// Outcome of an oracle pass, mirroring `ReconcileReport`'s shape (counts + a status string). One
 /// per `run()`; persisted opaquely as `oracle_runs.stats_json` and surfaced via [`OracleStatus`].
 #[derive(Debug, Clone, Default, Serialize)]
@@ -895,8 +963,6 @@ pub struct OracleReport {
     /// verdict (#81 finding 2). A non-zero count means `eval` should warn that some documents
     /// were out of sync.
     pub skipped_drifted: u64,
-    /// `local N` occurrences skipped (function-local, no cross-file meaning).
-    pub skipped_local: u64,
     /// Candidates whose callee position fell outside any occurrence (no oracle data).
     pub no_occurrence: u64,
     /// `edge_oracle` rows written this pass.
@@ -911,12 +977,4 @@ pub struct OracleReport {
     /// contract `check_library_usage` reads.
     pub external_symbols_written: u64,
     pub status: String,
-}
-
-/// An oracle backend: produces (or consumes) a SCIP index for a checkout. Phase 1 implements only
-/// the consume-existing-`.scip` path; the trait is the seam phase 2 (#69) fills with indexer
-/// invocation. Kept minimal on purpose.
-pub trait Oracle {
-    fn tool(&self) -> OracleTool;
-    fn tool_version(&self) -> &str;
 }
