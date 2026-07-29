@@ -3,8 +3,12 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 /// What a live backend learned about a checkout's projects, resolved ONCE per session.
 ///
@@ -147,7 +151,12 @@ fn is_searchable_for_marker(path: &Path, name: &str) -> bool {
 /// declarations). Accepting a checkout whose database the server cannot find would report it
 /// usable while it silently never warms.
 pub(super) fn marker_sites(root: &Path, marker: &str) -> Vec<MarkerSite> {
-    let mut search = MarkerSearch { marker, visited_links: HashSet::new(), found: Vec::new() };
+    let mut search = MarkerSearch {
+        marker,
+        visited_links: HashSet::new(),
+        recorded_markers: HashSet::new(),
+        found: Vec::new(),
+    };
     search.descend(root, MARKER_SEARCH_MAX_DEPTH);
     search.found
 }
@@ -159,8 +168,8 @@ pub(super) fn marker_sites(root: &Path, marker: &str) -> Vec<MarkerSite> {
 /// ancestor. Deep enough for any real project layout.
 const MARKER_SEARCH_MAX_DEPTH: u32 = 24;
 
-/// One whole-checkout marker search: what it looks for, which symlinked directories it has already
-/// descended into, and the sites found so far.
+/// One whole-checkout marker search: what it looks for, which symlinked directories and marker
+/// files it has already visited, and the sites found so far.
 struct MarkerSearch<'a> {
     marker: &'a str,
     /// Canonical paths of the SYMLINKED directories already descended into. Following directory
@@ -168,8 +177,11 @@ struct MarkerSearch<'a> {
     /// way this walk can revisit a directory — so recording just those targets bounds the
     /// traversal without paying a canonicalize per ordinary entry.
     visited_links: HashSet<PathBuf>,
-    /// Marker sites, collected until there are two — the only distinction any caller draws is
-    /// "exactly one" versus "several", and a monorepo can hold hundreds.
+    /// Canonical paths of the marker FILES already recorded, so one database reachable through
+    /// several directory paths counts once. See [`Self::record_marker_in`].
+    recorded_markers: HashSet<PathBuf>,
+    /// Marker sites, collected until there are two DISTINCT databases — the only distinction any
+    /// caller draws is "exactly one" versus "several", and a monorepo can hold hundreds.
     found: Vec<MarkerSite>,
 }
 
@@ -178,11 +190,7 @@ impl MarkerSearch<'_> {
         if self.found.len() >= 2 {
             return;
         }
-        let candidate = dir.join(self.marker);
-        if candidate.exists() {
-            let usable = marker_file_is_usable(&candidate);
-            self.found.push(MarkerSite { dir: dir.to_path_buf(), usable });
-        }
+        self.record_marker_in(dir);
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -195,6 +203,34 @@ impl MarkerSearch<'_> {
         for sub in subdirectories {
             self.descend(&sub, depth_left);
         }
+    }
+
+    /// Record the marker file in `dir`, unless the same PHYSICAL file was already recorded under
+    /// another path.
+    ///
+    /// One database is routinely reachable twice: `out/` alongside a `current-build -> out`
+    /// symlink, which this search follows on purpose (that is what makes a symlinked build
+    /// directory discoverable at all). Recording both would make a single-database checkout look
+    /// multi-database — `sole_marker_dir` returns `None`, no `--compile-commands-dir` is passed,
+    /// and every source outside clangd's own ancestor/`build/` search stops being resolvable.
+    ///
+    /// Canonicalizing is affordable here because it happens once per marker file FOUND, and the
+    /// walk stops at two distinct databases — unlike the traversal itself, which sees every
+    /// directory in the checkout and therefore canonicalizes only the rare symlink.
+    fn record_marker_in(&mut self, dir: &Path) {
+        let candidate = dir.join(self.marker);
+        if !candidate.exists() {
+            return;
+        }
+        // A marker file that will not canonicalize is recorded under its own path rather than
+        // dropped: it exists, and losing the checkout's only database is worse than the alias this
+        // set exists to collapse.
+        let identity = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+        if !self.recorded_markers.insert(identity) {
+            return;
+        }
+        let usable = marker_file_is_usable(&candidate);
+        self.found.push(MarkerSite { dir: dir.to_path_buf(), usable });
     }
 
     /// The directory to descend into for `entry`, or `None` when it is not one this search may
@@ -239,77 +275,97 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 /// every call opens and parses the file, so per-file callers go through
 /// [`ProjectLayout::marker_is_usable`] instead, which remembers the verdict.
 ///
-/// The case that matters is a syntactically valid database that names no translation unit — `[]`,
-/// `{}`, or an array of objects without a `file` key. Measured, clangd emits no progress cycle at
+/// EVERY entry has to be complete, not just the first, because clangd rejects the WHOLE database
+/// when any single entry is malformed. Measured with clangd 19.1.2 on a database whose first entry
+/// carries `-DPROBE_OK=1` and whose second lacks a compiler invocation:
+///
+/// ```text
+/// E[..] Failed to load compilation database from …/compile_commands.json:
+///       Missing key: "command" or "arguments".
+/// I[..] Failed to find compilation database for …/src/main.c
+/// I[..] Generic fallback command is: […]
+/// ```
+///
+/// — the fallback command carries no `-DPROBE_OK=1`, so every file in that checkout is analysed
+/// with heuristic flags, and a cross-translation-unit call resolves to the callee's header
+/// declaration. Trusting the first entry alone would report such a database usable, pin the session
+/// to it, and persist those answers as trusted evidence.
+///
+/// The other case this catches is a syntactically valid database that names no translation unit —
+/// `[]`, `{}`, or entries without the required keys. Measured, clangd emits no progress cycle at
 /// all for one, so a checkout holding it can never report ready and the backend would retry its
 /// backlog forever while `oracle status` called it runnable.
 ///
-/// The FIRST entry is parsed, not the whole file and not a byte pattern. A real database can be
-/// tens of megabytes and this runs while the maintenance pass holds the repository write lock, so
-/// parsing all of it is too expensive; scanning for a token is simply wrong in both directions —
-/// it rejects a valid database whose first entry is larger than the window, and accepts a hollow
-/// one that merely contains the token inside some unrelated string.
+/// The whole file is STREAMED rather than buffered: entries deserialize into presence flags and
+/// discarded payloads, so the cost is one pass with no allocation proportional to the file. That
+/// cost is real — a 39 MB / 120k-entry database, the size a large C++ project exports, takes about
+/// 0.3s in a release build. The memo on [`ProjectLayout`] is what keeps it to once per marker file
+/// per layout rather than once per worklist path, which matters because this runs while the
+/// maintenance pass holds the repository write lock.
 fn marker_file_is_usable(path: &Path) -> bool {
-    /// One compilation-database entry, with the fields the format REQUIRES. `clangd --check`
-    /// rejects an entry missing any of them (`Missing key: "directory"`, `Missing key: "command"
-    /// or "arguments"`) and falls back to generic flags, so an entry naming only a file is not a
-    /// usable database however well-formed its JSON is.
-    ///
-    /// Only the PRESENCE of each field is checked, so every payload is discarded while parsing —
-    /// `file` and `directory` are required by their types, and the invocation is checked below
-    /// because either form satisfies it.
-    #[derive(serde::Deserialize)]
-    struct CompilationEntry {
-        #[allow(dead_code)]
-        file: serde::de::IgnoredAny,
-        #[allow(dead_code)]
-        directory: serde::de::IgnoredAny,
-        command: Option<serde::de::IgnoredAny>,
-        arguments: Option<serde::de::IgnoredAny>,
-    }
-
-    // One entry is small even when the database is not, so a bounded prefix always contains it.
-    const PREFIX_LIMIT: u64 = 1024 * 1024;
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    let mut prefix = Vec::new();
-    if std::io::Read::read_to_end(&mut std::io::Read::take(file, PREFIX_LIMIT), &mut prefix)
-        .is_err()
-    {
-        return false;
-    }
-    let text = String::from_utf8_lossy(&prefix);
-    first_json_object(&text)
-        .and_then(|object| serde_json::from_str::<CompilationEntry>(object).ok())
-        .is_some_and(|entry| entry.command.is_some() || entry.arguments.is_some())
+    // `serde_json`'s reader deserializer pulls ONE BYTE at a time — measured unbuffered, a 2 MB
+    // database costs two million `read` syscalls — so the buffer in front of it is what makes this
+    // a sequential read.
+    let reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    serde_json::from_reader::<_, CompilationDatabase>(reader)
+        .is_ok_and(|database| database.entries > 0)
 }
 
-/// The first top-level JSON object in `text`, as a slice — brace-matched with string and escape
-/// awareness so a `{` or `}` inside a compile command cannot end it early. `None` when the prefix
-/// holds no complete object.
-pub(super) fn first_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, ch) in text[start..].char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            '{' if !in_string => depth += 1,
-            '}' if !in_string => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..start + offset + ch.len_utf8()]);
-                }
-            },
-            _ => {},
-        }
+/// A compilation database, read for its SHAPE alone: how many entries it holds, having checked
+/// that each one carries what the format requires.
+struct CompilationDatabase {
+    entries: usize,
+}
+
+/// One compilation-database entry, with the fields the format REQUIRES. `clangd --check` rejects
+/// an entry missing any of them (`Missing key: "directory"`, `Missing key: "command" or
+/// "arguments"`) and falls back to generic flags for the whole checkout, so an entry naming only a
+/// file is not a usable database however well-formed its JSON is.
+///
+/// Only the PRESENCE of each field is checked, so every payload is discarded while parsing —
+/// `file` and `directory` are required by their types, and the invocation is checked in
+/// [`CompilationDatabaseVisitor`] because either form satisfies it.
+#[derive(Deserialize)]
+struct CompilationEntry {
+    #[allow(dead_code)]
+    file: IgnoredAny,
+    #[allow(dead_code)]
+    directory: IgnoredAny,
+    command: Option<IgnoredAny>,
+    arguments: Option<IgnoredAny>,
+}
+
+impl<'de> Deserialize<'de> for CompilationDatabase {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_seq(CompilationDatabaseVisitor)
     }
-    None
+}
+
+/// Reads the top-level array one entry at a time. A hand-written visitor rather than a
+/// `Vec<CompilationEntry>` so that neither the entries nor their payloads are ever collected:
+/// a real database is tens of megabytes, and nothing here needs to outlive the check.
+struct CompilationDatabaseVisitor;
+
+impl<'de> Visitor<'de> for CompilationDatabaseVisitor {
+    type Value = CompilationDatabase;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of compilation database entries")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut entries = 0usize;
+        // The first incomplete entry ends the read: clangd would reject the database at that point
+        // too, so there is nothing later in the file that could redeem it.
+        while let Some(entry) = seq.next_element::<CompilationEntry>()? {
+            if entry.command.is_none() && entry.arguments.is_none() {
+                return Err(de::Error::custom("entry has neither `command` nor `arguments`"));
+            }
+            entries += 1;
+        }
+        Ok(CompilationDatabase { entries })
+    }
 }

@@ -7,7 +7,6 @@ use std::time::Duration;
 use rag_rat_base::language::Language;
 
 use super::documents::enclosing_project_dir;
-use super::layout::first_json_object;
 use super::registry::LiveBackend;
 use crate::OracleTool;
 
@@ -510,24 +509,10 @@ fn the_nearest_database_decides_even_when_it_is_unusable() {
 }
 
 #[test]
-fn the_first_database_entry_is_parsed_not_pattern_matched() {
+fn a_database_is_parsed_not_pattern_matched() {
     // Scanning for a token is wrong in BOTH directions: it rejects a valid database whose
-    // first entry is larger than the window, and accepts a hollow one that merely contains
-    // the token inside an unrelated string. Parsing the first entry settles both.
-    assert_eq!(first_json_object(r#"[{"a":1},{"b":2}]"#), Some(r#"{"a":1}"#));
-    assert_eq!(
-        first_json_object(r#"[{"command":"cc -D'{' x.c","file":"x.c"}]"#),
-        Some(r#"{"command":"cc -D'{' x.c","file":"x.c"}"#),
-        "a brace inside a compile command must not end the object early",
-    );
-    assert_eq!(
-        first_json_object(r#"[{"command":"cc \"{\" x.c","file":"x.c"}]"#),
-        Some(r#"{"command":"cc \"{\" x.c","file":"x.c"}"#),
-        "nor may an escaped quote end the string early",
-    );
-    assert_eq!(first_json_object("[]"), None);
-    assert_eq!(first_json_object(r#"[{"unterminated": 1"#), None);
-
+    // entries are larger than the window, and accepts a hollow one that merely contains the
+    // token inside an unrelated string. Parsing the file settles both.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
     let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-db-shape");
     std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -544,8 +529,8 @@ fn the_first_database_entry_is_parsed_not_pattern_matched() {
     std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
     assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
 
-    // A first entry that puts a large `arguments` array before `file` is still valid — a
-    // fixed-size byte window would have rejected it.
+    // An entry that puts a large `arguments` array before `file` is still valid — a fixed-size
+    // byte window over a prefix of the file would have rejected it.
     let bulky = format!(
         r#"[{{"directory":"/x","arguments":[{}],"file":"/x/a.c"}}]"#,
         (0..40_000).map(|i| format!(r#""-DBIG{i}=1""#)).collect::<Vec<_>>().join(","),
@@ -554,7 +539,94 @@ fn the_first_database_entry_is_parsed_not_pattern_matched() {
     std::fs::write(dir.join("compile_commands.json"), &bulky).unwrap();
     assert!(
         clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
-        "a valid database must not be rejected for putting `file` late in a big first entry",
+        "a valid database must not be rejected for putting `file` late in a big entry",
+    );
+}
+
+#[test]
+fn one_malformed_entry_anywhere_makes_the_whole_database_unusable() {
+    // clangd loads a compilation database ALL-OR-NOTHING. Measured with clangd 19.1.2 on a
+    // database whose first entry is complete and whose second lacks a compiler invocation:
+    //   E[..] Failed to load compilation database from …: Missing key: "command" or "arguments".
+    //   I[..] Failed to find compilation database for …/src/main.c
+    //   I[..] Generic fallback command is: […]
+    // and the fallback command drops the first entry's `-D` flags entirely. So checking only the
+    // first entry would call that database usable, pin the session to it, and persist
+    // fallback-flag answers — which resolve a cross-unit call to the callee's header declaration.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-later-entry");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+    const GOOD: &str = r#"{"directory":"/x","file":"/x/a.c","command":"cc -c a.c"}"#;
+    let rejected = [
+        // A later entry with no compiler invocation, and one with no `directory`.
+        format!(r#"[{GOOD},{{"directory":"/x","file":"/x/b.c"}}]"#),
+        format!(r#"[{GOOD},{{"file":"/x/b.c","command":"cc -c b.c"}}]"#),
+        // A later element that is not an object at all, which clangd reports as `Expected
+        // object.` and likewise refuses the whole file for.
+        format!(r#"[{GOOD},7]"#),
+        // Complete entries wrapped in something that is not the top-level array clangd requires
+        // (`Expected array.`).
+        format!(r#"{{"commands":[{GOOD}]}}"#),
+    ];
+    for database in &rejected {
+        std::fs::write(dir.join("compile_commands.json"), database).unwrap();
+        assert!(
+            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            "clangd refuses to load {database}, so it configures nothing",
+        );
+    }
+    // The same entries, all complete, are a usable database — the rejections above are about the
+    // malformed entry, not about having several.
+    let accepted =
+        format!(r#"[{GOOD},{{"directory":"/x","file":"/x/b.c","command":"cc -c b.c"}}]"#);
+    std::fs::write(dir.join("compile_commands.json"), &accepted).unwrap();
+    assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+}
+
+#[test]
+fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
+    // Checking every entry makes the cost scale with the database, and this runs while the
+    // maintenance pass holds the repository write lock — so the size a large C++ project actually
+    // produces is pinned here rather than assumed small. Measured on the fixture below (39 MB,
+    // 120k entries): ~0.3s in a release build, ~3.3s in this unoptimized test build. The budget is
+    // an order of magnitude above that, so it documents the cost without failing on a loaded
+    // machine; only a change that made validation super-linear would trip it.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-large-db");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+
+    // Shaped like a real Ninja/CMake export: absolute paths, one entry per translation unit, and
+    // a flag list long enough that the file's size comes from the commands rather than the count.
+    const FLAGS: &str = "-DNDEBUG -DUSE_AURA=1 -DCOMPONENT_BUILD -I../.. -Igen \
+                         -I../../third_party/abseil-cpp -I../../third_party/boringssl/src/include \
+                         -O2 -std=c++20 -fno-exceptions -fno-rtti -Wall";
+    let mut database = String::from("[");
+    for unit in 0..120_000 {
+        if unit > 0 {
+            database.push(',');
+        }
+        database.push_str(&format!(
+            r#"{{"directory":"/w/out/Release","file":"/w/components/mod{unit}/impl.cc","#
+        ));
+        database.push_str(&format!(
+            r#""command":"clang++ {FLAGS} -c ../../components/mod{unit}/impl.cc "#
+        ));
+        database.push_str(&format!(r#"-o obj/mod{unit}/impl.o"}}"#));
+    }
+    database.push(']');
+    assert!(database.len() > 32 * 1024 * 1024, "the fixture must be tens of megabytes");
+    std::fs::write(dir.join("compile_commands.json"), &database).unwrap();
+    drop(database);
+
+    let started = std::time::Instant::now();
+    let layout = clangd.resolve_layout(&dir);
+    let elapsed = started.elapsed();
+    assert!(layout.sole_marker_dir().is_some(), "a large database is still a usable one");
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "validating one large compilation database took {elapsed:?}",
     );
 }
 
@@ -574,6 +646,55 @@ fn a_symlinked_build_directory_is_still_searched() {
     std::os::windows::fs::symlink_dir(dir.join("cmake-build-debug"), dir.join("build")).unwrap();
 
     assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+}
+
+#[cfg(unix)]
+#[test]
+fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
+    // `out/` plus a `current-build -> out` convenience symlink is ONE database reachable by two
+    // paths. The walk follows directory symlinks on purpose — that is what makes a symlinked build
+    // directory discoverable — so without collapsing aliases the checkout looks multi-database:
+    // `--compile-commands-dir` is dropped, and a source outside clangd's own ancestor/`build/`
+    // search stops being resolvable even though the checkout is perfectly ordinary.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-aliased-db");
+    std::fs::create_dir_all(dir.join("out")).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("out/compile_commands.json"), COMPDB).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+    std::os::unix::fs::symlink(dir.join("out"), dir.join("current-build")).unwrap();
+
+    let layout = clangd.resolve_layout(&dir);
+    let args = clangd.spawn_args(&["--background-index"], &layout);
+    assert!(
+        args.contains(&compdb_arg(&dir.join("out")))
+            || args.contains(&compdb_arg(&dir.join("current-build"))),
+        "either path reaches the one database, but the session must be pointed at it: {args:?}",
+    );
+    assert!(
+        clangd.session_can_resolve(&dir, "src/main.c", &layout),
+        "a source clangd could not find the database for is resolvable only because we pin it",
+    );
+
+    // A genuinely different second database still disqualifies pinning: aliases collapse,
+    // projects do not.
+    std::fs::create_dir_all(dir.join("other/build")).unwrap();
+    std::fs::write(dir.join("other/build/compile_commands.json"), COMPDB).unwrap();
+    let layout = clangd.resolve_layout(&dir);
+    assert_eq!(
+        clangd.spawn_args(&["--background-index"], &layout),
+        vec![OsString::from("--background-index")],
+        "two distinct databases are still two",
+    );
+    // Including when the second one is unusable — it is what clangd would load for its own
+    // project's files, so pinning the working one would hand them the wrong flags.
+    std::fs::write(dir.join("other/build/compile_commands.json"), "[]").unwrap();
+    let layout = clangd.resolve_layout(&dir);
+    assert_eq!(
+        clangd.spawn_args(&["--background-index"], &layout),
+        vec![OsString::from("--background-index")],
+        "an unusable second database disqualifies pinning too",
+    );
 }
 
 #[cfg(unix)]
